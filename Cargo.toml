@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wt-core",
+    "crates/pty-core",
+    "crates/app",
+]
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+gpui = { path = "vendor/zed/crates/gpui" }
+anyhow = "1"
+thiserror = "1"
