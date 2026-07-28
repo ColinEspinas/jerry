@@ -10,8 +10,10 @@
 
 pub mod file_tree;
 pub mod fonts;
+pub mod rail;
 pub mod root;
 pub mod sessions;
+pub mod status;
 pub mod terminal_grid;
 pub mod terminal_pane;
 pub mod theme;
@@ -43,6 +45,13 @@ pub fn run(repo_path: PathBuf) {
                 // log rather than silently swallowed.
                 log::error!("failed to load bundled fonts: {err}");
             }
+
+            // The rail's `+`/⌘N "new session" control (see `crate::root::NewSession`'s
+            // docs for the real, verified `actions!`/`KeyBinding` pattern this follows,
+            // taken directly from `vendor/zed/crates/gpui/examples/input.rs`, and for the
+            // documented judgment call on how far its focus-priority interaction with a
+            // focused terminal tab was verified).
+            cx.bind_keys([gpui::KeyBinding::new("cmd-n", root::NewSession, None)]);
 
             let bounds = Bounds::centered(None, size(px(1440.0), px(928.0)), cx);
             let opened = cx.open_window(

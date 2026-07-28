@@ -115,4 +115,26 @@ mod tests {
     fn empty_list_maps_to_empty_items() {
         assert_eq!(build_worktree_items(Vec::new()), Vec::new());
     }
+
+    /// `is_locked` must survive the `wt_core::Worktree` -> `WorktreeItem` mapping unchanged -
+    /// the rail's "by project" mode (`crate::rail::WorktreeNote::is_locked`) and its prune
+    /// safety check both depend on this real value reaching the UI layer, not a default.
+    #[test]
+    fn locked_state_is_preserved_from_the_real_worktree_result() {
+        let mut locked = worktree("/repo-wt/locked", Some("locked-branch"), false);
+        locked.is_locked = true;
+        let items = build_worktree_items(vec![Ok(locked)]);
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0].is_locked,
+            "a locked worktree's is_locked must be preserved as true"
+        );
+    }
+
+    #[test]
+    fn unlocked_state_is_preserved_from_the_real_worktree_result() {
+        let unlocked = worktree("/repo-wt/unlocked", Some("unlocked-branch"), false);
+        let items = build_worktree_items(vec![Ok(unlocked)]);
+        assert!(!items[0].is_locked);
+    }
 }

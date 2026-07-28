@@ -255,7 +255,12 @@ pub fn remove_worktree(repo_path: &Path, worktree_path: &Path, force: bool) -> R
 /// we don't wait for it normally in that case (which could deadlock if the unread output
 /// exceeds the OS pipe buffer and `git` blocks trying to write more); instead we kill it
 /// and then wait, only to reap the process rather than leave a zombie.
-fn is_dirty(worktree_dir: &Path) -> Result<bool, Error> {
+///
+/// Public (not just used internally by [`remove_worktree`]): the session rail's "by
+/// project" mode needs the same real clean/dirty signal to label a worktree row `checkout
+/// · clean` or hide a dirty worktree from `prune` candidacy - see `app::rail`'s docs.
+/// Performs blocking I/O; see the crate-level docs.
+pub fn is_dirty(worktree_dir: &Path) -> Result<bool, Error> {
     let args: Vec<OsString> = vec![
         "status".into(),
         "--porcelain".into(),

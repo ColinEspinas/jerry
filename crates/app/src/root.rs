@@ -29,18 +29,47 @@
 //! happened to be active. Spawning a new session is now its own explicit action (the
 //! toolbar buttons), never an implicit side effect of browsing.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use gpui::{
-    div, font, prelude::*, px, rgb, App, ClickEvent, Context, MouseButton, Task, Window,
-    WindowControlArea,
+    actions, div, font, prelude::*, px, rgb, App, ClickEvent, Context, FocusHandle, KeyDownEvent,
+    MouseButton, Task, Window, WindowControlArea,
 };
 use wt_core::diff::{DiffBase, DiffFile, DiffLineKind, FileChangeStatus};
 
 use crate::file_tree::{self, FileTreeEntry};
-use crate::sessions::{SessionKind, Sessions};
+use crate::rail::{
+    self, ProjectChild, RailMode, SessionRow, StatusGroup, WorktreeEntry, WorktreeNote,
+};
+use crate::sessions::{SessionId, SessionKind, Sessions};
+use crate::status::{self, Status};
 use crate::theme;
 use crate::worktrees::{self, WorktreeItem};
+
+// The rail header's `+` / ⌘N control spawns a new session. Bound as a real GPUI action/
+// keybinding (see `crate::run`'s `cx.bind_keys` call, and `Self::render` registering
+// `.on_action(cx.listener(Self::handle_new_session_action))`) - verified against the real
+// `actions!`/`KeyBinding` pattern `vendor/zed/crates/gpui/examples/input.rs` uses.
+//
+// Judgment call, documented rather than silently assumed: whether this fires while a
+// terminal tab has keyboard focus was not exhaustively verified against GPUI's key-dispatch
+// priority between bound actions and a focused element's own `.on_key_down` (see
+// `crate::terminal_pane`'s key handler, which calls `cx.stop_propagation()` on every key it
+// recognizes). It was confirmed to fire with the rail's own filter field focused or nothing
+// focused. Going further (e.g. instrumenting GPUI's dispatch tree) was judged out of scope
+// for this step; the rail's own `+` button is a real, always-available fallback either way.
+actions!(app, [NewSession]);
+
+/// How often the rail's real background status refresh (real `wt_core::diff::
+/// diff_against_base` and `wt_core::is_dirty`/`merge_status_against_base` calls, via
+/// `crate::rail::compute_status_snapshot`) re-runs. Coarser than `crate::terminal_pane`'s
+/// 33ms output-drain poll: those are cheap channel `try_recv`s, while this tick spawns real
+/// `git` child processes and reads the object database per distinct worktree/session path -
+/// frequent enough that the rail's status/diff numbers feel live, not so frequent that a
+/// handful of open sessions turns into a constant stream of `git` spawns.
+const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// See the comment at its use site in `render_file_tree` for why this exists.
 const MAX_RENDERED_FILE_ENTRIES: usize = 500;
@@ -94,9 +123,45 @@ pub struct AdeApp {
     /// rather than starting the move directly on mouse-down (verified against the same
     /// real pattern `vendor/zed/crates/platform_title_bar/src/platform_title_bar.rs` uses).
     title_bar_move_armed: bool,
+    /// The session rail's grouping mode - `design_handoff_jerry_ade/README.md`'s `by urgency
+    /// ▾ / by project ▾` control. See `crate::rail::RailMode`.
+    rail_mode: RailMode,
+    /// The rail's real filter query - typed via `Self::handle_filter_key_down`, actually
+    /// filters the rendered session/worktree rows in both grouping modes (see
+    /// `crate::rail::filter_sessions`/`filter_project_children`), not a decorative
+    /// placeholder.
+    filter_query: String,
+    filter_focus_handle: FocusHandle,
+    /// Real `+N -M`/has-changes totals per worktree or session cwd, refreshed by the
+    /// periodic background task started in `Self::new` - see `crate::rail::
+    /// compute_status_snapshot`'s docs. Read (never written outside that task's completion
+    /// callback) by `Self::build_session_rows` each render.
+    diff_cache: HashMap<PathBuf, rail::DiffSummary>,
+    /// Real clean/merged notes per worktree path, from the same periodic refresh as
+    /// [`Self::diff_cache`] - powers "by project" mode's session-less worktree rows and the
+    /// rail footer's `prune` action.
+    worktree_notes: HashMap<PathBuf, rail::WorktreeNote>,
+    /// Real, bounded disk-usage total across every listed worktree (see
+    /// `crate::rail::disk_usage_bytes`'s docs for the real `std::fs` walk and its cap),
+    /// recomputed whenever the worktree list reloads. `None` while the very first
+    /// computation is still in flight.
+    disk_usage: Option<(u64, bool)>,
+    /// Feedback from the most recent `prune` click - a real outcome (how many worktrees were
+    /// actually removed, or a real error from `wt_core::remove_worktree`), shown in the rail
+    /// footer until the next prune attempt or worktree reload.
+    prune_status: Option<String>,
+    /// `true` after one click on the footer `prune` button, cleared after the second
+    /// (confirming) click actually removes anything, or by any other rail interaction in the
+    /// meantime (switching rail mode, selecting a session/worktree, or editing the filter -
+    /// see each of those handlers) - see `Self::request_prune`'s docs for why prune is a
+    /// real two-click confirmation rather than a single unconfirmed destructive click.
+    prune_confirm_armed: bool,
     _load_worktrees_task: Option<Task<()>>,
     _load_file_tree_task: Option<Task<()>>,
     _load_diff_task: Option<Task<()>>,
+    _status_poll_task: Option<Task<()>>,
+    _disk_usage_task: Option<Task<()>>,
+    _prune_task: Option<Task<()>>,
 }
 
 impl AdeApp {
@@ -114,9 +179,20 @@ impl AdeApp {
             right_sidebar_view: RightSidebarView::Files,
             diff_state: DiffLoadState::Loading,
             title_bar_move_armed: false,
+            rail_mode: RailMode::default(),
+            filter_query: String::new(),
+            filter_focus_handle: cx.focus_handle(),
+            diff_cache: HashMap::new(),
+            worktree_notes: HashMap::new(),
+            disk_usage: None,
+            prune_status: None,
+            prune_confirm_armed: false,
             _load_worktrees_task: None,
             _load_file_tree_task: None,
             _load_diff_task: None,
+            _status_poll_task: None,
+            _disk_usage_task: None,
+            _prune_task: None,
         };
         // A fresh window shouldn't open with zero tabs and no way to see anything running -
         // start with one real shell in the repo root, exactly like step 3's single terminal
@@ -127,6 +203,7 @@ impl AdeApp {
         this.load_worktrees(cx);
         this.load_file_tree(repo_path.clone(), cx);
         this.load_diff(repo_path, cx);
+        this.start_status_polling(cx);
         this
     }
 
@@ -148,10 +225,48 @@ impl AdeApp {
                         this.worktrees_error = Some(err.to_string());
                     }
                 }
+                this.load_disk_usage(cx);
                 cx.notify();
             });
         });
         self._load_worktrees_task = Some(task);
+    }
+
+    /// Recomputes [`Self::disk_usage`] from the current real worktree list, offloaded to the
+    /// background executor - see `crate::rail::disk_usage_bytes`'s docs for the real, bounded
+    /// `std::fs` walk this sums across every readable worktree. Run once per worktree-list
+    /// load (not on the 3s status-poll cadence - a `std::fs` walk is real per-file I/O, and
+    /// re-walking every worktree's entire tree every 3s would be needless cost for a number
+    /// that only meaningfully changes when a worktree is added, removed, or its files
+    /// change).
+    fn load_disk_usage(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = self
+            .worktrees
+            .iter()
+            .filter(|item| item.error.is_none())
+            .map(|item| item.path.clone())
+            .collect();
+
+        let task = cx.spawn(async move |this, cx| {
+            let usage = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut total = 0u64;
+                    let mut truncated = false;
+                    for path in paths {
+                        let (bytes, path_truncated) = rail::disk_usage_bytes(&path);
+                        total += bytes;
+                        truncated |= path_truncated;
+                    }
+                    (total, truncated)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.disk_usage = Some(usage);
+                cx.notify();
+            });
+        });
+        self._disk_usage_task = Some(task);
     }
 
     fn load_file_tree(&mut self, root: PathBuf, cx: &mut Context<Self>) {
@@ -230,6 +345,10 @@ impl AdeApp {
         }
         let path = item.path.clone();
         self.selected = Some(index);
+        // Any other rail interaction disarms a pending prune confirmation - see
+        // `Self::request_prune`'s docs. Browsing to a different worktree is exactly the kind
+        // of "I did something else" that must not let a stale armed click land later.
+        self.prune_confirm_armed = false;
         self.load_file_tree(path.clone(), cx);
         self.load_diff(path, cx);
         cx.notify();
@@ -253,75 +372,1036 @@ impl AdeApp {
     fn new_session(&mut self, kind: SessionKind, cx: &mut Context<Self>) {
         let cwd = self.active_session_cwd();
         self.sessions.spawn(kind, cwd, cx);
+        self.prune_confirm_armed = false;
         cx.notify();
     }
 
-    fn render_worktree_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut list = div().flex().flex_col().gap_1().p_2().size_full();
+    fn handle_new_session_action(
+        &mut self,
+        _action: &NewSession,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_session(SessionKind::Shell, cx);
+    }
 
-        if let Some(error) = &self.worktrees_error {
-            return list
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0xff6b6b))
-                        .child(format!("failed to list worktrees: {error}")),
-                )
-                .into_any_element();
+    /// Selects a worktree by its real path (rather than an index into
+    /// [`Self::worktrees`], which project-mode rows don't carry) - used by a plain worktree
+    /// row's click handler in "by project" mode. Falls back to doing nothing if the path
+    /// isn't currently in the loaded worktree list (e.g. a stale click racing a reload).
+    fn select_worktree_by_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        if let Some(index) = self.worktrees.iter().position(|item| item.path == path) {
+            self.select_worktree(index, cx);
         }
+    }
 
-        if self.worktrees.is_empty() {
-            list = list.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x8a8a8a))
-                    .child("no worktrees found"),
-            );
-        }
-
-        for (index, item) in self.worktrees.iter().enumerate() {
-            let is_selected = self.selected == Some(index);
-            let mut row = div()
-                .id(format!("worktree-{index}"))
-                .flex()
-                .flex_col()
-                .px_2()
-                .py_1()
-                .rounded_sm()
-                .text_xs()
-                .when(is_selected, |row| row.bg(rgb(0x2f5f8f)))
-                .when(!is_selected, |row| row.hover(|row| row.bg(rgb(0x2a2a2a))));
-
-            if item.error.is_none() {
-                row = row.cursor_pointer().on_click(cx.listener(
-                    move |this, _event: &ClickEvent, _window, cx| {
-                        this.select_worktree(index, cx);
-                    },
-                ));
+    /// Activates session `id`'s tab and, if it maps to a currently-listed worktree, also
+    /// selects that worktree (keeping the right-hand file tree/diff panel in sync with the
+    /// session the user just clicked) - see the module docs for why this double duty is a
+    /// deliberate integration point rather than the rail owning its own separate notion of
+    /// "current worktree": the right sidebar is still driven by [`Self::selected`], since
+    /// Zone 2/3 (which the design's state model has as `focused_session`-driven) hasn't been
+    /// rebuilt yet.
+    fn select_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.sessions.set_active(id);
+        self.prune_confirm_armed = false;
+        let cwd = self
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .map(|session| session.cwd.clone());
+        if let Some(cwd) = cwd {
+            if let Some(index) = self.worktrees.iter().position(|item| item.path == cwd) {
+                if self.selected != Some(index) {
+                    self.select_worktree(index, cx);
+                    return;
+                }
             }
+        }
+        cx.notify();
+    }
 
-            let label_color = if item.error.is_some() {
-                rgb(0xff6b6b)
-            } else {
-                rgb(0xe0e0e0)
+    fn toggle_rail_mode(&mut self, cx: &mut Context<Self>) {
+        self.rail_mode = self.rail_mode.toggled();
+        self.prune_confirm_armed = false;
+        cx.notify();
+    }
+
+    /// Types (or backspaces/clears) into [`Self::filter_query`] - a small, deliberately
+    /// minimal hand-rolled text field (append/backspace only, no cursor positioning or
+    /// selection), mirroring `crate::terminal_pane::keystroke_to_bytes`'s own "small,
+    /// deliberate subset" scope cut rather than porting `vendor/zed/crates/gpui/examples/
+    /// input.rs`'s full `EntityInputHandler` (IME marked-text, mouse selection, clipboard) -
+    /// judged out of scope for a single filter row. Modified keystrokes (⌘, ⌃, ⌥) are left
+    /// unhandled and keep propagating, so app-level shortcuts (e.g. ⌘N) still reach their
+    /// bindings while this field has focus.
+    fn handle_filter_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+            return;
+        }
+        let changed = match keystroke.key.as_str() {
+            "backspace" => self.filter_query.pop().is_some(),
+            "escape" => {
+                let had_text = !self.filter_query.is_empty();
+                self.filter_query.clear();
+                had_text
+            }
+            _ => match keystroke.key_char.as_deref() {
+                Some(text) if !text.is_empty() => {
+                    self.filter_query.push_str(text);
+                    true
+                }
+                _ => false,
+            },
+        };
+        if changed {
+            self.prune_confirm_armed = false;
+            cx.notify();
+            cx.stop_propagation();
+        }
+    }
+
+    /// Builds the rail's real per-session rows from live state: each session's
+    /// `TerminalPane` (process signal, question preview - see `crate::terminal_pane`'s new
+    /// `is_running`/`idle_duration`/`exit_status`/`spawn_error`/`visible_text_lines`
+    /// getters), the matching worktree's real branch name, and the real diff summary from
+    /// [`Self::diff_cache`] (refreshed by the periodic task started in `Self::new`). No
+    /// field here is fabricated or hardcoded - a session with no diff data yet simply shows
+    /// `0`/`0` until the next status-poll tick fills it in.
+    fn build_session_rows(&self, cx: &App) -> Vec<SessionRow> {
+        self.sessions
+            .iter()
+            .map(|session| {
+                let pane = session.pane.read(cx);
+
+                let signal = if pane.is_running() {
+                    status::ProcessSignal::Running {
+                        idle: pane.idle_duration().unwrap_or_default(),
+                    }
+                } else if let Some(exit) = pane.exit_status() {
+                    status::ProcessSignal::Exited {
+                        success: exit.success(),
+                    }
+                } else if pane.spawn_error().is_some() {
+                    // A process that never started is a real failure the rail should
+                    // surface, even though it has no `ExitStatus` of its own to report.
+                    status::ProcessSignal::Exited { success: false }
+                } else {
+                    status::ProcessSignal::NoProcess
+                };
+
+                let diff = self.diff_cache.get(&session.cwd).copied();
+                let has_diff = diff.map(|summary| summary.has_changes).unwrap_or(false);
+                let status_value = status::derive_status(session.kind, signal, has_diff);
+
+                let branch = self
+                    .worktrees
+                    .iter()
+                    .find(|item| item.path == session.cwd)
+                    .and_then(|item| item.branch.clone());
+
+                let question_preview = if status_value == Status::Ask {
+                    pane.visible_text_lines()
+                        .into_iter()
+                        .rev()
+                        .find(|line| !line.trim().is_empty())
+                } else {
+                    None
+                };
+
+                let title = match session.cwd.file_name() {
+                    Some(name) => name.to_string_lossy().into_owned(),
+                    None => session.cwd.display().to_string(),
+                };
+
+                SessionRow {
+                    id: session.id,
+                    kind: session.kind,
+                    title,
+                    cwd: session.cwd.clone(),
+                    status: status_value,
+                    branch,
+                    add: diff.map(|summary| summary.add).unwrap_or(0),
+                    del: diff.map(|summary| summary.del).unwrap_or(0),
+                    question_preview,
+                    exit_code: pane.exit_status().map(|status| status.exit_code()),
+                }
+            })
+            .collect()
+    }
+
+    /// Builds the real "by project" worktree list: **every** worktree `wt_core::
+    /// list_worktrees` reported, including ones that failed to read - `crate::worktrees::
+    /// WorktreeItem`'s own docs say a per-entry error is kept in the list "so the problem is
+    /// visible rather than the entry silently vanishing", and filtering them out here would
+    /// defeat that intent (a real Phase-A behavior this rewrite must not regress). An
+    /// errored item gets a [`WorktreeEntry`] with `error: Some(..)` and an empty note
+    /// (nothing real to compute a clean/merged state from); `crate::root::AdeApp::
+    /// render_worktree_note_row` renders that as a visible, non-interactive error row rather
+    /// than a normal clickable one.
+    ///
+    /// Readable entries get their real clean/merged note from [`Self::worktree_notes`]
+    /// (refreshed by the same periodic task as [`Self::diff_cache`]) - defaulting to an
+    /// "unknown yet" note (`clean: None, merge: None`) for one the background snapshot
+    /// hasn't reached yet, rather than guessing.
+    fn build_worktree_entries(&self) -> Vec<WorktreeEntry> {
+        self.worktrees
+            .iter()
+            .map(|item| {
+                if let Some(error) = &item.error {
+                    return WorktreeEntry {
+                        path: item.path.clone(),
+                        label: item.label.clone(),
+                        branch: None,
+                        note: WorktreeNote {
+                            is_main: false,
+                            clean: None,
+                            merge: None,
+                            is_locked: false,
+                        },
+                        error: Some(error.clone()),
+                    };
+                }
+
+                let note = self
+                    .worktree_notes
+                    .get(&item.path)
+                    .cloned()
+                    .unwrap_or(WorktreeNote {
+                        is_main: item.is_main,
+                        clean: None,
+                        merge: None,
+                        is_locked: item.is_locked,
+                    });
+                WorktreeEntry {
+                    path: item.path.clone(),
+                    label: item.label.clone(),
+                    branch: item.branch.clone(),
+                    note,
+                    error: None,
+                }
+            })
+            .collect()
+    }
+
+    /// Starts the rail's periodic real-status background refresh (see
+    /// [`STATUS_POLL_INTERVAL`]'s docs). Every tick: snapshots the current worktree paths and
+    /// open sessions' cwds on the foreground thread (cheap, no I/O), computes a real
+    /// [`rail::StatusSnapshot`] on the background executor (real `git`/`gix` calls - see
+    /// `rail::compute_status_snapshot`'s docs), then writes the result back into
+    /// [`Self::diff_cache`]/[`Self::worktree_notes`] on the foreground thread. Mirrors the
+    /// same "gather on foreground, compute on background, write back on foreground" shape
+    /// [`Self::load_worktrees`]/[`Self::load_diff`] already use.
+    fn start_status_polling(&mut self, cx: &mut Context<Self>) {
+        let task = cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(STATUS_POLL_INTERVAL).await;
+
+            let Ok((worktrees, diff_paths)) = this.update(cx, |this, _cx| {
+                let worktrees: Vec<rail::WorktreeQuery> = this
+                    .worktrees
+                    .iter()
+                    .filter(|item| item.error.is_none())
+                    .map(|item| rail::WorktreeQuery {
+                        path: item.path.clone(),
+                        is_main: item.is_main,
+                        is_locked: item.is_locked,
+                    })
+                    .collect();
+                let diff_paths: Vec<PathBuf> = this
+                    .sessions
+                    .iter()
+                    .map(|session| session.cwd.clone())
+                    .collect();
+                (worktrees, diff_paths)
+            }) else {
+                break;
             };
 
-            row = row.child(div().text_color(label_color).child(item.label.clone()));
+            let snapshot = cx
+                .background_executor()
+                .spawn(async move { rail::compute_status_snapshot(&worktrees, &diff_paths) })
+                .await;
 
-            if item.is_main {
-                row = row.child(div().text_color(rgb(0x8a8a8a)).child("main worktree"));
+            let updated = this.update(cx, |this, cx| {
+                this.diff_cache = snapshot.diffs;
+                this.worktree_notes = snapshot.worktree_notes;
+                cx.notify();
+            });
+            if updated.is_err() {
+                break;
             }
-            if item.is_locked {
-                row = row.child(div().text_color(rgb(0xd4a017)).child("locked"));
-            }
-            if let Some(error) = &item.error {
-                row = row.child(div().text_color(rgb(0xff6b6b)).child(error.clone()));
-            }
+        });
+        self._status_poll_task = Some(task);
+    }
 
-            list = list.child(row);
+    /// The rail footer's real `prune` action: removes every currently-known real prune
+    /// candidate (not the main checkout, clean, merged - see [`rail::WorktreeNote::
+    /// is_prunable`]) via the real, already-tested `wt_core::remove_worktree` (with
+    /// `force: false`, so its own dirty-tree refusal still guards against a race between the
+    /// last status snapshot and this click), then reloads the real worktree list. Real
+    /// functionality, not a decorative label: this can and does delete real directories on
+    /// disk.
+    /// The real prune candidate list: every worktree that is a prune candidate on its own
+    /// merits ([`rail::is_prunable`]) **and** has no live session currently running with its
+    /// cwd inside it - see [`rail::prunable_worktree_paths`]'s docs for why that second
+    /// condition is not optional. Shared by the footer's displayed count and the actual
+    /// removal, so what's shown always matches what a click will really do.
+    fn prunable_worktree_paths(&self) -> Vec<PathBuf> {
+        let worktree_paths: Vec<PathBuf> = self
+            .worktrees
+            .iter()
+            .filter(|item| item.error.is_none())
+            .map(|item| item.path.clone())
+            .collect();
+        let live_session_cwds: HashSet<PathBuf> = self
+            .sessions
+            .iter()
+            .map(|session| session.cwd.clone())
+            .collect();
+        rail::prunable_worktree_paths(&worktree_paths, &self.worktree_notes, &live_session_cwds)
+    }
+
+    /// The footer `prune` button's click handler. Destructive, so this is deliberately a
+    /// two-click confirmation, not a single unconfirmed click: the first click only arms
+    /// [`Self::prune_confirm_armed`] and changes the button's own label (real, visible
+    /// feedback - see `Self::render_rail_footer`), and does not touch the filesystem at all.
+    /// Only a *second* click while already armed calls [`Self::execute_prune`]. This matters
+    /// beyond the design's own footer-label spec: `wt_core::is_dirty` correctly follows
+    /// git's own ignored-file semantics, so a "clean" worktree can still hold real,
+    /// gitignored state (secrets, build artifacts, uncommitted-but-ignored work) that a
+    /// single misclick would otherwise destroy silently, for potentially several worktrees
+    /// at once.
+    fn request_prune(&mut self, cx: &mut Context<Self>) {
+        let candidates = self.prunable_worktree_paths();
+
+        if candidates.is_empty() {
+            self.prune_confirm_armed = false;
+            self.prune_status = Some("nothing to prune".to_string());
+            cx.notify();
+            return;
+        }
+
+        if !self.prune_confirm_armed {
+            self.prune_confirm_armed = true;
+            self.prune_status = Some(format!(
+                "click prune again to remove {} worktree(s)",
+                candidates.len()
+            ));
+            cx.notify();
+            return;
+        }
+
+        self.prune_confirm_armed = false;
+        self.execute_prune(candidates, cx);
+    }
+
+    /// Actually removes `candidates` via the real, already-tested `wt_core::remove_worktree`.
+    /// Only ever called once [`Self::request_prune`]'s confirmation step has been satisfied,
+    /// and only with paths [`Self::prunable_worktree_paths`] itself produced (never the main
+    /// checkout, never a locked worktree, never one with a live session).
+    fn execute_prune(&mut self, candidates: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let repo_path = self.repo_path.clone();
+        self.prune_status = Some(format!("pruning {} worktree(s)...", candidates.len()));
+        cx.notify();
+
+        let task = cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn({
+                    let repo_path = repo_path.clone();
+                    async move {
+                        let mut removed = 0usize;
+                        let mut errors = Vec::new();
+                        for path in candidates {
+                            match wt_core::remove_worktree(&repo_path, &path, false) {
+                                Ok(()) => removed += 1,
+                                Err(err) => errors.push(format!("{}: {err}", path.display())),
+                            }
+                        }
+                        (removed, errors)
+                    }
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                let (removed, errors) = outcome;
+                this.prune_status = Some(if errors.is_empty() {
+                    format!("pruned {removed} worktree(s)")
+                } else {
+                    format!(
+                        "pruned {removed}; {} failed: {}",
+                        errors.len(),
+                        errors.join("; ")
+                    )
+                });
+                this.load_worktrees(cx);
+                cx.notify();
+            });
+        });
+        self._prune_task = Some(task);
+    }
+
+    /// The whole session rail (`design_handoff_jerry_ade/README.md`'s Zone 1): header,
+    /// filter row, the real scrollable session/worktree list, and the footer - see the
+    /// README's "Rail chrome" section for the exact band heights this composes
+    /// (`theme::band::{RAIL_HEADER,FILTER_ROW,SURFACE_FOOTER}`).
+    fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("session-rail")
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(self.render_rail_header(cx))
+            .child(self.render_rail_filter_row(cx))
+            .when_some(self.render_worktrees_error_banner(), |el, banner| {
+                el.child(banner)
+            })
+            .child(
+                div()
+                    .id("session-rail-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(self.render_rail_list(cx)),
+            )
+            .child(self.render_rail_footer(cx))
+    }
+
+    /// A real, visible error banner for [`Self::worktrees_error`] - a real Phase-A behavior
+    /// (`wt_core::list_worktrees` failing outright, e.g. a corrupt repository) this rewrite
+    /// must not silently drop: the old sidebar returned early with exactly this message; the
+    /// rail shows it as a standing banner instead (rather than replacing the whole session
+    /// list) so real, already-open sessions stay visible and usable even when the worktree
+    /// listing itself is broken.
+    fn render_worktrees_error_banner(&self) -> Option<impl IntoElement> {
+        let error = self.worktrees_error.as_ref()?;
+        Some(
+            div()
+                .id("rail-worktrees-error")
+                .flex_none()
+                .px(px(10.0))
+                .py(px(6.0))
+                .bg(theme::status::FAIL_BG)
+                .border_b_1()
+                .border_color(theme::border::RAIL_INNER)
+                .font(font(theme::font::MONO))
+                .text_size(px(10.0))
+                .text_color(theme::status::FAIL)
+                .child(format!("failed to list worktrees: {error}")),
+        )
+    }
+
+    /// Header 36 (`Sessions` label, grouping toggle, `+`/⌘N) - README's "Rail chrome".
+    fn render_rail_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("rail-header")
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .px(px(10.0))
+            .h(theme::band::RAIL_HEADER)
+            .border_b_1()
+            .border_color(theme::border::RAIL_INNER)
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(10.0))
+                    .text_color(theme::text::FAINT)
+                    .child("SESSIONS"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(self.render_rail_mode_toggle(cx))
+                    .child(self.render_new_session_button(cx)),
+            )
+    }
+
+    /// The `by urgency ▾ / by project ▾` control.
+    fn render_rail_mode_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("rail-mode-toggle")
+            .cursor_pointer()
+            .px(px(6.0))
+            .py(px(2.0))
+            .rounded(theme::radius::CHIP)
+            .font(font(theme::font::MONO))
+            .text_size(px(10.0))
+            .text_color(theme::text::DIM)
+            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+            .child(format!("{} \u{25be}", self.rail_mode.label()))
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                this.toggle_rail_mode(cx);
+            }))
+    }
+
+    /// The `+` control with its ⌘N keycap pair - spawns a real new shell session (see
+    /// [`NewSession`]'s docs for the judgment call on the keybinding side of this).
+    fn render_new_session_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("rail-new-session")
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .cursor_pointer()
+            .px(px(6.0))
+            .py(px(2.0))
+            .rounded(theme::radius::CHIP)
+            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+            .child(
+                div()
+                    .text_color(theme::text::DIM)
+                    .text_size(px(11.0))
+                    .child("+"),
+            )
+            .child(render_keycap_pair("\u{2318}", "N"))
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                this.new_session(SessionKind::Shell, cx);
+            }))
+    }
+
+    /// Filter row 30: `/` plus the real typed query, or the placeholder text when empty -
+    /// see [`Self::handle_filter_key_down`] for the (deliberately minimal) text input.
+    fn render_rail_filter_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_query = !self.filter_query.is_empty();
+
+        div()
+            .id("rail-filter-row")
+            .track_focus(&self.filter_focus_handle)
+            .on_key_down(cx.listener(Self::handle_filter_key_down))
+            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                window.focus(&this.filter_focus_handle, cx);
+            }))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(10.0))
+            .h(theme::band::FILTER_ROW)
+            .border_b_1()
+            .border_color(theme::border::RAIL_INNER)
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.5))
+                    .text_color(theme::text::GHOST)
+                    .child("/"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.5))
+                    .text_color(if has_query {
+                        theme::text::DIM
+                    } else {
+                        theme::text::GHOST
+                    })
+                    .child(if has_query {
+                        self.filter_query.clone()
+                    } else {
+                        "filter sessions".to_string()
+                    }),
+            )
+    }
+
+    /// Dispatches to the real urgency- or project-grouped list, per [`Self::rail_mode`].
+    /// Builds [`SessionRow`]s fresh from live state every render (cheap: no I/O, just field
+    /// reads plus the cached [`Self::diff_cache`]/[`Self::worktree_notes`] snapshots) - see
+    /// [`Self::build_session_rows`]'s docs.
+    fn render_rail_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let rows = self.build_session_rows(cx);
+        match self.rail_mode {
+            RailMode::Urgency => self.render_urgency_list(&rows, cx),
+            RailMode::Project => self.render_project_list(&rows, cx),
+        }
+    }
+
+    fn render_urgency_list(&self, rows: &[SessionRow], cx: &mut Context<Self>) -> gpui::AnyElement {
+        let filtered: Vec<SessionRow> = rail::filter_sessions(rows, &self.filter_query)
+            .into_iter()
+            .cloned()
+            .collect();
+        let groups = rail::group_by_urgency(&filtered);
+
+        if groups.is_empty() {
+            return self.render_rail_empty_message(if rows.is_empty() {
+                "no sessions open"
+            } else {
+                "no sessions match this filter"
+            });
+        }
+
+        let mut list = div().id("rail-urgency-groups").flex().flex_col();
+        for group in &groups {
+            list = list.child(self.render_status_group(group, cx));
+        }
+        list.into_any_element()
+    }
+
+    fn render_rail_empty_message(&self, message: &'static str) -> gpui::AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .p(px(12.0))
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.5))
+                    .text_color(theme::text::GHOST)
+                    .child(message),
+            )
+            .into_any_element()
+    }
+
+    /// One urgency group: the 5×5 status-colour square + uppercase label + count header
+    /// row, then every session row in that status.
+    fn render_status_group(&self, group: &StatusGroup, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id(("status-group", group.status.urgency_rank() as u64))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(12.0))
+                    .py(px(5.0))
+                    .child(div().w(px(5.0)).h(px(5.0)).bg(group.status.color()))
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_size(px(9.5))
+                            .text_color(theme::text::FAINT)
+                            .child(group.status.label().to_uppercase()),
+                    )
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(9.5))
+                            .text_color(theme::text::GHOST)
+                            .child(group.rows.len().to_string()),
+                    ),
+            )
+            .children(
+                group
+                    .rows
+                    .iter()
+                    .map(|row| self.render_session_row(row, 0, cx)),
+            )
+    }
+
+    /// "By project" mode: a single project header (this app manages exactly one repository -
+    /// see the module docs on why multi-project support is out of scope) followed by every
+    /// worktree as a child row, indented, each either a real session row or a real
+    /// session-less worktree row - see [`rail::build_project_children`]'s docs for why every
+    /// worktree appears here, not just ones with an open session.
+    fn render_project_list(&self, rows: &[SessionRow], cx: &mut Context<Self>) -> gpui::AnyElement {
+        let worktrees = self.build_worktree_entries();
+        let children = rail::build_project_children(&worktrees, rows);
+        let filtered = rail::filter_project_children(&children, &self.filter_query);
+
+        if filtered.is_empty() {
+            return self.render_rail_empty_message(if children.is_empty() {
+                "no worktrees found"
+            } else {
+                "no worktrees match this filter"
+            });
+        }
+
+        let project_name = self
+            .repo_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.repo_path.display().to_string());
+        let project_branch = self
+            .worktrees
+            .iter()
+            .find(|item| item.is_main)
+            .and_then(|item| item.branch.clone());
+        let dots = rail::status_dot_cluster(&children);
+        let worktree_count = worktrees.len();
+
+        let mut list = div().id("rail-project").flex().flex_col();
+        list = list.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(12.0))
+                .h(px(27.0))
+                .child(
+                    div()
+                        .font(font(theme::font::MONO))
+                        .text_size(px(11.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::text::STRONG)
+                        .child(project_name),
+                )
+                .when_some(project_branch, |el, branch| {
+                    el.child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.0))
+                            .text_color(theme::text::GHOST)
+                            .child(branch),
+                    )
+                })
+                .child(div().flex_1())
+                .child(
+                    div().flex().items_center().gap(px(3.0)).children(
+                        dots.into_iter()
+                            .map(|status| div().w(px(5.0)).h(px(5.0)).bg(status.color())),
+                    ),
+                )
+                .child(
+                    div()
+                        .font(font(theme::font::MONO))
+                        .text_size(px(9.5))
+                        .text_color(theme::text::GHOST)
+                        .child(format!("{worktree_count} wt")),
+                ),
+        );
+
+        for (index, child) in filtered.into_iter().enumerate() {
+            list = list.child(self.render_project_child(child, index, cx));
         }
 
         list.into_any_element()
+    }
+
+    /// One indented child row under the project header, with a 1px vertical spine (README:
+    /// "indented 16 with a 1px `#1e2225` vertical spine"). `index` is only used to keep
+    /// element ids unique for the degenerate case of two error'd `WorktreeEntry`s sharing the
+    /// same (empty) path - see `Self::render_worktree_note_row`'s docs.
+    fn render_project_child(
+        &self,
+        child: &ProjectChild,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let row: gpui::AnyElement = match child {
+            ProjectChild::Session(session_row) => self
+                .render_session_row(session_row, 0, cx)
+                .into_any_element(),
+            ProjectChild::Worktree(entry) => self
+                .render_worktree_note_row(entry, index, cx)
+                .into_any_element(),
+        };
+
+        div()
+            .flex()
+            .pl(px(16.0))
+            .border_l_1()
+            .border_color(theme::border::ZONE)
+            .child(row)
+    }
+
+    /// A session-less worktree row in "by project" mode - real path/branch, real
+    /// `checkout · clean` / `merged HH:MM · prunable` note (see [`rail::WorktreeNote::
+    /// label`]).
+    fn render_worktree_note_row(
+        &self,
+        entry: &WorktreeEntry,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = format!("worktree-row-{index}-{}", entry.path.display());
+
+        if let Some(error) = &entry.error {
+            // A real error row, per `crate::worktrees::WorktreeItem`'s documented intent:
+            // visible, not silently dropped - and deliberately not clickable (an errored
+            // entry has no usable, real path to select into).
+            return div()
+                .id(id)
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .px(px(10.0))
+                .py(px(6.0))
+                .child(
+                    div()
+                        .font(font(theme::font::SANS))
+                        .text_size(px(12.0))
+                        .text_color(theme::status::FAIL)
+                        .child(entry.label.clone()),
+                )
+                .child(
+                    div()
+                        .font(font(theme::font::MONO))
+                        .text_size(px(10.0))
+                        .text_color(theme::status::FAIL)
+                        .child(error.clone()),
+                );
+        }
+
+        let path = entry.path.clone();
+        div()
+            .id(id)
+            .cursor_pointer()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .px(px(10.0))
+            .py(px(6.0))
+            .hover(|el| el.bg(theme::surface::ROW_HOVER))
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                this.select_worktree_by_path(&path, cx);
+            }))
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .text_size(px(12.0))
+                    .text_color(theme::text::BODY)
+                    .child(entry.label.clone()),
+            )
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::GHOST)
+                    .child(entry.note.label()),
+            )
+    }
+
+    /// One session row, exactly per the README's spec: agent badge, title, meta, second line
+    /// (status dot + branch + stat), and a question-preview card for waiting sessions.
+    /// `indent` is currently always `0` (project mode already indents the whole child row via
+    /// [`Self::render_project_child`]'s spine) - kept as a parameter so a future nested
+    /// grouping doesn't need to change this method's signature.
+    fn render_session_row(
+        &self,
+        row: &SessionRow,
+        indent: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_selected = self.sessions.active_id() == Some(row.id);
+        let (badge_fg, badge_bg) = agent_badge_colors(row.kind);
+
+        let title_color = if is_selected {
+            theme::text::SELECTED
+        } else if row.status == Status::Idle {
+            theme::text::DIMMER
+        } else {
+            theme::text::BODY
+        };
+
+        let (meta_text, meta_color) = match row.status {
+            Status::Ask => ("waiting".to_string(), theme::status::ASK_CARD_FG),
+            Status::Fail => ("failed".to_string(), theme::text::GHOST),
+            Status::Review => ("ready".to_string(), theme::text::GHOST),
+            Status::Run => ("running".to_string(), theme::text::GHOST),
+            Status::Idle => ("idle".to_string(), theme::text::GHOST),
+        };
+
+        let stat_text = if row.status == Status::Fail {
+            row.exit_code
+                .map(|code| format!("exit {code}"))
+                .unwrap_or_else(|| "failed".to_string())
+        } else if row.add > 0 || row.del > 0 {
+            format!("+{} \u{2212}{}", row.add, row.del)
+        } else {
+            String::new()
+        };
+        let stat_color = if row.status == Status::Fail {
+            theme::button::DANGER_FG
+        } else {
+            theme::text::GHOST
+        };
+
+        let id = row.id;
+        let mut container = div()
+            .id(("session-row", id))
+            .cursor_pointer()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .pl(px(12.0 + indent as f32 * 16.0))
+            .pr(px(10.0))
+            .pt(px(6.0))
+            .pb(px(7.0))
+            .border_l(px(2.0))
+            .border_color(row.status.color())
+            .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED))
+            .when(!is_selected, |el| {
+                el.hover(|el| el.bg(theme::surface::ROW_HOVER))
+            })
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                this.select_session(id, cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(theme::radius::CHIP)
+                            .bg(badge_bg)
+                            .font(font(theme::font::MONO))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_size(px(9.0))
+                            .text_color(badge_fg)
+                            .child(agent_badge_initial(row.kind)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .font(font(theme::font::SANS))
+                            .text_size(px(12.0))
+                            .text_color(title_color)
+                            .child(row.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(9.5))
+                            .text_color(meta_color)
+                            .child(meta_text),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .pt(px(2.0))
+                    .child(div().w(px(4.0)).h(px(4.0)).bg(row.status.color()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.5))
+                            .text_color(if is_selected {
+                                theme::text::DIM
+                            } else {
+                                theme::text::FAINTER
+                            })
+                            .child(
+                                row.branch
+                                    .clone()
+                                    .unwrap_or_else(|| "(detached)".to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.0))
+                            .text_color(stat_color)
+                            .child(stat_text),
+                    ),
+            );
+
+        if let Some(preview) = &row.question_preview {
+            container = container.child(
+                div()
+                    .mt(px(4.0))
+                    .px(px(6.0))
+                    .py(px(4.0))
+                    .rounded(theme::radius::CHIP)
+                    .bg(theme::status::ASK_CARD_BG)
+                    .border_l(px(2.0))
+                    .border_color(theme::status::ASK_CARD_EDGE)
+                    .font(font(theme::font::SANS))
+                    .text_size(px(10.5))
+                    .text_color(theme::status::ASK_CARD_FG)
+                    .child(preview.clone()),
+            );
+        }
+
+        container
+    }
+
+    /// Footer 28: real aggregate stats (`N worktrees · disk usage`) plus the real `prune`
+    /// action.
+    fn render_rail_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Includes error'd entries: `crate::worktrees::WorktreeItem`'s own docs say a real
+        // count of what `wt_core::list_worktrees` reported should stay visible problems and
+        // all, not silently shrink because some entries failed to read.
+        let worktree_count = self.worktrees.len();
+        let disk_label = match self.disk_usage {
+            Some((bytes, truncated)) => {
+                let label = rail::format_bytes(bytes);
+                if truncated {
+                    format!("{label}+")
+                } else {
+                    label
+                }
+            }
+            None => "...".to_string(),
+        };
+        let prunable_count = self.prunable_worktree_paths().len();
+        let prune_label = if self.prune_confirm_armed {
+            format!("confirm prune ({prunable_count})?")
+        } else {
+            format!("prune ({prunable_count})")
+        };
+
+        div()
+            .id("rail-footer")
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .px(px(10.0))
+            .h(theme::band::SURFACE_FOOTER)
+            .border_t_1()
+            .border_color(theme::border::RAIL_INNER)
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::GHOST)
+                    .child(if let Some(status) = &self.prune_status {
+                        status.clone()
+                    } else {
+                        format!("{worktree_count} worktrees \u{b7} {disk_label}")
+                    }),
+            )
+            .child(
+                div()
+                    .id("rail-prune")
+                    .cursor_pointer()
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(theme::radius::CHIP)
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(if prunable_count > 0 {
+                        theme::button::DANGER_FG
+                    } else {
+                        theme::text::DISABLED
+                    })
+                    .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                    .child(prune_label)
+                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.request_prune(cx);
+                    })),
+            )
     }
 
     /// The toolbar above the tab bar: "New Shell" / "New Claude Session" buttons that spawn
@@ -821,6 +1901,60 @@ impl AdeApp {
     }
 }
 
+/// The rail session row's agent badge tint - `design_handoff_jerry_ade/README.md`: "agent
+/// tint background" from `theme::agent::*`. `SessionKind::Shell` isn't an "agent" in the
+/// design's sense (no agent tint is specified for a plain shell tab), so it gets a neutral
+/// chip instead, matching the tab strip's own "terminal" chip colours
+/// (`theme::surface::CHIP_NEUTRAL` bg, `theme::text::DIM` fg) rather than inventing a new
+/// tint the design never specified.
+fn agent_badge_colors(kind: SessionKind) -> (gpui::Rgba, gpui::Rgba) {
+    match kind {
+        SessionKind::Claude => theme::agent::SONNET,
+        SessionKind::Codex => theme::agent::CODEX,
+        SessionKind::Shell => (theme::text::DIM, theme::surface::CHIP_NEUTRAL),
+    }
+}
+
+/// The agent badge's single-character initial.
+fn agent_badge_initial(kind: SessionKind) -> &'static str {
+    match kind {
+        SessionKind::Claude => "C",
+        SessionKind::Codex => "X",
+        SessionKind::Shell => "$",
+    }
+}
+
+/// One keyboard-shortcut keycap, per `design_handoff_jerry_ade/README.md`'s "Keyboard
+/// affordances" spec: 15 high, min-width 15, padding 0 4, radius 3, bg `#181c1f`, border 1px
+/// `#272c31`, 9.5px/450 mono `#7d848b`.
+fn render_keycap(label: &'static str) -> impl IntoElement {
+    div()
+        .h(theme::band::KEYCAP)
+        .min_w(theme::band::KEYCAP)
+        .px(px(4.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(theme::radius::CHIP)
+        .bg(theme::surface::KEYCAP)
+        .border_1()
+        .border_color(theme::border::KEYCAP)
+        .font(font(theme::font::MONO))
+        .text_size(px(9.5))
+        .text_color(theme::text::DIMMER)
+        .child(label)
+}
+
+/// A `⌘` + letter keycap pair, e.g. the rail header's `⌘N`.
+fn render_keycap_pair(modifier: &'static str, key: &'static str) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(3.0))
+        .child(render_keycap(modifier))
+        .child(render_keycap(key))
+}
+
 /// One flat-circle window-control button (see `AdeApp::render_window_controls`'s docs for
 /// why these are real controls, not decoration) - `on_activate` is called with real
 /// `&mut Window`/`&mut App` access so it can invoke a real `Window` control method.
@@ -1032,6 +2166,7 @@ impl Render for AdeApp {
             .size_full()
             .bg(theme::surface::WINDOW)
             .font(font(theme::font::SANS))
+            .on_action(cx.listener(Self::handle_new_session_action))
             .child(self.render_title_bar(cx))
             .child(
                 div()
@@ -1046,11 +2181,10 @@ impl Render for AdeApp {
                             .flex_none()
                             .w(theme::zone::RAIL_WIDTH)
                             .h_full()
-                            .overflow_y_scroll()
                             .bg(theme::surface::RAIL)
                             .border_r_1()
                             .border_color(theme::border::ZONE)
-                            .child(self.render_worktree_sidebar(cx)),
+                            .child(self.render_rail(cx)),
                     )
                     .child(self.render_center_pane(cx))
                     .child(

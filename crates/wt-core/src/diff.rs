@@ -257,6 +257,83 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
     }))
 }
 
+/// Real merge-state of a worktree's `HEAD` against the repository's detected default base
+/// branch (see the module docs' "What 'base' means" section for the detection order) -
+/// powers the session rail's "by project" worktree rows
+/// (`design_handoff_jerry_ade/README.md`: a worktree whose branch is fully merged into the
+/// default branch, with no running session, is offered as `merged HH:MM · prunable`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeMergeStatus {
+    /// The short name of the detected default branch this was checked against.
+    pub base_branch: String,
+    /// `true` if the worktree's `HEAD` is a real ancestor of (or equal to) the base
+    /// branch's tip - i.e. every commit reachable from `HEAD` is already reachable from the
+    /// base branch, the same condition `git branch --merged <base>` reports. Computed via
+    /// `gix::Repository::merge_base`: `HEAD` is merged iff its own id *is* the merge-base of
+    /// (`HEAD`, base tip) - equivalently, fast-forwarding the base branch to `HEAD` would be
+    /// a no-op.
+    pub merged: bool,
+    /// The worktree `HEAD` commit's real committer timestamp, as seconds since the Unix
+    /// epoch (UTC) - read via `gix`'s `Commit::time()`. `None` only if the commit object
+    /// itself could not be decoded (unexpected for any object `HEAD` successfully resolved
+    /// to; treated as "unknown" rather than a hard error, since it only affects a display
+    /// label, not the `merged` verdict itself).
+    pub head_committer_unix_seconds: Option<i64>,
+}
+
+/// Compute [`WorktreeMergeStatus`] for the worktree at `worktree_path`: whether its `HEAD`
+/// has already been fully merged into the repository's detected default branch, per this
+/// module's own base-detection order. Returns `Ok(None)` if no sensible base could be
+/// detected or `HEAD` is unborn - the same "no fabricated answer" contract
+/// [`diff_against_base`] uses for [`DiffBase::NoBaseFound`], rather than guessing.
+///
+/// Performs blocking I/O (`gix` reads only - no `git` child process is spawned here, unlike
+/// [`diff_against_base`]).
+pub fn merge_status_against_base(
+    worktree_path: &Path,
+) -> Result<Option<WorktreeMergeStatus>, Error> {
+    let repo = open_repo(worktree_path)?;
+
+    let mut head = repo
+        .head()
+        .map_err(|source| Error::Head(Box::new(source)))?;
+    let head_id = head
+        .try_peel_to_id_in_place()
+        .map_err(|source| Error::PeelHead(Box::new(source)))?;
+    let Some(head_id) = head_id else {
+        // Unborn HEAD: nothing has been committed yet, so there is nothing to compare.
+        return Ok(None);
+    };
+    let head_id = head_id.detach();
+
+    let Some((base_branch, base_commit_id)) = detect_default_base(&repo)? else {
+        return Ok(None);
+    };
+
+    let merged = if head_id == base_commit_id {
+        true
+    } else {
+        match repo.merge_base(head_id, base_commit_id) {
+            Ok(merge_base_id) => merge_base_id.detach() == head_id,
+            // No common ancestor at all: definitely not merged.
+            Err(gix::repository::merge_base::Error::NotFound { .. }) => false,
+            Err(source) => return Err(Error::MergeBase(Box::new(source))),
+        }
+    };
+
+    let head_committer_unix_seconds = repo
+        .find_commit(head_id)
+        .ok()
+        .and_then(|commit| commit.time().ok())
+        .map(|time| time.seconds);
+
+    Ok(Some(WorktreeMergeStatus {
+        base_branch,
+        merged,
+        head_committer_unix_seconds,
+    }))
+}
+
 /// Detect the repository's default branch and its tip commit id, per this module's
 /// documented detection order. Returns `Ok(None)` if none of the strategies yield a branch
 /// (rather than an `Err`): an undetectable default branch is a real, expected outcome (e.g. a
@@ -1504,5 +1581,85 @@ index 0000000..fedcba9
         assert_eq!(files.len(), 1);
         assert!(files[0].truncated);
         assert_eq!(files[0].hunks[0].lines.len(), MAX_HUNK_LINES_PER_FILE);
+    }
+
+    #[test]
+    fn merge_status_reports_merged_true_for_a_worktree_fully_contained_in_base() {
+        let repo = init_repo();
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        // No new commits on `feature`: it's exactly `main`, so it's trivially "merged".
+        git(repo.path(), &["checkout", "main"]);
+
+        // Real linked worktree, not just a branch switch in place - this is what the rail
+        // actually inspects.
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("feature-wt");
+        drop(linked_dir);
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                linked_path.to_str().expect("utf8 path"),
+                "feature",
+            ],
+        );
+
+        let status = merge_status_against_base(&linked_path)
+            .expect("merge_status_against_base")
+            .expect("a base should be detected");
+        assert_eq!(status.base_branch, "main");
+        assert!(status.merged, "an unchanged branch off main is merged");
+        assert!(status.head_committer_unix_seconds.is_some());
+    }
+
+    #[test]
+    fn merge_status_reports_merged_false_for_a_worktree_with_unique_commits() {
+        let repo = init_repo();
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        fs::write(repo.path().join("feature.txt"), "feature work\n").expect("write");
+        git(repo.path(), &["add", "feature.txt"]);
+        git(repo.path(), &["commit", "-m", "unique feature commit"]);
+        git(repo.path(), &["checkout", "main"]);
+
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("feature-wt");
+        drop(linked_dir);
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                linked_path.to_str().expect("utf8 path"),
+                "feature",
+            ],
+        );
+
+        let status = merge_status_against_base(&linked_path)
+            .expect("merge_status_against_base")
+            .expect("a base should be detected");
+        assert!(
+            !status.merged,
+            "a branch with a commit not on main must not be reported as merged"
+        );
+    }
+
+    #[test]
+    fn merge_status_is_none_when_no_base_is_detectable() {
+        let dir = TempDir::new().expect("tempdir");
+        git(dir.path(), &["init", "-b", "main"]);
+        // Unborn HEAD: nothing committed yet.
+        let status = merge_status_against_base(dir.path()).expect("merge_status_against_base");
+        assert_eq!(status, None);
+    }
+
+    #[test]
+    fn merge_status_on_the_default_branch_itself_is_trivially_merged() {
+        let repo = init_repo();
+        let status = merge_status_against_base(repo.path())
+            .expect("merge_status_against_base")
+            .expect("main itself has a detectable base (itself)");
+        assert_eq!(status.base_branch, "main");
+        assert!(status.merged);
     }
 }

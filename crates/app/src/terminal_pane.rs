@@ -42,13 +42,13 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::TryRecvError;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     canvas, div, font, prelude::*, rgb, Bounds, ClickEvent, Context, FocusHandle, Focusable,
     FontWeight, KeyDownEvent, Keystroke, Pixels, Size, Task, Window,
 };
-use pty_core::{PtyError, PtySession, SpawnOptions};
+use pty_core::{ExitStatus, PtyError, PtySession, SpawnOptions};
 
 use crate::terminal_grid::{GridCell, TerminalGrid, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND};
 
@@ -72,6 +72,58 @@ const MAX_CHUNKS_PER_TICK: usize = 64;
 /// `maybe_resize_pty`) has a chance to run during the first render.
 const TERMINAL_ROWS: u16 = 48;
 const TERMINAL_COLS: u16 = 160;
+
+/// How many [`POLL_INTERVAL`] ticks (~10s total) [`TerminalPane`]'s poll loop keeps retrying
+/// `PtySession::try_wait` after observing pty EOF before giving up - see
+/// [`eof_poll_decision`]'s docs for the real race this bounds, and why giving up is a
+/// synthetic failure rather than a silent "no status".
+const MAX_EOF_POLL_TICKS: u32 = 300;
+
+/// Decides what a poll tick should do once pty EOF has been observed (the output channel's
+/// `TryRecvError::Disconnected`) but the child's real exit status hasn't been confirmed yet,
+/// given this tick's own non-blocking `PtySession::try_wait` result.
+///
+/// This is a pure decision function, factored out of `TerminalPane::spawn_process`'s poll
+/// loop (mirroring [`ResizeLatch`]'s own split of "what changed" from "what to actually do
+/// about it") specifically so the real, checker-reproduced bug this fixes is directly
+/// unit-testable without a real GPUI window or timing a real poll loop against a wall clock:
+/// the original code called `try_wait` exactly **once**, at the moment EOF was observed, and
+/// if that single non-blocking check returned `Ok(None)` (the child hasn't been reaped
+/// *yet*, but is still alive) it gave up immediately, dropped the `PtySession` (which, per
+/// `pty-core`'s own `Drop` impl, *signals the still-live process* - so a legitimate,
+/// still-running child got killed out from under itself), and left `exit_status` `None`
+/// forever, which `crate::status::derive_status` then reads as [`crate::status::
+/// ProcessSignal::NoProcess`] - i.e. `Status::Idle`, not `Status::Fail`. This is a real,
+/// reproducible race, not theoretical: any child that closes its own pty-attached stdio
+/// before actually exiting (`sh -c 'exec 0<&- 1>&- 2>&-; sleep 2; exit 7'` is a minimal
+/// repro - see the real end-to-end test below) triggers EOF well before it's reapable.
+///
+/// Returns `None` when the caller should keep the session alive and retry next tick
+/// (`try_wait` hasn't resolved yet, or errored transiently, and the tick budget isn't
+/// exhausted) - critically, `None` here must *not* cause the caller to drop the
+/// `PtySession`. Returns `Some(status)` once the caller should finalize: either the real,
+/// confirmed [`ExitStatus`], or - once [`MAX_EOF_POLL_TICKS`] is exhausted without ever
+/// confirming one - a synthetic failed status (`ExitStatus::with_signal`, a real, public
+/// `portable_pty` constructor; its `success()` is always `false`), so a process whose exit
+/// could never be confirmed is reported as [`crate::status::Status::Fail`] rather than
+/// silently reverting to [`crate::status::Status::Idle`].
+fn eof_poll_decision(
+    try_wait_result: Result<Option<ExitStatus>, ()>,
+    ticks_pending: u32,
+) -> Option<ExitStatus> {
+    match try_wait_result {
+        Ok(Some(status)) => Some(status),
+        Ok(None) | Err(()) => {
+            if ticks_pending >= MAX_EOF_POLL_TICKS {
+                Some(ExitStatus::with_signal(
+                    "gave up waiting for exit status after EOF",
+                ))
+            } else {
+                None
+            }
+        }
+    }
+}
 
 /// Approximate monospace cell metrics, in pixels, for the `text_xs()` font size this pane
 /// renders with. Used only to turn a pixel viewport into an approximate row/column count
@@ -128,6 +180,30 @@ pub struct TerminalPane {
     grid: TerminalGrid,
     session: Option<PtySession>,
     spawn_error: Option<String>,
+    /// The real exit status of this pane's process, once it has exited - captured via a
+    /// non-blocking `PtySession::try_wait` the moment the poll loop observes the output
+    /// channel disconnect (see `Self::spawn_process`'s docs). `None` while a process is still
+    /// running, before one has ever been spawned, or if a spawn attempt itself failed (see
+    /// [`Self::spawn_error`] for that case instead - a process that never started has no real
+    /// `ExitStatus` to report).
+    exit_status: Option<ExitStatus>,
+    /// The last time this pane's process is known to have produced real output, or - if it
+    /// hasn't produced any yet - the moment it successfully started. `None` only before any
+    /// process has ever successfully started. This is the raw signal
+    /// `crate::status::derive_status`'s idle-time heuristic is built from (see that module's
+    /// docs); it is intentionally *not* itself a `Status` - this pane has no notion of
+    /// "session status", only "when did I last see this process do something".
+    activity_at: Option<Instant>,
+    /// `true` from the moment pty EOF is observed (the output channel disconnects) until the
+    /// child's real exit status is either confirmed or given up on - see
+    /// [`eof_poll_decision`]'s docs for the real bug this state exists to fix. While `true`,
+    /// [`Self::session`] is deliberately *not* yet cleared: the process may genuinely still
+    /// be alive (it closed its pty-attached stdio but hasn't exited), so
+    /// [`Self::is_running`] correctly keeps reporting `true` during this window.
+    eof_pending: bool,
+    /// How many poll ticks [`Self::eof_pending`] has been `true` for - fed into
+    /// [`eof_poll_decision`] each tick; reset whenever a fresh EOF is observed.
+    eof_poll_ticks: u32,
     focus_handle: FocusHandle,
     /// This pane's own real, rendered content-area bounds - captured every frame via a
     /// measuring `canvas()` child in `render` (see that method's docs for why this exists
@@ -150,6 +226,10 @@ impl TerminalPane {
             grid: TerminalGrid::new(TERMINAL_ROWS, TERMINAL_COLS),
             session: None,
             spawn_error: None,
+            exit_status: None,
+            activity_at: None,
+            eof_pending: false,
+            eof_poll_ticks: 0,
             focus_handle: cx.focus_handle(),
             content_bounds: None,
             resize_latch: ResizeLatch::default(),
@@ -178,6 +258,62 @@ impl TerminalPane {
                 })
                 .detach();
         }
+    }
+
+    /// `true` while a real child process is alive (spawned and not yet observed to have
+    /// exited). The rail's real status derivation (`crate::status::derive_status`) uses this
+    /// to distinguish a still-running session from one that has exited or never started.
+    pub fn is_running(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// How long it has been since this pane's process last produced real output (or since it
+    /// started, if it hasn't produced any yet). `None` if no process is currently running -
+    /// callers that need "no process" as a distinct case (rather than treating it as
+    /// zero-idle) should check [`Self::is_running`] first; see `crate::rail`'s
+    /// `process_signal` for exactly that.
+    pub fn idle_duration(&self) -> Option<Duration> {
+        if !self.is_running() {
+            return None;
+        }
+        Some(
+            self.activity_at
+                .map(|at| at.elapsed())
+                .unwrap_or(Duration::ZERO),
+        )
+    }
+
+    /// The real exit status of this pane's process, once observed - see
+    /// [`Self::exit_status`]'s field docs for exactly when this becomes `Some`.
+    pub fn exit_status(&self) -> Option<&ExitStatus> {
+        self.exit_status.as_ref()
+    }
+
+    /// The real error from the most recent failed spawn attempt, if any. A process that never
+    /// started at all has no [`Self::exit_status`] to report, but is still a real failure the
+    /// rail's status derivation should surface - see `crate::rail`'s `process_signal`.
+    pub fn spawn_error(&self) -> Option<&str> {
+        self.spawn_error.as_deref()
+    }
+
+    /// The currently visible grid, as plain trimmed-right text lines (right-trimmed only -
+    /// leading whitespace, e.g. an agent CLI's own indented menu, is preserved) - used by
+    /// `crate::rail` to build the "question preview" the design calls "Jerry reading the tail
+    /// of the agent's pty": a real read of this pane's own real terminal grid, not a
+    /// reimplementation of pty reading (see `crate::terminal_grid::TerminalGrid::visible_rows`
+    /// for the real grid this is built from).
+    pub fn visible_text_lines(&self) -> Vec<String> {
+        self.grid
+            .visible_rows()
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
     }
 
     fn spawn_process(&mut self, cx: &mut Context<Self>) {
@@ -211,6 +347,12 @@ impl TerminalPane {
             if this
                 .update(cx, |this, cx| {
                     this.session = Some(session);
+                    // A freshly started process hasn't produced any output yet, but it just
+                    // demonstrably did something (started) - counting that as "activity now"
+                    // is what keeps a session that's still spawning (or between its first two
+                    // output chunks) from being immediately misread as long-idle by
+                    // `crate::status::derive_status`.
+                    this.activity_at = Some(std::time::Instant::now());
                     // The pane may already have rendered (and computed a target grid size)
                     // before this task's background spawn finished - see `ResizeLatch`'s
                     // docs for why that earlier call could not have reached the pty (there
@@ -233,8 +375,32 @@ impl TerminalPane {
                 let poll_result = this.update(cx, |this, cx| {
                     let mut appended = false;
                     let mut process_ended = false;
+                    // Captured inside the `this.session.as_mut()` borrow below (so it can
+                    // call the real, `&mut self` `PtySession::try_wait`) and only written
+                    // back to `this.exit_status` once that borrow has ended.
+                    let mut newly_exited: Option<ExitStatus> = None;
 
-                    if let Some(session) = &this.session {
+                    if this.eof_pending {
+                        // EOF was already observed on a previous tick but the child's real
+                        // exit status wasn't confirmed yet - see `eof_poll_decision`'s docs
+                        // for the real race this branch exists to handle correctly (a child
+                        // that closes its pty-attached stdio before actually exiting).
+                        // `Self::session` is deliberately still `Some` here: the process may
+                        // genuinely still be alive.
+                        match this.session.as_mut() {
+                            Some(session) => {
+                                let wait_result = session.try_wait().map_err(|_| ());
+                                match eof_poll_decision(wait_result, this.eof_poll_ticks) {
+                                    Some(status) => {
+                                        newly_exited = Some(status);
+                                        process_ended = true;
+                                    }
+                                    None => this.eof_poll_ticks += 1,
+                                }
+                            }
+                            None => process_ended = true, // defensive; shouldn't happen
+                        }
+                    } else if let Some(session) = this.session.as_mut() {
                         // Capped at `MAX_CHUNKS_PER_TICK`, not drained to empty: see that
                         // constant's docs for why an unbounded drain here is a real
                         // foreground-thread-starvation risk against a firehose child.
@@ -243,19 +409,34 @@ impl TerminalPane {
                             match session.output().try_recv() {
                                 Ok(chunk) => {
                                     this.grid.append_bytes(&chunk);
+                                    this.activity_at = Some(Instant::now());
                                     appended = true;
                                 }
                                 Err(TryRecvError::Empty) => break,
                                 Err(TryRecvError::Disconnected) => {
-                                    process_ended = true;
+                                    this.eof_pending = true;
+                                    let wait_result = session.try_wait().map_err(|_| ());
+                                    match eof_poll_decision(wait_result, 0) {
+                                        Some(status) => {
+                                            newly_exited = Some(status);
+                                            process_ended = true;
+                                        }
+                                        None => this.eof_poll_ticks = 1,
+                                    }
                                     break;
                                 }
                             }
                         }
                     }
 
+                    if let Some(status) = newly_exited {
+                        this.exit_status = Some(status);
+                    }
+
                     if process_ended {
                         this.session = None;
+                        this.eof_pending = false;
+                        this.eof_poll_ticks = 0;
                         this.grid.mark_ended();
                         appended = true;
                     }
@@ -264,7 +445,11 @@ impl TerminalPane {
                         cx.notify();
                     }
 
-                    !process_ended
+                    // Keep polling as long as there's a live session, or we're still waiting
+                    // on a final exit status after EOF (the latter matters because
+                    // `this.session` can be `Some` while `eof_pending` is `true`, so the two
+                    // conditions aren't redundant).
+                    this.session.is_some() || this.eof_pending
                 });
 
                 match poll_result {
@@ -460,10 +645,24 @@ impl Focusable for TerminalPane {
 /// Returns `None` for keys with no reasonable terminal-input meaning (e.g. a bare modifier
 /// key, or a function key this subset doesn't handle), in which case nothing is sent.
 fn keystroke_to_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
+    // Never forward a platform (⌘ on macOS, Super/Meta on Linux)-modified keystroke as
+    // literal pty input. Two real reasons, not just one: it would type garbage into the
+    // child process, and - since `handle_key_down` calls `cx.stop_propagation()` after any
+    // successful write - it would swallow an app-level shortcut (e.g. the rail's ⌘N "new
+    // session", see `crate::root::NewSession`) before it ever reaches its `KeyBinding`,
+    // simply because a terminal tab happened to have focus. This must run *before* the
+    // fallthrough `key_char` branch below, which otherwise returns a character for any
+    // keystroke that has one - including platform-modified ones. Mirrors the same guard
+    // `crate::root::AdeApp::handle_filter_key_down` already applies to its own text field.
+    if keystroke.modifiers.platform {
+        return None;
+    }
+
     // Ctrl+<letter> control codes (Ctrl-A through Ctrl-Z), e.g. Ctrl-C -> 0x03 (SIGINT at
     // the line discipline), Ctrl-D -> 0x04 (EOF). Computed rather than hardcoded per-key:
     // this is the standard terminal mapping (`letter.to_ascii_uppercase() as u8 & 0x1f`).
-    if keystroke.modifiers.control && !keystroke.modifiers.alt && !keystroke.modifiers.platform {
+    // (`modifiers.platform` is already excluded by the early return above.)
+    if keystroke.modifiers.control && !keystroke.modifiers.alt {
         if let Some(ch) = keystroke.key.chars().next() {
             if keystroke.key.chars().count() == 1 && ch.is_ascii_alphabetic() {
                 let code = (ch.to_ascii_uppercase() as u8) & 0x1f;
@@ -725,5 +924,143 @@ mod resize_tests {
         let actions = latch.apply((50, 170), true);
         assert!(actions.resize_grid);
         assert!(actions.resize_session);
+    }
+}
+
+#[cfg(test)]
+mod eof_poll_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_immediately_when_try_wait_already_has_a_status() {
+        let status = ExitStatus::with_exit_code(7);
+        match eof_poll_decision(Ok(Some(status)), 0) {
+            Some(resolved) => assert_eq!(resolved.exit_code(), 7),
+            None => panic!("expected an immediate resolution from a ready try_wait result"),
+        }
+    }
+
+    #[test]
+    fn keeps_waiting_while_try_wait_has_no_answer_and_the_tick_cap_is_not_reached() {
+        assert!(eof_poll_decision(Ok(None), 0).is_none());
+        assert!(eof_poll_decision(Ok(None), MAX_EOF_POLL_TICKS - 1).is_none());
+        assert!(
+            eof_poll_decision(Err(()), MAX_EOF_POLL_TICKS - 1).is_none(),
+            "a transient try_wait error must also be retried, not treated as final"
+        );
+    }
+
+    #[test]
+    fn gives_up_at_the_tick_cap_with_a_synthetic_failed_status_not_silence() {
+        // The exact bug this whole decomposition exists to prevent: giving up must never
+        // look like "no exit status at all" (which `crate::status::derive_status` would
+        // read as `Status::Idle`) - it must resolve to a real, if synthetic, failed status.
+        match eof_poll_decision(Ok(None), MAX_EOF_POLL_TICKS) {
+            Some(status) => assert!(
+                !status.success(),
+                "giving up must never be reported as a successful exit"
+            ),
+            None => panic!("expected the tick cap to force a resolution"),
+        }
+    }
+
+    /// Real, empirical proof (no GPUI needed) that the race `eof_poll_decision` exists to
+    /// handle is genuine: a real child spawned via `pty_core::spawn` that closes its own
+    /// pty-attached stdio *before* actually exiting causes the output channel to disconnect
+    /// (real EOF) while the process is still alive - a single non-blocking `try_wait` at
+    /// that exact moment legitimately observes nothing, and only a later retry observes the
+    /// real exit status. This is the same repro the checker used to find the original bug.
+    #[test]
+    fn real_process_closing_pty_fds_before_exiting_is_not_yet_reaped_at_eof() {
+        let mut session = pty_core::spawn(
+            pty_core::SpawnOptions::new("sh")
+                .arg("-c")
+                .arg("exec 0<&- 1>&- 2>&-; sleep 1; exit 7"),
+        )
+        .expect("spawning the shell should succeed");
+
+        // Drain until the output channel disconnects - exactly the `TryRecvError::
+        // Disconnected` signal `TerminalPane`'s poll loop reacts to.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                panic!("timed out waiting for the pty output channel to disconnect (EOF)");
+            }
+            if session.output().recv_timeout(remaining).is_err() {
+                break; // disconnected
+            }
+        }
+
+        // At the moment of EOF the process has not exited yet (it's mid-`sleep 1`) - a
+        // single `try_wait` here legitimately observes nothing. If this assertion itself
+        // fails, the test's timing assumption is wrong, not the fix under test.
+        let immediately_after_eof = session
+            .try_wait()
+            .expect("try_wait should not error for a live child");
+        assert!(
+            immediately_after_eof.is_none(),
+            "expected the process to still be alive (sleeping) right after its pty fds \
+             closed - a single try_wait must not yet observe an exit"
+        );
+
+        // The bounded retry loop `eof_poll_decision` drives in real usage: keep checking
+        // until the real exit status becomes observable.
+        let mut observed = None;
+        let poll_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < poll_deadline {
+            if let Some(status) = session
+                .try_wait()
+                .expect("try_wait should not error while polling")
+            {
+                observed = Some(status);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let status =
+            observed.expect("the process should eventually be reaped with a real exit status");
+        assert!(!status.success());
+        assert_eq!(status.exit_code(), 7);
+    }
+}
+
+#[cfg(test)]
+mod keystroke_tests {
+    use super::*;
+    use gpui::Modifiers;
+
+    fn keystroke(key: &str, modifiers: Modifiers) -> Keystroke {
+        Keystroke {
+            key: key.to_string(),
+            key_char: Some(key.to_string()),
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn platform_modified_keystrokes_are_never_forwarded_as_literal_pty_input() {
+        // Regression test for the ⌘N-swallowed-by-a-focused-terminal bug: before the fix,
+        // this fell through to the `key_char` branch and returned `Some(b"n")`, which
+        // `handle_key_down` then wrote to the pty *and* called `stop_propagation()` on -
+        // silently eating the app-level ⌘N shortcut and typing a stray "n" into the agent.
+        let modifiers = Modifiers {
+            platform: true,
+            ..Default::default()
+        };
+        let ks = keystroke("n", modifiers);
+
+        assert_eq!(
+            keystroke_to_bytes(&ks),
+            None,
+            "a platform-modified keystroke must never be forwarded as pty input"
+        );
+    }
+
+    #[test]
+    fn an_unmodified_letter_is_still_forwarded_normally() {
+        let ks = keystroke("n", Modifiers::default());
+        assert_eq!(keystroke_to_bytes(&ks), Some(b"n".to_vec()));
     }
 }
