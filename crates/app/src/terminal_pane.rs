@@ -1,5 +1,13 @@
-//! The center pane: a real shell spawned via `pty-core`, streamed into a
-//! [`crate::ansi::TerminalBuffer`] and rendered as scrolling monospace text.
+//! A single terminal-backed pane: a real process (a plain shell, or - since step 4 - an
+//! agent CLI like `claude`) spawned via `pty-core`, streamed into a real
+//! `alacritty_terminal`-backed [`crate::terminal_grid::TerminalGrid`] and rendered as a
+//! genuine cursor-addressed terminal grid (not a scrolling plain-text log - see
+//! `crate::terminal_grid`'s module docs for why that distinction matters for agent CLIs).
+//! What exactly gets spawned is described by [`TerminalSpec`] - `TerminalPane` itself has
+//! no notion of "shell" vs. "agent CLI"; it just spawns whatever program/args/cwd it's
+//! given. The session/tab bookkeeping that decides *which* `TerminalSpec` to use for a "New
+//! Shell" vs. "New Claude Session" button, and that owns more than one `TerminalPane` at
+//! once as tabs, lives in `crate::sessions`/`crate::root`, one layer up.
 //!
 //! ## Offloading blocking work off the GPUI foreground thread
 //!
@@ -28,20 +36,21 @@
 //! Enter/Backspace/Tab/Escape/arrows, and `Ctrl`+letter control codes), written via
 //! [`pty_core::PtySession::write_input`]. This is a deliberately small subset of
 //! `vendor/zed/crates/terminal/src/mappings/keys.rs`'s `to_esc_str` (which itself needs
-//! `alacritty_terminal`'s terminal-mode state this crate doesn't have - see `crate::ansi`'s
-//! scope decision) - enough to type commands and send `Ctrl-C`, not a full VT100 keymap.
+//! more `alacritty_terminal` terminal-mode state than this pane threads through for input
+//! encoding - e.g. application cursor-key mode) - enough to type commands, use arrow keys,
+//! and send `Ctrl-C`, not a full VT100 keymap.
 
 use std::path::PathBuf;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
 use gpui::{
-    div, font, prelude::*, rgb, ClickEvent, Context, FocusHandle, Focusable, KeyDownEvent,
-    Keystroke, ScrollHandle, Task, Window,
+    div, font, prelude::*, rgb, ClickEvent, Context, FocusHandle, Focusable, FontWeight,
+    KeyDownEvent, Keystroke, Task, Window,
 };
 use pty_core::{PtyError, PtySession, SpawnOptions};
 
-use crate::ansi::TerminalBuffer;
+use crate::terminal_grid::{GridCell, TerminalGrid, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND};
 
 /// How often the foreground poll task wakes up to drain any pty output that has arrived
 /// and, if there was any, re-render. 33ms is close to a 30fps redraw rate: fast enough that
@@ -49,14 +58,14 @@ use crate::ansi::TerminalBuffer;
 const POLL_INTERVAL: Duration = Duration::from_millis(33);
 
 /// Defensive cap on how many output chunks a single poll tick will drain and decode
-/// (ANSI-strip + append into `TerminalBuffer`) on the GPUI foreground thread. Without this,
-/// a firehose child (e.g. `yes`, or a very chatty build tool) could hand the poll loop the
-/// full contents of `pty-core`'s bounded output channel - up to `OUTPUT_CHANNEL_CAPACITY *
-/// READ_BUF_SIZE` (~1MB; see `pty-core`'s docs) - to decode in a single tick, on the same
-/// thread responsible for input handling and re-rendering. Capping chunks-per-tick spreads
-/// that cost across multiple ticks instead: whatever isn't drained this tick is still
-/// sitting in the channel (pty-core's reader thread just backpressures, per its own docs)
-/// and gets picked up automatically on the next tick.
+/// (fed into the real VT100 parser, see `crate::terminal_grid`) on the GPUI foreground
+/// thread. Without this, a firehose child (e.g. `yes`, or a very chatty build tool) could
+/// hand the poll loop the full contents of `pty-core`'s bounded output channel - up to
+/// `OUTPUT_CHANNEL_CAPACITY * READ_BUF_SIZE` (~1MB; see `pty-core`'s docs) - to decode in a
+/// single tick, on the same thread responsible for input handling and re-rendering. Capping
+/// chunks-per-tick spreads that cost across multiple ticks instead: whatever isn't drained
+/// this tick is still sitting in the channel (pty-core's reader thread just backpressures,
+/// per its own docs) and gets picked up automatically on the next tick.
 const MAX_CHUNKS_PER_TICK: usize = 64;
 
 /// Initial pty size used for the spawned shell, before the first real resize (see
@@ -66,81 +75,117 @@ const TERMINAL_COLS: u16 = 160;
 
 /// Approximate monospace cell metrics, in pixels, for the `text_xs()` font size this pane
 /// renders with. Used only to turn a pixel viewport into an approximate row/column count
-/// for `PtySession::resize` - not measured from the actual font/renderer (no verified GPUI
-/// API for querying a rendered glyph's real advance width was used for this step), so
-/// treat this as a reasonable estimate, not a pixel-accurate fit.
+/// for `PtySession::resize` and `TerminalGrid::resize` - not measured from the actual
+/// font/renderer (no verified GPUI API for querying a rendered glyph's real advance width
+/// was used for this step), so treat this as a reasonable estimate, not a pixel-accurate
+/// fit.
 const APPROX_CELL_WIDTH_PX: f32 = 7.0;
 const APPROX_CELL_HEIGHT_PX: f32 = 16.0;
 
-/// Only the most recent lines are rendered as elements each frame; the buffer itself can
-/// hold far more (see `crate::ansi::MAX_LINES`), but rendering thousands of `div`s per
-/// frame for scrollback that's off-screen anyway isn't worth doing in this step.
-const MAX_RENDERED_LINES: usize = 1000;
+/// What a [`TerminalPane`] should spawn: a program, its arguments, and the working
+/// directory to spawn it in. Generalizes step 3's "always spawn `$SHELL`" so the same pane
+/// implementation can host a plain shell *or* an agent CLI (`claude`, `codex`, ...) - see
+/// the module docs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalSpec {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+}
+
+impl TerminalSpec {
+    /// The user's shell (`$SHELL`, falling back to `/bin/bash` if unset), no extra
+    /// arguments - this is exactly step 3's original default-shell behavior, just factored
+    /// out so it's one `TerminalSpec` variant among several instead of the only option.
+    pub fn shell(cwd: PathBuf) -> Self {
+        let program = std::env::var_os("SHELL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/bin/bash"));
+        Self {
+            program,
+            args: Vec::new(),
+            cwd,
+        }
+    }
+
+    /// An arbitrary command. `program` may be a bare name (e.g. `"claude"`, with no path
+    /// separator): `pty-core`'s `spawn` resolves it via `PATH` through
+    /// `portable_pty::CommandBuilder` the same way a shell would (verified against
+    /// `portable-pty-0.9.0`'s `cmdbuilder.rs`, and already exercised by `pty-core`'s own
+    /// `spawns_and_reads_short_process_output` test, which spawns bare `"echo"`), so this
+    /// doesn't need the caller to resolve an absolute path itself.
+    pub fn command(program: impl Into<PathBuf>, args: Vec<String>, cwd: PathBuf) -> Self {
+        Self {
+            program: program.into(),
+            args,
+            cwd,
+        }
+    }
+}
 
 pub struct TerminalPane {
-    cwd: PathBuf,
-    buffer: TerminalBuffer,
+    spec: TerminalSpec,
+    grid: TerminalGrid,
     session: Option<PtySession>,
     spawn_error: Option<String>,
-    scroll_handle: ScrollHandle,
     focus_handle: FocusHandle,
-    /// The `(rows, cols)` last sent to `PtySession::resize`, so `maybe_resize_pty` only
-    /// issues a real resize call when the computed size actually changes instead of on
-    /// every render.
+    /// The `(rows, cols)` last sent to `PtySession::resize`/`TerminalGrid::resize`, so
+    /// `maybe_resize_pty` only issues a real resize call when the computed size actually
+    /// changes instead of on every render.
     last_size: Option<(u16, u16)>,
-    /// Owns the in-flight "spawn the shell, then poll its output" task. Replacing this
-    /// (see `respawn`) drops/cancels whatever the previous task was doing, which is what
-    /// stops an old worktree's poll loop from racing the new one over the same struct
-    /// fields after a worktree switch.
+    /// Owns the in-flight "spawn the process, then poll its output" task. Dropping/replacing
+    /// this cancels whatever the previous task was doing, which is what stops an old
+    /// session's poll loop from racing a new one over the same struct fields.
     _task: Option<Task<()>>,
 }
 
 impl TerminalPane {
-    pub fn new(cwd: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub fn new(spec: TerminalSpec, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
-            cwd,
-            buffer: TerminalBuffer::new(),
+            spec,
+            grid: TerminalGrid::new(TERMINAL_ROWS, TERMINAL_COLS),
             session: None,
             spawn_error: None,
-            scroll_handle: ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             last_size: None,
             _task: None,
         };
-        this.spawn_shell(cx);
+        this.spawn_process(cx);
         this
     }
 
-    /// Tears down the current shell (a fast, non-blocking `Drop` per `pty-core`'s docs -
-    /// safe to do directly on the foreground thread) and starts a new one in `cwd`.
-    pub fn respawn(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
-        self.cwd = cwd;
+    /// Deterministically tears down the current child process, if any, via the real
+    /// `PtySession::shutdown` (blocks until the process tree is confirmed dead and reaped;
+    /// see `pty-core`'s "Kill: `Drop` vs. `shutdown()`" docs) - run on the background
+    /// executor so this doesn't block the GPUI foreground thread. Intended for closing a
+    /// tab: called before the owning `Entity<TerminalPane>` is dropped, so process teardown
+    /// is a completed, verified fact rather than left to `Drop`'s fire-and-forget
+    /// signal-then-detach behavior (which is still correct and non-leaking on its own, per
+    /// `pty-core`'s docs, just not deterministic about *when* the process is fully reaped).
+    pub fn shutdown(&mut self, cx: &mut Context<Self>) {
         self._task = None;
-        self.session = None;
-        self.buffer = TerminalBuffer::new();
-        self.spawn_error = None;
-        // Force `maybe_resize_pty` to issue a real resize against the *new* session on the
-        // next render, even if the computed size happens to match the old session's last
-        // known size - the new `PtySession` starts at `TERMINAL_ROWS`/`TERMINAL_COLS`
-        // regardless of what the old one had been resized to.
-        self.last_size = None;
-        self.spawn_shell(cx);
-        cx.notify();
+        if let Some(mut session) = self.session.take() {
+            cx.background_executor()
+                .spawn(async move {
+                    if let Err(err) = session.shutdown() {
+                        log::warn!("failed to shut down terminal session: {err}");
+                    }
+                })
+                .detach();
+        }
     }
 
-    fn spawn_shell(&mut self, cx: &mut Context<Self>) {
-        let cwd = self.cwd.clone();
+    fn spawn_process(&mut self, cx: &mut Context<Self>) {
+        let spec = self.spec.clone();
+        let program_for_error = spec.program.clone();
         let task = cx.spawn(async move |this, cx| {
-            let shell = std::env::var_os("SHELL")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/bin/bash"));
-
             let spawn_result: Result<PtySession, PtyError> = cx
                 .background_executor()
                 .spawn(async move {
                     pty_core::spawn(
-                        SpawnOptions::new(shell)
-                            .cwd(cwd)
+                        SpawnOptions::new(spec.program)
+                            .args(spec.args)
+                            .cwd(spec.cwd)
                             .size(TERMINAL_ROWS, TERMINAL_COLS),
                     )
                 })
@@ -149,7 +194,7 @@ impl TerminalPane {
             let session = match spawn_result {
                 Ok(session) => session,
                 Err(err) => {
-                    let message = err.to_string();
+                    let message = format!("failed to start {}: {err}", program_for_error.display());
                     let _ = this.update(cx, |this, cx| {
                         this.spawn_error = Some(message);
                         cx.notify();
@@ -165,7 +210,7 @@ impl TerminalPane {
                 })
                 .is_err()
             {
-                return; // the pane was dropped before the shell finished starting
+                return; // the pane was dropped before the process finished starting
             }
 
             loop {
@@ -183,7 +228,7 @@ impl TerminalPane {
                         for _ in 0..MAX_CHUNKS_PER_TICK {
                             match session.output().try_recv() {
                                 Ok(chunk) => {
-                                    this.buffer.append_bytes(&chunk);
+                                    this.grid.append_bytes(&chunk);
                                     appended = true;
                                 }
                                 Err(TryRecvError::Empty) => break,
@@ -197,16 +242,11 @@ impl TerminalPane {
 
                     if process_ended {
                         this.session = None;
-                        this.buffer.mark_ended();
+                        this.grid.mark_ended();
                         appended = true;
                     }
 
                     if appended {
-                        // Pin to the bottom exactly when new output actually arrived, not
-                        // on every render pass (which would re-run this against whatever
-                        // scroll position the user had just set by scrolling up to read
-                        // back through history - see the `Render` impl below).
-                        this.scroll_handle.scroll_to_bottom();
                         cx.notify();
                     }
 
@@ -251,9 +291,11 @@ impl TerminalPane {
 
     /// Recomputes an approximate `(rows, cols)` from the window's viewport (see
     /// `APPROX_CELL_WIDTH_PX`/`APPROX_CELL_HEIGHT_PX`'s docs for the caveat that this is
-    /// the whole window, not this pane's own element bounds) and issues a real
-    /// `PtySession::resize` when it changed. Called from `render` so it naturally re-runs
-    /// whenever the window is resized.
+    /// the whole window, not this pane's own element bounds) and issues real
+    /// `PtySession::resize`/`TerminalGrid::resize` calls when it changed - both must move
+    /// together (see `TerminalGrid::resize`'s docs) or the rendered grid's geometry would
+    /// silently diverge from what the child process believes its terminal size is. Called
+    /// from `render` so it naturally re-runs whenever the window is resized.
     fn maybe_resize_pty(&mut self, window: &Window) {
         let viewport = window.viewport_size();
         let cols = ((viewport.width.as_f32() / APPROX_CELL_WIDTH_PX) as u16).max(20);
@@ -264,6 +306,7 @@ impl TerminalPane {
         }
         self.last_size = Some((rows, cols));
 
+        self.grid.resize(rows, cols);
         if let Some(session) = &self.session {
             if let Err(err) = session.resize(rows, cols) {
                 log::warn!("failed to resize pty session: {err}");
@@ -314,6 +357,63 @@ fn keystroke_to_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
     }
 }
 
+/// Packs an `(r, g, b)` triple into the `0xRRGGBB` form `gpui::rgb` expects.
+fn pack_rgb((r, g, b): (u8, u8, u8)) -> u32 {
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+/// Whether two cells share every attribute a rendered run cares about (everything but the
+/// character itself) - used to group a grid row into as few styled spans as possible.
+fn same_run_style(a: &GridCell, b: &GridCell) -> bool {
+    a.fg == b.fg
+        && a.bg == b.bg
+        && a.bold == b.bold
+        && a.italic == b.italic
+        && a.underline == b.underline
+        && a.strikethrough == b.strikethrough
+}
+
+/// Renders one grid row as a horizontal run of styled spans - grouping consecutive cells
+/// that share the same style into a single span keeps the element count low (a typical row
+/// is mostly-uniform default-styled text, so this is usually 1-3 spans, not one element per
+/// character) even though the underlying grid can be up to `TERMINAL_ROWS` x
+/// `TERMINAL_COLS` cells.
+fn render_row(row: &[GridCell]) -> impl IntoElement {
+    let mut line = div().flex().flex_row();
+
+    let mut start = 0;
+    while start < row.len() {
+        let style = &row[start];
+        let mut end = start + 1;
+        while end < row.len() && same_run_style(&row[end], style) {
+            end += 1;
+        }
+
+        let text: String = row[start..end].iter().map(|cell| cell.c).collect();
+        let mut span = div().text_color(rgb(pack_rgb(style.fg)));
+        if style.bg != DEFAULT_BACKGROUND {
+            span = span.bg(rgb(pack_rgb(style.bg)));
+        }
+        if style.bold {
+            span = span.font_weight(FontWeight::BOLD);
+        }
+        if style.italic {
+            span = span.italic();
+        }
+        if style.underline {
+            span = span.underline();
+        }
+        if style.strikethrough {
+            span = span.line_through();
+        }
+        line = line.child(span.child(text));
+
+        start = end;
+    }
+
+    line
+}
+
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_resize_pty(window);
@@ -321,7 +421,6 @@ impl Render for TerminalPane {
         let mut pane = div()
             .id("terminal-pane")
             .track_focus(&self.focus_handle)
-            .track_scroll(&self.scroll_handle)
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                 window.focus(&this.focus_handle, cx);
@@ -329,42 +428,29 @@ impl Render for TerminalPane {
             .flex()
             .flex_col()
             .size_full()
-            .overflow_y_scroll()
-            .bg(rgb(0x1e1e1e))
+            .overflow_hidden()
+            .bg(rgb(pack_rgb(DEFAULT_BACKGROUND)))
             .p_2()
             .font(font("monospace"))
             .text_xs()
-            .text_color(rgb(0xd4d4d4));
-
-        pane = pane.child(
-            div()
-                .text_xs()
-                .text_color(rgb(0x7a7a7a))
-                .child(format!("$ {}", self.cwd.display())),
-        );
+            .text_color(rgb(pack_rgb(DEFAULT_FOREGROUND)));
 
         if let Some(error) = &self.spawn_error {
             pane = pane.child(
                 div()
                     .text_color(rgb(0xff6b6b))
-                    .child(format!("failed to start shell: {error}")),
+                    .child(format!("failed to start process: {error}")),
             );
         }
 
-        let lines: Vec<&str> = self.buffer.lines().collect();
-        let start = lines.len().saturating_sub(MAX_RENDERED_LINES);
-        for line in &lines[start..] {
-            pane = pane.child(div().child(line.to_string()));
+        for row in self.grid.visible_rows() {
+            pane = pane.child(render_row(&row));
         }
 
-        if self.buffer.ended {
+        if self.grid.ended {
             pane = pane.child(div().text_color(rgb(0xffcc66)).child("[process exited]"));
         }
 
-        // Note: pinning scroll to the bottom happens in the poll loop above, exactly when
-        // new output actually arrived - not unconditionally here on every render (which
-        // used to fight the user scrolling up to read back through history; see the poll
-        // loop's comment).
         pane
     }
 }

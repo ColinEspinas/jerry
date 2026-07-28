@@ -1,15 +1,17 @@
 //! `app`: the ADE desktop application shell.
 //!
 //! A three-pane GPUI window: a left sidebar listing the target repository's real git
-//! worktrees (via `wt-core`), a center pane running a real shell for the selected worktree
-//! (via `pty-core`), and a right sidebar showing that worktree's real file tree (via
-//! `std::fs::read_dir`). See `crate::root`, `crate::terminal_pane`, and `crate::ansi` for
-//! the interesting design decisions (entity/state model, blocking-call offloading, terminal
-//! rendering fidelity trade-off).
+//! worktrees (via `wt-core`) with session/tab controls for spawning agent CLIs or shells
+//! into them, a tabbed center pane of real terminal sessions (via `pty-core` +
+//! `alacritty_terminal`), and a right sidebar showing the active worktree's real file tree
+//! (via `std::fs::read_dir`). See `crate::root`, `crate::sessions`, `crate::terminal_pane`,
+//! and `crate::terminal_grid` for the interesting design decisions (entity/state model,
+//! blocking-call offloading, terminal grid rendering).
 
-pub mod ansi;
 pub mod file_tree;
 pub mod root;
+pub mod sessions;
+pub mod terminal_grid;
 pub mod terminal_pane;
 pub mod worktrees;
 

@@ -1,5 +1,5 @@
-//! The top-level three-pane window: a left worktree sidebar, a center terminal pane, and a
-//! right file tree, composed as GPUI entities.
+//! The top-level three-pane window: a left worktree sidebar, a tabbed center pane of real
+//! terminal sessions, and a right file tree, composed as GPUI entities.
 //!
 //! ## Offloading `wt-core`'s blocking calls
 //!
@@ -11,13 +11,30 @@
 //! thread, once the background task's `Task` resolves. The same pattern is used for
 //! `crate::file_tree::build_file_tree`, which does its own (smaller, but still real)
 //! blocking `std::fs::read_dir` walk.
+//!
+//! ## Sessions/tabs, and what selecting a worktree does (and doesn't) do
+//!
+//! Step 3 had exactly one always-live terminal, respawned in place whenever the selected
+//! worktree changed. Step 4 replaces that with [`crate::sessions::Sessions`]: any number of
+//! independent, simultaneously-running terminal sessions (a plain shell, or a real agent CLI
+//! like `claude`), each pinned to the worktree it was started in, shown as tabs in the
+//! center pane.
+//!
+//! A deliberate behavior change from step 3 falls out of that: **selecting a worktree in
+//! the sidebar no longer respawns anything.** It only updates [`AdeApp::selected`] (which
+//! drives the file tree on the right, and which worktree `active_session_cwd` resolves to
+//! for the *next* "New Shell"/"New Claude Session" click). Keeping step 3's
+//! respawn-on-select behavior here would mean clicking a worktree in the sidebar - just to
+//! browse its files - could silently kill a live agent session running in whatever tab
+//! happened to be active. Spawning a new session is now its own explicit action (the
+//! toolbar buttons), never an implicit side effect of browsing.
 
 use std::path::PathBuf;
 
-use gpui::{div, prelude::*, rgb, ClickEvent, Context, Entity, Task, Window};
+use gpui::{div, prelude::*, rgb, ClickEvent, Context, Task, Window};
 
 use crate::file_tree::{self, FileTreeEntry};
-use crate::terminal_pane::TerminalPane;
+use crate::sessions::{SessionKind, Sessions};
 use crate::worktrees::{self, WorktreeItem};
 
 const SIDEBAR_WIDTH: gpui::Pixels = gpui::px(240.0);
@@ -30,7 +47,7 @@ pub struct AdeApp {
     worktrees: Vec<WorktreeItem>,
     worktrees_error: Option<String>,
     selected: Option<usize>,
-    terminal: Entity<TerminalPane>,
+    sessions: Sessions,
     file_tree: Vec<FileTreeEntry>,
     file_tree_root: PathBuf,
     file_tree_error: Option<String>,
@@ -40,20 +57,24 @@ pub struct AdeApp {
 
 impl AdeApp {
     pub fn new(repo_path: PathBuf, cx: &mut Context<Self>) -> Self {
-        let terminal = cx.new(|cx| TerminalPane::new(repo_path.clone(), cx));
-
         let mut this = Self {
             file_tree_root: repo_path.clone(),
             repo_path: repo_path.clone(),
             worktrees: Vec::new(),
             worktrees_error: None,
             selected: None,
-            terminal,
+            sessions: Sessions::new(),
             file_tree: Vec::new(),
             file_tree_error: None,
             _load_worktrees_task: None,
             _load_file_tree_task: None,
         };
+        // A fresh window shouldn't open with zero tabs and no way to see anything running -
+        // start with one real shell in the repo root, exactly like step 3's single terminal
+        // did, except now it's a tab like any other rather than the only pane that can
+        // exist.
+        this.sessions
+            .spawn(SessionKind::Shell, repo_path.clone(), cx);
         this.load_worktrees(cx);
         this.load_file_tree(repo_path, cx);
         this
@@ -110,6 +131,17 @@ impl AdeApp {
         self._load_file_tree_task = Some(task);
     }
 
+    /// The worktree a *new* session should be spawned into: the selected worktree's real
+    /// path if one is selected and readable, otherwise the repo root - see the module docs'
+    /// "Sessions/tabs" section for why this is resolved at spawn time rather than tracked as
+    /// a per-tab "current worktree".
+    fn active_session_cwd(&self) -> PathBuf {
+        match self.selected.and_then(|index| self.worktrees.get(index)) {
+            Some(item) if item.error.is_none() => item.path.clone(),
+            _ => self.repo_path.clone(),
+        }
+    }
+
     fn select_worktree(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(item) = self.worktrees.get(index) else {
             return;
@@ -120,9 +152,13 @@ impl AdeApp {
         }
         let path = item.path.clone();
         self.selected = Some(index);
-        self.terminal
-            .update(cx, |terminal, cx| terminal.respawn(path.clone(), cx));
         self.load_file_tree(path, cx);
+        cx.notify();
+    }
+
+    fn new_session(&mut self, kind: SessionKind, cx: &mut Context<Self>) {
+        let cwd = self.active_session_cwd();
+        self.sessions.spawn(kind, cwd, cx);
         cx.notify();
     }
 
@@ -192,6 +228,143 @@ impl AdeApp {
         }
 
         list.into_any_element()
+    }
+
+    /// The toolbar above the tab bar: "New Shell" / "New Claude Session" buttons that spawn
+    /// a real session into `active_session_cwd()`, plus a reminder of which worktree that
+    /// currently resolves to.
+    fn render_session_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let cwd = self.active_session_cwd();
+
+        let new_session_button = |label: &'static str, kind: SessionKind| {
+            div()
+                .id(format!("new-session-{}", kind.label()))
+                .cursor_pointer()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .text_xs()
+                .bg(rgb(0x2a2a2a))
+                .hover(|el| el.bg(rgb(0x3a3a3a)))
+                .text_color(rgb(0xe0e0e0))
+                .child(label)
+                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    this.new_session(kind, cx);
+                }))
+        };
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(rgb(0x2a2a2a))
+            .child(new_session_button("+ New Shell", SessionKind::Shell))
+            .child(new_session_button(
+                "+ New Claude Session",
+                SessionKind::Claude,
+            ))
+            .child(new_session_button(
+                "+ New Codex Session",
+                SessionKind::Codex,
+            ))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x6a6a6a))
+                    .child(format!("new sessions spawn in: {}", cwd.display())),
+            )
+    }
+
+    /// The tab strip: one entry per open session, click to activate, click the "x" to close
+    /// (tearing down its real process - see `Sessions::close`'s docs).
+    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_id = self.sessions.active_id();
+        let mut bar = div()
+            .flex()
+            .flex_row()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(rgb(0x2a2a2a));
+
+        for session in self.sessions.iter() {
+            let id = session.id;
+            let is_active = active_id == Some(id);
+            let title = match session.cwd.file_name() {
+                Some(name) => name.to_string_lossy().into_owned(),
+                None => session.cwd.display().to_string(),
+            };
+
+            let tab = div()
+                .id(("session-tab", id))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .text_xs()
+                .cursor_pointer()
+                .when(is_active, |tab| tab.bg(rgb(0x2f5f8f)))
+                .when(!is_active, |tab| tab.hover(|tab| tab.bg(rgb(0x2a2a2a))))
+                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    this.sessions.set_active(id);
+                    cx.notify();
+                }))
+                .child(div().text_color(rgb(0xe0e0e0)).child(format!(
+                    "{}: {}",
+                    session.kind.label(),
+                    title
+                )))
+                .child(
+                    div()
+                        .id(("close-session-tab", id))
+                        .px_1()
+                        .rounded_sm()
+                        .text_color(rgb(0x9a9a9a))
+                        .hover(|el| el.bg(rgb(0x4a2a2a)).text_color(rgb(0xff6b6b)))
+                        .child("x")
+                        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            this.sessions.close(id, cx);
+                            cx.notify();
+                        })),
+                );
+
+            bar = bar.child(tab);
+        }
+
+        bar
+    }
+
+    fn render_center_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let body: gpui::AnyElement = match self.sessions.active() {
+            Some(session) => session.pane.clone().into_any_element(),
+            None => div()
+                .flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .text_color(rgb(0x6a6a6a))
+                .child("no sessions open - start one with the buttons above")
+                .into_any_element(),
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .h_full()
+            .child(self.render_session_toolbar(cx))
+            .child(self.render_tab_bar(cx))
+            .child(div().flex().flex_col().flex_1().min_h_0().child(body))
     }
 
     fn render_file_tree(&self) -> impl IntoElement {
@@ -292,14 +465,7 @@ impl Render for AdeApp {
                     .border_color(rgb(0x2a2a2a))
                     .child(self.render_worktree_sidebar(cx)),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .h_full()
-                    .child(self.terminal.clone()),
-            )
+            .child(self.render_center_pane(cx))
             .child(
                 div()
                     .id("file-tree-sidebar")
