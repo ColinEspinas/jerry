@@ -45,8 +45,8 @@ use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
 use gpui::{
-    div, font, prelude::*, rgb, ClickEvent, Context, FocusHandle, Focusable, FontWeight,
-    KeyDownEvent, Keystroke, Task, Window,
+    canvas, div, font, prelude::*, rgb, Bounds, ClickEvent, Context, FocusHandle, Focusable,
+    FontWeight, KeyDownEvent, Keystroke, Pixels, Size, Task, Window,
 };
 use pty_core::{PtyError, PtySession, SpawnOptions};
 
@@ -129,10 +129,14 @@ pub struct TerminalPane {
     session: Option<PtySession>,
     spawn_error: Option<String>,
     focus_handle: FocusHandle,
-    /// The `(rows, cols)` last sent to `PtySession::resize`/`TerminalGrid::resize`, so
-    /// `maybe_resize_pty` only issues a real resize call when the computed size actually
-    /// changes instead of on every render.
-    last_size: Option<(u16, u16)>,
+    /// This pane's own real, rendered content-area bounds - captured every frame via a
+    /// measuring `canvas()` child in `render` (see that method's docs for why this exists
+    /// instead of `window.viewport_size()`). `None` only before the very first paint.
+    content_bounds: Option<Bounds<Pixels>>,
+    /// Tracks which `(rows, cols)` the grid and the real child pty are each actually in
+    /// sync with - see [`ResizeLatch`]'s docs for the real bug this decomposition exists
+    /// to prevent.
+    resize_latch: ResizeLatch,
     /// Owns the in-flight "spawn the process, then poll its output" task. Dropping/replacing
     /// this cancels whatever the previous task was doing, which is what stops an old
     /// session's poll loop from racing a new one over the same struct fields.
@@ -147,7 +151,8 @@ impl TerminalPane {
             session: None,
             spawn_error: None,
             focus_handle: cx.focus_handle(),
-            last_size: None,
+            content_bounds: None,
+            resize_latch: ResizeLatch::default(),
             _task: None,
         };
         this.spawn_process(cx);
@@ -206,6 +211,15 @@ impl TerminalPane {
             if this
                 .update(cx, |this, cx| {
                     this.session = Some(session);
+                    // The pane may already have rendered (and computed a target grid size)
+                    // before this task's background spawn finished - see `ResizeLatch`'s
+                    // docs for why that earlier call could not have reached the pty (there
+                    // was no live session yet) and why it's retried here now that one
+                    // exists, rather than waiting for the next window/pane resize to ever
+                    // reach the real child pty.
+                    if let Some(target) = this.resize_latch.grid {
+                        this.resize_to(target.0, target.1);
+                    }
                     cx.notify();
                 })
                 .is_err()
@@ -289,29 +303,148 @@ impl TerminalPane {
         cx.stop_propagation();
     }
 
-    /// Recomputes an approximate `(rows, cols)` from the window's viewport (see
-    /// `APPROX_CELL_WIDTH_PX`/`APPROX_CELL_HEIGHT_PX`'s docs for the caveat that this is
-    /// the whole window, not this pane's own element bounds) and issues real
-    /// `PtySession::resize`/`TerminalGrid::resize` calls when it changed - both must move
-    /// together (see `TerminalGrid::resize`'s docs) or the rendered grid's geometry would
-    /// silently diverge from what the child process believes its terminal size is. Called
-    /// from `render` so it naturally re-runs whenever the window is resized.
+    /// Recomputes an approximate `(rows, cols)` from this pane's own real content-area
+    /// bounds (see [`Self::content_bounds`]'s docs) and applies it via [`Self::resize_to`].
+    /// Called from `render` so it naturally re-runs whenever the pane's own size changes -
+    /// not just whenever the *window's* size changes, since Phase A's three-zone shell
+    /// means those are no longer the same thing (see [`size_to_grid`]'s docs for the real
+    /// bug this distinction fixes).
+    ///
+    /// [`Self::content_bounds`] reflects the *previous* frame's measured bounds (the
+    /// measuring `canvas()` in `render` only fires during paint, which happens after
+    /// `render` itself returns) - one frame stale on the very first resize, which
+    /// self-corrects on the next render and is a normal, accepted trade-off for GPUI's
+    /// real bounds-measurement idiom (verified against `vendor/zed/crates/workspace/
+    /// src/workspace.rs`'s own `this.bounds = bounds` canvas pattern, which has the same
+    /// one-frame lag). Before any paint has happened at all, falls back to
+    /// `window.viewport_size()` - a real, if too-wide, guess that's still strictly better
+    /// than not resizing at all, and gets corrected by the first real measurement.
     fn maybe_resize_pty(&mut self, window: &Window) {
-        let viewport = window.viewport_size();
-        let cols = ((viewport.width.as_f32() / APPROX_CELL_WIDTH_PX) as u16).max(20);
-        let rows = ((viewport.height.as_f32() / APPROX_CELL_HEIGHT_PX) as u16).max(10);
+        let size = self
+            .content_bounds
+            .map(|bounds| bounds.size)
+            .unwrap_or_else(|| window.viewport_size());
+        let (rows, cols) = size_to_grid(size);
+        self.resize_to(rows, cols);
+    }
 
-        if self.last_size == Some((rows, cols)) {
-            return;
+    /// Applies a target `(rows, cols)` to the grid and, if a live session exists, the real
+    /// child pty - delegating the "what actually needs to happen" decision to
+    /// [`ResizeLatch::apply`] (see its docs for the bug this split exists to prevent), and
+    /// only calling [`ResizeLatch::session_resize_succeeded`] once `PtySession::resize` has
+    /// actually returned `Ok`, so a failed resize is retried next time instead of being
+    /// permanently (and incorrectly) treated as done.
+    fn resize_to(&mut self, rows: u16, cols: u16) {
+        let actions = self
+            .resize_latch
+            .apply((rows, cols), self.session.is_some());
+
+        if actions.resize_grid {
+            self.grid.resize(rows, cols);
         }
-        self.last_size = Some((rows, cols));
 
-        self.grid.resize(rows, cols);
-        if let Some(session) = &self.session {
-            if let Err(err) = session.resize(rows, cols) {
-                log::warn!("failed to resize pty session: {err}");
+        if actions.resize_session {
+            let Some(session) = &self.session else {
+                return;
+            };
+            match session.resize(rows, cols) {
+                Ok(()) => self.resize_latch.session_resize_succeeded((rows, cols)),
+                Err(err) => log::warn!("failed to resize pty session: {err}"),
             }
         }
+    }
+}
+
+/// Converts a pixel-space size into an approximate `(rows, cols)` terminal grid size using
+/// [`APPROX_CELL_WIDTH_PX`]/[`APPROX_CELL_HEIGHT_PX`] - not measured from the actual
+/// font/renderer (no verified GPUI API for querying a rendered glyph's real advance width
+/// was used for this step), so treat this as a reasonable estimate, not a pixel-accurate
+/// fit. Deliberately a pure function of a [`Size<Pixels>`], independent of `Window` or this
+/// pane's own state, so it's directly unit-testable (see the tests below) rather than only
+/// exercisable through a real GPUI window.
+///
+/// This function itself isn't what the real bug was - it faithfully turns whatever size
+/// it's given into a column/row count. The bug (see `TerminalPane::maybe_resize_pty`'s
+/// history) was in *what size* it used to be called with: the *whole window's*
+/// `viewport_size()`, unconditionally. Phase A's three-zone shell added a 276px rail, a
+/// 320px panel, and ~64px of title/status-bar chrome around the centre pane, none of which
+/// this pane's own content occupies - at a 1440px-wide window that computed roughly 205
+/// columns even though the real visible terminal pane is only around 820-840px wide
+/// (roughly 118-120 columns at [`APPROX_CELL_WIDTH_PX`]). The practical effect: every
+/// terminal row rendered assuming ~205 columns were visible when only ~118 actually were,
+/// so any full-width line silently rendered ~42% off the right edge of the pane - not
+/// clipped-and-correct, just invisible. Fixed by calling this with this pane's own real,
+/// measured content-area size (`TerminalPane::content_bounds`) instead of the window's.
+fn size_to_grid(size: Size<Pixels>) -> (u16, u16) {
+    let cols = ((size.width.as_f32() / APPROX_CELL_WIDTH_PX) as u16).max(20);
+    let rows = ((size.height.as_f32() / APPROX_CELL_HEIGHT_PX) as u16).max(10);
+    (rows, cols)
+}
+
+/// What [`ResizeLatch::apply`] says the caller should actually do for a target size.
+#[derive(Debug, PartialEq, Eq)]
+struct ResizeActions {
+    resize_grid: bool,
+    resize_session: bool,
+}
+
+/// Tracks, separately, which `(rows, cols)` [`TerminalGrid`] currently reflects and which
+/// `(rows, cols)` was last successfully sent to a *live* `PtySession::resize`.
+///
+/// This split exists because of a real, empirically-confirmed bug: a single latched "last
+/// size" field, set unconditionally on every call (including before any `PtySession`
+/// existed - `TerminalPane::new` returns with `session: None`, since spawning happens
+/// asynchronously on the background executor), meant the very first render latched a
+/// target size while there was no session to resize yet, and every later call with that
+/// same computed size then short-circuited on "already up to date" - permanently, even
+/// once a real session appeared. The real child pty stayed stuck at
+/// `TERMINAL_ROWS`/`TERMINAL_COLS` (its spawn-time size) forever, silently diverging from
+/// what `TerminalGrid` (and the rendered UI) believed the size was - confirmed empirically
+/// via `stty -F <pty> size` against a live session's actual pty. Any full-screen,
+/// cursor-addressed program (`vim`, `less`, an agent CLI's own interactive UI) would then
+/// paint for the wrong dimensions.
+///
+/// [`Self::grid`] is latched unconditionally (resizing `TerminalGrid` has no failure mode
+/// and no live-session precondition), but [`Self::session`] is latched *only* by
+/// [`Self::session_resize_succeeded`] - called by `TerminalPane::resize_to` only after a
+/// real `PtySession::resize` call has actually returned `Ok`. A target size computed
+/// before a session exists therefore never gets latched as "session in sync", so
+/// `TerminalPane::spawn_process`'s success callback re-running `resize_to` at that same
+/// cached target size (see its own doc comment) genuinely reaches the pty instead of being
+/// skipped.
+#[derive(Debug, Default)]
+struct ResizeLatch {
+    /// The `(rows, cols)` `TerminalGrid` currently reflects.
+    grid: Option<(u16, u16)>,
+    /// The `(rows, cols)` last successfully sent to a *live* session's real pty resize -
+    /// `None` until a session exists and a resize has actually reached it.
+    session: Option<(u16, u16)>,
+}
+
+impl ResizeLatch {
+    /// Decides what `(rows, cols)` needs applying to the grid and/or a live session's real
+    /// pty, and latches [`Self::grid`] immediately (grid resizes can't fail). Does *not*
+    /// latch [`Self::session`] - only [`Self::session_resize_succeeded`] does that, once
+    /// the caller has confirmed a real `PtySession::resize` call actually succeeded.
+    fn apply(&mut self, target: (u16, u16), has_session: bool) -> ResizeActions {
+        let resize_grid = self.grid != Some(target);
+        if resize_grid {
+            self.grid = Some(target);
+        }
+
+        let resize_session = has_session && self.session != Some(target);
+
+        ResizeActions {
+            resize_grid,
+            resize_session,
+        }
+    }
+
+    /// Records that `target` has actually reached a live session's real pty via a
+    /// successful `PtySession::resize` call - only after this has it been called does
+    /// [`Self::apply`] treat `target` as already in sync for the session side.
+    fn session_resize_succeeded(&mut self, target: (u16, u16)) {
+        self.session = Some(target);
     }
 }
 
@@ -418,6 +551,29 @@ impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_resize_pty(window);
 
+        // Measures this pane's own real, rendered content-area bounds every frame, so
+        // `Self::maybe_resize_pty` can size the terminal grid from the pane's actual
+        // width/height instead of the whole window's - see that method's docs and
+        // `size_to_grid`'s docs for the real bug this fixes. `.absolute().size_full()`
+        // inside a `.relative()` parent, updating `self.content_bounds` from the real
+        // `canvas()` prepaint callback via a strong `Entity<Self>` handle, is the same real
+        // idiom `vendor/zed/crates/workspace/src/workspace.rs` uses for its own dock-sizing
+        // bounds (`let this = cx.entity(); canvas(move |bounds, _, cx| { this.update(cx, ..)
+        // }, ..).absolute().size_full()`), not an invented pattern.
+        let measure_bounds = {
+            let this = cx.entity();
+            canvas(
+                move |bounds, _window, cx| {
+                    this.update(cx, |this, _cx| {
+                        this.content_bounds = Some(bounds);
+                    });
+                },
+                |_bounds, _prepaint, _window, _cx| {},
+            )
+            .absolute()
+            .size_full()
+        };
+
         let mut pane = div()
             .id("terminal-pane")
             .track_focus(&self.focus_handle)
@@ -425,15 +581,21 @@ impl Render for TerminalPane {
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                 window.focus(&this.focus_handle, cx);
             }))
+            .relative()
             .flex()
             .flex_col()
             .size_full()
+            .min_w_0()
             .overflow_hidden()
             .bg(rgb(pack_rgb(DEFAULT_BACKGROUND)))
             .p_2()
-            .font(font("monospace"))
+            // The real bundled IBM Plex Mono (`crate::fonts`), not a generic "monospace"
+            // alias - the terminal is this app's most prominent monospace surface, so it's
+            // the clearest place to prove the bundled font is actually rendering.
+            .font(font(crate::theme::font::MONO))
             .text_xs()
-            .text_color(rgb(pack_rgb(DEFAULT_FOREGROUND)));
+            .text_color(rgb(pack_rgb(DEFAULT_FOREGROUND)))
+            .child(measure_bounds);
 
         if let Some(error) = &self.spawn_error {
             pane = pane.child(
@@ -452,5 +614,116 @@ impl Render for TerminalPane {
         }
 
         pane
+    }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::*;
+    use gpui::{px, size};
+
+    #[test]
+    fn size_to_grid_derives_columns_and_rows_from_the_given_size_not_a_fixed_constant() {
+        // A plausible centre-pane content width once Phase A's shell chrome (a 276px rail
+        // plus a 320px panel plus borders) is subtracted from a 1440px window - roughly
+        // 820px, not the full 1440.
+        let (rows, cols) = size_to_grid(size(px(820.0), px(800.0)));
+        assert_eq!(cols, (820.0 / APPROX_CELL_WIDTH_PX) as u16);
+        assert_eq!(rows, (800.0 / APPROX_CELL_HEIGHT_PX) as u16);
+    }
+
+    #[test]
+    fn size_to_grid_enforces_a_minimum_row_and_column_count() {
+        let (rows, cols) = size_to_grid(size(px(10.0), px(10.0)));
+        assert_eq!(cols, 20);
+        assert_eq!(rows, 10);
+    }
+
+    #[test]
+    fn size_to_grid_from_a_real_pane_width_is_plausible_not_the_full_window_derived_count() {
+        // Regression guard documenting the actual magnitude of the original bug: deriving
+        // columns from the *whole* 1440px window (ignoring the 276+320px of shell chrome
+        // either side) computed roughly 205 columns; the real, visible centre-pane width is
+        // roughly 820-840px, around 118-120 columns. Both numbers are "correct" outputs of
+        // `size_to_grid` for their respective inputs - the bug was `maybe_resize_pty`
+        // feeding it the wrong one. This test pins the two magnitudes apart so a future
+        // regression back to `window.viewport_size()` would be caught by inspection here.
+        let (_rows, whole_window_cols) = size_to_grid(size(px(1440.0), px(928.0)));
+        let (_rows, real_pane_cols) = size_to_grid(size(px(828.0), px(800.0)));
+        assert!(
+            whole_window_cols > real_pane_cols * 3 / 2,
+            "expected the whole-window column count ({whole_window_cols}) to be \
+             substantially larger than the real-pane-width column count ({real_pane_cols}) \
+             - if they're close, something about the approximation changed"
+        );
+        assert!(real_pane_cols < 130, "got {real_pane_cols}");
+    }
+
+    #[test]
+    fn first_apply_with_no_session_resizes_the_grid_but_not_a_session() {
+        let mut latch = ResizeLatch::default();
+        let actions = latch.apply((48, 160), false);
+        assert!(actions.resize_grid);
+        assert!(!actions.resize_session);
+    }
+
+    /// The exact regression this whole module exists to prevent: a target size computed
+    /// before any session exists must still trigger a real session resize once one
+    /// appears, not be silently treated as already in sync.
+    #[test]
+    fn a_size_computed_before_any_session_exists_is_retried_once_one_appears() {
+        let mut latch = ResizeLatch::default();
+        let target = (48, 160);
+
+        let first = latch.apply(target, false);
+        assert!(first.resize_grid);
+        assert!(!first.resize_session);
+
+        let second = latch.apply(target, true);
+        assert!(
+            second.resize_session,
+            "a session appearing at an already-computed size must still trigger a real \
+             session resize, not be treated as already in sync"
+        );
+    }
+
+    #[test]
+    fn does_not_repeat_a_successful_session_resize_for_the_same_target() {
+        let mut latch = ResizeLatch::default();
+        let target = (48, 160);
+        latch.apply(target, true);
+        latch.session_resize_succeeded(target);
+
+        let repeat = latch.apply(target, true);
+        assert!(
+            !repeat.resize_session,
+            "already in sync at this size; resizing again would be redundant"
+        );
+    }
+
+    #[test]
+    fn a_failed_session_resize_is_retried_since_it_was_never_latched_as_succeeded() {
+        let mut latch = ResizeLatch::default();
+        let target = (48, 160);
+        latch.apply(target, true);
+        // Simulate a failed `PtySession::resize` call: the caller deliberately does NOT
+        // call `session_resize_succeeded` in this path.
+
+        let retry = latch.apply(target, true);
+        assert!(
+            retry.resize_session,
+            "a failed resize must not be latched as done, or it would never be retried"
+        );
+    }
+
+    #[test]
+    fn a_new_target_size_resizes_both_grid_and_session_again() {
+        let mut latch = ResizeLatch::default();
+        latch.apply((48, 160), true);
+        latch.session_resize_succeeded((48, 160));
+
+        let actions = latch.apply((50, 170), true);
+        assert!(actions.resize_grid);
+        assert!(actions.resize_session);
     }
 }

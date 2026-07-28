@@ -31,14 +31,16 @@
 
 use std::path::PathBuf;
 
-use gpui::{div, font, prelude::*, rgb, ClickEvent, Context, Task, Window};
+use gpui::{
+    div, font, prelude::*, px, rgb, App, ClickEvent, Context, MouseButton, Task, Window,
+    WindowControlArea,
+};
 use wt_core::diff::{DiffBase, DiffFile, DiffLineKind, FileChangeStatus};
 
 use crate::file_tree::{self, FileTreeEntry};
 use crate::sessions::{SessionKind, Sessions};
+use crate::theme;
 use crate::worktrees::{self, WorktreeItem};
-
-const SIDEBAR_WIDTH: gpui::Pixels = gpui::px(240.0);
 
 /// See the comment at its use site in `render_file_tree` for why this exists.
 const MAX_RENDERED_FILE_ENTRIES: usize = 500;
@@ -86,6 +88,12 @@ pub struct AdeApp {
     right_sidebar_view: RightSidebarView,
     diff_root: PathBuf,
     diff_state: DiffLoadState,
+    /// Armed by a left mouse-down on the title bar's drag area, consumed (and cleared) by
+    /// the next mouse-move to call the real `Window::start_window_move` - see
+    /// `Self::render_title_bar`'s docs for why this two-step arm-then-move dance is needed
+    /// rather than starting the move directly on mouse-down (verified against the same
+    /// real pattern `vendor/zed/crates/platform_title_bar/src/platform_title_bar.rs` uses).
+    title_bar_move_armed: bool,
     _load_worktrees_task: Option<Task<()>>,
     _load_file_tree_task: Option<Task<()>>,
     _load_diff_task: Option<Task<()>>,
@@ -105,6 +113,7 @@ impl AdeApp {
             file_tree_error: None,
             right_sidebar_view: RightSidebarView::Files,
             diff_state: DiffLoadState::Loading,
+            title_bar_move_armed: false,
             _load_worktrees_task: None,
             _load_file_tree_task: None,
             _load_diff_task: None,
@@ -428,6 +437,45 @@ impl AdeApp {
         bar
     }
 
+    /// The centre "work surface" zone. `.min_w_0()` on this method's own root div (the flex
+    /// item actually sitting inside the outer three-zone `flex_row`) is the real fix for
+    /// the responsive-layout bug this step was asked to fix: see this method's own doc
+    /// comment continuation below for the root cause.
+    ///
+    /// ## Root cause of "typing in the terminal pushes the file tree off-screen"
+    ///
+    /// This is the classic flexbox "min-width: auto" trap, confirmed against GPUI's real
+    /// (Taffy-based) layout engine rather than assumed: a flex item's minimum width before
+    /// it's allowed to shrink below its flex-basis defaults to its *content's* intrinsic
+    /// (min-content) width, unless something overrides it. `crate::terminal_pane::render_row`
+    /// lays out each terminal row as `div().flex().flex_row()` of unwrapped text spans -
+    /// `crate::terminal_pane::maybe_resize_pty` sized the grid from the *whole window's*
+    /// viewport width (a separate bug, since fixed - see that function's own docs), so a
+    /// wide window meant wide rows, and wide unbroken text spans have a large intrinsic
+    /// width. Before this fix, this method's own root div - the flex item sitting directly
+    /// in the outer `flex_row` of [sidebar, centre, sidebar] in `Render for AdeApp` - had
+    /// neither `overflow_hidden()` nor `min_w_0()`, so *its own* automatic minimum width was
+    /// still derived from its content (bubbling all the way up from the terminal's widest
+    /// row), and it grew to fit that instead of being held to its `flex_1` share - pushing
+    /// the fixed-width right sidebar off the visible window.
+    ///
+    /// The fix is `.min_w_0()` on *this* div specifically (verified real,
+    /// `vendor/zed/crates/gpui_macros/src/styles.rs`'s generated box-style suffix, mirroring
+    /// CSS `min-width: 0`), confirmed against `vendor/zed/crates/workspace/src/status_bar.rs`'s
+    /// own real `.flex_1().min_w_0()` pattern for exactly this situation. Note this is
+    /// *not* about `overflow_hidden()` merely "clipping paint but not layout" - GPUI's own
+    /// `Overflow::Hidden` doc comment (`vendor/zed/crates/gpui/src/style.rs`) says plainly
+    /// that non-`Visible` overflow *does* zero a node's automatic minimum size for
+    /// flex/grid layout, the same effect `min_w_0()` has. The reason `overflow_hidden()`
+    /// alone didn't already fix this is narrower: that zeroing only applies to the node
+    /// it's set on. `TerminalPane::render`'s root div already had `overflow_hidden()` from
+    /// step 3 onward, so its own automatic minimum size was already zero - but that node
+    /// isn't the one sitting in the outer three-zone `flex_row`; this method's own root div
+    /// is, and *it* had `overflow: Visible` (the default) the whole time. `min_w_0()` here
+    /// is the fix; the `min_w_0()`/`overflow_hidden()` combination on the inner wrapper
+    /// below and on `TerminalPane`'s own root div are cheap, correct, defense-in-depth
+    /// (each additionally zeroes its own node's contribution), not load-bearing on their
+    /// own - this div is the one that actually mattered.
     fn render_center_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let body: gpui::AnyElement = match self.sessions.active() {
             Some(session) => session.pane.clone().into_any_element(),
@@ -443,13 +491,25 @@ impl AdeApp {
         };
 
         div()
+            .id("work-surface")
             .flex()
             .flex_col()
             .flex_1()
+            .min_w_0()
             .h_full()
+            .bg(theme::surface::CENTER)
             .child(self.render_session_toolbar(cx))
             .child(self.render_tab_bar(cx))
-            .child(div().flex().flex_col().flex_1().min_h_0().child(body))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(body),
+            )
     }
 
     fn render_file_tree(&self) -> gpui::AnyElement {
@@ -718,7 +778,7 @@ impl AdeApp {
             container = container.child(
                 div()
                     .text_xs()
-                    .font(font("monospace"))
+                    .font(font(theme::font::MONO))
                     .text_color(rgb(0x6ab0f3))
                     .pl_2()
                     .child(hunk.header.clone()),
@@ -737,7 +797,7 @@ impl AdeApp {
                 };
                 let mut line_el = div()
                     .text_xs()
-                    .font(font("monospace"))
+                    .font(font(theme::font::MONO))
                     .pl_2()
                     .text_color(fg);
                 if let Some(bg) = bg {
@@ -761,44 +821,260 @@ impl AdeApp {
     }
 }
 
+/// One flat-circle window-control button (see `AdeApp::render_window_controls`'s docs for
+/// why these are real controls, not decoration) - `on_activate` is called with real
+/// `&mut Window`/`&mut App` access so it can invoke a real `Window` control method.
+fn window_control_dot(
+    id: &'static str,
+    on_activate: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .w(px(11.0))
+        .h(px(11.0))
+        .rounded(px(5.5))
+        .bg(theme::text::GUTTER)
+        .cursor_pointer()
+        .hover(|el| el.bg(theme::text::FAINT))
+        .on_click(move |_event, window, cx| {
+            cx.stop_propagation();
+            on_activate(window, cx);
+        })
+}
+
+impl AdeApp {
+    /// The three flat-circle window controls in the title bar's left cluster (matching
+    /// `design_handoff_jerry_ade/Jerry.dc.html`'s three `#3a3f44` dots at the very start of
+    /// its title bar - the design doesn't colour-code them the way macOS's traffic lights
+    /// are, so this keeps that flat, neutral look while wiring each dot to a real GPUI
+    /// window-control method (verified at `vendor/zed/crates/gpui/src/window.rs`:
+    /// `remove_window` (`:2016`, used directly by `vendor/zed/crates/gpui/examples/
+    /// on_window_close_quit.rs:19`), `minimize_window` (`:5520`), `zoom_window` (`:2489`,
+    /// toggles maximize/restore) - the same three calls
+    /// `vendor/zed/crates/platform_title_bar/src/platforms/platform_linux.rs`'s own
+    /// `WindowControl::on_click` makes. Left-to-right order (close, minimize, maximize)
+    /// mirrors that same three-flat-dot visual grouping's most common real-world reading
+    /// (macOS traffic lights); this design deliberately doesn't colour-code them, so there
+    /// is no ordering hint from the mockup itself - a judgment call, not a spec value.
+    ///
+    /// The wrapping row stops left-click propagation on mouse-down, mirroring
+    /// `vendor/zed/crates/platform_title_bar/src/platforms/platform_linux.rs`'s
+    /// `LinuxWindowControls` (`.on_mouse_down(MouseButton::Left, |_, _, cx|
+    /// cx.stop_propagation())`), so pressing a dot can never also arm
+    /// `Self::render_title_bar`'s window-move drag.
+    fn render_window_controls(&self) -> impl IntoElement {
+        div()
+            .id("window-controls")
+            .flex()
+            .gap(px(8.0))
+            .pl(px(2.0))
+            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                cx.stop_propagation();
+            })
+            .child(window_control_dot("title-bar-close", |window, _cx| {
+                window.remove_window();
+            }))
+            .child(window_control_dot("title-bar-minimize", |window, _cx| {
+                window.minimize_window();
+            }))
+            .child(window_control_dot("title-bar-maximize", |window, _cx| {
+                window.zoom_window();
+            }))
+    }
+
+    /// The 38px title-bar band (`design_handoff_jerry_ade/README.md`'s Layout table: height
+    /// 38, bg `#101214`, bottom border `#1e2225`) - real window content, not OS chrome (see
+    /// this step's task docs: the README's "the real app gets OS window chrome" refers to
+    /// the *outer* window frame, and this band draws itself regardless of that). It carries
+    /// [`Self::render_window_controls`], a divider, and the real project name/branch (the
+    /// repository directory name and the main worktree's real detected branch, once
+    /// `Self::load_worktrees` has resolved - never a placeholder string).
+    ///
+    /// ## Dragging the window
+    ///
+    /// GPUI has no single "make this element drag the window" method; the real pattern
+    /// (verified against `vendor/zed/crates/platform_title_bar/src/platform_title_bar.rs`'s
+    /// own title bar, which faces the identical "Wayland/X11 have no native draggable
+    /// titlebar for a client-side-decorated window" problem) is: mark the area with
+    /// `.window_control_area(WindowControlArea::Drag)` (`vendor/zed/crates/gpui/src/
+    /// elements/div.rs:1167`, a hit-test hint the compositor consults for double-click/
+    /// right-click gestures - `vendor/zed/crates/gpui/src/window.rs:1747`'s
+    /// `on_hit_test_window_control`), then drive the actual move from ordinary mouse
+    /// events: arm [`Self::title_bar_move_armed`] on left mouse-down, and on the next
+    /// mouse-move (still armed) call the real `Window::start_window_move`
+    /// (`window.rs:2502` - "tells the compositor to take control of window movement
+    /// (Wayland and X11)") and disarm. `on_mouse_up`/`on_mouse_down_out` also disarm, so a
+    /// click that never moves (e.g. clicking to focus the window) never starts a move.
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let project_name = self
+            .repo_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.repo_path.display().to_string());
+        let branch = self
+            .worktrees
+            .iter()
+            .find(|item| item.is_main)
+            .and_then(|item| item.branch.clone());
+
+        div()
+            .id("title-bar")
+            .window_control_area(WindowControlArea::Drag)
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(14.0))
+            .px(px(12.0))
+            .w_full()
+            .h(theme::band::TITLE_BAR)
+            .bg(theme::surface::TITLE_BAR)
+            .border_b_1()
+            .border_color(theme::border::ZONE)
+            .on_mouse_down_out(cx.listener(|this, _event, _window, _cx| {
+                this.title_bar_move_armed = false;
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, _cx| {
+                    this.title_bar_move_armed = false;
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, _cx| {
+                    this.title_bar_move_armed = true;
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, _event, window, _cx| {
+                if this.title_bar_move_armed {
+                    this.title_bar_move_armed = false;
+                    window.start_window_move();
+                }
+            }))
+            .child(self.render_window_controls())
+            .child(div().w(px(1.0)).h(px(16.0)).bg(theme::border::DIVIDER))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .text_size(px(12.0))
+                            .text_color(theme::text::STRONG)
+                            .child(project_name),
+                    )
+                    .when_some(branch, |el, branch| {
+                        el.child(
+                            div()
+                                .font(font(theme::font::MONO))
+                                .text_size(px(11.0))
+                                .text_color(theme::text::FAINTER)
+                                .child(branch),
+                        )
+                    }),
+            )
+            .child(div().flex_1())
+    }
+
+    /// The 26px status bar (`design_handoff_jerry_ade/README.md`'s Layout table: height 26,
+    /// bg `#101214`, top border `#1e2225`). The mockup's own content here (`↑2 ↓0` ahead/
+    /// behind counts, a `{{ statusLine }}` template placeholder, and `⌘K`/`⌘⇧K` command-
+    /// palette hints) either needs git plumbing this phase doesn't build or a command
+    /// palette that doesn't exist yet (phase A's task explicitly leaves the palette for a
+    /// later phase) - rendering those would be exactly the "component bound to nothing"
+    /// this project's constraints forbid. This phase's status bar instead shows only real,
+    /// already-available data: the repository root path and how many real worktrees
+    /// `Self::load_worktrees` found.
+    fn render_status_bar(&self) -> impl IntoElement {
+        let worktree_count = self.worktrees.len();
+        let label = match worktree_count {
+            1 => "1 worktree".to_string(),
+            n => format!("{n} worktrees"),
+        };
+
+        div()
+            .id("status-bar")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(12.0))
+            .px(px(12.0))
+            .w_full()
+            .h(theme::band::STATUS_BAR)
+            .bg(theme::surface::TITLE_BAR)
+            .border_t_1()
+            .border_color(theme::border::ZONE)
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::GHOST)
+                    .child(self.repo_path.display().to_string()),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::GHOST)
+                    .child(label),
+            )
+    }
+}
+
 impl Render for AdeApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
-            .flex_row()
+            .flex_col()
             .size_full()
-            .bg(rgb(0x181818))
+            .bg(theme::surface::WINDOW)
+            .font(font(theme::font::SANS))
+            .child(self.render_title_bar(cx))
             .child(
                 div()
-                    .id("worktree-sidebar")
-                    .flex_none()
-                    .w(SIDEBAR_WIDTH)
-                    .h_full()
-                    .overflow_y_scroll()
-                    .border_r_1()
-                    .border_color(rgb(0x2a2a2a))
-                    .child(self.render_worktree_sidebar(cx)),
-            )
-            .child(self.render_center_pane(cx))
-            .child(
-                div()
-                    .id("file-tree-sidebar")
+                    .id("body")
                     .flex()
-                    .flex_col()
-                    .flex_none()
-                    .w(SIDEBAR_WIDTH)
-                    .h_full()
-                    .border_l_1()
-                    .border_color(rgb(0x2a2a2a))
-                    .child(self.render_right_sidebar_toggle(cx))
+                    .flex_row()
+                    .flex_1()
+                    .min_h_0()
                     .child(
                         div()
-                            .id("right-sidebar-body")
-                            .flex_1()
-                            .min_h_0()
+                            .id("worktree-sidebar")
+                            .flex_none()
+                            .w(theme::zone::RAIL_WIDTH)
+                            .h_full()
                             .overflow_y_scroll()
-                            .child(self.render_right_sidebar_body()),
+                            .bg(theme::surface::RAIL)
+                            .border_r_1()
+                            .border_color(theme::border::ZONE)
+                            .child(self.render_worktree_sidebar(cx)),
+                    )
+                    .child(self.render_center_pane(cx))
+                    .child(
+                        div()
+                            .id("file-tree-sidebar")
+                            .flex()
+                            .flex_col()
+                            .flex_none()
+                            .w(theme::zone::PANEL_WIDTH)
+                            .h_full()
+                            .bg(theme::surface::RAIL)
+                            .border_l_1()
+                            .border_color(theme::border::ZONE)
+                            .child(self.render_right_sidebar_toggle(cx))
+                            .child(
+                                div()
+                                    .id("right-sidebar-body")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .child(self.render_right_sidebar_body()),
+                            ),
                     ),
             )
+            .child(self.render_status_bar())
     }
 }

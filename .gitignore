@@ -1,2 +1,4 @@
 vendor/
 target/
+.claude/scratch/
+*:Zone.Identifier

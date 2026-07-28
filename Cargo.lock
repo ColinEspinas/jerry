@@ -275,6 +275,7 @@ dependencies = [
  "log",
  "pty-core",
  "tempfile",
+ "ttf-parser",
  "wt-core",
 ]
 
