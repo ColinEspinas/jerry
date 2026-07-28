@@ -623,3 +623,36 @@ before landing, each finding real bugs the previous round missed:
 The conflict banner (design's cross-session "another session touched this file" warning)
 was scoped out — it needs a per-session parallel diff cache the app doesn't have yet,
 documented as a materially separate feature rather than faked.
+
+### Phase H — real code editor + LSP client (split into H1/H2/H3)
+
+The final and largest phase, comparable in scope to the entire original five-step build on
+its own, so it's split into three sub-phases with the same audit rigor as everything else:
+H1 (real syntax-highlighted source viewer), H2 (real LSP client + diagnostics), H3 (real
+completions/hover). Chose to hand-roll the LSP JSON-RPC/stdio transport around the real
+`lsp-types` crate rather than depending on `vendor/zed/crates/lsp` directly — that crate is
+real and correct, but it's GPL-3.0-or-later, and this project has stayed on permissively-
+licensed dependencies throughout; avoiding that entanglement for what's fundamentally a
+protocol-framing job seemed like the right call given nothing else in the stack required it.
+
+#### Phase H1 — syntax-highlighted code viewer (read-only)
+
+Real tree-sitter parsing (`=0.26.9` / `tree-sitter-rust 0.24.2`, exact match to
+`vendor/zed`'s own pins) of real Rust files into real syntax-colored spans; non-Rust files
+render as plain text rather than fake highlighting. Real git-gutter markers reusing
+`wt_core::diff`'s existing hunk parser rather than a second implementation that could drift.
+
+Audit independently instrumented the caching path with atomic counters — zero re-parses
+across 21 renders, exactly one on a genuine on-disk change — confirming the caching itself
+was correct from the start, genuinely breaking this project's most repeated bug pattern
+(recomputing expensive work every render) for the first time on the first pass. What it did
+find: the one real parse that does happen ran synchronously on the GPUI foreground thread,
+contradicting a rule already documented elsewhere in this same file; a per-render diff-hunk
+rescan and a per-render deep-clone of the selected file's full hunk list (the same
+recompute-every-frame class, just in cheaper spots); a hard 800-line render cap that made
+most of a large file permanently unviewable rather than merely unscrolled; a version-pin
+claim that had already drifted; and a fabricated cursor column always shown as 1. All
+fixed — file loading moved to the same background-executor pattern used for diffs and
+worktree lists, the cap became real virtualization via `gpui::uniform_list` so a whole file
+is actually reachable, the version claim became a real pin, and the fake column was removed
+rather than left wrong.
