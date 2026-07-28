@@ -22,6 +22,58 @@
 
 ## Step log
 
+### Step 1: `wt-core`
+
+- Built `crates/wt-core`: `list_worktrees(repo_path)` reads via `gix` (open the repo,
+  enumerate `Repository::worktrees()` proxies plus the main worktree, resolve HEAD per
+  worktree); `add_worktree`/`remove_worktree` shell out to real `git worktree add`/
+  `remove` via `std::process::Command` argv (never a shell string). No fallback to
+  `git worktree list --porcelain` was needed — gix's worktree/head APIs covered
+  everything. gix isn't used anywhere in `vendor/zed`, so its API was verified by reading
+  the fetched crate source directly under
+  `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gix-0.68.0/src/` (open,
+  `Repository::{main_repo,worktrees,work_dir,head}`, `worktree::Proxy::{base,is_locked,
+  lock_reason}`, `Head::{referent_name,try_peel_to_id_in_place}`) plus
+  `gix-ref-0.49.1/src/fullname.rs` for `FullName::shorten()`.
+- Toolchain wrinkle: `gix 0.68`'s transitive dep `kstring 2.0.4` requires rustc 1.96, one
+  above this repo's pinned 1.95.0. Pinned it back with
+  `cargo update -p kstring --precise 2.0.2` (reflected in `Cargo.lock`) rather than
+  bumping the toolchain further.
+- Dirty-worktree-removal semantics (the one hard requirement from the spec): dirty =
+  any output from `git status --porcelain --untracked-files=normal` inside the worktree —
+  both tracked modifications and untracked files block removal without `force: true`,
+  conservatively.
+
+#### Audit round: real bugs found and fixed
+
+A `checker` subagent found nine real issues beyond the passing test suite (the dirty-tree
+guarantee itself was sound, but its *reliability* had gaps):
+
+- **Path-resolution mismatch (critical).** The dirty check ran with the worktree path
+  resolved against the process's CWD while the actual `git worktree remove` call resolved
+  the same (possibly relative) path against `repo_path` — they could silently check
+  different directories. Fixed by absolutizing `worktree_path` against `repo_path` once,
+  up front, and using that consistently everywhere.
+- **Inherited `GIT_DIR`/`GIT_WORK_TREE`/etc. env vars (critical).** These override
+  `current_dir()` for git's own resolution, so an inherited `GIT_DIR` could make the
+  dirty-check silently operate on the wrong repo and report a dirty worktree as clean.
+  Fixed by scrubbing all of `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
+  `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY` on every git invocation.
+- **No `--` option terminator.** A caller-supplied `commit_ish` like `--detach` or a
+  `worktree_path` starting with `-` was parsed as a git flag rather than a positional
+  argument. Fixed by inserting `--` before the first positional arg in both `add_worktree`
+  and `remove_worktree`.
+- Unbounded-memory dirty check, no `stdin(Stdio::null())` (askpass/GPG-prompt hang risk),
+  bare-repo enumeration hard-failing instead of skipping the (nonexistent) main-worktree
+  entry, signal-terminated processes collapsing into a fake `-1` exit code, one bad linked
+  worktree aborting the entire `list_worktrees` call instead of surfacing per-entry —
+  all fixed; see the doc comments and 14 tests in `crates/wt-core/src/lib.rs` for detail.
+  `force: true` now pushes `--force` twice (git requires it twice to remove a *locked*
+  worktree; a single `--force` still refuses), and an empty `locked` file (lock with no
+  `--reason`) now surfaces as `lock_reason: None` rather than `Some("")`.
+- Test count: 6 → 14, including a regression test for the exact relative-path failure
+  mode above, a bare-repo case, detached HEAD, and lock-with/without-reason.
+
 ### Step 2: `pty-core`
 
 - Built `crates/pty-core` as a spawn/stream/resize/kill primitive over `portable-pty`
@@ -144,3 +196,92 @@ summary:
   expected text appears).
 - `cargo build -p pty-core`, `cargo build --workspace`, `cargo fmt -p pty-core -- --check`,
   and `cargo clippy -p pty-core --all-targets -- -D warnings` all clean.
+
+### Step 3: `app` (the risky one)
+
+- Built a real GPUI three-pane window: `Application`/`cx.open_window`/`cx.new` entry point
+  (verified against `vendor/zed/crates/gpui/examples/{hello_world,window}.rs`),
+  `Entity<T: Render>`/`Context<T>`/`WeakEntity<T>` state model, structurally patterned
+  after `vendor/zed/crates/project_panel`'s sidebar-list-plus-selection shape and
+  `vendor/zed/crates/terminal_view/src/terminal_view.rs`'s key-input wiring. Left = real
+  `wt_core::list_worktrees` results; center = a real spawned shell via `pty_core`; right =
+  a real recursive `std::fs::read_dir` walk of the selected worktree. All three are
+  dispatched off the GPUI foreground thread via `cx.background_executor().spawn(...)`
+  (gpui's real thread-pool executor, not a stub), updating entity state back on the
+  foreground thread inside `this.update(cx, ...)`.
+- **Workspace gotcha, non-obvious:** once this repo's own root `Cargo.toml` declared its
+  own `[workspace]` table, Cargo started treating `vendor/zed`'s nested crates as
+  *implicit members of this workspace* (not just an external path dependency, as the
+  earlier scratch-project test showed) — `gpui`'s `foo.workspace = true` fields then
+  failed to resolve since our workspace doesn't define those keys. Fixed with
+  `[workspace] exclude = ["vendor/zed"]`. Reproduced the failure by temporarily removing
+  it during the audit round; restored and confirmed clean.
+- Terminal rendering: deliberately does **not** pull in `alacritty_terminal` (matching
+  `pty-core`'s own step-2 decision) — a hand-rolled `TerminalBuffer` in
+  `crates/app/src/ansi.rs` strips CSI/OSC escapes and renders plain scrolling monospace
+  text rather than a full color/attribute grid. This is a real fidelity cut, documented
+  in code, not a fake terminal — the bytes are always real.
+- Environment finding: root-window screenshots (`mss`, `xwd -root`) come back solid black
+  in this sandbox — a WSLg/rootless-Xwayland limitation unrelated to the app (confirmed
+  with a plain Tk control window). Per-window capture (`xwd -id <id>`) works. Separately,
+  the *default* `wayland`-only build (the one `cargo build -p app` actually produces)
+  creates no discoverable X11 window at all in this sandbox, so it could not be
+  screenshotted honestly; the `x11` gpui_platform feature link-fails here without
+  system packages we don't have passwordless-sudo to install
+  (`libxkbcommon-x11`/`libxcb-xkb` missing). Verification screenshots were taken from a
+  temporary, local-only x11-patched build (extracted `.deb`s + `LD_LIBRARY_PATH`, never
+  touching the system or committed to the repo); `Cargo.toml` was confirmed reverted to
+  the wayland-only default afterward (`ldd target/debug/app` shows no
+  `libxkbcommon-x11`). This means step 3's visual proof is real but was not captured from
+  the exact binary a plain `cargo build -p app` produces on *this* machine — it would be
+  on a machine with `x11` system libs present, or already is on the shipped `wayland`
+  path against a real (non-sandboxed) Wayland compositor.
+
+#### Audit round: real bugs found and fixed
+
+A `checker` subagent found one serious functional bug and several robustness issues in
+the first version, beyond the passing test suite and a plausible-looking screenshot:
+
+- **Headline bug: the center pane rendered no actual output, only the trailing prompt
+  (critical, empirically proven).** A PTY has `ONLCR` on, so every real `\n` a child
+  writes arrives as `\r\n`. The original `TerminalBuffer` treated `\r` as "clear the
+  current line immediately" — so the CR right before each LF wiped the line's text before
+  the LF could commit it. `append_bytes(b"HELLO\r\n")` rendered `["", ""]`. The only reason
+  the first screenshot looked alive was that a shell prompt has no trailing newline, so it
+  survived as the in-progress `current_line`; every actual line of command output was
+  invisible. This is exactly the kind of bug a "no fake functionality" bar exists to catch
+  even when nothing was faked on purpose — real bytes were flowing in and being silently
+  discarded on the way to the screen. Fixed with a deferred `pending_cr` flag: `\r` no
+  longer clears eagerly; it only clears (as a real column-0 overwrite, for `\r`-only
+  progress-bar-style updates) if the *next* byte isn't `\n`. Verified after the fix with a
+  screenshot of `printf 'LINE-ONE\nLINE-TWO\nLINE-THREE\n'` typed into the live terminal
+  pane, rendering as three separate correct lines followed by a fresh prompt.
+- **No keyboard input path at all (functional gap, not just a fidelity cut).** Nothing in
+  the first version called `pty_core`'s write-input or resize APIs — a spawned interactive
+  shell just sat at its prompt forever with no way to type into it. Fixed: the terminal
+  pane now takes focus (`FocusHandle`/`Focusable`/`.track_focus`), handles
+  `.on_key_down`, maps printable chars / Enter / Backspace / Tab / Escape / arrows / Ctrl+letter
+  to real bytes via `PtySession::write_input`, and issues an approximate resize from the
+  window's viewport size on render.
+- Unbounded `current_line` growth (no per-line cap, unlike the already-bounded completed-
+  line deque) — capped at 8KiB with forced commit past the cap. Unbounded per-tick ANSI
+  decode work on the GPUI foreground thread (a firehose child could hand it ~1MB of
+  byte-by-byte decode work every ~33ms poll tick) — capped at 64 chunks drained per tick.
+  `scroll_to_bottom()` was called unconditionally inside `render()` using stale prior-
+  frame measurements — moved into the poll loop, only invoked when new output actually
+  arrived.
+- The right-sidebar file tree was also a real bug source during initial verification, not
+  just an audit finding: an early version rendered every *loaded* file-tree entry
+  (uncapped) as a real `div()`; against this repo's own `vendor/zed` subtree (~5000
+  entries), re-laying that out via Taffy on every ~33ms poll tick pegged the foreground
+  executor badly enough that unrelated timers fired 10+ seconds late, and the UI looked
+  frozen/stale even though background loads and `cx.notify()` were both firing correctly.
+  Root-caused with a minimal counter-entity probe that confirmed GPUI's own spawn/notify/
+  redraw pipeline was fine, which pointed the search at application code. Fixed with a
+  separate, smaller *rendered*-row cap (500) independent of the *loaded* cap (5000);
+  documented in `root.rs`. This is the kind of thing "commit after each step" and "checker
+  after each step" both exist to catch before it compounds into steps 4/5.
+- Test count: 43 → 49 workspace-wide after the fixes (25 in `app` alone), including an
+  end-to-end regression that spawns a real `printf` through `pty_core::spawn` and feeds
+  its actual output through `TerminalBuffer` — the shape of test that would have caught
+  the CR/LF bug the first time.
