@@ -12,6 +12,7 @@ pub mod changes;
 pub mod file_tree;
 pub mod fonts;
 pub mod layout;
+pub mod palette;
 pub mod rail;
 pub mod root;
 pub mod sessions;
@@ -53,8 +54,13 @@ pub fn run(repo_path: PathBuf) {
             // docs for the real, verified `actions!`/`KeyBinding` pattern this follows,
             // taken directly from `vendor/zed/crates/gpui/examples/input.rs`, and for the
             // documented judgment call on how far its focus-priority interaction with a
-            // focused terminal tab was verified).
-            cx.bind_keys([gpui::KeyBinding::new("cmd-n", root::NewSession, None)]);
+            // focused terminal tab was verified). `cmd-k` follows the exact same
+            // `actions!`/`KeyBinding` pattern for the command palette (see
+            // `crate::root::TogglePalette`'s docs).
+            cx.bind_keys([
+                gpui::KeyBinding::new("cmd-n", root::NewSession, None),
+                gpui::KeyBinding::new("cmd-k", root::TogglePalette, None),
+            ]);
 
             let bounds = Bounds::centered(None, size(px(1440.0), px(928.0)), cx);
             let opened = cx.open_window(
@@ -79,7 +85,7 @@ pub fn run(repo_path: PathBuf) {
                 },
                 {
                     let repo_path = repo_path.clone();
-                    move |_window, cx| cx.new(|cx| root::AdeApp::new(repo_path.clone(), cx))
+                    move |window, cx| cx.new(|cx| root::AdeApp::new(repo_path.clone(), window, cx))
                 },
             );
 

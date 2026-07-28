@@ -341,3 +341,36 @@ pub mod font {
     pub const SANS: &str = "IBM Plex Sans";
     pub const MONO: &str = "IBM Plex Mono";
 }
+
+/// Palette-only (⌘K) colours read directly from `design_handoff_jerry_ade/Jerry.dc.html`'s own
+/// inline literals for the `paletteOpen` block - like [`text::PATH`]/[`button::GREEN_KEYCAP_FG`]
+/// before it, these are real values present in the reviewed mockup but missing from
+/// `design_handoff_jerry_ade/tokens.rs`'s transcription (that file predates the palette section
+/// being added to the README/HTML), so they're added here directly rather than reusing a
+/// nearby-but-different existing token or leaving them as inline magic numbers at each call site.
+pub mod palette {
+    use super::{hex, Rgba};
+
+    /// The input row's scope-prefix glyph (`design_handoff_jerry_ade/Jerry.dc.html` line
+    /// ~748: `color:#5f7f9e`).
+    pub const PREFIX: Rgba = hex(0x5f7f9e);
+    /// A result group's uppercase header label (`Jerry.dc.html` line ~766: `color:#5b6167`) -
+    /// close to but distinct from [`super::text::FAINT`] (`#6b7178`), so kept as its own token
+    /// rather than reusing that nearby value for a different element.
+    pub const GROUP_HEADER: Rgba = hex(0x5b6167);
+    /// An unselected result row's real hover background (`Jerry.dc.html`'s `style-hover`
+    /// attribute on the row template: `background:#191d20`) - distinct from
+    /// [`super::surface::ROW_HOVER`] (`#15181b`, which happens to equal the palette panel's own
+    /// background, [`super::surface::PALETTE`]).
+    pub const ROW_HOVER: Rgba = hex(0x191d20);
+    /// The selected/first row's label colour (`Jerry.dc.html`'s row-decoration function:
+    /// `fg: first ? '#e3e8ed' : '#c2c7cc'`) - one hex step brighter than
+    /// [`super::text::SELECTED`] (`#dde2e7`, used elsewhere for a selected rail row's title), so
+    /// kept distinct rather than reused.
+    pub const LABEL_SELECTED: Rgba = hex(0xe3e8ed);
+    /// A command result's real, always-the-same kind chip `(fg, bg)` (`Jerry.dc.html` line
+    /// ~772: `background:#1d2532` / `color:#7f9ad4`) - the exact same hex pair as
+    /// [`super::lang::MD`], but kept as its own named token here since a command chip and a
+    /// Markdown-file chip are unrelated concepts that merely happen to share a designed colour.
+    pub const COMMAND_CHIP: (Rgba, Rgba) = (hex(0x7f9ad4), hex(0x1d2532));
+}
