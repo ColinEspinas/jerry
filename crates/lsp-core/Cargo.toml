@@ -1,0 +1,45 @@
+[package]
+name = "lsp-core"
+version = "0.1.0"
+edition = { workspace = true }
+publish = { workspace = true }
+
+[dependencies]
+# Real, correct LSP protocol type definitions (InitializeParams, PublishDiagnosticsParams,
+# Position, Range, Diagnostic, DiagnosticSeverity, Uri, ...) - the actual, permissively
+# (MIT) licensed crates.io `lsp-types` (https://crates.io/crates/lsp-types, maintained under
+# gluon-lang), deliberately NOT `vendor/zed`'s own fork
+# (`git+https://github.com/zed-industries/lsp-types?rev=f4dfa89a...`, pinned in
+# `vendor/zed/Cargo.lock` at "0.95.1") - see this crate's `README`/step report for why: this
+# project depends on real crates.io packages for genuinely third-party protocol types, the
+# same way `tree-sitter`/`tree-sitter-rust` are real crates.io deps in `crates/app/Cargo.toml`
+# rather than reaching into `vendor/zed`'s own copies. `0.97.0` is the newest real version on
+# crates.io as of this writing; nothing here depends on any `proposed`-feature (unstable,
+# pre-final-spec) extension zed's fork carries that upstream doesn't, so there's no functional
+# gap from not using their fork.
+lsp-types = "0.97.0"
+serde = { version = "1", features = ["derive"] }
+# Pinned to the exact version already resolved in this workspace's `Cargo.lock` (via gpui's
+# own transitive deps), so this adds no new version surface.
+serde_json = "1.0.151"
+thiserror = { workspace = true }
+# Matches `crates/app/Cargo.toml`'s own pin - `crate::client::run_stderr_drain_loop` logs
+# rust-analyzer's real stderr through the same `log` facade the rest of this app uses.
+log = "0.4"
+# Used only to build a correct, percent-encoded `file://` URI from a real `PathBuf`
+# (`Url::from_file_path`) - hand-rolling that encoding correctly (spaces, non-ASCII path
+# segments, etc.) is a real footgun `url` already solves; already resolved transitively in
+# this workspace's `Cargo.lock` (2.5.8, via other deps), so this is not new version surface.
+url = "2"
+
+# Process-tree kill (SIGTERM-then-SIGKILL, plus a `/proc` descendant sweep so a `cargo
+# check`/`rustc` child rust-analyzer spawned while indexing doesn't survive as an orphan) -
+# unix-only, mirroring `pty-core`'s own kill implementation (see `src/client.rs`'s module
+# docs for the differences: SIGTERM instead of SIGHUP, no process-group/`setsid` handling
+# since rust-analyzer is spawned as a plain `std::process::Command` child, not a pty session
+# leader). Pinned to the exact version `pty-core/Cargo.toml` already pins.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.28", default-features = false, features = ["signal"] }
+
+[dev-dependencies]
+tempfile = "3"

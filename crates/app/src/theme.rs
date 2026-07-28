@@ -193,6 +193,21 @@ pub mod syntax {
     pub const CARET: Rgba = hex(0x5a9ad4);
     pub const ERROR_UNDERLINE: Rgba = hex(0xe0625c); // 2px dotted
     pub const HOVER_UNDERLINE: Rgba = hex(0x4d7ba8); // 1px solid
+
+    /// The File view's real Diagnostic-state row tint (`design_handoff_jerry_ade/README.md`:
+    /// "row tinted `#191416`") - a real, distinct-from-[`super::surface::CURRENT_LINE`] tint for
+    /// a code row that has at least one real diagnostic on it (`crate::diagnostics_view`).
+    pub const DIAGNOSTIC_ROW_BG: Rgba = hex(0x191416);
+    /// The Diagnostic state's dim, end-of-line inline message text
+    /// (`design_handoff_jerry_ade/README.md`: "dim inline message at end of line (`#6b4a48`)").
+    pub const DIAGNOSTIC_INLINE_MESSAGE: Rgba = hex(0x6b4a48);
+    /// The Diagnostic state's card message text (`design_handoff_jerry_ade/README.md`: "a card
+    /// below: message `#e3908b`"). Same hex as [`super::button::DANGER_FG_HOVER`], kept as its
+    /// own named token here (same reasoning as this crate's other same-hex-different-meaning
+    /// tokens, e.g. [`super::text::PATH`]'s own docs): a diagnostic card's message and a danger
+    /// button's hover state are unrelated real UI elements that merely happen to share a
+    /// designed red.
+    pub const DIAGNOSTIC_CARD_MESSAGE: Rgba = hex(0xe3908b);
 }
 
 pub mod term {

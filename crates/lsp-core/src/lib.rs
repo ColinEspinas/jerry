@@ -1,0 +1,61 @@
+//! `lsp-core`: a real Language Server Protocol client, built to spawn and drive `rust-analyzer`
+//! for Surface C's File view (`design_handoff_jerry_ade/README.md`'s "Language server UI"
+//! subsection, *Diagnostic* state - see `crate::diagnostics_view` in the `app` crate for how a
+//! real `PublishDiagnosticsParams` becomes rendered UI).
+//!
+//! ## Scope decision: this crate, not a module of `app`
+//!
+//! Mirrors `pty-core`'s own split from `app` (see that crate's docs): the process-spawn/
+//! transport-framing/handshake-correlation logic here has no real dependency on GPUI at all,
+//! and keeping it a separate crate means its own tests (protocol framing, process lifecycle,
+//! the real rust-analyzer end-to-end handshake) run as plain `cargo test -p lsp-core`, with no
+//! GPUI window/test harness involved - the same benefit `pty-core`'s own tests get.
+//!
+//! ## Not a pty
+//!
+//! Unlike every other long-lived child process this workspace manages (`claude`, `codex`, a
+//! shell - all via `pty-core`), `rust-analyzer` is spawned as a plain `std::process::Command`
+//! child with `Stdio::piped()`, deliberately **not** through `pty-core`/a real pseudo-terminal.
+//! A pty's line discipline (cooked-mode processing: `\n` → `\r\n` translation, signal
+//! characters, etc.) actively corrupts JSON-RPC's `Content-Length`-framed byte stream - the
+//! `Content-Length` header's declared byte count would stop matching what actually arrives once
+//! the pty has rewritten some of those bytes. LSP servers are designed to be driven over plain,
+//! unmodified pipes for exactly this reason. See `crate::client`'s own docs for the process
+//! spawn/kill implementation this scope decision leads to.
+//!
+//! ## `lsp-types`: real crates.io crate, not `vendor/zed`'s fork
+//!
+//! Every LSP protocol type used here (`InitializeParams`, `PublishDiagnosticsParams`,
+//! `Position`, `Range`, `Diagnostic`, `DiagnosticSeverity`, `Uri`, ...) comes from the real,
+//! independently-maintained `lsp-types` crate on crates.io (MIT-licensed;
+//! <https://crates.io/crates/lsp-types>), re-exported here as [`lsp_types`] so downstream
+//! crates (the `app` crate's own diagnostics rendering) reference the exact same version rather
+//! than adding a second, independently-resolved `lsp-types` dependency of their own. This is
+//! deliberately **not** `vendor/zed`'s own git fork of `lsp-types`
+//! (`vendor/zed/Cargo.lock` pins `lsp-types 0.95.1` from
+//! `git+https://github.com/zed-industries/lsp-types?rev=f4dfa89a...`) - see this crate's
+//! `Cargo.toml` and the step report for the version/licensing reasoning.
+//!
+//! JSON-RPC 2.0's own message *framing* (`Content-Length: N\r\n\r\n<json>`) is not something
+//! `lsp-types` defines at all (it only defines the request/notification payload shapes) - see
+//! [`transport`] for that hand-rolled piece.
+
+#[cfg(not(unix))]
+compile_error!(
+    "lsp-core's process-tree kill implementation (crate::proc) is unix-only right now \
+     (this repo targets Linux/WSL2), mirroring pty-core's own documented platform scope cut."
+);
+
+mod client;
+mod proc;
+mod transport;
+
+pub use client::{ClientUpdate, LspClient, LspError};
+/// Re-exported so callers (the `app` crate) depend on exactly this crate's resolved
+/// `lsp-types` version rather than adding a second, potentially-drifting direct dependency -
+/// see this module's own docs.
+pub use lsp_types;
+
+// `transport` is intentionally not re-exported: it's an internal wire-format detail of
+// `LspClient`, not part of this crate's real public surface. Its own unit tests (pure,
+// non-process-spawning encode/decode coverage) live alongside it in `src/transport.rs`.

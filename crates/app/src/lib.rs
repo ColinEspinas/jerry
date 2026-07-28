@@ -10,6 +10,7 @@
 
 pub mod changes;
 pub mod code_view;
+pub mod diagnostics_view;
 pub mod file_tree;
 pub mod fonts;
 pub mod layout;

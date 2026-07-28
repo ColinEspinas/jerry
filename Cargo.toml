@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/wt-core",
     "crates/pty-core",
+    "crates/lsp-core",
     "crates/app",
 ]
 # `vendor/zed` is its own separate Cargo workspace (it has its own `[workspace]` table

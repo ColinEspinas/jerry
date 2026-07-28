@@ -21,6 +21,14 @@ gpui_platform = { path = "../../vendor/zed/crates/gpui_platform", features = [
 ] }
 wt-core = { path = "../wt-core" }
 pty-core = { path = "../pty-core" }
+# Real LSP client (spawns `rust-analyzer`, real initialize/initialized handshake, real
+# `textDocument/publishDiagnostics`) backing Surface C's File view Diagnostic state
+# (`crate::diagnostics_view`) - see `crates/lsp-core/src/lib.rs`'s own docs for the scope
+# decision (a separate crate, not a module here, mirroring `pty-core`) and the `lsp-types`
+# licensing/version reasoning. `lsp_core::lsp_types` is used directly (re-exported by that
+# crate) rather than this crate adding its own separate `lsp-types` dependency, so there is
+# only ever one resolved version of it in this workspace.
+lsp-core = { path = "../lsp-core" }
 anyhow = { workspace = true }
 env_logger = "0.11"
 log = "0.4"
