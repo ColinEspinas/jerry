@@ -39,10 +39,12 @@ use gpui::{
     WindowControlArea,
 };
 use wt_core::diff::{DiffBase, DiffFile, DiffLineKind, FileChangeStatus, WorktreeDiff};
+use wt_core::merge::{ConflictHunk, ConflictSegment, ConflictedPath};
 
 use crate::changes::{self, ChangeTag};
 use crate::file_tree::{self, FileTreeEntry, LangChip};
 use crate::layout;
+use crate::merge;
 use crate::palette;
 use crate::rail::{
     self, ProjectChild, RailMode, SessionRow, StatusGroup, WorktreeEntry, WorktreeNote,
@@ -317,6 +319,21 @@ pub struct AdeApp {
     /// `Vec::new()` (an empty card, matching a `None` `resolved_path` for a still-loading state
     /// would be dishonest here since it isn't per-row) until the first real load completes.
     agent_rows: Vec<settings::AgentRow>,
+    /// The context bar's real `Merge` action and Surface D's real conflict-resolution flow -
+    /// see `crate::merge::MergeFlow`'s docs. `None` whenever no session has an in-flight
+    /// merge attempt or unresolved conflict - `Self::render_center_pane` shows the active
+    /// session's normal pty/diff surface in that case, exactly as before this phase.
+    merge_flow: Option<merge::MergeFlow>,
+    /// `true` for the duration of a real, in-flight `Complete merge`/`Abort merge` background
+    /// git operation (`Self::complete_merge_flow`/`Self::abort_merge_flow`) - guards against a
+    /// second click spawning a second, racing real git operation while the first is still
+    /// running (see those methods' own docs for the real race this closes: a fast
+    /// Abort-right-after-Complete double-click could otherwise let `git merge --abort` win a
+    /// race against an in-flight `git commit` and discard real, already-resolved conflict
+    /// work). `Self::start_merge` doesn't need a second flag of its own for the same purpose -
+    /// its own `self.merge_flow.is_some()` check already serves that role, since `merge_flow`
+    /// is `None` right up until the moment it synchronously sets it to `Running`.
+    merge_op_in_flight: bool,
     _load_worktrees_task: Option<Task<()>>,
     _load_file_tree_task: Option<Task<()>>,
     _load_diff_task: Option<Task<()>>,
@@ -324,6 +341,29 @@ pub struct AdeApp {
     _disk_usage_task: Option<Task<()>>,
     _prune_task: Option<Task<()>>,
     _agent_rows_task: Option<Task<()>>,
+    _merge_task: Option<Task<()>>,
+    /// A real, in-flight `Self::clear_merge_flow_for_closed_session` best-effort abort, kept in
+    /// its own field rather than sharing [`Self::_merge_task`] - see that method's docs for the
+    /// exact real bug this was verified to cause when the two shared one slot: dropping a GPUI
+    /// `Task` cancels it immediately (`vendor/zed/crates/scheduler/src/executor.rs`'s own "If
+    /// you drop a task it will be cancelled immediately"), so a cleanup-triggered abort
+    /// overwriting the same field as a real, in-flight `Self::complete_merge_flow`/
+    /// `Self::abort_merge_flow` commit would cancel that commit mid-flight, permanently
+    /// stranding [`Self::merge_op_in_flight`] at `true` (its own reset lives inside the very
+    /// closure that got cancelled) and letting `git merge --abort` win a race against `git
+    /// commit`, discarding already-resolved conflict work.
+    _merge_cleanup_task: Option<Task<()>>,
+    /// Every real, in-flight [`Self::resolve_active_hunk`] background write
+    /// (`wt_core::merge::write_resolved_file`), keyed by nothing (a `Vec`, not a single slot) -
+    /// see that method's docs for why a single `Option<Task<()>>` here was a verified real bug:
+    /// resolving one file's last hunk while a *different* file's write was still in flight
+    /// would drop (cancel) the earlier write via the same "dropping a `Task` cancels it
+    /// immediately" mechanism described on [`Self::_merge_cleanup_task`], leaving real conflict
+    /// markers on disk while the in-memory model already reported that file as resolved. Writes
+    /// to distinct files are independent, so keeping every in-flight one alive here is safe;
+    /// [`Self::resolve_active_hunk`] prunes already-finished entries (`Task::is_ready`) before
+    /// pushing a new one so this never grows unboundedly.
+    _merge_write_tasks: Vec<Task<()>>,
 }
 
 /// Clears every piece of per-worktree UI state that would otherwise survive a worktree switch
@@ -395,6 +435,8 @@ impl AdeApp {
             settings_return_focus: None,
             settings_opened_session: None,
             agent_rows: Vec::new(),
+            merge_flow: None,
+            merge_op_in_flight: false,
             _load_worktrees_task: None,
             _load_file_tree_task: None,
             _load_diff_task: None,
@@ -402,6 +444,9 @@ impl AdeApp {
             _disk_usage_task: None,
             _prune_task: None,
             _agent_rows_task: None,
+            _merge_task: None,
+            _merge_cleanup_task: None,
+            _merge_write_tasks: Vec::new(),
         };
         // A fresh window shouldn't open with zero tabs and no way to see anything running -
         // start with one real shell in the repo root, exactly like step 3's single terminal
@@ -777,14 +822,419 @@ impl AdeApp {
 
     /// The context bar's real `Archive` action, and the idle-status footer's own `Archive`
     /// action (`design_handoff_jerry_ade/README.md`'s Session context bar spec: "`Merge`
-    /// (outline) · `Archive` (ghost)") - closes the tab via the already-real `Sessions::
-    /// close` (which deterministically tears down the real child process - see that method's
-    /// docs), exactly like the tab strip's own `×`. Not a placeholder: this is the one
-    /// context-bar action with real, already-existing backing logic - `Merge` has none (see
-    /// `render_merge_button`'s docs for why it's honestly disabled instead of wired to
-    /// something fake).
+    /// (outline) · `Archive` (ghost)") - closes the tab via [`Self::close_session`] (see that
+    /// method's docs for why every real tab-close path goes through it, not
+    /// `Sessions::close` directly).
     fn archive_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.close_session(id, cx);
+        self.prune_confirm_armed = false;
+        cx.notify();
+    }
+
+    /// Closes session `id`'s real tab (`Sessions::close` - deterministically tears down its
+    /// real child process) and, if `id` is the session whose `Merge` click started
+    /// [`Self::merge_flow`], cleans that up too (see [`Self::clear_merge_flow_for_closed_session`]).
+    ///
+    /// Every real place a session tab closes - [`Self::archive_session`], [`Self::
+    /// respawn_session`]'s close-then-respawn, and the tab strip's own `×` - goes through this
+    /// one function rather than calling `Sessions::close` directly, so none of them can
+    /// independently forget the merge_flow cleanup. This was a real, verified bug: with
+    /// `Sessions::close` called from three separate places and only one of them (originally
+    /// `archive_session`) clearing `merge_flow`, archiving (or retrying/resuming) the session
+    /// that was mid-merge left `Self::merge_flow`'s `session_id` pointing at a session that no
+    /// longer existed - Surface D could never render again to finish or abort it, and
+    /// `Self::render_merge_button`'s `self.merge_flow.is_some()` disabled check stayed `true`
+    /// forever, silently disabling the `Merge` button for *every* session in the app.
+    fn close_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
         self.sessions.close(id, cx);
+        if self
+            .merge_flow
+            .as_ref()
+            .is_some_and(|flow| flow.session_id == id)
+        {
+            self.clear_merge_flow_for_closed_session(cx);
+        }
+    }
+
+    /// Real cleanup for [`Self::close_session`] closing the very session whose `Merge` click
+    /// started [`Self::merge_flow`]. If a real merge is genuinely still in progress in the
+    /// base worktree at that moment (`Clean`/`Conflicted` - both real "`MERGE_HEAD` present,
+    /// uncommitted" states - or an `Error` with a real `abortable_worktree`), this really
+    /// aborts it (`wt_core::merge::abort_merge`) rather than just dropping the UI's own state
+    /// and silently leaving the repository mid-merge with no UI left to finish or abort it.
+    ///
+    /// A merge attempt still `Running` (the `git merge` child process itself, in flight on the
+    /// background executor) can't be cancelled from here - there is no cancellation token
+    /// threaded through it. Clearing `merge_flow` regardless is still correct: `Self::
+    /// start_merge`'s own completion handler already guards on `merge_flow`'s `session_id`
+    /// still matching before applying its result (see that method), so a `Running` attempt
+    /// that finishes after this point is a no-op here, not a resurrected stale flow. In the
+    /// rare case that in-flight attempt *did* leave a real `MERGE_HEAD` behind before this
+    /// runs, it's a real, narrow, self-healing race: the next `Merge` click will hit a real
+    /// git failure, and `Self::run_merge_attempt`'s `find_in_progress_merge` fallback (see its
+    /// docs) surfaces a real `Abort merge` action for it then - never a silent, permanent
+    /// dead end.
+    ///
+    /// If [`Self::merge_op_in_flight`] is `true`, a real `Self::complete_merge_flow`/
+    /// `Self::abort_merge_flow` background git operation already owns this flow's outcome, so
+    /// this deliberately spawns nothing here and returns after only clearing the UI-facing
+    /// `merge_flow` field. This was a verified real bug: this method used to unconditionally
+    /// spawn its own best-effort abort into the *same* [`Self::_merge_task`] slot
+    /// `complete_merge_flow`/`abort_merge_flow` use, and dropping a GPUI `Task` cancels it
+    /// immediately - so closing/archiving a session while a real `Complete merge` commit was
+    /// still in flight silently cancelled that commit (discarding already-resolved conflict
+    /// work to a `git merge --abort` that won the resulting race) *and* permanently stranded
+    /// `merge_op_in_flight` at `true` forever, since the reset lives inside the very completion
+    /// closure that got cancelled - wedging the repository mid-merge with no working recovery
+    /// action anywhere in the UI. Leaving that already-running operation alone and letting its
+    /// own completion handler finish naturally is the real fix; see [`Self::_merge_cleanup_task`]
+    /// for why this method's own best-effort abort (the non-in-flight case below) now lives in
+    /// a separate field instead.
+    fn clear_merge_flow_for_closed_session(&mut self, cx: &mut Context<Self>) {
+        let Some(flow) = self.merge_flow.take() else {
+            return;
+        };
+        if self.merge_op_in_flight {
+            return;
+        }
+        let base_worktree_path = match flow.state {
+            merge::MergeFlowState::Clean {
+                base_worktree_path, ..
+            }
+            | merge::MergeFlowState::Conflicted {
+                base_worktree_path, ..
+            } => Some(base_worktree_path),
+            merge::MergeFlowState::Error {
+                abortable_worktree, ..
+            } => abortable_worktree,
+            merge::MergeFlowState::Running | merge::MergeFlowState::AlreadyUpToDate { .. } => None,
+        };
+        let Some(base_worktree_path) = base_worktree_path else {
+            return;
+        };
+        let task = cx.spawn(async move |_this, cx| {
+            // Fire-and-forget: the session tab (and any UI to show a further error) is
+            // already gone by the time this real abort even starts. Best-effort is the
+            // honest ceiling here - if it genuinely fails, the repository is left in
+            // whatever real state `git merge --abort` left it in, inspectable/recoverable
+            // via a real terminal, exactly like every other real-error path in this module.
+            let _ = cx
+                .background_executor()
+                .spawn(async move { wt_core::merge::abort_merge(&base_worktree_path) })
+                .await;
+        });
+        self._merge_cleanup_task = Some(task);
+    }
+
+    /// The context bar's real `Merge` action (`render_merge_button`'s docs) - starts a real
+    /// `wt_core::merge::attempt_merge` of `id`'s worktree branch into the repository's
+    /// detected base branch, on the background executor (this performs real, possibly-slow
+    /// blocking I/O: a `gix` open, a `git status` dirty-check, and a spawned `git merge`
+    /// child process - see that function's own docs for the full plumbing and why it's safe).
+    ///
+    /// Only one merge flow is tracked at a time (`Self::merge_flow`); a click here while one
+    /// is already in progress for *any* session is a no-op - the design's own `Merge` button
+    /// has no concept of queuing a second merge behind a first one, and doing two at once
+    /// would mean two real, concurrent `git merge` invocations racing over the same base
+    /// worktree.
+    fn start_merge(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if self.merge_flow.is_some() {
+            return;
+        }
+        let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
+            return;
+        };
+        let repo_path = self.repo_path.clone();
+        let worktree_path = session.cwd.clone();
+        self.merge_flow = Some(merge::MergeFlow {
+            session_id: id,
+            state: merge::MergeFlowState::Running,
+        });
+        self.prune_confirm_armed = false;
+        cx.notify();
+
+        let task = cx.spawn(async move |this, cx| {
+            let state = cx
+                .background_executor()
+                .spawn(async move { run_merge_attempt(&repo_path, &worktree_path) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.merge_flow.as_ref().map(|flow| flow.session_id) == Some(id) {
+                    this.merge_flow = Some(merge::MergeFlow {
+                        session_id: id,
+                        state,
+                    });
+                }
+                cx.notify();
+            });
+        });
+        self._merge_task = Some(task);
+    }
+
+    /// Surface D's real `Take left`/`Take right`/`Take both` action on the currently active
+    /// hunk (`merge_flow.state`'s `active_file`/`active_hunk`) - mutates the real, in-memory
+    /// [`wt_core::merge::ConflictedFile`] via `wt_core::merge::resolve_hunk`, then advances to
+    /// the next real unresolved hunk (`crate::merge::first_unresolved`). If that resolves the
+    /// file's very last conflict, the real, now-fully-resolved content is written back to disk
+    /// and `git add`ed on the background executor (`wt_core::merge::write_resolved_file`) -
+    /// never left resolved only in memory.
+    ///
+    /// Only ever mutates a [`wt_core::merge::ConflictedPath::Text`] entry - `active_file`/
+    /// `active_hunk` are only ever set from `crate::merge::first_unresolved`'s own real
+    /// output, which never points at an `Unmergeable` entry (it has no hunk to point at - see
+    /// that function's docs).
+    fn resolve_active_hunk(
+        &mut self,
+        choice: wt_core::merge::ConflictChoice,
+        cx: &mut Context<Self>,
+    ) {
+        self.prune_confirm_armed = false;
+        let Some(flow) = self.merge_flow.as_mut() else {
+            return;
+        };
+        let merge::MergeFlowState::Conflicted {
+            base_worktree_path,
+            files,
+            active_file,
+            active_hunk,
+            ..
+        } = &mut flow.state
+        else {
+            return;
+        };
+        let Some(wt_core::merge::ConflictedPath::Text(file)) = files.get_mut(*active_file) else {
+            return;
+        };
+        if wt_core::merge::resolve_hunk(file, *active_hunk, choice).is_err() {
+            // A stale index (shouldn't happen) - nothing sensible to do but ignore the click
+            // rather than panicking.
+            return;
+        }
+        let write_back = if file.is_resolved() {
+            Some((base_worktree_path.clone(), file.clone()))
+        } else {
+            None
+        };
+        if let Some((next_file, next_hunk)) = merge::first_unresolved(files) {
+            *active_file = next_file;
+            *active_hunk = next_hunk;
+        }
+        cx.notify();
+
+        let Some((worktree_path, resolved_file)) = write_back else {
+            return;
+        };
+        let session_id = flow.session_id;
+        let worktree_path_for_check = worktree_path.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    wt_core::merge::write_resolved_file(&worktree_path, &resolved_file)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Err(err) = result {
+                    if this.merge_flow.as_ref().map(|flow| flow.session_id) == Some(session_id) {
+                        // Best-effort: re-check real `MERGE_HEAD` presence in this same
+                        // worktree so a real `Abort merge` stays offered rather than
+                        // silently vanishing - see `merge::MergeFlowState::Error`'s docs.
+                        let abortable_worktree =
+                            wt_core::merge::merge_head_exists(&worktree_path_for_check)
+                                .ok()
+                                .filter(|present| *present)
+                                .map(|_| worktree_path_for_check.clone());
+                        if let Some(flow) = this.merge_flow.as_mut() {
+                            flow.state = merge::MergeFlowState::Error {
+                                message: format!("failed to write resolved file: {err}"),
+                                abortable_worktree,
+                            };
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        });
+        // Prune already-finished entries rather than replacing a single slot: dropping a GPUI
+        // `Task` cancels it immediately, so a single `Option<Task<()>>` here was a verified
+        // real bug - resolving a *different* file's last hunk while this write was still in
+        // flight would cancel it, leaving real conflict markers on disk while the in-memory
+        // model already reported that file resolved. Writes to distinct files are independent,
+        // so nothing in-flight is ever dropped here, only tasks that have already completed.
+        self._merge_write_tasks.retain(|task| !task.is_ready());
+        self._merge_write_tasks.push(task);
+    }
+
+    /// Surface D's real `Complete merge` action - a real `git commit` finishing the
+    /// in-progress merge (`wt_core::merge::complete_merge`'s docs), valid once a clean merge
+    /// is staged or every conflicted file is resolved (`crate::merge::all_resolved`). On real
+    /// success, clears the flow and refreshes the real worktree/diff state so the rest of the
+    /// UI reflects the merge that actually just happened.
+    ///
+    /// Guarded by [`Self::merge_op_in_flight`] (set for the duration of the real background
+    /// commit): without this, the button stayed clickable while a first click's real `git
+    /// commit` was still in flight, and a second click (e.g. a fast Abort-right-after-Complete
+    /// double-click) could spawn a second real git operation racing the first, overwriting
+    /// [`Self::_merge_task`] and dropping the first one's own completion handler - verified to
+    /// let a real `git merge --abort` win the race and discard real, already-resolved conflict
+    /// work `git commit` was mid-writing. [`Self::clear_merge_flow_for_closed_session`] respects
+    /// this same flag (see its docs) so closing/archiving the session mid-commit can no longer
+    /// reach into [`Self::_merge_task`] and cancel this operation out from under itself either.
+    ///
+    /// The success arm only clears [`Self::merge_flow`] when it still belongs to this same
+    /// `session_id` - matching the error arm right below it - since a session close no longer
+    /// blocks this real background commit from running to completion (see
+    /// `clear_merge_flow_for_closed_session`'s docs); a real merge for a *different* session
+    /// could legitimately have started and be in `merge_flow` by the time this closure runs.
+    fn complete_merge_flow(&mut self, cx: &mut Context<Self>) {
+        self.prune_confirm_armed = false;
+        if self.merge_op_in_flight {
+            return;
+        }
+        let Some(flow) = self.merge_flow.as_ref() else {
+            return;
+        };
+        let base_worktree_path = match &flow.state {
+            merge::MergeFlowState::Clean {
+                base_worktree_path, ..
+            } => base_worktree_path.clone(),
+            merge::MergeFlowState::Conflicted {
+                base_worktree_path,
+                files,
+                ..
+            } if merge::all_resolved(files) => base_worktree_path.clone(),
+            _ => return,
+        };
+        self.merge_op_in_flight = true;
+        cx.notify();
+        let session_id = flow.session_id;
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { wt_core::merge::complete_merge(&base_worktree_path) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.merge_op_in_flight = false;
+                match result {
+                    Ok(()) => {
+                        if this.merge_flow.as_ref().map(|flow| flow.session_id) == Some(session_id)
+                        {
+                            this.merge_flow = None;
+                        }
+                        let repo_path = this.repo_path.clone();
+                        this.load_worktrees(cx);
+                        this.load_diff(repo_path, cx);
+                    }
+                    Err(err) => {
+                        if this.merge_flow.as_ref().map(|flow| flow.session_id) == Some(session_id)
+                        {
+                            // Real defense in depth (`wt_core::merge::complete_merge`'s own
+                            // docs) can be exactly what failed here (e.g. a real modify/
+                            // delete or binary conflict this app has no resolution action
+                            // for) - `MERGE_HEAD` is still genuinely present in that case, so
+                            // a real `Abort merge` stays offered.
+                            let abortable_worktree =
+                                wt_core::merge::find_in_progress_merge(&this.repo_path)
+                                    .ok()
+                                    .flatten();
+                            if let Some(flow) = this.merge_flow.as_mut() {
+                                flow.state = merge::MergeFlowState::Error {
+                                    message: format!("commit failed: {err}"),
+                                    abortable_worktree,
+                                };
+                            }
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self._merge_task = Some(task);
+    }
+
+    /// Surface D's real `Abort merge` action - a real `git merge --abort`
+    /// (`wt_core::merge::abort_merge`'s docs), restoring the base worktree to exactly its
+    /// pre-merge state. If the abort itself genuinely fails (rare - e.g. no merge was actually
+    /// in progress any more), the flow is left in a real `Error` state describing that
+    /// (`merge::MergeFlowState::Error`'s own docs on why this never silently drops the UI back
+    /// to "nothing happening" while git might still be mid-merge) rather than pretending the
+    /// abort succeeded.
+    ///
+    /// Guarded by [`Self::merge_op_in_flight`] - see [`Self::complete_merge_flow`]'s docs for
+    /// the real Complete-vs-Abort race this (and the matching guard there) prevents.
+    fn abort_merge_flow(&mut self, cx: &mut Context<Self>) {
+        self.prune_confirm_armed = false;
+        if self.merge_op_in_flight {
+            return;
+        }
+        let Some(flow) = self.merge_flow.as_ref() else {
+            return;
+        };
+        let base_worktree_path = match &flow.state {
+            merge::MergeFlowState::Clean {
+                base_worktree_path, ..
+            }
+            | merge::MergeFlowState::Conflicted {
+                base_worktree_path, ..
+            } => base_worktree_path.clone(),
+            merge::MergeFlowState::Error {
+                abortable_worktree: Some(path),
+                ..
+            } => path.clone(),
+            merge::MergeFlowState::Running
+            | merge::MergeFlowState::AlreadyUpToDate { .. }
+            | merge::MergeFlowState::Error {
+                abortable_worktree: None,
+                ..
+            } => {
+                self.merge_flow = None;
+                cx.notify();
+                return;
+            }
+        };
+        self.merge_op_in_flight = true;
+        cx.notify();
+        let session_id = flow.session_id;
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { wt_core::merge::abort_merge(&base_worktree_path) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.merge_op_in_flight = false;
+                if this.merge_flow.as_ref().map(|flow| flow.session_id) == Some(session_id) {
+                    match result {
+                        Ok(()) => this.merge_flow = None,
+                        Err(err) => {
+                            let abortable_worktree =
+                                wt_core::merge::find_in_progress_merge(&this.repo_path).ok().flatten();
+                            if let Some(flow) = this.merge_flow.as_mut() {
+                                flow.state = merge::MergeFlowState::Error {
+                                    message: format!(
+                                        "abort failed - the repository may still be mid-merge: {err}"
+                                    ),
+                                    abortable_worktree,
+                                };
+                            }
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self._merge_task = Some(task);
+    }
+
+    /// Surface D's `Dismiss` action on a real `Error` state - UI-only: clears
+    /// [`Self::merge_flow`] without running any further git command, since the real
+    /// repository state at that point is exactly whatever the last real `wt_core::merge` call
+    /// left it as (see `merge::MergeFlowState::Error`'s docs) and remains inspectable/
+    /// recoverable through a real terminal in that worktree either way. When a real merge is
+    /// still genuinely in progress (`abortable_worktree: Some(_)`), Surface D also offers a
+    /// real `Abort merge` action right next to this one (`Self::abort_merge_flow`) - `Dismiss`
+    /// itself deliberately never runs a git command on its own.
+    fn dismiss_merge_error(&mut self, cx: &mut Context<Self>) {
+        self.merge_flow = None;
         self.prune_confirm_armed = false;
         cx.notify();
     }
@@ -815,7 +1265,7 @@ impl AdeApp {
         };
         let kind = session.kind;
         let cwd = session.cwd.clone();
-        self.sessions.close(id, cx);
+        self.close_session(id, cx);
         self.sessions.spawn(kind, cwd, cx);
         self.prune_confirm_armed = false;
         cx.notify();
@@ -2495,7 +2945,7 @@ impl AdeApp {
                             .on_click(cx.listener(
                                 move |this, _event: &ClickEvent, _window, cx| {
                                     cx.stop_propagation();
-                                    this.sessions.close(id, cx);
+                                    this.close_session(id, cx);
                                     cx.notify();
                                 },
                             )),
@@ -2593,8 +3043,56 @@ impl AdeApp {
                     .child(worktree_path),
             )
             .child(render_status_pill(status_value))
-            .child(render_merge_button())
+            .child(self.render_merge_button(id, cx))
             .child(self.render_archive_button(id, cx))
+    }
+
+    /// The context bar's real `Merge` button - see [`Self::start_merge`]'s docs for the real
+    /// `wt_core::merge::attempt_merge` call it starts. Disabled (dimmed, non-interactive - the
+    /// design's own "Accept file" precedent: "dimmed ... never a button that looks clickable
+    /// but silently does nothing") whenever *any* merge flow is already active, own session or
+    /// not (`Self::start_merge`'s docs on why only one runs at a time), and shows `Merging…`
+    /// in place of `Merge` while this specific session's own attempt is the one running.
+    fn render_merge_button(&self, id: SessionId, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_for_this_session = self
+            .merge_flow
+            .as_ref()
+            .is_some_and(|flow| flow.session_id == id);
+        let running = active_for_this_session
+            && matches!(
+                self.merge_flow.as_ref().map(|flow| &flow.state),
+                Some(merge::MergeFlowState::Running)
+            );
+        let disabled = self.merge_flow.is_some();
+        let label = if running { "Merging\u{2026}" } else { "Merge" };
+
+        let base = div()
+            .id(("context-bar-merge", id))
+            .flex_none()
+            .h(px(20.0))
+            .px(px(8.0))
+            .rounded(theme::radius::BUTTON)
+            .border_1()
+            .flex()
+            .items_center()
+            .font(font(theme::font::SANS))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(px(10.5))
+            .child(label);
+
+        if disabled {
+            base.cursor_default()
+                .border_color(theme::border::BUTTON_DISABLED)
+                .text_color(theme::text::GHOSTER)
+        } else {
+            base.cursor_pointer()
+                .border_color(theme::border::BUTTON)
+                .text_color(theme::text::SECONDARY)
+                .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    this.start_merge(id, cx);
+                }))
+        }
     }
 
     /// The context bar's real `Archive` button - see [`Self::archive_session`]'s docs.
@@ -3450,9 +3948,14 @@ impl AdeApp {
             .child(self.render_tab_strip(cx));
 
         match self.sessions.active() {
-            Some(session) => surface
-                .child(self.render_session_context_bar(session, cx))
-                .child(
+            Some(session) => {
+                let body = if self
+                    .merge_flow
+                    .as_ref()
+                    .is_some_and(|flow| flow.session_id == session.id)
+                {
+                    self.render_merge_flow_surface(session, cx)
+                } else {
                     div()
                         .id("pty-surface")
                         .flex()
@@ -3471,8 +3974,13 @@ impl AdeApp {
                                 .overflow_hidden()
                                 .child(session.pane.clone().into_any_element()),
                         )
-                        .child(self.render_pty_footer(session, cx)),
-                ),
+                        .child(self.render_pty_footer(session, cx))
+                        .into_any_element()
+                };
+                surface
+                    .child(self.render_session_context_bar(session, cx))
+                    .child(body)
+            }
             None => surface.child(
                 div()
                     .flex()
@@ -3487,6 +3995,686 @@ impl AdeApp {
             ),
         }
         .into_any_element()
+    }
+
+    /// Surface D - the real merge-conflict resolution surface (`design_handoff_jerry_ade/
+    /// README.md`'s "Surface D — merge conflict"), replacing the pty/diff body below the tab
+    /// strip and session context bar (which both keep rendering normally - only the body
+    /// changes) exactly like Surface B/C already do. Renders whichever real
+    /// [`merge::MergeFlowState`] `self.merge_flow` is currently in for `session`; every value
+    /// shown here (branch names, file paths, conflict line content) comes from the real
+    /// `wt_core::merge` call `Self::start_merge` made, never fabricated sample data.
+    ///
+    /// Deliberate simplifications vs. the design's full mockup, all honest rather than faked:
+    /// no per-line gutter numbers (a `ConflictHunk`'s `ours`/`theirs` lines aren't tied to real
+    /// original file line numbers once extracted from the markers - inventing incrementing
+    /// numbers here would be exactly the kind of fabricated-looking-real data this project's
+    /// conventions forbid); the left ("ours"/base) column is labelled with the real base branch
+    /// name rather than an agent identity, since `wt_core::merge::attempt_merge` always runs
+    /// `git merge` from the base worktree - the base branch is real git state, not a running
+    /// session, so it has no real agent to attribute the tint to (see [`Self::start_merge`]'s
+    /// docs for the plumbing this reflects).
+    fn render_merge_flow_surface(
+        &self,
+        session: &Session,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(flow) = self.merge_flow.as_ref() else {
+            return Empty.into_any_element();
+        };
+
+        let container = || {
+            div()
+                .id("merge-surface")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .overflow_hidden()
+                .bg(theme::surface::CENTER)
+        };
+
+        match &flow.state {
+            merge::MergeFlowState::Running => container()
+                .items_center()
+                .justify_center()
+                .font(font(theme::font::SANS))
+                .text_size(px(11.5))
+                .text_color(theme::text::FAINT)
+                .child("merging\u{2026}")
+                .into_any_element(),
+
+            merge::MergeFlowState::AlreadyUpToDate { base_branch } => container()
+                .child(self.render_merge_message(
+                    format!("Already up to date with {base_branch}"),
+                    "This branch contributes nothing new - there was nothing to merge.".to_string(),
+                    None,
+                    cx,
+                ))
+                .into_any_element(),
+
+            merge::MergeFlowState::Error {
+                message,
+                abortable_worktree,
+            } => container()
+                .child(self.render_merge_message(
+                    "Merge failed".to_string(),
+                    message.clone(),
+                    abortable_worktree.clone(),
+                    cx,
+                ))
+                .into_any_element(),
+
+            merge::MergeFlowState::Clean {
+                base_branch, files, ..
+            } => container()
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .p(px(14.0))
+                        .child(
+                            div()
+                                .font(font(theme::font::SANS))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_size(px(12.5))
+                                .text_color(theme::text::HEADING)
+                                .child(format!("Clean merge into {base_branch}")),
+                        )
+                        .child(
+                            div()
+                                .font(font(theme::font::SANS))
+                                .text_size(px(11.0))
+                                .text_color(theme::text::FAINT)
+                                .child(if files.is_empty() {
+                                    "No files changed.".to_string()
+                                } else {
+                                    format!("{} file(s) staged, not yet committed.", files.len())
+                                }),
+                        )
+                        .children(files.iter().map(|path| {
+                            div()
+                                .font(font(theme::font::MONO))
+                                .text_size(px(11.0))
+                                .text_color(theme::text::SECONDARY)
+                                .child(path.display().to_string())
+                        })),
+                )
+                .child(div().flex_1())
+                .child(self.render_merge_flow_footer(true, self.merge_op_in_flight, cx))
+                .into_any_element(),
+
+            merge::MergeFlowState::Conflicted {
+                base_branch,
+                clean_files,
+                files,
+                active_file,
+                active_hunk,
+                ..
+            } => {
+                let resolved = merge::all_resolved(files);
+                let mut body = container().child(self.render_merge_header(
+                    base_branch,
+                    files,
+                    *active_file,
+                    *active_hunk,
+                ));
+
+                let auto = clean_files.len();
+                let total = clean_files.len() + files.len();
+                let remaining = files
+                    .iter()
+                    .filter(|entry| match entry {
+                        ConflictedPath::Text(file) => !file.is_resolved(),
+                        ConflictedPath::Unmergeable { .. } => true,
+                    })
+                    .count();
+                body = body.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .px(px(14.0))
+                        .py(px(8.0))
+                        .bg(theme::status::REVIEW_BG)
+                        .border_b_1()
+                        .border_color(theme::border::INNER)
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(5.0))
+                                .h(px(5.0))
+                                .rounded_full()
+                                .bg(theme::status::REVIEW),
+                        )
+                        .child(
+                            div()
+                                .font(font(theme::font::SANS))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_size(px(11.0))
+                                .text_color(theme::status::REVIEW)
+                                .child(format!("Jerry auto-resolved {auto} of {total} files")),
+                        )
+                        .child(
+                            div()
+                                .font(font(theme::font::SANS))
+                                .text_size(px(11.0))
+                                .text_color(theme::text::FAINT)
+                                .child(if remaining == 0 {
+                                    "every conflict is resolved.".to_string()
+                                } else {
+                                    format!("{remaining} file(s) still need you.")
+                                }),
+                        ),
+                );
+
+                if resolved {
+                    body = body.child(div().flex_1()).child(
+                        div()
+                            .flex_none()
+                            .p(px(14.0))
+                            .font(font(theme::font::SANS))
+                            .text_size(px(11.5))
+                            .text_color(theme::text::SECONDARY)
+                            .child(
+                                "Every conflict is resolved and staged - complete the merge below.",
+                            ),
+                    );
+                } else if let Some((target_file, target_hunk)) = merge::first_unresolved(files) {
+                    // `merge::first_unresolved` only ever points at a real
+                    // `ConflictedPath::Text` entry with a real remaining `Conflict` segment -
+                    // see that function's own docs - so both of these always match.
+                    if let Some(ConflictedPath::Text(file)) = files.get(target_file) {
+                        if let Some(ConflictSegment::Conflict(hunk)) =
+                            file.segments.get(target_hunk)
+                        {
+                            body = body
+                                .child(self.render_conflict_columns(base_branch, session, hunk, cx))
+                                .child(self.render_take_both_row(cx));
+                        } else {
+                            body = body.child(div().flex_1());
+                        }
+                    } else {
+                        body = body.child(div().flex_1());
+                    }
+                } else {
+                    // Not resolved, but no real text hunk left to show either: every
+                    // remaining unresolved entry is a real modify/delete or binary conflict
+                    // this app has no text-hunk resolution action for - see
+                    // `crate::merge::unmergeable_paths`'s docs. A distinct, honest panel
+                    // (never silently falling through to "conflicts resolved").
+                    body =
+                        body.child(self.render_unmergeable_panel(merge::unmergeable_paths(files)));
+                }
+
+                body.child(self.render_merge_flow_footer(resolved, self.merge_op_in_flight, cx))
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// Surface D's header row: `Resolve merge`, the real base branch, and `hunk X of Y` for
+    /// whichever file/hunk is currently active - `crate::merge::hunk_position_in_file`/
+    /// `crate::merge::hunk_count`'s real, computed positions, not a hardcoded label.
+    fn render_merge_header(
+        &self,
+        base_branch: &str,
+        files: &[ConflictedPath],
+        active_file: usize,
+        active_hunk: usize,
+    ) -> impl IntoElement {
+        let position_label = files.get(active_file).and_then(|entry| {
+            let ConflictedPath::Text(file) = entry else {
+                return None;
+            };
+            merge::hunk_position_in_file(file, active_hunk)
+                .map(|pos| format!("hunk {pos} of {}", merge::hunk_count(file)))
+        });
+
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(14.0))
+            .py(px(10.0))
+            .border_b_1()
+            .border_color(theme::border::INNER)
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(12.5))
+                    .text_color(theme::text::HEADING)
+                    .child("Resolve merge"),
+            )
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(11.5))
+                    .text_color(theme::text::DIM)
+                    .child(format!("into {base_branch}")),
+            )
+            .when_some(position_label, |el, label| {
+                el.child(
+                    div()
+                        .font(font(theme::font::SANS))
+                        .text_size(px(11.0))
+                        .text_color(theme::text::FAINTER)
+                        .child(label),
+                )
+            })
+    }
+
+    /// Surface D's real two-column split for the currently active conflict hunk - real
+    /// `ours`/`theirs` content extracted from the file's real on-disk conflict markers, never
+    /// simulated. See [`Self::render_merge_flow_surface`]'s docs for why the left column is
+    /// labelled with the real base branch rather than an agent identity.
+    fn render_conflict_columns(
+        &self,
+        base_branch: &str,
+        session: &Session,
+        hunk: &ConflictHunk,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (agent_fg, agent_bg) = work_surface::agent_tint(session.kind);
+        let session_branch = self
+            .worktrees
+            .iter()
+            .find(|item| item.path == session.cwd)
+            .and_then(|item| item.branch.clone())
+            .unwrap_or_else(|| hunk.theirs_label.clone());
+
+        let column = |label: String,
+                      sub: String,
+                      lines: &[String],
+                      fg: gpui::Rgba,
+                      take_id: &'static str,
+                      take_label: &'static str,
+                      choice: wt_core::merge::ConflictChoice,
+                      cx: &mut Context<Self>| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(28.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .px(px(12.0))
+                        .bg(theme::surface::HEADER)
+                        .border_b_1()
+                        .border_color(theme::border::INNER)
+                        .child(
+                            div()
+                                .font(font(theme::font::SANS))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_size(px(11.0))
+                                .text_color(theme::text::SECONDARY)
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .font(font(theme::font::MONO))
+                                .text_size(px(10.5))
+                                .text_color(theme::text::DIMMER)
+                                .child(sub),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .p(px(10.0))
+                        .font(font(theme::font::MONO))
+                        .text_size(px(11.5))
+                        .text_color(fg)
+                        .children(lines.iter().map(|line| {
+                            div().child(if line.is_empty() {
+                                "\u{a0}".to_string()
+                            } else {
+                                line.clone()
+                            })
+                        })),
+                )
+                .child(
+                    div()
+                        .id(take_id)
+                        .flex_none()
+                        .cursor_pointer()
+                        .m(px(10.0))
+                        .h(px(24.0))
+                        .px(px(11.0))
+                        .rounded(theme::radius::BUTTON)
+                        .border_1()
+                        .border_color(theme::border::BUTTON)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .font(font(theme::font::SANS))
+                        .text_size(px(11.0))
+                        .text_color(theme::text::SECONDARY)
+                        .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                        .child(take_label)
+                        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                            this.resolve_active_hunk(choice, cx);
+                        })),
+                )
+        };
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .border_r_1()
+                    .border_color(theme::border::ZONE)
+                    .child(column(
+                        base_branch.to_string(),
+                        hunk.ours_label.clone(),
+                        &hunk.ours,
+                        theme::text::SECONDARY,
+                        "take-left",
+                        "Take left",
+                        wt_core::merge::ConflictChoice::Left,
+                        cx,
+                    )),
+            )
+            .child(div().flex_1().min_w_0().bg(agent_bg).child(column(
+                session.kind.label().to_string(),
+                session_branch,
+                &hunk.theirs,
+                agent_fg,
+                "take-right",
+                "Take right",
+                wt_core::merge::ConflictChoice::Right,
+                cx,
+            )))
+    }
+
+    /// The real `Take both` action (`design_handoff_jerry_ade/README.md`'s Result strip -
+    /// "Jerry proposes the answer") on the currently active hunk - real, tested
+    /// `wt_core::merge::ConflictChoice::Both` (keeps *both* sides' lines, ours then theirs),
+    /// the same real function [`Self::render_conflict_columns`]'s own Take-left/Take-right
+    /// buttons call.
+    fn render_take_both_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .py(px(8.0))
+            .border_t_1()
+            .border_color(theme::border::ZONE)
+            .bg(theme::surface::FOOTER)
+            .child(
+                div()
+                    .id("take-both")
+                    .cursor_pointer()
+                    .h(px(24.0))
+                    .px(px(11.0))
+                    .rounded(theme::radius::BUTTON)
+                    .bg(theme::button::GREEN_BG)
+                    .flex()
+                    .items_center()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(11.0))
+                    .text_color(theme::button::GREEN_FG)
+                    .hover(|el| el.bg(theme::button::GREEN_BG_HOVER))
+                    .child("Take both")
+                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.resolve_active_hunk(wt_core::merge::ConflictChoice::Both, cx);
+                    })),
+            )
+    }
+
+    /// The real, distinct panel for [`wt_core::merge::ConflictedPath::Unmergeable`] entries -
+    /// modify/delete or binary conflicts this app has no text-hunk resolution action for (see
+    /// that type's docs). Deliberately never rendered as if these were resolved or as the
+    /// normal two-column text editor (there is no real hunk to show for either reason) -
+    /// lists each real path and reason, and points at a real terminal as the honest way to
+    /// resolve them by hand, matching this app's own established fallback for other real
+    /// gaps (e.g. `crate::work_surface::ActionKind::Unimplemented`'s own "no fake action"
+    /// precedent).
+    fn render_unmergeable_panel(
+        &self,
+        paths: Vec<(&std::path::Path, wt_core::merge::UnmergeableReason)>,
+    ) -> impl IntoElement {
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .p(px(14.0))
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(12.0))
+                    .text_color(theme::text::HEADING)
+                    .child("Needs manual resolution"),
+            )
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .text_size(px(11.0))
+                    .text_color(theme::text::FAINT)
+                    .child(
+                        "Jerry has no automatic resolution for these - resolve them in a real \
+                         terminal in this worktree, then reopen Merge.",
+                    ),
+            )
+            .children(paths.into_iter().map(|(path, reason)| {
+                let reason_label = match reason {
+                    wt_core::merge::UnmergeableReason::ModifyDelete => {
+                        "modified on one side, deleted on the other"
+                    }
+                    wt_core::merge::UnmergeableReason::Binary => "binary content conflict",
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(11.0))
+                            .text_color(theme::text::SECONDARY)
+                            .child(path.display().to_string()),
+                    )
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .text_size(px(10.5))
+                            .text_color(theme::text::FAINTER)
+                            .child(reason_label),
+                    )
+            }))
+    }
+
+    /// Surface D's footer: `Complete merge` (real `git commit`, enabled only once
+    /// `resolved`) and `Abort merge` (real `git merge --abort`, always available while a flow
+    /// is active) - see [`Self::complete_merge_flow`]/[`Self::abort_merge_flow`]'s docs.
+    /// `in_flight` (`Self::merge_op_in_flight`) dims and disables both while a real background
+    /// commit/abort from a previous click is still running, so a second click can't spawn a
+    /// second, racing real git operation (defense in depth alongside the guard clause each of
+    /// those methods already has - see their docs).
+    fn render_merge_flow_footer(
+        &self,
+        resolved: bool,
+        in_flight: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let complete = div()
+            .id("merge-complete")
+            .flex_none()
+            .h(px(24.0))
+            .px(px(11.0))
+            .rounded(theme::radius::BUTTON)
+            .flex()
+            .items_center()
+            .font(font(theme::font::SANS))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(px(11.0));
+        let complete = if resolved && !in_flight {
+            complete
+                .cursor_pointer()
+                .bg(theme::button::GREEN_BG)
+                .text_color(theme::button::GREEN_FG)
+                .hover(|el| el.bg(theme::button::GREEN_BG_HOVER))
+                .child("Complete merge")
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.complete_merge_flow(cx);
+                }))
+        } else {
+            complete
+                .cursor_default()
+                .bg(theme::border::BUTTON_DISABLED)
+                .text_color(theme::text::GHOSTER)
+                .child(if in_flight {
+                    "Completing\u{2026}"
+                } else {
+                    "Complete merge"
+                })
+        };
+
+        let abort = div()
+            .id("merge-abort")
+            .flex_none()
+            .h(px(24.0))
+            .px(px(11.0))
+            .rounded(theme::radius::BUTTON)
+            .flex()
+            .items_center()
+            .font(font(theme::font::SANS))
+            .text_size(px(11.0));
+        let abort = if in_flight {
+            abort
+                .cursor_default()
+                .text_color(theme::text::GHOSTER)
+                .child("Abort merge")
+        } else {
+            abort
+                .cursor_pointer()
+                .text_color(theme::button::DANGER_FG)
+                .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                .child("Abort merge")
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.abort_merge_flow(cx);
+                }))
+        };
+
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px(8.0))
+            .px(px(14.0))
+            .py(px(10.0))
+            .border_t_1()
+            .border_color(theme::border::INNER)
+            .bg(theme::surface::FOOTER)
+            .child(abort)
+            .child(complete)
+    }
+
+    /// A simple real-message panel (`AlreadyUpToDate`/`Error` states) - a title, the real
+    /// message text, a real `Abort merge` action when `abortable_worktree` is `Some` (a real
+    /// merge is genuinely still in progress there - see `merge::MergeFlowState::Error`'s
+    /// docs), and a `Dismiss` action that clears [`Self::merge_flow`] without touching git.
+    fn render_merge_message(
+        &self,
+        title: String,
+        message: String,
+        abortable_worktree: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(8.0))
+            .p(px(20.0))
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(13.0))
+                    .text_color(theme::text::HEADING)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .max_w(px(480.0))
+                    .font(font(theme::font::SANS))
+                    .text_size(px(11.5))
+                    .text_color(theme::text::FAINT)
+                    .child(message),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .mt(px(6.0))
+                    .when(abortable_worktree.is_some(), |el| {
+                        el.child(
+                            div()
+                                .id("merge-message-abort")
+                                .cursor_pointer()
+                                .h(px(24.0))
+                                .px(px(11.0))
+                                .rounded(theme::radius::BUTTON)
+                                .flex()
+                                .items_center()
+                                .font(font(theme::font::SANS))
+                                .text_size(px(11.0))
+                                .text_color(theme::button::DANGER_FG)
+                                .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                                .child("Abort merge")
+                                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                    this.abort_merge_flow(cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("merge-dismiss")
+                            .cursor_pointer()
+                            .h(px(24.0))
+                            .px(px(11.0))
+                            .rounded(theme::radius::BUTTON)
+                            .border_1()
+                            .border_color(theme::border::BUTTON)
+                            .flex()
+                            .items_center()
+                            .font(font(theme::font::SANS))
+                            .text_size(px(11.0))
+                            .text_color(theme::text::SECONDARY)
+                            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                            .child("Dismiss")
+                            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                this.dismiss_merge_error(cx);
+                            })),
+                    ),
+            )
     }
 
     /// The centre's real single-file diff surface, opened by a Changes row click - a toolbar
@@ -4137,31 +5325,71 @@ fn render_status_pill(status: Status) -> impl IntoElement {
         )
 }
 
-/// The context bar's `Merge` action - honestly, visibly disabled. `wt_core`'s only mutating
-/// entry points are `add_worktree`/`remove_worktree` (verified: `crates/wt-core/src/lib.rs`) -
-/// there is no merge/rebase/fast-forward operation to wire this to yet, and faking one (or
-/// reimplementing a real merge flow just for this button) is out of scope for this phase.
-/// Rendered with the design's own "dimmed, real-disabled" treatment
-/// (`design_handoff_jerry_ade/README.md`'s own precedent for `Accept file`: "dimmed ... when
-/// there is nothing to accept ... never a button that looks clickable but silently does
-/// nothing") instead of the mockup's default-active outline styling, and deliberately has no
-/// `.cursor_pointer()`/`.hover()`/`.on_click()` at all.
-fn render_merge_button() -> impl IntoElement {
-    div()
-        .flex_none()
-        .cursor_default()
-        .h(px(20.0))
-        .px(px(8.0))
-        .rounded(theme::radius::BUTTON)
-        .border_1()
-        .border_color(theme::border::BUTTON_DISABLED)
-        .flex()
-        .items_center()
-        .font(font(theme::font::SANS))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_size(px(10.5))
-        .text_color(theme::text::GHOSTER)
-        .child("Merge")
+/// Builds a real [`merge::MergeFlowState::Error`] for `message`, best-effort populating
+/// `abortable_worktree` via [`wt_core::merge::find_in_progress_merge`] - real ground truth
+/// ("does the repository's base worktree genuinely have `MERGE_HEAD` set right now"), not an
+/// assumption that a merge is (or isn't) in progress just because *this* call happened to
+/// fail. If `find_in_progress_merge` itself also fails, `abortable_worktree` is `None` (no
+/// worse than not offering the abort action at all - never compounds one real error into a
+/// second, confusing one).
+fn merge_error_state(repo_path: &std::path::Path, message: String) -> merge::MergeFlowState {
+    let abortable_worktree = wt_core::merge::find_in_progress_merge(repo_path)
+        .ok()
+        .flatten();
+    merge::MergeFlowState::Error {
+        message,
+        abortable_worktree,
+    }
+}
+
+/// Runs one real `wt_core::merge::attempt_merge` and folds its `Result<(MergeStart,
+/// MergeOutcome), Error>` into a [`merge::MergeFlowState`] - a free function (not an `AdeApp`
+/// method) so it can run entirely inside `cx.background_executor().spawn`, per this crate's
+/// own established `load_diff`/`load_worktrees` convention of doing the real blocking I/O and
+/// its result-shaping together, off the GPUI foreground thread. For a real
+/// [`wt_core::merge::MergeOutcome::Conflicted`], this also classifies every conflicted path's
+/// real state (`wt_core::merge::classify_conflicted_file` - real text conflict vs. a real
+/// modify/delete or binary conflict this app has no text-hunk resolution for, see that
+/// function's docs) here, still off-thread, rather than leaving that as a second round-trip.
+fn run_merge_attempt(
+    repo_path: &std::path::Path,
+    worktree_path: &std::path::Path,
+) -> merge::MergeFlowState {
+    let (start, outcome) = match wt_core::merge::attempt_merge(repo_path, worktree_path) {
+        Ok(result) => result,
+        Err(err) => return merge_error_state(repo_path, err.to_string()),
+    };
+    match outcome {
+        wt_core::merge::MergeOutcome::AlreadyUpToDate => merge::MergeFlowState::AlreadyUpToDate {
+            base_branch: start.base_branch,
+        },
+        wt_core::merge::MergeOutcome::Clean { files } => merge::MergeFlowState::Clean {
+            base_branch: start.base_branch,
+            base_worktree_path: start.base_worktree_path,
+            files,
+        },
+        wt_core::merge::MergeOutcome::Conflicted {
+            conflicted_files,
+            clean_files,
+        } => {
+            let mut files = Vec::with_capacity(conflicted_files.len());
+            for path in &conflicted_files {
+                match wt_core::merge::classify_conflicted_file(&start.base_worktree_path, path) {
+                    Ok(classified) => files.push(classified),
+                    Err(err) => return merge_error_state(repo_path, err.to_string()),
+                }
+            }
+            let (active_file, active_hunk) = merge::first_unresolved(&files).unwrap_or((0, 0));
+            merge::MergeFlowState::Conflicted {
+                base_branch: start.base_branch,
+                base_worktree_path: start.base_worktree_path,
+                clean_files,
+                files,
+                active_file,
+                active_hunk,
+            }
+        }
+    }
 }
 
 /// One flat-circle window-control button (see `AdeApp::render_window_controls`'s docs for
@@ -6112,5 +7340,323 @@ mod settings_focus_tests {
                 "{kind:?} should have a real row after a real $PATH search"
             );
         }
+    }
+}
+
+/// Real, interactive regression coverage for the two round-2-audit bugs the round-1 fix for
+/// the Complete-vs-Abort race (`AdeApp::merge_op_in_flight`'s own docs) introduced: both
+/// [`AdeApp::clear_merge_flow_for_closed_session`] and [`AdeApp::resolve_active_hunk`] used to
+/// funnel their own background task into a field a *different* real, in-flight merge
+/// background task also used ([`AdeApp::_merge_task`] and a since-removed single-slot
+/// `_merge_write_task` respectively) - and dropping a GPUI `Task` cancels it immediately
+/// (`vendor/zed/crates/scheduler/src/executor.rs`), so the second task to land silently
+/// cancelled the first one's real git operation. Exercised against real git repositories in
+/// tempdirs (`init_repo`/`add_worktree`, the same idiom `wt_core::merge`'s own test module
+/// uses) through a real `AdeApp` in a real (test) GPUI window, driven by GPUI's deterministic
+/// test executor: `cx.run_until_parked()` is called only where the test deliberately wants a
+/// pending background task to actually finish, so that calling a second `AdeApp` method
+/// in between two `run_until_parked()` calls reliably lands *while the first task is still
+/// in flight* rather than racing it - reproducing the two bugs deterministically rather than
+/// relying on real wall-clock timing.
+#[cfg(test)]
+mod merge_regression_tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use std::fs;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "user.name", "Test User"]);
+        fs::write(dir.path().join("base.txt"), "base\n").expect("write");
+        git(dir.path(), &["add", "base.txt"]);
+        git(dir.path(), &["commit", "-m", "initial"]);
+        dir
+    }
+
+    /// Same real-linked-worktree idiom as `wt_core::merge`'s own test module.
+    fn add_worktree(repo_path: &std::path::Path, branch: &str, name: &str) -> PathBuf {
+        let container = TempDir::new().expect("tempdir");
+        let path = container.path().join(name);
+        drop(container);
+        git(
+            repo_path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                path.to_str().expect("utf8 path"),
+            ],
+        );
+        path
+    }
+
+    fn status(dir: &std::path::Path) -> String {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Regression test for Bug 1 (the critical one): closing/archiving the session mid-`Complete
+    /// merge` used to cancel that real, in-flight `git commit` (via the shared `_merge_task`
+    /// slot `clear_merge_flow_for_closed_session` also wrote to) and permanently strand
+    /// `merge_op_in_flight` at `true` - see this module's own docs, and
+    /// `AdeApp::clear_merge_flow_for_closed_session`'s docs, for the exact mechanism.
+    #[gpui::test]
+    fn close_session_during_in_flight_complete_merge_lets_the_commit_finish(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let feature = add_worktree(repo.path(), "feature", "feature-wt");
+        fs::write(feature.join("new.txt"), "from feature\n").expect("write");
+        git(&feature, &["add", "new.txt"]);
+        git(&feature, &["commit", "-m", "feature commit"]);
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let feature_session_id = app.update(cx, |app, cx| {
+            app.sessions.spawn(SessionKind::Shell, feature.clone(), cx)
+        });
+
+        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let flow = app
+                .merge_flow
+                .as_ref()
+                .expect("merge_flow after start_merge");
+            assert_eq!(flow.session_id, feature_session_id);
+            assert!(
+                matches!(flow.state, merge::MergeFlowState::Clean { .. }),
+                "seed setup should produce a clean (no-conflict) merge, ready for Complete"
+            );
+        });
+
+        // Click Complete - this synchronously sets `merge_op_in_flight` and spawns the real
+        // `git commit` onto the background executor, but the deterministic test executor
+        // doesn't run it until the next `run_until_parked()`/similar below.
+        app.update(cx, |app, cx| app.complete_merge_flow(cx));
+        assert!(
+            app.read_with(cx, |app, _| app.merge_op_in_flight),
+            "merge_op_in_flight should be set synchronously by complete_merge_flow"
+        );
+
+        // Before that commit has actually run, close (archive) the session it belongs to -
+        // exactly the "click Complete, then immediately click Archive/the tab x" race from the
+        // bug report.
+        app.update(cx, |app, cx| app.close_session(feature_session_id, cx));
+
+        // Now let both the pending real `git commit` and its completion handler actually run.
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app.merge_op_in_flight),
+            "merge_op_in_flight must not be permanently stranded at true - the real commit's \
+             own completion handler must still run to reset it, since closing the session must \
+             not cancel that in-flight task"
+        );
+
+        assert!(
+            !wt_core::merge::merge_head_exists(repo.path()).expect("merge_head_exists"),
+            "MERGE_HEAD must be gone - the merge must have genuinely completed (committed), not \
+             been discarded by a competing abort"
+        );
+        assert_eq!(
+            status(repo.path()),
+            "",
+            "the base worktree must be clean after a real, completed commit"
+        );
+        assert!(
+            repo.path().join("new.txt").is_file(),
+            "the resolved/merged content must genuinely be present on disk - not discarded"
+        );
+    }
+
+    /// The same regression, but asserting the *second* half explicitly: immediately starting a
+    /// brand-new merge after the close-during-complete race must find a real, clean repository
+    /// (not one still wedged mid-merge from a cancelled commit racing an abort).
+    #[gpui::test]
+    fn close_session_during_in_flight_complete_merge_leaves_repo_usable_for_a_new_merge(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let feature = add_worktree(repo.path(), "feature", "feature-wt");
+        fs::write(feature.join("new.txt"), "from feature\n").expect("write");
+        git(&feature, &["add", "new.txt"]);
+        git(&feature, &["commit", "-m", "feature commit"]);
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let feature_session_id = app.update(cx, |app, cx| {
+            app.sessions.spawn(SessionKind::Shell, feature.clone(), cx)
+        });
+
+        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        cx.run_until_parked();
+        app.update(cx, |app, cx| app.complete_merge_flow(cx));
+        app.update(cx, |app, cx| app.close_session(feature_session_id, cx));
+        cx.run_until_parked();
+
+        // A second, independent worktree/session/merge against the same base repo must work
+        // normally - proof the repo was left in a real, clean, usable state rather than wedged.
+        let second_feature = add_worktree(repo.path(), "second-feature", "second-feature-wt");
+        fs::write(second_feature.join("more.txt"), "more work\n").expect("write");
+        git(&second_feature, &["add", "more.txt"]);
+        git(&second_feature, &["commit", "-m", "second feature commit"]);
+
+        let second_session_id = app.update(cx, |app, cx| {
+            app.sessions
+                .spawn(SessionKind::Shell, second_feature.clone(), cx)
+        });
+        app.update(cx, |app, cx| app.start_merge(second_session_id, cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let flow = app
+                .merge_flow
+                .as_ref()
+                .expect("merge_flow after second start_merge");
+            assert_eq!(flow.session_id, second_session_id);
+            assert!(
+                matches!(flow.state, merge::MergeFlowState::Clean { .. }),
+                "a real, independent merge must succeed cleanly on the now-clean repo, not hit \
+                 a stale MERGE_HEAD left behind by the earlier race"
+            );
+        });
+        app.update(cx, |app, cx| app.complete_merge_flow(cx));
+        cx.run_until_parked();
+        assert!(!app.read_with(cx, |app, _| app.merge_op_in_flight));
+        assert!(!wt_core::merge::merge_head_exists(repo.path()).expect("merge_head_exists"));
+        assert!(repo.path().join("more.txt").is_file());
+    }
+
+    /// Regression test for Bug 2: resolving two different conflicted files' last hunk
+    /// back-to-back (e.g. via Take-both) used to cancel the first file's real background write
+    /// (`wt_core::merge::write_resolved_file`) via a shared single-slot `_merge_write_task`,
+    /// leaving real conflict markers on disk for the first file while the in-memory model
+    /// already reported it resolved. See `AdeApp::resolve_active_hunk`'s docs and this module's
+    /// own docs for the exact mechanism.
+    #[gpui::test]
+    fn resolving_two_files_back_to_back_writes_both_to_disk_without_cancelling_either(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        fs::write(repo.path().join("a.txt"), "line1\nline2\nline3\n").expect("write");
+        fs::write(repo.path().join("b.txt"), "line1\nline2\nline3\n").expect("write");
+        git(repo.path(), &["add", "a.txt", "b.txt"]);
+        git(repo.path(), &["commit", "-m", "seed a.txt and b.txt"]);
+
+        let feature = add_worktree(repo.path(), "feature", "feature-wt");
+        fs::write(repo.path().join("a.txt"), "line1\nBASE CHANGED A\nline3\n").expect("write");
+        fs::write(repo.path().join("b.txt"), "line1\nBASE CHANGED B\nline3\n").expect("write");
+        git(
+            repo.path(),
+            &["commit", "-am", "base changes a.txt and b.txt"],
+        );
+
+        fs::write(feature.join("a.txt"), "line1\nFEATURE CHANGED A\nline3\n").expect("write");
+        fs::write(feature.join("b.txt"), "line1\nFEATURE CHANGED B\nline3\n").expect("write");
+        git(
+            &feature,
+            &["commit", "-am", "feature changes a.txt and b.txt"],
+        );
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let feature_session_id = app.update(cx, |app, cx| {
+            app.sessions.spawn(SessionKind::Shell, feature.clone(), cx)
+        });
+
+        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let flow = app
+                .merge_flow
+                .as_ref()
+                .expect("merge_flow after start_merge");
+            let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
+                panic!("expected a conflicted merge");
+            };
+            assert_eq!(files.len(), 2, "both a.txt and b.txt should be conflicted");
+        });
+
+        // Resolve the first active file's only hunk via Take-both - this spawns a real
+        // background write for it, but the deterministic test executor holds it pending until
+        // the next `run_until_parked()`.
+        app.update(cx, |app, cx| {
+            app.resolve_active_hunk(wt_core::merge::ConflictChoice::Both, cx);
+        });
+
+        // Before that first write has actually run, resolve the *second* file's only hunk too
+        // - exactly the back-to-back Take-both race from the bug report. This must not cancel
+        // the first file's still-pending write.
+        app.update(cx, |app, cx| {
+            app.resolve_active_hunk(wt_core::merge::ConflictChoice::Both, cx);
+        });
+
+        app.read_with(cx, |app, _| {
+            let flow = app.merge_flow.as_ref().expect("merge_flow still present");
+            let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
+                panic!("expected a conflicted merge");
+            };
+            assert!(
+                merge::all_resolved(files),
+                "both files should be fully resolved in-memory after two Take-both clicks"
+            );
+        });
+
+        // Now let both pending real background writes actually run.
+        cx.run_until_parked();
+
+        let a_on_disk = fs::read_to_string(repo.path().join("a.txt")).expect("read a.txt");
+        let b_on_disk = fs::read_to_string(repo.path().join("b.txt")).expect("read b.txt");
+        assert!(
+            !a_on_disk.contains("<<<<<<<"),
+            "a.txt must be genuinely marker-free on disk, not left mid-conflict by a cancelled \
+             write: {a_on_disk:?}"
+        );
+        assert!(
+            !b_on_disk.contains("<<<<<<<"),
+            "b.txt must be genuinely marker-free on disk, not left mid-conflict by a cancelled \
+             write: {b_on_disk:?}"
+        );
+
+        let real_status = status(repo.path());
+        assert!(
+            !real_status.contains('U'),
+            "git status must show no remaining unmerged (U) entries for either file: \
+             {real_status:?}"
+        );
+
+        // Real defense-in-depth proof: the merge can actually be completed now (both files are
+        // genuinely staged and resolved on disk, not just in the in-memory model).
+        app.update(cx, |app, cx| app.complete_merge_flow(cx));
+        cx.run_until_parked();
+        assert!(
+            !wt_core::merge::merge_head_exists(repo.path()).expect("merge_head_exists"),
+            "the merge should have completed successfully now that both files are genuinely \
+             resolved on disk"
+        );
     }
 }

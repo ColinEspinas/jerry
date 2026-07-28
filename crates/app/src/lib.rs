@@ -12,6 +12,7 @@ pub mod changes;
 pub mod file_tree;
 pub mod fonts;
 pub mod layout;
+pub mod merge;
 pub mod palette;
 pub mod rail;
 pub mod root;

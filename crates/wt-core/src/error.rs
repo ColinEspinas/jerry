@@ -93,4 +93,87 @@ pub enum Error {
         "worktree at {path} has uncommitted changes (tracked or untracked); pass force=true to remove it anyway"
     )]
     DirtyWorktree { path: PathBuf },
+
+    /// [`crate::merge::attempt_merge`] could not detect any default/base branch to merge
+    /// into (same "no fabricated answer" contract as [`crate::diff::DiffBase::NoBaseFound`]).
+    #[error("no default/base branch could be detected for this repository")]
+    MergeNoBaseBranch,
+
+    /// The session worktree's own branch *is* the detected base branch - there is nothing
+    /// meaningful to merge.
+    #[error("worktree is already on the base branch {branch:?}; nothing to merge")]
+    MergeSourceIsBaseBranch { branch: String },
+
+    /// The session worktree's `HEAD` is detached (no branch checked out), so there is no
+    /// branch name to hand to `git merge`.
+    #[error("worktree at {path} has no branch checked out (detached HEAD); nothing to merge")]
+    MergeSourceDetached { path: PathBuf },
+
+    /// The detected base branch is not checked out in *any* worktree of this repository, so
+    /// there is nowhere to run `git merge` from - see `crate::merge`'s module docs for why a
+    /// worktree already checked out on the base branch is required (a branch checked out in
+    /// one worktree can never be checked out, even temporarily, in another).
+    #[error(
+        "base branch {branch:?} is not checked out in any worktree; check it out somewhere \
+         before merging into it"
+    )]
+    MergeBaseBranchNotCheckedOut { branch: String },
+
+    /// Refused to attempt a merge because the worktree the merge would run in (the one with
+    /// the base branch checked out) has uncommitted changes: `git merge` would either refuse
+    /// outright or risk overwriting real, unrelated work in progress there.
+    #[error(
+        "worktree at {path} (base branch) has uncommitted changes; commit or discard them \
+         before merging"
+    )]
+    MergeTargetDirty { path: PathBuf },
+
+    /// A conflicted file's real on-disk content was not valid UTF-8, so its conflict markers
+    /// could not be parsed as text.
+    #[error("conflicted file {path} is not valid UTF-8; cannot parse its conflict markers")]
+    MergeConflictFileNotUtf8 { path: PathBuf },
+
+    /// A conflicted file's real conflict markers did not close (`<<<<<<<`/`=======`/
+    /// `>>>>>>>` all present and in order) - unexpected for a file `git merge` itself just
+    /// produced, but this module is a real *parser* of the file's real bytes, not a trusted
+    /// oracle, so a malformed file is reported rather than corrupting content on write-back.
+    #[error("conflicted file {path} has malformed/unterminated conflict markers")]
+    MergeMalformedConflictMarkers { path: PathBuf },
+
+    /// A conflicted file uses `diff3`-style conflict markers (`|||||||` base-content
+    /// section), which this parser does not understand - [`crate::merge::attempt_merge`]
+    /// always pins `merge.conflictStyle=merge` for merges it starts itself (see that
+    /// function's docs), so this should only ever arise from a merge some other tool started
+    /// with a different `merge.conflictStyle`.
+    #[error("conflicted file {path} uses diff3-style conflict markers, which are not supported")]
+    MergeUnsupportedConflictStyle { path: PathBuf },
+
+    /// [`crate::merge::resolve_hunk`] was asked to resolve a hunk index that either doesn't
+    /// exist in the file, or was already resolved (turned into an ordinary, non-conflicted
+    /// segment by an earlier call).
+    #[error("no unresolved conflict hunk at index {index} in {path}")]
+    MergeNoSuchHunk { path: PathBuf, index: usize },
+
+    /// [`crate::merge::write_resolved_file`] was called on a file that still has one or more
+    /// unresolved conflict hunks - writing it back to disk in that state would leave real
+    /// `<<<<<<<`/`=======`/`>>>>>>>` conflict markers in the file, which this refuses to do.
+    #[error("{path} still has unresolved conflict hunks; cannot write it back yet")]
+    MergeFileNotFullyResolved { path: PathBuf },
+
+    /// [`crate::merge::complete_merge`] was called on a worktree with no `MERGE_HEAD` at all -
+    /// there is no real in-progress merge to finish committing.
+    #[error("no merge is in progress at {path}; nothing to complete")]
+    MergeNotInProgress { path: PathBuf },
+
+    /// [`crate::merge::complete_merge`] was called while `git` still reports real unmerged
+    /// paths (`git diff --name-only --diff-filter=U`) - real defense in depth against
+    /// committing a merge the UI *believes* is fully resolved but isn't, e.g. a modify/delete
+    /// or binary conflict a caller's own conflict-marker-based "is this resolved" check can't
+    /// see (see [`crate::merge::ConflictedPath`]'s docs).
+    #[error(
+        "cannot complete the merge: {} file(s) are still unmerged: {}",
+        paths.len(),
+        paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+    )]
+    MergeFilesStillConflicted { paths: Vec<PathBuf> },
 }

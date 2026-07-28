@@ -339,7 +339,13 @@ pub fn merge_status_against_base(
 /// (rather than an `Err`): an undetectable default branch is a real, expected outcome (e.g. a
 /// repository with no `origin` remote and a default branch named something other than `main`
 /// or `master`), not a failure.
-fn detect_default_base(repo: &gix::Repository) -> Result<Option<(String, gix::ObjectId)>, Error> {
+///
+/// `pub(crate)` (not private): `crate::merge` reuses this exact detection logic to find the
+/// real base branch a session's worktree merges into, rather than reimplementing it - see
+/// that module's docs.
+pub(crate) fn detect_default_base(
+    repo: &gix::Repository,
+) -> Result<Option<(String, gix::ObjectId)>, Error> {
     if let Ok(mut origin_head) = repo.find_reference("refs/remotes/origin/HEAD") {
         if let gix::refs::TargetRef::Symbolic(name) = origin_head.target() {
             let full = name.as_bstr().to_string();

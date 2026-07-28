@@ -21,6 +21,7 @@
 
 pub mod diff;
 mod error;
+pub mod merge;
 
 pub use error::{Error, GitExit};
 
