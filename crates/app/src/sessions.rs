@@ -42,10 +42,35 @@ impl SessionKind {
     }
 
     fn spec(self, cwd: PathBuf) -> TerminalSpec {
+        // Reads through `agent_binary_name` (rather than matching `Claude`/`Codex` directly a
+        // second time) so it stays the one real source of truth for "what literal command name
+        // does this kind spawn" - see that method's docs. Falls back to a real shell rather than
+        // `.unwrap_or_default()`-ing to `""` if some future `SessionKind` variant were added
+        // without also being taught to `agent_binary_name`: spawning `""` would silently fail in
+        // a confusing way, while a shell session is at least a real, working process instead of
+        // a silent misspawn.
+        match self.agent_binary_name() {
+            Some(binary) => TerminalSpec::command(binary, Vec::new(), cwd),
+            None => TerminalSpec::shell(cwd),
+        }
+    }
+
+    /// The literal command name this kind's real process is spawned as (see [`Self::spec`],
+    /// which calls this directly) - `None` for [`SessionKind::Shell`], which resolves `$SHELL`
+    /// rather than a single fixed binary name, so "the binary name" has no single real answer
+    /// for it.
+    ///
+    /// Exposed (not just an internal implementation detail of `spec`) so `crate::settings`'s
+    /// real Settings › Agents page - which needs to know *what name a real `$PATH` search
+    /// should look for* to show a genuine ready/not-found status per agent - reads the exact
+    /// same literal this method already hands `TerminalSpec::command` at spawn time, rather
+    /// than maintaining a second, separately written `"claude"`/`"codex"` list that could
+    /// silently drift from what actually gets spawned.
+    pub fn agent_binary_name(self) -> Option<&'static str> {
         match self {
-            SessionKind::Shell => TerminalSpec::shell(cwd),
-            SessionKind::Claude => TerminalSpec::command("claude", Vec::new(), cwd),
-            SessionKind::Codex => TerminalSpec::command("codex", Vec::new(), cwd),
+            SessionKind::Shell => None,
+            SessionKind::Claude => Some("claude"),
+            SessionKind::Codex => Some("codex"),
         }
     }
 }

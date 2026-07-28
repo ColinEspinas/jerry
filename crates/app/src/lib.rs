@@ -16,6 +16,7 @@ pub mod palette;
 pub mod rail;
 pub mod root;
 pub mod sessions;
+pub mod settings;
 pub mod status;
 pub mod terminal_grid;
 pub mod terminal_pane;
@@ -56,10 +57,14 @@ pub fn run(repo_path: PathBuf) {
             // documented judgment call on how far its focus-priority interaction with a
             // focused terminal tab was verified). `cmd-k` follows the exact same
             // `actions!`/`KeyBinding` pattern for the command palette (see
-            // `crate::root::TogglePalette`'s docs).
+            // `crate::root::TogglePalette`'s docs). `cmd-,` follows it again for the
+            // Settings surface (see `crate::root::ToggleSettings`'s docs for the real
+            // `vendor/zed/assets/keymaps/default-macos.json` precedent this literal
+            // keystroke string was verified against).
             cx.bind_keys([
                 gpui::KeyBinding::new("cmd-n", root::NewSession, None),
                 gpui::KeyBinding::new("cmd-k", root::TogglePalette, None),
+                gpui::KeyBinding::new("cmd-,", root::ToggleSettings, None),
             ]);
 
             let bounds = Bounds::centered(None, size(px(1440.0), px(928.0)), cx);

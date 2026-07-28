@@ -48,6 +48,7 @@ use crate::rail::{
     self, ProjectChild, RailMode, SessionRow, StatusGroup, WorktreeEntry, WorktreeNote,
 };
 use crate::sessions::{Session, SessionId, SessionKind, Sessions};
+use crate::settings::{self, SettingsPage};
 use crate::status::{self, Status};
 use crate::theme;
 use crate::work_surface;
@@ -69,7 +70,14 @@ use crate::worktrees::{self, WorktreeItem};
 // `TogglePalette` (⌘K) follows the exact same pattern - see
 // `Self::handle_toggle_palette_action` and `crate::lib::run`'s matching `cx.bind_keys` entry.
 // The same focus-priority caveat applies equally to it; not re-verified separately here.
-actions!(app, [NewSession, TogglePalette]);
+//
+// `ToggleSettings` (⌘,) follows the exact same pattern again - see
+// `Self::handle_toggle_settings_action` and `crate::lib::run`'s matching `cx.bind_keys` entry.
+// The literal keystroke string `"cmd-,"` was verified against a real precedent before use:
+// `vendor/zed/assets/keymaps/default-macos.json` binds Zed's own `zed::OpenSettings` action to
+// exactly `"cmd-,"` (and its Linux keymap the `ctrl-,` equivalent), confirming GPUI's real
+// keystroke parser accepts a bare `,` as a keystroke's key component.
+actions!(app, [NewSession, TogglePalette, ToggleSettings]);
 
 /// How often the rail's real background status refresh (real `wt_core::diff::
 /// diff_against_base` and `wt_core::is_dirty`/`merge_status_against_base` calls, via
@@ -264,6 +272,14 @@ pub struct AdeApp {
     /// recomputed whenever the worktree list reloads. `None` while the very first
     /// computation is still in flight.
     disk_usage: Option<(u64, bool)>,
+    /// The real, per-worktree half of the same computation [`Self::disk_usage`] sums -
+    /// `crate::rail::disk_usage_bytes(path)` run once per real, readable worktree path (see
+    /// `Self::load_disk_usage`). `disk_usage` itself is always exactly the sum/any-truncated
+    /// fold of this map, kept as its own field only because most call sites (the rail footer)
+    /// only ever need the aggregate, not a lookup - added for the Settings › Worktrees page
+    /// (`Self::render_settings_worktrees_page`), which is the first real caller that needs a
+    /// *per-row* size rather than just the total.
+    worktree_disk_usage: HashMap<PathBuf, (u64, bool)>,
     /// Feedback from the most recent `prune` click - a real outcome (how many worktrees were
     /// actually removed, or a real error from `wt_core::remove_worktree`), shown in the rail
     /// footer until the next prune attempt or worktree reload.
@@ -274,12 +290,40 @@ pub struct AdeApp {
     /// see each of those handlers) - see `Self::request_prune`'s docs for why prune is a
     /// real two-click confirmation rather than a single unconfirmed destructive click.
     prune_confirm_armed: bool,
+    /// Whether the Settings surface (`design_handoff_jerry_ade/README.md`'s "Settings"
+    /// section) is currently replacing the three-zone body - see [`Self::open_settings`]/
+    /// [`Self::close_settings`], which follow the exact same real-focus-capture-and-restore
+    /// shape [`Self::palette_open`]'s own docs describe (and the same bug class this app has
+    /// already hit once for the palette - see `palette_focus_tests`).
+    settings_open: bool,
+    /// Which Settings nav page is currently selected - persists across opens/closes (unlike
+    /// the palette's query/scope, which resets every time) so navigating away and reopening
+    /// Settings later doesn't lose your place.
+    settings_page: settings::SettingsPage,
+    settings_focus_handle: FocusHandle,
+    /// See [`Self::palette_return_focus`]'s docs for the exact bug this mirrors and fixes -
+    /// same mechanism, applied to the Settings surface instead of the palette overlay.
+    settings_return_focus: Option<FocusHandle>,
+    /// See [`Self::palette_opened_session`]'s docs - same mechanism, applied to Settings.
+    settings_opened_session: Option<SessionId>,
+    /// The Settings › Agents page's real rows - `crate::settings::detect_agent_rows`, resolved
+    /// via `pty_core::resolve_on_path`, but computed off the foreground thread and cached here
+    /// (see [`Self::load_agent_rows`]) rather than recomputed inline on every render.
+    /// `resolve_on_path`'s not-found path walks every `$PATH` entry with no early exit -
+    /// measured on this machine at ~30ms for a genuinely absent binary like `codex`, which is
+    /// exactly the case this page exists to show - so calling it directly from `render()` would
+    /// have capped the whole Settings surface at that render's frame rate, and re-paid the ~30ms
+    /// on every one of `start_status_polling`'s 3s re-renders while the page stayed open.
+    /// `Vec::new()` (an empty card, matching a `None` `resolved_path` for a still-loading state
+    /// would be dishonest here since it isn't per-row) until the first real load completes.
+    agent_rows: Vec<settings::AgentRow>,
     _load_worktrees_task: Option<Task<()>>,
     _load_file_tree_task: Option<Task<()>>,
     _load_diff_task: Option<Task<()>>,
     _status_poll_task: Option<Task<()>>,
     _disk_usage_task: Option<Task<()>>,
     _prune_task: Option<Task<()>>,
+    _agent_rows_task: Option<Task<()>>,
 }
 
 /// Clears every piece of per-worktree UI state that would otherwise survive a worktree switch
@@ -342,14 +386,22 @@ impl AdeApp {
             diff_cache: HashMap::new(),
             worktree_notes: HashMap::new(),
             disk_usage: None,
+            worktree_disk_usage: HashMap::new(),
             prune_status: None,
             prune_confirm_armed: false,
+            settings_open: false,
+            settings_page: settings::SettingsPage::General,
+            settings_focus_handle: cx.focus_handle(),
+            settings_return_focus: None,
+            settings_opened_session: None,
+            agent_rows: Vec::new(),
             _load_worktrees_task: None,
             _load_file_tree_task: None,
             _load_diff_task: None,
             _status_poll_task: None,
             _disk_usage_task: None,
             _prune_task: None,
+            _agent_rows_task: None,
         };
         // A fresh window shouldn't open with zero tabs and no way to see anything running -
         // start with one real shell in the repo root, exactly like step 3's single terminal
@@ -399,13 +451,17 @@ impl AdeApp {
         self._load_worktrees_task = Some(task);
     }
 
-    /// Recomputes [`Self::disk_usage`] from the current real worktree list, offloaded to the
-    /// background executor - see `crate::rail::disk_usage_bytes`'s docs for the real, bounded
-    /// `std::fs` walk this sums across every readable worktree. Run once per worktree-list
-    /// load (not on the 3s status-poll cadence - a `std::fs` walk is real per-file I/O, and
-    /// re-walking every worktree's entire tree every 3s would be needless cost for a number
-    /// that only meaningfully changes when a worktree is added, removed, or its files
-    /// change).
+    /// Recomputes [`Self::disk_usage`] *and* [`Self::worktree_disk_usage`] from the current
+    /// real worktree list, offloaded to the background executor - see
+    /// `crate::rail::disk_usage_bytes`'s docs for the real, bounded `std::fs` walk this runs
+    /// once per readable worktree. Run once per worktree-list load (not on the 3s status-poll
+    /// cadence - a `std::fs` walk is real per-file I/O, and re-walking every worktree's entire
+    /// tree every 3s would be needless cost for numbers that only meaningfully change when a
+    /// worktree is added, removed, or its files change).
+    ///
+    /// [`Self::disk_usage`] (the rail footer's aggregate) is always derived from the same
+    /// per-path map the Settings › Worktrees page reads - one real computation, two real
+    /// consumers, never two separately-run walks that could disagree.
     fn load_disk_usage(&mut self, cx: &mut Context<Self>) {
         let paths: Vec<PathBuf> = self
             .worktrees
@@ -415,21 +471,22 @@ impl AdeApp {
             .collect();
 
         let task = cx.spawn(async move |this, cx| {
-            let usage = cx
+            let per_path = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut total = 0u64;
-                    let mut truncated = false;
+                    let mut per_path = HashMap::with_capacity(paths.len());
                     for path in paths {
-                        let (bytes, path_truncated) = rail::disk_usage_bytes(&path);
-                        total += bytes;
-                        truncated |= path_truncated;
+                        let usage = rail::disk_usage_bytes(&path);
+                        per_path.insert(path, usage);
                     }
-                    (total, truncated)
+                    per_path
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.disk_usage = Some(usage);
+                let total: u64 = per_path.values().map(|(bytes, _)| bytes).sum();
+                let truncated = per_path.values().any(|(_, truncated)| *truncated);
+                this.disk_usage = Some((total, truncated));
+                this.worktree_disk_usage = per_path;
                 cx.notify();
             });
         });
@@ -876,6 +933,26 @@ impl AdeApp {
     /// (e.g. a completely fresh window that had never been clicked into).
     fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = false;
+        if self.settings_open {
+            // Settings is showing underneath the palette right now - either because
+            // `Self::execute_palette_command`'s `OpenSettings` branch just opened it
+            // (`Self::run_selected_palette_entry` always calls `close_palette` right after
+            // dispatching a command, regardless of which one), or because the palette (⌘K)
+            // happened to be opened *while Settings was already open* and is now just being
+            // dismissed back down to it. Either way the correct real focus target is
+            // [`Self::settings_focus_handle`] - the same handle `Self::open_settings` itself
+            // moves focus onto - never [`Self::palette_return_focus`]/the active session's
+            // terminal pane: restoring either of those would either fight `open_settings`'s own
+            // focus move (the first case) or move focus onto a surface that isn't even being
+            // rendered anymore, since the Settings surface still replaces the three zones (the
+            // second case) - both exactly the "`Window::focus` left pointing at an untracked
+            // handle" bug class [`Self::palette_return_focus`]'s own docs describe.
+            window.focus(&self.settings_focus_handle, cx);
+            self.palette_return_focus = None;
+            self.palette_opened_session = None;
+            cx.notify();
+            return;
+        }
         let session_changed = self.sessions.active_id() != self.palette_opened_session;
         let restore_target = if session_changed {
             None
@@ -906,6 +983,122 @@ impl AdeApp {
         } else {
             self.open_palette(window, cx);
         }
+    }
+
+    /// Opens the Settings surface (`design_handoff_jerry_ade/README.md`'s "Settings" section) -
+    /// mirrors [`Self::open_palette`]'s exact real-focus-capture shape: captures whatever was
+    /// really focused beforehand (`None` if nothing was) into [`Self::settings_return_focus`],
+    /// plus which session was active into [`Self::settings_opened_session`], so
+    /// [`Self::close_settings`] can restore correctly instead of leaving `Window::focus`
+    /// dangling on [`Self::settings_focus_handle`] once the surface stops rendering - see
+    /// [`Self::palette_return_focus`]'s docs for the exact bug this class of fix addresses.
+    ///
+    /// Unlike [`Self::open_palette`], this does **not** reset [`Self::settings_page`] - which
+    /// page was showing persists across opens, matching ordinary settings-window UX (the
+    /// palette's query/scope reset because it's a transient search, not a navigation history).
+    /// Also disarms a pending rail prune confirmation, for the same reason `open_palette` does.
+    ///
+    /// If the palette happens to be open at the same time (e.g. the raw `cmd-,` keybinding
+    /// fired while `cmd-k` was still showing), it's closed first via [`Self::close_palette`] -
+    /// run while [`Self::settings_open`] is still `false`, so that call takes its own normal,
+    /// non-Settings-aware restore path - rather than leaving both overlays stacked at once.
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_open {
+            self.close_palette(window, cx);
+        }
+        self.settings_open = true;
+        self.settings_return_focus = window.focused(cx);
+        self.settings_opened_session = self.sessions.active_id();
+        self.prune_confirm_armed = false;
+        window.focus(&self.settings_focus_handle, cx);
+        self.load_agent_rows(cx);
+        cx.notify();
+    }
+
+    /// Closes the Settings surface - the nav header's `esc` keycap, real `Esc` key handling
+    /// (`Self::handle_settings_key_down`), and (in the palette-focus test module, matching
+    /// `close_palette`'s own test coverage) direct calls. Restores real keyboard focus the same
+    /// way [`Self::close_palette`] does, and for the same documented reason.
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        let session_changed = self.sessions.active_id() != self.settings_opened_session;
+        let restore_target = if session_changed {
+            None
+        } else {
+            self.settings_return_focus.take()
+        };
+        let focus_target = restore_target.or_else(|| {
+            self.sessions
+                .active()
+                .map(|session| session.pane.focus_handle(cx))
+        });
+        if let Some(handle) = focus_target {
+            window.focus(&handle, cx);
+        }
+        self.settings_return_focus = None;
+        self.settings_opened_session = None;
+        cx.notify();
+    }
+
+    fn handle_toggle_settings_action(
+        &mut self,
+        _action: &ToggleSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings_open {
+            self.close_settings(window, cx);
+        } else {
+            self.open_settings(window, cx);
+        }
+    }
+
+    /// The Settings surface's own key handler - just real `Esc`-to-close
+    /// (`design_handoff_jerry_ade/README.md`: "esc (rendered as a keycap in the nav header)
+    /// returns to the workspace"). No other Settings keyboard affordance is documented in the
+    /// design (nav is click-only - `Jerry.dc.html`'s own nav rows have no keyboard binding),
+    /// so unlike [`Self::handle_palette_key_down`] this doesn't need arrow-key/tab handling.
+    fn handle_settings_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.key.as_str() == "escape" {
+            self.close_settings(window, cx);
+            cx.stop_propagation();
+        }
+    }
+
+    /// Selects a Settings nav page - the nav row click handler.
+    fn select_settings_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        self.settings_page = page;
+        cx.notify();
+    }
+
+    /// Recomputes [`Self::agent_rows`] - a real `$PATH` search via `pty_core::resolve_on_path`
+    /// (the same real search `pty-core`'s own spawn path performs, per that function's docs) for
+    /// each known agent kind, via `crate::settings::detect_agent_rows`. Offloaded to the
+    /// background executor and cached, mirroring [`Self::load_disk_usage`]'s exact shape: a
+    /// not-found `resolve_on_path` call has no early exit and walks every `$PATH` entry (~30ms
+    /// measured on a real dev machine for `codex`, genuinely absent), so running it inline in
+    /// `render()` - which used to happen here - would block the foreground/GPUI thread for that
+    /// long on every single frame the Agents page was open, and again on every one of
+    /// `start_status_polling`'s 3s re-renders. Run once when Settings opens
+    /// ([`Self::open_settings`]), not on every render or on the 3s poll cadence - the set of
+    /// agent binaries actually on `$PATH` essentially never changes while the app is running.
+    fn load_agent_rows(&mut self, cx: &mut Context<Self>) {
+        let task = cx.spawn(async move |this, cx| {
+            let rows = cx
+                .background_executor()
+                .spawn(async move { settings::detect_agent_rows(pty_core::resolve_on_path) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.agent_rows = rows;
+                cx.notify();
+            });
+        });
+        self._agent_rows_task = Some(task);
     }
 
     /// Builds the palette's real, live candidate lists from current app state and hands them to
@@ -973,6 +1166,10 @@ impl AdeApp {
                     "{} prunable worktree(s)",
                     self.prunable_worktree_paths().len()
                 ),
+            },
+            palette::CommandCandidate {
+                command: palette::PaletteCommand::OpenSettings,
+                secondary: "agents, worktrees, and the rest of the settings surface".to_string(),
             },
         ];
 
@@ -1048,9 +1245,14 @@ impl AdeApp {
     /// exact same `AdeApp` method its existing, already-real UI affordance calls (see
     /// [`palette::PaletteCommand`]'s own per-variant docs for which one). Never a second,
     /// independent implementation of the action.
+    ///
+    /// Takes `window` (unlike every other palette-adjacent method that only needed `cx`) purely
+    /// for [`palette::PaletteCommand::OpenSettings`]: [`Self::open_settings`] needs it to
+    /// capture/move real keyboard focus, the same way [`Self::open_palette`] itself does.
     fn execute_palette_command(
         &mut self,
         command: palette::PaletteCommand,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match command {
@@ -1072,6 +1274,7 @@ impl AdeApp {
             }
             palette::PaletteCommand::ToggleRailGrouping => self.toggle_rail_mode(cx),
             palette::PaletteCommand::PruneWorktrees => self.request_prune(cx),
+            palette::PaletteCommand::OpenSettings => self.open_settings(window, cx),
         }
     }
 
@@ -1124,7 +1327,9 @@ impl AdeApp {
             .map(|entry| entry.target.clone());
         if let Some(target) = target {
             match target {
-                palette::EntryTarget::Command(command) => self.execute_palette_command(command, cx),
+                palette::EntryTarget::Command(command) => {
+                    self.execute_palette_command(command, window, cx)
+                }
                 palette::EntryTarget::Session(id) => self.select_session(id, cx),
                 palette::EntryTarget::File(path) => self.open_palette_file_result(path, cx),
             }
@@ -4596,89 +4801,806 @@ impl Render for AdeApp {
             .font(font(theme::font::SANS))
             .on_action(cx.listener(Self::handle_new_session_action))
             .on_action(cx.listener(Self::handle_toggle_palette_action))
+            .on_action(cx.listener(Self::handle_toggle_settings_action))
             .child(self.render_title_bar(cx))
-            .child(
-                div()
-                    .id("body")
-                    .flex()
-                    .flex_row()
-                    .flex_1()
-                    .min_h_0()
-                    // Real drag-to-resize: `on_drag_move` fires for every mouse-move event
-                    // while a `PaneResizeDrag` is active *anywhere in the window*, not just
-                    // while the cursor stays over the thin resize handle that started the drag
-                    // (see `Interactivity::on_drag_move`'s own doc comment, and
-                    // `PaneResizeDrag`'s docs for the real, verified
-                    // `vendor/zed/crates/workspace` precedent this follows) - registering it
-                    // here, on the body that contains both handles, is what makes a fast drag
-                    // still track correctly even after the cursor leaves the handle's own
-                    // 6px-wide hitbox. No matching `on_mouse_up` is needed to end the drag:
-                    // GPUI's own window dispatch clears `active_drag` (and stops delivering
-                    // further `on_drag_move` ticks) on *any* `MouseUpEvent`, anywhere in the
-                    // window, independent of which element's handlers actually fired -
-                    // verified at `vendor/zed/crates/gpui/src/window.rs`'s
-                    // `dispatch_mouse_event` ("If this was a mouse up event, cancel the active
-                    // drag"). Combined with [`Self::apply_pane_resize`] deriving the width
-                    // fresh from the cursor position and [`Self::body_bounds`] on every tick
-                    // rather than an armed baseline, there is no drag state left here to leak
-                    // if the mouse is released outside the window.
-                    .on_drag_move(cx.listener(
-                        |this, event: &DragMoveEvent<PaneResizeDrag>, _window, cx| {
-                            let PaneResizeDrag(target) = *event.drag(cx);
-                            this.apply_pane_resize(target, event.event.position.x, cx);
-                        },
-                    ))
-                    // Captures the body's real paint bounds into `Self::body_bounds` on every
-                    // render, the same real `gpui::canvas` pattern
-                    // `vendor/zed/crates/workspace/src/workspace.rs` uses to capture its own
-                    // `Workspace::bounds` for the equivalent dock-resize computation - see
-                    // `Self::body_bounds`'s docs.
-                    .child({
-                        let this = cx.entity();
-                        gpui::canvas(
-                            move |bounds, _window, cx| {
-                                this.update(cx, |this, _cx| {
-                                    this.body_bounds = bounds;
-                                });
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full()
-                    })
-                    .child(
-                        div()
-                            .id("worktree-sidebar")
-                            .relative()
-                            .flex_none()
-                            .w(self.rail_width)
-                            .h_full()
-                            .bg(theme::surface::RAIL)
-                            .border_r_1()
-                            .border_color(theme::border::ZONE)
-                            .child(self.render_rail(cx))
-                            .child(self.render_resize_handle(ResizeTarget::Rail, cx)),
-                    )
-                    .child(self.render_center_pane(cx))
-                    .child(
-                        div()
-                            .id("file-tree-sidebar")
-                            .relative()
-                            .flex()
-                            .flex_col()
-                            .flex_none()
-                            .w(self.panel_width)
-                            .h_full()
-                            .bg(theme::surface::RAIL)
-                            .border_l_1()
-                            .border_color(theme::border::ZONE)
-                            .child(self.render_right_sidebar(cx))
-                            .child(self.render_resize_handle(ResizeTarget::Panel, cx)),
-                    ),
-            )
+            // The Settings surface (`design_handoff_jerry_ade/README.md`: "a separate surface,
+            // not a modal: it replaces the three zones while the title bar and status bar
+            // stay") swaps out only this one child - the title bar above and the status bar
+            // below are unconditional siblings, rendered every frame regardless of
+            // `settings_open`.
+            .child(if self.settings_open {
+                self.render_settings(cx).into_any_element()
+            } else {
+                self.render_workspace_body(cx).into_any_element()
+            })
             .child(self.render_status_bar(cx))
             .when(self.palette_open, |el| el.child(self.render_palette(cx)))
     }
+}
+
+impl AdeApp {
+    /// The three-zone workspace body (session rail, centre pane, files/changes panel) -
+    /// pulled out of [`Render::render`] so it and [`Self::render_settings`] can both be
+    /// [`gpui::AnyElement`]-branched as a single child, matching the real precedent found for
+    /// this exact shape (`vendor/zed/crates/gpui/src/util.rs`'s `Styled::when_else`, and
+    /// `vendor/zed/crates/gpui/examples/image_loading.rs`'s own `.into_any_element()` fallback
+    /// branch) rather than trying to conditionally omit/include zones within one shared tree.
+    fn render_workspace_body(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("body")
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            // Real drag-to-resize: `on_drag_move` fires for every mouse-move event
+            // while a `PaneResizeDrag` is active *anywhere in the window*, not just
+            // while the cursor stays over the thin resize handle that started the drag
+            // (see `Interactivity::on_drag_move`'s own doc comment, and
+            // `PaneResizeDrag`'s docs for the real, verified
+            // `vendor/zed/crates/workspace` precedent this follows) - registering it
+            // here, on the body that contains both handles, is what makes a fast drag
+            // still track correctly even after the cursor leaves the handle's own
+            // 6px-wide hitbox. No matching `on_mouse_up` is needed to end the drag:
+            // GPUI's own window dispatch clears `active_drag` (and stops delivering
+            // further `on_drag_move` ticks) on *any* `MouseUpEvent`, anywhere in the
+            // window, independent of which element's handlers actually fired -
+            // verified at `vendor/zed/crates/gpui/src/window.rs`'s
+            // `dispatch_mouse_event` ("If this was a mouse up event, cancel the active
+            // drag"). Combined with [`Self::apply_pane_resize`] deriving the width
+            // fresh from the cursor position and [`Self::body_bounds`] on every tick
+            // rather than an armed baseline, there is no drag state left here to leak
+            // if the mouse is released outside the window.
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<PaneResizeDrag>, _window, cx| {
+                    let PaneResizeDrag(target) = *event.drag(cx);
+                    this.apply_pane_resize(target, event.event.position.x, cx);
+                },
+            ))
+            // Captures the body's real paint bounds into `Self::body_bounds` on every
+            // render, the same real `gpui::canvas` pattern
+            // `vendor/zed/crates/workspace/src/workspace.rs` uses to capture its own
+            // `Workspace::bounds` for the equivalent dock-resize computation - see
+            // `Self::body_bounds`'s docs.
+            .child({
+                let this = cx.entity();
+                gpui::canvas(
+                    move |bounds, _window, cx| {
+                        this.update(cx, |this, _cx| {
+                            this.body_bounds = bounds;
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            })
+            .child(
+                div()
+                    .id("worktree-sidebar")
+                    .relative()
+                    .flex_none()
+                    .w(self.rail_width)
+                    .h_full()
+                    .bg(theme::surface::RAIL)
+                    .border_r_1()
+                    .border_color(theme::border::ZONE)
+                    .child(self.render_rail(cx))
+                    .child(self.render_resize_handle(ResizeTarget::Rail, cx)),
+            )
+            .child(self.render_center_pane(cx))
+            .child(
+                div()
+                    .id("file-tree-sidebar")
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .w(self.panel_width)
+                    .h_full()
+                    .bg(theme::surface::RAIL)
+                    .border_l_1()
+                    .border_color(theme::border::ZONE)
+                    .child(self.render_right_sidebar(cx))
+                    .child(self.render_resize_handle(ResizeTarget::Panel, cx)),
+            )
+    }
+
+    /// The Settings surface (`design_handoff_jerry_ade/README.md`'s "Settings" section): a
+    /// 212px nav plus a content column. `track_focus`/`on_key_down` here are what make real
+    /// `Esc` actually reach [`Self::handle_settings_key_down`] - the same real pattern
+    /// `Self::render_palette` already uses for its own panel (`vendor/zed/crates/gpui/src/
+    /// elements/div.rs`'s real `Div::track_focus`/`Interactivity::on_key_down`).
+    fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("settings-surface")
+            .track_focus(&self.settings_focus_handle)
+            .on_key_down(cx.listener(Self::handle_settings_key_down))
+            .flex()
+            .flex_1()
+            .min_h_0()
+            .child(self.render_settings_nav(cx))
+            .child(self.render_settings_content(cx))
+    }
+
+    /// The 212px nav column - `design_handoff_jerry_ade/README.md`: "Nav 212 wide ... Groups
+    /// (Workspace, Editor, Other) with the same 9.5px uppercase header as the rail." Every one
+    /// of the ten real pages is real, clickable navigation (`crate::settings::nav_groups`);
+    /// only two render real content past this point - see `crate::settings`'s module docs.
+    fn render_settings_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let groups = settings::nav_groups();
+        // Real counts, not the mockup's fabricated `4`/`11`/`3` badges - `crate::settings::
+        // AGENT_KINDS.len()` is exactly how many rows `self.agent_rows` will show, and
+        // `self.worktrees.len()` is exactly how many rows the Worktrees page's card will show
+        // (including any real error rows - see `Self::render_settings_worktree_row`).
+        let agent_count = settings::AGENT_KINDS.len();
+        let worktree_count = self.worktrees.len();
+
+        div()
+            .id("settings-nav")
+            .flex_none()
+            .w(theme::zone::SETTINGS_NAV_WIDTH)
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(theme::surface::RAIL)
+            .border_r_1()
+            .border_color(theme::border::ZONE)
+            .child(
+                div()
+                    .flex_none()
+                    .h(theme::band::RAIL_HEADER)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .pl(px(12.0))
+                    .pr(px(10.0))
+                    .border_b_1()
+                    .border_color(theme::border::RAIL_INNER)
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_size(px(10.0))
+                            .text_color(theme::text::FAINT)
+                            .child("Settings"),
+                    )
+                    .child(
+                        div()
+                            .id("settings-close")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                                this.close_settings(window, cx);
+                            }))
+                            .child(render_keycap("esc")),
+                    ),
+            )
+            .child(
+                div()
+                    .id("settings-nav-groups")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .py(px(6.0))
+                    .flex()
+                    .flex_col()
+                    .children(groups.into_iter().map(|group| {
+                        self.render_settings_nav_group(group, agent_count, worktree_count, cx)
+                    })),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .h(theme::band::SURFACE_FOOTER)
+                    .flex()
+                    .items_center()
+                    .px(px(12.0))
+                    .border_t_1()
+                    .border_color(theme::border::RAIL_INNER)
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.0))
+                            .text_color(theme::text::HINT)
+                            // Real crate name/version (`env!` reads this crate's own real
+                            // `Cargo.toml` at compile time), not `Jerry.dc.html`'s fabricated
+                            // "jerry 0.4.2" - and an honest "no settings.toml yet" rather than
+                            // the mockup's own "· settings.toml", since this app has no real
+                            // settings-persistence file to point at (see `crate::settings`'s
+                            // module docs for why the Behaviour/Policy toggle rows that would
+                            // read/write one aren't built either).
+                            .child(format!(
+                                "{} {} \u{b7} no settings.toml yet",
+                                env!("CARGO_PKG_NAME"),
+                                env!("CARGO_PKG_VERSION"),
+                            )),
+                    ),
+            )
+    }
+
+    fn render_settings_nav_group(
+        &self,
+        group: settings::NavGroup,
+        agent_count: usize,
+        worktree_count: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut el = div()
+            .id(format!("settings-nav-group-{}", group.label))
+            .flex()
+            .flex_col()
+            .pb(px(4.0))
+            .child(
+                div()
+                    .px(px(12.0))
+                    .pt(px(7.0))
+                    .pb(px(4.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child(group.label.to_uppercase()),
+            );
+
+        for page in group.pages {
+            let badge = match page {
+                SettingsPage::Agents => Some(agent_count.to_string()),
+                SettingsPage::Worktrees => Some(worktree_count.to_string()),
+                // Every other page's mockup badge (`3` for Language servers, etc.) is
+                // fabricated sample data with nothing real behind it - omitted rather than
+                // invented, matching `crate::settings`'s own documented scope.
+                _ => None,
+            };
+            el = el.child(self.render_settings_nav_row(page, badge, cx));
+        }
+        el
+    }
+
+    fn render_settings_nav_row(
+        &self,
+        page: SettingsPage,
+        badge: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.settings_page == page;
+
+        div()
+            .id(format!("settings-nav-row-{}", page.id()))
+            .cursor_pointer()
+            .h(px(25.0))
+            .pl(px(10.0))
+            .pr(px(12.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .border_l(px(2.0))
+            .border_color(if active {
+                theme::border::SELECTED_EDGE
+            } else {
+                work_surface::TRANSPARENT
+            })
+            .when(active, |el| el.bg(theme::surface::ROW_SELECTED))
+            .when(!active, |el| {
+                el.hover(|el| el.bg(theme::settings::NAV_ROW_HOVER))
+            })
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                this.select_settings_page(page, cx);
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .font(font(theme::font::SANS))
+                    .text_size(px(11.5))
+                    .text_color(if active {
+                        theme::text::SELECTED
+                    } else {
+                        theme::text::DIM
+                    })
+                    .child(page.label()),
+            )
+            .when_some(badge, |el, badge| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .font(font(theme::font::MONO))
+                        .text_size(px(9.5))
+                        .text_color(theme::text::GHOSTER)
+                        .child(badge),
+                )
+            })
+    }
+
+    /// The content column: header block (title + real subtitle) plus whichever page's real (or
+    /// honestly placeholder) body - `design_handoff_jerry_ade/README.md`'s "Content column"
+    /// section.
+    fn render_settings_content(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let page = self.settings_page;
+
+        div()
+            .id("settings-content")
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .bg(theme::surface::CENTER)
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(26.0))
+                    .pt(px(18.0))
+                    .pb(px(14.0))
+                    .border_b_1()
+                    .border_color(theme::border::INNER)
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_size(px(15.0))
+                            .text_color(theme::text::SELECTED)
+                            .child(page.label()),
+                    )
+                    .child(
+                        div()
+                            .mt(px(4.0))
+                            .font(font(theme::font::SANS))
+                            .text_size(px(11.5))
+                            .text_color(theme::settings::SUBTITLE)
+                            .child(page.subtitle()),
+                    ),
+            )
+            .child(
+                div()
+                    .id("settings-content-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px(px(26.0))
+                    .pb(px(20.0))
+                    .child(match page {
+                        SettingsPage::Agents => {
+                            self.render_settings_agents_page(cx).into_any_element()
+                        }
+                        SettingsPage::Worktrees => {
+                            self.render_settings_worktrees_page(cx).into_any_element()
+                        }
+                        _ => render_settings_placeholder_page().into_any_element(),
+                    }),
+            )
+    }
+
+    /// *Agents › Installed* - `design_handoff_jerry_ade/README.md`: "bordered card ... of four
+    /// rows ... agent badge ... name ... binary path ... model ... a `default` pill ... green
+    /// dot + 'ready' ... Edit." This app's real version drops the `model`/`default`/`Edit`
+    /// pieces - see `crate::settings`'s module docs for why - and shows exactly
+    /// [`settings::AGENT_KINDS`]'s two real rows (`claude`, `codex`) instead of the mockup's
+    /// four fabricated ones, each with a real, live PATH-search-derived status.
+    fn render_settings_agents_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = &self.agent_rows;
+        let last_index = rows.len().saturating_sub(1);
+
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .pt(px(16.0))
+                    .pb(px(6.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Installed"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .rounded(theme::radius::CARD)
+                    .border_1()
+                    .border_color(theme::border::CARD)
+                    .overflow_hidden()
+                    .children(rows.iter().enumerate().map(|(index, row)| {
+                        self.render_settings_agent_row(row, index == last_index, cx)
+                    }))
+                    .child(self.render_settings_agents_footer()),
+            )
+    }
+
+    fn render_settings_agent_row(
+        &self,
+        row: &settings::AgentRow,
+        is_last: bool,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (badge_fg, badge_bg) = work_surface::agent_tint(row.kind);
+        let path_text = match &row.resolved_path {
+            Some(path) => path.display().to_string(),
+            // Real, honest - not "unknown"/blank - the exact reason a "ready" dot isn't shown:
+            // a real `$PATH` search for this literal binary name came back empty.
+            None => format!("{} not found on PATH", row.binary_name),
+        };
+        let dot_color = if row.is_ready() {
+            theme::settings::AGENT_READY
+        } else {
+            theme::settings::AGENT_NOT_FOUND
+        };
+
+        div()
+            .id(format!("settings-agent-row-{}", row.binary_name))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(12.0))
+            .py(px(9.0))
+            .bg(theme::surface::CARD)
+            .when(!is_last, |el| {
+                el.border_b_1().border_color(theme::settings::CARD_ROW_SEP)
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(18.0))
+                    .h(px(18.0))
+                    .rounded(theme::radius::BUTTON)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(badge_bg)
+                    .font(font(theme::font::MONO))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(9.5))
+                    .text_color(badge_fg)
+                    .child(work_surface::agent_initial(row.kind)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(104.0))
+                    .font(font(theme::font::SANS))
+                    .text_size(px(12.0))
+                    .text_color(theme::text::HEADING)
+                    .child(row.kind.label()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.5))
+                    .text_color(if row.is_ready() {
+                        theme::text::FAINT
+                    } else {
+                        theme::button::DANGER_FG
+                    })
+                    .child(path_text),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(div().w(px(5.0)).h(px(5.0)).rounded(px(2.5)).bg(dot_color))
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.0))
+                            .text_color(theme::text::FAINTER)
+                            .child(row.status_label()),
+                    ),
+            )
+    }
+
+    /// The Installed card's footer - `design_handoff_jerry_ade/README.md`: "Card footer ...
+    /// '+ Add an agent — any binary that speaks a resumable session on stdin'." Rendered real
+    /// and dimmed/inert (no `on_click`, no fake modal) - `crate::sessions::SessionKind` is a
+    /// fixed Rust enum, so there is no real runtime "register a new agent binary" flow to wire
+    /// this to yet; see `crate::settings`'s module docs for the judgment call this documents.
+    fn render_settings_agents_footer(&self) -> impl IntoElement {
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .px(px(12.0))
+            .py(px(8.0))
+            .bg(theme::surface::CARD_SUNK)
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(12.0))
+                    .text_color(theme::text::DISABLED)
+                    .child("+"),
+            )
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .text_size(px(11.0))
+                    .text_color(theme::text::DISABLED)
+                    .child("Add an agent"),
+            )
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .text_size(px(10.5))
+                    .text_color(theme::text::GHOST)
+                    .child("\u{2014} any binary that speaks a resumable session on stdin"),
+            )
+    }
+
+    /// *Worktrees › Disk* - `design_handoff_jerry_ade/README.md`: "same card shape: status dot
+    /// ... worktree path ... branch ... size ... a right-aligned Open ... or Prune ...
+    /// action. Footer totals ... and a Prune 1 merged action." Every row and every total here
+    /// is the exact real data Phase B already built (`Self::worktrees`, `Self::worktree_notes`,
+    /// `Self::worktree_disk_usage`/`Self::disk_usage`) - not a re-derivation of it - and Prune
+    /// (both the row action and the footer action) dispatches through the exact same
+    /// `Self::request_prune`/`Self::execute_prune` two-click-confirmation path the rail footer
+    /// and command palette already use (see [`Self::render_settings_worktree_row`]'s docs for
+    /// why a *row's* Prune click isn't scoped to only that one row).
+    fn render_settings_worktrees_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let last_index = self.worktrees.len().saturating_sub(1);
+        let prunable_count = self.prunable_worktree_paths().len();
+        let disk_label = match self.disk_usage {
+            Some((bytes, truncated)) => {
+                let label = rail::format_bytes(bytes);
+                if truncated {
+                    format!("{label}+")
+                } else {
+                    label
+                }
+            }
+            None => "...".to_string(),
+        };
+        let worktree_count = self.worktrees.len();
+        let prune_label = if self.prune_confirm_armed {
+            format!("confirm prune ({prunable_count})?")
+        } else {
+            format!("Prune {prunable_count} merged")
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .pt(px(16.0))
+                    .pb(px(6.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Disk"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .rounded(theme::radius::CARD)
+                    .border_1()
+                    .border_color(theme::border::CARD)
+                    .overflow_hidden()
+                    .children(self.worktrees.iter().enumerate().map(|(index, item)| {
+                        self.render_settings_worktree_row(item, index == last_index, cx)
+                    }))
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.0))
+                            .px(px(12.0))
+                            .py(px(8.0))
+                            .bg(theme::surface::CARD_SUNK)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .font(font(theme::font::MONO))
+                                    .text_size(px(10.5))
+                                    .text_color(theme::text::FAINTER)
+                                    .child(format!(
+                                        "{worktree_count} worktrees \u{b7} {disk_label}"
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-prune-all-merged")
+                                    .cursor_pointer()
+                                    .font(font(theme::font::SANS))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_size(px(10.5))
+                                    .text_color(if prunable_count > 0 {
+                                        theme::button::DANGER_FG
+                                    } else {
+                                        theme::text::DISABLED
+                                    })
+                                    .hover(|el| el.text_color(theme::button::DANGER_FG_HOVER))
+                                    .child(prune_label)
+                                    .on_click(cx.listener(
+                                        |this, _event: &ClickEvent, _window, cx| {
+                                            this.request_prune(cx);
+                                        },
+                                    )),
+                            ),
+                    ),
+            )
+    }
+
+    /// One real Worktrees-page row. `Open` selects that worktree in the real workspace and
+    /// switches back to it (`Self::select_worktree_by_path` + `Self::close_settings`, exactly
+    /// what clicking a worktree in the rail already does, plus leaving Settings). `Prune`
+    /// deliberately calls the exact same [`Self::request_prune`] the footer's own
+    /// `Prune N merged` button and the command palette's `Prune Worktrees` command call -
+    /// there is no separate "prune only this one worktree" code path in this app, since the
+    /// one real, safety-checked removal primitive (`Self::prunable_worktree_paths` plus
+    /// `Self::execute_prune`) always operates on *every* currently-prunable worktree at once,
+    /// live-session-excluded. A row's `Prune` button is only ever shown when that row's own
+    /// worktree is itself one of those candidates (`settings::worktree_row_action`), so
+    /// clicking it is always a real, honest prune that includes this worktree - it just isn't
+    /// scoped to *only* this worktree if others also happen to be prunable at the same moment,
+    /// exactly like the footer button it reuses.
+    fn render_settings_worktree_row(
+        &self,
+        item: &WorktreeItem,
+        is_last: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let row = div()
+            .id(format!("settings-worktree-row-{}", item.path.display()))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(12.0))
+            .py(px(8.0))
+            .bg(theme::surface::CARD)
+            .when(!is_last, |el| {
+                el.border_b_1().border_color(theme::settings::CARD_ROW_SEP)
+            });
+
+        if let Some(error) = &item.error {
+            return row
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(5.0))
+                        .h(px(5.0))
+                        .rounded(px(2.5))
+                        .bg(theme::status::FAIL),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .font(font(theme::font::MONO))
+                        .text_size(px(10.5))
+                        .text_color(theme::status::FAIL)
+                        .child(error.clone()),
+                );
+        }
+
+        let note = self.worktree_notes.get(&item.path);
+        let dot_color = match note.map(|note| settings::worktree_dot_status(item.is_main, note)) {
+            Some(settings::WorktreeDotStatus::Main) => theme::status::IDLE,
+            Some(settings::WorktreeDotStatus::Clean) => theme::status::REVIEW,
+            Some(settings::WorktreeDotStatus::Dirty) => theme::status::ASK,
+            Some(settings::WorktreeDotStatus::Prunable) => theme::settings::WORKTREE_PRUNABLE_DOT,
+            Some(settings::WorktreeDotStatus::Unknown) | None => theme::text::DISABLED,
+        };
+        let branch_label = item
+            .branch
+            .clone()
+            .unwrap_or_else(|| "(detached)".to_string());
+        let size_label = match self.worktree_disk_usage.get(&item.path) {
+            Some((bytes, truncated)) => {
+                let label = rail::format_bytes(*bytes);
+                if *truncated {
+                    format!("{label}+")
+                } else {
+                    label
+                }
+            }
+            None => "...".to_string(),
+        };
+        let action = note.map(|note| settings::worktree_row_action(item.is_main, note));
+        let path = item.path.clone();
+
+        let row = row
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(5.0))
+                    .h(px(5.0))
+                    .rounded(px(2.5))
+                    .bg(dot_color),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(196.0))
+                    .overflow_hidden()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.5))
+                    .text_color(theme::text::STRONG)
+                    .child(item.path.display().to_string()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.5))
+                    .text_color(theme::text::FAINT)
+                    .child(branch_label),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.5))
+                    .text_color(theme::text::DIM)
+                    .child(size_label),
+            );
+
+        match action {
+            Some(settings::WorktreeRowAction::Open) => row.child(
+                div()
+                    .id(format!("settings-worktree-open-{}", path.display()))
+                    .cursor_pointer()
+                    .flex_none()
+                    .w(px(74.0))
+                    .text_right()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(10.5))
+                    .text_color(theme::text::FAINT)
+                    .hover(|el| el.text_color(theme::text::SECONDARY))
+                    .child("Open")
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                        this.select_worktree_by_path(&path, cx);
+                        this.close_settings(window, cx);
+                    })),
+            ),
+            Some(settings::WorktreeRowAction::Prune) => row.child(
+                div()
+                    .id(format!("settings-worktree-prune-{}", path.display()))
+                    .cursor_pointer()
+                    .flex_none()
+                    .w(px(74.0))
+                    .text_right()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(10.5))
+                    .text_color(theme::button::DANGER_FG)
+                    .hover(|el| el.text_color(theme::button::DANGER_FG_HOVER))
+                    .child("Prune")
+                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.request_prune(cx);
+                    })),
+            ),
+            Some(settings::WorktreeRowAction::None) | None => {
+                row.child(div().flex_none().w(px(74.0)))
+            }
+        }
+    }
+}
+
+/// A nav-only Settings page's real, honest placeholder body - `Jerry.dc.html`'s own `setStub`
+/// state's exact copy (line ~705: `not designed in this mockup`). Used for every page except
+/// [`SettingsPage::Agents`]/[`SettingsPage::Worktrees`] - see `crate::settings`'s module docs
+/// for why this is a documented act of fidelity to the source design (which itself never
+/// specified what these pages should contain), not a shortcut.
+fn render_settings_placeholder_page() -> impl IntoElement {
+    div()
+        .py(px(26.0))
+        .font(font(theme::font::MONO))
+        .text_size(px(11.0))
+        .text_color(theme::text::DISABLED)
+        .child("not designed in this mockup")
 }
 
 /// One real drag-to-resize splitter (`design_handoff_jerry_ade/README.md`'s Layout table: rail
@@ -4838,7 +5760,12 @@ mod palette_focus_tests {
     /// `AdeApp::new` still spawns one real shell session regardless (see that method's docs),
     /// which is exactly the terminal pane these tests check ⌘K's focus-restore behavior
     /// against.
-    fn open_test_app(
+    ///
+    /// `pub(super)` rather than private: `settings_focus_tests` (a sibling test module, not a
+    /// child of this one) reuses this exact same real-window setup for its own Settings
+    /// lifecycle coverage, rather than maintaining a second, separately-written copy that could
+    /// drift.
+    pub(super) fn open_test_app(
         cx: &mut TestAppContext,
         repo_path: PathBuf,
     ) -> (Entity<AdeApp>, &mut gpui::VisualTestContext) {
@@ -4910,8 +5837,8 @@ mod palette_focus_tests {
         let initial_session_id = app.read_with(cx, |app, _| app.sessions.active_id());
 
         cx.dispatch_action(TogglePalette);
-        app.update(cx, |app, cx| {
-            app.execute_palette_command(palette::PaletteCommand::NewShell, cx);
+        app.update_in(cx, |app, window, cx| {
+            app.execute_palette_command(palette::PaletteCommand::NewShell, window, cx);
         });
         // `execute_palette_command` alone (as used directly here) doesn't close the palette -
         // that's `run_selected_palette_entry`'s own job - so close it the same way Escape does,
@@ -4968,5 +5895,222 @@ mod palette_focus_tests {
             );
             assert_eq!(app.palette_query, "x>");
         });
+    }
+}
+
+/// Real, interactive regression coverage for the Settings surface's own lifecycle - the same
+/// bug class `palette_focus_tests` exists to catch (a `Window::focus` handle left dangling
+/// after an element stops rendering), now exercised against the Settings surface instead of
+/// the palette overlay. Settings is a bigger risk for exactly this bug than the palette was:
+/// it *replaces* the whole three-zone body (see [`AdeApp::render_workspace_body`]'s docs)
+/// rather than drawing on top of it, so a broken focus restore here would leave every bound
+/// action (⌘N, ⌘K, ⌘,) unreachable, not just ⌘K.
+#[cfg(test)]
+mod settings_focus_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// `cmd-,` opens Settings, real `Esc` (simulated as an actual keystroke via `VisualTestContext::
+    /// simulate_keystrokes` - `vendor/zed/crates/editor/src/edit_prediction_tests.rs`'s own
+    /// `cx.simulate_keystroke("escape")` on `TestAppContext` is the verified real precedent
+    /// that GPUI's keystroke parser accepts the lowercase string `"escape"` for this key)
+    /// closes it, and a subsequent `cmd-k` still reaches
+    /// [`AdeApp::handle_toggle_palette_action`] - which it only can if closing Settings left
+    /// real, live focus somewhere `dispatch_action` can find, not dangling on
+    /// [`AdeApp::settings_focus_handle`].
+    #[gpui::test]
+    fn toggle_settings_action_opens_then_real_escape_closes_it_and_focus_stays_live(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        cx.dispatch_action(ToggleSettings);
+        assert!(
+            app.read_with(cx, |app, _| app.settings_open),
+            "cmd-, should open the Settings surface"
+        );
+
+        cx.simulate_keystrokes("escape");
+        assert!(
+            !app.read_with(cx, |app, _| app.settings_open),
+            "a real Esc keystroke, dispatched to whatever has real focus, should close Settings \
+             - this only reaches AdeApp::handle_settings_key_down if track_focus/on_key_down \
+             actually wired real focus onto the Settings surface"
+        );
+
+        cx.dispatch_action(TogglePalette);
+        assert!(
+            app.read_with(cx, |app, _| app.palette_open),
+            "cmd-k after closing Settings must still reach handle_toggle_palette_action - the \
+             exact bug class this module exists to catch is close_settings leaving \
+             Window::focus dangling on settings_focus_handle instead of restoring it"
+        );
+    }
+
+    /// `cmd-,` works from a completely fresh window (nothing manually clicked into yet) - the
+    /// same "no click has established real focus" case `palette_focus_tests::
+    /// toggle_palette_works_on_a_fresh_window_with_nothing_clicked_yet` covers for the palette,
+    /// here for Settings. Relies on the same real fix (`AdeApp::new` focusing the initial
+    /// session's terminal pane up front) that test's own docs describe.
+    #[gpui::test]
+    fn toggle_settings_works_on_a_fresh_window_with_nothing_clicked_yet(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        cx.dispatch_action(ToggleSettings);
+
+        assert!(
+            app.read_with(cx, |app, _| app.settings_open),
+            "cmd-, on a completely fresh window (nothing clicked yet) should still open Settings"
+        );
+    }
+
+    /// The orchestrator-visible proof that closing Settings genuinely "returns to the
+    /// workspace" with real state intact, per `design_handoff_jerry_ade/README.md`'s "esc ...
+    /// returns to the workspace": a session tab opened *before* Settings was ever shown is
+    /// still there, and still the active tab, after a real open/close round-trip - Settings
+    /// swapping out `AdeApp::render_workspace_body` (see that method's docs) never tore down
+    /// or mutated `AdeApp::sessions` itself, only which body `Render::render` draws.
+    #[gpui::test]
+    fn closing_settings_leaves_open_session_tabs_intact(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let sessions_before = app.read_with(cx, |app, _| app.sessions.iter().count());
+        let active_before = app.read_with(cx, |app, _| app.sessions.active_id());
+        assert_eq!(
+            sessions_before, 1,
+            "AdeApp::new starts with exactly one real shell tab"
+        );
+
+        cx.dispatch_action(ToggleSettings);
+        assert!(app.read_with(cx, |app, _| app.settings_open));
+
+        cx.simulate_keystrokes("escape");
+        assert!(!app.read_with(cx, |app, _| app.settings_open));
+
+        let sessions_after = app.read_with(cx, |app, _| app.sessions.iter().count());
+        let active_after = app.read_with(cx, |app, _| app.sessions.active_id());
+        assert_eq!(
+            sessions_after, sessions_before,
+            "the real session tab opened before Settings was shown must still exist after \
+             closing Settings"
+        );
+        assert_eq!(
+            active_after, active_before,
+            "the active tab must be unchanged by a Settings open/close round-trip"
+        );
+    }
+
+    /// Selecting a nav page is real, live `AdeApp` state - covers the "nav-page-switching"
+    /// focus/lifecycle risk the orchestrator flagged alongside Esc-to-close, verifying a page
+    /// switch survives (and doesn't reset) across a Settings close/reopen, matching
+    /// `AdeApp::open_settings`'s own documented "does not reset settings_page" contract.
+    #[gpui::test]
+    fn settings_page_selection_persists_across_a_close_and_reopen(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        cx.dispatch_action(ToggleSettings);
+        app.update(cx, |app, cx| {
+            app.select_settings_page(SettingsPage::Worktrees, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings_page),
+            SettingsPage::Worktrees
+        );
+
+        cx.simulate_keystrokes("escape");
+        assert!(!app.read_with(cx, |app, _| app.settings_open));
+
+        cx.dispatch_action(ToggleSettings);
+        assert!(app.read_with(cx, |app, _| app.settings_open));
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings_page),
+            SettingsPage::Worktrees,
+            "which page was showing should persist across a close/reopen, unlike the palette's \
+             own query/scope which intentionally resets every open"
+        );
+    }
+
+    /// The palette's real `Open Settings` command (`palette::PaletteCommand::OpenSettings`)
+    /// actually opens Settings and leaves real, live focus on it - not on a stale palette
+    /// handle - covers `AdeApp::close_palette`'s Settings-aware branch (see its docs) via the
+    /// exact real dispatch path a user typing "settings" into ⌘K and hitting `⏎` would take.
+    #[gpui::test]
+    fn open_settings_palette_command_leaves_real_focus_on_settings(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        cx.dispatch_action(TogglePalette);
+        app.update_in(cx, |app, window, cx| {
+            app.execute_palette_command(palette::PaletteCommand::OpenSettings, window, cx);
+        });
+        // Mirrors `palette_focus_tests::
+        // toggle_palette_still_works_after_a_palette_spawned_new_shell`'s own comment:
+        // `execute_palette_command` alone doesn't close the palette - that's
+        // `run_selected_palette_entry`'s job - so close it the same way Escape does, to reach
+        // the exact real `close_palette` code path this test targets.
+        app.update_in(cx, |app, window, cx| {
+            app.close_palette(window, cx);
+        });
+
+        assert!(
+            app.read_with(cx, |app, _| app.settings_open),
+            "the Open Settings command should have opened Settings"
+        );
+        assert!(
+            !app.read_with(cx, |app, _| app.palette_open),
+            "sanity check: the palette itself should be closed"
+        );
+
+        cx.simulate_keystrokes("escape");
+        assert!(
+            !app.read_with(cx, |app, _| app.settings_open),
+            "a real Esc must still reach Settings' own key handler after this palette-driven \
+             open - proof close_palette's Settings-aware branch left real focus on Settings, \
+             not dangling on palette_focus_handle"
+        );
+    }
+
+    /// The real regression this module exists to catch for [`AdeApp::load_agent_rows`]: opening
+    /// Settings must actually populate [`AdeApp::agent_rows`] from a real `$PATH` search, not
+    /// leave it permanently empty now that the search moved off the render path and onto
+    /// `cx.spawn`/`cx.background_executor()` (see that method's docs for why - a real ~30ms
+    /// `$PATH` walk for a not-found binary, previously paid inline in `render()` on every
+    /// frame). `cx.run_until_parked()` is what actually drives the spawned background task (and
+    /// its `this.update` write-back) to completion in this deterministic test executor - without
+    /// it, the assertion below would race the still-in-flight task and could flake.
+    #[gpui::test]
+    fn opening_settings_populates_real_agent_rows_from_a_background_path_search(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        assert!(
+            app.read_with(cx, |app, _| app.agent_rows.is_empty()),
+            "agent_rows should still be empty before Settings has ever been opened - nothing \
+             should eagerly run a $PATH search that's only ever shown on the Agents page"
+        );
+
+        cx.dispatch_action(ToggleSettings);
+        cx.run_until_parked();
+
+        let rows = app.read_with(cx, |app, _| app.agent_rows.clone());
+        assert_eq!(
+            rows.len(),
+            settings::AGENT_KINDS.len(),
+            "opening Settings should populate exactly one real row per AGENT_KINDS entry, the \
+             same count the Agents page nav badge (`self.agent_rows.len()` via \
+             render_settings_nav) shows"
+        );
+        for kind in settings::AGENT_KINDS {
+            assert!(
+                rows.iter().any(|row| row.kind == kind),
+                "{kind:?} should have a real row after a real $PATH search"
+            );
+        }
     }
 }

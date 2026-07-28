@@ -279,6 +279,47 @@ pub mod tag {
     pub const TREE_MODIFIED: Rgba = hex(0xa3873f); // "M" mark
 }
 
+/// Settings-surface-only colours read directly from `design_handoff_jerry_ade/Jerry.dc.html`'s
+/// own inline literals for the `settingsOpen` block - like [`palette`]'s tokens before them,
+/// real values present in the reviewed mockup but missing from `design_handoff_jerry_ade/
+/// tokens.rs`'s transcription (that file predates the Settings section being added to the
+/// README/HTML), so they're added here directly rather than approximated with a nearby-but-
+/// different existing token. Every other Settings colour (card borders, card row backgrounds,
+/// card footer backgrounds, most text colours, button/danger colours) is a genuine reuse of an
+/// existing token from another module - see `crate::root`'s Settings render methods for exactly
+/// which ones - since `design_handoff_jerry_ade/README.md`'s own Settings section literally
+/// says its cards use "the same 9.5px uppercase header as the rail" and its rows use the same
+/// card shape as the composer; this module holds only what's genuinely new.
+pub mod settings {
+    use super::{hex, Rgba};
+
+    /// A nav row's real hover background (`Jerry.dc.html`'s settings nav row `style-hover`:
+    /// `background:#17191b`) - distinct from [`super::surface::ROW_HOVER`] (`#15181b`, the
+    /// palette's own unselected-row hover, which happens to be one hex step off).
+    pub const NAV_ROW_HOVER: Rgba = hex(0x17191b);
+    /// The content column's page-subtitle text (`Jerry.dc.html`'s settings header block:
+    /// `color:#767d84`) - close to but distinct from [`super::text::DIM`] (`#8b9197`).
+    pub const SUBTITLE: Rgba = hex(0x767d84);
+    /// A card row's own bottom separator (`Jerry.dc.html`'s Agents/Worktrees card row:
+    /// `border-bottom:1px solid #1f2327`) - distinct from [`super::border::CARD_FIELD`]
+    /// (`#22272b`).
+    pub const CARD_ROW_SEP: Rgba = hex(0x1f2327);
+    /// A real-binary-found status dot on the Agents page. Same hex as [`super::status::REVIEW`],
+    /// kept as its own token rather than a reuse of that one: `design_handoff_jerry_ade/
+    /// README.md`'s own "Status vocabulary — use nowhere else" rule reserves the session
+    /// `Status` palette for session urgency specifically, and "this binary resolved on `$PATH`"
+    /// is a different real fact that only visually happens to want the same green.
+    pub const AGENT_READY: Rgba = hex(0x5cb87f);
+    /// A real binary-not-found status dot on the Agents page - same reasoning as
+    /// [`AGENT_READY`], with the same hex as [`super::status::FAIL`].
+    pub const AGENT_NOT_FOUND: Rgba = hex(0xe0625c);
+    /// The Worktrees page's real "merged and prunable" row dot (`Jerry.dc.html`'s `wtDefs`
+    /// sample: the one `note`-only row with no live session, `dot: '#3f454b'`) - distinct from
+    /// [`super::status::IDLE`] (`#565d64`, used here for the main checkout's own dot, matching
+    /// that same fixture's `{ path: 'jerry-core', ..., dot: '#565d64' }`).
+    pub const WORKTREE_PRUNABLE_DOT: Rgba = hex(0x3f454b);
+}
+
 pub mod radius {
     use super::{px, Pixels};
 

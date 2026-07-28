@@ -16,3 +16,9 @@ anyhow = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28", default-features = false, features = ["signal"] }
 filedescriptor = "0.8"
+
+[dev-dependencies]
+# Test-only: `resolve_on_path_skips_a_same_named_directory` needs a real, isolated temporary
+# directory to prepend to `$PATH` (see that test's docs). Matches the exact version
+# `crates/app/Cargo.toml`/`crates/wt-core/Cargo.toml` already pin.
+tempfile = "3"

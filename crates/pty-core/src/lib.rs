@@ -117,6 +117,7 @@
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
@@ -235,6 +236,75 @@ impl SpawnOptions {
         self.cols = cols;
         self
     }
+}
+
+/// Resolves `program` (a bare command name, e.g. `"claude"`) against `$PATH`, real
+/// filesystem checks only - no fabricated result, no caching of a stale answer.
+///
+/// This exists so a caller that needs to know *whether a spawn would succeed* (e.g. the
+/// app crate's Settings › Agents page, showing a real "ready"/"not found" dot per agent
+/// binary) can ask honestly, without actually spawning anything. It deliberately mirrors
+/// `portable-pty-0.9.0`'s own real `CommandBuilder::search_path` (unix implementation,
+/// `~/.cargo/registry/src/index.crates.io-6f17d22bba15001f/portable-pty-0.9.0/src/
+/// cmdbuilder.rs:416-472`) - the exact, private (not `pub`, so it cannot be called
+/// directly) function [`spawn`] itself relies on via `CommandBuilder::spawn`'s internal
+/// `search_path` call for a bare (non-cwd-relative) program name: for each directory in
+/// `std::env::split_paths(&PATH)`, join it with `program` and check the candidate exists
+/// and is executable, returning the first hit.
+///
+/// Two deliberate, documented departures from that exact algorithm:
+/// - `portable-pty` uses `nix::unistd::access(path, X_OK)`, a real `access(2)` syscall
+///   this crate's callers (the `app` crate) has no `nix` dependency of its own to call.
+///   [`is_executable`] instead checks the owner/group/other execute bits on
+///   `std::fs::Metadata::permissions().mode()` (`S_IXUSR | S_IXGRP | S_IXOTH`) - real
+///   file metadata, not a guess, though (unlike `access(2)`) it doesn't itself account for
+///   ACLs or a process's specific uid/gid. For a "is this binary on PATH at all" status
+///   dot, that gap was judged an acceptable, documented simplification over adding a new
+///   dependency.
+/// - This never checks a cwd-relative candidate (`portable-pty`'s `is_cwd_relative_path`
+///   branch, e.g. `./claude`) - every real caller here passes a bare name
+///   (`SessionKind::agent_binary_name` in the `app` crate only ever returns plain names
+///   like `"claude"`/`"codex"`, never a path), so that branch is dead code for this
+///   crate's actual callers and was left out rather than speculatively added.
+///
+/// Because this is a second, independent implementation of the same *algorithm* rather
+/// than a call into `portable-pty`'s own (private) function, it is not literally
+/// guaranteed to agree with what [`spawn`] does in every exotic case (e.g. a `PATH` entry
+/// that is itself a symlink to a directory, or unusual permission-bit combinations) - but
+/// both walk the same `$PATH` list in the same order and apply the same "exists and is
+/// executable" test, so in every realistic case (the ones this app's Settings page is
+/// actually screenshotting: `claude` present, `codex` absent) they agree.
+pub fn resolve_on_path(program: &str) -> Option<PathBuf> {
+    resolve_in_path_var(&std::env::var_os("PATH")?, program)
+}
+
+/// The real search loop [`resolve_on_path`] runs, factored out so it can take a `PATH` value
+/// as a plain argument instead of always reading the real process environment. This is what
+/// lets `resolve_on_path_skips_a_same_named_directory` (and any other test that needs a
+/// custom, isolated `PATH`) construct an `OsString` directly and pass it here, rather than
+/// mutating `std::env`'s real, process-global `PATH` var - which would need `unsafe` (`std::
+/// env::set_var` requires it as of this workspace's edition) and would be genuinely racy
+/// against any other test concurrently reading the environment (e.g. via `portable_pty`'s
+/// `get_base_env`, which sibling tests here exercise through real `spawn` calls) since
+/// `cargo test` runs this crate's tests concurrently by default.
+fn resolve_in_path_var(path_var: &OsStr, program: &str) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path_var) {
+        let candidate = dir.join(program);
+        if candidate.is_file() && is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Real executable-bit check via `std::fs::Metadata` - see [`resolve_on_path`]'s docs for
+/// why this is used instead of a real `access(2)` call.
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    const EXEC_BITS: u32 = 0o111; // owner, group, other execute bits
+    std::fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & EXEC_BITS != 0)
+        .unwrap_or(false)
 }
 
 /// A running process attached to a PTY.
@@ -934,5 +1004,72 @@ mod tests {
             Err(other) => panic!("expected PtyError::InvalidCwd, got a different error: {other}"),
             Ok(_) => panic!("expected spawn to reject a nonexistent cwd, but it succeeded"),
         }
+    }
+
+    /// `sh` is as close to a guaranteed-present binary as a unix test environment gets
+    /// (this crate is unix-only already - see the crate-level `compile_error!`, and every
+    /// other test here already spawns real coreutils/shell binaries like `echo`/`sleep`/
+    /// `sh` unconditionally). Real end-to-end proof that [`resolve_on_path`] finds a real
+    /// binary and returns a path that is itself real (exists, is a file, is executable) -
+    /// not just "found something".
+    #[test]
+    fn resolve_on_path_finds_a_real_binary_and_the_path_is_itself_real() {
+        let resolved = resolve_on_path("sh").expect("`sh` should be found on PATH");
+        assert!(
+            resolved.is_file(),
+            "resolved path {resolved:?} should be a real, existing file"
+        );
+        assert!(
+            is_executable(&resolved),
+            "resolved path {resolved:?} should be executable"
+        );
+        assert!(resolved.is_absolute(), "resolved path should be absolute");
+    }
+
+    /// The exact real, non-panicking "not found" case the app's Settings › Agents page
+    /// depends on for a genuinely-absent binary (e.g. `codex` on a dev machine that never
+    /// installed it) to show a real "not found" status rather than silently panicking or
+    /// fabricating a `ready` state.
+    #[test]
+    fn resolve_on_path_returns_none_for_a_binary_that_does_not_exist() {
+        assert_eq!(
+            resolve_on_path("definitely-not-a-real-binary-xyz-pty-core-test"),
+            None
+        );
+    }
+
+    /// A directory that happens to share the binary's name must not be mistaken for it -
+    /// this is exactly the `candidate.is_dir()` guard `portable-pty`'s own `search_path`
+    /// has (see [`resolve_on_path`]'s docs); the equivalent guard here is `is_file()`,
+    /// checked directly against a real temporary directory of that name to prove it isn't
+    /// just an untested claim in a comment.
+    ///
+    /// Builds a real, isolated `PATH` value and passes it directly to
+    /// [`resolve_in_path_var`] rather than mutating the real process-global `PATH` via
+    /// `std::env::set_var` - that would need `unsafe` and would be genuinely racy against
+    /// `cargo test`'s default concurrent test execution (see [`resolve_in_path_var`]'s
+    /// docs), for zero benefit: the search loop under test never reads `std::env` itself.
+    #[test]
+    fn resolve_on_path_skips_a_same_named_directory() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let fake_dir_binary = tmp.path().join("not-really-a-binary");
+        std::fs::create_dir(&fake_dir_binary).expect("mkdir");
+
+        // A real, isolated PATH - the real process PATH (so a genuine same-named binary
+        // elsewhere on it still wouldn't wrongly match first) with the tempdir prepended,
+        // so the search actually walks through the directory-shaped candidate before
+        // (if ever) finding a real one.
+        let real_path = std::env::var_os("PATH").unwrap_or_default();
+        let joined = std::env::join_paths(
+            std::iter::once(tmp.path().to_path_buf()).chain(std::env::split_paths(&real_path)),
+        )
+        .expect("joining PATH entries should not fail for real filesystem paths");
+
+        let result = resolve_in_path_var(&joined, "not-really-a-binary");
+
+        assert_eq!(
+            result, None,
+            "a same-named directory on PATH must never be returned as a resolved binary"
+        );
     }
 }

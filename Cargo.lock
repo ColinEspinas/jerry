@@ -5362,6 +5362,7 @@ dependencies = [
  "filedescriptor",
  "nix",
  "portable-pty",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 

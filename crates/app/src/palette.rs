@@ -152,16 +152,22 @@ pub enum PaletteCommand {
     /// exact same confirmation gate as clicking the footer's own `prune` button - it never
     /// bypasses it, even when invoked a second time from the palette rather than the footer.
     PruneWorktrees,
+    /// Opens the real Settings surface - `crate::root::AdeApp::open_settings`, the same real
+    /// action the status bar/title bar's own entry point (once one exists) performs. Named and
+    /// keyed exactly like `Jerry.dc.html`'s own palette fixture entry (`paletteData.all`'s
+    /// Commands group: `{ k: 'c', label: 'Open settings', sub: '', key: '⌘,' }`).
+    OpenSettings,
 }
 
 impl PaletteCommand {
-    pub const ALL: [PaletteCommand; 6] = [
+    pub const ALL: [PaletteCommand; 7] = [
         PaletteCommand::NewShell,
         PaletteCommand::NewClaudeSession,
         PaletteCommand::NewCodexSession,
         PaletteCommand::ToggleFilesChanges,
         PaletteCommand::ToggleRailGrouping,
         PaletteCommand::PruneWorktrees,
+        PaletteCommand::OpenSettings,
     ];
 
     pub fn label(self) -> &'static str {
@@ -172,6 +178,7 @@ impl PaletteCommand {
             PaletteCommand::ToggleFilesChanges => "Toggle Files / Changes",
             PaletteCommand::ToggleRailGrouping => "Toggle Rail Grouping",
             PaletteCommand::PruneWorktrees => "Prune Worktrees",
+            PaletteCommand::OpenSettings => "Open Settings",
         }
     }
 
@@ -185,17 +192,20 @@ impl PaletteCommand {
             PaletteCommand::ToggleFilesChanges => "files changes panel sidebar switch",
             PaletteCommand::ToggleRailGrouping => "rail grouping urgency project sessions",
             PaletteCommand::PruneWorktrees => "prune worktree remove delete cleanup merged",
+            PaletteCommand::OpenSettings => "settings preferences agents worktrees config",
         }
     }
 
     /// The real, already-bound keyboard shortcut for this command, if it has one -
-    /// `Some("⌘N")` only for [`Self::NewShell`], since `cmd-n` is the one real, globally-bound
-    /// keybinding among these actions (`crate::lib::run`'s `cx.bind_keys` call). Every other
-    /// command has no dedicated shortcut in this app yet, so this deliberately returns `None`
-    /// for them rather than displaying a keycap that would silently do nothing if pressed.
+    /// `Some("⌘N")` for [`Self::NewShell`] (`cmd-n`) and `Some("⌘,")` for
+    /// [`Self::OpenSettings`] (`cmd-,`) - the two real, globally-bound keybindings among these
+    /// actions (`crate::lib::run`'s `cx.bind_keys` call). Every other command has no dedicated
+    /// shortcut in this app yet, so this deliberately returns `None` for them rather than
+    /// displaying a keycap that would silently do nothing if pressed.
     pub fn shortcut(self) -> Option<&'static str> {
         match self {
             PaletteCommand::NewShell => Some("\u{2318}N"),
+            PaletteCommand::OpenSettings => Some("\u{2318},"),
             _ => None,
         }
     }
@@ -643,19 +653,24 @@ mod tests {
         assert!(labels.contains(&"New Claude Session"));
         assert!(labels.contains(&"New Codex Session"));
         assert!(labels.contains(&"Prune Worktrees"));
+        assert!(labels.contains(&"Open Settings"));
     }
 
     #[test]
-    fn only_new_shell_carries_a_real_bound_shortcut() {
+    fn only_new_shell_and_open_settings_carry_a_real_bound_shortcut() {
         for command in PaletteCommand::ALL {
-            if command == PaletteCommand::NewShell {
-                assert_eq!(command.shortcut(), Some("\u{2318}N"));
-            } else {
-                assert_eq!(
+            match command {
+                PaletteCommand::NewShell => {
+                    assert_eq!(command.shortcut(), Some("\u{2318}N"))
+                }
+                PaletteCommand::OpenSettings => {
+                    assert_eq!(command.shortcut(), Some("\u{2318},"))
+                }
+                _ => assert_eq!(
                     command.shortcut(),
                     None,
                     "{command:?} has no real global keybinding, so it must not show one"
-                );
+                ),
             }
         }
     }
