@@ -345,3 +345,71 @@ the first version, beyond the passing test suite and a plausible-looking screens
   once the user supplied the original launch command, matching the original prompts and
   per-agent models (`builder`→sonnet, `checker`→opus, `finder`→haiku) exactly, and
   committed them so a future reconnect doesn't lose them again.
+
+### Step 5: read-only diffs, and the last step
+
+- "Base" decision: a git worktree has no explicit "base branch" concept, so `wt_core::
+  diff::diff_against_base` detects the repository's default branch in order —
+  `refs/remotes/origin/HEAD` (symbolic ref) → local `main` → local `master` → the main
+  worktree's own currently-checked-out branch — then computes the merge-base with the
+  selected worktree's `HEAD` via `gix`. If the worktree's branch *is* the detected default,
+  or no merge-base exists (unrelated histories), that's a real, rendered, non-error UI
+  state (`DiffBase::OnDefaultBranch`/`NoBaseFound`), not a fabricated empty diff.
+- Diff content: `git diff <merge-base>` (not `<merge-base>..HEAD`) — deliberately, so
+  uncommitted working-tree changes render alongside committed-since-branch-point changes,
+  since an agent's work may not be committed yet and that's exactly what a reviewer needs
+  to see.
+- gix-vs-git-CLI split, mirroring wt-core's own established pattern: base detection and
+  merge-base computation go through `gix` (a real, stable API for both). Producing the
+  actual diff *text* shells out to `git diff` instead — reimplementing `git diff`'s unified
+  diff formatter (hunk headers, rename detection, binary detection, working-tree-aware
+  content) on top of `gix-diff`'s lower-level tree/blob primitives was judged a real risk of
+  subtly-wrong output for a lot of effort, versus `git diff` itself being definitionally
+  correct.
+- First audit round found the design/API-verification work solid (every gix/git-CLI claim
+  checked out) but three critical, empirically-demonstrated bugs and two lesser ones in the
+  diff-parsing and process-handling logic — the kind of thing that's easy to miss by
+  reading code but shows up immediately under adversarial testing:
+  - **Hunk-body lines starting with `--- `/`+++ ` were misparsed as file headers** (e.g. a
+    deleted SQL comment line `-- foo` renders as `--- foo`), silently truncating the rest
+    of that hunk and, worse, misattributing content to the wrong filename entirely — for a
+    tool whose purpose is reviewing an agent's changes before merge, showing a change under
+    the wrong file's name is close to the worst failure mode available. Fixed by tracking
+    hunk boundaries from the `@@ -a,b +c,d @@` header's own declared line counts instead of
+    guessing from line prefixes, so header-detection only ever runs outside a hunk body.
+  - **Untracked (newly-created, unstaged) files were completely invisible in the diff** —
+    `git diff <merge-base>` alone never includes untracked paths, contradicting both the
+    module's own docs and the fact that a new file is one of the most common things an
+    agent produces. Fixed with a throwaway `--intent-to-add`-augmented shadow index (a temp
+    copy of the real index, swapped in via `GIT_INDEX_FILE`) — the real index is only ever
+    *read*, never written; verified empirically (a `git status` immediately after diffing
+    still reports the file as untracked, never staged).
+  - **Path parsing assumed `a/`/`b/` prefixes were guaranteed**, but `diff.mnemonicPrefix`
+    (a real, fairly common user git config) changes them to `i/`/`w/`/`c/`, silently
+    mislabeling every file. Fixed by pinning `-c diff.mnemonicPrefix=false -c
+    diff.noprefix=false -c core.quotePath=false` on the `git diff` invocation itself, rather
+    than assuming defaults.
+  - Unbounded stderr read plus stdout/stderr drained sequentially rather than concurrently
+    — a narrow but real deadlock/child-leak path if `git diff` wrote enough stderr (e.g. one
+    warning line per file, across up to 300 files) to fill its pipe buffer before stdout
+    finished. Fixed with a capped, concurrently-drained stderr reader.
+  - Clicking the Files/Diff toggle didn't recompute the diff, so it could silently go
+    stale relative to new agent activity. Fixed by reloading on toggle.
+- Test count: wt-core 28 → 36 after these fixes, including regression tests built directly
+  from each bug's real reproduction (a deleted `-- comment` line, an added `++ b/evil.txt`
+  line, an untracked file appearing as a real addition, `diff.mnemonicPrefix=true` set in
+  the test repo, a stderr-heavy child process bounded by a timeout so a regression fails
+  fast instead of hanging).
+- Infra note: this step's builder agent was interrupted mid-task by another background
+  session reconnect (see step 4's note on the same failure mode) partway through — but it
+  had already produced 903 lines of genuinely complete, well-reasoned `diff.rs` (the base-
+  detection algorithm, the gix/git-CLI split, and the caps were all already correct) before
+  being cut off; a fresh `builder` agent picked it up, wired it into the crate, and finished
+  the `app`-side UI rather than restarting from scratch.
+
+## Where this leaves the project
+
+All five build steps are complete, checked (each went through at least one adversarial
+audit round that found and got real bugs fixed, not just a read-through), and committed.
+See `ASSESSMENT.md` for an honest account of what actually runs end to end versus what's
+still rough, and where the real effort went.
