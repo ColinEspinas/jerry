@@ -7,6 +7,6 @@ publish = { workspace = true }
 [dependencies]
 gix = { version = "0.68" }
 thiserror = { workspace = true }
-
-[dev-dependencies]
+# Used at runtime (not just in tests) by `diff::prepare_shadow_index` to build a throwaway
+# copy of the real index for `git diff`'s untracked-file handling - see that function's docs.
 tempfile = "3"

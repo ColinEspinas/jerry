@@ -65,6 +65,11 @@ pub enum Error {
     #[error("failed to resolve HEAD to a commit: {0}")]
     PeelHead(#[source] Box<gix::head::peel::Error>),
 
+    /// Failed to compute the merge-base between a worktree's `HEAD` and the detected
+    /// default branch.
+    #[error("failed to compute merge-base: {0}")]
+    MergeBase(#[source] Box<gix::repository::merge_base::Error>),
+
     /// Failed to spawn the `git` process.
     #[error("failed to run `git {args}`: {source}")]
     GitSpawn {

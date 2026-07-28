@@ -31,7 +31,8 @@
 
 use std::path::PathBuf;
 
-use gpui::{div, prelude::*, rgb, ClickEvent, Context, Task, Window};
+use gpui::{div, font, prelude::*, rgb, ClickEvent, Context, Task, Window};
+use wt_core::diff::{DiffBase, DiffFile, DiffLineKind, FileChangeStatus};
 
 use crate::file_tree::{self, FileTreeEntry};
 use crate::sessions::{SessionKind, Sessions};
@@ -42,6 +43,37 @@ const SIDEBAR_WIDTH: gpui::Pixels = gpui::px(240.0);
 /// See the comment at its use site in `render_file_tree` for why this exists.
 const MAX_RENDERED_FILE_ENTRIES: usize = 500;
 
+/// Cap on how many changed files the diff view turns into rendered elements, independent of
+/// `wt_core::diff`'s own `MAX_FILES` cap (300) on the *loaded* diff. Mirrors
+/// `MAX_RENDERED_FILE_ENTRIES` above for the same reason: `wt_core::diff` can hand back up
+/// to 300 files, each carrying its own hunk lines on top, and laying all of that out as
+/// GPUI divs on every render is the same kind of foreground-executor stall documented at
+/// `MAX_RENDERED_FILE_ENTRIES`'s use site, just with a much larger multiplier.
+const MAX_RENDERED_DIFF_FILES: usize = 40;
+
+/// Cap on how many hunk lines a single file's diff renders, independent of `wt_core::diff`'s
+/// own per-file `MAX_HUNK_LINES_PER_FILE` cap (2000) on loaded data. Same reasoning as
+/// `MAX_RENDERED_DIFF_FILES`: a single enormous file (e.g. a generated lockfile that slipped
+/// past the loaded-data cap) shouldn't be allowed to blow up render time on its own.
+const MAX_RENDERED_DIFF_LINES_PER_FILE: usize = 300;
+
+/// Which real data source the right sidebar currently shows for the selected worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RightSidebarView {
+    Files,
+    Diff,
+}
+
+/// The outcome of the most recent (or in-flight) `wt_core::diff::diff_against_base` call for
+/// [`AdeApp::diff_root`]. Kept separate from [`DiffBase`] (rather than wrapping it in an
+/// `Option`/`Result` at the call site) so "still computing" is a first-class, renderable
+/// state rather than reusing an empty/default value that could be mistaken for "no changes".
+enum DiffLoadState {
+    Loading,
+    Loaded(DiffBase),
+    Error(String),
+}
+
 pub struct AdeApp {
     repo_path: PathBuf,
     worktrees: Vec<WorktreeItem>,
@@ -51,14 +83,19 @@ pub struct AdeApp {
     file_tree: Vec<FileTreeEntry>,
     file_tree_root: PathBuf,
     file_tree_error: Option<String>,
+    right_sidebar_view: RightSidebarView,
+    diff_root: PathBuf,
+    diff_state: DiffLoadState,
     _load_worktrees_task: Option<Task<()>>,
     _load_file_tree_task: Option<Task<()>>,
+    _load_diff_task: Option<Task<()>>,
 }
 
 impl AdeApp {
     pub fn new(repo_path: PathBuf, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             file_tree_root: repo_path.clone(),
+            diff_root: repo_path.clone(),
             repo_path: repo_path.clone(),
             worktrees: Vec::new(),
             worktrees_error: None,
@@ -66,8 +103,11 @@ impl AdeApp {
             sessions: Sessions::new(),
             file_tree: Vec::new(),
             file_tree_error: None,
+            right_sidebar_view: RightSidebarView::Files,
+            diff_state: DiffLoadState::Loading,
             _load_worktrees_task: None,
             _load_file_tree_task: None,
+            _load_diff_task: None,
         };
         // A fresh window shouldn't open with zero tabs and no way to see anything running -
         // start with one real shell in the repo root, exactly like step 3's single terminal
@@ -76,7 +116,8 @@ impl AdeApp {
         this.sessions
             .spawn(SessionKind::Shell, repo_path.clone(), cx);
         this.load_worktrees(cx);
-        this.load_file_tree(repo_path, cx);
+        this.load_file_tree(repo_path.clone(), cx);
+        this.load_diff(repo_path, cx);
         this
     }
 
@@ -131,6 +172,34 @@ impl AdeApp {
         self._load_file_tree_task = Some(task);
     }
 
+    /// Loads (or reloads) the real diff of `root` against its detected base branch, per
+    /// `wt_core::diff`'s docs. Offloaded to `cx.background_executor()` for the same reason
+    /// `load_worktrees`/`load_file_tree` are: `diff_against_base` performs blocking I/O
+    /// (`gix` reads plus a spawned `git diff` child process) and must never run on the GPUI
+    /// foreground thread.
+    fn load_diff(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        self.diff_root = root.clone();
+        self.diff_state = DiffLoadState::Loading;
+        cx.notify();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let root = root.clone();
+                    async move { wt_core::diff::diff_against_base(&root) }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.diff_state = match result {
+                    Ok(base) => DiffLoadState::Loaded(base),
+                    Err(err) => DiffLoadState::Error(err.to_string()),
+                };
+                cx.notify();
+            });
+        });
+        self._load_diff_task = Some(task);
+    }
+
     /// The worktree a *new* session should be spawned into: the selected worktree's real
     /// path if one is selected and readable, otherwise the repo root - see the module docs'
     /// "Sessions/tabs" section for why this is resolved at spawn time rather than tracked as
@@ -152,8 +221,24 @@ impl AdeApp {
         }
         let path = item.path.clone();
         self.selected = Some(index);
-        self.load_file_tree(path, cx);
+        self.load_file_tree(path.clone(), cx);
+        self.load_diff(path, cx);
         cx.notify();
+    }
+
+    /// Switches which real data source the right sidebar shows. Switching *to* the Diff view
+    /// always recomputes it (`load_diff`, not just `cx.notify()`) rather than showing
+    /// whatever was last loaded: the core workflow this feature exists for is "run an agent
+    /// in a terminal tab, then check the diff", and a stale snapshot captured back when the
+    /// worktree was first selected would silently hide exactly the changes just made -
+    /// worse than an obviously-loading state.
+    fn set_right_sidebar_view(&mut self, view: RightSidebarView, cx: &mut Context<Self>) {
+        self.right_sidebar_view = view;
+        if view == RightSidebarView::Diff {
+            self.load_diff(self.diff_root.clone(), cx);
+        } else {
+            cx.notify();
+        }
     }
 
     fn new_session(&mut self, kind: SessionKind, cx: &mut Context<Self>) {
@@ -367,7 +452,7 @@ impl AdeApp {
             .child(div().flex().flex_col().flex_1().min_h_0().child(body))
     }
 
-    fn render_file_tree(&self) -> impl IntoElement {
+    fn render_file_tree(&self) -> gpui::AnyElement {
         let mut list = div().flex().flex_col().p_2().size_full();
 
         list = list.child(
@@ -445,6 +530,235 @@ impl AdeApp {
 
         list.into_any_element()
     }
+
+    /// The small "Files" / "Diff" toggle at the top of the right sidebar, switching what
+    /// [`Self::render_right_sidebar_body`] shows for the currently selected worktree.
+    fn render_right_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let toggle_button = |label: &'static str, view: RightSidebarView| {
+            let is_active = self.right_sidebar_view == view;
+            div()
+                .id(label)
+                .cursor_pointer()
+                .flex_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .text_center()
+                .rounded_sm()
+                .when(is_active, |el| el.bg(rgb(0x2f5f8f)))
+                .when(!is_active, |el| el.hover(|el| el.bg(rgb(0x2a2a2a))))
+                .text_color(rgb(0xe0e0e0))
+                .child(label)
+                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    this.set_right_sidebar_view(view, cx);
+                }))
+        };
+
+        div()
+            .flex()
+            .flex_row()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(rgb(0x2a2a2a))
+            .child(toggle_button("Files", RightSidebarView::Files))
+            .child(toggle_button("Diff", RightSidebarView::Diff))
+    }
+
+    /// The right sidebar's content: the real file tree, or the real diff against the
+    /// selected worktree's base branch, per [`Self::right_sidebar_view`].
+    fn render_right_sidebar_body(&self) -> gpui::AnyElement {
+        match self.right_sidebar_view {
+            RightSidebarView::Files => self.render_file_tree(),
+            RightSidebarView::Diff => self.render_diff(),
+        }
+    }
+
+    /// Renders [`Self::diff_state`] for [`Self::diff_root`]: a loading/error state, one of
+    /// `wt_core::diff::DiffBase`'s explanatory non-diff outcomes (on the default branch, or
+    /// no base could be found), or the real diff itself.
+    fn render_diff(&self) -> gpui::AnyElement {
+        let mut list = div().flex().flex_col().p_2().size_full();
+
+        list = list.child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x8a8a8a))
+                .pb_1()
+                .child(self.diff_root.display().to_string()),
+        );
+
+        match &self.diff_state {
+            DiffLoadState::Loading => list
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x8a8a8a))
+                        .child("computing diff..."),
+                )
+                .into_any_element(),
+            DiffLoadState::Error(err) => list
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0xff6b6b))
+                        .child(format!("failed to compute diff: {err}")),
+                )
+                .into_any_element(),
+            DiffLoadState::Loaded(DiffBase::NoBaseFound) => list
+                .child(div().text_xs().text_color(rgb(0x8a8a8a)).child(
+                    "no base branch could be detected for this worktree (no origin/HEAD, \
+                     no local main/master, and no fallback branch found)",
+                ))
+                .into_any_element(),
+            DiffLoadState::Loaded(DiffBase::OnDefaultBranch { branch }) => list
+                .child(div().text_xs().text_color(rgb(0x8a8a8a)).child(format!(
+                    "this worktree is on the default branch ({branch}); nothing to \
+                             diff against"
+                )))
+                .into_any_element(),
+            DiffLoadState::Loaded(DiffBase::Diff(diff)) => {
+                list = list.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x8a8a8a))
+                        .pb_1()
+                        .child(format!(
+                            "diff against {} ({})",
+                            diff.base_branch,
+                            &diff.base_commit[..diff.base_commit.len().min(10)]
+                        )),
+                );
+
+                if diff.truncated {
+                    list = list.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xd4a017))
+                            .pb_1()
+                            .child("diff output was too large; some files/lines are omitted"),
+                    );
+                }
+
+                if diff.files.is_empty() {
+                    return list
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x8a8a8a))
+                                .child("no changes"),
+                        )
+                        .into_any_element();
+                }
+
+                let rendered_count = diff.files.len().min(MAX_RENDERED_DIFF_FILES);
+                for file in &diff.files[..rendered_count] {
+                    list = list.child(self.render_diff_file(file));
+                }
+                if diff.files.len() > rendered_count {
+                    list = list.child(div().text_xs().text_color(rgb(0x8a8a8a)).pt_1().child(
+                        format!(
+                            "... and {} more changed files not shown",
+                            diff.files.len() - rendered_count
+                        ),
+                    ));
+                }
+
+                list.into_any_element()
+            }
+        }
+    }
+
+    /// Renders one changed file: its status/path header, then either a "binary file" note or
+    /// its hunks as unified-diff-style, color-coded lines (added/removed/context) - capped by
+    /// [`MAX_RENDERED_DIFF_LINES_PER_FILE`] independent of `wt_core::diff`'s own load-time cap
+    /// (see that constant's docs).
+    fn render_diff_file(&self, file: &DiffFile) -> impl IntoElement {
+        let (status_label, status_color) = match file.status {
+            FileChangeStatus::Added => ("A", rgb(0x7ee787)),
+            FileChangeStatus::Deleted => ("D", rgb(0xffa198)),
+            FileChangeStatus::Modified => ("M", rgb(0xd4a017)),
+            FileChangeStatus::Renamed => ("R", rgb(0x6ab0f3)),
+        };
+
+        let path_text = match &file.old_path {
+            Some(old) => format!("{} -> {}", old.display(), file.path.display()),
+            None => file.path.display().to_string(),
+        };
+
+        let mut container = div()
+            .id(format!("diff-file-{}", file.path.display()))
+            .flex()
+            .flex_col()
+            .pb_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .items_center()
+                    .child(div().text_xs().text_color(status_color).child(status_label))
+                    .child(div().text_xs().text_color(rgb(0xe0e0e0)).child(path_text)),
+            );
+
+        if file.is_binary {
+            return container.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8a8a8a))
+                    .pl_2()
+                    .child("binary file (contents not diffed)"),
+            );
+        }
+
+        let mut rendered_lines = 0usize;
+        let mut hunks_truncated = false;
+        'hunks: for hunk in &file.hunks {
+            container = container.child(
+                div()
+                    .text_xs()
+                    .font(font("monospace"))
+                    .text_color(rgb(0x6ab0f3))
+                    .pl_2()
+                    .child(hunk.header.clone()),
+            );
+            for line in &hunk.lines {
+                if rendered_lines >= MAX_RENDERED_DIFF_LINES_PER_FILE {
+                    hunks_truncated = true;
+                    break 'hunks;
+                }
+                rendered_lines += 1;
+
+                let (prefix, fg, bg) = match line.kind {
+                    DiffLineKind::Added => ("+", rgb(0x7ee787), Some(rgb(0x0f2a1a))),
+                    DiffLineKind::Removed => ("-", rgb(0xffa198), Some(rgb(0x2d1214))),
+                    DiffLineKind::Context => (" ", rgb(0xb0b0b0), None),
+                };
+                let mut line_el = div()
+                    .text_xs()
+                    .font(font("monospace"))
+                    .pl_2()
+                    .text_color(fg);
+                if let Some(bg) = bg {
+                    line_el = line_el.bg(bg);
+                }
+                container = container.child(line_el.child(format!("{prefix}{}", line.content)));
+            }
+        }
+
+        if file.truncated || hunks_truncated {
+            container = container.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8a8a8a))
+                    .pl_2()
+                    .child("... diff truncated for this file"),
+            );
+        }
+
+        container
+    }
 }
 
 impl Render for AdeApp {
@@ -469,13 +783,22 @@ impl Render for AdeApp {
             .child(
                 div()
                     .id("file-tree-sidebar")
+                    .flex()
+                    .flex_col()
                     .flex_none()
                     .w(SIDEBAR_WIDTH)
                     .h_full()
-                    .overflow_y_scroll()
                     .border_l_1()
                     .border_color(rgb(0x2a2a2a))
-                    .child(self.render_file_tree()),
+                    .child(self.render_right_sidebar_toggle(cx))
+                    .child(
+                        div()
+                            .id("right-sidebar-body")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .child(self.render_right_sidebar_body()),
+                    ),
             )
     }
 }
