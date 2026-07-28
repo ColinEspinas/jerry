@@ -656,3 +656,43 @@ fixed — file loading moved to the same background-executor pattern used for di
 worktree lists, the cap became real virtualization via `gpui::uniform_list` so a whole file
 is actually reachable, the version claim became a real pin, and the fake column was removed
 rather than left wrong.
+
+#### Phase H2 — real LSP client + diagnostics
+
+New `crates/lsp-core`: spawns real `rust-analyzer` as a piped (not pty) subprocess, a real
+hand-rolled `Content-Length`-framed JSON-RPC transport, a real `initialize`/`initialized`
+handshake, and real `textDocument/publishDiagnostics` handling. Built around the real,
+MIT-licensed `lsp-types` crate from crates.io rather than `vendor/zed/crates/lsp` (real,
+correct, but GPL-3.0-or-later) — read the latter for reference on real handshake/message
+sequencing, never depended on it, to keep this project on permissive licenses throughout.
+
+The builder for this phase was killed by an infrastructure interruption after finishing and
+testing the core implementation but before writing a report or taking screenshots — so the
+audit that followed had no claims to check, just code and tests to read cold. What it found
+already solid: correct handshake ordering (verified against a recorded wire log from a real
+fake-server harness), real out-of-order request/response correlation, clean process teardown
+with no orphaned threads or grandchildren, and a genuine end-to-end test against real
+rust-analyzer catching a real compile error with correct byte ranges and error codes. What it
+found broken: an unbounded `Content-Length` header could abort the whole app process via a
+failed allocation, or hang the reader thread forever on a more moderate oversized value —
+reachable by anything that desyncs the framer, not just a hostile server; one rust-analyzer
+process leaked per worktree browsed, unbounded, for the life of the window — multi-gigabyte
+each against this repo's own vendored tree, the same per-worktree-state-accumulation bug
+class already caught and fixed once in Phase B; and a blocking `canonicalize()` call ran
+directly on the render thread, the same rule this project has enforced and re-found broken
+in nearly every phase since Phase D. All fixed, plus a multi-line diagnostic message
+overflowing a fixed-height list row, diagnostic severity being computed but never actually
+affecting rendering (a real Hint looked identical to a real Error), a latent reader-thread
+pipe-deadlock risk, and a protocol-shape violation in the generic reply to server-pushed
+requests.
+
+Closed the remaining verification gap directly rather than re-dispatching for it: ran the
+app against a real scratch crate with a genuine type error through the established x11
+screenshot pipeline, and got a real diagnostic — dotted underline, "mismatched types", a
+detail card with the real `rustc`/`E0308` — from a real rust-analyzer response. Hit one
+real environment gotcha along the way, not an app bug: a scratch repo with no
+`rust-toolchain.toml` made rustup's `rust-analyzer` shim resolve to the default "stable"
+toolchain (which doesn't have the component installed) instead of the 1.95.0 toolchain that
+does, surfacing as an honest "rust-analyzer closed the connection" status rather than a
+silent failure — fixed by pinning the scratch repo's own toolchain file, same as this
+project's own.
