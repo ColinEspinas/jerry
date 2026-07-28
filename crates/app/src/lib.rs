@@ -9,6 +9,7 @@
 //! blocking-call offloading, terminal grid rendering).
 
 pub mod changes;
+pub mod code_view;
 pub mod file_tree;
 pub mod fonts;
 pub mod layout;

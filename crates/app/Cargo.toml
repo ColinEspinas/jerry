@@ -32,6 +32,18 @@ log = "0.4"
 # separate top-level dependency here, so there's no risk of it drifting to a different `vte`
 # version than the one `alacritty_terminal` itself was built against.
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
+# Real Rust syntax highlighting for Surface C's File view (`crate::code_view`) - pinned to the
+# exact versions `vendor/zed/Cargo.toml` itself pins (`tree-sitter = "0.26.9"`,
+# `tree-sitter-rust = "0.24.2"`), so this is the same grammar/bindings pair Zed's own `language`
+# crate verified against, not an independently-drifting version. `tree-sitter` is a real, exact
+# `=` pin rather than a caret requirement: a bare `"0.26.9"` requirement already drifted to a
+# newer real resolved version (0.26.11) the moment it was published to crates.io, silently
+# breaking the "same version Zed verified against" claim above - `cargo update -p tree-sitter
+# --precise 0.26.9` was run after adding the `=` here to bring `Cargo.lock` back in line.
+# `tree-sitter-rust`'s own caret requirement hasn't drifted (still resolves to 0.24.2, matching
+# vendor/zed's own `Cargo.lock` exactly), so it's left as a normal caret requirement.
+tree-sitter = "=0.26.9"
+tree-sitter-rust = "0.24.2"
 
 [dev-dependencies]
 tempfile = "3"
