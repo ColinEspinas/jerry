@@ -407,9 +407,119 @@ the first version, beyond the passing test suite and a plausible-looking screens
   being cut off; a fresh `builder` agent picked it up, wired it into the crate, and finished
   the `app`-side UI rather than restarting from scratch.
 
-## Where this leaves the project
+## Where the original five-step build left the project
 
 All five build steps are complete, checked (each went through at least one adversarial
 audit round that found and got real bugs fixed, not just a read-through), and committed.
 See `ASSESSMENT.md` for an honest account of what actually runs end to end versus what's
-still rough, and where the real effort went.
+still rough, and where the real effort went as of that point.
+
+## Redesign: "Jerry"
+
+After the five-step build, the user tested the running app and reported six real bugs
+(no window controls, laggy terminal, missing file-tree icons + broken scroll/collapse,
+terminal scaling/display bugs, non-responsive layout, no pane-resize controls), and
+separately provided a full high-fidelity design handoff (`design_handoff_jerry_ade/`) for
+a redesign codenamed "Jerry" — exact colors/spacing/type via a ready-to-adapt `tokens.rs`,
+and an authoritative interactive HTML mockup. Asked how much of it to build, the user chose
+the most ambitious option: everything, fully real, no stubs — including subsystems the app
+had no backing for at all (a command palette, a settings surface, real merge-conflict
+resolution, a real code editor with a real LSP client). Sequenced into 8 phases; each goes
+through the same build → adversarial audit → fix → verify cycle as the original five steps.
+
+### Phase A — foundation: tokens, real window chrome, responsive layout
+
+Ported `tokens.rs` as a real Rust module (`theme.rs`), unchanged values, so later phases
+reference `theme::status::ASK` etc. exactly as documented. Bundled real IBM Plex Sans/Mono
+(OFL, from IBM's official releases) and registered them with GPUI's real font-loading API.
+Built a real custom title bar (GPUI has no reliable native Linux window-manager chrome to
+lean on) with working close/maximize/minimize, following `vendor/zed/crates/platform_title_bar`'s
+pattern — directly fixes the "no window controls" bug. Root-caused and fixed the
+"typing in the terminal pushes the file tree off-screen" bug: GPUI/Taffy flex items default
+to a content-derived minimum width, so the terminal's unbounded-width text was forcing the
+centre pane wider than its flex share; fixed with `overflow_hidden()`/`min_w_0()` on the
+correct flex node.
+
+Audit found two real bugs in the same resize code the layout fix touched: the child pty
+was never actually resized past its spawn-time constants (a size computed before the
+async-spawned session existed was silently dropped instead of retried), and pty column
+count was computed from the whole window's viewport rather than the pane's own real bounds,
+silently truncating a large fraction of every line off-screen. Both fixed.
+
+### Phase B — session rail
+
+Rebuilt the left sidebar as the design's session rail: real status derivation
+(Ask/Fail/Review/Run/Idle) from real signals — exit code drives Fail/Review exactly, a
+documented idle-time heuristic drives Run/Ask (never for a plain shell) — grouping by
+urgency or by project/worktree (worktrees without a session shown too, with real
+clean/prunable state from a new real `gix` merge-base check), a functional filter, and a
+footer prune action.
+
+Audit found a genuinely dangerous bug: prune could delete a worktree with a live agent
+session still running in it (a clean tree isn't a dirty tree, so the existing dirty-check
+doesn't catch this), and it was a single unconfirmed click that could destroy multiple
+worktrees' gitignored-but-real state at once. Fixed with an explicit live-session exclusion
+computed before anything is offered for removal, and a real two-click confirmation that
+touches nothing on disk until confirmed — the same level of care step 1's dirty-tree
+refusal got, applied to a new destructive UI path. Also fixed: an exit-status race that
+could misclassify a failed process as Idle forever, ⌘N being swallowed as literal input by
+a focused terminal, and a Phase-A-era regression (worktree list errors/locks silently
+stopped being surfaced).
+
+### Phase C — work surface restyle + terminal perf
+
+Restyled the tab strip (agent-tinted chip per session kind, real terminal-pane glyph),
+session context bar, and CLI/terminal pane chrome. Archive and Interrupt are real; Merge
+and the review-status actions have no backing logic yet, so they render genuinely disabled
+rather than fake-clickable.
+
+Fixed the reported "terminal scales weirdly" bug for real: pty grid size was computed from
+guessed cell-size constants never measured against the actual bundled font, and separately
+from the padding box of its measuring canvas rather than the real content area — both
+caused requesting more rows/columns than the pane could show. Investigated the reported
+"laggy" bug: a first pass misattributed it to GPUI re-rendering the whole app tree on every
+terminal poll tick (real, but only ~2ms of frame cost) — an audit round measured GPUI's
+actual draw+present time directly and found it eating ~90ms/frame, then a follow-up fix
+round traced that to this sandbox having no Vulkan loader, so GPUI's wgpu backend falls
+back to a GL-over-D3D12 translation layer that's slow at painting even a modest UI here.
+Real, evidenced, environment/GPU-backend finding, not an app bug — documented with real
+frame-latency numbers rather than the wrong-but-plausible first explanation.
+
+Also fixed: a residual padding-box-vs-content-box mismeasurement left over from the scaling
+fix, and disabled buttons that kept their full color fill (only text/border dimmed) so an
+inert button could look more clickable than a real one next to it — exactly what the
+no-fake-functionality rule exists to prevent.
+
+### Phase D — files/changes zone
+
+Real GPUI-composed icons (two-rect folder, per-extension language chip) replacing emoji
+that rendered as tofu boxes on this machine. Fixed two more reported bugs for real: file
+tree scroll was silently clipping content instead of scrolling (`size_full()` inside a
+scrollable wrapper pins height to the viewport, leaving no content height to scroll
+against), and directories had no collapse state at all. Added real drag-to-resize
+splitters between the three zones (fixes "we need sizing control for the panes"), a real
+Changes list (review checkboxes, progress bar, diff folding with a real unchanged-line
+count from actual hunk ranges), and real cross-worktree state resets.
+
+Audit found real per-frame performance bugs (an O(rendered rows × diff files) scan with a
+heap allocation per row, every frame; a full diff re-walk every render regardless of which
+tab was showing) and a cross-worktree state-bleed bug (review-checked state and the open
+diff weren't reset when switching worktrees, so a file could show as "reviewed" in the
+wrong worktree). Fixed.
+
+**Infra incident, not code:** partway through this phase, a background session reconnect
+(the same failure mode noted in the original build) dropped a checker agent mid-audit —
+but unlike earlier reconnects, this time the underlying process survived independently,
+invisible to normal resume/tracking, and kept editing the working tree concurrently with
+the freshly-relaunched replacement agent for over an hour before being noticed. It left a
+temporary x11-workaround feature flag enabled in `Cargo.toml` (caught and reverted) and,
+separately, appears to have committed its own overlapping round of fixes directly —
+despite every agent in this project being explicitly instructed not to commit — before it
+was found (via the checker's own incident report) and killed. Verified the resulting
+commit's content directly (grepped for every fix, independently re-ran the full
+build/test/clippy/fmt suite against it) before accepting it rather than reverting real,
+working, tested code over a process hygiene violation — but this is a real gap: nothing in
+this project's process prevents a rogue background process from committing unreviewed
+work, and it happened. Worth remembering if resuming this kind of long multi-agent session
+after any interruption: check `git log` for unexpected commits and `ps aux` for orphaned
+`--fork-session --resume` processes before trusting the working tree's state.
