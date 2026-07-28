@@ -580,3 +580,46 @@ than just patching the comment.
 
 The rogue-process fix from Phase E held for the rest of this phase and its audit — no
 further sightings.
+
+### Phase G — real git merge and conflict resolution
+
+The first feature anywhere in this project that can create real merge commits or otherwise
+alter real git history. Wires up the context bar's "Merge" button (real-but-disabled since
+Phase C) to a real `git merge --no-commit --no-ff`, run in whichever worktree already has
+the base branch checked out (a real git-worktree subtlety: you can't check out a branch
+that's already checked out elsewhere, so the merge has to run from wherever the base
+actually lives, never via a fresh checkout). Never auto-commits — both a clean merge and a
+resolved conflict require an explicit "Complete merge" action. Real conflict-marker
+parsing, real take-left/right/both writing real resolved content, real `git merge --abort`
+recovery.
+
+Given the stakes, this got three rounds of adversarial testing against real git repos
+before landing, each finding real bugs the previous round missed:
+
+- **Round one** (7 bugs): a missing `core.quotePath` pin meant a non-ASCII filename could
+  get a stray, wrongly-named file written into the repo; modify/delete and binary
+  conflicts have no textual markers on disk and were silently reported as "resolved,"
+  which would let a user click Complete and get a confusing failure instead of a clear
+  state; the error state had no abort action, so any read failure after a successful `git
+  merge` permanently wedged the base worktree mid-merge with no in-app recovery; merge
+  state leaked across three different session-close paths (archive, respawn, tab close),
+  only one of which was originally checked, permanently disabling Merge app-wide after any
+  of them; Complete/Abort had no in-flight guard; "Take both" had no UI control despite
+  being tested at the wt-core level; `complete_merge` had no defense-in-depth precondition
+  of its own, relying entirely on git's own rejection.
+- **Round two**: the round-one fix introduced its own wedge. Two async operations (a
+  session-close cleanup abort, and an in-flight Complete/Abort) shared single task-handle
+  fields, and GPUI cancels a `Task` immediately on drop — so closing a session while a
+  Complete was landing silently cancelled it via the cleanup abort, discarding real
+  resolved work and leaving `merge_op_in_flight` stuck `true` with both recovery buttons
+  reduced to no-ops. A sibling bug let resolving two files back-to-back cancel one file's
+  write the same way. Both fixed by giving each async operation its own task slot instead
+  of sharing one, and having cleanup back off entirely when a real operation is already in
+  flight rather than racing it.
+- **Round three**: re-verified everything against real repos, including deliberately
+  reverting each fix in isolation to confirm its specific regression test actually catches
+  the regression, not just that the test suite stays green.
+
+The conflict banner (design's cross-session "another session touched this file" warning)
+was scoped out — it needs a per-session parallel diff cache the app doesn't have yet,
+documented as a materially separate feature rather than faked.
