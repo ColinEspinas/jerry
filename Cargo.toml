@@ -5,6 +5,13 @@ members = [
     "crates/pty-core",
     "crates/app",
 ]
+# `vendor/zed` is its own separate Cargo workspace (it has its own `[workspace]` table
+# with its own `workspace.dependencies`, e.g. `accesskit`, that gpui's Cargo.toml
+# inherits from via `.workspace = true`). Without this exclude, Cargo treats every path
+# dependency under `vendor/zed` that isn't an explicit member as belonging to *this*
+# workspace instead, and gpui's manifest fails to parse because this workspace's
+# `[workspace.dependencies]` doesn't define those keys.
+exclude = ["vendor/zed"]
 
 [workspace.package]
 edition = "2021"

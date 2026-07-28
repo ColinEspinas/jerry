@@ -4,4 +4,26 @@ version = "0.1.0"
 edition = { workspace = true }
 publish = { workspace = true }
 
+[[bin]]
+name = "app"
+path = "src/main.rs"
+
 [dependencies]
+gpui = { workspace = true }
+# Only the `wayland` backend is enabled by default: the `x11` feature link-fails on this
+# dev machine because `libxkbcommon-x11`/`libxcb-xkb` aren't installed system packages here
+# and there's no passwordless sudo to install them (see the step-3 report for how `x11` was
+# still verified to render correctly, via a temporary local workaround). WSLg (this dev
+# machine) provides a real Wayland compositor (`WAYLAND_DISPLAY=wayland-0`), so `wayland`
+# alone is sufficient for `cargo build -p app` to produce a working, launchable binary here.
+gpui_platform = { path = "../../vendor/zed/crates/gpui_platform", features = [
+    "wayland",
+] }
+wt-core = { path = "../wt-core" }
+pty-core = { path = "../pty-core" }
+anyhow = { workspace = true }
+env_logger = "0.11"
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
