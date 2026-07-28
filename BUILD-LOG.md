@@ -558,3 +558,25 @@ permanent test-support harness, since a `FocusHandle` pointing at an unrendered 
 structurally invisible to plain unit tests. Also fixed: the panel always rendering at max
 height regardless of content, and palette actions not clearing an armed-but-unconfirmed
 rail prune.
+
+### Phase F — settings surface
+
+A real settings surface (not a modal), following the design doc's own explicit scope
+statement: "Agents and Worktrees are designed; the rest are nav-only in this mockup."
+Agents page does real `$PATH` detection (Claude genuinely resolves on this machine, Codex
+genuinely doesn't); Worktrees page reuses Phase B's real worktree/prune state rather than
+a parallel implementation. Every other nav page renders the mockup's own literal
+placeholder copy rather than invented settings content that was never designed.
+
+Audit found the Agents page recomputing its PATH search directly in `render()` — fast
+(~5µs) when a binary is found, but ~30ms when not found (only the not-found path walks the
+whole `$PATH` list), paid every frame and re-triggered by the existing 3-second status
+poll while the page stayed open. Fixed with the same background-cache pattern already used
+for disk usage. Also found a real, if latent, `unsafe` env-var mutation in pty-core's own
+tests whose safety comment incorrectly claimed single-threaded execution — refactored the
+PATH search into a pure function taking the PATH value as a parameter instead of reading
+process environment internally, removing pty-core's last `unsafe` block entirely rather
+than just patching the comment.
+
+The rogue-process fix from Phase E held for the rest of this phase and its audit — no
+further sightings.
