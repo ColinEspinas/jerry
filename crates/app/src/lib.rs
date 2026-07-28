@@ -17,6 +17,7 @@ pub mod status;
 pub mod terminal_grid;
 pub mod terminal_pane;
 pub mod theme;
+pub mod work_surface;
 pub mod worktrees;
 
 use std::path::PathBuf;

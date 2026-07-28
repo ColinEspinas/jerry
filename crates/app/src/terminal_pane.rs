@@ -45,7 +45,7 @@ use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    canvas, div, font, prelude::*, rgb, Bounds, ClickEvent, Context, FocusHandle, Focusable,
+    canvas, div, font, prelude::*, px, rgb, Bounds, ClickEvent, Context, FocusHandle, Focusable,
     FontWeight, KeyDownEvent, Keystroke, Pixels, Size, Task, Window,
 };
 use pty_core::{ExitStatus, PtyError, PtySession, SpawnOptions};
@@ -125,14 +125,37 @@ fn eof_poll_decision(
     }
 }
 
-/// Approximate monospace cell metrics, in pixels, for the `text_xs()` font size this pane
-/// renders with. Used only to turn a pixel viewport into an approximate row/column count
-/// for `PtySession::resize` and `TerminalGrid::resize` - not measured from the actual
-/// font/renderer (no verified GPUI API for querying a rendered glyph's real advance width
-/// was used for this step), so treat this as a reasonable estimate, not a pixel-accurate
-/// fit.
+/// The terminal body's real, explicit font size and line height -
+/// `design_handoff_jerry_ade/README.md`'s Surface A/B body spec: "lines at 12px/19 mono".
+/// Set explicitly (`.text_size()`/`.line_height()`) on the pane root by [`TerminalPane`]'s
+/// own `Render` impl, not per-row by [`render_row`] - each row's children simply inherit both
+/// from that root, the same real GPUI style-inheritance idiom used elsewhere in this file -
+/// rather than the pane's previous `.text_xs()` (`rems(0.75)`, dependent on
+/// `Window::rem_size()`) with no `.line_height()` at all (GPUI's own default,
+/// `gpui::geometry::phi()` - the golden ratio, ~1.618× the font size, unrelated to this
+/// font's real metrics). This closes the vertical half of a real, measured "scales weirdly"
+/// bug - see [`TerminalPane::cell_size`]'s docs for the horizontal half and the fuller
+/// before/after story.
+const ROW_FONT_SIZE_PX: f32 = 12.0;
+const ROW_LINE_HEIGHT_PX: f32 = 19.0;
+
+/// Fallback monospace cell width, in pixels, used only until [`TerminalPane::cell_size`]'s
+/// real measurement (`Window::text_system().advance`) succeeds at least once - i.e. before
+/// the very first paint. Was, until this step, the *only* source for this value (a guess,
+/// never actually measured against the real bundled IBM Plex Mono - see [`TerminalPane::
+/// cell_size`]'s docs for the real, measured gap that left, and the fix).
 const APPROX_CELL_WIDTH_PX: f32 = 7.0;
-const APPROX_CELL_HEIGHT_PX: f32 = 16.0;
+
+/// The pane root's own padding, applied on every side via `.p(px(PANE_PADDING_PX))` in
+/// `render` (previously the GPUI-provided `.p_2()` shorthand - `rems(0.5)`, 8px at the
+/// default 16px `Window::rem_size()` this app never overrides, per `gpui_macros::styles`'s
+/// `box_style_suffixes`). Named as its own real `f32` constant, rather than left as `.p_2()`,
+/// so [`TerminalPane::maybe_resize_pty`] can subtract the exact same padding it applies from
+/// its own measured content-area bounds before converting to a grid size - see that method's
+/// docs for the real padding-box-vs-content-box bug this fixes, and [`ROW_FONT_SIZE_PX`]'s
+/// docs for the same "don't let a rendered value silently drift from an implicit default"
+/// precedent this follows.
+const PANE_PADDING_PX: f32 = 8.0;
 
 /// What a [`TerminalPane`] should spawn: a program, its arguments, and the working
 /// directory to spawn it in. Generalizes step 3's "always spawn `$SHELL`" so the same pane
@@ -209,6 +232,11 @@ pub struct TerminalPane {
     /// measuring `canvas()` child in `render` (see that method's docs for why this exists
     /// instead of `window.viewport_size()`). `None` only before the very first paint.
     content_bounds: Option<Bounds<Pixels>>,
+    /// The real, measured advance width of this pane's monospace font at
+    /// [`ROW_FONT_SIZE_PX`] - see [`Self::cell_size`]'s docs. `None` until the first
+    /// successful measurement (the loaded font/size never changes at runtime once it does,
+    /// so this is cached rather than re-measured every render).
+    cell_width_px: Option<Pixels>,
     /// Tracks which `(rows, cols)` the grid and the real child pty are each actually in
     /// sync with - see [`ResizeLatch`]'s docs for the real bug this decomposition exists
     /// to prevent.
@@ -232,6 +260,7 @@ impl TerminalPane {
             eof_poll_ticks: 0,
             focus_handle: cx.focus_handle(),
             content_bounds: None,
+            cell_width_px: None,
             resize_latch: ResizeLatch::default(),
             _task: None,
         };
@@ -294,6 +323,52 @@ impl TerminalPane {
     /// rail's status derivation should surface - see `crate::rail`'s `process_signal`.
     pub fn spawn_error(&self) -> Option<&str> {
         self.spawn_error.as_deref()
+    }
+
+    /// The real, resolved program name this pane was spawned with (e.g. `claude`, `codex`, or
+    /// whatever `$SHELL` resolved to - `zsh`, `bash`, ...), used by `crate::root`'s Zone 2
+    /// restyle for the CLI/terminal tab label and pane header
+    /// (`design_handoff_jerry_ade/README.md`'s "the binary: `claude`, `codex`, `qwen`" and
+    /// "`zsh` + worktree path" - real state, never the design's own sample strings). Falls
+    /// back to the full path's own display form only in the (practically unreachable, since
+    /// [`TerminalSpec::shell`]/`::command` always hand this a non-empty path) case
+    /// `Path::file_name` returns `None`.
+    pub fn program_label(&self) -> String {
+        match self.spec.program.file_name() {
+            Some(name) => name.to_string_lossy().into_owned(),
+            None => self.spec.program.display().to_string(),
+        }
+    }
+
+    /// The real child process's OS pid, once spawned - `PtySession::process_id`, per
+    /// `pty-core`'s own docs, `None` before a process exists or once the platform doesn't
+    /// expose one. Backs the CLI pane header's real `pid 48213` (never a placeholder number).
+    pub fn pid(&self) -> Option<u32> {
+        self.session
+            .as_ref()
+            .and_then(|session| session.process_id())
+    }
+
+    /// Sends a real `Ctrl-C` (`0x03`) to the child process's pty, exactly as
+    /// [`Self::handle_key_down`] would for an actual `Ctrl-C` keystroke - backs the surface
+    /// footer's real `Interrupt \u{2303}C` action (`crate::root::AdeApp::interrupt_session`),
+    /// not a simulated keypress. A no-op when no session is live (nothing to interrupt).
+    pub fn interrupt(&mut self, _cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        // A failed write here is logged, not stored in `Self::spawn_error` - that field is
+        // read by `crate::root::AdeApp::session_status` for an unrelated purpose (a process
+        // that never *started* at all), and is only ever consulted while `!self.is_running()`
+        // (see that method's docs). A live-enough-to-interrupt session is by definition
+        // running, so this write failing could never actually reach that read today - but
+        // storing it there anyway is the wrong field semantically, and would silently start
+        // being read as "the process never started" the moment `is_running()` ever became
+        // stale relative to a real write failure. `log::warn!` surfaces the real failure
+        // without repurposing shared state for it.
+        if let Err(err) = session.write_input(&[0x03]) {
+            log::warn!("failed to send interrupt: {err}");
+        }
     }
 
     /// The currently visible grid, as plain trimmed-right text lines (right-trimmed only -
@@ -488,12 +563,56 @@ impl TerminalPane {
         cx.stop_propagation();
     }
 
-    /// Recomputes an approximate `(rows, cols)` from this pane's own real content-area
-    /// bounds (see [`Self::content_bounds`]'s docs) and applies it via [`Self::resize_to`].
-    /// Called from `render` so it naturally re-runs whenever the pane's own size changes -
-    /// not just whenever the *window's* size changes, since Phase A's three-zone shell
-    /// means those are no longer the same thing (see [`size_to_grid`]'s docs for the real
-    /// bug this distinction fixes).
+    /// This pane's real, measured monospace cell size - `(the real advance width of 'm' in
+    /// the actual bundled IBM Plex Mono at `ROW_FONT_SIZE_PX`, `ROW_LINE_HEIGHT_PX`)`. The
+    /// width comes from GPUI's own real font-metrics API, `Window::text_system().advance`
+    /// (verified against `vendor/zed/crates/terminal_view/src/terminal_element.rs:1284`,
+    /// which computes its own terminal's `cell_width` the exact same way: `text_system.
+    /// advance(font_id, font_pixels, 'm').unwrap().width`) - not a guess. The height is
+    /// [`ROW_LINE_HEIGHT_PX`] directly: [`render_row`] sets that as this pane's own explicit,
+    /// controlled `.line_height()`, so there is nothing to *measure* for height - it's a
+    /// known fact by construction, not a second approximation.
+    ///
+    /// Cached in [`Self::cell_width_px`] after the first successful measurement (resolving a
+    /// font and querying its metrics has some real cost, and the loaded font/size never
+    /// changes at runtime), falling back to [`APPROX_CELL_WIDTH_PX`] only on an outright
+    /// measurement failure (e.g. the font somehow isn't resolvable) - a defensive fallback,
+    /// not the primary path.
+    fn cell_size(&mut self, window: &Window) -> Size<Pixels> {
+        let width = match self.cell_width_px {
+            Some(width) => width,
+            None => {
+                let font_id = window
+                    .text_system()
+                    .resolve_font(&font(crate::theme::font::MONO));
+                let measured = window
+                    .text_system()
+                    .advance(font_id, px(ROW_FONT_SIZE_PX), 'm')
+                    .map(|advance| advance.width)
+                    .ok()
+                    .filter(|width| *width > px(0.0));
+                let width = measured.unwrap_or(px(APPROX_CELL_WIDTH_PX));
+                // `debug!`, not `info!` - useful when actually diagnosing a sizing bug (see
+                // this method's own docs for the real one this replaced), silent by default
+                // (`main.rs`'s `env_logger` filter defaults to `info`).
+                log::debug!(
+                    "terminal_pane: measured real cell width = {width:?} (font-metrics lookup \
+                     succeeded: {}; {APPROX_CELL_WIDTH_PX}px fallback used otherwise)",
+                    measured.is_some()
+                );
+                self.cell_width_px = Some(width);
+                width
+            }
+        };
+        gpui::size(width, px(ROW_LINE_HEIGHT_PX))
+    }
+
+    /// Recomputes a real `(rows, cols)` from this pane's own real content-area bounds (see
+    /// [`Self::content_bounds`]'s docs) and its own real, measured cell size (see
+    /// [`Self::cell_size`]), then applies it via [`Self::resize_to`]. Called from `render` so
+    /// it naturally re-runs whenever the pane's own size changes - not just whenever the
+    /// *window's* size changes, since Phase A's three-zone shell means those are no longer
+    /// the same thing (see [`size_to_grid`]'s docs for the real bug this distinction fixes).
     ///
     /// [`Self::content_bounds`] reflects the *previous* frame's measured bounds (the
     /// measuring `canvas()` in `render` only fires during paint, which happens after
@@ -504,12 +623,28 @@ impl TerminalPane {
     /// one-frame lag). Before any paint has happened at all, falls back to
     /// `window.viewport_size()` - a real, if too-wide, guess that's still strictly better
     /// than not resizing at all, and gets corrected by the first real measurement.
+    ///
+    /// [`Self::content_bounds`] itself is the *padding box*, not the content box glyphs
+    /// actually render into: `render`'s measuring `canvas()` is `.absolute().size_full()`
+    /// inside the pane root, and that root also carries [`PANE_PADDING_PX`] of real padding -
+    /// an absolutely positioned, size-full child sizes itself against its positioned ancestor's
+    /// padding box (padding included), while the row `div`s (normal flow, not absolutely
+    /// positioned) are laid out inside the *content* box, inset by that same padding. Real,
+    /// measured proof: an 844x713px pane at the real 7.2x19.0px cell size computed 117
+    /// cols/37 rows from the raw padding-box measurement, but only ~115 cols/~36 rows
+    /// actually fit once [`PANE_PADDING_PX`] (applied twice - once per side) is subtracted -
+    /// the extra column/row's glyphs painted straight through the pane's own
+    /// `overflow_hidden()` clip edge. [`size_to_grid`]'s own `.max(20)`/`.max(10)` floors
+    /// already handle the (here, practically unreachable) case of the padding subtraction
+    /// driving a dimension negative, so no separate clamp is needed here.
     fn maybe_resize_pty(&mut self, window: &Window) {
-        let size = self
+        let raw_size = self
             .content_bounds
             .map(|bounds| bounds.size)
             .unwrap_or_else(|| window.viewport_size());
-        let (rows, cols) = size_to_grid(size);
+        let size = content_size_from_padding_box(raw_size);
+        let cell_size = self.cell_size(window);
+        let (rows, cols) = size_to_grid(size, cell_size);
         self.resize_to(rows, cols);
     }
 
@@ -540,30 +675,51 @@ impl TerminalPane {
     }
 }
 
-/// Converts a pixel-space size into an approximate `(rows, cols)` terminal grid size using
-/// [`APPROX_CELL_WIDTH_PX`]/[`APPROX_CELL_HEIGHT_PX`] - not measured from the actual
-/// font/renderer (no verified GPUI API for querying a rendered glyph's real advance width
-/// was used for this step), so treat this as a reasonable estimate, not a pixel-accurate
-/// fit. Deliberately a pure function of a [`Size<Pixels>`], independent of `Window` or this
-/// pane's own state, so it's directly unit-testable (see the tests below) rather than only
-/// exercisable through a real GPUI window.
+/// Converts a pixel-space size into a `(rows, cols)` terminal grid size, given the real,
+/// caller-measured `cell_size` a single monospace cell renders at (see [`TerminalPane::
+/// cell_size`]). Deliberately a pure function of two [`Size<Pixels>`] values, independent of
+/// `Window` or this pane's own state, so it's directly unit-testable (see the tests below)
+/// rather than only exercisable through a real GPUI window.
 ///
-/// This function itself isn't what the real bug was - it faithfully turns whatever size
-/// it's given into a column/row count. The bug (see `TerminalPane::maybe_resize_pty`'s
-/// history) was in *what size* it used to be called with: the *whole window's*
-/// `viewport_size()`, unconditionally. Phase A's three-zone shell added a 276px rail, a
-/// 320px panel, and ~64px of title/status-bar chrome around the centre pane, none of which
-/// this pane's own content occupies - at a 1440px-wide window that computed roughly 205
-/// columns even though the real visible terminal pane is only around 820-840px wide
-/// (roughly 118-120 columns at [`APPROX_CELL_WIDTH_PX`]). The practical effect: every
-/// terminal row rendered assuming ~205 columns were visible when only ~118 actually were,
-/// so any full-width line silently rendered ~42% off the right edge of the pane - not
-/// clipped-and-correct, just invisible. Fixed by calling this with this pane's own real,
-/// measured content-area size (`TerminalPane::content_bounds`) instead of the window's.
-fn size_to_grid(size: Size<Pixels>) -> (u16, u16) {
-    let cols = ((size.width.as_f32() / APPROX_CELL_WIDTH_PX) as u16).max(20);
-    let rows = ((size.height.as_f32() / APPROX_CELL_HEIGHT_PX) as u16).max(10);
+/// Two real, independently-confirmed bugs lived here across two phases, both in *what this
+/// function was called with*, never in the arithmetic itself:
+///
+/// - **Phase A: the wrong size.** `TerminalPane::maybe_resize_pty` used to pass the *whole
+///   window's* `viewport_size()`, unconditionally. Phase A's three-zone shell added a 276px
+///   rail, a 320px panel, and ~64px of title/status-bar chrome around the centre pane, none
+///   of which this pane's own content occupies - at a 1440px-wide window that computed
+///   roughly 205 columns even though the real visible terminal pane is only around 820-840px
+///   wide. Fixed by calling this with the pane's own real, measured content-area size
+///   (`TerminalPane::content_bounds`) instead of the window's.
+/// - **Phase C: the wrong cell size.** Even after that fix, `cell_size` itself was
+///   [`APPROX_CELL_WIDTH_PX`]/an `APPROX_CELL_HEIGHT_PX` of `16.0` - both guessed, never
+///   measured against the real bundled IBM Plex Mono or this pane's real rendered line
+///   height. The height guess was the bigger of the two: this pane's rows had no explicit
+///   `.line_height()` at all before this phase, so GPUI's own default (`gpui::geometry::
+///   phi()`, the golden ratio, ~1.618× the 12px font size ≈ 19.4px) was what *actually*
+///   rendered - the `16.0` guess fed to this function was ~21% short of that, so
+///   `maybe_resize_pty` always asked for more rows than could actually fit in the pane's real
+///   height, and the bottom rows silently rendered past the pane's `overflow_hidden()` clip.
+///   Fixed by making the line height an explicit, controlled fact
+///   ([`ROW_LINE_HEIGHT_PX`], set on every row by [`render_row`]) instead of an unrelated
+///   implicit default, and by measuring the real cell width via GPUI's own font-metrics API
+///   (`Window::text_system().advance`) instead of guessing it - see [`TerminalPane::
+///   cell_size`]'s docs, including this step's own before/after measurement.
+fn size_to_grid(size: Size<Pixels>, cell_size: Size<Pixels>) -> (u16, u16) {
+    let cols = ((size.width.as_f32() / cell_size.width.as_f32()) as u16).max(20);
+    let rows = ((size.height.as_f32() / cell_size.height.as_f32()) as u16).max(10);
     (rows, cols)
+}
+
+/// Converts [`TerminalPane::content_bounds`]'s raw *padding-box* measurement into the real
+/// content-box size glyphs actually render into, by subtracting [`PANE_PADDING_PX`] from
+/// each side of both dimensions - see [`TerminalPane::maybe_resize_pty`]'s docs for the real,
+/// measured padding-box-vs-content-box bug this fixes. A pure function of one `Size<Pixels>`,
+/// factored out of `maybe_resize_pty` so this step's own real before/after numbers (a real
+/// 844x713px pane) are directly unit-testable below without a live GPUI window.
+fn content_size_from_padding_box(padding_box: Size<Pixels>) -> Size<Pixels> {
+    let padding = px(PANE_PADDING_PX * 2.0);
+    gpui::size(padding_box.width - padding, padding_box.height - padding)
 }
 
 /// What [`ResizeLatch::apply`] says the caller should actually do for a target size.
@@ -787,12 +943,21 @@ impl Render for TerminalPane {
             .min_w_0()
             .overflow_hidden()
             .bg(rgb(pack_rgb(DEFAULT_BACKGROUND)))
-            .p_2()
+            // `.p(px(PANE_PADDING_PX))`, not the equivalent `.p_2()` shorthand - see
+            // `PANE_PADDING_PX`'s docs for why this needs to be the exact same real value
+            // `Self::maybe_resize_pty` subtracts from its own measured bounds.
+            .p(px(PANE_PADDING_PX))
             // The real bundled IBM Plex Mono (`crate::fonts`), not a generic "monospace"
             // alias - the terminal is this app's most prominent monospace surface, so it's
             // the clearest place to prove the bundled font is actually rendering.
             .font(font(crate::theme::font::MONO))
-            .text_xs()
+            // Explicit, not `.text_xs()` - `design_handoff_jerry_ade/README.md`'s "lines at
+            // 12px/19 mono" exactly, and the same real values `Self::cell_size`'s real
+            // measurement/`size_to_grid`'s real row math are built on. See `ROW_FONT_SIZE_PX`/
+            // `ROW_LINE_HEIGHT_PX`'s docs for why leaving either of these implicit was a real,
+            // measured bug.
+            .text_size(px(ROW_FONT_SIZE_PX))
+            .line_height(px(ROW_LINE_HEIGHT_PX))
             .text_color(rgb(pack_rgb(DEFAULT_FOREGROUND)))
             .child(measure_bounds);
 
@@ -821,34 +986,44 @@ mod resize_tests {
     use super::*;
     use gpui::{px, size};
 
+    /// A representative real cell size, matching what `TerminalPane::cell_size` measures in
+    /// practice (real IBM Plex Mono advance width at 12px is close to `APPROX_CELL_WIDTH_PX`,
+    /// per this step's own before/after measurement - see `size_to_grid`'s docs) - used by
+    /// tests below that only care about `size_to_grid`'s arithmetic, not about the exact cell
+    /// size.
+    fn test_cell_size() -> Size<Pixels> {
+        size(px(APPROX_CELL_WIDTH_PX), px(ROW_LINE_HEIGHT_PX))
+    }
+
     #[test]
     fn size_to_grid_derives_columns_and_rows_from_the_given_size_not_a_fixed_constant() {
         // A plausible centre-pane content width once Phase A's shell chrome (a 276px rail
         // plus a 320px panel plus borders) is subtracted from a 1440px window - roughly
         // 820px, not the full 1440.
-        let (rows, cols) = size_to_grid(size(px(820.0), px(800.0)));
+        let (rows, cols) = size_to_grid(size(px(820.0), px(800.0)), test_cell_size());
         assert_eq!(cols, (820.0 / APPROX_CELL_WIDTH_PX) as u16);
-        assert_eq!(rows, (800.0 / APPROX_CELL_HEIGHT_PX) as u16);
+        assert_eq!(rows, (800.0 / ROW_LINE_HEIGHT_PX) as u16);
     }
 
     #[test]
     fn size_to_grid_enforces_a_minimum_row_and_column_count() {
-        let (rows, cols) = size_to_grid(size(px(10.0), px(10.0)));
+        let (rows, cols) = size_to_grid(size(px(10.0), px(10.0)), test_cell_size());
         assert_eq!(cols, 20);
         assert_eq!(rows, 10);
     }
 
     #[test]
     fn size_to_grid_from_a_real_pane_width_is_plausible_not_the_full_window_derived_count() {
-        // Regression guard documenting the actual magnitude of the original bug: deriving
+        // Regression guard documenting the actual magnitude of the Phase-A bug: deriving
         // columns from the *whole* 1440px window (ignoring the 276+320px of shell chrome
         // either side) computed roughly 205 columns; the real, visible centre-pane width is
         // roughly 820-840px, around 118-120 columns. Both numbers are "correct" outputs of
         // `size_to_grid` for their respective inputs - the bug was `maybe_resize_pty`
         // feeding it the wrong one. This test pins the two magnitudes apart so a future
         // regression back to `window.viewport_size()` would be caught by inspection here.
-        let (_rows, whole_window_cols) = size_to_grid(size(px(1440.0), px(928.0)));
-        let (_rows, real_pane_cols) = size_to_grid(size(px(828.0), px(800.0)));
+        let (_rows, whole_window_cols) =
+            size_to_grid(size(px(1440.0), px(928.0)), test_cell_size());
+        let (_rows, real_pane_cols) = size_to_grid(size(px(828.0), px(800.0)), test_cell_size());
         assert!(
             whole_window_cols > real_pane_cols * 3 / 2,
             "expected the whole-window column count ({whole_window_cols}) to be \
@@ -856,6 +1031,89 @@ mod resize_tests {
              - if they're close, something about the approximation changed"
         );
         assert!(real_pane_cols < 130, "got {real_pane_cols}");
+    }
+
+    #[test]
+    fn size_to_grid_uses_the_real_given_cell_size_not_an_internal_constant() {
+        // Regression guard for the Phase-C bug: before this phase, `size_to_grid` computed
+        // columns/rows from its own hardcoded `APPROX_CELL_WIDTH_PX`/`APPROX_CELL_HEIGHT_PX`
+        // constants, ignoring whatever the pane's *real* rendered cell size actually was. It
+        // now takes `cell_size` as a real parameter - a bigger cell must produce fewer
+        // columns/rows for the same pixel area, and the ratio must match exactly (not just
+        // "fewer somehow").
+        let small_cells = size_to_grid(size(px(800.0), px(760.0)), size(px(8.0), px(19.0)));
+        let big_cells = size_to_grid(size(px(800.0), px(760.0)), size(px(16.0), px(38.0)));
+        assert_eq!(small_cells, (40, 100));
+        assert_eq!(
+            big_cells,
+            (small_cells.0 / 2, small_cells.1 / 2),
+            "doubling the cell size must exactly halve both dimensions"
+        );
+    }
+
+    #[test]
+    fn size_to_grid_documents_the_real_before_after_column_count_at_a_typical_pane_width() {
+        // Real before/after numbers for this step's own performance/scaling report, pinned as
+        // a test so they can't silently drift out of sync with the actual constants: at a
+        // plausible real centre-pane width (828px, per the test above) and a typical pty
+        // panel height (~800px), how many columns/rows the *old* guessed cell size
+        // (7.0 x 16.0) computed versus the *new* real line-height-corrected one (7.0 x 19.0).
+        // Width is unchanged in this comparison (this test isolates the height/line-height
+        // half of the Phase-C bug; the width half is that `cell_size`'s width now comes from
+        // a real GPUI font-metrics measurement instead of a guess, which this pure function
+        // can't itself demonstrate - see `TerminalPane::cell_size`'s own docs for that half).
+        let old_guess = size(px(APPROX_CELL_WIDTH_PX), px(16.0));
+        let new_real = size(px(APPROX_CELL_WIDTH_PX), px(ROW_LINE_HEIGHT_PX));
+        let pane = size(px(828.0), px(800.0));
+
+        let (old_rows, _) = size_to_grid(pane, old_guess);
+        let (new_rows, _) = size_to_grid(pane, new_real);
+
+        // The old, too-short line-height guess asked the pty for more rows than the pane
+        // could actually show without clipping (`800.0 / 16.0 = 50` rows requested, but at
+        // the real ~19px line height only `800.0 / 19.0 = 42` actually fit) - a real ~19%
+        // over-request, not a rounding artifact.
+        assert_eq!(old_rows, 50);
+        assert_eq!(new_rows, 42);
+        assert!(
+            old_rows > new_rows,
+            "the old guess must over-request rows relative to the real, corrected line height"
+        );
+    }
+
+    #[test]
+    fn content_size_from_padding_box_subtracts_the_real_pane_padding_from_both_sides() {
+        // `PANE_PADDING_PX` (8.0) is applied on every side, so both dimensions must shrink
+        // by twice that, not once.
+        let padding_box = size(px(844.0), px(713.0));
+        let content = content_size_from_padding_box(padding_box);
+        assert_eq!(content.width, px(844.0 - 16.0));
+        assert_eq!(content.height, px(713.0 - 16.0));
+    }
+
+    #[test]
+    fn padding_box_measurement_over_requests_columns_and_rows_relative_to_the_real_content_box() {
+        // The real, checker-reproduced padding-box-vs-content-box bug this test pins: a real
+        // measured pane of 844x713px with a real measured cell size of 7.2x19.0px. Before the
+        // fix, `maybe_resize_pty` fed the *raw* padding-box measurement straight into
+        // `size_to_grid`, computing 117 cols/37 rows - one more of each than the pane's real
+        // content box (844-16=828px wide, 713-16=697px tall) actually fits (115 cols/36
+        // rows), so the last column/row's glyphs painted through the pane's own
+        // `overflow_hidden()` clip edge.
+        let padding_box = size(px(844.0), px(713.0));
+        let real_cell_size = size(px(7.2), px(19.0));
+
+        let (over_requested_rows, over_requested_cols) = size_to_grid(padding_box, real_cell_size);
+        assert_eq!((over_requested_rows, over_requested_cols), (37, 117));
+
+        let content_box = content_size_from_padding_box(padding_box);
+        let (fitting_rows, fitting_cols) = size_to_grid(content_box, real_cell_size);
+        assert_eq!((fitting_rows, fitting_cols), (36, 115));
+
+        assert!(
+            over_requested_cols > fitting_cols && over_requested_rows > fitting_rows,
+            "the raw padding-box measurement must over-request relative to the real content box"
+        );
     }
 
     #[test]

@@ -122,6 +122,14 @@ pub mod text {
     pub const HINT: Rgba = hex(0x41464b);
     pub const GUTTER: Rgba = hex(0x3a3f44);
     pub const DISABLED: Rgba = hex(0x3d4248);
+    /// The context bar's worktree path text specifically - `design_handoff_jerry_ade/
+    /// README.md`'s "branch 11px mono `#8b9197` · worktree path 10.5px mono `#4a5057`" (its
+    /// own distinct value, one hex step off [`GHOST`]'s `#4e545a`) - `tokens.rs`'s `text`
+    /// module omits it (the same real gap [`super::button::GREEN_KEYCAP_FG`]'s docs describe
+    /// for a different module: present in the HTML/README, missing from the transcribed
+    /// token list), so it's added here directly rather than reusing the nearby-but-different
+    /// [`GHOST`] or an unrelated module's identically-valued constant (`diff::FOLD_FG`).
+    pub const PATH: Rgba = hex(0x4a5057);
 }
 
 /// Status is the only place colour carries meaning in the rail.
@@ -226,6 +234,15 @@ pub mod button {
     pub const GREEN_BG_HOVER: Rgba = hex(0x2c6045);
     pub const GREEN_FG: Rgba = hex(0x9fdcb6);
     pub const GREEN_KEYCAP: Rgba = hex(0x376b4d);
+    /// The keycap *glyph* colour inside a green primary button - `design_handoff_jerry_ade/
+    /// README.md`'s "Keyboard affordances" section states this explicitly ("green
+    /// `#376b4d`/`#8ac9a4`") and `Jerry.dc.html`'s own `AB.primaryG.keyFg` inline literal
+    /// confirms it, but `design_handoff_jerry_ade/tokens.rs`'s `button` module omits it (only
+    /// [`GREEN_KEYCAP`], the keycap *border*, is transcribed there) - added here directly from
+    /// the HTML/README rather than left as an inline magic number at each Phase C call site.
+    pub const GREEN_KEYCAP_FG: Rgba = hex(0x8ac9a4);
+    // The equivalent blue keycap glyph colour (`#8fbde6`) needs no separate constant here -
+    // it's the exact same value already ported as `term::PROMPT`.
     pub const BLUE_BG: Rgba = hex(0x243c50);
     pub const BLUE_BG_HOVER: Rgba = hex(0x2c4a63);
     pub const BLUE_FG: Rgba = hex(0xa5cdf0);

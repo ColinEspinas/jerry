@@ -43,9 +43,10 @@ use crate::file_tree::{self, FileTreeEntry};
 use crate::rail::{
     self, ProjectChild, RailMode, SessionRow, StatusGroup, WorktreeEntry, WorktreeNote,
 };
-use crate::sessions::{SessionId, SessionKind, Sessions};
+use crate::sessions::{Session, SessionId, SessionKind, Sessions};
 use crate::status::{self, Status};
 use crate::theme;
+use crate::work_surface;
 use crate::worktrees::{self, WorktreeItem};
 
 // The rail header's `+` / ⌘N control spawns a new session. Bound as a real GPUI action/
@@ -421,6 +422,105 @@ impl AdeApp {
         cx.notify();
     }
 
+    /// Derives the real [`Status`] for one live session - the single source of truth both
+    /// [`Self::build_session_rows`] (the rail) and Zone 2's restyle (the context bar's status
+    /// pill, and the CLI/terminal pane header/footer) read, so the rail and the work surface
+    /// can never disagree about a session's status. Mirrors `Self::build_session_rows`'s own
+    /// prior inline signal-gathering exactly - factored out once a second call site (Zone 2)
+    /// needed the identical logic, rather than a second, independently-drifting copy of it.
+    fn session_status(&self, session: &Session, cx: &App) -> Status {
+        let pane = session.pane.read(cx);
+        let signal = if pane.is_running() {
+            status::ProcessSignal::Running {
+                idle: pane.idle_duration().unwrap_or_default(),
+            }
+        } else if let Some(exit) = pane.exit_status() {
+            status::ProcessSignal::Exited {
+                success: exit.success(),
+            }
+        } else if pane.spawn_error().is_some() {
+            // A process that never started is a real failure the status derivation should
+            // surface, even though it has no `ExitStatus` of its own to report.
+            status::ProcessSignal::Exited { success: false }
+        } else {
+            status::ProcessSignal::NoProcess
+        };
+        let has_diff = self
+            .diff_cache
+            .get(&session.cwd)
+            .map(|summary| summary.has_changes)
+            .unwrap_or(false);
+        status::derive_status(session.kind, signal, has_diff)
+    }
+
+    /// The context bar's real `Archive` action, and the idle-status footer's own `Archive`
+    /// action (`design_handoff_jerry_ade/README.md`'s Session context bar spec: "`Merge`
+    /// (outline) · `Archive` (ghost)") - closes the tab via the already-real `Sessions::
+    /// close` (which deterministically tears down the real child process - see that method's
+    /// docs), exactly like the tab strip's own `×`. Not a placeholder: this is the one
+    /// context-bar action with real, already-existing backing logic - `Merge` has none (see
+    /// `render_merge_button`'s docs for why it's honestly disabled instead of wired to
+    /// something fake).
+    fn archive_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.sessions.close(id, cx);
+        self.prune_confirm_armed = false;
+        cx.notify();
+    }
+
+    /// The surface footer's real `Interrupt ⌃C` action - sends a real `Ctrl-C` to the
+    /// session's own pty via `TerminalPane::interrupt`, exactly as if the user had focused the
+    /// pane and pressed Ctrl-C themselves.
+    fn interrupt_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
+            return;
+        };
+        let pane = session.pane.clone();
+        pane.update(cx, |pane, cx| pane.interrupt(cx));
+    }
+
+    /// The surface footer's real `Retry ⌘R` (failed sessions) / `Resume ⌘⏎` (idle sessions)
+    /// action. This app has no saved-session resumability to actually resume *from* (see
+    /// `crate::work_surface::pty_state_label`'s docs on the same gap: no `detached ·
+    /// resumable` state exists here) - the real, honest equivalent implemented here is: close
+    /// this tab, then spawn a fresh session of the same kind into the same worktree, exactly
+    /// as if the user had clicked "New ... Session" again themselves. A real action (the old
+    /// process is genuinely torn down, a new one genuinely started), just not literally
+    /// "resume where it left off" - `crate::work_surface::ActionKind::Respawn`'s docs name
+    /// this same trade-off.
+    fn respawn_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
+            return;
+        };
+        let kind = session.kind;
+        let cwd = session.cwd.clone();
+        self.sessions.close(id, cx);
+        self.sessions.spawn(kind, cwd, cx);
+        self.prune_confirm_armed = false;
+        cx.notify();
+    }
+
+    /// The surface footer's real `Open terminal` action - finds an already-open real `Shell`
+    /// session in the same worktree and selects it, or spawns one if none exists yet. Real,
+    /// minimal: this app's session model has no notion of "the terminal view of *this*
+    /// session" (each session is its own independent tab/process - see `crate::sessions`'
+    /// module docs), so "open terminal" here means "get me a shell in this worktree", the same
+    /// real capability the rail's own "+ New Shell" button already provides.
+    fn open_companion_terminal(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
+        let existing = self
+            .sessions
+            .iter()
+            .find(|session| session.kind == SessionKind::Shell && session.cwd == cwd)
+            .map(|session| session.id);
+        match existing {
+            Some(id) => self.select_session(id, cx),
+            None => {
+                self.sessions.spawn(SessionKind::Shell, cwd, cx);
+                self.prune_confirm_armed = false;
+                cx.notify();
+            }
+        }
+    }
+
     fn toggle_rail_mode(&mut self, cx: &mut Context<Self>) {
         self.rail_mode = self.rail_mode.toggled();
         self.prune_confirm_armed = false;
@@ -478,27 +578,9 @@ impl AdeApp {
         self.sessions
             .iter()
             .map(|session| {
+                let status_value = self.session_status(session, cx);
                 let pane = session.pane.read(cx);
-
-                let signal = if pane.is_running() {
-                    status::ProcessSignal::Running {
-                        idle: pane.idle_duration().unwrap_or_default(),
-                    }
-                } else if let Some(exit) = pane.exit_status() {
-                    status::ProcessSignal::Exited {
-                        success: exit.success(),
-                    }
-                } else if pane.spawn_error().is_some() {
-                    // A process that never started is a real failure the rail should
-                    // surface, even though it has no `ExitStatus` of its own to report.
-                    status::ProcessSignal::Exited { success: false }
-                } else {
-                    status::ProcessSignal::NoProcess
-                };
-
                 let diff = self.diff_cache.get(&session.cwd).copied();
-                let has_diff = diff.map(|summary| summary.has_changes).unwrap_or(false);
-                let status_value = status::derive_status(session.kind, signal, has_diff);
 
                 let branch = self
                     .worktrees
@@ -1190,7 +1272,7 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_selected = self.sessions.active_id() == Some(row.id);
-        let (badge_fg, badge_bg) = agent_badge_colors(row.kind);
+        let (badge_fg, badge_bg) = work_surface::agent_tint(row.kind);
 
         let title_color = if is_selected {
             theme::text::SELECTED
@@ -1262,7 +1344,7 @@ impl AdeApp {
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_size(px(9.0))
                             .text_color(badge_fg)
-                            .child(agent_badge_initial(row.kind)),
+                            .child(work_surface::agent_initial(row.kind)),
                     )
                     .child(
                         div()
@@ -1404,9 +1486,13 @@ impl AdeApp {
             )
     }
 
-    /// The toolbar above the tab bar: "New Shell" / "New Claude Session" buttons that spawn
-    /// a real session into `active_session_cwd()`, plus a reminder of which worktree that
-    /// currently resolves to.
+    /// A real utility row above the tab strip: "+ shell" / "+ claude" / "+ codex" buttons that
+    /// spawn a real session into `active_session_cwd()`, plus a reminder of which worktree
+    /// that currently resolves to. Not part of `design_handoff_jerry_ade/Jerry.dc.html` (the
+    /// mockup's own rail "+"/tab-strip "+" only ever spawn one default kind - real per-kind
+    /// selection lives in the design's Settings › Agents page, which is out of scope here) -
+    /// kept as a real, restyled (theme-token, not raw `rgb()`) necessity: without it, this app
+    /// would have no way to start a `claude`/`codex` session at all.
     fn render_session_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let cwd = self.active_session_cwd();
 
@@ -1414,13 +1500,17 @@ impl AdeApp {
             div()
                 .id(format!("new-session-{}", kind.label()))
                 .cursor_pointer()
-                .px_2()
-                .py_1()
-                .rounded_sm()
-                .text_xs()
-                .bg(rgb(0x2a2a2a))
-                .hover(|el| el.bg(rgb(0x3a3a3a)))
-                .text_color(rgb(0xe0e0e0))
+                .px(px(8.0))
+                .py(px(3.0))
+                .rounded(theme::radius::CHIP)
+                .bg(theme::surface::CHIP_NEUTRAL)
+                .font(font(theme::font::MONO))
+                .text_size(px(10.5))
+                .text_color(theme::text::DIM)
+                .hover(|el| {
+                    el.bg(theme::surface::ROW_HOVER_ALT)
+                        .text_color(theme::text::PRIMARY)
+                })
                 .child(label)
                 .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                     this.new_session(kind, cx);
@@ -1428,93 +1518,485 @@ impl AdeApp {
         };
 
         div()
+            .id("session-toolbar")
             .flex()
-            .flex_row()
+            .flex_none()
             .items_center()
-            .gap_2()
-            .px_2()
-            .py_1()
+            .gap(px(6.0))
+            .px(px(12.0))
+            .h(px(30.0))
+            .bg(theme::surface::HEADER)
             .border_b_1()
-            .border_color(rgb(0x2a2a2a))
-            .child(new_session_button("+ New Shell", SessionKind::Shell))
-            .child(new_session_button(
-                "+ New Claude Session",
-                SessionKind::Claude,
-            ))
-            .child(new_session_button(
-                "+ New Codex Session",
-                SessionKind::Codex,
-            ))
+            .border_color(theme::border::INNER)
+            .child(new_session_button("+ shell", SessionKind::Shell))
+            .child(new_session_button("+ claude", SessionKind::Claude))
+            .child(new_session_button("+ codex", SessionKind::Codex))
+            .child(div().flex_1())
             .child(
                 div()
-                    .text_xs()
-                    .text_color(rgb(0x6a6a6a))
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::GHOST)
                     .child(format!("new sessions spawn in: {}", cwd.display())),
             )
     }
 
-    /// The tab strip: one entry per open session, click to activate, click the "x" to close
-    /// (tearing down its real process - see `Sessions::close`'s docs).
-    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_id = self.sessions.active_id();
+    /// The tab strip (34) - `design_handoff_jerry_ade/README.md`'s spec: one 14×14 kind chip
+    /// per tab (see [`render_tab_chip`]), active/inactive bg/underline/label colours (see
+    /// `crate::work_surface::tab_colors`), a real `+` (spawns a new default shell session,
+    /// same real action as the rail's own `+`), and the `⌘`/`1…8` keycap hint pinned right.
+    fn render_tab_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut bar = div()
+            .id("tab-strip")
             .flex()
-            .flex_row()
-            .gap_1()
-            .px_2()
-            .py_1()
+            .flex_none()
+            .items_stretch()
+            .h(theme::band::TAB_STRIP)
+            .bg(theme::surface::TITLE_BAR)
             .border_b_1()
-            .border_color(rgb(0x2a2a2a));
+            .border_color(theme::border::ZONE);
 
         for session in self.sessions.iter() {
-            let id = session.id;
-            let is_active = active_id == Some(id);
-            let title = match session.cwd.file_name() {
-                Some(name) => name.to_string_lossy().into_owned(),
-                None => session.cwd.display().to_string(),
-            };
-
-            let tab = div()
-                .id(("session-tab", id))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .px_2()
-                .py_1()
-                .rounded_sm()
-                .text_xs()
-                .cursor_pointer()
-                .when(is_active, |tab| tab.bg(rgb(0x2f5f8f)))
-                .when(!is_active, |tab| tab.hover(|tab| tab.bg(rgb(0x2a2a2a))))
-                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                    this.sessions.set_active(id);
-                    cx.notify();
-                }))
-                .child(div().text_color(rgb(0xe0e0e0)).child(format!(
-                    "{}: {}",
-                    session.kind.label(),
-                    title
-                )))
-                .child(
-                    div()
-                        .id(("close-session-tab", id))
-                        .px_1()
-                        .rounded_sm()
-                        .text_color(rgb(0x9a9a9a))
-                        .hover(|el| el.bg(rgb(0x4a2a2a)).text_color(rgb(0xff6b6b)))
-                        .child("x")
-                        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                            cx.stop_propagation();
-                            this.sessions.close(id, cx);
-                            cx.notify();
-                        })),
-                );
-
-            bar = bar.child(tab);
+            bar = bar.child(self.render_session_tab(session, cx));
         }
 
-        bar
+        bar = bar.child(
+            div()
+                .id("tab-strip-new")
+                .flex_none()
+                .flex()
+                .items_center()
+                .px(px(11.0))
+                .cursor_pointer()
+                .font(font(theme::font::MONO))
+                .text_size(px(13.0))
+                .text_color(theme::text::GHOST)
+                .hover(|el| el.text_color(theme::text::MUTED))
+                .child("+")
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.new_session(SessionKind::Shell, cx);
+                })),
+        );
+
+        bar.child(div().flex_1()).child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .px(px(12.0))
+                .child(render_keycap_pair("\u{2318}", "1\u{2026}8")),
+        )
+    }
+
+    /// One tab: a 14×14 kind chip, the real label (the resolved binary name for an agent CLI
+    /// tab, or the literal `terminal` for a shell tab - `design_handoff_jerry_ade/README.md`'s
+    /// own tab-strip spec), and a real `×` that closes it (`Sessions::close`, tearing down the
+    /// real process). Split into a `flex_1` clickable content row plus a `flex_none` 1px
+    /// underline bar (rather than a single div with two differently-coloured borders) because
+    /// GPUI's `Style::border_color` is one uniform colour for every edge
+    /// (`vendor/zed/crates/gpui/src/style.rs`) - it cannot give the right border (always
+    /// `theme::border::INNER`) and the bottom "underline" (active/inactive-dependent) two
+    /// different colours on the same div.
+    fn render_session_tab(&self, session: &Session, cx: &mut Context<Self>) -> impl IntoElement {
+        let id = session.id;
+        let is_active = self.sessions.active_id() == Some(id);
+        let chip_kind = work_surface::tab_chip_kind(session.kind);
+        let label = match chip_kind {
+            work_surface::TabChipKind::Cli => session.pane.read(cx).program_label(),
+            work_surface::TabChipKind::Term => "terminal".to_string(),
+        };
+        let is_mono = matches!(chip_kind, work_surface::TabChipKind::Cli);
+        let colors = work_surface::tab_colors(is_active);
+
+        div()
+            .id(("session-tab", id))
+            .flex()
+            .flex_none()
+            .flex_col()
+            .border_r_1()
+            .border_color(theme::border::INNER)
+            .bg(colors.bg)
+            .child(
+                div()
+                    .id(("session-tab-hit", id))
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .px(px(13.0))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                        this.select_session(id, cx);
+                    }))
+                    .child(render_tab_chip(session.kind, is_active))
+                    .child(
+                        div()
+                            .font(font(if is_mono {
+                                theme::font::MONO
+                            } else {
+                                theme::font::SANS
+                            }))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_size(if is_mono { px(11.0) } else { px(11.5) })
+                            .text_color(colors.label)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .id(("close-session-tab", id))
+                            .px(px(2.0))
+                            .cursor_pointer()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(11.0))
+                            .text_color(theme::text::GHOST)
+                            .hover(|el| el.text_color(theme::button::DANGER_FG))
+                            .child("\u{d7}")
+                            .on_click(cx.listener(
+                                move |this, _event: &ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    this.sessions.close(id, cx);
+                                    cx.notify();
+                                },
+                            )),
+                    ),
+            )
+            .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline))
+    }
+
+    /// The session context bar (32) - `design_handoff_jerry_ade/README.md`'s spec: agent
+    /// badge/name, a divider, real branch, the real worktree path (the one flexible,
+    /// ellipsising child - every other child here is `flex_none` and non-wrapping, matching
+    /// the README's own "layout rule that matters" so the bar never wraps when the centre
+    /// narrows), a real status pill, and `Merge`/`Archive`.
+    fn render_session_context_bar(
+        &self,
+        session: &Session,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let status_value = self.session_status(session, cx);
+        let (agent_fg, agent_bg) = work_surface::agent_tint(session.kind);
+        let agent_initial = work_surface::agent_initial(session.kind);
+        // The design's `focus.agent` is a *model* name (`sonnet-4.5`, `gpt-5-codex`) this
+        // app's `SessionKind` has no equivalent of (it only tracks which CLI *binary* is
+        // running, not which model that CLI is configured to use) - `session.kind.label()`
+        // ("Claude"/"Codex"/"Shell") is the closest real, honest substitute, rather than
+        // fabricating a model name this app never actually observed.
+        let agent_label = session.kind.label();
+        let branch = self
+            .worktrees
+            .iter()
+            .find(|item| item.path == session.cwd)
+            .and_then(|item| item.branch.clone());
+        let worktree_path = session.cwd.display().to_string();
+        let id = session.id;
+
+        div()
+            .id("session-context-bar")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(12.0))
+            .h(theme::band::CONTEXT_BAR)
+            .bg(theme::surface::HEADER)
+            .border_b_1()
+            .border_color(theme::border::INNER)
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(15.0))
+                    .h(px(15.0))
+                    .rounded(theme::radius::CHIP)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(agent_bg)
+                    .font(font(theme::font::MONO))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(8.5))
+                    .text_color(agent_fg)
+                    .child(agent_initial),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(11.0))
+                    .text_color(theme::text::MUTED)
+                    .child(agent_label),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(1.0))
+                    .h(px(13.0))
+                    .bg(theme::border::DIVIDER),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(11.0))
+                    .text_color(theme::text::DIM)
+                    .child(branch.unwrap_or_else(|| "(detached)".to_string())),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.5))
+                    .text_color(theme::text::PATH)
+                    .child(worktree_path),
+            )
+            .child(render_status_pill(status_value))
+            .child(render_merge_button())
+            .child(self.render_archive_button(id, cx))
+    }
+
+    /// The context bar's real `Archive` button - see [`Self::archive_session`]'s docs.
+    fn render_archive_button(&self, id: SessionId, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id(("context-bar-archive", id))
+            .flex_none()
+            .cursor_pointer()
+            .h(px(20.0))
+            .px(px(8.0))
+            .rounded(theme::radius::BUTTON)
+            .flex()
+            .items_center()
+            .font(font(theme::font::SANS))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(px(10.5))
+            .text_color(theme::text::FAINT)
+            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+            .child("Archive")
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                this.archive_session(id, cx);
+            }))
+    }
+
+    /// Surface A/B's shared 27px header - `design_handoff_jerry_ade/README.md`'s Surface A
+    /// spec (`claude --resume 3d91e07`-style command, `pid 48213`, right-aligned pty state)
+    /// and Surface B spec (`zsh` + worktree path). This app has no saved-session resumability
+    /// (no `--resume <sha>` to show - see `crate::work_surface::pty_state_label`'s docs), so
+    /// the left label is the real resolved program name alone, never a fabricated resume
+    /// argument.
+    fn render_pty_header(&self, session: &Session, cx: &mut Context<Self>) -> impl IntoElement {
+        let pane = session.pane.read(cx);
+        let program_label = pane.program_label();
+        let pid = pane.pid();
+        let is_running = pane.is_running();
+        let exit_code = pane.exit_status().map(|status| status.exit_code());
+        let status_value = self.session_status(session, cx);
+        let state_label = work_surface::pty_state_label(is_running, status_value, exit_code);
+
+        let header = div()
+            .id("pty-header")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(9.0))
+            .px(px(12.0))
+            .h(theme::band::PTY_HEADER)
+            .bg(theme::surface::FOOTER)
+            .border_b_1()
+            .border_color(theme::border::INNER)
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.5))
+                    .text_color(theme::text::DIM)
+                    .child(program_label),
+            );
+
+        let header = match session.kind {
+            SessionKind::Shell => header.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.5))
+                    .text_color(theme::text::GHOST)
+                    .child(session.cwd.display().to_string()),
+            ),
+            SessionKind::Claude | SessionKind::Codex => {
+                let header = match pid {
+                    Some(pid) => header.child(
+                        div()
+                            .flex_none()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.5))
+                            .text_color(theme::text::GHOST)
+                            .child(format!("pid {pid}")),
+                    ),
+                    None => header,
+                };
+                header.child(div().flex_1())
+            }
+        };
+
+        header.child(
+            div()
+                .flex_none()
+                .font(font(theme::font::MONO))
+                .text_size(px(10.0))
+                .text_color(theme::text::HINT)
+                .child(state_label),
+        )
+    }
+
+    /// Surface A/B's shared 28px footer - `design_handoff_jerry_ade/README.md`'s Surface A
+    /// spec: the `Jerry` word plus git-level actions appropriate to the session's real status.
+    /// See `crate::work_surface::footer_actions`/[`Self::render_footer_action_button`] for
+    /// which of those actions are real-and-minimal versus honestly disabled this phase.
+    fn render_pty_footer(&self, session: &Session, cx: &mut Context<Self>) -> impl IntoElement {
+        let status_value = self.session_status(session, cx);
+        let is_running = session.pane.read(cx).is_running();
+        let actions = work_surface::footer_actions(status_value);
+        let id = session.id;
+        let cwd = session.cwd.clone();
+
+        let mut footer = div()
+            .id("pty-footer")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(7.0))
+            .px(px(12.0))
+            .h(theme::band::SURFACE_FOOTER)
+            .bg(theme::surface::FOOTER)
+            .border_t_1()
+            .border_color(theme::border::INNER)
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.0))
+                    .text_color(theme::text::GHOSTER)
+                    .child("JERRY"),
+            );
+
+        for action in actions {
+            let mut enabled = action.implemented;
+            // `Resume` (idle status) only means something for a session that has actually
+            // exited/never started - a *live*, merely-idle shell has nothing to "resume" (see
+            // `crate::work_surface::ActionKind::Respawn`'s docs); real-disable it in that one
+            // case rather than letting a click spawn a redundant duplicate session next to a
+            // still-running one.
+            if action.kind == work_surface::ActionKind::Respawn
+                && status_value == Status::Idle
+                && is_running
+            {
+                enabled = false;
+            }
+            footer = footer.child(self.render_footer_action_button(
+                id,
+                cwd.clone(),
+                action,
+                enabled,
+                cx,
+            ));
+        }
+
+        footer.child(div().flex_1())
+    }
+
+    /// One footer action button - real (`cursor_pointer`, hover, a real `on_click` dispatch on
+    /// `action.kind`) when `enabled`, otherwise the design's own "dimmed, real-disabled"
+    /// treatment (no cursor/hover/click at all) - never a button that looks clickable but
+    /// silently does nothing.
+    fn render_footer_action_button(
+        &self,
+        id: SessionId,
+        cwd: PathBuf,
+        action: work_surface::FooterAction,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let colors = work_surface::action_button_colors(action.style);
+        let label = action.label;
+        let kind = action.kind;
+
+        let mut button = div()
+            .id(format!("footer-action-{id}-{label}"))
+            .h(px(23.0))
+            .px(px(10.0))
+            .rounded(theme::radius::BUTTON)
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .bg(if enabled {
+                colors.bg
+            } else {
+                // A disabled action must never keep its real, full-color fill (that would
+                // make an inert button look as, or more, clickable than a real one - exactly
+                // what this project's "no fake functionality" rule exists to prevent; a real
+                // disabled blue "Resume" was found rendering with the full solid `#243c50`
+                // fill next to a real, working "Archive" button). The design itself has no
+                // separate disabled-background token - its own disabled precedent
+                // (`design_handoff_jerry_ade/README.md`'s "Accept file is always rendered,
+                // dimmed (`#454b51` / border `#1f2327`) when there is nothing to accept", and
+                // the `Outline`/`Ghost` button styles above, which are already `TRANSPARENT`
+                // at full strength) dims only fg/border, never bg - so falling back to
+                // `TRANSPARENT` here lets the footer's own background
+                // (`theme::surface::FOOTER`) show through and the button visually recede,
+                // consistent with that precedent rather than inventing a new muted-fill token.
+                work_surface::TRANSPARENT
+            })
+            .border_1()
+            .border_color(if enabled {
+                colors.border
+            } else {
+                theme::border::BUTTON_DISABLED
+            })
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(11.0))
+                    .text_color(if enabled {
+                        colors.fg
+                    } else {
+                        theme::text::GHOSTER
+                    })
+                    .child(label),
+            );
+
+        if let Some(cap) = action.keycap {
+            let (keycap_fg, keycap_border) = if enabled {
+                (colors.keycap_fg, colors.keycap_border)
+            } else {
+                (theme::text::GHOSTER, theme::border::BUTTON_DISABLED)
+            };
+            button = button.child(render_action_keycap(cap, keycap_fg, keycap_border));
+        }
+
+        if enabled {
+            button = button
+                .cursor_pointer()
+                .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                .on_click(
+                    cx.listener(move |this, _event: &ClickEvent, _window, cx| match kind {
+                        work_surface::ActionKind::Interrupt => this.interrupt_session(id, cx),
+                        work_surface::ActionKind::OpenTerminal => {
+                            this.open_companion_terminal(cwd.clone(), cx)
+                        }
+                        work_surface::ActionKind::Respawn => this.respawn_session(id, cx),
+                        work_surface::ActionKind::Archive => this.archive_session(id, cx),
+                        work_surface::ActionKind::Unimplemented => {}
+                    }),
+                );
+        } else {
+            button = button.cursor_default();
+        }
+
+        button
     }
 
     /// The centre "work surface" zone. `.min_w_0()` on this method's own root div (the flex
@@ -1557,20 +2039,7 @@ impl AdeApp {
     /// (each additionally zeroes its own node's contribution), not load-bearing on their
     /// own - this div is the one that actually mattered.
     fn render_center_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let body: gpui::AnyElement = match self.sessions.active() {
-            Some(session) => session.pane.clone().into_any_element(),
-            None => div()
-                .flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .text_xs()
-                .text_color(rgb(0x6a6a6a))
-                .child("no sessions open - start one with the buttons above")
-                .into_any_element(),
-        };
-
-        div()
+        let surface = div()
             .id("work-surface")
             .flex()
             .flex_col()
@@ -1579,17 +2048,45 @@ impl AdeApp {
             .h_full()
             .bg(theme::surface::CENTER)
             .child(self.render_session_toolbar(cx))
-            .child(self.render_tab_bar(cx))
-            .child(
+            .child(self.render_tab_strip(cx));
+
+        match self.sessions.active() {
+            Some(session) => surface
+                .child(self.render_session_context_bar(session, cx))
+                .child(
+                    div()
+                        .id("pty-surface")
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .bg(theme::surface::PTY)
+                        .child(self.render_pty_header(session, cx))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .child(session.pane.clone().into_any_element()),
+                        )
+                        .child(self.render_pty_footer(session, cx)),
+                ),
+            None => surface.child(
                 div()
                     .flex()
-                    .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .child(body),
-            )
+                    .items_center()
+                    .justify_center()
+                    .font(font(theme::font::SANS))
+                    .text_size(px(11.5))
+                    .text_color(theme::text::FAINT)
+                    .child("no sessions open - start one with the buttons above"),
+            ),
+        }
     }
 
     fn render_file_tree(&self) -> gpui::AnyElement {
@@ -1901,29 +2398,6 @@ impl AdeApp {
     }
 }
 
-/// The rail session row's agent badge tint - `design_handoff_jerry_ade/README.md`: "agent
-/// tint background" from `theme::agent::*`. `SessionKind::Shell` isn't an "agent" in the
-/// design's sense (no agent tint is specified for a plain shell tab), so it gets a neutral
-/// chip instead, matching the tab strip's own "terminal" chip colours
-/// (`theme::surface::CHIP_NEUTRAL` bg, `theme::text::DIM` fg) rather than inventing a new
-/// tint the design never specified.
-fn agent_badge_colors(kind: SessionKind) -> (gpui::Rgba, gpui::Rgba) {
-    match kind {
-        SessionKind::Claude => theme::agent::SONNET,
-        SessionKind::Codex => theme::agent::CODEX,
-        SessionKind::Shell => (theme::text::DIM, theme::surface::CHIP_NEUTRAL),
-    }
-}
-
-/// The agent badge's single-character initial.
-fn agent_badge_initial(kind: SessionKind) -> &'static str {
-    match kind {
-        SessionKind::Claude => "C",
-        SessionKind::Codex => "X",
-        SessionKind::Shell => "$",
-    }
-}
-
 /// One keyboard-shortcut keycap, per `design_handoff_jerry_ade/README.md`'s "Keyboard
 /// affordances" spec: 15 high, min-width 15, padding 0 4, radius 3, bg `#181c1f`, border 1px
 /// `#272c31`, 9.5px/450 mono `#7d848b`.
@@ -1953,6 +2427,142 @@ fn render_keycap_pair(modifier: &'static str, key: &'static str) -> impl IntoEle
         .gap(px(3.0))
         .child(render_keycap(modifier))
         .child(render_keycap(key))
+}
+
+/// One footer-action keycap with the *button's own* tint (`design_handoff_jerry_ade/
+/// README.md`'s "Keyboard affordances": "Inside a coloured button the cap goes transparent and
+/// borrows the button's tint") - unlike [`render_keycap`] (the rail/tab-strip's always-neutral
+/// keycaps), this one's colours vary per `crate::work_surface::ActionStyle` (see
+/// `crate::work_surface::action_button_colors`).
+fn render_action_keycap(
+    label: &'static str,
+    fg: gpui::Rgba,
+    border: gpui::Rgba,
+) -> impl IntoElement {
+    div()
+        .flex_none()
+        .h(theme::band::KEYCAP)
+        .min_w(theme::band::KEYCAP)
+        .px(px(4.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(theme::radius::CHIP)
+        .border_1()
+        .border_color(border)
+        .font(font(theme::font::MONO))
+        .text_size(px(9.5))
+        .text_color(fg)
+        .child(label)
+}
+
+/// The tab strip's 14×14 kind chip - a `❯` glyph tinted with the session's real agent colour
+/// for agent CLI tabs, or the pane glyph (a 14×4 bar plus a 5×2 prompt mark, per
+/// `design_handoff_jerry_ade/README.md`'s tab-strip spec) for terminal tabs. Turns
+/// `crate::work_surface::tab_chip_kind`/`tab_chip_colors`'s real, unit-tested mapping into
+/// actual GPUI elements - no chip-selection *logic* lives here.
+fn render_tab_chip(kind: SessionKind, active: bool) -> gpui::AnyElement {
+    let colors = work_surface::tab_chip_colors(kind, active);
+    let base = div()
+        .flex_none()
+        .w(px(14.0))
+        .h(px(14.0))
+        .rounded(theme::radius::CHIP)
+        .bg(colors.bg);
+
+    match work_surface::tab_chip_kind(kind) {
+        work_surface::TabChipKind::Cli => base
+            .flex()
+            .items_center()
+            .justify_center()
+            .font(font(theme::font::MONO))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(px(8.0))
+            .text_color(colors.fg)
+            .child("\u{276f}")
+            .into_any_element(),
+        work_surface::TabChipKind::Term => base
+            .relative()
+            .overflow_hidden()
+            .child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(0.0))
+                    .w(px(14.0))
+                    .h(px(4.0))
+                    .bg(colors.fg),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(3.0))
+                    .top(px(7.0))
+                    .w(px(5.0))
+                    .h(px(2.0))
+                    .rounded(px(1.0))
+                    .bg(colors.fg),
+            )
+            .into_any_element(),
+    }
+}
+
+/// The session context bar's real status pill - `design_handoff_jerry_ade/README.md`: "status
+/// pill (19 high, radius 3, 5px dot + 10px/500 label in the status colour)".
+fn render_status_pill(status: Status) -> impl IntoElement {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(5.0))
+        .h(px(19.0))
+        .px(px(7.0))
+        .rounded(theme::radius::CHIP)
+        .bg(status.pill_bg())
+        .child(
+            div()
+                .flex_none()
+                .w(px(5.0))
+                .h(px(5.0))
+                .rounded(px(2.5))
+                .bg(status.color()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .font(font(theme::font::SANS))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_size(px(10.0))
+                .text_color(status.color())
+                .child(status.label()),
+        )
+}
+
+/// The context bar's `Merge` action - honestly, visibly disabled. `wt_core`'s only mutating
+/// entry points are `add_worktree`/`remove_worktree` (verified: `crates/wt-core/src/lib.rs`) -
+/// there is no merge/rebase/fast-forward operation to wire this to yet, and faking one (or
+/// reimplementing a real merge flow just for this button) is out of scope for this phase.
+/// Rendered with the design's own "dimmed, real-disabled" treatment
+/// (`design_handoff_jerry_ade/README.md`'s own precedent for `Accept file`: "dimmed ... when
+/// there is nothing to accept ... never a button that looks clickable but silently does
+/// nothing") instead of the mockup's default-active outline styling, and deliberately has no
+/// `.cursor_pointer()`/`.hover()`/`.on_click()` at all.
+fn render_merge_button() -> impl IntoElement {
+    div()
+        .flex_none()
+        .cursor_default()
+        .h(px(20.0))
+        .px(px(8.0))
+        .rounded(theme::radius::BUTTON)
+        .border_1()
+        .border_color(theme::border::BUTTON_DISABLED)
+        .flex()
+        .items_center()
+        .font(font(theme::font::SANS))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_size(px(10.5))
+        .text_color(theme::text::GHOSTER)
+        .child("Merge")
 }
 
 /// One flat-circle window-control button (see `AdeApp::render_window_controls`'s docs for

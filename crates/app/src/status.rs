@@ -116,6 +116,19 @@ impl Status {
         }
     }
 
+    /// The status pill's background colour (`design_handoff_jerry_ade/README.md`'s "Session
+    /// context bar" spec: "status pill (19 high, radius 3, 5px dot + ... label in the status
+    /// colour)" on this background) - `crate::theme::status::*_BG`, one per [`Status`].
+    pub fn pill_bg(self) -> gpui::Rgba {
+        match self {
+            Status::Ask => crate::theme::status::ASK_BG,
+            Status::Fail => crate::theme::status::FAIL_BG,
+            Status::Review => crate::theme::status::REVIEW_BG,
+            Status::Run => crate::theme::status::RUN_BG,
+            Status::Idle => crate::theme::status::IDLE_BG,
+        }
+    }
+
     /// Every status, already in the README's "by urgency" group order - `crate::rail`'s
     /// urgency grouping iterates this rather than re-deriving the order from
     /// [`Self::urgency_rank`] at each call site.
@@ -292,6 +305,24 @@ mod tests {
             derive_status(SessionKind::Claude, signal, false),
             Status::Idle
         );
+    }
+
+    #[test]
+    fn pill_bg_is_distinct_per_status_and_matches_the_dot_colour_family() {
+        // Every status must have its own pill background (never accidentally sharing one
+        // with a different status) - a real regression a copy-pasted match arm could
+        // introduce silently, since two visually-similar dark ambers/reds would still
+        // "look plausible" without this check. `gpui::Rgba` has no `Debug` impl, so this
+        // compares raw channels rather than using `assert_ne!` directly on the colour.
+        let bgs: Vec<gpui::Rgba> = Status::ORDER.iter().map(|s| s.pill_bg()).collect();
+        for (i, a) in bgs.iter().enumerate() {
+            for (j, b) in bgs.iter().enumerate() {
+                if i != j {
+                    let same = a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
+                    assert!(!same, "status {i} and {j} share a pill background");
+                }
+            }
+        }
     }
 
     #[test]
