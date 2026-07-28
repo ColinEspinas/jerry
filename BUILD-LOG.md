@@ -285,3 +285,63 @@ the first version, beyond the passing test suite and a plausible-looking screens
   end-to-end regression that spawns a real `printf` through `pty_core::spawn` and feeds
   its actual output through `TerminalBuffer` — the shape of test that would have caught
   the CR/LF bug the first time.
+
+### Step 4: Sessions, and correcting a real stack deviation
+
+- The immediate goal was "spawn an agent CLI (Claude Code / Codex) in a chosen worktree,
+  with its output in the center pane" — but before building that, the human reviewer
+  flagged that step 3's `ansi.rs` (a hand-rolled CR/LF-scanning plain-text buffer) was
+  never actually replaced with real `alacritty_terminal` grid emulation, despite the
+  stack being fixed to "alacritty_terminal plus portable-pty for terminals." This was a
+  real, correct catch: an interactive agent CLI is exactly the case a plain-text scanner
+  can't handle (cursor-addressed redraws render as garbled repeated lines, not clean
+  updates), which would have made Sessions look superficially done while being broken for
+  its actual purpose. Fixed first, before building sessions/tabs on top of it.
+- Deleted `ansi.rs` entirely. New `crates/app/src/terminal_grid.rs`: `TerminalGrid` wraps
+  a real `alacritty_terminal::Term<NoopEventListener>`, fed via
+  `alacritty_terminal::vte::ansi::Processor::advance` (alacritty re-exports `vte` itself,
+  confirmed via `pub use vte;` in its `lib.rs` — so no separate top-level `vte` dependency,
+  avoiding version drift). `alacritty_terminal` pinned to the exact same git rev
+  `vendor/zed/Cargo.toml` uses (`4c129667ce56611becdc82de6e28218c80e2e88f`), specifically
+  *because* the reference implementations this was verified against —
+  `vendor/zed/crates/terminal/src/terminal.rs` and
+  `vendor/zed/crates/terminal_view/src/terminal_element.rs` — were themselves written
+  against that exact fork/rev; using upstream crates.io `alacritty_terminal` instead would
+  have broken the "verify against vendor/zed" methodology this whole project relies on,
+  since the API surfaces aren't guaranteed to match.
+- Colors: fixed ANSI-16 palette + standard xterm 256-color cube/grayscale-ramp formulas
+  (matching Zed's own `get_color_at_index`); verified independently by an audit round
+  against the known xterm math (cube stops 0,95,135,175,215,255; grayscale 8..238 step 10).
+- New `crates/app/src/sessions.rs`: `SessionKind::{Shell,Claude,Codex}` each map to a real
+  `TerminalSpec`; `Sessions` owns open sessions and which is active. Closing a tab calls
+  `TerminalPane::shutdown()` → `PtySession::shutdown()` on the background executor —
+  deterministic, confirmed-reaped teardown, not just dropping the entity and hoping
+  `Drop`'s fire-and-forget signal gets there eventually.
+- Deliberate behavior change from step 3, documented in `root.rs`'s module docs: selecting
+  a worktree in the sidebar no longer respawns the active terminal. It only changes where
+  *new* sessions spawn. Step 3's respawn-on-select behavior would mean clicking a worktree
+  to browse its files could silently kill a live agent session — unacceptable once
+  sessions are meant to be long-running and valuable.
+- Real proof: a live interactive `claude` session (the actual `claude` binary installed
+  on this dev machine, `2.1.220`) rendering its box-drawing welcome screen correctly
+  through the new grid pipeline — cursor-addressed redraw-in-place, not garbled repeated
+  lines. A "New Codex Session" attempt fails with a real, non-panicking, in-tab error
+  (`codex` genuinely isn't installed here) rather than a simulated one. Automated
+  tests/screenshots use `claude --version`/`--help` (fast, deterministic, no API cost)
+  rather than a full interactive agentic session, to avoid incurring real API usage during
+  verification.
+- Audit round found the integration itself solid (every `alacritty_terminal`/`vte` API
+  claim checked out against the real pinned source; 41/41 tests independently
+  reproduced; resource bounds — 256KB/tick decode cap, 500-row file-tree render cap,
+  alacritty's own bounded scrollback — all held) and one minor issue: `TerminalPane::
+  respawn` had become dead code once worktree-selection stopped respawning anything.
+  Removed rather than left as unused public API.
+- Infra note, not code: partway through this step, the background builder agent was
+  killed mid-edit by what looked like an external stop (later confirmed a mis-click), and
+  shortly after, a session reconnect silently dropped the custom `builder`/`checker`/
+  `finder` subagent definitions entirely (they'd been defined via `claude --agents
+  '{...}'` at process launch, not via `.claude/agents/*.md` files, so nothing on disk
+  survived the reconnect). Recreated them as `.claude/agents/{builder,checker,finder}.md`
+  once the user supplied the original launch command, matching the original prompts and
+  per-agent models (`builder`→sonnet, `checker`→opus, `finder`→haiku) exactly, and
+  committed them so a future reconnect doesn't lose them again.
