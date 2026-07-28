@@ -523,3 +523,38 @@ this project's process prevents a rogue background process from committing unrev
 work, and it happened. Worth remembering if resuming this kind of long multi-agent session
 after any interruption: check `git log` for unexpected commits and `ps aux` for orphaned
 `--fork-session --resume` processes before trusting the working tree's state.
+
+### Phase E — command palette (⌘K)
+
+Real overlay palette over real data: sessions from `Sessions`, files from the loaded file
+tree (changed files surfaced first on an empty query), and a fixed set of commands each
+dispatching to an already-real app method. Prune goes through the exact same two-click
+code path the rail's own prune button uses, not a shortcut around it — verified by tracing
+the call chain to the same function, then executing it live via a real test harness (arm,
+confirm nothing's deleted yet, confirm on second run, worktree actually gone).
+
+The infra incident from Phase D got much worse during this phase: the same rogue process
+respawned three separate times in real time while dispatching and re-dispatching this
+phase, at one point actively interleaving edits with a freshly-launched legitimate agent
+in the same files while both were live simultaneously — confirmed via file-modification
+timestamps seconds apart. Killing individual process instances stopped working as a fix
+(it kept respawning within minutes); traced it to a daemon (`bg-pty-host`) retrying a
+specific stale session id (`c500d122`) via `--resume`, and broke the loop at its root by
+renaming that session's own transcript file so `--resume` has nothing to find. Held for
+the rest of the session after that. Two prior interrupted-session incidents this same
+session id caused are also almost certainly attributable to this same daemon retry
+behavior, not independent events.
+
+Audit found the palette's own entry point was broken: closing it never restored window
+focus to whatever was focused before, so ⌘K worked exactly once per manual click and did
+nothing at all on a fresh window before any click had happened — invisible to the builder
+precisely because it couldn't test interactively (the same X11 synthetic-input limitation
+documented since steps 3-4). This phase's checker worked around that by building a real
+GPUI `TestAppContext`/`VisualTestContext` harness to drive actual keystrokes/clicks against
+the real app instead of relying on screenshots — reused for the fix's own verification
+(the fix agent proved causation by reverting its own fix and watching the new tests fail
+with exactly the reported symptoms, then restoring it), and kept as this crate's first
+permanent test-support harness, since a `FocusHandle` pointing at an unrendered node is
+structurally invisible to plain unit tests. Also fixed: the panel always rendering at max
+height regardless of content, and palette actions not clearing an armed-but-unconfirmed
+rail prune.
