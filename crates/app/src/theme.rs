@@ -130,6 +130,12 @@ pub mod text {
     /// token list), so it's added here directly rather than reusing the nearby-but-different
     /// [`GHOST`] or an unrelated module's identically-valued constant (`diff::FOLD_FG`).
     pub const PATH: Rgba = hex(0x4a5057);
+    /// The file tree row's `▾`/`▸` caret specifically - `design_handoff_jerry_ade/
+    /// Jerry.dc.html`'s tree row template (`n.caret`'s span, `color:#4a5057`). Same hex as
+    /// [`PATH`] but a distinct token for a distinct real UI element, per this module's own
+    /// stated policy above of not reusing an unrelated element's constant just because the
+    /// value happens to match.
+    pub const TREE_CARET: Rgba = hex(0x4a5057);
 }
 
 /// Status is the only place colour carries meaning in the rail.

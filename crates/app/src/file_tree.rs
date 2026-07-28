@@ -12,13 +12,28 @@
 //!   pathological trees (this is a UI sidebar, not a full indexer); once the cap is hit,
 //!   remaining entries are simply omitted rather than erroring.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use gpui::Rgba;
+
+use crate::theme;
+
 /// Defensive cap on how many entries [`build_file_tree`] will collect, regardless of how
 /// large the real tree is.
 const MAX_ENTRIES: usize = 5000;
+
+/// Cap on how many *visible* file-tree rows `crate::root::AdeApp::render_file_tree` turns into
+/// actual GPUI elements, independent of [`MAX_ENTRIES`]'s much larger loaded-tree size. Laying
+/// out that many `div`s through GPUI's flexbox engine on *every* render (which happens as
+/// often as every ~33ms while a terminal pane is streaming output and calling `cx.notify()`)
+/// was a real, measured foreground-executor stall during an earlier step's own verification. A
+/// real virtualized list (`uniform_list`, see `vendor/zed/crates/project_panel`) would be a
+/// further improvement for a tree of unbounded size, but is out of scope here. Also used by
+/// [`visible_entries`] to bound its own allocation - see that function's docs.
+pub const MAX_RENDERED_FILE_ENTRIES: usize = 500;
 
 /// One row in the flattened file tree: a real filesystem entry, its path, and its depth
 /// (0 = direct child of the tree root) for indentation.
@@ -86,6 +101,82 @@ fn visit(
     Ok(())
 }
 
+/// A file tree row's real 13×13 language chip - `design_handoff_jerry_ade/README.md`'s Zone 3
+/// table (`.rs`→`rs`, `.toml`→`to`, `.md`→`md`, `.sql`→`sq`, matching `theme::lang::*` from
+/// Phase A's `theme.rs`), plus a neutral fallback (`theme::lang::UNKNOWN`) for any other
+/// extension so every file row still gets *some* chip rather than one silently missing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LangChip {
+    pub label: &'static str,
+    pub fg: Rgba,
+    pub bg: Rgba,
+}
+
+/// Picks the real language chip for a file name by its extension (case-insensitive - `Cargo.TOML`
+/// gets the same chip as `Cargo.toml`), per [`LangChip`]'s docs.
+pub fn lang_chip_for_name(name: &str) -> LangChip {
+    let extension = Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+
+    let (label, (fg, bg)) = match extension.as_deref() {
+        Some("rs") => ("rs", theme::lang::RS),
+        Some("toml") => ("to", theme::lang::TOML),
+        Some("md") => ("md", theme::lang::MD),
+        Some("sql") => ("sq", theme::lang::SQL),
+        _ => (".", theme::lang::UNKNOWN),
+    };
+    LangChip { label, fg, bg }
+}
+
+/// Filters a flattened, depth-annotated [`build_file_tree`] listing down to the rows that
+/// should actually be rendered given which directories are collapsed - the real backing logic
+/// for the file tree's collapse/expand feature (a collapsed directory's own row still shows,
+/// but every row nested underneath it is hidden until it's expanded again).
+///
+/// Relies on `entries` being in the same pre-order depth-first shape `build_file_tree` produces
+/// (a directory immediately followed by its own descendants, deeper `depth` first): once a
+/// collapsed directory at depth `d` is seen, every following entry with `depth > d` is skipped,
+/// and skipping stops as soon as an entry with `depth <= d` is reached (i.e. a sibling or an
+/// ancestor's next sibling - past the collapsed subtree). Nested collapsed directories inside an
+/// already-hidden subtree need no special case: they're already skipped along with the rest of
+/// their (also hidden) parent.
+///
+/// The returned `Vec`'s full length still matters to the caller (`crate::root::AdeApp::
+/// render_file_tree`'s "... and N more entries not shown" count), so every visible entry really
+/// is collected here rather than stopping early at [`MAX_RENDERED_FILE_ENTRIES`] - but the
+/// initial allocation is capped at that same bound rather than `entries.len()` (which can be up
+/// to [`MAX_ENTRIES`], 5000): most real trees have far fewer entries collapsed away than that,
+/// and reserving capacity for a full 5000-entry tree on every render when at most
+/// `MAX_RENDERED_FILE_ENTRIES` (500) of them will ever be rendered wastes an allocation for no
+/// benefit - `Vec` still grows geometrically past this initial reservation if the real visible
+/// count exceeds it.
+pub fn visible_entries<'a>(
+    entries: &'a [FileTreeEntry],
+    collapsed: &HashSet<PathBuf>,
+) -> Vec<&'a FileTreeEntry> {
+    let mut visible = Vec::with_capacity(entries.len().min(MAX_RENDERED_FILE_ENTRIES));
+    let mut hidden_below_depth: Option<usize> = None;
+
+    for entry in entries {
+        if let Some(hidden_depth) = hidden_below_depth {
+            if entry.depth > hidden_depth {
+                continue;
+            }
+            hidden_below_depth = None;
+        }
+
+        visible.push(entry);
+
+        if entry.is_dir && collapsed.contains(&entry.path) {
+            hidden_below_depth = Some(entry.depth);
+        }
+    }
+
+    visible
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +231,135 @@ mod tests {
         let missing = PathBuf::from("/definitely/not/a/real/path/for/ade/file-tree-test");
         let result = build_file_tree(&missing);
         assert!(result.is_err());
+    }
+
+    fn same(a: Rgba, b: Rgba) -> bool {
+        a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a
+    }
+
+    #[test]
+    fn each_documented_extension_gets_its_own_chip() {
+        let rs = lang_chip_for_name("main.rs");
+        assert_eq!(rs.label, "rs");
+        assert!(same(rs.fg, theme::lang::RS.0));
+        assert!(same(rs.bg, theme::lang::RS.1));
+
+        let toml = lang_chip_for_name("Cargo.toml");
+        assert_eq!(toml.label, "to");
+        assert!(same(toml.fg, theme::lang::TOML.0));
+
+        let md = lang_chip_for_name("README.md");
+        assert_eq!(md.label, "md");
+        assert!(same(md.fg, theme::lang::MD.0));
+
+        let sql = lang_chip_for_name("schema.sql");
+        assert_eq!(sql.label, "sq");
+        assert!(same(sql.fg, theme::lang::SQL.0));
+    }
+
+    #[test]
+    fn an_unrecognized_extension_gets_the_neutral_fallback_chip() {
+        let chip = lang_chip_for_name("image.png");
+        assert_eq!(chip.label, ".");
+        assert!(same(chip.fg, theme::lang::UNKNOWN.0));
+        assert!(same(chip.bg, theme::lang::UNKNOWN.1));
+    }
+
+    #[test]
+    fn extension_matching_is_case_insensitive() {
+        let upper = lang_chip_for_name("Notes.MD");
+        assert_eq!(upper.label, "md");
+    }
+
+    #[test]
+    fn a_name_with_no_extension_gets_the_fallback_chip() {
+        let chip = lang_chip_for_name("Makefile");
+        assert_eq!(chip.label, ".");
+    }
+
+    fn entry(name: &str, depth: usize, is_dir: bool) -> FileTreeEntry {
+        FileTreeEntry {
+            path: PathBuf::from(name),
+            name: name.to_string(),
+            depth,
+            is_dir,
+        }
+    }
+
+    #[test]
+    fn nothing_collapsed_shows_every_entry() {
+        let entries = vec![
+            entry("sub", 0, true),
+            entry("nested.txt", 1, false),
+            entry("a.txt", 0, false),
+        ];
+        let visible = visible_entries(&entries, &HashSet::new());
+        assert_eq!(visible.len(), 3);
+    }
+
+    #[test]
+    fn collapsing_a_directory_hides_only_its_own_descendants() {
+        let entries = vec![
+            entry("sub", 0, true),
+            entry("nested.txt", 1, false),
+            entry("deeper", 1, true),
+            entry("deepest.txt", 2, false),
+            entry("a.txt", 0, false),
+        ];
+        let mut collapsed = HashSet::new();
+        collapsed.insert(PathBuf::from("sub"));
+
+        let visible = visible_entries(&entries, &collapsed);
+        let names: Vec<&str> = visible.iter().map(|e| e.name.as_str()).collect();
+        // "sub" itself still shows (its own row is what you click to re-expand it); every
+        // entry nested underneath it (at a strictly greater depth) is hidden; "a.txt", a
+        // sibling back at "sub"'s own depth, is unaffected.
+        assert_eq!(names, vec!["sub", "a.txt"]);
+    }
+
+    #[test]
+    fn collapsing_a_nested_directory_only_hides_its_own_subtree() {
+        let entries = vec![
+            entry("sub", 0, true),
+            entry("nested.txt", 1, false),
+            entry("deeper", 1, true),
+            entry("deepest.txt", 2, false),
+            entry("after-deeper.txt", 1, false),
+        ];
+        let mut collapsed = HashSet::new();
+        collapsed.insert(PathBuf::from("deeper"));
+
+        let visible = visible_entries(&entries, &collapsed);
+        let names: Vec<&str> = visible.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["sub", "nested.txt", "deeper", "after-deeper.txt"]
+        );
+    }
+
+    #[test]
+    fn collapsing_a_directory_with_no_children_hides_nothing_extra() {
+        let entries = vec![entry("empty-dir", 0, true), entry("a.txt", 0, false)];
+        let mut collapsed = HashSet::new();
+        collapsed.insert(PathBuf::from("empty-dir"));
+
+        let visible = visible_entries(&entries, &collapsed);
+        assert_eq!(visible.len(), 2);
+    }
+
+    #[test]
+    fn visible_entries_on_a_real_tree_matches_manual_filtering() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::create_dir(dir.path().join("sub")).expect("mkdir");
+        fs::write(dir.path().join("sub/nested.txt"), "n").expect("write");
+        fs::write(dir.path().join("a.txt"), "a").expect("write");
+
+        let entries = build_file_tree(dir.path()).expect("build_file_tree");
+        let mut collapsed = HashSet::new();
+        collapsed.insert(dir.path().join("sub"));
+
+        let visible = visible_entries(&entries, &collapsed);
+        let names: Vec<&str> = visible.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["sub", "a.txt"]);
     }
 }

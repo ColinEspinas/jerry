@@ -34,12 +34,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{
-    actions, div, font, prelude::*, px, rgb, App, ClickEvent, Context, FocusHandle, KeyDownEvent,
-    MouseButton, Task, Window, WindowControlArea,
+    actions, div, font, prelude::*, px, App, ClickEvent, Context, DragMoveEvent, Empty,
+    FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Task, Window,
+    WindowControlArea,
 };
-use wt_core::diff::{DiffBase, DiffFile, DiffLineKind, FileChangeStatus};
+use wt_core::diff::{DiffBase, DiffFile, DiffLineKind, FileChangeStatus, WorktreeDiff};
 
-use crate::file_tree::{self, FileTreeEntry};
+use crate::changes::{self, ChangeTag};
+use crate::file_tree::{self, FileTreeEntry, LangChip};
+use crate::layout;
 use crate::rail::{
     self, ProjectChild, RailMode, SessionRow, StatusGroup, WorktreeEntry, WorktreeNote,
 };
@@ -72,15 +75,12 @@ actions!(app, [NewSession]);
 /// handful of open sessions turns into a constant stream of `git` spawns.
 const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-/// See the comment at its use site in `render_file_tree` for why this exists.
-const MAX_RENDERED_FILE_ENTRIES: usize = 500;
-
 /// Cap on how many changed files the diff view turns into rendered elements, independent of
 /// `wt_core::diff`'s own `MAX_FILES` cap (300) on the *loaded* diff. Mirrors
-/// `MAX_RENDERED_FILE_ENTRIES` above for the same reason: `wt_core::diff` can hand back up
-/// to 300 files, each carrying its own hunk lines on top, and laying all of that out as
-/// GPUI divs on every render is the same kind of foreground-executor stall documented at
-/// `MAX_RENDERED_FILE_ENTRIES`'s use site, just with a much larger multiplier.
+/// `file_tree::MAX_RENDERED_FILE_ENTRIES` for the same reason: `wt_core::diff` can hand back up
+/// to 300 files, each carrying its own hunk lines on top, and laying all of that out as GPUI
+/// divs on every render is the same kind of foreground-executor stall documented at
+/// `file_tree::MAX_RENDERED_FILE_ENTRIES`'s use site, just with a much larger multiplier.
 const MAX_RENDERED_DIFF_FILES: usize = 40;
 
 /// Cap on how many hunk lines a single file's diff renders, independent of `wt_core::diff`'s
@@ -89,11 +89,39 @@ const MAX_RENDERED_DIFF_FILES: usize = 40;
 /// past the loaded-data cap) shouldn't be allowed to blow up render time on its own.
 const MAX_RENDERED_DIFF_LINES_PER_FILE: usize = 300;
 
-/// Which real data source the right sidebar currently shows for the selected worktree.
+/// Which real data source the right sidebar currently shows for the selected worktree -
+/// `design_handoff_jerry_ade/README.md`'s Zone 3 `right_pane` state (`Files | Changes`, `Files`
+/// default). The panel itself never shows diff *content* (see [`AdeApp::open_change`]'s docs) -
+/// `Changes` is the real per-file review list, not a diff view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RightSidebarView {
     Files,
-    Diff,
+    Changes,
+}
+
+/// Which of the two real drag-to-resize splitters (`design_handoff_jerry_ade/README.md`'s
+/// Layout table: rail "276 (range 240–340)", panel "320 (260 in empty states)") is being
+/// dragged - see [`AdeApp::apply_pane_resize`] and `crate::layout`'s pure clamp math.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeTarget {
+    Rail,
+    Panel,
+}
+
+/// The invisible payload/"drag ghost" GPUI's real drag-and-drop system requires to start a
+/// trackable drag (`Interactivity::on_drag`'s `T`/`W` type parameters - see this file's use of
+/// `.on_drag`/`.on_drag_move` on the resize handles). Renders nothing (`gpui::Empty`), matching
+/// `vendor/zed/crates/workspace/src/workspace.rs`'s own `DraggedDock` - the real, verified
+/// precedent for using GPUI's drag system to implement a resize handle rather than a
+/// drag-and-drop interaction (see that type's doc comment: "Useful for implementing draggable
+/// UIs that don't conform to a drag and drop style interaction, like resizing").
+#[derive(Debug, Clone, Copy)]
+struct PaneResizeDrag(ResizeTarget);
+
+impl gpui::Render for PaneResizeDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
 }
 
 /// The outcome of the most recent (or in-flight) `wt_core::diff::diff_against_base` call for
@@ -118,6 +146,48 @@ pub struct AdeApp {
     right_sidebar_view: RightSidebarView,
     diff_root: PathBuf,
     diff_state: DiffLoadState,
+    /// The real `+n`/`-n` totals across every file in [`Self::diff_state`]'s currently loaded
+    /// diff (`Self::render_right_sidebar_toggle`'s header totals), computed once - off the UI
+    /// thread, alongside `diff_state` itself becoming `DiffLoadState::Loaded` - rather than
+    /// re-folded over every one of up to 300 files' hunks on *every single render* regardless
+    /// of which Zone 3 tab is even showing. `None` whenever there's no loaded diff to sum (see
+    /// [`Self::current_diff`]'s docs for exactly which [`DiffLoadState`]/[`DiffBase`]
+    /// combinations count).
+    diff_totals: Option<(u32, u32)>,
+    /// Real collapse/expand state for the file tree - a directory's path is in this set iff
+    /// the user has collapsed it (see `crate::file_tree::visible_entries`, which this set
+    /// feeds directly). Absence means expanded, so a freshly loaded tree starts fully open,
+    /// matching the design's own default screenshots.
+    collapsed_dirs: HashSet<PathBuf>,
+    /// Real, UI-only per-file "reviewed" toggle state for the Changes list
+    /// (`design_handoff_jerry_ade/README.md`'s Zone 3 review checkboxes) - a file's path is in
+    /// this set iff its checkbox is checked. There is no backend "review" concept yet (see the
+    /// task brief this phase shipped against); this is a real, live, per-file `HashSet` toggle,
+    /// not decoration - `Self::render_changes_header`'s progress bar and `N reviewed` count are
+    /// both computed directly from its real membership.
+    reviewed_files: HashSet<PathBuf>,
+    /// The file whose real diff is currently opened in the centre pane (`design_handoff_
+    /// jerry_ade/README.md`'s `open_change` state field), set by clicking a Changes row.
+    /// `render_center_pane` shows this file's diff instead of the active session's terminal
+    /// while it's `Some` - see that method's docs for the judgment call on how far this stands
+    /// in for the design's full Surface C.
+    open_change: Option<PathBuf>,
+    /// The session rail's real, user-adjustable width - `design_handoff_jerry_ade/README.md`'s
+    /// Layout table ("276, range 240–340"), dragged via the resize handle on the rail's right
+    /// edge (see [`Self::apply_pane_resize`]/`crate::layout::rail_width_for_cursor`).
+    rail_width: Pixels,
+    /// The files/changes panel's real, user-adjustable width - see [`Self::rail_width`]'s docs
+    /// for the same mechanism, mirrored on the panel's left edge
+    /// (`crate::layout::panel_width_for_cursor`).
+    panel_width: Pixels,
+    /// The window body's real, current paint bounds - captured every render by a `gpui::canvas`
+    /// child of the body div (see [`Self::render`]'s body child list), and read by
+    /// [`Self::apply_pane_resize`] to turn a drag's absolute cursor position into a pane width.
+    /// Verified against the real, equivalent `Workspace::bounds` field
+    /// `vendor/zed/crates/workspace/src/workspace.rs` captures the same way for its own
+    /// dock-resize `on_drag_move` handler. `Bounds::default()` (zero origin/size) until the
+    /// first paint; harmless, since nothing reads it before a resize handle can be dragged.
+    body_bounds: gpui::Bounds<Pixels>,
     /// Armed by a left mouse-down on the title bar's drag area, consumed (and cleared) by
     /// the next mouse-move to call the real `Window::start_window_move` - see
     /// `Self::render_title_bar`'s docs for why this two-step arm-then-move dance is needed
@@ -165,6 +235,28 @@ pub struct AdeApp {
     _prune_task: Option<Task<()>>,
 }
 
+/// Clears every piece of per-worktree UI state that would otherwise survive a worktree switch
+/// ([`AdeApp::reviewed_files`], [`AdeApp::open_change`], [`AdeApp::collapsed_dirs`]) - called
+/// from [`AdeApp::select_worktree`] on every switch. `reviewed_files`/`open_change` are keyed by
+/// repo-relative paths, so without this reset a file reviewed (or opened) in worktree A would
+/// silently read as already-reviewed - or reopen a same-named file - in worktree B just because
+/// it happens to share the same relative path; neither has any per-worktree scoping of its own.
+/// `collapsed_dirs` is keyed by absolute path (so it never visually bleeds the same way - two
+/// worktrees are different directories on disk), but nothing ever removed a past worktree's
+/// entries either, so it grew unboundedly across however many worktrees got browsed in a
+/// session; clearing it here on every switch is the same fix applied for the same reason.
+/// Pulled out as a free, `gpui`-free function (rather than an `AdeApp` method) so this behavior
+/// is directly unit-testable without needing a `Context<AdeApp>` to construct an `AdeApp` first.
+fn reset_per_worktree_ui_state(
+    reviewed_files: &mut HashSet<PathBuf>,
+    open_change: &mut Option<PathBuf>,
+    collapsed_dirs: &mut HashSet<PathBuf>,
+) {
+    reviewed_files.clear();
+    *open_change = None;
+    collapsed_dirs.clear();
+}
+
 impl AdeApp {
     pub fn new(repo_path: PathBuf, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
@@ -179,6 +271,13 @@ impl AdeApp {
             file_tree_error: None,
             right_sidebar_view: RightSidebarView::Files,
             diff_state: DiffLoadState::Loading,
+            diff_totals: None,
+            collapsed_dirs: HashSet::new(),
+            reviewed_files: HashSet::new(),
+            open_change: None,
+            rail_width: px(layout::RAIL_DEFAULT),
+            panel_width: px(layout::PANEL_DEFAULT),
+            body_bounds: gpui::Bounds::default(),
             title_bar_move_armed: false,
             rail_mode: RailMode::default(),
             filter_query: String::new(),
@@ -305,20 +404,45 @@ impl AdeApp {
     fn load_diff(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.diff_root = root.clone();
         self.diff_state = DiffLoadState::Loading;
+        self.diff_totals = None;
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn({
                     let root = root.clone();
-                    async move { wt_core::diff::diff_against_base(&root) }
+                    async move {
+                        // The `+n`/`-n` header totals (`Self::diff_totals`) are folded here,
+                        // off the UI thread, right alongside the diff itself becoming
+                        // available - not recomputed on every render (see `diff_totals`'s
+                        // docs for the real per-frame cost that used to be).
+                        wt_core::diff::diff_against_base(&root).map(|base| {
+                            let totals = match &base {
+                                DiffBase::Diff(diff) => Some(diff.files.iter().fold(
+                                    (0u32, 0u32),
+                                    |(add, del), file| {
+                                        let (file_add, file_del) = changes::diff_file_stats(file);
+                                        (add + file_add, del + file_del)
+                                    },
+                                )),
+                                DiffBase::NoBaseFound | DiffBase::OnDefaultBranch { .. } => None,
+                            };
+                            (base, totals)
+                        })
+                    }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.diff_state = match result {
-                    Ok(base) => DiffLoadState::Loaded(base),
-                    Err(err) => DiffLoadState::Error(err.to_string()),
-                };
+                match result {
+                    Ok((base, totals)) => {
+                        this.diff_state = DiffLoadState::Loaded(base);
+                        this.diff_totals = totals;
+                    }
+                    Err(err) => {
+                        this.diff_state = DiffLoadState::Error(err.to_string());
+                        this.diff_totals = None;
+                    }
+                }
                 cx.notify();
             });
         });
@@ -350,24 +474,97 @@ impl AdeApp {
         // `Self::request_prune`'s docs. Browsing to a different worktree is exactly the kind
         // of "I did something else" that must not let a stale armed click land later.
         self.prune_confirm_armed = false;
+        // Review/collapse state is per-worktree in spirit but keyed only by repo-relative (or,
+        // for `collapsed_dirs`, absolute-but-never-pruned) path (see
+        // `reset_per_worktree_ui_state`'s docs) - reset it here so switching worktrees never
+        // leaks a "reviewed" checkbox or an open diff from the worktree just left, and never
+        // lets `collapsed_dirs` grow forever across however many worktrees get browsed.
+        reset_per_worktree_ui_state(
+            &mut self.reviewed_files,
+            &mut self.open_change,
+            &mut self.collapsed_dirs,
+        );
         self.load_file_tree(path.clone(), cx);
         self.load_diff(path, cx);
         cx.notify();
     }
 
-    /// Switches which real data source the right sidebar shows. Switching *to* the Diff view
-    /// always recomputes it (`load_diff`, not just `cx.notify()`) rather than showing
-    /// whatever was last loaded: the core workflow this feature exists for is "run an agent
-    /// in a terminal tab, then check the diff", and a stale snapshot captured back when the
-    /// worktree was first selected would silently hide exactly the changes just made -
+    /// Switches which real data source the right sidebar shows. Switching *to* the Changes
+    /// view always recomputes the diff (`load_diff`, not just `cx.notify()`) rather than
+    /// showing whatever was last loaded: the core workflow this feature exists for is "run an
+    /// agent in a terminal tab, then check what changed", and a stale snapshot captured back
+    /// when the worktree was first selected would silently hide exactly the changes just made -
     /// worse than an obviously-loading state.
     fn set_right_sidebar_view(&mut self, view: RightSidebarView, cx: &mut Context<Self>) {
         self.right_sidebar_view = view;
-        if view == RightSidebarView::Diff {
+        if view == RightSidebarView::Changes {
             self.load_diff(self.diff_root.clone(), cx);
         } else {
             cx.notify();
         }
+    }
+
+    /// Toggles a directory's collapsed/expanded state - the file tree row's real click handler
+    /// (`crate::file_tree::visible_entries` does the actual hiding at render time).
+    fn toggle_dir_collapsed(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.collapsed_dirs.remove(&path) {
+            self.collapsed_dirs.insert(path);
+        }
+        cx.notify();
+    }
+
+    /// Toggles a file's real reviewed/not-reviewed state - the Changes row checkbox's click
+    /// handler. Deliberately stops propagation at the call site (see
+    /// `Self::render_change_row`) so checking a box never also opens that file's diff.
+    fn toggle_reviewed(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.reviewed_files.remove(&path) {
+            self.reviewed_files.insert(path);
+        }
+        cx.notify();
+    }
+
+    /// Opens `path`'s real diff in the centre pane - the Changes row's own click handler
+    /// (`design_handoff_jerry_ade/README.md`: "clicking a change row sets ... open_change =
+    /// row"). See [`Self::open_change`]'s docs for what this actually swaps in.
+    fn open_change_diff(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.open_change = Some(path);
+        cx.notify();
+    }
+
+    /// Closes the centre's file-diff view and returns to the active session's terminal - the
+    /// diff surface's own real "back"/close affordance.
+    fn close_change_diff(&mut self, cx: &mut Context<Self>) {
+        self.open_change = None;
+        cx.notify();
+    }
+
+    /// Applies one real `on_drag_move` tick for `target`'s pane, deriving the new width
+    /// directly from the drag's current absolute cursor x position and [`Self::body_bounds`]
+    /// via `crate::layout`'s pure, unit-tested clamp math - no "armed" drag-start baseline is
+    /// carried between ticks (see [`Self::body_bounds`]'s docs for the verified
+    /// `vendor/zed/crates/workspace/src/workspace.rs` precedent this follows). Since `target`
+    /// comes straight from the `PaneResizeDrag` payload the event itself carries, this is
+    /// always acting on the pane actually being dragged - there is no separate "is some other
+    /// drag currently armed" state that could disagree with it.
+    fn apply_pane_resize(
+        &mut self,
+        target: ResizeTarget,
+        cursor_x: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        let new_width = match target {
+            ResizeTarget::Rail => {
+                layout::rail_width_for_cursor(self.body_bounds.left().as_f32(), cursor_x.as_f32())
+            }
+            ResizeTarget::Panel => {
+                layout::panel_width_for_cursor(self.body_bounds.right().as_f32(), cursor_x.as_f32())
+            }
+        };
+        match target {
+            ResizeTarget::Rail => self.rail_width = px(new_width),
+            ResizeTarget::Panel => self.panel_width = px(new_width),
+        }
+        cx.notify();
     }
 
     fn new_session(&mut self, kind: SessionKind, cx: &mut Context<Self>) {
@@ -1999,46 +2196,597 @@ impl AdeApp {
         button
     }
 
-    /// The centre "work surface" zone. `.min_w_0()` on this method's own root div (the flex
-    /// item actually sitting inside the outer three-zone `flex_row`) is the real fix for
-    /// the responsive-layout bug this step was asked to fix: see this method's own doc
-    /// comment continuation below for the root cause.
+    /// The currently loaded real diff, if [`Self::diff_state`] has one - `None` while
+    /// loading/erroring, or when the worktree is on its default branch / has no detectable
+    /// base (see `wt_core::diff::DiffBase`'s docs for those two explanatory non-diff
+    /// outcomes). The one real source every Zone 3 view (file-tree change marks, the Changes
+    /// list, the centre's file-diff surface) reads, so they can never disagree.
+    fn current_diff(&self) -> Option<&WorktreeDiff> {
+        match &self.diff_state {
+            DiffLoadState::Loaded(DiffBase::Diff(diff)) => Some(diff),
+            _ => None,
+        }
+    }
+
+    /// A real, themed explanatory message for every [`DiffLoadState`] that isn't a loaded diff,
+    /// shared by the Changes list (no diff yet/loaded) and, defensively, anywhere else that
+    /// needs to explain why there's no diff content to show.
+    fn render_diff_state_message(&self) -> gpui::AnyElement {
+        let (text, color) = match &self.diff_state {
+            DiffLoadState::Loading => ("computing diff...".to_string(), theme::text::FAINT),
+            DiffLoadState::Error(err) => (
+                format!("failed to compute diff: {err}"),
+                theme::status::FAIL,
+            ),
+            DiffLoadState::Loaded(DiffBase::NoBaseFound) => (
+                "no base branch could be detected for this worktree (no origin/HEAD, no \
+                 local main/master, and no fallback branch found)"
+                    .to_string(),
+                theme::text::FAINT,
+            ),
+            DiffLoadState::Loaded(DiffBase::OnDefaultBranch { branch }) => (
+                format!(
+                    "this worktree is on the default branch ({branch}); nothing to diff against"
+                ),
+                theme::text::FAINT,
+            ),
+            // Unreachable from every real call site (each checks `current_diff()` first), but
+            // matched explicitly rather than a wildcard so a future `DiffBase` variant can't
+            // silently fall through here without a compile error to catch it.
+            DiffLoadState::Loaded(DiffBase::Diff(_)) => (String::new(), theme::text::FAINT),
+        };
+        render_sidebar_message(text, color)
+    }
+
+    /// The real `A`/`M` change marks for every changed file in the currently loaded diff, keyed
+    /// by each file's absolute path (`design_handoff_jerry_ade/README.md`: "Changed files carry
+    /// an `A` ... or `M` ... mark at the right"). Built *once* per [`Self::render_file_tree`]
+    /// call and looked up per row from there, rather than the row itself re-scanning
+    /// `diff.files` (a `Vec`, so a linear scan) and re-joining a `PathBuf` for every rendered
+    /// row: with up to `file_tree::MAX_RENDERED_FILE_ENTRIES` (500) rows rendered against up to
+    /// 300 loaded diff files, doing that scan+allocation per row per frame was a real, measured
+    /// ~21ms foreground-executor cost against a ~33ms frame budget - exactly the kind of stall
+    /// `file_tree::MAX_RENDERED_FILE_ENTRIES`'s own doc comment already warned a prior phase
+    /// measured. A
+    /// deleted file never needs an entry here: `crate::file_tree::build_file_tree` only ever
+    /// lists real, currently-existing directory entries, so a deleted path simply never produces
+    /// a row to mark in the first place.
+    fn tree_change_marks(&self) -> HashMap<PathBuf, (&'static str, gpui::Rgba)> {
+        let Some(diff) = self.current_diff() else {
+            return HashMap::new();
+        };
+        diff.files
+            .iter()
+            .filter_map(|file| {
+                let mark = match file.status {
+                    FileChangeStatus::Added => ("A", theme::tag::TREE_ADDED),
+                    FileChangeStatus::Modified | FileChangeStatus::Renamed => {
+                        ("M", theme::tag::TREE_MODIFIED)
+                    }
+                    FileChangeStatus::Deleted => return None,
+                };
+                Some((self.file_tree_root.join(&file.path), mark))
+            })
+            .collect()
+    }
+
+    /// The real file tree - `design_handoff_jerry_ade/README.md`'s Zone 3 "Files (tree)" spec:
+    /// real rect-composed folder/language-chip icons (see [`render_folder_icon`]/
+    /// [`render_lang_chip`], never emoji or an SVG pipeline), real collapse/expand (see
+    /// [`Self::toggle_dir_collapsed`]/`crate::file_tree::visible_entries`), and - critically for
+    /// scrolling to actually work - **no `size_full()`/fixed height on this list**: its caller
+    /// (`Self::render_right_sidebar`) puts it inside a `flex_1().min_h_0().overflow_y_scroll()`
+    /// wrapper, and a scrollable container's child must be free to grow to its own natural
+    /// content height (not clamped to `height: 100%` of the scroll viewport) for there to be
+    /// anything to scroll *to*. That `size_full()` on this method's own root div was exactly
+    /// the reported "file tree scroll doesn't work" bug: it pinned the list's height to the
+    /// visible viewport regardless of how many rows it held, so content past the bottom was
+    /// silently clipped instead of scrollable (verified against `Self::render_rail_list`, which
+    /// never had this bug - it was never given a `size_full()` in the first place).
+    fn render_file_tree(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if let Some(error) = &self.file_tree_error {
+            return render_sidebar_message(
+                format!("failed to read directory: {error}"),
+                theme::status::FAIL,
+            );
+        }
+        if self.file_tree.is_empty() {
+            return render_sidebar_message("(empty directory)".to_string(), theme::text::FAINT);
+        }
+
+        let visible = file_tree::visible_entries(&self.file_tree, &self.collapsed_dirs);
+
+        // Only the first `file_tree::MAX_RENDERED_FILE_ENTRIES` *visible* rows are turned into
+        // actual elements - independent of `self.file_tree`'s own up-to-`file_tree::MAX_ENTRIES`
+        // (5000) loaded size. Laying out that many `div`s through GPUI's flexbox engine on
+        // *every* render (which happens as often as every ~33ms while a terminal pane is
+        // streaming output and calling `cx.notify()`) was a real, measured foreground-executor
+        // stall during an earlier step's own verification (see this constant's docs) - a real
+        // virtualized list (`uniform_list`, see `vendor/zed/crates/project_panel`) would be a
+        // further improvement for a tree of unbounded size, but is out of scope here.
+        let rendered_count = visible.len().min(file_tree::MAX_RENDERED_FILE_ENTRIES);
+
+        // Built once per render, not once per row - see `Self::tree_change_marks`'s docs for
+        // the real per-frame cost this avoids.
+        let marks = self.tree_change_marks();
+
+        let mut list = div().id("file-tree-list").flex().flex_col().py(px(4.0));
+        for entry in &visible[..rendered_count] {
+            list = list.child(self.render_file_tree_row(entry, &marks, cx));
+        }
+        if visible.len() > rendered_count {
+            list = list.child(render_sidebar_message(
+                format!(
+                    "... and {} more entries not shown",
+                    visible.len() - rendered_count
+                ),
+                theme::text::FAINT,
+            ));
+        }
+
+        list.into_any_element()
+    }
+
+    /// One file-tree row: real indent (13px/level, per the README), a real composed icon (a
+    /// folder's two-rect glyph or a file's language chip), the real name, and, for a directory,
+    /// a real click handler that toggles [`Self::collapsed_dirs`] (never an always-expanded
+    /// tree: this was the other half of the reported "collapse doesn't work" bug, since there
+    /// was previously no collapse *state* at all, so every directory rendered permanently open).
+    fn render_file_tree_row(
+        &self,
+        entry: &FileTreeEntry,
+        marks: &HashMap<PathBuf, (&'static str, gpui::Rgba)>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let indent = px(13.0 * entry.depth as f32);
+        let is_open = entry.is_dir && !self.collapsed_dirs.contains(&entry.path);
+        let mark = marks.get(&entry.path).copied();
+
+        let mut row = div()
+            .id(format!("file-tree-row-{}", entry.path.display()))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .h(theme::band::TREE_ROW)
+            .pl(px(8.0) + indent)
+            .pr(px(8.0))
+            .font(font(theme::font::MONO))
+            .text_size(px(11.5));
+
+        if entry.is_dir {
+            let path = entry.path.clone();
+            row = row
+                .cursor_pointer()
+                .hover(|el| el.bg(theme::surface::ROW_HOVER))
+                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    this.toggle_dir_collapsed(path.clone(), cx);
+                }));
+        }
+
+        row = row
+            .child(render_tree_caret(entry.is_dir, is_open))
+            .child(if entry.is_dir {
+                render_folder_icon(is_open).into_any_element()
+            } else {
+                render_lang_chip(file_tree::lang_chip_for_name(&entry.name)).into_any_element()
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_color(if entry.is_dir {
+                        theme::text::SECONDARY
+                    } else {
+                        theme::text::STRONG
+                    })
+                    .child(entry.name.clone()),
+            );
+
+        if let Some((label, color)) = mark {
+            row = row.child(
+                div()
+                    .flex_none()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(color)
+                    .child(label),
+            );
+        }
+
+        row.into_any_element()
+    }
+
+    /// Zone 3's header band (36 high): the real `Files | Changes` segmented control
+    /// (`design_handoff_jerry_ade/README.md`: "Header 36: segmented `Files | Changes`
+    /// (Files is first and default...)") plus the real `+n`/`−n` totals across the currently
+    /// loaded diff, summed from the same real per-file stats
+    /// (`crate::changes::diff_file_stats`) the Changes rows themselves show.
+    fn render_right_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let segment = |label: &'static str, view: RightSidebarView| {
+            let is_active = self.right_sidebar_view == view;
+            div()
+                .id(label)
+                .cursor_pointer()
+                .px(px(8.0))
+                .py(px(3.0))
+                .rounded(theme::radius::CHIP)
+                .when(is_active, |el| el.bg(theme::surface::SEGMENT_ACTIVE))
+                .font(font(theme::font::SANS))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_size(px(10.5))
+                .text_color(if is_active {
+                    theme::text::PRIMARY
+                } else {
+                    theme::text::DIMMER
+                })
+                .child(label)
+                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    this.set_right_sidebar_view(view, cx);
+                }))
+        };
+
+        let totals = self.diff_totals;
+
+        div()
+            .flex_none()
+            .h(theme::band::PANEL_HEADER)
+            .flex()
+            .items_center()
+            .justify_between()
+            .px(px(10.0))
+            .border_b_1()
+            .border_color(theme::border::INNER)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .p(px(2.0))
+                    .rounded(theme::radius::CHIP)
+                    .bg(theme::surface::SEGMENT_TRACK)
+                    .child(segment("Files", RightSidebarView::Files))
+                    .child(segment("Changes", RightSidebarView::Changes)),
+            )
+            .when_some(totals, |el, (add, del)| {
+                el.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .font(font(theme::font::MONO))
+                        .text_size(px(10.0))
+                        .child(
+                            div()
+                                .text_color(theme::diff::STAT_ADD)
+                                .child(format!("+{add}")),
+                        )
+                        .child(
+                            div()
+                                .text_color(theme::diff::STAT_DEL)
+                                .child(format!("\u{2212}{del}")),
+                        ),
+                )
+            })
+    }
+
+    /// Zone 3's whole real body: the `Files | Changes` header, then either the scrollable file
+    /// tree, or the Changes list's own header/scrollable-rows/footer trio -
+    /// `design_handoff_jerry_ade/README.md`'s Changes spec ("Header 7/12 ... Footer 29"), with
+    /// the same `flex_1().min_h_0().overflow_y_scroll()` real-scroll wrapper
+    /// [`Self::render_file_tree`]'s docs explain, so a long Changes list scrolls under its own
+    /// pinned header/footer instead of pushing them off-screen.
+    fn render_right_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let container = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(self.render_right_sidebar_toggle(cx));
+
+        match self.right_sidebar_view {
+            RightSidebarView::Files => container.child(
+                div()
+                    .id("right-sidebar-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(self.render_file_tree(cx)),
+            ),
+            RightSidebarView::Changes => match self.current_diff() {
+                Some(diff) => {
+                    let header = self.render_changes_header(diff);
+                    container
+                        .child(header)
+                        .child(
+                            div()
+                                .id("right-sidebar-body")
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .child(self.render_changes_rows(cx)),
+                        )
+                        .child(render_changes_footer())
+                }
+                None => container.child(
+                    div()
+                        .id("right-sidebar-body")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .child(self.render_diff_state_message()),
+                ),
+            },
+        }
+    }
+
+    /// The Changes header: real file count, a real review-progress bar and `N reviewed` count
+    /// (`design_handoff_jerry_ade/README.md`: "file count, a 56×3 review progress bar, and
+    /// `3 reviewed`"), both computed directly from [`Self::reviewed_files`]'s real membership
+    /// against `diff`'s real file list, never an independently tracked counter that could drift
+    /// from what's actually checked.
+    fn render_changes_header(&self, diff: &WorktreeDiff) -> impl IntoElement {
+        let total = diff.files.len();
+        let reviewed = diff
+            .files
+            .iter()
+            .filter(|file| self.reviewed_files.contains(&file.path))
+            .count();
+        let progress = changes::ReviewProgress { reviewed, total };
+        let fraction = progress.fraction();
+        const BAR_WIDTH: f32 = 56.0;
+
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(12.0))
+            .py(px(7.0))
+            .bg(theme::surface::HEADER)
+            .border_b_1()
+            .border_color(theme::border::INNER)
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::DIM)
+                    .child(format!("{total} file{}", if total == 1 { "" } else { "s" })),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex_none()
+                    .w(px(BAR_WIDTH))
+                    .h(px(3.0))
+                    .rounded(px(1.5))
+                    .bg(theme::diff::STAT_EMPTY)
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(0.0))
+                            .top(px(0.0))
+                            .h(px(3.0))
+                            .w(px(BAR_WIDTH * fraction))
+                            .rounded(px(1.5))
+                            .bg(theme::status::REVIEW),
+                    ),
+            )
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::DIM)
+                    .child(format!("{reviewed} reviewed")),
+            )
+    }
+
+    /// The Changes list's real, scrollable rows - falls back to [`Self::render_diff_state_message`]
+    /// if the diff isn't loaded (defensive: `Self::render_right_sidebar` already branches on
+    /// `current_diff()` before calling this, but this stays correct on its own regardless), or a
+    /// real "no changes" message for a genuinely clean worktree.
+    fn render_changes_rows(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(diff) = self.current_diff() else {
+            return self.render_diff_state_message();
+        };
+        if diff.files.is_empty() {
+            return render_sidebar_message("no changes".to_string(), theme::text::FAINT);
+        }
+
+        let rendered_count = diff.files.len().min(MAX_RENDERED_DIFF_FILES);
+        let mut list = div().id("changes-rows").flex().flex_col();
+        // `diff.truncated` is `wt_core::diff`'s own load-time cap firing (2MB of raw `git diff`
+        // output, or more than 300 changed files - see `WorktreeDiff::truncated`'s docs) -
+        // distinct from both a single file's own `DiffFile::truncated` (a per-file hunk-line
+        // cap, surfaced separately in `Self::render_diff_file_detail`) and this list's own
+        // `MAX_RENDERED_DIFF_FILES` *render* cap (the "... and N more changed files not shown"
+        // message below, which only fires when there's real, fully-loaded data this view simply
+        // chose not to render). Without this, a diff that hit `wt_core::diff`'s own cap looked
+        // exactly like a complete one - a real regression from the pre-Phase-D Changes view.
+        if diff.truncated {
+            list = list.child(render_sidebar_message(
+                "diff truncated: this worktree's real changes exceeded wt_core::diff's own \
+                 load limits, so some files or lines are missing from this list"
+                    .to_string(),
+                theme::status::ASK,
+            ));
+        }
+        for file in &diff.files[..rendered_count] {
+            list = list.child(self.render_change_row(file, cx));
+        }
+        if diff.files.len() > rendered_count {
+            list = list.child(render_sidebar_message(
+                format!(
+                    "... and {} more changed files not shown",
+                    diff.files.len() - rendered_count
+                ),
+                theme::text::FAINT,
+            ));
+        }
+        list.into_any_element()
+    }
+
+    /// One Changes row: a real review checkbox, `dir`/`name`, an optional tag pill, real
+    /// `+n`/`−n`, and the real five-segment stat bar - `design_handoff_jerry_ade/README.md`'s
+    /// Changes row spec. Clicking anywhere on the row (other than the checkbox itself - see
+    /// [`Self::render_review_checkbox`]'s `stop_propagation`) opens this file's real diff in the
+    /// centre via [`Self::open_change_diff`].
+    fn render_change_row(&self, file: &DiffFile, cx: &mut Context<Self>) -> impl IntoElement {
+        let path = file.path.clone();
+        let open_path = path.clone();
+        let reviewed = self.reviewed_files.contains(&file.path);
+        let selected = self.open_change.as_deref() == Some(file.path.as_path());
+        let (add, del) = changes::diff_file_stats(file);
+        let (dir, name) = changes::split_dir_name(&file.path);
+        let tag = changes::change_tag(file.status);
+        let segments = changes::stat_bar_segments(add, del);
+
+        div()
+            .id(format!("change-row-{}", file.path.display()))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .h(theme::band::CHANGE_ROW)
+            .pl(px(9.0))
+            .pr(px(10.0))
+            .border_b_1()
+            .border_color(theme::border::ROW)
+            .cursor_pointer()
+            .when(selected, |el| {
+                el.bg(theme::surface::ROW_SELECTED)
+                    .border_l_2()
+                    .border_color(theme::border::SELECTED_EDGE)
+            })
+            .when(!selected, |el| {
+                el.hover(|el| el.bg(theme::surface::ROW_HOVER))
+            })
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                this.open_change_diff(open_path.clone(), cx);
+            }))
+            .child(self.render_review_checkbox(path, reviewed, cx))
+            .when(!dir.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .font(font(theme::font::MONO))
+                        .text_size(px(10.5))
+                        .text_color(theme::text::GHOST)
+                        .child(format!("{dir}/")),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .font(font(theme::font::MONO))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(11.5))
+                    .text_color(if reviewed {
+                        theme::text::DIMMER
+                    } else {
+                        theme::text::STRONG
+                    })
+                    .child(name),
+            )
+            .when_some(tag, |el, tag| el.child(render_tag_pill(tag)))
+            // A rename-only file gets no `tag` from `changes::change_tag` (a plain rename isn't
+            // `new`/`del`), so without this it rendered as a plain filename with `+0 -0` and an
+            // empty stat bar - visually identical to a file with no changes at all. Real
+            // signal, not decoration: `changes::is_real_rename` only fires when `old_path` is
+            // both present and actually different from the current path.
+            .when(changes::is_real_rename(file), |el| {
+                el.child(render_moved_tag())
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::diff::STAT_ADD)
+                    .child(format!("+{add}")),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::diff::STAT_DEL)
+                    .child(format!("\u{2212}{del}")),
+            )
+            .child(render_stat_bar(segments))
+    }
+
+    /// The Changes row's real 12×12 review checkbox (`design_handoff_jerry_ade/README.md`:
+    /// "a 12×12 review checkbox (checked border `#2f6d4b`, bg `#24503a`, `✓` `#9fdcb6`)") - real
+    /// interactive state via [`Self::toggle_reviewed`], not decoration. Stops propagation on
+    /// click so checking a box never also opens the row's diff, mirroring
+    /// `Self::render_session_tab`'s own nested-clickable-child pattern (its tab-close `×`).
+    fn render_review_checkbox(
+        &self,
+        path: PathBuf,
+        checked: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(format!("review-checkbox-{}", path.display()))
+            .flex_none()
+            .w(px(12.0))
+            .h(px(12.0))
+            .rounded(px(2.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .border_1()
+            .when(checked, |el| {
+                el.bg(theme::button::GREEN_BG)
+                    .border_color(theme::toggle::TRACK_ON)
+            })
+            .when(!checked, |el| el.border_color(theme::border::BUTTON))
+            .font(font(theme::font::MONO))
+            .text_size(px(9.0))
+            .text_color(theme::button::GREEN_FG)
+            .when(checked, |el| el.child("\u{2713}"))
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
+                this.toggle_reviewed(path.clone(), cx);
+            }))
+    }
+
+    /// The centre pane's content: either the real active session's terminal (the pre-existing
+    /// behavior), or - while [`Self::open_change`] names a file that's actually present in the
+    /// currently loaded diff - that file's real diff surface (`Self::render_diff_surface`).
     ///
-    /// ## Root cause of "typing in the terminal pushes the file tree off-screen"
+    /// This is a deliberately scoped stand-in for the design's full Surface C ("code, Diff |
+    /// File toggle, breadcrumbs, language-server popups"): this phase's brief asks specifically
+    /// for Zone 3 (icons, scroll/collapse, resize, the Changes list, diff folding) plus wiring
+    /// the Changes list's click-through "into the centre" per the design's own state-transition
+    /// rule, not for building the rest of Surface C from scratch. What's here is real - an
+    /// actual file's real hunks, real fold markers, opened by a real click, closable by a real
+    /// button - just narrower in visual fidelity (no breadcrumbs, no File view, no LSP popups)
+    /// than the full mockup surface.
     ///
-    /// This is the classic flexbox "min-width: auto" trap, confirmed against GPUI's real
-    /// (Taffy-based) layout engine rather than assumed: a flex item's minimum width before
-    /// it's allowed to shrink below its flex-basis defaults to its *content's* intrinsic
-    /// (min-content) width, unless something overrides it. `crate::terminal_pane::render_row`
-    /// lays out each terminal row as `div().flex().flex_row()` of unwrapped text spans -
-    /// `crate::terminal_pane::maybe_resize_pty` sized the grid from the *whole window's*
-    /// viewport width (a separate bug, since fixed - see that function's own docs), so a
-    /// wide window meant wide rows, and wide unbroken text spans have a large intrinsic
-    /// width. Before this fix, this method's own root div - the flex item sitting directly
-    /// in the outer `flex_row` of [sidebar, centre, sidebar] in `Render for AdeApp` - had
-    /// neither `overflow_hidden()` nor `min_w_0()`, so *its own* automatic minimum width was
-    /// still derived from its content (bubbling all the way up from the terminal's widest
-    /// row), and it grew to fit that instead of being held to its `flex_1` share - pushing
-    /// the fixed-width right sidebar off the visible window.
-    ///
-    /// The fix is `.min_w_0()` on *this* div specifically (verified real,
-    /// `vendor/zed/crates/gpui_macros/src/styles.rs`'s generated box-style suffix, mirroring
-    /// CSS `min-width: 0`), confirmed against `vendor/zed/crates/workspace/src/status_bar.rs`'s
-    /// own real `.flex_1().min_w_0()` pattern for exactly this situation. Note this is
-    /// *not* about `overflow_hidden()` merely "clipping paint but not layout" - GPUI's own
-    /// `Overflow::Hidden` doc comment (`vendor/zed/crates/gpui/src/style.rs`) says plainly
-    /// that non-`Visible` overflow *does* zero a node's automatic minimum size for
-    /// flex/grid layout, the same effect `min_w_0()` has. The reason `overflow_hidden()`
-    /// alone didn't already fix this is narrower: that zeroing only applies to the node
-    /// it's set on. `TerminalPane::render`'s root div already had `overflow_hidden()` from
-    /// step 3 onward, so its own automatic minimum size was already zero - but that node
-    /// isn't the one sitting in the outer three-zone `flex_row`; this method's own root div
-    /// is, and *it* had `overflow: Visible` (the default) the whole time. `min_w_0()` here
-    /// is the fix; the `min_w_0()`/`overflow_hidden()` combination on the inner wrapper
-    /// below and on `TerminalPane`'s own root div are cheap, correct, defense-in-depth
-    /// (each additionally zeroes its own node's contribution), not load-bearing on their
-    /// own - this div is the one that actually mattered.
-    fn render_center_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The terminal-surface fallback path's own root div keeps its historically load-bearing
+    /// `.min_w_0()` (an earlier step's real fix for "typing in the terminal pushes the file
+    /// tree off-screen" - GPUI's flexbox layout gives a flex item's minimum width its
+    /// *content's* intrinsic width by default, so an unbroken wide terminal row could otherwise
+    /// grow this pane past its `flex_1` share and push the fixed-width right sidebar off
+    /// screen; `.min_w_0()` zeroes that automatic minimum, confirmed against
+    /// `vendor/zed/crates/workspace/src/status_bar.rs`'s own real `.flex_1().min_w_0()` use for
+    /// exactly this situation).
+    fn render_center_pane(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if let Some(open_path) = self.open_change.clone() {
+            if let Some(diff) = self.current_diff() {
+                if let Some(file) = diff
+                    .files
+                    .iter()
+                    .find(|file| file.path == open_path)
+                    .cloned()
+                {
+                    return self.render_diff_surface(&file, cx);
+                }
+            }
+        }
+
         let surface = div()
             .id("work-surface")
             .flex()
@@ -2087,315 +2835,413 @@ impl AdeApp {
                     .child("no sessions open - start one with the buttons above"),
             ),
         }
+        .into_any_element()
     }
 
-    fn render_file_tree(&self) -> gpui::AnyElement {
-        let mut list = div().flex().flex_col().p_2().size_full();
+    /// The centre's real single-file diff surface, opened by a Changes row click - a toolbar
+    /// (`dir`/`name`, an optional tag pill, real `+n`/`−n`, and a real close/back action) over
+    /// [`Self::render_diff_file_detail`]'s real, folded hunk content. See
+    /// [`Self::render_center_pane`]'s docs for how this compares in scope to the design's full
+    /// Surface C toolbar (no file stepper, no `Diff | File` segmented toggle, no `Accept file` -
+    /// none of those have real backing logic yet, so none are rendered as if they did).
+    fn render_diff_surface(&self, file: &DiffFile, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (dir, name) = changes::split_dir_name(&file.path);
+        let tag = changes::change_tag(file.status);
+        let (add, del) = changes::diff_file_stats(file);
 
-        list = list.child(
-            div()
-                .text_xs()
-                .text_color(rgb(0x8a8a8a))
-                .pb_1()
-                .child(self.file_tree_root.display().to_string()),
-        );
+        div()
+            .id("diff-surface")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .h_full()
+            .overflow_hidden()
+            .bg(theme::surface::CENTER)
+            .child(
+                div()
+                    .flex_none()
+                    .h(theme::band::DIFF_TOOLBAR)
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(12.0))
+                    .bg(theme::surface::HEADER)
+                    .border_b_1()
+                    .border_color(theme::border::INNER)
+                    .when(!dir.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .font(font(theme::font::MONO))
+                                .text_size(px(10.5))
+                                .text_color(theme::text::GHOST)
+                                .child(format!("{dir}/")),
+                        )
+                    })
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_size(px(11.5))
+                            .text_color(theme::text::HEADING)
+                            .child(name),
+                    )
+                    .when_some(tag, |el, tag| el.child(render_tag_pill(tag)))
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.5))
+                            .text_color(theme::diff::STAT_ADD)
+                            .child(format!("+{add}")),
+                    )
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.5))
+                            .text_color(theme::diff::STAT_DEL)
+                            .child(format!("\u{2212}{del}")),
+                    )
+                    // The toolbar's own real "renamed from" detail - the row's compact
+                    // `render_moved_tag` has no room for the actual pre-rename path, but this
+                    // toolbar does. `changes::rename_label` is `None` unless `old_path` is both
+                    // present and really different from the current path.
+                    .when_some(changes::rename_label(file), |el, label| {
+                        el.child(
+                            div()
+                                .font(font(theme::font::MONO))
+                                .text_size(px(10.0))
+                                .text_color(theme::text::GHOST)
+                                .child(label),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("close-diff-surface")
+                            .cursor_pointer()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(11.0))
+                            .text_color(theme::text::GHOST)
+                            .hover(|el| el.text_color(theme::text::PRIMARY))
+                            .child("\u{d7} close")
+                            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                this.close_change_diff(cx);
+                            })),
+                    ),
+            )
+            .child(self.render_diff_file_detail(file))
+            .into_any_element()
+    }
 
-        if let Some(error) = &self.file_tree_error {
-            return list
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0xff6b6b))
-                        .child(format!("failed to read directory: {error}")),
-                )
+    /// One changed file's real diff content: a "binary file" note, or its real hunks as
+    /// unified-diff-style themed lines, with a real `⋯ N unchanged lines` fold marker
+    /// (`design_handoff_jerry_ade/README.md`'s Diff view fold spec) for the real gap between
+    /// consecutive hunks (`crate::changes::fold_gap_between`, parsed from the hunks' own real
+    /// `@@ ... @@` headers - never a fabricated line count). `wt_core::diff` has no lazy
+    /// per-file hunk-loading state to build a "press ⏎ to load this hunk" treatment for (every
+    /// non-binary changed file's hunks are already eagerly loaded - see that module's docs), so
+    /// that part of the design's fold spec doesn't apply to this app's real data model; capped
+    /// by [`MAX_RENDERED_DIFF_LINES_PER_FILE`] independent of `wt_core::diff`'s own load-time
+    /// cap.
+    fn render_diff_file_detail(&self, file: &DiffFile) -> gpui::AnyElement {
+        let mut container = div()
+            .id(format!("diff-detail-{}", file.path.display()))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .bg(theme::surface::PTY)
+            .py(px(4.0));
+
+        if file.is_binary {
+            return container
+                .child(render_sidebar_message(
+                    "binary file (contents not diffed)".to_string(),
+                    theme::text::FAINT,
+                ))
                 .into_any_element();
         }
 
-        if self.file_tree.is_empty() {
-            list = list.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x8a8a8a))
-                    .child("(empty directory)"),
-            );
-        }
-
-        // Only the first `MAX_RENDERED_FILE_ENTRIES` rows are turned into actual elements.
-        // `self.file_tree` itself can hold up to `file_tree::MAX_ENTRIES` (5000) real
-        // entries - fine as loaded data, but laying out that many `div`s through GPUI's
-        // flexbox engine on *every* render (which happens as often as every ~33ms while
-        // the terminal pane is streaming output and calling `cx.notify()`) turned out to
-        // be a real, measured performance bug during this step's own verification: with a
-        // target repo whose tree includes a large nested checkout (`vendor/zed`, ~5000
-        // entries on its own), unbounded rendering here starved the foreground executor
-        // badly enough that unrelated timers (e.g. the worktree/file-tree load callbacks)
-        // were observed firing 10+ seconds late instead of near-instantly. Capping the
-        // *rendered* rows (independent of the *loaded* cap) fixes that; a real
-        // virtualized list (`uniform_list`, see `vendor/zed/crates/project_panel`) would
-        // be the following step for a tree of unbounded size, but is out of scope here.
-        let rendered_count = self.file_tree.len().min(MAX_RENDERED_FILE_ENTRIES);
-        for entry in &self.file_tree[..rendered_count] {
-            let indent = gpui::px(12.0 * entry.depth as f32);
-            let icon = if entry.is_dir {
-                "\u{1F4C1}"
-            } else {
-                "\u{1F4C4}"
-            };
-            list = list.child(
-                div()
-                    .id(format!("file-{}", entry.path.display()))
-                    .flex()
-                    .pl(indent)
-                    .text_xs()
-                    .text_color(rgb(0xcccccc))
-                    .child(format!("{icon} {}", entry.name)),
-            );
-        }
-
-        if self.file_tree.len() > rendered_count {
-            list = list.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x8a8a8a))
-                    .pt_1()
-                    .child(format!(
-                        "... and {} more entries not shown",
-                        self.file_tree.len() - rendered_count
-                    )),
-            );
-        }
-
-        list.into_any_element()
-    }
-
-    /// The small "Files" / "Diff" toggle at the top of the right sidebar, switching what
-    /// [`Self::render_right_sidebar_body`] shows for the currently selected worktree.
-    fn render_right_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let toggle_button = |label: &'static str, view: RightSidebarView| {
-            let is_active = self.right_sidebar_view == view;
-            div()
-                .id(label)
-                .cursor_pointer()
-                .flex_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .text_center()
-                .rounded_sm()
-                .when(is_active, |el| el.bg(rgb(0x2f5f8f)))
-                .when(!is_active, |el| el.hover(|el| el.bg(rgb(0x2a2a2a))))
-                .text_color(rgb(0xe0e0e0))
-                .child(label)
-                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                    this.set_right_sidebar_view(view, cx);
-                }))
-        };
-
-        div()
-            .flex()
-            .flex_row()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .border_b_1()
-            .border_color(rgb(0x2a2a2a))
-            .child(toggle_button("Files", RightSidebarView::Files))
-            .child(toggle_button("Diff", RightSidebarView::Diff))
-    }
-
-    /// The right sidebar's content: the real file tree, or the real diff against the
-    /// selected worktree's base branch, per [`Self::right_sidebar_view`].
-    fn render_right_sidebar_body(&self) -> gpui::AnyElement {
-        match self.right_sidebar_view {
-            RightSidebarView::Files => self.render_file_tree(),
-            RightSidebarView::Diff => self.render_diff(),
-        }
-    }
-
-    /// Renders [`Self::diff_state`] for [`Self::diff_root`]: a loading/error state, one of
-    /// `wt_core::diff::DiffBase`'s explanatory non-diff outcomes (on the default branch, or
-    /// no base could be found), or the real diff itself.
-    fn render_diff(&self) -> gpui::AnyElement {
-        let mut list = div().flex().flex_col().p_2().size_full();
-
-        list = list.child(
-            div()
-                .text_xs()
-                .text_color(rgb(0x8a8a8a))
-                .pb_1()
-                .child(self.diff_root.display().to_string()),
-        );
-
-        match &self.diff_state {
-            DiffLoadState::Loading => list
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x8a8a8a))
-                        .child("computing diff..."),
-                )
-                .into_any_element(),
-            DiffLoadState::Error(err) => list
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0xff6b6b))
-                        .child(format!("failed to compute diff: {err}")),
-                )
-                .into_any_element(),
-            DiffLoadState::Loaded(DiffBase::NoBaseFound) => list
-                .child(div().text_xs().text_color(rgb(0x8a8a8a)).child(
-                    "no base branch could be detected for this worktree (no origin/HEAD, \
-                     no local main/master, and no fallback branch found)",
+        // A rename-only file (renamed with no content change) produces zero real `@@` hunks -
+        // `git diff` has nothing to diff line-by-line - so falling through the loop below would
+        // otherwise leave `container` with no children at all: a blank centre pane on click that
+        // looks like a rendering bug rather than the real "nothing to show" state it actually
+        // is. `changes::empty_hunks_message` picks the honest wording (naming the rename
+        // specifically when that's the real cause, per `DiffFile::status`).
+        if file.hunks.is_empty() {
+            return container
+                .child(render_sidebar_message(
+                    changes::empty_hunks_message(file.status).to_string(),
+                    theme::text::FAINT,
                 ))
-                .into_any_element(),
-            DiffLoadState::Loaded(DiffBase::OnDefaultBranch { branch }) => list
-                .child(div().text_xs().text_color(rgb(0x8a8a8a)).child(format!(
-                    "this worktree is on the default branch ({branch}); nothing to \
-                             diff against"
-                )))
-                .into_any_element(),
-            DiffLoadState::Loaded(DiffBase::Diff(diff)) => {
-                list = list.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x8a8a8a))
-                        .pb_1()
-                        .child(format!(
-                            "diff against {} ({})",
-                            diff.base_branch,
-                            &diff.base_commit[..diff.base_commit.len().min(10)]
-                        )),
-                );
-
-                if diff.truncated {
-                    list = list.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xd4a017))
-                            .pb_1()
-                            .child("diff output was too large; some files/lines are omitted"),
-                    );
-                }
-
-                if diff.files.is_empty() {
-                    return list
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x8a8a8a))
-                                .child("no changes"),
-                        )
-                        .into_any_element();
-                }
-
-                let rendered_count = diff.files.len().min(MAX_RENDERED_DIFF_FILES);
-                for file in &diff.files[..rendered_count] {
-                    list = list.child(self.render_diff_file(file));
-                }
-                if diff.files.len() > rendered_count {
-                    list = list.child(div().text_xs().text_color(rgb(0x8a8a8a)).pt_1().child(
-                        format!(
-                            "... and {} more changed files not shown",
-                            diff.files.len() - rendered_count
-                        ),
-                    ));
-                }
-
-                list.into_any_element()
-            }
-        }
-    }
-
-    /// Renders one changed file: its status/path header, then either a "binary file" note or
-    /// its hunks as unified-diff-style, color-coded lines (added/removed/context) - capped by
-    /// [`MAX_RENDERED_DIFF_LINES_PER_FILE`] independent of `wt_core::diff`'s own load-time cap
-    /// (see that constant's docs).
-    fn render_diff_file(&self, file: &DiffFile) -> impl IntoElement {
-        let (status_label, status_color) = match file.status {
-            FileChangeStatus::Added => ("A", rgb(0x7ee787)),
-            FileChangeStatus::Deleted => ("D", rgb(0xffa198)),
-            FileChangeStatus::Modified => ("M", rgb(0xd4a017)),
-            FileChangeStatus::Renamed => ("R", rgb(0x6ab0f3)),
-        };
-
-        let path_text = match &file.old_path {
-            Some(old) => format!("{} -> {}", old.display(), file.path.display()),
-            None => file.path.display().to_string(),
-        };
-
-        let mut container = div()
-            .id(format!("diff-file-{}", file.path.display()))
-            .flex()
-            .flex_col()
-            .pb_2()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_1()
-                    .items_center()
-                    .child(div().text_xs().text_color(status_color).child(status_label))
-                    .child(div().text_xs().text_color(rgb(0xe0e0e0)).child(path_text)),
-            );
-
-        if file.is_binary {
-            return container.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x8a8a8a))
-                    .pl_2()
-                    .child("binary file (contents not diffed)"),
-            );
+                .into_any_element();
         }
 
         let mut rendered_lines = 0usize;
         let mut hunks_truncated = false;
+        let mut previous_header: Option<&str> = None;
         'hunks: for hunk in &file.hunks {
+            if let Some(previous) = previous_header {
+                if let Some(gap) = changes::fold_gap_between(previous, &hunk.header) {
+                    container = container.child(render_fold_marker(gap));
+                }
+            }
+            previous_header = Some(hunk.header.as_str());
+
             container = container.child(
                 div()
-                    .text_xs()
                     .font(font(theme::font::MONO))
-                    .text_color(rgb(0x6ab0f3))
-                    .pl_2()
+                    .text_size(px(11.0))
+                    .px(px(8.0))
+                    .bg(theme::diff::HUNK_BG)
+                    .text_color(theme::diff::HUNK_FG)
                     .child(hunk.header.clone()),
             );
+
             for line in &hunk.lines {
                 if rendered_lines >= MAX_RENDERED_DIFF_LINES_PER_FILE {
                     hunks_truncated = true;
                     break 'hunks;
                 }
                 rendered_lines += 1;
-
-                let (prefix, fg, bg) = match line.kind {
-                    DiffLineKind::Added => ("+", rgb(0x7ee787), Some(rgb(0x0f2a1a))),
-                    DiffLineKind::Removed => ("-", rgb(0xffa198), Some(rgb(0x2d1214))),
-                    DiffLineKind::Context => (" ", rgb(0xb0b0b0), None),
-                };
-                let mut line_el = div()
-                    .text_xs()
-                    .font(font(theme::font::MONO))
-                    .pl_2()
-                    .text_color(fg);
-                if let Some(bg) = bg {
-                    line_el = line_el.bg(bg);
-                }
-                container = container.child(line_el.child(format!("{prefix}{}", line.content)));
+                container = container.child(render_diff_line(line));
             }
         }
 
         if file.truncated || hunks_truncated {
-            container = container.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x8a8a8a))
-                    .pl_2()
-                    .child("... diff truncated for this file"),
-            );
+            container = container.child(render_sidebar_message(
+                "... diff truncated for this file".to_string(),
+                theme::text::FAINT,
+            ));
         }
 
-        container
+        container.into_any_element()
     }
+}
+
+/// A themed, single-line message used for every Zone 3 empty/loading/error state (the file
+/// tree's and the Changes list's alike) - one real, consistent look instead of each call site
+/// improvising its own.
+fn render_sidebar_message(text: String, color: gpui::Rgba) -> gpui::AnyElement {
+    div()
+        .p(px(10.0))
+        .font(font(theme::font::MONO))
+        .text_size(px(10.5))
+        .text_color(color)
+        .child(text)
+        .into_any_element()
+}
+
+/// The Changes list's real footer 29 (`design_handoff_jerry_ade/README.md`: "Footer 29: `click
+/// a file to open its diff in the centre · ] next file`"). The `] next file` portion of that
+/// spec text is deliberately dropped here: `]` isn't actually bound to anything (only `cmd-n`
+/// is a real, wired-up keybinding - see `crate::lib`'s `cx.bind_keys` call), and advertising a
+/// shortcut that silently does nothing if pressed is worse than a shorter, accurate footer.
+fn render_changes_footer() -> impl IntoElement {
+    div()
+        .flex_none()
+        .h(theme::band::SURFACE_FOOTER)
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .border_t_1()
+        .border_color(theme::border::INNER)
+        .bg(theme::surface::FOOTER)
+        .font(font(theme::font::MONO))
+        .text_size(px(10.0))
+        .text_color(theme::text::HINT)
+        .child("click a file to open its diff in the centre")
+}
+
+/// The file tree row's real `▾`/`▸` caret (`design_handoff_jerry_ade/Jerry.dc.html`'s tree row
+/// template: an 8px-wide `n.caret` span, `#4a5057`, before the folder/file icon) - the signal
+/// that a directory row is clickable/expandable, distinct from the folder icon itself. Blank
+/// (but still 8px wide, to keep every row's icon column aligned) for a file row, which the
+/// mockup's own data never gives a caret at all.
+fn render_tree_caret(is_dir: bool, open: bool) -> impl IntoElement {
+    let label = if !is_dir {
+        ""
+    } else if open {
+        "\u{25be}"
+    } else {
+        "\u{25b8}"
+    };
+    div()
+        .flex_none()
+        .w(px(8.0))
+        .font(font(theme::font::MONO))
+        .text_size(px(9.0))
+        .text_color(theme::text::TREE_CARET)
+        .child(label)
+}
+
+/// The file tree's real folder icon - `design_handoff_jerry_ade/README.md`: "Folder icon is two
+/// rects — a 5×3 tab at (0,1) and a 12×8 radius-2 body at (0,3) — outlined `#4e545a` when
+/// collapsed, filled `#23272b` with a `#6b7178` border when open." Composed entirely from
+/// nested `div()`s with real borders/backgrounds/rounded corners (per the design's own "Assets"
+/// section: "Every icon is composed from rects and text glyphs ... precisely so that nothing
+/// needs an SVG pipeline") - never an emoji glyph standing in for it, which is exactly what the
+/// reported "tofu box" bug was: `\u{1F4C1}` folder/`\u{1F4C4}` file emoji with no matching glyph
+/// installed on the machine that reported the bug.
+///
+/// The two rects are *not* styled identically, verified against `design_handoff_jerry_ade/
+/// Jerry.dc.html`'s own real tree-row template (`n.folderBd`/`n.folderBg`, not this crate's own
+/// paraphrase above): the 12×8 body alternates between a filled `bg` (open) and a transparent
+/// one (collapsed), both with a real `border`, exactly as the doc comment above says - but the
+/// 5×3 tab is always solid-filled with the state's `border` colour and has no separate border of
+/// its own (`background:{{ n.folderBd }}` with nothing else). Rendering the tab with the same
+/// hollow-when-collapsed treatment as the body (an earlier version of this function did) was a
+/// real design-fidelity gap: the mockup's collapsed-folder tab is solid, not outlined.
+fn render_folder_icon(open: bool) -> impl IntoElement {
+    let (fill, border) = if open {
+        (theme::surface::CHIP_NEUTRAL, theme::text::FAINT)
+    } else {
+        (work_surface::TRANSPARENT, theme::text::GHOST)
+    };
+
+    div()
+        .relative()
+        .flex_none()
+        .w(px(12.0))
+        .h(px(11.0))
+        .child(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(1.0))
+                .w(px(5.0))
+                .h(px(3.0))
+                .bg(border),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(3.0))
+                .w(px(12.0))
+                .h(px(8.0))
+                .rounded(px(2.0))
+                .bg(fill)
+                .border_1()
+                .border_color(border),
+        )
+}
+
+/// The file tree's real 13×13 radius-2.5 language chip (`design_handoff_jerry_ade/README.md`'s
+/// Zone 3 chip table) - a real rect with a real text-glyph label, per
+/// `crate::file_tree::lang_chip_for_name`'s pure selection logic (never an emoji, never a
+/// second, independent extension-matching guess at the tab-strip's own `rs`/`to`/`md`/`sq`
+/// chips).
+fn render_lang_chip(chip: LangChip) -> impl IntoElement {
+    div()
+        .flex_none()
+        .w(px(13.0))
+        .h(px(13.0))
+        .rounded(px(2.5))
+        .bg(chip.bg)
+        .flex()
+        .items_center()
+        .justify_center()
+        .font(font(theme::font::MONO))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_size(px(7.5))
+        .text_color(chip.fg)
+        .child(chip.label)
+}
+
+/// The Changes row / diff toolbar's optional `new`/`del` tag pill.
+fn render_tag_pill(tag: ChangeTag) -> impl IntoElement {
+    let style = changes::tag_style(tag);
+    div()
+        .flex_none()
+        .px(px(5.0))
+        .py(px(1.0))
+        .rounded(theme::radius::CHIP)
+        .bg(style.bg)
+        .font(font(theme::font::MONO))
+        .text_size(px(9.5))
+        .text_color(style.fg)
+        .child(style.label)
+}
+
+/// The Changes row's `moved` tag for a real rename with a different pre-rename path
+/// (`changes::is_real_rename`) - a plain rename has no `ChangeTag` of its own
+/// (`changes::change_tag` deliberately returns `None` for `Modified`/`Renamed` alike, since
+/// most renames also carry a content change and already show real `+n`/`−n`), so a rename-only
+/// file needs its own distinct visual signal instead of looking identical to "no changes at
+/// all". Deliberately its own muted style, not [`ChangeTag`]'s bg/fg pair (that enum only
+/// covers `new`/`del`, and reusing an unrelated colour for a third, semantically different
+/// meaning was judged worse than a plain, honestly-neutral tag here).
+fn render_moved_tag() -> impl IntoElement {
+    div()
+        .flex_none()
+        .px(px(5.0))
+        .py(px(1.0))
+        .rounded(theme::radius::CHIP)
+        .bg(theme::surface::CHIP_NEUTRAL)
+        .font(font(theme::font::MONO))
+        .text_size(px(9.5))
+        .text_color(theme::text::GHOST)
+        .child("moved")
+}
+
+/// The Changes row's real five-segment 3×8 stat bar (`design_handoff_jerry_ade/README.md`:
+/// "a five-segment 3×8 stat bar (`#4e8c68` / `#a35f5b` / `#22262a`)"), per
+/// `crate::changes::stat_bar_segments`'s real, unit-tested proportional allocation.
+fn render_stat_bar(segments: [changes::StatSegment; 5]) -> impl IntoElement {
+    div()
+        .flex_none()
+        .flex()
+        .gap(px(1.0))
+        .children(segments.into_iter().map(|segment| {
+            div()
+                .w(px(3.0))
+                .h(px(8.0))
+                .bg(changes::stat_segment_color(segment))
+        }))
+}
+
+/// The diff view's real `⋯ N unchanged lines` fold marker
+/// (`design_handoff_jerry_ade/README.md`'s Diff view fold spec) - `N` is always a real count
+/// derived from the hunks' own `@@ ... @@` headers (`crate::changes::fold_gap_between`), never
+/// an estimate.
+fn render_fold_marker(gap: usize) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .px(px(8.0))
+        .h(px(20.0))
+        .bg(theme::diff::FOLD_BG)
+        .font(font(theme::font::MONO))
+        .text_size(px(11.0))
+        .text_color(theme::diff::FOLD_FG)
+        .child(format!(
+            "\u{22ef} {gap} unchanged line{}",
+            if gap == 1 { "" } else { "s" }
+        ))
+}
+
+/// One real diff line - added/removed/context, coloured per `design_handoff_jerry_ade/
+/// README.md`'s Diff view line-kind table.
+fn render_diff_line(line: &wt_core::diff::DiffLine) -> impl IntoElement {
+    let (prefix, fg, bg) = match line.kind {
+        DiffLineKind::Added => ("+", theme::diff::ADD_FG, Some(theme::diff::ADD_BG)),
+        DiffLineKind::Removed => ("\u{2212}", theme::diff::DEL_FG, Some(theme::diff::DEL_BG)),
+        DiffLineKind::Context => (" ", theme::diff::CTX_FG, None),
+    };
+    let mut element = div()
+        .flex()
+        .font(font(theme::font::MONO))
+        .text_size(px(11.5))
+        .px(px(8.0))
+        .text_color(fg);
+    if let Some(bg) = bg {
+        element = element.bg(bg);
+    }
+    element.child(format!("{prefix} {}", line.content))
 }
 
 /// One keyboard-shortcut keycap, per `design_handoff_jerry_ade/README.md`'s "Keyboard
@@ -2785,40 +3631,182 @@ impl Render for AdeApp {
                     .flex_row()
                     .flex_1()
                     .min_h_0()
+                    // Real drag-to-resize: `on_drag_move` fires for every mouse-move event
+                    // while a `PaneResizeDrag` is active *anywhere in the window*, not just
+                    // while the cursor stays over the thin resize handle that started the drag
+                    // (see `Interactivity::on_drag_move`'s own doc comment, and
+                    // `PaneResizeDrag`'s docs for the real, verified
+                    // `vendor/zed/crates/workspace` precedent this follows) - registering it
+                    // here, on the body that contains both handles, is what makes a fast drag
+                    // still track correctly even after the cursor leaves the handle's own
+                    // 6px-wide hitbox. No matching `on_mouse_up` is needed to end the drag:
+                    // GPUI's own window dispatch clears `active_drag` (and stops delivering
+                    // further `on_drag_move` ticks) on *any* `MouseUpEvent`, anywhere in the
+                    // window, independent of which element's handlers actually fired -
+                    // verified at `vendor/zed/crates/gpui/src/window.rs`'s
+                    // `dispatch_mouse_event` ("If this was a mouse up event, cancel the active
+                    // drag"). Combined with [`Self::apply_pane_resize`] deriving the width
+                    // fresh from the cursor position and [`Self::body_bounds`] on every tick
+                    // rather than an armed baseline, there is no drag state left here to leak
+                    // if the mouse is released outside the window.
+                    .on_drag_move(cx.listener(
+                        |this, event: &DragMoveEvent<PaneResizeDrag>, _window, cx| {
+                            let PaneResizeDrag(target) = *event.drag(cx);
+                            this.apply_pane_resize(target, event.event.position.x, cx);
+                        },
+                    ))
+                    // Captures the body's real paint bounds into `Self::body_bounds` on every
+                    // render, the same real `gpui::canvas` pattern
+                    // `vendor/zed/crates/workspace/src/workspace.rs` uses to capture its own
+                    // `Workspace::bounds` for the equivalent dock-resize computation - see
+                    // `Self::body_bounds`'s docs.
+                    .child({
+                        let this = cx.entity();
+                        gpui::canvas(
+                            move |bounds, _window, cx| {
+                                this.update(cx, |this, _cx| {
+                                    this.body_bounds = bounds;
+                                });
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full()
+                    })
                     .child(
                         div()
                             .id("worktree-sidebar")
+                            .relative()
                             .flex_none()
-                            .w(theme::zone::RAIL_WIDTH)
+                            .w(self.rail_width)
                             .h_full()
                             .bg(theme::surface::RAIL)
                             .border_r_1()
                             .border_color(theme::border::ZONE)
-                            .child(self.render_rail(cx)),
+                            .child(self.render_rail(cx))
+                            .child(self.render_resize_handle(ResizeTarget::Rail, cx)),
                     )
                     .child(self.render_center_pane(cx))
                     .child(
                         div()
                             .id("file-tree-sidebar")
+                            .relative()
                             .flex()
                             .flex_col()
                             .flex_none()
-                            .w(theme::zone::PANEL_WIDTH)
+                            .w(self.panel_width)
                             .h_full()
                             .bg(theme::surface::RAIL)
                             .border_l_1()
                             .border_color(theme::border::ZONE)
-                            .child(self.render_right_sidebar_toggle(cx))
-                            .child(
-                                div()
-                                    .id("right-sidebar-body")
-                                    .flex_1()
-                                    .min_h_0()
-                                    .overflow_y_scroll()
-                                    .child(self.render_right_sidebar_body()),
-                            ),
+                            .child(self.render_right_sidebar(cx))
+                            .child(self.render_resize_handle(ResizeTarget::Panel, cx)),
                     ),
             )
             .child(self.render_status_bar())
+    }
+}
+
+/// One real drag-to-resize splitter (`design_handoff_jerry_ade/README.md`'s Layout table: rail
+/// "276 (range 240–340)", panel "320 (260 in empty states)"), a thin (6px) invisible strip
+/// straddling the pane's edge - verified against `vendor/zed/crates/workspace/src/dock.rs`'s
+/// own real resize-handle shape (`RESIZE_HANDLE_SIZE = 6px`, absolutely positioned over the
+/// edge via `.right(-RESIZE_HANDLE_SIZE / 2.)`/`.left(-RESIZE_HANDLE_SIZE / 2.)`, `.occlude()`
+/// so it - not whatever's underneath - receives the mouse, and a real `col-resize` cursor via
+/// `.cursor_col_resize()`).
+impl AdeApp {
+    fn render_resize_handle(
+        &self,
+        target: ResizeTarget,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        const HANDLE_WIDTH: f32 = 6.0;
+        let id = match target {
+            ResizeTarget::Rail => "rail-resize-handle",
+            ResizeTarget::Panel => "panel-resize-handle",
+        };
+
+        let mut handle = div()
+            .id(id)
+            .absolute()
+            .top(px(0.0))
+            .h_full()
+            .w(px(HANDLE_WIDTH))
+            .cursor_col_resize()
+            .occlude()
+            .on_drag(PaneResizeDrag(target), move |drag, _offset, _window, cx| {
+                cx.new(|_| *drag)
+            })
+            // Only stops the mouse-down from propagating (e.g. into whatever's under the
+            // handle) - verified against `vendor/zed/crates/workspace/src/dock.rs`'s own
+            // resize handle, whose mouse-down handler does likewise and carries no drag-start
+            // state of its own; the drag's baseline is [`Self::body_bounds`] plus the current
+            // cursor position on each `on_drag_move` tick, not anything captured here.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _event: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                }),
+            );
+
+        handle = match target {
+            ResizeTarget::Rail => handle.right(px(-HANDLE_WIDTH / 2.0)),
+            ResizeTarget::Panel => handle.left(px(-HANDLE_WIDTH / 2.0)),
+        };
+        handle
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the cross-worktree state-bleed bug: `reviewed_files`/`open_change`
+    /// are keyed only by repo-relative path, so without `reset_per_worktree_ui_state`'s call in
+    /// `AdeApp::select_worktree`, a file reviewed (or opened) in one worktree would silently
+    /// read as already-reviewed - or reopen a same-named file - in a different worktree that
+    /// happens to share the same relative path.
+    #[test]
+    fn reset_per_worktree_ui_state_clears_reviewed_files_and_open_change() {
+        let mut reviewed_files = HashSet::new();
+        reviewed_files.insert(PathBuf::from("src/main.rs"));
+        reviewed_files.insert(PathBuf::from("Cargo.toml"));
+        let mut open_change = Some(PathBuf::from("src/main.rs"));
+        let mut collapsed_dirs = HashSet::new();
+
+        reset_per_worktree_ui_state(&mut reviewed_files, &mut open_change, &mut collapsed_dirs);
+
+        assert!(reviewed_files.is_empty());
+        assert_eq!(open_change, None);
+    }
+
+    #[test]
+    fn reset_per_worktree_ui_state_is_a_no_op_when_already_empty() {
+        let mut reviewed_files = HashSet::new();
+        let mut open_change = None;
+        let mut collapsed_dirs = HashSet::new();
+
+        reset_per_worktree_ui_state(&mut reviewed_files, &mut open_change, &mut collapsed_dirs);
+
+        assert!(reviewed_files.is_empty());
+        assert_eq!(open_change, None);
+        assert!(collapsed_dirs.is_empty());
+    }
+
+    /// Regression test for the "never pruned" half of the same bug (item f): `collapsed_dirs`
+    /// is keyed by absolute path, so it doesn't visually bleed between worktrees the way
+    /// `reviewed_files` does, but nothing removed a past worktree's entries either, so it grew
+    /// unboundedly across however many worktrees got browsed in a session.
+    #[test]
+    fn reset_per_worktree_ui_state_clears_collapsed_dirs_too() {
+        let mut reviewed_files = HashSet::new();
+        let mut open_change = None;
+        let mut collapsed_dirs = HashSet::new();
+        collapsed_dirs.insert(PathBuf::from("/repo/worktree-a/src"));
+        collapsed_dirs.insert(PathBuf::from("/repo/worktree-a/tests"));
+
+        reset_per_worktree_ui_state(&mut reviewed_files, &mut open_change, &mut collapsed_dirs);
+
+        assert!(collapsed_dirs.is_empty());
     }
 }
