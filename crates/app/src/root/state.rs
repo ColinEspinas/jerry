@@ -3,7 +3,35 @@ use crate::root::code_surface::{DiffLoadState, FileLoadState};
 use crate::root::sidebar_render::RightSidebarView;
 
 impl AdeApp {
+    /// Real, production entry point - loads `~/.config/jerry/settings.toml` for real
+    /// (`Settings::load_or_init`, see that method's own docs for why this is one of the rare
+    /// deliberate exceptions to this codebase's "never block the foreground thread" rule: it's
+    /// a single, tiny file read that must complete before the very first frame renders anyway -
+    /// unlike every other blocking-I/O call this project's audits have repeatedly caught, this
+    /// one is not a per-render or per-poll cost, it runs exactly once, before a window even
+    /// exists) and delegates to [`Self::new_with_settings`].
     pub fn new(repo_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let settings_path = settings_store::settings_toml_path();
+        let settings = settings_store::Settings::load_or_init();
+        Self::new_with_settings(repo_path, settings, settings_path, window, cx)
+    }
+
+    /// The real constructor - takes an already-resolved [`Settings`] value and its real
+    /// (optional) source path rather than resolving them itself, so [`Self::new`] (the real
+    /// `~/.config/jerry/settings.toml`-backed production path) and
+    /// `root::focus::palette_focus_tests::open_test_app` (every GPUI regression test in this
+    /// crate's shared entry point) can each supply their own - test app instances get real,
+    /// in-memory-only defaults and a `None` path, so [`Self::persist_settings`] is a genuine,
+    /// honest no-op for them (the same real code path a genuinely `$HOME`-less production
+    /// environment already exercises - see [`settings_store::settings_toml_path`]'s own docs),
+    /// never a write to whatever real machine happens to run `cargo test`.
+    pub(super) fn new_with_settings(
+        repo_path: PathBuf,
+        settings: settings_store::Settings,
+        settings_path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut this = Self {
             file_tree_root: repo_path.clone(),
             diff_root: repo_path.clone(),
@@ -81,7 +109,14 @@ impl AdeApp {
             _hover_request_task: None,
             _goto_definition_tasks: Vec::new(),
             pending_cursor_line: None,
-            window_controls_style: WindowControlsStyle::default(),
+            settings,
+            settings_path,
+            _settings_save_task: None,
+            settings_cfg_format: settings_store::CfgFormat::default(),
+            lsp_rows: Vec::new(),
+            _lsp_rows_task: None,
+            settings_keymap_filter: String::new(),
+            settings_keymap_filter_focus_handle: cx.focus_handle(),
         };
         // A fresh window shouldn't open with zero tabs and no way to see anything running -
         // start with one real shell in the repo root, exactly like step 3's single terminal

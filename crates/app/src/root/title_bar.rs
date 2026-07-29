@@ -216,7 +216,7 @@ impl AdeApp {
             .iter()
             .find(|item| item.is_main)
             .and_then(|item| item.branch.clone());
-        let macos = self.window_controls_style.is_macos();
+        let macos = self.window_controls_style().is_macos();
 
         div()
             .id("title-bar")
@@ -435,8 +435,7 @@ mod caption_button_tests {
         // test happens to run on, so the test is deterministic everywhere (see `crate::keymap`'s
         // module docs for why one shared `WindowControlsStyle` field drives this).
         app.update(cx, |app, cx| {
-            app.window_controls_style = WindowControlsStyle::WindowsLinuxStyle;
-            cx.notify();
+            app.set_window_controls_style(WindowControlsStyle::WindowsLinuxStyle, cx);
         });
         cx.run_until_parked();
 

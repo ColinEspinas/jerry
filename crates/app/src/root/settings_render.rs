@@ -63,6 +63,23 @@ impl AdeApp {
         self._agent_rows_task = Some(task);
     }
 
+    /// Recomputes [`Self::lsp_rows`] - the Language servers page's real `$PATH` search, exactly
+    /// mirroring [`Self::load_agent_rows`]'s own shape and reasoning (`crate::settings::
+    /// detect_lsp_rows`, offloaded to the background executor, run once when Settings opens).
+    pub(super) fn load_lsp_rows(&mut self, cx: &mut Context<Self>) {
+        let task = cx.spawn(async move |this, cx| {
+            let rows = cx
+                .background_executor()
+                .spawn(async move { settings::detect_lsp_rows(pty_core::resolve_on_path) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.lsp_rows = rows;
+                cx.notify();
+            });
+        });
+        self._lsp_rows_task = Some(task);
+    }
+
     /// The Settings surface (`design_handoff_jerry_ade/README.md`'s "Settings" section): a
     /// 212px nav plus a content column. `track_focus`/`on_key_down` here are what make real
     /// `Esc` actually reach [`Self::handle_settings_key_down`] - the same real pattern
@@ -80,10 +97,11 @@ impl AdeApp {
             .child(self.render_settings_content(cx))
     }
 
-    /// The 212px nav column - `design_handoff_jerry_ade/README.md`: "Nav 212 wide ... Groups
-    /// (Workspace, Editor, Other) with the same 9.5px uppercase header as the rail." Every one
-    /// of the ten real pages is real, clickable navigation (`crate::settings::nav_groups`);
-    /// only two render real content past this point - see `crate::settings`'s module docs.
+    /// The 212px nav column - `design_handoff_jerry_ade/revision/README.md`: "Nav 212 wide ...
+    /// Groups (Workspace, Interface, Editor, Other) with the same 9.5px uppercase header as the
+    /// rail." Every one of the eleven real pages is real, clickable navigation
+    /// (`crate::settings::nav_groups`); seven render real content past this point - see
+    /// `crate::settings`'s module docs.
     pub(super) fn render_settings_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let groups = settings::nav_groups();
         // Real counts, not the mockup's fabricated `4`/`11`/`3` badges - `crate::settings::
@@ -132,7 +150,7 @@ impl AdeApp {
                             .child(render_keycap_row(
                                 &keymap::resolve_combo(
                                     "esc",
-                                    self.window_controls_style.is_macos(),
+                                    self.window_controls_style().is_macos(),
                                 ),
                                 KeycapSize::Standard,
                             )),
@@ -167,13 +185,13 @@ impl AdeApp {
                             .text_color(theme::text::HINT)
                             // Real crate name/version (`env!` reads this crate's own real
                             // `Cargo.toml` at compile time), not `Jerry.dc.html`'s fabricated
-                            // "jerry 0.4.2" - and an honest "no settings.toml yet" rather than
-                            // the mockup's own "· settings.toml", since this app has no real
-                            // settings-persistence file to point at (see `crate::settings`'s
-                            // module docs for why the Behaviour/Policy toggle rows that would
-                            // read/write one aren't built either).
+                            // "jerry 0.4.2" - now a genuinely real "settings.toml" caption too
+                            // (Revision R3): `crate::settings_store::Settings` really is loaded
+                            // from, and saved back to, a real file on disk (see that module's
+                            // docs), unlike the "no settings.toml yet" this footer said before
+                            // that phase existed.
                             .child(format!(
-                                "{} {} \u{b7} no settings.toml yet",
+                                "{} {} \u{b7} settings.toml",
                                 env!("CARGO_PKG_NAME"),
                                 env!("CARGO_PKG_VERSION"),
                             )),
@@ -209,9 +227,19 @@ impl AdeApp {
             let badge = match page {
                 SettingsPage::Agents => Some(agent_count.to_string()),
                 SettingsPage::Worktrees => Some(worktree_count.to_string()),
-                // Every other page's mockup badge (`3` for Language servers, etc.) is
-                // fabricated sample data with nothing real behind it - omitted rather than
-                // invented, matching `crate::settings`'s own documented scope.
+                // Real, live counts - not `Jerry.dc.html`'s fabricated sample badges (`6` for
+                // Themes happens to match by coincidence; Keybindings' mockup `48` and Language
+                // servers' mockup `5` don't - `crate::settings::keybinding_rows`'s own docs
+                // explain why this app's real, honest count is smaller).
+                SettingsPage::Theme => Some(settings::THEME_DEFS.len().to_string()),
+                SettingsPage::Keymap => Some(
+                    settings::keybinding_rows(&crate::default_key_bindings())
+                        .len()
+                        .to_string(),
+                ),
+                SettingsPage::LanguageServers => Some(settings::LSP_LANGUAGES.len().to_string()),
+                // Every other page has nothing real to count - omitted rather than invented,
+                // matching `crate::settings`'s own documented scope.
                 _ => None,
             };
             el = el.child(self.render_settings_nav_row(page, badge, cx));
@@ -276,8 +304,12 @@ impl AdeApp {
     }
 
     /// The content column: header block (title + real subtitle) plus whichever page's real (or
-    /// honestly placeholder) body - `design_handoff_jerry_ade/README.md`'s "Content column"
-    /// section.
+    /// honestly placeholder) body - `design_handoff_jerry_ade/revision/README.md`'s "Content
+    /// column" section. `design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3 narrows
+    /// this: both the header and the scrollable body are capped at
+    /// `theme::zone::SETTINGS_CONTENT_MAX_WIDTH` (700px), left-aligned inside the unchanged
+    /// 26px padding - matching `Jerry.dc.html`'s own `style="width:100%;max-width:700px"`
+    /// wrapper on each.
     pub(super) fn render_settings_content(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let page = self.settings_page;
 
@@ -296,23 +328,28 @@ impl AdeApp {
                     .pb(px(14.0))
                     .border_b_1()
                     .border_color(theme::border::INNER)
-                    .flex()
-                    .flex_col()
                     .child(
                         div()
-                            .font(font(theme::font::SANS))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(px(15.0))
-                            .text_color(theme::text::SELECTED)
-                            .child(page.label()),
-                    )
-                    .child(
-                        div()
-                            .mt(px(4.0))
-                            .font(font(theme::font::SANS))
-                            .text_size(px(11.5))
-                            .text_color(theme::settings::SUBTITLE)
-                            .child(page.subtitle()),
+                            .w_full()
+                            .max_w(theme::zone::SETTINGS_CONTENT_MAX_WIDTH)
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .font(font(theme::font::SANS))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_size(px(15.0))
+                                    .text_color(theme::text::SELECTED)
+                                    .child(page.label()),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(4.0))
+                                    .font(font(theme::font::SANS))
+                                    .text_size(px(11.5))
+                                    .text_color(theme::settings::SUBTITLE)
+                                    .child(page.subtitle()),
+                            ),
                     ),
             )
             .child(
@@ -323,15 +360,35 @@ impl AdeApp {
                     .overflow_y_scroll()
                     .px(px(26.0))
                     .pb(px(20.0))
-                    .child(match page {
-                        SettingsPage::Agents => {
-                            self.render_settings_agents_page(cx).into_any_element()
-                        }
-                        SettingsPage::Worktrees => {
-                            self.render_settings_worktrees_page(cx).into_any_element()
-                        }
-                        _ => render_settings_placeholder_page().into_any_element(),
-                    }),
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(theme::zone::SETTINGS_CONTENT_MAX_WIDTH)
+                            .child(match page {
+                                SettingsPage::General => {
+                                    self.render_settings_general_page(cx).into_any_element()
+                                }
+                                SettingsPage::Agents => {
+                                    self.render_settings_agents_page(cx).into_any_element()
+                                }
+                                SettingsPage::Worktrees => {
+                                    self.render_settings_worktrees_page(cx).into_any_element()
+                                }
+                                SettingsPage::Appearance => {
+                                    self.render_settings_appearance_page(cx).into_any_element()
+                                }
+                                SettingsPage::Theme => {
+                                    self.render_settings_theme_page(cx).into_any_element()
+                                }
+                                SettingsPage::Keymap => {
+                                    self.render_settings_keymap_page(cx).into_any_element()
+                                }
+                                SettingsPage::LanguageServers => {
+                                    self.render_settings_lsp_page(cx).into_any_element()
+                                }
+                                _ => render_settings_placeholder_page().into_any_element(),
+                            }),
+                    ),
             )
     }
 
@@ -754,13 +811,785 @@ impl AdeApp {
             }
         }
     }
+
+    /// *General* - the one real settings row this phase wires
+    /// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3: `Window controls` as a
+    /// segmented `System | macOS | Windows/Linux` choice, wired live - see
+    /// `Self::window_controls_style`'s own docs for how both this row and the command palette's
+    /// three `Window controls: …` entries now read/write the exact same real, persisted field).
+    ///
+    /// `Default environment`, `Restore sessions on launch`, and `Confirm before discarding a
+    /// worktree` - three more rows `Jerry.dc.html`'s own `settingsRows.general` fixture shows -
+    /// are deliberately left out, matching `crate::settings`'s own documented Agents/Worktrees
+    /// precedent: no real WSL/environment detection exists anywhere in this codebase yet
+    /// (that's Revision R6's job), and session-restore-on-launch / a discard-confirmation flow
+    /// are real app *behaviour* this phase doesn't build, not settings-surface plumbing around
+    /// an existing behaviour - rendering a toggle for either would be a control bound to
+    /// nothing.
+    pub(super) fn render_settings_general_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.window_controls_style().label().to_string();
+        let choice = self.render_choice_control(
+            "settings-window-controls",
+            &["System", "macOS", "Windows/Linux"],
+            selected,
+            cx,
+            |this, label, cx| {
+                let style = match label {
+                    "macOS" => WindowControlsStyle::MacosStyle,
+                    "Windows/Linux" => WindowControlsStyle::WindowsLinuxStyle,
+                    _ => WindowControlsStyle::System,
+                };
+                this.set_window_controls_style(style, cx);
+            },
+        );
+        let row = self.render_settings_row(
+            "Window controls",
+            "Traffic lights on macOS, caption buttons on Windows and Linux. Follows the \
+             platform unless you pin it - this switches live.",
+            choice,
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .child(self.render_config_banner(settings_store::ConfigPage::General, cx))
+            .child(
+                div()
+                    .pt(px(20.0))
+                    .pb(px(4.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Window & launch"),
+            )
+            .child(row)
+            .child(self.render_snippet_block(settings_store::ConfigPage::General))
+    }
+
+    /// *Appearance & scaling* - every row here is real, persisted, and round-trips through
+    /// [`Self::settings`] (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3). What's
+    /// **not** real yet: nothing in the render pipeline actually reads these values back to
+    /// resize the running UI - `crate::theme`'s tokens are compile-time `const`s read directly
+    /// by roughly 500 render call sites across this codebase, not a runtime-scaled resource.
+    /// Turning that into a real, applied interface scale is Revision R5's own, separately
+    /// tracked job; this phase's job is only the settings surface. The four preview cards are a
+    /// real, static approximation (scaled font sizes on fixed sample text) of what a scale
+    /// *would* look like, not a live re-render of any actual pane.
+    pub(super) fn render_settings_appearance_page(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected_percent = self.settings.appearance.interface_scale_percent;
+
+        let preview = div().flex().gap(px(8.0)).children(
+            [90u16, 100, 110, 125]
+                .into_iter()
+                .map(|percent| self.render_appearance_preview_card(percent, selected_percent, cx)),
+        );
+
+        let scale_choice = self.render_choice_control(
+            "settings-interface-scale",
+            &["90%", "100%", "110%", "125%"],
+            format!("{selected_percent}%"),
+            cx,
+            |this, label, cx| {
+                if let Ok(percent) = label.trim_end_matches('%').parse::<u16>() {
+                    this.set_interface_scale_percent(percent, cx);
+                }
+            },
+        );
+        let editor_font_row = self.render_settings_row(
+            "Editor font size",
+            "Per-tab zoom shifts this without changing the default.",
+            self.render_stepper_control(
+                "settings-editor-font",
+                format!("{:.0} px", self.settings.appearance.editor_font_size),
+                cx,
+                |this, cx| this.adjust_editor_font_size(-1.0, cx),
+                |this, cx| this.adjust_editor_font_size(1.0, cx),
+            ),
+        );
+        let terminal_font_row = self.render_settings_row(
+            "Terminal font size",
+            "",
+            self.render_stepper_control(
+                "settings-terminal-font",
+                format!("{:.1} px", self.settings.appearance.terminal_font_size),
+                cx,
+                |this, cx| this.adjust_terminal_font_size(-0.5, cx),
+                |this, cx| this.adjust_terminal_font_size(0.5, cx),
+            ),
+        );
+        let follow_system_row = self.render_settings_row(
+            "Follow system text size",
+            "Takes the OS accessibility setting instead of the scale above.",
+            self.render_toggle_control(
+                "settings-follow-system-text-size",
+                self.settings.appearance.follow_system_text_size,
+                cx,
+                |this, cx| this.toggle_follow_system_text_size(cx),
+            ),
+        );
+        let per_tab_zoom_row = self.render_settings_row(
+            "Zoom per editor tab",
+            "Zoom applies to the focused tab only; the rest of the UI keeps its scale.",
+            self.render_toggle_control(
+                "settings-per-tab-zoom",
+                self.settings.appearance.per_tab_zoom,
+                cx,
+                |this, cx| this.toggle_per_tab_zoom(cx),
+            ),
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .child(self.render_config_banner(settings_store::ConfigPage::Appearance, cx))
+            .child(
+                div()
+                    .pt(px(16.0))
+                    .pb(px(6.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Preview"),
+            )
+            .child(preview)
+            .child(
+                div()
+                    .pt(px(20.0))
+                    .pb(px(4.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Sizing"),
+            )
+            .child(self.render_settings_row(
+                "Interface scale",
+                "Rail, tabs, panels and every keycap. Preview above updates as you pick.",
+                scale_choice,
+            ))
+            .child(editor_font_row)
+            .child(terminal_font_row)
+            .child(follow_system_row)
+            .child(per_tab_zoom_row)
+            .child(self.render_snippet_block(settings_store::ConfigPage::Appearance))
+    }
+
+    /// One Appearance page preview card - real, static approximation of `percent`'s scale on a
+    /// fixed sample row (font sizes scaled by `percent / 100`, not a live re-render of any real
+    /// pane - see [`Self::render_settings_appearance_page`]'s own docs). Selection state
+    /// (border/background) is real and live, tied to [`Self::settings`]'s own
+    /// `appearance.interface_scale_percent`.
+    fn render_appearance_preview_card(
+        &self,
+        percent: u16,
+        selected_percent: u16,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_selected = percent == selected_percent;
+        let ratio = percent as f32 / 100.0;
+        let macos = self.window_controls_style().is_macos();
+
+        div()
+            .id(format!("settings-scale-preview-{percent}"))
+            .cursor_pointer()
+            .flex_1()
+            .min_w_0()
+            .rounded(theme::radius::CARD)
+            .border_1()
+            .border_color(if is_selected {
+                theme::border::SELECTED_EDGE
+            } else {
+                theme::border::CARD
+            })
+            .bg(if is_selected {
+                theme::settings::CARD_SELECTED_BG
+            } else {
+                theme::settings::CARD_UNSELECTED_BG
+            })
+            .px(px(10.0))
+            .py(px(9.0))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(if is_selected {
+                        theme::text::SELECTED
+                    } else {
+                        theme::text::DIM
+                    })
+                    .child(format!("{percent}%")),
+            )
+            .child(
+                div()
+                    .mt(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .text_size(px(11.5 * ratio))
+                            .text_color(theme::text::HEADING)
+                            .child("Needs input"),
+                    )
+                    .child(
+                        div()
+                            .mt(px(2.0))
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.5 * ratio))
+                            .text_color(theme::text::FAINT)
+                            .child("fix/auth-token-race"),
+                    )
+                    .child(div().mt(px(7.0)).child(render_keycap_row(
+                        &keymap::resolve_combo("mod+K", macos),
+                        KeycapSize::Hint,
+                    ))),
+            )
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                this.set_interface_scale_percent(percent, cx);
+            }))
+    }
+
+    /// *Themes* - the six real cards from `crate::settings::THEME_DEFS`, real swatch colours,
+    /// real (persisted) selection. Selecting a card other than "Jerry Dark" persists correctly
+    /// (`Self::settings.theme.name` round-trips through `settings.toml`) but does **not** yet
+    /// re-skin the running app - `crate::theme` is a set of compile-time `const` colour tokens
+    /// read directly by roughly 500 render call sites across this codebase, not a runtime-
+    /// swappable resource. Turning that into a live theme-swap engine is real, substantial
+    /// follow-up work in its own right (a named, deliberately deferred item - not something to
+    /// fake with, say, a global colour-multiplier hack), tracked the same way this project has
+    /// always named a deferred item rather than silently shipping a partial one (see
+    /// `BUILD-LOG.md`'s Revision R1 background-task-dispatch note for the precedent).
+    pub(super) fn render_settings_theme_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let cards = div().flex().flex_wrap().gap(px(8.0)).children(
+            settings::THEME_DEFS
+                .iter()
+                .map(|def| self.render_theme_card(def, cx)),
+        );
+
+        let follow_system_row = self.render_settings_row(
+            "Follow system appearance",
+            "Switch to the light theme when the OS does.",
+            self.render_toggle_control(
+                "settings-theme-follow-system",
+                self.settings.theme.follow_system,
+                cx,
+                |this, cx| this.toggle_theme_follow_system(cx),
+            ),
+        );
+        let high_contrast_row = self.render_settings_row(
+            "High-contrast diff colours",
+            "Stronger add and delete backgrounds for bright rooms.",
+            self.render_toggle_control(
+                "settings-theme-high-contrast-diff",
+                self.settings.theme.high_contrast_diff,
+                cx,
+                |this, cx| this.toggle_high_contrast_diff(cx),
+            ),
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .child(self.render_config_banner(settings_store::ConfigPage::Theme, cx))
+            .child(
+                div()
+                    .pt(px(16.0))
+                    .pb(px(6.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Installed themes"),
+            )
+            .child(cards)
+            .child(
+                div()
+                    .pt(px(20.0))
+                    .pb(px(4.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Colour"),
+            )
+            .child(follow_system_row)
+            .child(high_contrast_row)
+            .child(self.render_snippet_block(settings_store::ConfigPage::Theme))
+    }
+
+    fn render_theme_card(
+        &self,
+        def: &settings::ThemeDef,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_selected = def.name == self.settings.theme.name;
+        let name = def.name;
+
+        div()
+            .id(format!("settings-theme-card-{name}"))
+            .cursor_pointer()
+            .w(px(212.0))
+            .rounded(theme::radius::CARD)
+            .border_1()
+            .border_color(if is_selected {
+                theme::border::SELECTED_EDGE
+            } else {
+                theme::border::CARD
+            })
+            .bg(if is_selected {
+                theme::settings::CARD_SELECTED_BG
+            } else {
+                theme::settings::CARD_UNSELECTED_BG
+            })
+            .overflow_hidden()
+            .when(!is_selected, |el| {
+                el.hover(|el| el.border_color(theme::settings::THEME_CARD_HOVER_BORDER))
+            })
+            .child(
+                div().h(px(34.0)).flex().children(
+                    def.swatches
+                        .iter()
+                        .map(|hex| div().flex_1().bg(gpui::rgb(*hex))),
+                ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .border_t_1()
+                    .border_color(theme::border::CARD)
+                    .child(
+                        div()
+                            .flex_none()
+                            .font(font(theme::font::SANS))
+                            .text_size(px(11.5))
+                            .text_color(if is_selected {
+                                theme::text::SELECTED
+                            } else {
+                                theme::text::BODY
+                            })
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.0))
+                            .text_color(theme::text::FAINTER)
+                            .child(def.subtitle),
+                    )
+                    .when(is_selected, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .font(font(theme::font::MONO))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_size(px(9.0))
+                                .text_color(theme::status::REVIEW)
+                                .child("in use"),
+                        )
+                    }),
+            )
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                this.set_theme_name(name.to_string(), cx);
+            }))
+    }
+
+    /// *Keybindings* - every row here is real, derived at render time from
+    /// `crate::default_key_bindings()`'s actual, live-registered `gpui::KeyBinding`s
+    /// (`crate::settings::keybinding_rows` - see that function's own docs for why this replaced a
+    /// second, hand-maintained parallel list, and the real inaccuracies that list had already
+    /// produced). No config banner/snippet here - these rows aren't `settings.toml` keys, they're
+    /// derived from compiled-in code (`crate::settings_store::ConfigPage` deliberately has no
+    /// `Keymap` variant). Read-only: no rebind UI, since this app has no real keymap-file-writing
+    /// infrastructure to back one.
+    pub(super) fn render_settings_keymap_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let macos = self.window_controls_style().is_macos();
+        let bindings = crate::default_key_bindings();
+        let rows = settings::keybinding_rows(&bindings);
+        let filtered = settings::filter_keybinding_rows(&rows, &self.settings_keymap_filter);
+        let last_index = filtered.len().saturating_sub(1);
+
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .pt(px(16.0))
+                    .pb(px(6.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Bindings"),
+            )
+            .child(
+                div()
+                    .rounded(theme::radius::CARD)
+                    .border_1()
+                    .border_color(theme::border::CARD)
+                    .overflow_hidden()
+                    .child(self.render_settings_keymap_filter_row(filtered.len(), rows.len(), cx))
+                    .children(filtered.iter().enumerate().map(|(index, row)| {
+                        self.render_settings_keybinding_row(row, index == last_index, macos)
+                    })),
+            )
+    }
+
+    fn render_settings_keymap_filter_row(
+        &self,
+        shown: usize,
+        total: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let has_query = !self.settings_keymap_filter.is_empty();
+
+        div()
+            .id("settings-keymap-filter")
+            .track_focus(&self.settings_keymap_filter_focus_handle)
+            .on_key_down(cx.listener(Self::handle_settings_keymap_filter_key_down))
+            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                window.focus(&this.settings_keymap_filter_focus_handle, cx);
+            }))
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .px(px(11.0))
+            .py(px(7.0))
+            .bg(theme::surface::CARD_SUNK)
+            .border_b_1()
+            .border_color(theme::border::CARD)
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(11.0))
+                    .text_color(theme::text::GHOSTER)
+                    .child("/"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .font(font(theme::font::SANS))
+                    .text_size(px(11.0))
+                    .text_color(if has_query {
+                        theme::text::DIM
+                    } else {
+                        theme::text::GHOST
+                    })
+                    .child(if has_query {
+                        self.settings_keymap_filter.clone()
+                    } else {
+                        format!("filter {total} bindings")
+                    }),
+            )
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::GHOST)
+                    .child(format!("{shown} shown")),
+            )
+    }
+
+    /// Same minimal append/backspace/escape-clears shape as [`Self::handle_filter_key_down`] -
+    /// see that method's own docs for the deliberate scope cut (no cursor positioning, no
+    /// selection, no IME).
+    pub(super) fn handle_settings_keymap_filter_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+            return;
+        }
+        let changed = match keystroke.key.as_str() {
+            "backspace" => self.settings_keymap_filter.pop().is_some(),
+            "escape" => {
+                let had_text = !self.settings_keymap_filter.is_empty();
+                self.settings_keymap_filter.clear();
+                had_text
+            }
+            _ => match keystroke.key_char.as_deref() {
+                Some(text) if !text.is_empty() => {
+                    self.settings_keymap_filter.push_str(text);
+                    true
+                }
+                _ => false,
+            },
+        };
+        if changed {
+            cx.notify();
+            cx.stop_propagation();
+        }
+    }
+
+    fn render_settings_keybinding_row(
+        &self,
+        row: &settings::KeybindingRow,
+        is_last: bool,
+        macos: bool,
+    ) -> impl IntoElement {
+        let glyphs: Vec<String> = row
+            .keystrokes
+            .iter()
+            .flat_map(|keystroke| keymap::resolve_keystroke(keystroke, macos))
+            .collect();
+        div()
+            .id(format!("settings-keybinding-row-{}", row.command))
+            // Test-only (`#[cfg(any(test, feature = "test-support"))]` - a real no-op in a
+            // release build): lets `VisualTestContext::debug_bounds` confirm which rows the real
+            // render call actually produced for a given filter query, not just what the pure
+            // `settings::filter_keybinding_rows` logic function returns - see this file's own
+            // `settings_keymap_filter_tests` module.
+            .debug_selector(move || format!("keybinding-row-{}", row.command))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(11.0))
+            .py(px(7.0))
+            .bg(theme::surface::CARD)
+            .when(!is_last, |el| {
+                el.border_b_1().border_color(theme::settings::CARD_ROW_SEP)
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .font(font(theme::font::SANS))
+                    .text_size(px(11.5))
+                    .text_color(theme::text::STRONG)
+                    .child(row.command),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(64.0))
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::FAINTER)
+                    .child(row.context),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(96.0))
+                    .flex()
+                    .justify_end()
+                    .child(render_keycap_row(&glyphs, KeycapSize::Standard)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(36.0))
+                    .text_right()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(9.5))
+                    .text_color(theme::text::FAINTER)
+                    .child("base"),
+            )
+    }
+
+    /// *Language servers* - real PATH-detection rows, following the exact same pattern as
+    /// [`Self::render_settings_agents_page`] (`crate::settings::detect_lsp_rows`, cached in
+    /// [`Self::lsp_rows`]). `format on save`/`inlay hints`/`diagnostics in the rail` toggles
+    /// from `Jerry.dc.html`'s own `settingsRows.lsp` fixture are left out - no real backing
+    /// exists anywhere in this codebase for any of the three, matching `crate::settings`'s own
+    /// documented Agents/Worktrees precedent. No config banner/snippet either: these rows are
+    /// live-detected `$PATH` state, not `settings.toml` keys.
+    pub(super) fn render_settings_lsp_page(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = &self.lsp_rows;
+        let last_index = rows.len().saturating_sub(1);
+
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .pt(px(16.0))
+                    .pb(px(6.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Servers"),
+            )
+            .child(
+                div()
+                    .rounded(theme::radius::CARD)
+                    .border_1()
+                    .border_color(theme::border::CARD)
+                    .overflow_hidden()
+                    .children(rows.iter().enumerate().map(|(index, row)| {
+                        self.render_settings_lsp_row(row, index == last_index)
+                    })),
+            )
+    }
+
+    fn render_settings_lsp_row(&self, row: &settings::LspRow, is_last: bool) -> impl IntoElement {
+        let chip = file_tree::lang_chip_for_name(&format!("x.{}", row.ext));
+        let path_text = match &row.resolved_path {
+            Some(path) => path.display().to_string(),
+            None => format!("{} not found on PATH", row.binary),
+        };
+        let dot_color = if row.is_ready() {
+            theme::settings::AGENT_READY
+        } else {
+            theme::status::IDLE
+        };
+
+        div()
+            .id(format!("settings-lsp-row-{}", row.binary))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(12.0))
+            .py(px(8.0))
+            .bg(theme::surface::CARD)
+            .when(!is_last, |el| {
+                el.border_b_1().border_color(theme::settings::CARD_ROW_SEP)
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(17.0))
+                    .h(px(17.0))
+                    .rounded(theme::radius::CHIP)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(chip.bg)
+                    .font(font(theme::font::MONO))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(7.5))
+                    .text_color(chip.fg)
+                    .child(chip.label),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(78.0))
+                    .font(font(theme::font::SANS))
+                    .text_size(px(11.5))
+                    .text_color(theme::text::HEADING)
+                    .child(row.language),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(196.0))
+                    .overflow_hidden()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.5))
+                    .text_color(if row.is_ready() {
+                        theme::text::DIM
+                    } else {
+                        theme::button::DANGER_FG
+                    })
+                    .child(path_text),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::FAINTER)
+                    .child(row.note),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(div().w(px(5.0)).h(px(5.0)).rounded(px(2.5)).bg(dot_color))
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.0))
+                            .text_color(theme::text::FAINTER)
+                            .child(row.status_label()),
+                    ),
+            )
+    }
+
+    fn set_interface_scale_percent(&mut self, percent: u16, cx: &mut Context<Self>) {
+        self.settings.appearance.interface_scale_percent = percent;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    fn adjust_editor_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.settings.appearance.editor_font_size = (self.settings.appearance.editor_font_size
+            + delta)
+            .clamp(settings_store::FONT_SIZE_MIN, settings_store::FONT_SIZE_MAX);
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    fn adjust_terminal_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.settings.appearance.terminal_font_size = (self.settings.appearance.terminal_font_size
+            + delta)
+            .clamp(settings_store::FONT_SIZE_MIN, settings_store::FONT_SIZE_MAX);
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    fn toggle_follow_system_text_size(&mut self, cx: &mut Context<Self>) {
+        self.settings.appearance.follow_system_text_size =
+            !self.settings.appearance.follow_system_text_size;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    fn toggle_per_tab_zoom(&mut self, cx: &mut Context<Self>) {
+        self.settings.appearance.per_tab_zoom = !self.settings.appearance.per_tab_zoom;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    fn set_theme_name(&mut self, name: String, cx: &mut Context<Self>) {
+        self.settings.theme.name = name;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    fn toggle_theme_follow_system(&mut self, cx: &mut Context<Self>) {
+        self.settings.theme.follow_system = !self.settings.theme.follow_system;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    fn toggle_high_contrast_diff(&mut self, cx: &mut Context<Self>) {
+        self.settings.theme.high_contrast_diff = !self.settings.theme.high_contrast_diff;
+        self.persist_settings(cx);
+        cx.notify();
+    }
 }
 
 /// A nav-only Settings page's real, honest placeholder body - `Jerry.dc.html`'s own `setStub`
-/// state's exact copy (line ~705: `not designed in this mockup`). Used for every page except
-/// [`SettingsPage::Agents`]/[`SettingsPage::Worktrees`] - see `crate::settings`'s module docs
-/// for why this is a documented act of fidelity to the source design (which itself never
-/// specified what these pages should contain), not a shortcut.
+/// state's exact copy (line ~857: `not designed in this mockup`). Used for every page
+/// [`SettingsPage::is_implemented`] reports `false` for (`Editor`, `Notifications`,
+/// `Integrations`, `About`) - see `crate::settings`'s module docs for why this is a documented
+/// act of fidelity to the source design, not a shortcut: `Editor` in particular has zero real
+/// backing anywhere in this codebase for indentation/soft-wrap/whitespace-display, so it stays
+/// here rather than growing fake controls just because the mockup shows some.
 pub(super) fn render_settings_placeholder_page() -> impl IntoElement {
     div()
         .py(px(26.0))
@@ -768,4 +1597,69 @@ pub(super) fn render_settings_placeholder_page() -> impl IntoElement {
         .text_size(px(11.0))
         .text_color(theme::text::DISABLED)
         .child("not designed in this mockup")
+}
+
+/// Real, interactive regression coverage for the Keybindings page's filter row - unlike
+/// `crate::settings`'s own `filter_keybinding_rows_*` tests (which call the pure logic function
+/// directly), this drives the *actual rendered UI*: a real, focused GPUI element receiving real
+/// simulated keystrokes, then checks (via `VisualTestContext::debug_bounds`, keyed by each row's
+/// real `Self::render_settings_keybinding_row` `debug_selector`) which rows the real render call
+/// actually painted - proving the interactive filter field is really wired to the real render
+/// path, not just that the standalone filter function it happens to call is correct.
+#[cfg(test)]
+mod settings_keymap_filter_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn typing_into_the_keybindings_filter_changes_which_rows_are_actually_rendered(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        cx.dispatch_action(ToggleSettings);
+        app.update(cx, |app, cx| {
+            app.select_settings_page(SettingsPage::Keymap, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("keybinding-row-Command palette").is_some(),
+            "every real row should be rendered before any filter is typed"
+        );
+        assert!(
+            cx.debug_bounds("keybinding-row-Go to definition").is_some(),
+            "every real row should be rendered before any filter is typed"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            window.focus(&app.settings_keymap_filter_focus_handle, cx);
+        });
+        cx.simulate_input("definition");
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("keybinding-row-Go to definition").is_some(),
+            "the row matching the real, just-typed filter query should still be rendered"
+        );
+        assert!(
+            cx.debug_bounds("keybinding-row-Command palette").is_none(),
+            "typing a real keystroke into the real, focused filter field should have actually \
+             changed which rows the real render call produces - not just updated the pure \
+             filter_keybinding_rows logic function's own separately-tested output"
+        );
+
+        app.update(cx, |app, cx| {
+            app.settings_keymap_filter.clear();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("keybinding-row-Command palette").is_some(),
+            "clearing the real filter should render every row again"
+        );
+    }
 }

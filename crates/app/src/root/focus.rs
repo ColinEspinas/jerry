@@ -119,6 +119,7 @@ impl AdeApp {
         self.prune_confirm_armed = false;
         window.focus(&self.settings_focus_handle, cx);
         self.load_agent_rows(cx);
+        self.load_lsp_rows(cx);
         cx.notify();
     }
 
@@ -163,11 +164,24 @@ pub(in crate::root) mod palette_focus_tests {
     /// lifecycle coverage, rather than maintaining a second, separately-written copy that could
     /// drift - as do several test modules in other `crate::root` submodules (`code_surface`,
     /// `lsp`, `merge_flow`) covering cross-cutting focus regressions in their own areas.
+    ///
+    /// Uses `AdeApp::new_with_settings` (real, in-memory-only `Settings::default()`, `None`
+    /// settings path), not `AdeApp::new` - see that method's own docs for why: `AdeApp::new`
+    /// really does read and write `~/.config/jerry/settings.toml` on whatever real machine
+    /// calls it, which must never be the machine running `cargo test`.
     pub(in crate::root) fn open_test_app(
         cx: &mut TestAppContext,
         repo_path: PathBuf,
     ) -> (Entity<AdeApp>, &mut gpui::VisualTestContext) {
-        cx.add_window_view(|window, cx| AdeApp::new(repo_path, window, cx))
+        cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                repo_path,
+                settings_store::Settings::default(),
+                None,
+                window,
+                cx,
+            )
+        })
     }
 
     /// The bug this guards against, exactly as measured: closing the palette used to leave
@@ -593,6 +607,106 @@ mod settings_focus_tests {
                 "{kind:?} should have a real row after a real $PATH search"
             );
         }
+    }
+
+    /// Mirrors the Agents-page test above, for [`AdeApp::lsp_rows`]
+    /// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3 "Language servers" page).
+    #[gpui::test]
+    fn opening_settings_populates_real_lsp_rows_from_a_background_path_search(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        assert!(app.read_with(cx, |app, _| app.lsp_rows.is_empty()));
+
+        cx.dispatch_action(ToggleSettings);
+        cx.run_until_parked();
+
+        let rows = app.read_with(cx, |app, _| app.lsp_rows.clone());
+        assert_eq!(rows.len(), settings::LSP_LANGUAGES.len());
+        for def in settings::LSP_LANGUAGES {
+            assert!(rows.iter().any(|row| row.language == def.language));
+        }
+    }
+
+    /// `design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3: "Default page is now
+    /// General (was Agents)."
+    #[gpui::test]
+    fn settings_opens_to_general_by_default_on_a_fresh_window(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        cx.dispatch_action(ToggleSettings);
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings_page),
+            SettingsPage::General
+        );
+    }
+
+    /// A real, whole-surface render smoke test: every real page in `SettingsPage::ALL` -
+    /// General/Agents/Worktrees/Appearance/Theme/Keymap's real content and every nav-only
+    /// page's honest placeholder alike - must actually render without panicking. Selecting a
+    /// page and running the real GPUI test executor to a parked, fully-drawn state
+    /// (`cx.run_until_parked`) is what actually exercises `AdeApp::render_settings_content`'s
+    /// real per-page render call, not just the pure state transition `select_settings_page`
+    /// itself performs.
+    #[gpui::test]
+    fn every_settings_page_renders_without_panicking(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        cx.dispatch_action(ToggleSettings);
+        cx.run_until_parked();
+
+        for page in SettingsPage::ALL {
+            app.update(cx, |app, cx| {
+                app.select_settings_page(page, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                app.read_with(cx, |app, _| app.settings_page),
+                page,
+                "{:?} should have actually become the selected page",
+                page.label()
+            );
+        }
+    }
+
+    /// `design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3: `Window controls` on the
+    /// General page is "wired live to change 1" - the real title-bar/keycap override, not a
+    /// decorative row. `AdeApp::set_window_controls_style` is the exact method the General
+    /// page's real choice-row click handler calls (`crate::root::settings_render::
+    /// render_settings_general_page`) - the same real, single source of truth
+    /// `root::title_bar::caption_button_tests::clicking_the_close_caption_button_closes_the_real_window`
+    /// already proves actually changes which title-bar variant renders.
+    #[gpui::test]
+    fn window_controls_style_change_updates_the_real_persisted_settings_field(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.window_controls_style()),
+            WindowControlsStyle::System,
+            "System is the real documented default"
+        );
+
+        app.update(cx, |app, cx| {
+            app.set_window_controls_style(WindowControlsStyle::WindowsLinuxStyle, cx);
+        });
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.window_controls_style()),
+            WindowControlsStyle::WindowsLinuxStyle
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.window.controls),
+            WindowControlsStyle::WindowsLinuxStyle,
+            "the real Settings struct field, not a second independent copy, must have changed"
+        );
     }
 }
 

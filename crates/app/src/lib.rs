@@ -22,6 +22,7 @@ pub mod rail;
 pub mod root;
 pub mod sessions;
 pub mod settings;
+pub mod settings_store;
 pub mod status;
 pub mod terminal_grid;
 pub mod terminal_pane;

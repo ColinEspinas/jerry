@@ -346,6 +346,19 @@ pub mod settings {
     /// [`super::status::IDLE`] (`#565d64`, used here for the main checkout's own dot, matching
     /// that same fixture's `{ path: 'jerry-core', ..., dot: '#565d64' }`).
     pub const WORKTREE_PRUNABLE_DOT: Rgba = hex(0x3f454b);
+    /// A selected Appearance-preview-card's / Theme-card's own real background
+    /// (`design_handoff_jerry_ade/revision/Jerry.dc.html`'s `scaleSamples`/`themeRows`
+    /// row-decoration: `bg: uiScale === s ? '#161b1f' : '#131619'`) - see
+    /// [`CARD_UNSELECTED_BG`] for the unselected counterpart.
+    pub const CARD_SELECTED_BG: Rgba = hex(0x161b1f);
+    pub const CARD_UNSELECTED_BG: Rgba = hex(0x131619);
+    /// A Theme card's real hover border (`Jerry.dc.html`'s theme card template:
+    /// `style-hover="border-color:#3a4148"`).
+    pub const THEME_CARD_HOVER_BORDER: Rgba = hex(0x3a4148);
+    /// The config snippet block's real section-header line colour
+    /// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3: "section lines `#c294e0`" -
+    /// confirmed against `Jerry.dc.html`'s own `CSFG = { s: '#c294e0', ... }`).
+    pub const SNIPPET_SECTION: Rgba = hex(0xc294e0);
 }
 
 pub mod radius {
@@ -401,6 +414,12 @@ pub mod zone {
     pub const PANEL_WIDTH: Pixels = px(320.0);
     pub const PANEL_WIDTH_EMPTY: Pixels = px(260.0);
     pub const SETTINGS_NAV_WIDTH: Pixels = px(212.0);
+    /// The Settings content column's real cap (`design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s change 3: "content column capped at 700px, left-aligned inside the
+    /// existing 26px padding") - both the header block and the scrollable body share this
+    /// `max_w`, matching `Jerry.dc.html`'s own `style="width:100%;max-width:700px"` wrapper on
+    /// each.
+    pub const SETTINGS_CONTENT_MAX_WIDTH: Pixels = px(700.0);
     pub const PALETTE_WIDTH: Pixels = px(684.0);
     pub const COMPOSER_WIDTH: Pixels = px(560.0);
 }

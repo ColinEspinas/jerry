@@ -268,7 +268,7 @@ impl AdeApp {
                     .child(render_keycap_row(
                         &keymap::resolve_combo(
                             "mod+1\u{2026}8",
-                            self.window_controls_style.is_macos(),
+                            self.window_controls_style().is_macos(),
                         ),
                         KeycapSize::Standard,
                     )),
@@ -729,7 +729,7 @@ impl AdeApp {
             } else {
                 (theme::text::GHOSTER, theme::border::BUTTON_DISABLED)
             };
-            let parts = keymap::resolve_combo(spec, self.window_controls_style.is_macos());
+            let parts = keymap::resolve_combo(spec, self.window_controls_style().is_macos());
             button = button.child(render_action_keycap_row(&parts, keycap_fg, keycap_border));
         }
 

@@ -1308,7 +1308,7 @@ impl AdeApp {
                     .bg(theme::border::DIVIDER),
             )
             .child(render_accept_file_button(
-                self.window_controls_style.is_macos(),
+                self.window_controls_style().is_macos(),
             ))
             .child(
                 div()

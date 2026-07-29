@@ -23,3 +23,14 @@ license = "MIT OR Apache-2.0"
 gpui = { path = "vendor/zed/crates/gpui" }
 anyhow = "1"
 thiserror = "1"
+# Real config-file (de)serialization for `crate::settings_store::Settings`
+# (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change 3). Pinned to
+# the exact major versions `vendor/zed/Cargo.toml` itself pins (`serde = "1.0.221"`,
+# `toml = "0.8"`), matching this project's established "same versions Zed verified against"
+# convention for shared dependencies (see `crates/app/Cargo.toml`'s own `tree-sitter`/
+# `alacritty_terminal` comments for precedent). `serde_json` has no equivalent vendor/zed pin
+# to match (Zed's own `Cargo.toml` doesn't depend on it at the workspace level), so it's a
+# plain, unpinned-beyond-major-version dependency instead.
+serde = { version = "1.0.221", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"

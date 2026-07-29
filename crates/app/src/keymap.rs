@@ -5,7 +5,11 @@
 //! Deliberately GPUI-free, mirroring `crate::palette`/`crate::work_surface`'s own split: this
 //! module only maps a platform choice onto plain strings, so that mapping is directly
 //! unit-testable without a live GPUI window - turning a resolved combo into actual `gpui::Div`
-//! keycap trees happens one layer up, in `crate::root::widgets`.
+//! keycap trees happens one layer up, in `crate::root::widgets`. [`resolve_keystroke`] is the one
+//! real exception: it takes a real, plain-data `gpui::Keystroke` (no live window needed to
+//! construct or inspect one) so the Settings › Keybindings page can resolve glyphs straight off
+//! `crate::default_key_bindings`'s actual registered bindings - see that function's own docs for
+//! why.
 //!
 //! ## Why one setting, not two
 //!
@@ -75,14 +79,15 @@
 //! (`design_handoff_jerry_ade/README.md`'s `Default environment`/`Window controls` rows) both
 //! care about.
 //!
-//! ## Not yet persisted
+//! ## Persisted (R3)
 //!
-//! [`WindowControlsStyle`] lives only in `crate::root::AdeApp`'s in-memory state this phase -
-//! R3's config-file-backed Settings rewrite (`CHANGELOG.md`'s change 3, the "General" page's
-//! `Window controls: System | macOS | Windows` segmented choice) is where this gets a real
-//! `~/.config/jerry/settings.toml` row and a permanent settings-page home.
-//! `crate::root::palette_render`'s three "Window controls: …" command-palette entries are a
-//! deliberate, documented placeholder entry point for this phase only - see that module's docs.
+//! [`WindowControlsStyle`] is now a real field of `crate::settings_store::Settings`
+//! (`crate::settings_store::WindowSettings::controls`), loaded from and saved to
+//! `~/.config/jerry/settings.toml` - see that module's docs and [`WindowControlsStyle`]'s own
+//! "Now persisted (R3)" doc, above. `crate::root::palette_render`'s three "Window controls: …"
+//! command-palette entries and the General settings page's `Window controls` choice row both
+//! read/write `crate::root::AdeApp::window_controls_style`'s real, single, saved value - not
+//! two independent copies.
 
 /// Which platform's chrome (title-bar variant, keycap glyphs) should render right now.
 /// `System` (the default) follows [`detected_platform_is_macos`]; the other two variants pin a
@@ -93,11 +98,25 @@
 /// [`crate::default_key_bindings`]'s real, globally-bound shortcuts, which are fixed at compile
 /// time by the real OS - see this module's own "This is a cosmetic preview, not a rebinding"
 /// docs, above, for why that's an honest, deliberate limitation rather than an oversight.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// ## Now persisted (R3)
+///
+/// This type's `#[derive(Serialize, Deserialize)]` and per-variant `#[serde(rename = ...)]`
+/// (`"system"`/`"macos"`/`"windows"`, matching `design_handoff_jerry_ade/revision/Jerry.dc.html`'s
+/// own `cfgSnippets.general` fixture: `controls = "system" # system · macos · windows`) back
+/// `crate::settings_store::WindowSettings::controls` - the real, single source of truth this
+/// module's own "Not yet persisted" section (below) used to say didn't exist yet. It does now:
+/// `crate::root::AdeApp::window_controls_style` reads/writes `self.settings.window.controls`
+/// directly, so the General settings page's `Window controls` choice row and the command
+/// palette's three `Window controls: …` entries mutate the exact same real, saved field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum WindowControlsStyle {
     #[default]
+    #[serde(rename = "system")]
     System,
+    #[serde(rename = "macos")]
     MacosStyle,
+    #[serde(rename = "windows")]
     WindowsLinuxStyle,
 }
 
@@ -206,6 +225,65 @@ pub fn resolve_combo(spec: &str, macos: bool) -> Vec<String> {
         .collect()
 }
 
+/// Resolves a real, already-registered `gpui::Keystroke` (`crate::default_key_bindings`'s
+/// actual, live `gpui::KeyBinding`s, not a hand-transcribed spec string) into the same real
+/// per-platform glyphs [`resolve_combo`] produces - the Settings › Keybindings page's real input
+/// (`crate::settings::keybinding_rows`), so its rows read directly off what's really bound and
+/// can never drift the way a second, hand-copied `"mod+K"`-style list already had (a wrong
+/// `context` label, an order that quietly stopped matching real registration order).
+///
+/// This is the one place in this module that takes a real `gpui::` type - every real, global
+/// keybinding `crate::default_key_bindings` registers is authored with either no modifier at all
+/// (`"f12"`) or exactly GPUI's own `"secondary-"` prefix (never a literal, independent `"cmd-"`/
+/// `"ctrl-"`), which `gpui::Keystroke::parse` resolves to exactly one of `modifiers.platform`
+/// (macOS) or `modifiers.control` (every other OS) at compile time - see
+/// `crate::default_key_bindings`'s own docs. `Modifiers::secondary()` is GPUI's own real,
+/// already-verified answer to "is this real, compiled modifier that same 'secondary' concept",
+/// so folding it into this table's cross-platform `modifier` glyph (rather than the physical
+/// `ctrl` glyph) reconstructs *this exact compiled binary's* real registered shortcut, not a
+/// second guess - a literal, independent `ctrl`/`alt`/`shift` held alongside it (none of this
+/// app's four real global bindings do, but a future one could) still renders as its own,
+/// separate glyph.
+pub fn resolve_keystroke(keystroke: &gpui::Keystroke, macos: bool) -> Vec<String> {
+    let table = if macos {
+        &MACOS_TABLE
+    } else {
+        &WINDOWS_LINUX_TABLE
+    };
+    let modifiers = &keystroke.modifiers;
+    let mut parts = Vec::new();
+    if modifiers.secondary() {
+        parts.push(table.modifier.to_string());
+    } else if modifiers.control {
+        parts.push(table.ctrl.to_string());
+    }
+    if modifiers.alt {
+        parts.push(table.alt.to_string());
+    }
+    if modifiers.shift {
+        parts.push(table.shift.to_string());
+    }
+    parts.push(resolve_keystroke_key(&keystroke.key, macos));
+    parts
+}
+
+/// `gpui::Keystroke::parse` always stores `key` lowercased (`vendor/zed/crates/gpui/src/
+/// platform/keystroke.rs`'s own real `key_str.make_ascii_lowercase()`), unlike every
+/// hand-authored spec string this module already renders (`"mod+N"`, `"F12"`) which is written
+/// already-capitalized. [`resolve_token`] alone would silently start rendering real, derived keys
+/// in lowercase (`"n"`, `"f12"`) even though every other keycap in this app is capitalized - this
+/// wrapper applies the same capitalization a hand-authored spec already carries, but only to a
+/// token [`resolve_token`] didn't itself recognize and resolve to a named glyph (an `enter`/`esc`/
+/// `tab`/... token is already correctly-cased by its table entry, and must not be re-cased).
+fn resolve_keystroke_key(key: &str, macos: bool) -> String {
+    let resolved = resolve_token(key, macos);
+    if resolved == key {
+        resolved.to_uppercase()
+    } else {
+        resolved
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +376,58 @@ mod tests {
     fn default_window_controls_style_is_system() {
         assert_eq!(WindowControlsStyle::default(), WindowControlsStyle::System);
     }
+
+    #[test]
+    fn resolve_keystroke_renders_the_secondary_modifier_as_the_cross_platform_mod_glyph() {
+        // Exactly what `gpui::Keystroke::parse("secondary-n")` produces on a non-macOS build -
+        // `modifiers.control == true`, `modifiers.platform == false` (see that function's own
+        // docs, quoted in `crate::default_key_bindings`).
+        let keystroke = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            key: "n".to_string(),
+            key_char: None,
+        };
+        assert_eq!(
+            resolve_keystroke(&keystroke, false),
+            vec!["Ctrl".to_string(), "N".to_string()]
+        );
+        assert_eq!(
+            resolve_keystroke(&keystroke, true),
+            vec!["\u{2318}".to_string(), "N".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_keystroke_with_no_modifiers_capitalizes_an_unrecognized_key_like_a_hand_authored_spec(
+    ) {
+        // `gpui::Keystroke::parse("f12")` stores `key == "f12"` (lowercased) - real, live-bound
+        // `crate::default_key_bindings`'s `f12` entry - but every hand-authored spec string this
+        // module renders capitalizes bare keys (`"F12"`), so a derived key must match.
+        let keystroke = gpui::Keystroke {
+            modifiers: gpui::Modifiers::default(),
+            key: "f12".to_string(),
+            key_char: None,
+        };
+        assert_eq!(
+            resolve_keystroke(&keystroke, false),
+            vec!["F12".to_string()]
+        );
+    }
+
+    // Note: `resolve_keystroke`'s `else if modifiers.control` branch (a real, independent `ctrl`
+    // modifier held *without* `secondary`) is only reachable on a real macOS build, where
+    // `Modifiers::secondary()` (`vendor/zed/crates/gpui/src/platform/keystroke.rs`) resolves to
+    // `modifiers.platform`, not `modifiers.control` - on this Linux dev/test sandbox (this app's
+    // only currently-supported, currently-verifiable platform - see
+    // `crate::root::settings_widgets::open_settings_file`'s own docs), `secondary()` *is*
+    // `modifiers.control`, so any keystroke with `control: true` already takes the `secondary`
+    // branch and there is no real, constructible `Keystroke` value here that could reach the
+    // `else if` at all. Not tested for the same honest reason `crate::keymap::WindowControlsStyle`'s
+    // own docs give for its own `cfg!(target_os = "macos")`-gated behavior: real, compile-time-
+    // correct code this sandbox cannot compile-and-run the other branch of.
 
     #[test]
     fn labels_are_the_real_command_palette_display_strings() {

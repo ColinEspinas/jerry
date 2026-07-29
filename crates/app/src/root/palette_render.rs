@@ -125,21 +125,21 @@ impl AdeApp {
             palette::CommandCandidate {
                 command: palette::PaletteCommand::WindowControlsSystem,
                 secondary: window_controls_secondary(
-                    self.window_controls_style,
+                    self.window_controls_style(),
                     WindowControlsStyle::System,
                 ),
             },
             palette::CommandCandidate {
                 command: palette::PaletteCommand::WindowControlsMacos,
                 secondary: window_controls_secondary(
-                    self.window_controls_style,
+                    self.window_controls_style(),
                     WindowControlsStyle::MacosStyle,
                 ),
             },
             palette::CommandCandidate {
                 command: palette::PaletteCommand::WindowControlsWindowsLinux,
                 secondary: window_controls_secondary(
-                    self.window_controls_style,
+                    self.window_controls_style(),
                     WindowControlsStyle::WindowsLinuxStyle,
                 ),
             },
@@ -255,22 +255,19 @@ impl AdeApp {
             palette::PaletteCommand::PruneWorktrees => self.request_prune(cx),
             palette::PaletteCommand::OpenSettings => self.open_settings(window, cx),
             // See `crate::keymap`'s module docs and `palette::PaletteCommand::
-            // WindowControlsSystem`'s own docs for why these three exist here rather than on a
-            // real Settings page: a real, in-memory-only override that actually re-renders live
-            // (explicit `cx.notify()`, mirroring every other direct-field-mutation branch in
-            // this match, e.g. `Self::toggle_rail_mode`'s own), never persisted to a config
-            // file (that's R3's job).
+            // WindowControlsSystem`'s own docs for why these three still exist here even now
+            // that the General settings page has its own real `Window controls` row: both
+            // real entry points call the exact same `Self::set_window_controls_style`, which
+            // mutates and persists `Self::settings.window.controls` for real (R3) - never two
+            // independent copies.
             palette::PaletteCommand::WindowControlsSystem => {
-                self.window_controls_style = WindowControlsStyle::System;
-                cx.notify();
+                self.set_window_controls_style(WindowControlsStyle::System, cx);
             }
             palette::PaletteCommand::WindowControlsMacos => {
-                self.window_controls_style = WindowControlsStyle::MacosStyle;
-                cx.notify();
+                self.set_window_controls_style(WindowControlsStyle::MacosStyle, cx);
             }
             palette::PaletteCommand::WindowControlsWindowsLinux => {
-                self.window_controls_style = WindowControlsStyle::WindowsLinuxStyle;
-                cx.notify();
+                self.set_window_controls_style(WindowControlsStyle::WindowsLinuxStyle, cx);
             }
         }
     }
@@ -770,7 +767,7 @@ impl AdeApp {
         }
         if let Some(spec) = entry.shortcut {
             row = row.child(render_keycap_row(
-                &keymap::resolve_combo(spec, self.window_controls_style.is_macos()),
+                &keymap::resolve_combo(spec, self.window_controls_style().is_macos()),
                 KeycapSize::Standard,
             ));
         }
@@ -795,7 +792,7 @@ impl AdeApp {
     /// names), so it passes through `resolve_combo` unchanged, the same real "unrecognized token"
     /// path a bare letter like `N` takes.
     pub(super) fn render_palette_footer(&self, total: usize) -> impl IntoElement {
-        let macos = self.window_controls_style.is_macos();
+        let macos = self.window_controls_style().is_macos();
         let hints = [
             ("\u{2191}\u{2193}", "move"),
             ("enter", "run"),

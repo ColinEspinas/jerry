@@ -430,7 +430,7 @@ impl AdeApp {
                     .child("+"),
             )
             .child(render_keycap_row(
-                &keymap::resolve_combo("mod+N", self.window_controls_style.is_macos()),
+                &keymap::resolve_combo("mod+N", self.window_controls_style().is_macos()),
                 KeycapSize::Standard,
             ))
             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {

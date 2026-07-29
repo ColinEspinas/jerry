@@ -55,7 +55,7 @@ impl AdeApp {
                     .items_center()
                     .gap(px(6.0))
                     .child(render_keycap_row(
-                        &keymap::resolve_combo("mod+K", self.window_controls_style.is_macos()),
+                        &keymap::resolve_combo("mod+K", self.window_controls_style().is_macos()),
                         KeycapSize::Standard,
                     ))
                     .child(

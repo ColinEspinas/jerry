@@ -54,6 +54,11 @@ alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev 
 # vendor/zed's own `Cargo.lock` exactly), so it's left as a normal caret requirement.
 tree-sitter = "=0.26.9"
 tree-sitter-rust = "0.24.2"
+# Real `~/.config/jerry/settings.toml` load/save (`crate::settings_store`) - see the workspace
+# `Cargo.toml`'s own comment for why these three are pinned the way they are.
+serde = { workspace = true }
+toml = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

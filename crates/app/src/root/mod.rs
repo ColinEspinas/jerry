@@ -56,6 +56,7 @@ use crate::rail::{
 };
 use crate::sessions::{Session, SessionId, SessionKind, Sessions};
 use crate::settings::{self, SettingsPage};
+use crate::settings_store::{self, CfgFormat, Settings};
 use crate::status::{self, Status};
 use crate::theme;
 use crate::work_surface;
@@ -626,17 +627,126 @@ pub struct AdeApp {
     /// file's later load - and by `spawn_file_load`'s own failed-load branch, so a real read error
     /// can't leave it to misapply onto whatever loads successfully next.
     pending_cursor_line: Option<(PathBuf, usize)>,
-    /// Which platform's title-bar variant/keycap glyphs render right now
-    /// (`design_handoff_jerry_ade/CHANGELOG.md`'s 2026-07-29 entry, changes 1 and 2 - see
-    /// `crate::keymap`'s module docs for why this one field drives both). Defaults to
-    /// [`WindowControlsStyle::System`] (real OS detection); overridden live, in-memory only
-    /// (never persisted - that's R3's config-file-backed Settings job), by the command
-    /// palette's three `Window controls: …` entries
-    /// (`crate::root::palette_render::execute_palette_command`'s
-    /// `WindowControlsSystem`/`WindowControlsMacos`/`WindowControlsWindowsLinux` branches) - a
-    /// deliberate, documented placeholder entry point for this phase, until R3's real General
-    /// settings page gives it a permanent home.
-    window_controls_style: WindowControlsStyle,
+    /// The real, config-file-backed settings struct (`design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s 2026-07-29 entry, change 3) - loaded once from `~/.config/jerry/
+    /// settings.toml` at startup (`Self::new`, via `Settings::load_or_init`) and re-saved
+    /// (`Self::persist_settings`) on every real change made from the General/Appearance &
+    /// scaling/Themes settings pages or the command palette's `Window controls: …` entries.
+    /// See `crate::settings_store`'s own module docs for exactly which fields are
+    /// persisted-only vs. also applied, and [`Self::window_controls_style`] for the one field
+    /// this struct exposes through a dedicated accessor rather than a bare field read.
+    settings: Settings,
+    /// The real, resolved path [`Self::persist_settings`] writes to - `Some(~/.config/jerry/
+    /// settings.toml)` in production (`Self::new`), `None` for every GPUI test built via
+    /// `root::focus::palette_focus_tests::open_test_app` (`Self::new_with_settings`'s own
+    /// docs) - see [`Self::persist_settings`] for why a `None` here makes a save a genuine,
+    /// honest no-op rather than a special-cased test skip.
+    settings_path: Option<PathBuf>,
+    /// The single, real, in-flight [`Self::persist_settings`] background save, if any - unlike
+    /// [`Self::_lsp_tasks`]'s own "independent operations" `Vec`, settings saves are never
+    /// independent of each other: there is only ever one real `settings.toml` to write, so a
+    /// fast second settings change must *supersede* an earlier still-mid-write save, not race
+    /// it. This used to be a `Vec`, with each save capturing its own `Settings` snapshot at
+    /// *spawn* time - a real, live bug: two fast edits (e.g. clicking a stepper twice quickly)
+    /// had no ordering guarantee between their two independent `std::fs::write` calls, so the
+    /// file could end up holding the *older* edit's value if its write happened to land last,
+    /// silently reverting the newer one on disk (and, on next launch, in memory) even though
+    /// the UI kept showing the newer value. Assigning a fresh task to this single slot instead
+    /// drops (and so immediately cancels, per GPUI's real "dropping a `Task` cancels it
+    /// immediately" semantics - the same real mechanism [`Self::_hover_request_task`]'s own docs
+    /// rely on for this exact "supersede the previous pending op" shape) any still-in-flight
+    /// previous save. And unlike the old per-task snapshot, [`Self::persist_settings`]'s spawned
+    /// closure reads [`Self::settings`] fresh, at the moment it actually runs, not at the moment
+    /// it was spawned - so even in the residual window where a superseded save's background
+    /// `std::fs::write` was already dispatched to a thread-pool worker before cancellation could
+    /// stop it (the same real, disclosed, already-accepted race
+    /// [`Self::_hover_request_task`]'s own docs describe for a superseded hover request), it was
+    /// still writing *some* real, live snapshot of the settings at the time it ran, never a
+    /// stale one captured before a later edit happened.
+    _settings_save_task: Option<Task<()>>,
+    /// The config banner's real `TOML | JSON` segment (`design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s change 3) - a display-only choice, not itself a [`Settings`] field, see
+    /// `crate::settings_store`'s "TOML is the real file; JSON is a read-only alternate view"
+    /// docs.
+    settings_cfg_format: CfgFormat,
+    /// The Settings › Language servers page's real rows - `crate::settings::detect_lsp_rows`,
+    /// resolved via `pty_core::resolve_on_path`, cached the same way [`Self::agent_rows`] is
+    /// (see that field's own docs for the real ~30ms-per-not-found-binary cost this avoids
+    /// paying on every render).
+    lsp_rows: Vec<settings::LspRow>,
+    _lsp_rows_task: Option<Task<()>>,
+    /// The Keybindings settings page's real, hand-rolled filter query - same minimal
+    /// append/backspace shape as [`Self::filter_query`] (see
+    /// [`Self::handle_settings_keymap_filter_key_down`]).
+    settings_keymap_filter: String,
+    settings_keymap_filter_focus_handle: FocusHandle,
+}
+
+impl AdeApp {
+    /// The real, single source of truth for which platform's title-bar variant/keycap glyphs
+    /// render right now (`design_handoff_jerry_ade/CHANGELOG.md`'s 2026-07-29 entry, changes 1
+    /// and 2 - see `crate::keymap`'s module docs for why this one field drives both).
+    /// [`Self::settings`]`.window.controls` is the real, persisted backing (R3) - both the
+    /// General settings page's `Window controls` choice row and the command palette's three
+    /// `Window controls: …` entries read/write it through this same accessor and
+    /// [`Self::set_window_controls_style`], never a second, independent copy.
+    pub(super) fn window_controls_style(&self) -> WindowControlsStyle {
+        self.settings.window.controls
+    }
+
+    /// Sets [`Self::window_controls_style`] and persists it for real (`Self::persist_settings`).
+    /// The one real write path both the General settings page and the command palette's three
+    /// `Window controls: …` entries call, so the two can never silently disagree about which
+    /// override is active.
+    pub(super) fn set_window_controls_style(
+        &mut self,
+        style: WindowControlsStyle,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.window.controls = style;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// Spawns a real, background-executor save of the *current* [`Self::settings`] value to
+    /// [`Self::settings_path`] (`Settings::save_at`) - called from every real settings mutation
+    /// (see `Self::set_window_controls_style` and the Appearance/Themes page mutators in
+    /// `crate::root::settings_render`). A `None` path (every GPUI test - see
+    /// [`Self::settings_path`]'s own docs) makes this a genuine no-op, not a special test case;
+    /// a real save failure against a real, resolved path is logged, not surfaced to the UI.
+    ///
+    /// Deliberately re-reads [`Self::settings`] via `this.update` *inside* the spawned task,
+    /// rather than cloning it into the closure up front - see [`Self::_settings_save_task`]'s own
+    /// docs for the real out-of-order-write bug this fixes, and why a single superseding task
+    /// slot alone isn't quite enough on its own to close it. Mirrors the real "gather on
+    /// foreground, do blocking work on background" shape `Self::start_status_polling`/
+    /// `Self::load_worktrees` already use, just with the "gather" step being a single field
+    /// clone rather than a real `git`/`gix` call.
+    pub(super) fn persist_settings(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.settings_path.clone() else {
+            return;
+        };
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(settings) = this.update(cx, |this, _cx| this.settings.clone()) else {
+                // The entity is already gone (e.g. the window closed while this task was still
+                // queued) - nothing real left to save.
+                return;
+            };
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let path = path.clone();
+                    async move { settings.save_at(&path) }
+                })
+                .await;
+            if let Err(err) = result {
+                log::warn!("failed to save {}: {err}", path.display());
+            }
+        });
+        // A single slot, not an unbounded `Vec` - see `Self::_settings_save_task`'s own docs.
+        // Assigning here drops (and so immediately cancels) any still-in-flight previous save.
+        self._settings_save_task = Some(task);
+    }
 }
 
 impl Render for AdeApp {
@@ -814,6 +924,7 @@ mod palette_render;
 mod rail_render;
 mod resize;
 mod settings_render;
+mod settings_widgets;
 mod sidebar_render;
 mod state;
 mod status_bar;
