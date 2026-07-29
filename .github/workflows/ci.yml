@@ -103,53 +103,82 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
-  # Build-only signal on macOS and Windows. This project's own dev environment is
-  # Linux/WSL2-only (see BUILD-LOG.md and README.md), so these jobs are the actual,
-  # only real verification that the workspace even compiles on those platforms going
-  # forward - nobody working on this repo can check that locally today (this sandbox
-  # included - Revision R11, which added the real per-target Cargo.toml sections below,
-  # verified them with `cargo check`/`cargo clippy --target x86_64-pc-windows-gnu` and
-  # `--target aarch64-apple-darwin` for `pty-core`/`wt-core`, and `cargo check --target
-  # x86_64-pc-windows-gnu` got well into `app`'s own real dependency tree before hitting
-  # an unrelated missing system `x86_64-w64-mingw32-gcc` cross-compiler this sandbox has
-  # no passwordless `sudo` to install - see BUILD-LOG.md's Revision R11 entry for exactly
-  # how far that verification reached and what it could not reach).
+  # Build-only signal on macOS and Windows, as two separate jobs (not a matrix) so all
+  # three platforms read as peers in the Actions UI, rather than Linux standing alone
+  # against one oddly-combined "the other two" job. This project's own dev environment
+  # is Linux/WSL2-only (see BUILD-LOG.md and README.md), so these two jobs are the
+  # actual, only real verification that the workspace even compiles on those platforms
+  # going forward - nobody working on this repo can check that locally today (this
+  # sandbox included - Revision R11, which added the real per-target Cargo.toml sections
+  # below, verified them with `cargo check`/`cargo clippy --target x86_64-pc-windows-gnu`
+  # and `--target aarch64-apple-darwin` for `pty-core`/`wt-core`, and `cargo check
+  # --target x86_64-pc-windows-gnu` got well into `app`'s own real dependency tree before
+  # hitting an unrelated missing system `x86_64-w64-mingw32-gcc` cross-compiler this
+  # sandbox has no passwordless `sudo` to install - see BUILD-LOG.md's Revision R11 entry
+  # for exactly how far that verification reached and what it could not reach).
   #
-  # `crates/app/Cargo.toml` now has real per-target `[target.'cfg(target_os =
+  # `crates/app/Cargo.toml` has real per-target `[target.'cfg(target_os =
   # "...")'.dependencies]` sections for `gpui_platform` (Revision R11): Linux requests the
   # `wayland` feature, macOS and Windows request no feature at all, because - unlike
   # Linux's `gpui_linux` - `gpui_platform`'s own Cargo.toml
   # (vendor/zed/crates/gpui_platform/Cargo.toml) pulls in `gpui_macos`/`gpui_windows`
   # purely from `target_os` via its own `[target.'cfg(...)'.dependencies]` sections, with
   # no corresponding top-level feature to request. So `cargo build --workspace` below
-  # needs no `--features` flag on any platform: per-target dependency/feature selection
-  # is Cargo's job, resolved automatically from the actual build target.
+  # needs no `--features` flag on either platform: per-target dependency/feature
+  # selection is Cargo's job, resolved automatically from the actual build target.
   #
-  # Two real, platform-specific build-script requirements worth recording here, found by
-  # reading `vendor/zed/crates/gpui_macos/build.rs` and `gpui_windows/build.rs` directly
-  # (not assumed): macOS's build script unconditionally shells out to `xcrun -sdk macosx
-  # metal` to compile real Metal shaders - this needs a full Xcode install, not just the
-  # standalone Command Line Tools package (`macos-latest` runner images ship full Xcode,
-  # so this is expected to work, but is unverified from this Linux-only sandbox). The
-  # Windows build script's `fxc.exe`-based HLSL shader compilation is gated behind
-  # `#[cfg(not(debug_assertions))]`, i.e. release-only - this job's plain (debug) `cargo
-  # build --workspace` never invokes it, so a real regression on that specific path
-  # (`fxc.exe` not found, etc.) would not be caught here; only `cargo build --release`
-  # would exercise it, which is out of scope for a build-only signal job.
-  #
-  # Both jobs' "Fetch vendor/zed" step already sets `shell: bash` explicitly (checked
-  # for this revision, not assumed) - load-bearing on `windows-latest`, whose *default*
-  # shell for a `run:` step without an explicit `shell:` is PowerShell, which the bash
-  # `git init && git remote add && ...` script above would not parse correctly. `bash` is
+  # Both jobs' "Fetch vendor/zed" step sets `shell: bash` explicitly (checked for this
+  # revision, not assumed) - load-bearing on `windows-latest`, whose *default* shell for
+  # a `run:` step without an explicit `shell:` is PowerShell, which the bash
+  # `git init && git remote add && ...` script below would not parse correctly. `bash` is
   # available there via the Git for Windows install already bundled into GitHub's
   # `windows-latest` runner image.
-  cross-build:
-    name: Build only (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
+  macos:
+    name: macOS (build only)
+    runs-on: macos-latest
+    # A real, platform-specific build-script requirement found by reading
+    # `vendor/zed/crates/gpui_macos/build.rs` directly (not assumed): it unconditionally
+    # shells out to `xcrun -sdk macosx metal` to compile real Metal shaders - this needs
+    # a full Xcode install, not just the standalone Command Line Tools package.
+    # `macos-latest` runner images ship full Xcode, so this is expected to work, but is
+    # unverified from this Linux-only sandbox.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Fetch vendor/zed (pinned commit)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init vendor/zed
+          git -C vendor/zed remote add origin https://github.com/zed-industries/zed
+          git -C vendor/zed fetch --depth 1 origin "$ZED_VENDOR_COMMIT"
+          git -C vendor/zed checkout FETCH_HEAD
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+  windows:
+    name: Windows (build only)
+    runs-on: windows-latest
+    # A real, platform-specific build-script quirk found by reading
+    # `vendor/zed/crates/gpui_windows/build.rs` directly (not assumed): its
+    # `fxc.exe`-based HLSL shader compilation is gated behind
+    # `#[cfg(not(debug_assertions))]`, i.e. release-only - this job's plain (debug)
+    # `cargo build --workspace` never invokes it, so a real regression on that specific
+    # path (`fxc.exe` not found, etc.) would not be caught here; only
+    # `cargo build --release` would exercise it, which is out of scope for a build-only
+    # signal job.
     steps:
       - name: Checkout
         uses: actions/checkout@v7
