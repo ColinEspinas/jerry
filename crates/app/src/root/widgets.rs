@@ -109,6 +109,48 @@ pub(super) fn render_hint_row(
     div().flex().items_center().gap(px(11.0)).children(pairs)
 }
 
+/// The real environment chip (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29
+/// entry, change 8): `WSL · <distro>` when this process is genuinely running inside WSL
+/// (`crate::env_info::is_wsl`), else `local · <arch>` (`crate::env_info::local_arch`,
+/// `std::env::consts::ARCH`). A parameterless, real-environment-reading widget - the terminal
+/// info footer (`crate::root::work_surface_render::render_pty_info_footer`, Revision R4b) is
+/// its first real call site; the status bar chip and the Settings `Default environment` row
+/// (both Revision R6, per the same changelog entry) are meant to call this exact function too,
+/// not a second, hand-copied chip.
+pub(super) fn render_env_chip() -> impl IntoElement {
+    let (label, fg, bg, border) = if env_info::is_wsl() {
+        let distro = env_info::wsl_distro_name().unwrap_or("WSL");
+        (
+            format!("WSL \u{b7} {distro}"),
+            theme::env::WSL_FG,
+            theme::env::WSL_BG,
+            theme::env::WSL_BORDER,
+        )
+    } else {
+        (
+            format!("local \u{b7} {}", env_info::local_arch()),
+            theme::env::LOCAL_FG,
+            work_surface::TRANSPARENT,
+            theme::env::LOCAL_BORDER,
+        )
+    };
+
+    div()
+        .flex_none()
+        .h(px(17.0))
+        .px(px(6.0))
+        .rounded(theme::radius::CHIP)
+        .border_1()
+        .border_color(border)
+        .bg(bg)
+        .flex()
+        .items_center()
+        .font(font(theme::font::MONO))
+        .text_size(px(9.5))
+        .text_color(fg)
+        .child(label)
+}
+
 /// A themed, single-line message used for every Zone 3 empty/loading/error state (the file
 /// tree's and the Changes list's alike) - one real, consistent look instead of each call site
 /// improvising its own.

@@ -1,5 +1,7 @@
 use super::*;
-use crate::root::widgets::{render_action_keycap_row, render_keycap_row, KeycapSize};
+use crate::root::widgets::{
+    render_action_keycap_row, render_env_chip, render_hint_pair, render_keycap_row, KeycapSize,
+};
 
 /// Defines one `JumpToSessionN` real action handler - see [`AdeApp::jump_to_session_at`]'s docs
 /// for why eight separate, near-identical handlers (one per real keystroke `secondary-1`..
@@ -31,7 +33,7 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let cwd = self.active_session_cwd();
-        self.sessions.spawn(kind, cwd, cx);
+        self.sessions.spawn(kind, cwd, window, cx);
         self.focus_newly_spawned_session(window, cx);
         self.prune_confirm_armed = false;
         cx.notify();
@@ -229,7 +231,7 @@ impl AdeApp {
         let kind = session.kind;
         let cwd = session.cwd.clone();
         self.close_session(id, window, cx);
-        self.sessions.spawn(kind, cwd, cx);
+        self.sessions.spawn(kind, cwd, window, cx);
         self.focus_newly_spawned_session(window, cx);
         self.prune_confirm_armed = false;
         cx.notify();
@@ -255,7 +257,7 @@ impl AdeApp {
         match existing {
             Some(id) => self.select_session(id, window, cx),
             None => {
-                self.sessions.spawn(SessionKind::Shell, cwd, cx);
+                self.sessions.spawn(SessionKind::Shell, cwd, window, cx);
                 self.focus_newly_spawned_session(window, cx);
                 self.prune_confirm_armed = false;
                 cx.notify();
@@ -740,7 +742,7 @@ impl AdeApp {
             // the same reason.
             let _ = this.update_in(cx, |this, window, cx| {
                 let kind = installed.unwrap_or(settings::AGENT_KINDS[0]);
-                this.sessions.spawn(kind, cwd, cx);
+                this.sessions.spawn(kind, cwd, window, cx);
                 this.focus_newly_spawned_session(window, cx);
                 this.prune_confirm_armed = false;
                 cx.notify();
@@ -1112,6 +1114,51 @@ impl AdeApp {
     /// (no `--resume <sha>` to show - see `crate::work_surface::pty_state_label`'s docs), so
     /// the left label is the real resolved program name alone, never a fabricated resume
     /// argument.
+    ///
+    /// ## Real content added this phase (Revision R4b), not replaced
+    ///
+    /// A `Shell` session's own program label gets a real ` · wsl` suffix when this process is
+    /// genuinely running inside WSL (`crate::env_info::is_wsl`, per
+    /// `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change 5: "shell
+    /// name is platform-dependent (`zsh` / `bash · wsl`)"). Every session kind - not just
+    /// `Shell` - gets a real hint row: `mod + click a path to open it` (real, now that
+    /// `crate::terminal_pane::render_row`'s own link detection/click-to-open exists) and a
+    /// real, click-only `clear` action (`crate::terminal_pane::TerminalPane::clear`). This was
+    /// briefly `Shell`-only before this fix, which was itself a bug: link-clicking and
+    /// `clear` both work identically for a `Claude`/`Codex` agent session's real stderr/panic
+    /// output (`render_row` is the exact same call for every session kind - see
+    /// `crate::terminal_pane`'s own module docs, "`TerminalPane` itself has no notion of shell
+    /// vs. agent CLI"), so hiding the hint/control there just meant an agent session with a
+    /// real clickable panic frame on screen had no UI ever telling the user that was possible.
+    /// The design's own third hint, `split`, is deliberately **not** rendered - this app has no
+    /// real terminal-pane-splitting feature at all (a much bigger, unrequested layout feature -
+    /// see this phase's own report), and this codebase's established discipline is to omit a
+    /// hint entirely rather than render a decorative keycap for a feature that doesn't exist
+    /// (the same real precedent `Self::render_plus_menu`'s own "Open file…" row already set for
+    /// exactly this situation).
+    ///
+    /// A `Claude`/`Codex` session's real pid is no longer shown in this header at all - the new
+    /// info footer band (`Self::render_pty_info_footer`, also this phase) now shows it for
+    /// every session kind, so keeping it here too meant an agent session showed its own pid
+    /// twice (once in this header, once 26px below in the footer).
+    ///
+    /// `clear` is real but deliberately click-only, not a global keybinding, even though the
+    /// design's own spec shows `mod+K`: `"mod"`/`"secondary"` resolves to plain `Ctrl` on
+    /// Linux/Windows (`crate::keymap`'s own docs), and ``Ctrl+K`` is a real, standard readline
+    /// binding (`kill-line`) every focused shell relies on - binding it globally would repeat
+    /// the exact "app-level shortcut steals real terminal input" bug class `crate::
+    /// default_key_bindings`'s own docs already document once for `secondary-p`/Ctrl+P.
+    /// `vendor/zed/assets/keymaps/default-linux.json`'s own real `terminal::Clear` binding
+    /// independently confirms this isn't overcaution: Zed binds its own terminal-clear action
+    /// to `ctrl-shift-l` on Linux/Windows specifically to avoid this exact collision, reserving
+    /// `cmd-k` for macOS alone (where a platform-modified keystroke is never forwarded to the
+    /// pty in the first place - see `crate::terminal_pane::keystroke_to_bytes`'s own guard).
+    /// Rather than introduce a second, OS-conditional key-binding-registration mechanism this
+    /// codebase doesn't otherwise have just for one small action, this hint is real but
+    /// click-only, per this phase's own explicit "if in doubt, prefer click-only" guidance -
+    /// no keycap is rendered for it, matching the same "no keycap for a binding that doesn't
+    /// exist" discipline `split`'s omission above and `Self::render_plus_menu`'s "Open file…"
+    /// row already establish.
     pub(super) fn render_pty_header(
         &self,
         session: &Session,
@@ -1119,11 +1166,16 @@ impl AdeApp {
     ) -> impl IntoElement {
         let pane = session.pane.read(cx);
         let program_label = pane.program_label();
-        let pid = pane.pid();
         let is_running = pane.is_running();
         let exit_code = pane.exit_status().map(|status| status.exit_code());
         let status_value = self.session_status(session, cx);
         let state_label = work_surface::pty_state_label(is_running, status_value, exit_code);
+        let is_wsl_shell = session.kind == SessionKind::Shell && env_info::is_wsl();
+        let label_text = if is_wsl_shell {
+            format!("{program_label} \u{b7} wsl")
+        } else {
+            program_label
+        };
 
         let header = div()
             .id("pty-header")
@@ -1142,35 +1194,53 @@ impl AdeApp {
                     .font(font(theme::font::MONO))
                     .text_size(px(10.5))
                     .text_color(theme::text::DIM)
-                    .child(program_label),
+                    .child(label_text),
             );
 
         let header = match session.kind {
             SessionKind::Shell => header.child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .flex_none()
+                    .max_w(px(280.0))
+                    .overflow_hidden()
                     .truncate()
                     .font(font(theme::font::MONO))
                     .text_size(px(10.5))
                     .text_color(theme::text::GHOST)
                     .child(session.cwd.display().to_string()),
             ),
-            SessionKind::Claude | SessionKind::Codex => {
-                let header = match pid {
-                    Some(pid) => header.child(
-                        div()
-                            .flex_none()
-                            .font(font(theme::font::MONO))
-                            .text_size(px(10.5))
-                            .text_color(theme::text::GHOST)
-                            .child(format!("pid {pid}")),
-                    ),
-                    None => header,
-                };
-                header.child(div().flex_1())
-            }
+            // No real per-kind header content for an agent session anymore - its pid now shows
+            // exactly once, in the info footer band below (`Self::render_pty_info_footer`), not
+            // duplicated here too. See this method's own docs for the real double-pid bug this
+            // closes.
+            SessionKind::Claude | SessionKind::Codex => header,
         };
+
+        let macos = self.window_controls_style().is_macos();
+        let pane_entity = session.pane.clone();
+        let header = header.child(div().flex_1()).child(
+            div()
+                .id("pty-header-hints")
+                .flex()
+                .items_center()
+                .gap(px(11.0))
+                .child(render_hint_pair(
+                    &keymap::resolve_combo("mod", macos),
+                    "click a path to open it",
+                ))
+                .child(
+                    div()
+                        .id("pty-header-clear")
+                        .cursor_pointer()
+                        .rounded(theme::radius::CHIP)
+                        .px(px(3.0))
+                        .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                        .child(render_hint_pair(&[], "clear"))
+                        .on_click(cx.listener(move |_this, _event: &ClickEvent, _window, cx| {
+                            pane_entity.update(cx, |pane, cx| pane.clear(cx));
+                        })),
+                ),
+        );
 
         header.child(
             div()
@@ -1179,6 +1249,73 @@ impl AdeApp {
                 .text_size(px(10.0))
                 .text_color(theme::text::HINT)
                 .child(state_label),
+        )
+    }
+
+    /// The terminal pane's own new 26px info footer (`design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s 2026-07-29 entry, change 5: "New footer band ... `pid` · `148×38` · the
+    /// environment chip ... right-aligned `file:line references open in a tab`") - additive,
+    /// the pane had no footer of its own before this phase. Rendered for every session kind
+    /// (not just agent sessions the way the header's own `pid` used to be): `TerminalPane` is
+    /// the exact same real component behind a `Shell` tab and a `Claude`/`Codex` tab (see that
+    /// module's own docs - it has no notion of "shell" vs. "agent CLI" at all), so a real pid
+    /// and real grid dimensions are exactly as meaningful for either. Distinct from, and
+    /// rendered alongside (not instead of), [`Self::render_pty_footer`] - that's still the
+    /// real session-level Interrupt/Retry/Archive action footer, unchanged.
+    pub(super) fn render_pty_info_footer(
+        &self,
+        session: &Session,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let pane = session.pane.read(cx);
+        let pid = pane.pid();
+        let (cols, rows) = pane.grid_dimensions();
+
+        let divider = || {
+            div()
+                .flex_none()
+                .w(px(1.0))
+                .h(px(11.0))
+                .bg(theme::border::DIVIDER)
+        };
+        let mono_text = |text: String| {
+            div()
+                .flex_none()
+                .font(font(theme::font::MONO))
+                .text_size(px(10.0))
+                .text_color(theme::text::PATH)
+                .child(text)
+        };
+
+        let mut footer = div()
+            .id("pty-info-footer")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(12.0))
+            .h(theme::band::PTY_INFO_FOOTER)
+            .bg(theme::surface::FOOTER)
+            .border_t_1()
+            .border_color(theme::border::INNER);
+
+        if let Some(pid) = pid {
+            footer = footer
+                .child(mono_text(format!("pid {pid}")))
+                .child(divider());
+        }
+        footer = footer
+            .child(mono_text(format!("{cols}\u{d7}{rows}")))
+            .child(divider())
+            .child(render_env_chip());
+
+        footer.child(div().flex_1()).child(
+            div()
+                .flex_none()
+                .font(font(theme::font::SANS))
+                .text_size(px(10.0))
+                .text_color(theme::text::HINT)
+                .child("file:line references open in a tab"),
         )
     }
 
@@ -1419,6 +1556,7 @@ impl AdeApp {
                                 .overflow_hidden()
                                 .child(session.pane.clone().into_any_element()),
                         )
+                        .child(self.render_pty_info_footer(session, cx))
                         .child(self.render_pty_footer(session, cx))
                         .into_any_element()
                 };

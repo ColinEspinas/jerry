@@ -45,6 +45,7 @@ use wt_core::merge::{ConflictHunk, ConflictSegment, ConflictedPath};
 use crate::changes::{self, ChangeTag};
 use crate::code_view;
 use crate::diagnostics_view;
+use crate::env_info;
 use crate::file_tree::{self, FileTreeEntry, LangChip};
 use crate::hover_view;
 use crate::keymap::{self, WindowControlsStyle};

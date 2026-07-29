@@ -588,9 +588,9 @@ mod tab_strip_keybinding_tests {
         let first_id = app.read_with(cx, |app, _| {
             app.sessions.active_id().expect("the initial shell session")
         });
-        app.update(cx, |app, cx| {
+        app.update_in(cx, |app, window, cx| {
             app.sessions
-                .spawn(SessionKind::Shell, repo.path().to_path_buf(), cx)
+                .spawn(SessionKind::Shell, repo.path().to_path_buf(), window, cx)
         });
         app.update_in(cx, |app, window, cx| {
             app.select_session(first_id, window, cx);
@@ -628,9 +628,9 @@ mod tab_strip_keybinding_tests {
         let first_id = app.read_with(cx, |app, _| {
             app.sessions.active_id().expect("the initial shell session")
         });
-        app.update(cx, |app, cx| {
+        app.update_in(cx, |app, window, cx| {
             app.sessions
-                .spawn(SessionKind::Shell, repo.path().to_path_buf(), cx)
+                .spawn(SessionKind::Shell, repo.path().to_path_buf(), window, cx)
         });
         app.update_in(cx, |app, window, cx| {
             app.select_session(first_id, window, cx);
@@ -839,9 +839,9 @@ mod tab_strip_keybinding_tests {
             app.sessions.active_id().expect("the initial shell session")
         })];
         for _ in 0..3 {
-            let id = app.update(cx, |app, cx| {
+            let id = app.update_in(cx, |app, window, cx| {
                 app.sessions
-                    .spawn(SessionKind::Shell, repo.path().to_path_buf(), cx)
+                    .spawn(SessionKind::Shell, repo.path().to_path_buf(), window, cx)
             });
             ids.push(id);
         }

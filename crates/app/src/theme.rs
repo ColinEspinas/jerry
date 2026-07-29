@@ -245,6 +245,42 @@ pub mod term {
     pub const MENU_SEL_FG: Rgba = hex(0xe0b263);
     pub const MENU_SEL_BG: Rgba = hex(0x1f1a10);
     pub const CURSOR: Rgba = hex(0x5a9ad4);
+    /// A real, clickable path/`path:line` link inside terminal output
+    /// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change 5) -
+    /// `Jerry.dc.html`'s own link span template: `color:#7fb4e3;border-bottom:1px dotted
+    /// #3d6a91`.
+    pub const LINK: Rgba = hex(0x7fb4e3);
+    pub const LINK_UNDERLINE: Rgba = hex(0x3d6a91);
+    /// The same link's real hover state (`Jerry.dc.html`: `style-hover="color:#a5cdf0;
+    /// border-bottom:1px solid #78a8d0"`). `LINK_HOVER` happens to be the exact same value as
+    /// [`super::button::BLUE_FG`] - kept as its own distinct token anyway, matching this
+    /// module's (and `super::text::PATH`'s) own established policy of one real UI element, one
+    /// named token, even when two unrelated elements happen to share a designed colour.
+    pub const LINK_HOVER: Rgba = hex(0xa5cdf0);
+    pub const LINK_UNDERLINE_HOVER: Rgba = hex(0x78a8d0);
+}
+
+/// The environment (WSL) chip - `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29
+/// entry, change 8. One real, reusable set of tokens for the one real widget
+/// (`crate::root::widgets::render_env_chip`) shown in three places across this revision and the
+/// next: the terminal footer (Revision R4b, this phase), and the status bar chip plus the
+/// Settings `Default environment` row (both Revision R6).
+pub mod env {
+    use super::{hex, Rgba};
+
+    /// `Jerry.dc.html`: `footRemoteFg: plat === 'windows' ? '#8fbde6' : ...` - the exact same
+    /// value already ported as [`super::term::PROMPT`], reused directly per this crate's own
+    /// "no separate token for a value that's already the exact same real thing" precedent
+    /// (`super::button`'s own `BLUE_KEYCAP`/`term::PROMPT` note).
+    pub const WSL_FG: Rgba = super::term::PROMPT;
+    pub const WSL_BG: Rgba = hex(0x16222c);
+    pub const WSL_BORDER: Rgba = hex(0x24384a);
+    /// `Jerry.dc.html`: `footRemoteFg: ... : '#6b7178'` - the exact same value already ported
+    /// as [`super::text::FAINT`].
+    pub const LOCAL_FG: Rgba = super::text::FAINT;
+    /// `Jerry.dc.html`: `footRemoteBd: ... : '#22262a'` - the exact same value already ported
+    /// as [`super::border::DIVIDER`].
+    pub const LOCAL_BORDER: Rgba = super::border::DIVIDER;
 }
 
 /// One tint per agent. Used on the rail badge, the CLI tab chip and the
@@ -394,6 +430,13 @@ pub mod band {
     pub const FILTER_ROW: Pixels = px(30.0);
     pub const SURFACE_FOOTER: Pixels = px(28.0);
     pub const PTY_HEADER: Pixels = px(27.0);
+    /// The terminal pane's own new info footer (`design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s 2026-07-29 entry, change 5: "New footer band, 26 high") - `pid` · grid
+    /// dimensions · the environment chip · right-aligned static copy. Distinct from
+    /// [`SURFACE_FOOTER`] (the session-level Interrupt/Retry/Archive action footer, unchanged
+    /// and still rendered separately) - this new band sits between the terminal body and that
+    /// existing footer, additive per the changelog's own framing ("the pane has none today").
+    pub const PTY_INFO_FOOTER: Pixels = px(26.0);
     pub const BREADCRUMB: Pixels = px(26.0);
     pub const STATUS_BAR: Pixels = px(26.0);
     pub const PALETTE_INPUT: Pixels = px(44.0);

@@ -11,6 +11,7 @@
 pub mod changes;
 pub mod code_view;
 pub mod diagnostics_view;
+pub mod env_info;
 pub mod file_tree;
 pub mod fonts;
 pub mod hover_view;
@@ -25,6 +26,7 @@ pub mod settings;
 pub mod settings_store;
 pub mod status;
 pub mod terminal_grid;
+pub mod terminal_links;
 pub mod terminal_pane;
 pub mod theme;
 pub mod work_surface;

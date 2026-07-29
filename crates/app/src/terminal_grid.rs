@@ -303,6 +303,29 @@ impl TerminalGrid {
         self.ended = true;
     }
 
+    /// The real, current `(cols, rows)` this grid's `Term` is sized to - `crate::terminal_pane`'s
+    /// info footer's own `148×38`-style display (`design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s 2026-07-29 entry, change 5). Already a known, tracked fact
+    /// ([`Self::resize`] is the only place [`Self::size`] ever changes) - this just exposes it
+    /// rather than recomputing it from anything.
+    pub fn dimensions(&self) -> (u16, u16) {
+        (self.size.cols as u16, self.size.rows as u16)
+    }
+
+    /// A real terminal "clear" - erases the visible screen *and* the scrollback `Term` itself
+    /// retains internally (`ClearMode::Saved`, per the module docs' "Scope cut: no scrollback
+    /// UI" - this app never surfaces that scrollback as UI, but `Term` still holds it, and a
+    /// real clear should drop it too, the same as pressing `clear`/Ctrl-L would leave nothing
+    /// to scroll back into even if this app grew scrollback UI later), then homes the cursor.
+    /// Implemented as real ANSI bytes fed through the exact same [`Self::append_bytes`] path
+    /// every other byte this grid ever renders goes through (`\x1b[3J` erase saved lines,
+    /// `\x1b[2J` erase the visible screen, `\x1b[H` home the cursor - the same real sequence a
+    /// shell's own `clear`/`tput reset` emits) rather than reaching into `alacritty_terminal`'s
+    /// `Term`/`Handler` API directly: one real, already-tested code path, not a second one.
+    pub fn clear(&mut self) {
+        self.append_bytes(b"\x1b[3J\x1b[2J\x1b[H");
+    }
+
     /// A snapshot of the currently *visible* grid (`rows.len() == screen_lines`, each row
     /// has exactly `columns` cells) - the real, cursor-addressed terminal state, not a
     /// scrolling text log. The cell at the cursor's current position (if the cursor is
@@ -412,6 +435,35 @@ mod tests {
         grid.append_bytes(b"\x1b[2J\x1b[1;1H");
         let rows = grid.visible_rows();
         assert_eq!(row_text(&rows[0]).trim(), "");
+    }
+
+    #[test]
+    fn dimensions_reports_the_real_current_cols_and_rows() {
+        let mut grid = TerminalGrid::new(5, 20);
+        assert_eq!(grid.dimensions(), (20, 5));
+        grid.resize(10, 40);
+        assert_eq!(grid.dimensions(), (40, 10));
+    }
+
+    #[test]
+    fn clear_erases_visible_text_and_homes_the_cursor() {
+        let mut grid = TerminalGrid::new(5, 20);
+        grid.append_bytes(b"\x1b[3;5Hhello");
+        assert_eq!(row_text(&grid.visible_rows()[2]).trim(), "hello");
+
+        grid.clear();
+        for row in grid.visible_rows() {
+            assert_eq!(
+                row_text(&row).trim(),
+                "",
+                "clear must erase every visible row"
+            );
+        }
+
+        // The cursor is homed to (1,1) - writing right after `clear()` lands at the top-left,
+        // not wherever the cursor happened to be before.
+        grid.append_bytes(b"X");
+        assert_eq!(grid.visible_rows()[0][0].c, 'X');
     }
 
     #[test]

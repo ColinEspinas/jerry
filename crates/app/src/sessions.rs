@@ -5,10 +5,10 @@
 
 use std::path::PathBuf;
 
-use gpui::{App, AppContext as _, Context, Entity, Focusable as _, Window};
+use gpui::{App, AppContext as _, Context, Entity, Focusable as _, Subscription, Window};
 
 use crate::root::AdeApp;
-use crate::terminal_pane::{TerminalPane, TerminalSpec};
+use crate::terminal_pane::{TerminalPane, TerminalPaneEvent, TerminalSpec};
 
 /// What kind of process a session runs. Purely descriptive - it drives the tab label and
 /// which "New ... Session" button created it - not behavioral: `TerminalPane` spawns
@@ -89,6 +89,11 @@ pub struct Session {
     /// its `cwd` back out.
     pub cwd: PathBuf,
     pub pane: Entity<TerminalPane>,
+    /// Keeps [`Sessions::spawn`]'s real `cx.subscribe_in(&pane, ...)` (real link-click-opens-a-
+    /// file wiring - see [`TerminalPaneEvent`]'s own docs) alive for exactly this session's
+    /// lifetime, the same RAII-cancel-on-drop shape `TerminalPane::_task`/every other real
+    /// background handle in this codebase already uses - never read directly, only kept alive.
+    _link_subscription: Subscription,
 }
 
 /// Owns every open session/tab and which one is active.
@@ -150,10 +155,22 @@ impl Sessions {
     /// (`AdeApp::new_session`/`open_companion_terminal`/`respawn_session`/`new_agent_pane`, plus
     /// the initial shell `AdeApp::new_with_settings` spawns) calls [`Self::focus_active`]
     /// itself, guarded by `AdeApp::open_change.is_none()`, right after this returns.
+    ///
+    /// ## Real link-click-opens-a-file wiring (Revision R4b)
+    ///
+    /// Subscribes to the new pane's own [`TerminalPaneEvent`]s (`cx.subscribe_in`, the same
+    /// real `EventEmitter`/subscribe idiom `vendor/zed/crates/terminal/src/terminal.rs` uses
+    /// for its own terminal-link-click event - see [`TerminalPaneEvent`]'s own docs) so a real,
+    /// `mod`-held click on a detected path/`path:line` link inside this session's terminal
+    /// output opens it as a real file tab (`crate::root::AdeApp::open_terminal_link`). `window`
+    /// is a real, new parameter this method needs specifically for `Context::subscribe_in`
+    /// (which resolves the subscribing window at subscribe time, per its own real signature) -
+    /// every one of this method's real call sites already had one available.
     pub fn spawn(
         &mut self,
         kind: SessionKind,
         cwd: PathBuf,
+        window: &mut Window,
         cx: &mut Context<AdeApp>,
     ) -> SessionId {
         let id = self.next_id;
@@ -161,12 +178,18 @@ impl Sessions {
 
         let spec = kind.spec(cwd.clone());
         let pane = cx.new(|cx| TerminalPane::new(spec, cx));
+        let link_subscription =
+            cx.subscribe_in(&pane, window, move |app, _pane, event, window, cx| {
+                let TerminalPaneEvent::OpenPath { path, line } = event;
+                app.open_terminal_link(path.clone(), *line, window, cx);
+            });
 
         self.sessions.push(Session {
             id,
             kind,
             cwd,
             pane,
+            _link_subscription: link_subscription,
         });
         self.active = Some(id);
         id

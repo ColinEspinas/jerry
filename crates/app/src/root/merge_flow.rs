@@ -550,8 +550,9 @@ mod merge_regression_tests {
         git(&feature, &["commit", "-m", "feature commit"]);
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let feature_session_id = app.update(cx, |app, cx| {
-            app.sessions.spawn(SessionKind::Shell, feature.clone(), cx)
+        let feature_session_id = app.update_in(cx, |app, window, cx| {
+            app.sessions
+                .spawn(SessionKind::Shell, feature.clone(), window, cx)
         });
 
         app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
@@ -625,8 +626,9 @@ mod merge_regression_tests {
         git(&feature, &["commit", "-m", "feature commit"]);
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let feature_session_id = app.update(cx, |app, cx| {
-            app.sessions.spawn(SessionKind::Shell, feature.clone(), cx)
+        let feature_session_id = app.update_in(cx, |app, window, cx| {
+            app.sessions
+                .spawn(SessionKind::Shell, feature.clone(), window, cx)
         });
 
         app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
@@ -644,9 +646,9 @@ mod merge_regression_tests {
         git(&second_feature, &["add", "more.txt"]);
         git(&second_feature, &["commit", "-m", "second feature commit"]);
 
-        let second_session_id = app.update(cx, |app, cx| {
+        let second_session_id = app.update_in(cx, |app, window, cx| {
             app.sessions
-                .spawn(SessionKind::Shell, second_feature.clone(), cx)
+                .spawn(SessionKind::Shell, second_feature.clone(), window, cx)
         });
         app.update(cx, |app, cx| app.start_merge(second_session_id, cx));
         cx.run_until_parked();
@@ -701,8 +703,9 @@ mod merge_regression_tests {
         );
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let feature_session_id = app.update(cx, |app, cx| {
-            app.sessions.spawn(SessionKind::Shell, feature.clone(), cx)
+        let feature_session_id = app.update_in(cx, |app, window, cx| {
+            app.sessions
+                .spawn(SessionKind::Shell, feature.clone(), window, cx)
         });
 
         app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));

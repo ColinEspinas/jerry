@@ -275,6 +275,7 @@ dependencies = [
  "log",
  "lsp-core",
  "pty-core",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

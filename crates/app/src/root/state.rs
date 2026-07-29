@@ -134,7 +134,7 @@ impl AdeApp {
         // handlers live where they do), until the user manually clicked into the terminal
         // first.
         this.sessions
-            .spawn(SessionKind::Shell, repo_path.clone(), cx);
+            .spawn(SessionKind::Shell, repo_path.clone(), window, cx);
         this.sessions.focus_active(window, cx);
         this.load_worktrees(cx);
         this.load_file_tree(repo_path.clone(), cx);

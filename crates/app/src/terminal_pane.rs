@@ -40,17 +40,19 @@
 //! encoding - e.g. application cursor-key mode) - enough to type commands, use arrow keys,
 //! and send `Ctrl-C`, not a full VT100 keymap.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    canvas, div, font, prelude::*, px, rgb, Bounds, ClickEvent, Context, FocusHandle, Focusable,
-    FontWeight, KeyDownEvent, Keystroke, Pixels, Size, Task, Window,
+    canvas, div, font, prelude::*, px, rgb, BorderStyle, Bounds, ClickEvent, Context, EventEmitter,
+    FocusHandle, Focusable, FontWeight, KeyDownEvent, Keystroke, Pixels, Size, Task, Window,
 };
 use pty_core::{ExitStatus, PtyError, PtySession, SpawnOptions};
 
 use crate::terminal_grid::{GridCell, TerminalGrid, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND};
+use crate::terminal_links::{self, LinkMatch};
+use crate::theme;
 
 /// How often the foreground poll task wakes up to drain any pty output that has arrived
 /// and, if there was any, re-render. 33ms is close to a 30fps redraw rate: fast enough that
@@ -155,7 +157,13 @@ const APPROX_CELL_WIDTH_PX: f32 = 7.0;
 /// docs for the real padding-box-vs-content-box bug this fixes, and [`ROW_FONT_SIZE_PX`]'s
 /// docs for the same "don't let a rendered value silently drift from an implicit default"
 /// precedent this follows.
-const PANE_PADDING_PX: f32 = 8.0;
+///
+/// `pub(crate)`, not private: `crate::root::code_surface`'s real terminal-link click
+/// interaction test (`terminal_link_click_tests`) needs this exact same real value to compute
+/// a real click position off the pane's own real, measured `content_bounds` - reading the one
+/// real constant directly rather than a second, hand-copied `8.0` literal that could silently
+/// drift from it.
+pub(crate) const PANE_PADDING_PX: f32 = 8.0;
 
 /// What a [`TerminalPane`] should spawn: a program, its arguments, and the working
 /// directory to spawn it in. Generalizes step 3's "always spawn `$SHELL`" so the same pane
@@ -196,6 +204,23 @@ impl TerminalSpec {
             cwd,
         }
     }
+}
+
+/// A real event [`TerminalPane`] emits (`cx.emit`) for its owner to react to - the same real
+/// `EventEmitter`/`cx.subscribe_in` pattern `vendor/zed/crates/terminal/src/terminal.rs`'s own
+/// `Event::Open(MaybeNavigationTarget)` uses for the exact same "a click inside the terminal
+/// resolved to a real navigation target" case (`vendor/zed/crates/terminal/src/terminal.rs:1823`,
+/// `cx.emit(Event::Open(target))`) - not an invented pattern. `TerminalPane` itself has no
+/// notion of tabs/file-opening (see the module docs), so it can only ever announce "a real link
+/// was clicked"; `crate::sessions::Sessions::spawn` is the one real place that subscribes and
+/// turns this into an actual `crate::root::AdeApp::open_terminal_link` call, since that's the
+/// layer that actually owns tab state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalPaneEvent {
+    /// A real, `mod`-held click on a detected link (`crate::terminal_links::find_links`) inside
+    /// this pane's own rendered grid - `path` is already resolved against this pane's own real
+    /// `TerminalSpec::cwd` (see [`render_link_span`]), never a bare, unresolved string.
+    OpenPath { path: PathBuf, line: Option<u32> },
 }
 
 pub struct TerminalPane {
@@ -369,6 +394,73 @@ impl TerminalPane {
         if let Err(err) = session.write_input(&[0x03]) {
             log::warn!("failed to send interrupt: {err}");
         }
+    }
+
+    /// The real, current `(cols, rows)` this pane's grid is sized to - backs the terminal info
+    /// footer's real `148×38`-style dimensions display (`design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s 2026-07-29 entry, change 5). Delegates directly to
+    /// [`TerminalGrid::dimensions`] - already a real, tracked fact (see [`Self::resize_to`]),
+    /// not recomputed here.
+    pub fn grid_dimensions(&self) -> (u16, u16) {
+        self.grid.dimensions()
+    }
+
+    /// A real terminal "clear" - the header's real `clear` hint's own action (see
+    /// `crate::root::work_surface_render::render_pty_header`'s docs for why this is a
+    /// click-only, not a global-keybinding, affordance). Delegates to [`TerminalGrid::clear`]
+    /// (real ANSI bytes through the same real VT100 parser every other byte this grid ever
+    /// renders goes through) and notifies so the now-empty grid actually repaints.
+    ///
+    /// ## Also signals the real child process, when one is live
+    ///
+    /// Clearing only this pane's own local grid is correct for a plain shell sitting at a
+    /// prompt (it redraws on the next Enter regardless), but this terminal also runs
+    /// full-screen, cursor-addressed programs (`vim`, `htop`, an agent CLI's own interactive
+    /// UI) - for any of those, blanking the grid alone leaves a genuinely dead screen with
+    /// nothing to ever repaint it, since the child process has no idea its output was just
+    /// discarded. A real `Ctrl-L` (`0x0c`) written to the pty - the same real
+    /// [`PtySession::write_input`] path [`Self::interrupt`] already uses for `Ctrl-C` - is the
+    /// standard, correct way to ask a running program to redraw: a readline shell reprints its
+    /// prompt, and a well-behaved full-screen TUI repaints its whole screen, exactly the same
+    /// as a user pressing Ctrl-L directly. A no-op (beyond the local grid clear) when no session
+    /// is live, same as [`Self::interrupt`]'s own guard.
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.grid.clear();
+        if let Some(session) = &self.session {
+            if let Err(err) = session.write_input(&[0x0c]) {
+                log::warn!("failed to send clear-redraw signal (Ctrl-L) to pty: {err}");
+            }
+        }
+        cx.notify();
+    }
+
+    /// Test-only seam: feeds real bytes straight into this pane's own real grid, exactly as
+    /// [`Self::spawn_process`]'s poll loop does for real pty output - lets a real interaction
+    /// test put known, deterministic text on screen without needing to synchronize against a
+    /// real, asynchronously-spawned child process's actual timing. `#[cfg(test)]`-gated, so
+    /// this adds nothing to a real production binary.
+    #[cfg(test)]
+    pub(crate) fn inject_bytes_for_test(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        self.grid.append_bytes(bytes);
+        cx.notify();
+    }
+
+    /// Test-only seam: this pane's own real, measured content-area bounds (see
+    /// [`Self::content_bounds`]'s docs) - lets a real interaction test compute a real click
+    /// position from the pane's actual painted geometry instead of a guessed pixel offset.
+    /// `None` before the pane has painted at least once.
+    #[cfg(test)]
+    pub(crate) fn content_bounds_for_test(&self) -> Option<Bounds<Pixels>> {
+        self.content_bounds
+    }
+
+    /// Test-only seam: this pane's own real, measured monospace cell size (see
+    /// [`Self::cell_size`]'s docs - the exact same real GPUI font-metrics measurement `render`
+    /// itself uses every frame), so a real interaction test can compute exactly where a given
+    /// row/column lands on screen.
+    #[cfg(test)]
+    pub(crate) fn cell_size_for_test(&mut self, window: &Window) -> Size<Pixels> {
+        self.cell_size(window)
     }
 
     /// The currently visible grid, as plain trimmed-right text lines (right-trimmed only -
@@ -795,6 +887,8 @@ impl Focusable for TerminalPane {
     }
 }
 
+impl EventEmitter<TerminalPaneEvent> for TerminalPane {}
+
 /// Converts a typed key into the bytes a real terminal would send for it. A deliberately
 /// small subset of `vendor/zed/crates/terminal/src/mappings/keys.rs`'s `to_esc_str` - see
 /// the module docs' "Input" section for why the full mapping isn't replicated here.
@@ -861,42 +955,267 @@ fn same_run_style(a: &GridCell, b: &GridCell) -> bool {
         && a.strikethrough == b.strikethrough
 }
 
-/// Renders one grid row as a horizontal run of styled spans - grouping consecutive cells
-/// that share the same style into a single span keeps the element count low (a typical row
-/// is mostly-uniform default-styled text, so this is usually 1-3 spans, not one element per
-/// character) even though the underlying grid can be up to `TERMINAL_ROWS` x
-/// `TERMINAL_COLS` cells.
-fn render_row(row: &[GridCell]) -> impl IntoElement {
-    let mut line = div().flex().flex_row();
+/// One segment of a grid row, per the "a line is authored as `[prefix, colour, link, suffix]`"
+/// contract [`split_segments`]'s own docs quote - either a span of the row's original
+/// style-per-cell text, or a real detected link. Deliberately holds only char offsets (not
+/// `GridCell`s themselves): [`split_segments`] is the pure half of link splitting, kept
+/// GPUI/`GridCell`-free so it's directly unit-testable; [`render_row`] is what turns a segment
+/// back into styled cells/elements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowSegment {
+    Plain {
+        start: usize,
+        end: usize,
+    },
+    Link {
+        start: usize,
+        end: usize,
+        link: LinkMatch,
+    },
+}
 
-    let mut start = 0;
-    while start < row.len() {
-        let style = &row[start];
-        let mut end = start + 1;
-        while end < row.len() && same_run_style(&row[end], style) {
+/// Splits a row of `row_char_count` characters into an ordered, non-overlapping list of plain
+/// and link segments, given that row's own already-detected links
+/// (`crate::terminal_links::find_links`, run against the row's plain text). The pure, GPUI/
+/// `GridCell`-free half of [`render_row`]'s real "a link is a span inside the line, not a
+/// whole-line style" contract (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29
+/// entry, change 5: "`  ↳ tests/upload.rs:88:` links only the path") - split out specifically
+/// so that contract is directly unit-testable without a live GPUI window or a real
+/// `alacritty_terminal`-backed grid. `links` is assumed sorted and non-overlapping, exactly
+/// what `find_links` already guarantees (its own `regex::Regex::captures_iter` never yields
+/// overlapping matches).
+fn split_segments(row_char_count: usize, links: &[LinkMatch]) -> Vec<RowSegment> {
+    let mut segments = Vec::new();
+    let mut pos = 0;
+    while pos < row_char_count {
+        if let Some(link) = links.iter().find(|link| link.start == pos) {
+            let end = link.end.min(row_char_count);
+            segments.push(RowSegment::Link {
+                start: pos,
+                end,
+                link: link.clone(),
+            });
+            pos = end;
+            continue;
+        }
+        let mut end = pos + 1;
+        // Stop the plain run right before the next link begins, even if the underlying style
+        // hasn't changed - `render_row` re-applies its own `same_run_style` merging *within*
+        // this plain segment separately, but must never merge across a link boundary.
+        while end < row_char_count && !links.iter().any(|link| link.start == end) {
             end += 1;
         }
+        segments.push(RowSegment::Plain { start: pos, end });
+        pos = end;
+    }
+    segments
+}
 
-        let text: String = row[start..end].iter().map(|cell| cell.c).collect();
-        let mut span = div().text_color(rgb(pack_rgb(style.fg)));
-        if style.bg != DEFAULT_BACKGROUND {
-            span = span.bg(rgb(pack_rgb(style.bg)));
-        }
-        if style.bold {
-            span = span.font_weight(FontWeight::BOLD);
-        }
-        if style.italic {
-            span = span.italic();
-        }
-        if style.underline {
-            span = span.underline();
-        }
-        if style.strikethrough {
-            span = span.line_through();
-        }
-        line = line.child(span.child(text));
+/// Builds one plain-styled span from a run of cells that already share [`same_run_style`] -
+/// the exact styling `render_row` always applied, factored out unchanged so link-splitting
+/// (added this phase) doesn't have to duplicate it.
+fn plain_span(style: &GridCell, text: String) -> impl IntoElement {
+    let mut span = div().text_color(rgb(pack_rgb(style.fg)));
+    if style.bg != DEFAULT_BACKGROUND {
+        span = span.bg(rgb(pack_rgb(style.bg)));
+    }
+    if style.bold {
+        span = span.font_weight(FontWeight::BOLD);
+    }
+    if style.italic {
+        span = span.italic();
+    }
+    if style.underline {
+        span = span.underline();
+    }
+    if style.strikethrough {
+        span = span.line_through();
+    }
+    span.child(text)
+}
 
-        start = end;
+/// Renders one real, detected link as a clickable span - `design_handoff_jerry_ade/revision/
+/// Jerry.dc.html`'s own link template: `color:#7fb4e3;border-bottom:1px dotted #3d6a91`, hover
+/// `color:#a5cdf0;border-bottom:1px solid #78a8d0`. The link's own fixed colour always
+/// replaces whatever ANSI colour the underlying cells had (matching the mockup, which never
+/// blends the two) - a link is visually a link regardless of what the surrounding text's own
+/// colour happened to be.
+///
+/// GPUI's real `BorderStyle` enum has exactly two variants, `Solid`/`Dashed`
+/// (`vendor/zed/crates/gpui/src/scene.rs:597`) - no `Dotted`. `.border_dashed()` is the
+/// closest real, honest visual match to the design's dotted underline (not a fabricated dotted
+/// renderer); the hover state switches it back to `Solid` directly via `Styled::style()`,
+/// since the `Styled` trait exposes no separate `.border_solid()` counterpart to
+/// `.border_dashed()` the way it does for width presets.
+///
+/// The real click gesture requires holding the platform `secondary` modifier (`⌘` on macOS,
+/// `Ctrl` elsewhere, the exact modifier `crate::root::work_surface_render::render_pty_header`'s
+/// own `mod + click a path to open it` hint advertises) rather than firing on a bare click -
+/// deliberately, so an ordinary click inside the terminal (which this pane still needs for real
+/// input focus, and eventually real text selection) is never silently hijacked into a
+/// navigation; a bare click on a link span still bubbles up to the pane's own root `on_click`
+/// (focus), unchanged.
+///
+/// This checks [`click_included_secondary_modifier`] rather than the simpler
+/// `event.modifiers().secondary()` - see that function's own docs for the real, checker-
+/// reproduced bug (mouse-up-only sampling) that distinction fixes.
+fn render_link_span(
+    text: String,
+    link: &LinkMatch,
+    cwd: &Path,
+    row_index: usize,
+    link_ordinal: usize,
+    cx: &mut Context<TerminalPane>,
+) -> impl IntoElement {
+    let target = terminal_links::resolve(cwd, &link.path);
+    let line = link.line;
+
+    let mut span = div()
+        .id(format!("terminal-link-{row_index}-{link_ordinal}"))
+        .cursor_pointer()
+        .text_color(theme::term::LINK)
+        .border_b_1()
+        .border_color(theme::term::LINK_UNDERLINE)
+        .child(text);
+    span.style().border_style = Some(BorderStyle::Dashed);
+
+    span.hover(|mut el| {
+        el.style().border_style = Some(BorderStyle::Solid);
+        el.text_color(theme::term::LINK_HOVER)
+            .border_color(theme::term::LINK_UNDERLINE_HOVER)
+    })
+    .on_click(cx.listener(move |_this, event: &ClickEvent, _window, cx| {
+        if click_included_secondary_modifier(event) {
+            cx.emit(TerminalPaneEvent::OpenPath {
+                path: target.clone(),
+                line,
+            });
+        }
+    }))
+}
+
+/// Whether a real click held the platform `secondary` modifier at *either* mouse-down or
+/// mouse-up, not just mouse-up.
+///
+/// `ClickEvent::modifiers()` (`vendor/zed/crates/gpui/src/interactive.rs:296-306`) only ever
+/// reports the modifiers held at mouse-*up* - real, documented GPUI behavior, not a bug in GPUI
+/// itself, but wrong for this call site: a real human click sequence - hold Ctrl, click, release
+/// Ctrl a fraction of a second before releasing the mouse button - is a completely ordinary way
+/// to click-and-modify, and checking mouse-up alone silently drops it with no feedback that
+/// anything went wrong. [`ClickEvent::Mouse`] carries both the real `MouseDownEvent` and
+/// `MouseUpEvent` (`vendor/zed/crates/gpui/src/interactive.rs:211-217`), each with its own real
+/// `modifiers` field, so this checks both and accepts either. `Keyboard`/`Touch` click variants
+/// have no real modifiers at all (`ClickEvent::modifiers()`'s own documented behavior for those
+/// two), so this defers to that same real method for them rather than duplicating its logic.
+fn click_included_secondary_modifier(event: &ClickEvent) -> bool {
+    match event {
+        ClickEvent::Mouse(mouse) => {
+            mouse.down.modifiers.secondary() || mouse.up.modifiers.secondary()
+        }
+        ClickEvent::Keyboard(_) | ClickEvent::Touch(_) => event.modifiers().secondary(),
+    }
+}
+
+/// Renders one grid row as a horizontal run of styled spans - grouping consecutive cells that
+/// share the same style into a single span keeps the element count low (a typical row is
+/// mostly-uniform default-styled text, so this is usually 1-3 spans, not one element per
+/// character) even though the underlying grid can be up to `TERMINAL_ROWS` x `TERMINAL_COLS`
+/// cells. Since this phase (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29
+/// entry, change 5): additionally splits any run that contains a real, detected link
+/// (`crate::terminal_links::find_links`, via the pure [`split_segments`]) into its own
+/// clickable span - see [`render_link_span`]'s docs for exactly what that span does.
+fn render_row(
+    row: &[GridCell],
+    row_index: usize,
+    cwd: &Path,
+    cx: &mut Context<TerminalPane>,
+) -> impl IntoElement {
+    let row_text: String = row.iter().map(|cell| cell.c).collect();
+    let links = terminal_links::find_links(&row_text);
+    let segments = split_segments(row.len(), &links);
+
+    let mut line = div().flex().flex_row();
+    let mut link_ordinal = 0usize;
+
+    for segment in segments {
+        match segment {
+            RowSegment::Plain { start, end } => {
+                let mut inner = start;
+                while inner < end {
+                    let style = &row[inner];
+                    let mut run_end = inner + 1;
+                    while run_end < end && same_run_style(&row[run_end], style) {
+                        run_end += 1;
+                    }
+                    let text: String = row[inner..run_end].iter().map(|cell| cell.c).collect();
+                    line = line.child(plain_span(style, text));
+                    inner = run_end;
+                }
+            }
+            RowSegment::Link { start, end, link } => {
+                let text: String = row[start..end].iter().map(|cell| cell.c).collect();
+                line = line.child(render_link_span(
+                    text,
+                    &link,
+                    cwd,
+                    row_index,
+                    link_ordinal,
+                    cx,
+                ));
+                link_ordinal += 1;
+            }
+        }
+    }
+
+    line
+}
+
+/// Renders one line of plain (uniformly-coloured) real text with the same real link detection/
+/// click-to-open behavior [`render_row`] gives grid rows - the spawn-error message
+/// (`Render::render`'s own `spawn_error` child) is real text `pty_core::spawn` returned, not a
+/// `GridCell` grid, but a program path inside it (e.g. a bad relative path the user typed) is
+/// structurally the same kind of reference `render_row` already links - this is the "same
+/// general mechanism, applied to wherever this text renders" the design's own "real panic
+/// output with clickable frames" spec calls for, extended to the one other place this pane
+/// shows real, unstyled text. `cwd` is `None` when no `TerminalSpec` is available to resolve a
+/// relative path against (never the case in practice - a `TerminalPane` always has one - but
+/// kept `Option` rather than assuming, since spawn errors are exactly the "something already
+/// went wrong" path where an extra defensive check costs little).
+fn render_plain_line_with_links(
+    text: &str,
+    color: gpui::Rgba,
+    cwd: &Path,
+    cx: &mut Context<TerminalPane>,
+) -> impl IntoElement {
+    let links = terminal_links::find_links(text);
+    let chars: Vec<char> = text.chars().collect();
+    let segments = split_segments(chars.len(), &links);
+
+    let mut line = div().flex().flex_row();
+    let mut link_ordinal = 0usize;
+
+    for segment in segments {
+        match segment {
+            RowSegment::Plain { start, end } => {
+                let plain_text: String = chars[start..end].iter().collect();
+                line = line.child(div().text_color(color).child(plain_text));
+            }
+            RowSegment::Link { start, end, link } => {
+                let link_text: String = chars[start..end].iter().collect();
+                line = line.child(render_link_span(
+                    link_text,
+                    &link,
+                    cwd,
+                    // Row index `usize::MAX` keeps this line's link ids in their own,
+                    // never-colliding namespace from real grid-row link ids (`render_row`'s
+                    // own `row_index` never reaches anywhere close to `usize::MAX`).
+                    usize::MAX,
+                    link_ordinal,
+                    cx,
+                ));
+                link_ordinal += 1;
+            }
+        }
     }
 
     line
@@ -961,16 +1280,20 @@ impl Render for TerminalPane {
             .text_color(rgb(pack_rgb(DEFAULT_FOREGROUND)))
             .child(measure_bounds);
 
+        let cwd = self.spec.cwd.clone();
+
         if let Some(error) = &self.spawn_error {
-            pane = pane.child(
-                div()
-                    .text_color(rgb(0xff6b6b))
-                    .child(format!("failed to start process: {error}")),
-            );
+            let message = format!("failed to start process: {error}");
+            pane = pane.child(render_plain_line_with_links(
+                &message,
+                rgb(0xff6b6b),
+                &cwd,
+                cx,
+            ));
         }
 
-        for row in self.grid.visible_rows() {
-            pane = pane.child(render_row(&row));
+        for (row_index, row) in self.grid.visible_rows().into_iter().enumerate() {
+            pane = pane.child(render_row(&row, row_index, &cwd, cx));
         }
 
         if self.grid.ended {
@@ -1343,6 +1666,173 @@ mod keystroke_tests {
             Some(vec![0x10]),
             "Ctrl+P must map to the real Ctrl+<letter> control code (0x10), the standard \
              readline 'previous history' byte every real shell relies on"
+        );
+    }
+}
+
+#[cfg(test)]
+mod link_segment_tests {
+    use super::*;
+
+    fn link(start: usize, end: usize, path: &str) -> LinkMatch {
+        LinkMatch {
+            start,
+            end,
+            path: path.to_string(),
+            line: None,
+            column: None,
+        }
+    }
+
+    #[test]
+    fn a_row_with_no_links_is_a_single_plain_segment() {
+        let segments = split_segments(10, &[]);
+        assert_eq!(segments, vec![RowSegment::Plain { start: 0, end: 10 }]);
+    }
+
+    /// The exact contract `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry,
+    /// change 5 states: "a line is authored as `[prefix, colour, link, suffix]` - the link is a
+    /// span inside the line, not a whole-line style". A link found in the middle of an
+    /// otherwise plain row must split it into exactly a plain prefix, the link itself, and a
+    /// plain suffix - never a single whole-row link, and never dropping the surrounding plain
+    /// text.
+    #[test]
+    fn a_link_in_the_middle_splits_into_prefix_link_suffix_not_a_whole_line_style() {
+        // `"  \u{21b3} tests/upload.rs:88:"` - the link spans chars 4..19 (`tests/upload.rs:88`),
+        // matching this module's own real detection of that exact CHANGELOG example.
+        let links = [link(4, 19, "tests/upload.rs")];
+        let segments = split_segments(20, &links);
+        assert_eq!(
+            segments,
+            vec![
+                RowSegment::Plain { start: 0, end: 4 },
+                RowSegment::Link {
+                    start: 4,
+                    end: 19,
+                    link: links[0].clone(),
+                },
+                RowSegment::Plain { start: 19, end: 20 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_at_the_very_start_has_no_leading_plain_segment() {
+        let links = [link(0, 5, "a.txt")];
+        let segments = split_segments(8, &links);
+        assert_eq!(
+            segments,
+            vec![
+                RowSegment::Link {
+                    start: 0,
+                    end: 5,
+                    link: links[0].clone(),
+                },
+                RowSegment::Plain { start: 5, end: 8 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_at_the_very_end_has_no_trailing_plain_segment() {
+        let links = [link(3, 8, "a.txt")];
+        let segments = split_segments(8, &links);
+        assert_eq!(
+            segments,
+            vec![
+                RowSegment::Plain { start: 0, end: 3 },
+                RowSegment::Link {
+                    start: 3,
+                    end: 8,
+                    link: links[0].clone(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn multiple_links_each_get_their_own_span_with_plain_text_between_them() {
+        let links = [link(2, 5, "a.rs"), link(9, 12, "b.rs")];
+        let segments = split_segments(14, &links);
+        assert_eq!(
+            segments,
+            vec![
+                RowSegment::Plain { start: 0, end: 2 },
+                RowSegment::Link {
+                    start: 2,
+                    end: 5,
+                    link: links[0].clone(),
+                },
+                RowSegment::Plain { start: 5, end: 9 },
+                RowSegment::Link {
+                    start: 9,
+                    end: 12,
+                    link: links[1].clone(),
+                },
+                RowSegment::Plain { start: 12, end: 14 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_covering_the_whole_row_is_a_single_link_segment() {
+        let links = [link(0, 10, "src/main.rs")];
+        let segments = split_segments(10, &links);
+        assert_eq!(
+            segments,
+            vec![RowSegment::Link {
+                start: 0,
+                end: 10,
+                link: links[0].clone(),
+            }]
+        );
+    }
+}
+
+#[cfg(test)]
+mod clear_pty_signal_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Real, end-to-end proof of the fix for the checker's "`clear()` never signals the child
+    /// process" finding: a real [`TerminalPane`] backed by a real `cat` child on a real pty,
+    /// [`TerminalPane::clear`] called, and what this test actually observes is the real pty's
+    /// own cooked-mode line-discipline echo (the same real mechanism `pty_core`'s own
+    /// `write_input_is_echoed_back_by_the_pty_line_discipline` test proves) - not a direct
+    /// assertion that `write_input` was called, but its real, round-tripped effect landing back
+    /// in this pane's own grid. With `ECHOCTL` (the real, standard-on-Linux termios default),
+    /// the raw `0x0c` `clear()` writes is echoed back as the two literal, printable characters
+    /// `^L`, which lands as ordinary text in the grid once the next poll tick parses it.
+    #[gpui::test]
+    fn clear_with_a_live_session_sends_a_real_ctrl_l_the_pty_echoes_back(cx: &mut TestAppContext) {
+        let pane = cx.new(|cx| {
+            TerminalPane::new(
+                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        pane.update(cx, |pane, cx| pane.clear(cx));
+
+        // Polls a bounded number of real ticks rather than a fixed sleep, since exactly which
+        // tick the real background pty-read/echo round trip lands on isn't itself the thing
+        // under test.
+        let mut saw_caret_l = false;
+        for _ in 0..50 {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+            let lines = pane.read_with(cx, |pane, _| pane.visible_text_lines());
+            if lines.iter().any(|line| line.contains("^L")) {
+                saw_caret_l = true;
+                break;
+            }
+        }
+        assert!(
+            saw_caret_l,
+            "expected the real pty's own echo of the Ctrl-L byte clear() sends to eventually \
+             appear in the grid - this is what actually proves the byte reached the pty, not \
+             just that write_input() was called"
         );
     }
 }

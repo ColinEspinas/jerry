@@ -610,6 +610,47 @@ impl AdeApp {
         cx.notify();
     }
 
+    /// The real handler for `crate::terminal_pane::TerminalPaneEvent::OpenPath` - a `mod`-held
+    /// click on a real, detected path/`path:line` link inside a session's terminal output
+    /// (`crate::sessions::Sessions::spawn`'s own real subscription is the one caller). `path`
+    /// is already resolved against the session's own real cwd (see
+    /// `crate::terminal_links::resolve`), never the app's own process cwd. Reuses the exact
+    /// same real navigation primitives go-to-definition already established rather than a
+    /// second, parallel way to open a file: [`Self::navigate_to_definition`] when the link
+    /// carried a real line number (the same one-shot `pending_cursor_line` race-avoidance that
+    /// method's own docs describe), or plain [`Self::open_file_view`] when it didn't.
+    ///
+    /// ## Real existence check first
+    ///
+    /// Every other real caller of [`Self::open_file_view`] (the file tree, the palette, a
+    /// Changes row, LSP go-to-definition) only ever supplies a path it already knows is real -
+    /// a terminal link is the first source that can't guarantee that (`crate::terminal_links`'s
+    /// own regex is a heuristic over plain text, not a filesystem lookup, and can still land on
+    /// a plausible-looking path that simply doesn't exist, e.g. a typo'd path in a shell error
+    /// message). `Path::is_file()` here is a real, synchronous `stat()` - acceptable because
+    /// it's triggered by one real user click, not run on every render the way a per-row check
+    /// would be. Without this, every false positive the link-detection regex ever produces
+    /// becomes a permanent, un-closeable-by-itself junk tab.
+    pub(crate) fn open_terminal_link(
+        &mut self,
+        path: PathBuf,
+        line: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !path.is_file() {
+            log::debug!(
+                "terminal link click: {} does not exist on disk, ignoring",
+                path.display()
+            );
+            return;
+        }
+        match line {
+            Some(line) => self.navigate_to_definition(path, line as usize, window, cx),
+            None => self.open_file_view(path, window, cx),
+        }
+    }
+
     /// [`GotoDefinition`]'s real, bound `F12` action handler.
     pub(super) fn handle_goto_definition_action(
         &mut self,
@@ -3919,5 +3960,204 @@ mod multi_file_tab_tests {
             "re-activating a tab that's active-but-not-really-showing must fall back to File \
              view, which always has real content, instead of staying a dead no-op"
         );
+    }
+}
+
+/// Real, end-to-end proof of Revision R4b's "terminal is interactive" link-click-opens-a-file
+/// path: a real `gpui::VisualTestContext::simulate_click` against the pane's own real, painted
+/// bounds - not a direct method call standing in for the click - drives `TerminalPane`'s real
+/// `on_click`/`cx.emit`, `Sessions::spawn`'s real `cx.subscribe_in`, and
+/// `AdeApp::open_terminal_link`, the same chain a real user's mouse click goes through.
+#[cfg(test)]
+mod terminal_link_click_tests {
+    use super::*;
+    use gpui::{
+        point, Bounds, Entity, Modifiers, MouseButton, Pixels, Size, TestAppContext,
+        VisualTestContext,
+    };
+
+    /// Injects a real row of terminal text containing a `path:line` link on the third visible
+    /// row (`"see src/main.rs:1 for it"`, 0-indexed row 2) into the active session's real pane,
+    /// and returns the real, painted geometry (`content_bounds`, cell size) an interaction test
+    /// needs to compute a real click position - factored out since both tests below need the
+    /// identical setup.
+    fn inject_link_row_and_measure(
+        app: &Entity<AdeApp>,
+        cx: &mut VisualTestContext,
+    ) -> (Bounds<Pixels>, Size<Pixels>) {
+        let pane = app
+            .read_with(cx, |app, _| app.sessions.active().map(|s| s.pane.clone()))
+            .expect("a fresh test window has one real, active shell session");
+
+        pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(
+                b"first line\r\nsecond line\r\nsee src/main.rs:1 for it",
+                cx,
+            );
+        });
+        // Lets the injected `cx.notify()` actually drive a real paint (populating
+        // `content_bounds`) - see `TerminalPane::content_bounds_for_test`'s own docs. The
+        // initial session's real `$SHELL` spawn may also make background progress here, but
+        // only ever appends *after* the cursor position my own injected bytes left it at (the
+        // end of row 2's text) - it can't touch the already-written link characters at the
+        // start of that row, which is all this test's click-position math depends on.
+        cx.run_until_parked();
+
+        let (bounds, cell_size) = pane.update_in(cx, |pane, window, _cx| {
+            (
+                pane.content_bounds_for_test(),
+                pane.cell_size_for_test(window),
+            )
+        });
+        (
+            bounds.expect("the pane must have painted at least once after run_until_parked"),
+            cell_size,
+        )
+    }
+
+    /// The real pixel position of the middle of `"src/main.rs:1"` on row 2 of
+    /// [`inject_link_row_and_measure`]'s own injected text (`"see "` is a real 4-character
+    /// prefix) - real geometry math off the pane's own real, measured padding/line-height/cell
+    /// width constants, mirroring the exact same real approach
+    /// `vendor/zed/crates/editor/src/editor_tests.rs`'s own `simulate_click` call sites use
+    /// (`text_origin + em_width * column`, `line_height * row`) rather than a guessed literal.
+    fn link_click_position(bounds: Bounds<Pixels>, cell_size: Size<Pixels>) -> gpui::Point<Pixels> {
+        let link_text = "src/main.rs:1";
+        let prefix_chars = 4.0; // "see "
+        let x = bounds.origin.x
+            + px(crate::terminal_pane::PANE_PADDING_PX)
+            + cell_size.width * (prefix_chars + link_text.chars().count() as f32 / 2.0);
+        let y = bounds.origin.y
+            + px(crate::terminal_pane::PANE_PADDING_PX)
+            + cell_size.height * 2.0
+            + cell_size.height / 2.0;
+        point(x, y)
+    }
+
+    #[gpui::test]
+    fn mod_click_on_a_detected_link_opens_the_real_file_tab(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join("src")).expect("mkdir src");
+        std::fs::write(repo.path().join("src/main.rs"), "fn main() {}\n").expect("write");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (bounds, cell_size) = inject_link_row_and_measure(&app, cx);
+
+        cx.simulate_click(
+            link_click_position(bounds, cell_size),
+            Modifiers::secondary_key(),
+        );
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.open_change,
+                Some(PathBuf::from("src/main.rs")),
+                "a real mod-held click on the detected link must open the real file as the \
+                 active tab - got open_change = {:?}, open_files = {:?}",
+                app.open_change,
+                app.open_files,
+            );
+            assert!(
+                app.open_files.contains(&PathBuf::from("src/main.rs")),
+                "the opened file must appear in the real tab list too"
+            );
+        });
+    }
+
+    /// The real gesture this app requires (`mod`-held click, per the header's own real hint)
+    /// matters: a bare click on the exact same link must not navigate anywhere, so an ordinary
+    /// click inside the terminal (real input focus today; real text selection eventually)
+    /// can never be silently hijacked into a file navigation.
+    #[gpui::test]
+    fn a_bare_click_on_a_detected_link_does_not_open_anything(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join("src")).expect("mkdir src");
+        std::fs::write(repo.path().join("src/main.rs"), "fn main() {}\n").expect("write");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (bounds, cell_size) = inject_link_row_and_measure(&app, cx);
+
+        cx.simulate_click(link_click_position(bounds, cell_size), Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.open_change, None,
+                "a bare click (no mod held) on a detected link must not open anything"
+            );
+            assert!(
+                app.open_files.is_empty(),
+                "a bare click must not add a real tab either"
+            );
+        });
+    }
+
+    /// The real, checker-reproduced bug `crate::terminal_pane::click_included_secondary_modifier`
+    /// fixes: `gpui::ClickEvent::modifiers()` only ever reports the modifiers held at mouse-*up*
+    /// (`vendor/zed/crates/gpui/src/interactive.rs:296-306`), so a completely ordinary click
+    /// sequence - hold the modifier, click, release the modifier a moment *before* releasing the
+    /// mouse button - used to silently do nothing. Drives the two halves of a real click
+    /// separately (`simulate_mouse_down`/`simulate_mouse_up`, not `simulate_click`, which always
+    /// holds the same modifiers for both) specifically so this test can hold the modifier only
+    /// at mouse-down and prove that still opens the link.
+    #[gpui::test]
+    fn mod_held_only_during_mouse_down_still_opens_the_real_file_tab(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join("src")).expect("mkdir src");
+        std::fs::write(repo.path().join("src/main.rs"), "fn main() {}\n").expect("write");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (bounds, cell_size) = inject_link_row_and_measure(&app, cx);
+        let position = link_click_position(bounds, cell_size);
+
+        cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::secondary_key());
+        cx.simulate_mouse_up(position, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.open_change,
+                Some(PathBuf::from("src/main.rs")),
+                "a modifier held only during mouse-down (released before mouse-up) must still \
+                 open the real file tab, not be silently dropped - got open_change = {:?}",
+                app.open_change,
+            );
+        });
+    }
+
+    /// A real, checker-reproduced false-positive class this app has no way to fully rule out
+    /// at the regex level alone (see `crate::terminal_links`'s own docs): a plausible-looking
+    /// path that simply doesn't exist on disk. `AdeApp::open_terminal_link`'s own
+    /// `Path::is_file()` check must refuse it, not open a permanent junk tab for it - the exact
+    /// real end-to-end path (real click -> real `TerminalPaneEvent::OpenPath` -> real handler)
+    /// the two tests above already exercise, just with a detected link that resolves to a real,
+    /// nonexistent path instead of a real file.
+    #[gpui::test]
+    fn mod_click_on_a_link_to_a_nonexistent_path_does_not_open_a_tab(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        // Deliberately never created: `src/` itself doesn't exist in this repo at all.
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (bounds, cell_size) = inject_link_row_and_measure(&app, cx);
+
+        cx.simulate_click(
+            link_click_position(bounds, cell_size),
+            Modifiers::secondary_key(),
+        );
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.open_change, None,
+                "a mod-click on a link that resolves to a real, nonexistent path must not open \
+                 anything - got open_change = {:?}",
+                app.open_change,
+            );
+            assert!(
+                app.open_files.is_empty(),
+                "a link to a nonexistent path must not add a real tab either"
+            );
+        });
     }
 }
