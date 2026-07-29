@@ -989,3 +989,48 @@ environment-variable signal isn't reliably inherited.
 
 This closes Revision R4 (both halves — R4a's unified tab strip and R4b's interactive
 terminal — are now complete and committed).
+
+## Revision R5 — real editor zoom and font/UI scaling
+
+Applied changelog entry 6 (editor zoom) plus the general task list's font/UI scaling ask.
+Real per-tab (or shared, per Revision R3's persisted toggle) editor zoom, 70-200% in steps
+of 10, via GPUI's real rem-size scoping mechanism — the first time this codebase has used
+it. A new `root/rem_scope.rs` ports `vendor/zed`'s own `with_rem_size` `Element` wrapper
+rather than calling `Window::with_rem_size` from a plain closure, since that API only works
+at real element-traversal time. Code text is authored in rems and scales; the base is the
+real, already-persisted `editor_font_size` setting from R3 rather than a new disconnected
+constant. Real terminal font size: changing it recomputes the real per-cell pixel size and
+drives the existing pty-resize path, applied live to every open session. Interface scale is
+real but deliberately partial: this app's entire sizing system is ~500 call sites of literal
+`px()` constants, not the `rems()`-based system Zed's own UI relies on for this exact
+feature, so a full retrofit was out of proportion for one phase — scoped instead to a real,
+central text-scale helper applied broadly across chrome text, honestly documented as
+text-only. `follow_system_text_size` stays persisted-only, verified against the real
+`vendor/zed` platform layer that no Linux system text-scale signal exists to wire it to.
+
+The audit measured real, live layout bounds rather than only reading the code, and found a
+genuine overlap bug: the gutter's line-number text inherited the same scoped rem size as the
+code text next to it, so a 4-digit line number could wrap inside the gutter's still-fixed-
+width column at higher zoom — and since GPUI's `uniform_list` measures every row's height
+from line 1 alone, a wrapped row's real height silently exceeded its slot and overlapped the
+row below. Fixed by pinning the gutter's own text to a real fixed size; the flagship zoom
+test's original gutter assertion compared two copies of the same compile-time literal and
+could not have failed under any implementation, so it was strengthened to scroll a real
+1200-line file to a 4-digit line number at the documented zoom maximum and assert the gutter
+can never grow taller than its own row. The same audit reproduced two further real per-tab-
+zoom bugs by hand: turning on per-tab zoom while a shared zoom was active silently reset
+every open tab on its next switch (the per-tab map was never seeded from the value it was
+replacing), and closing a zoomed tab left its entry behind, resurrecting a stale zoom on
+reopen instead of the documented 100% default — both fixed with tests reproducing each exact
+scenario. Also fixed: the diff view's changed-line bar and fold-marker sliver were still
+sized for the old fixed row height and visibly desynced at non-default zoom; and the prior
+pass's own account of which UI text responds to interface scale was materially incomplete
+(most row controls and two sidebar strings were silently unscaled, most visibly on the
+Appearance page's own scale control) — extended real scaling to those sites and corrected
+the disclosure to match what's actually wired.
+
+A new task (#31, "Revision R5.5") was added at the user's request during this phase: a real
+senior-maintainer code-quality pass that resolves R1's deferred `cx.spawn()`/single-task-slot
+consolidation finding for real (rather than deferring it again) and runs a fresh full-repo
+audit for patterns/reusability/organization now that R1-R5 have substantially grown the
+codebase past what R1 originally looked at. Queued to run next, before Revision R6.
