@@ -323,6 +323,108 @@ pub fn merge_status_against_base(
     }))
 }
 
+/// Real ahead/behind commit counts for a worktree's `HEAD` against the repository's detected
+/// default base branch - the status bar's `↑2 ↓0` indicator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AheadBehind {
+    /// Commits reachable from `HEAD` but not from the base branch's tip.
+    pub ahead: usize,
+    /// Commits reachable from the base branch's tip but not from `HEAD`.
+    pub behind: usize,
+}
+
+/// Computes real [`AheadBehind`] counts for the worktree at `worktree_path` against its
+/// detected default base branch, per this module's own base-detection order (see the module
+/// docs). Returns `Ok(None)` for the same "nothing sensible to compare" cases
+/// [`merge_status_against_base`] does: no base could be detected, or `HEAD` is unborn.
+/// [`AheadBehind`] is trivially `{0, 0}` when the worktree's own branch *is* the detected base.
+///
+/// Shells out to `git rev-list --left-right --count <base_commit>...HEAD` (the `...` symmetric
+/// difference already computes the merge-base internally, so there's no need to pass one
+/// explicitly) - `<base_commit>...HEAD` reports `<count only reachable from base>\t<count only
+/// reachable from HEAD>`, i.e. `<behind>\t<ahead>`. Before running it, this confirms via `gix`
+/// that a real common ancestor exists (mirrors [`diff_against_base`]'s own `NoBaseFound`
+/// handling for unrelated histories) - without that check, two branches with no shared history
+/// would silently degrade into "every commit reachable from either side", not a real ahead/
+/// behind count.
+///
+/// The `git` invocation is given `base_commit_id`'s real hex sha - *not* `base_branch`'s short
+/// name - exactly as [`diff_against_base`] already does for its own `git diff` invocation. A
+/// bare short name is not safe here: when `detect_default_base` finds its base via
+/// `refs/remotes/origin/HEAD` (a common, normal case), the short name it returns (e.g. `main`)
+/// is ambiguous in a repository that *also* has a local branch of the same name - git's own
+/// disambiguation rules resolve a bare `main...HEAD` against the local `refs/heads/main` first,
+/// not the remote-tracking `refs/remotes/origin/main` that was actually detected as the real
+/// base. A local `main` that's gone stale relative to `origin/main` would then silently compare
+/// against the wrong, stale commit and could under-report (or entirely miss) how far behind the
+/// worktree really is. The hex commit id has no such ambiguity.
+///
+/// Performs blocking I/O: opens the repository via `gix` and spawns a real `git` child process.
+pub fn ahead_behind_against_base(worktree_path: &Path) -> Result<Option<AheadBehind>, Error> {
+    let repo = open_repo(worktree_path)?;
+
+    let mut head = repo
+        .head()
+        .map_err(|source| Error::Head(Box::new(source)))?;
+    let worktree_branch = head.referent_name().map(|name| name.shorten().to_string());
+    let worktree_head_id = head
+        .try_peel_to_id_in_place()
+        .map_err(|source| Error::PeelHead(Box::new(source)))?;
+    let Some(worktree_head_id) = worktree_head_id else {
+        // Unborn HEAD: nothing has been committed yet, so there is nothing to compare.
+        return Ok(None);
+    };
+
+    let Some((base_branch, base_commit_id)) = detect_default_base(&repo)? else {
+        return Ok(None);
+    };
+
+    if worktree_branch.as_deref() == Some(base_branch.as_str()) {
+        return Ok(Some(AheadBehind::default()));
+    }
+
+    match repo.merge_base(worktree_head_id.detach(), base_commit_id) {
+        Ok(_) => {}
+        Err(gix::repository::merge_base::Error::NotFound { .. }) => return Ok(None),
+        Err(source) => return Err(Error::MergeBase(Box::new(source))),
+    }
+
+    let base_commit_sha = base_commit_id.to_string();
+    // Same defensive hex-only check `diff_against_base` applies to its own merge-base sha
+    // before handing it to a spawned `git` argument - see that function's own comment for why
+    // this costs nothing and guards against a future change silently turning into a
+    // git-argument injection.
+    if base_commit_sha.is_empty() || !base_commit_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::WorktreeIo(std::io::Error::other(
+            "detected base commit id was not a hex object id",
+        )));
+    }
+
+    let args: Vec<OsString> = vec![
+        "rev-list".into(),
+        "--left-right".into(),
+        "--count".into(),
+        format!("{base_commit_sha}...HEAD").into(),
+    ];
+    let output = run_git(worktree_path, &args)?;
+    check_success(&args, &output)?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_ahead_behind_counts(&text))
+}
+
+/// Parses `git rev-list --left-right --count <base>...HEAD`'s stdout (`<behind> <ahead>`,
+/// whitespace-separated) into a real [`AheadBehind`]. `None` - not a fabricated `{0, 0}` via
+/// `.unwrap_or(0)` - if either field is missing or isn't a real number, matching this codebase's
+/// own established "no entry rather than a fabricated value" convention (e.g. `rail.rs`'s
+/// clean/merge note handling) for exactly this class of situation: a confident-looking but wrong
+/// "up to date" is worse than an honestly-omitted value.
+fn parse_ahead_behind_counts(text: &str) -> Option<AheadBehind> {
+    let mut parts = text.split_whitespace();
+    let behind = parts.next().and_then(|part| part.parse::<usize>().ok())?;
+    let ahead = parts.next().and_then(|part| part.parse::<usize>().ok())?;
+    Some(AheadBehind { ahead, behind })
+}
+
 /// Detect the repository's default branch and its tip commit id, per this module's
 /// documented detection order. Returns `Ok(None)` if none of the strategies yield a branch
 /// (rather than an `Err`): an undetectable default branch is a real, expected outcome (e.g. a
@@ -1640,5 +1742,176 @@ index 0000000..fedcba9
             .expect("main itself has a detectable base (itself)");
         assert_eq!(status.base_branch, "main");
         assert!(status.merged);
+    }
+
+    #[test]
+    fn ahead_behind_on_default_branch_is_zero_and_zero() {
+        let repo = init_repo();
+        let result = ahead_behind_against_base(repo.path())
+            .expect("ahead_behind_against_base")
+            .expect("main itself has a detectable base (itself)");
+        assert_eq!(
+            result,
+            AheadBehind {
+                ahead: 0,
+                behind: 0
+            }
+        );
+    }
+
+    #[test]
+    fn ahead_behind_unborn_head_is_none() {
+        let dir = TempDir::new().expect("tempdir");
+        git(dir.path(), &["init", "-b", "main"]);
+        let result = ahead_behind_against_base(dir.path()).expect("ahead_behind_against_base");
+        assert_eq!(result, None);
+    }
+
+    /// Real, independently diverged histories on each side: two commits ahead on `feature`
+    /// after branching, then one commit added to `main` afterward - the exact shape the status
+    /// bar's `↑2 ↓0`-style indicator needs to be able to show a non-zero `behind` too, not just
+    /// `ahead`.
+    #[test]
+    fn ahead_behind_counts_real_diverged_commits_on_each_side() {
+        let repo = init_repo();
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        fs::write(repo.path().join("feature_one.txt"), "one\n").expect("write");
+        git(repo.path(), &["add", "feature_one.txt"]);
+        git(repo.path(), &["commit", "-m", "feature commit one"]);
+        fs::write(repo.path().join("feature_two.txt"), "two\n").expect("write");
+        git(repo.path(), &["add", "feature_two.txt"]);
+        git(repo.path(), &["commit", "-m", "feature commit two"]);
+
+        git(repo.path(), &["checkout", "main"]);
+        fs::write(repo.path().join("main_only.txt"), "main only\n").expect("write");
+        git(repo.path(), &["add", "main_only.txt"]);
+        git(repo.path(), &["commit", "-m", "a commit only main has"]);
+
+        git(repo.path(), &["checkout", "feature"]);
+        let result = ahead_behind_against_base(repo.path())
+            .expect("ahead_behind_against_base")
+            .expect("feature has a detectable base (main)");
+        assert_eq!(
+            result,
+            AheadBehind {
+                ahead: 2,
+                behind: 1
+            }
+        );
+    }
+
+    #[test]
+    fn ahead_behind_with_no_divergence_at_all_is_zero_and_zero() {
+        let repo = init_repo();
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        let result = ahead_behind_against_base(repo.path())
+            .expect("ahead_behind_against_base")
+            .expect("feature has a detectable base (main)");
+        assert_eq!(
+            result,
+            AheadBehind {
+                ahead: 0,
+                behind: 0
+            }
+        );
+    }
+
+    /// The audit's exact reproduction of the wrong-ref bug: the detected base comes from
+    /// `refs/remotes/origin/HEAD` (short name `main`), but a *local* `main` branch of the same
+    /// short name also exists and has gone stale relative to `origin/main`. Before this fix,
+    /// `ahead_behind_against_base` handed git the bare short name `main`, which git's own
+    /// disambiguation rules resolve against the stale local branch (`refs/heads/main`) rather
+    /// than the fresh remote-tracking commit that was actually detected as the real base -
+    /// silently reporting `↓0` (up to date) when the real, correct answer is `↓2`.
+    #[test]
+    fn ahead_behind_is_computed_against_the_detected_base_commit_not_a_stale_local_branch_of_the_same_name(
+    ) {
+        let origin = TempDir::new().expect("tempdir");
+        git(origin.path(), &["init", "--bare", "-b", "main"]);
+
+        let seed = TempDir::new().expect("tempdir");
+        git(seed.path(), &["init", "-b", "main"]);
+        git(seed.path(), &["config", "user.email", "test@example.com"]);
+        git(seed.path(), &["config", "user.name", "Test User"]);
+        fs::write(seed.path().join("file.txt"), "hello\n").expect("write");
+        git(seed.path(), &["add", "file.txt"]);
+        git(seed.path(), &["commit", "-m", "initial commit"]);
+        let origin_url = origin.path().to_str().expect("utf8 path").to_string();
+        git(seed.path(), &["remote", "add", "origin", &origin_url]);
+        git(seed.path(), &["push", "origin", "main"]);
+
+        let dir = TempDir::new().expect("tempdir");
+        git(
+            dir.path(),
+            &[
+                "clone",
+                &origin_url,
+                dir.path().to_str().expect("utf8 path"),
+            ],
+        );
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "user.name", "Test User"]);
+        // A real feature branch, checked out from `main` at the clone-time commit.
+        git(dir.path(), &["checkout", "-b", "feature"]);
+
+        // Advance origin's `main` two real commits further (from the seed clone - the origin
+        // itself is bare and can't be committed to directly).
+        fs::write(seed.path().join("file.txt"), "hello\nfrom origin 1\n").expect("write");
+        git(seed.path(), &["commit", "-am", "origin commit 1"]);
+        fs::write(
+            seed.path().join("file.txt"),
+            "hello\nfrom origin 1\nfrom origin 2\n",
+        )
+        .expect("write");
+        git(seed.path(), &["commit", "-am", "origin commit 2"]);
+        git(seed.path(), &["push", "origin", "main"]);
+
+        // Update the real worktree's remote-tracking ref (`refs/remotes/origin/main`, and thus
+        // `refs/remotes/origin/HEAD`'s target) to the fresh tip - deliberately *not* touching
+        // the local `refs/heads/main`, which stays 2 commits stale. This is exactly the
+        // real-world shape the audit reproduced.
+        git(dir.path(), &["fetch", "origin"]);
+
+        let result = ahead_behind_against_base(dir.path()).expect("ahead_behind_against_base");
+        let ahead_behind = result.expect("a real base should have been detected");
+        assert_eq!(
+            ahead_behind.behind, 2,
+            "must be computed against the real detected base commit (origin/main's fresh, \
+             fetched tip), not the stale local `main` branch of the same short name - got \
+             {ahead_behind:?}"
+        );
+        assert_eq!(ahead_behind.ahead, 0);
+    }
+
+    /// If `rev-list`'s output is ever not in the expected `<behind> <ahead>` shape, this must
+    /// report an honest "unknown" (`None`) rather than fabricating a confident-looking
+    /// `{ahead: 0, behind: 0}` via `.unwrap_or(0)`. Exercises the exact real parsing function
+    /// [`ahead_behind_against_base`] itself calls on `rev-list`'s real stdout, not a
+    /// reimplementation that could drift from it.
+    #[test]
+    fn unparsable_rev_list_output_parses_to_none_not_a_fabricated_zero() {
+        assert_eq!(
+            parse_ahead_behind_counts(""),
+            None,
+            "empty output must not fabricate {{0, 0}}"
+        );
+        assert_eq!(
+            parse_ahead_behind_counts("not-a-number also-not-a-number"),
+            None,
+            "non-numeric output must not fabricate {{0, 0}}"
+        );
+        assert_eq!(
+            parse_ahead_behind_counts("3"),
+            None,
+            "a missing second field must not fabricate an ahead of 0"
+        );
+        assert_eq!(
+            parse_ahead_behind_counts("2\t5"),
+            Some(AheadBehind {
+                ahead: 5,
+                behind: 2
+            }),
+            "well-formed output must still parse normally"
+        );
     }
 }

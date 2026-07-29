@@ -208,8 +208,8 @@ pub mod term {
     pub const LINK_UNDERLINE_HOVER: Rgba = hex(0x78a8d0);
 }
 
-/// The environment (WSL) chip's tokens - shown in the terminal footer, and later the status bar
-/// chip and Settings `Default environment` row.
+/// The environment (WSL) chip's tokens - shown in the terminal footer, the status bar, and
+/// Settings' `Default environment` row.
 pub mod env {
     use super::{hex, Rgba};
 
@@ -357,7 +357,8 @@ pub mod band {
     /// Interrupt/Retry/Archive action footer, rendered separately below it).
     pub const PTY_INFO_FOOTER: Pixels = px(26.0);
     pub const BREADCRUMB: Pixels = px(26.0);
-    pub const STATUS_BAR: Pixels = px(26.0);
+    /// 26 -> 28 (`CHANGELOG.md`'s change 7: "Height 26 -> 28").
+    pub const STATUS_BAR: Pixels = px(28.0);
     pub const PALETTE_INPUT: Pixels = px(44.0);
     pub const PALETTE_ROW: Pixels = px(30.0);
     pub const CHANGE_ROW: Pixels = px(27.0);

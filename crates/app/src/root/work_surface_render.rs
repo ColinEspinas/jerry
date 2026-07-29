@@ -320,10 +320,7 @@ impl AdeApp {
 
         bar = bar.child(self.render_tab_strip_plus(cx));
 
-        // Only show keycaps for sessions that actually exist, capped at 8 since
-        // `secondary-1`..`secondary-8` are the only ones bound (`crate::default_key_bindings`).
-        let session_count = self.sessions.iter().count().min(8);
-        let jump_keys: Vec<String> = (1..=session_count).map(|n| n.to_string()).collect();
+        let jump_keys = self.session_jump_keys();
 
         bar.child(div().flex_1()).child(
             div()
@@ -341,6 +338,17 @@ impl AdeApp {
                         .child("session"),
                 ),
         )
+    }
+
+    /// The real `secondary-1`..`secondary-8` session-jump keycap labels: one per currently open
+    /// session, capped at 8 since those are the only ones actually bound
+    /// (`crate::default_key_bindings`) - never a keycap advertising a shortcut that silently
+    /// does nothing. Shared by [`Self::render_tab_strip`]'s own right-aligned cluster and the
+    /// status bar's session hint (`root::status_bar::render_status_session_hint`), so the two
+    /// can never independently drift on what's really bound.
+    pub(super) fn session_jump_keys(&self) -> Vec<String> {
+        let session_count = self.sessions.iter().count().min(8);
+        (1..=session_count).map(|n| n.to_string()).collect()
     }
 
     /// A file tab: language chip (`file_tree::lang_chip_for_name`, dimmed via

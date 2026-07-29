@@ -19,6 +19,7 @@ pub mod keymap;
 pub mod layout;
 pub mod merge;
 pub mod palette;
+pub mod process_stats;
 pub mod rail;
 pub mod root;
 pub mod sessions;

@@ -43,6 +43,7 @@ use crate::keymap::{self, WindowControlsStyle};
 use crate::layout;
 use crate::merge;
 use crate::palette;
+use crate::process_stats;
 use crate::rail::{
     self, ProjectChild, RailMode, SessionRow, StatusGroup, WorktreeEntry, WorktreeNote,
 };
@@ -282,6 +283,16 @@ pub struct AdeApp {
     /// [`Self::diff_cache`] - powers "by project" mode's session-less worktree rows and the
     /// rail footer's `prune` action.
     worktree_notes: HashMap<PathBuf, rail::WorktreeNote>,
+    /// Real `wt_core::diff::AheadBehind` counts per worktree/session cwd, from the same
+    /// periodic refresh as [`Self::diff_cache`] - the status bar's `↑2 ↓0` indicator for the
+    /// active session's worktree.
+    ahead_behind_cache: HashMap<PathBuf, wt_core::diff::AheadBehind>,
+    /// Real, live per-pid CPU%/memory samples for every currently open session's process
+    /// (`crate::process_stats`), refreshed by the same periodic background task as
+    /// [`Self::diff_cache`] - see `Self::start_status_polling`'s docs for why this rides the
+    /// same timer rather than a second, independent polling loop. Keyed by OS pid; an entry is
+    /// absent for a pid not yet sampled (or already exited).
+    process_stats: HashMap<u32, process_stats::ProcessSample>,
     /// Real, bounded disk-usage total across every listed worktree (see
     /// `crate::rail::disk_usage_bytes`'s docs for the real `std::fs` walk and its cap),
     /// recomputed whenever the worktree list reloads. `None` while the very first
@@ -373,6 +384,18 @@ pub struct AdeApp {
     /// every render for a Rust file, cleared for a non-Rust file so diagnostics can't bleed
     /// across files.
     file_view_diagnostics: HashMap<usize, Vec<diagnostics_view::LineDiagnostic>>,
+    /// The real error-severity diagnostic count for whichever file [`Self::render_file_view`]
+    /// most recently rendered a `rust-analyzer` status for - exactly the same
+    /// `lsp::LspFileStatus::Analyzed { errors, .. }` value `code_surface::render_file_status_bar`
+    /// itself displays for that same file, in the same frame (set right alongside
+    /// [`Self::file_view_diagnostics`], from the same `lsp_status` computation). `None` whenever
+    /// that render didn't produce a real `Analyzed` status (non-Rust file, or the LSP client is
+    /// still spawning/indexing/failed) - not a fabricated `Some(0)`.
+    /// [`Self::status_bar_error_count`] reads this rather than re-deriving a count from
+    /// [`Self::file_view_diagnostics`]'s own per-line index (whose per-line shape would
+    /// over-count any diagnostic spanning multiple lines), so the two real error counts shown in
+    /// the same frame - this one and the File view's own footer - can never disagree.
+    file_view_error_count: Option<usize>,
     /// Every in-flight `lsp_core::LspClient::spawn`/`did_open` background task - a [`TaskPool`]
     /// for the same "independent operations" reason as [`Self::_merge_write_tasks`].
     _lsp_tasks: TaskPool,

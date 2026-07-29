@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::sessions::SessionKind;
 use crate::status::Status;
-use wt_core::diff::{DiffBase, DiffLineKind, WorktreeDiff, WorktreeMergeStatus};
+use wt_core::diff::{AheadBehind, DiffBase, DiffLineKind, WorktreeDiff, WorktreeMergeStatus};
 
 /// Which of the two rail grouping modes is active - `design_handoff_jerry_ade/README.md`'s
 /// `by urgency ▾ / by project ▾` control. Urgency is the documented default.
@@ -146,6 +146,21 @@ pub fn group_by_urgency(rows: &[SessionRow]) -> Vec<StatusGroup> {
             }
         })
         .collect()
+}
+
+/// Real per-status counts across every session row, in [`Status::ORDER`] - the status bar's
+/// five urgency-counter squares (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 7).
+/// Unlike [`group_by_urgency`], a status with zero matching rows still gets a real `0` entry
+/// rather than being omitted, since the status bar always shows all five squares. Built from the
+/// same per-session [`Status`] every [`SessionRow`] already carries - not a second, independent
+/// status classification.
+pub fn urgency_counts(rows: &[SessionRow]) -> [(Status, usize); 5] {
+    Status::ORDER.map(|status| {
+        (
+            status,
+            rows.iter().filter(|row| row.status == status).count(),
+        )
+    })
 }
 
 /// Clean/merged state for one worktree row in "by project" mode - computed from
@@ -336,6 +351,11 @@ pub struct StatusSnapshot {
     pub diffs: HashMap<PathBuf, DiffSummary>,
     /// Keyed by worktree path.
     pub worktree_notes: HashMap<PathBuf, WorktreeNote>,
+    /// Real `wt_core::diff::ahead_behind_against_base` result per worktree/session cwd - the
+    /// status bar's `↑2 ↓0` indicator. Keyed and deduplicated the same way as [`Self::diffs`];
+    /// a path with no detectable base (or whose `ahead_behind_against_base` call itself failed)
+    /// simply has no entry, rather than a fabricated `{0, 0}`.
+    pub ahead_behind: HashMap<PathBuf, AheadBehind>,
 }
 
 /// One worktree to compute a [`WorktreeNote`] for, as input to [`compute_status_snapshot`] -
@@ -361,6 +381,7 @@ pub fn compute_status_snapshot(
     unique_diff_paths.dedup();
 
     let mut diffs = HashMap::with_capacity(unique_diff_paths.len());
+    let mut ahead_behind = HashMap::with_capacity(unique_diff_paths.len());
     for path in unique_diff_paths {
         let summary = match wt_core::diff::diff_against_base(&path) {
             Ok(DiffBase::Diff(diff)) => {
@@ -377,6 +398,9 @@ pub fn compute_status_snapshot(
                 DiffSummary::default()
             }
         };
+        if let Ok(Some(counts)) = wt_core::diff::ahead_behind_against_base(&path) {
+            ahead_behind.insert(path.clone(), counts);
+        }
         diffs.insert(path, summary);
     }
 
@@ -404,6 +428,7 @@ pub fn compute_status_snapshot(
     StatusSnapshot {
         diffs,
         worktree_notes,
+        ahead_behind,
     }
 }
 
@@ -551,6 +576,33 @@ mod tests {
         assert_eq!(groups.len(), 1, "only Ask is present, so only one group");
         assert_eq!(groups[0].status, Status::Ask);
         assert_eq!(groups[0].rows.len(), 2);
+    }
+
+    #[test]
+    fn urgency_counts_covers_every_status_in_order_including_zero_counts() {
+        let rows = vec![
+            row(1, Status::Ask, "a", "/a"),
+            row(2, Status::Ask, "b", "/b"),
+            row(3, Status::Review, "c", "/c"),
+        ];
+        assert_eq!(
+            urgency_counts(&rows),
+            [
+                (Status::Ask, 2),
+                (Status::Fail, 0),
+                (Status::Review, 1),
+                (Status::Run, 0),
+                (Status::Idle, 0),
+            ],
+            "unlike group_by_urgency, every status must appear even when its count is zero"
+        );
+    }
+
+    #[test]
+    fn urgency_counts_with_no_sessions_is_all_zero_not_omitted() {
+        let counts = urgency_counts(&[]);
+        assert_eq!(counts.len(), 5);
+        assert!(counts.iter().all(|(_, count)| *count == 0));
     }
 
     #[test]
@@ -1071,6 +1123,22 @@ mod tests {
             !main_note.is_prunable(),
             "the main checkout is never prunable"
         );
+
+        // Neither linked worktree has diverged from `main` (both branched off it with no new
+        // commits on either side), so a real `ahead_behind` entry should exist for each and
+        // report zero on both sides.
+        let dirty_ahead_behind = snapshot
+            .ahead_behind
+            .get(&dirty_wt_path)
+            .expect("dirty worktree should have a real ahead_behind entry");
+        assert_eq!(dirty_ahead_behind.ahead, 0);
+        assert_eq!(dirty_ahead_behind.behind, 0);
+        let merged_ahead_behind = snapshot
+            .ahead_behind
+            .get(&merged_wt_path)
+            .expect("merged worktree should have a real ahead_behind entry");
+        assert_eq!(merged_ahead_behind.ahead, 0);
+        assert_eq!(merged_ahead_behind.behind, 0);
     }
 
     #[test]

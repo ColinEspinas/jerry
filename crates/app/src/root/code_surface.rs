@@ -1094,6 +1094,14 @@ impl AdeApp {
             self.file_view_diagnostics = HashMap::new();
             None
         };
+        // The status bar's `N servers · M errors` reads this exact value (see
+        // `AdeApp::file_view_error_count`'s own docs) instead of re-deriving a count from
+        // `file_view_diagnostics`'s per-line index, so it can never disagree with the real count
+        // this same frame's File view footer (`render_file_status_bar`, below) shows.
+        self.file_view_error_count = match &lsp_status {
+            Some(LspFileStatus::Analyzed { errors, .. }) => Some(*errors),
+            _ => None,
+        };
 
         let Some(parsed) = self.file_view_cache.as_ref() else {
             return render_sidebar_message("no file loaded".to_string(), theme::text::FAINT);

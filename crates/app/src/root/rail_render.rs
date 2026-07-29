@@ -145,48 +145,74 @@ impl AdeApp {
     }
 
     /// Starts the rail's periodic status background refresh (see [`STATUS_POLL_INTERVAL`]'s
-    /// docs). Every tick: snapshots the current worktree paths and open sessions' cwds on the
-    /// foreground thread (cheap, no I/O), computes a [`rail::StatusSnapshot`] on the
-    /// background executor, then writes the result back into
-    /// [`Self::diff_cache`]/[`Self::worktree_notes`] on the foreground thread - the same
-    /// "gather/compute/write back" shape [`Self::load_worktrees`]/[`Self::load_diff`] use.
+    /// docs). Every tick: snapshots the current worktree paths, open sessions' cwds, and open
+    /// sessions' real pids on the foreground thread (cheap, no I/O), computes a
+    /// [`rail::StatusSnapshot`] *and* a real [`process_stats::sample_processes`] reading on the
+    /// background executor, then writes both results back into
+    /// [`Self::diff_cache`]/[`Self::worktree_notes`]/[`Self::ahead_behind_cache`]/
+    /// [`Self::process_stats`] on the foreground thread - the same "gather/compute/write back"
+    /// shape [`Self::load_worktrees`]/[`Self::load_diff`] use.
+    ///
+    /// The status bar's real CPU%/memory sampling (`crate::process_stats`) deliberately rides
+    /// this same existing timer rather than spawning a second, independent polling loop -
+    /// `prev_process_samples` is the one piece of state that must survive across ticks (a CPU%
+    /// needs a delta between two samples), threaded through the loop body itself rather than
+    /// stored on `Self`, since nothing outside this loop ever needs the raw, pre-percentage
+    /// reading.
     pub(super) fn start_status_polling(&mut self, cx: &mut Context<Self>) {
-        let task = cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(STATUS_POLL_INTERVAL).await;
+        let task = cx.spawn(async move |this, cx| {
+            let mut prev_process_samples: HashMap<u32, process_stats::RawCpuSample> =
+                HashMap::new();
+            loop {
+                cx.background_executor().timer(STATUS_POLL_INTERVAL).await;
 
-            let Ok((worktrees, diff_paths)) = this.update(cx, |this, _cx| {
-                let worktrees: Vec<rail::WorktreeQuery> = this
-                    .worktrees
-                    .iter()
-                    .filter(|item| item.error.is_none())
-                    .map(|item| rail::WorktreeQuery {
-                        path: item.path.clone(),
-                        is_main: item.is_main,
-                        is_locked: item.is_locked,
+                let Ok((worktrees, diff_paths, pids)) = this.update(cx, |this, cx| {
+                    let worktrees: Vec<rail::WorktreeQuery> = this
+                        .worktrees
+                        .iter()
+                        .filter(|item| item.error.is_none())
+                        .map(|item| rail::WorktreeQuery {
+                            path: item.path.clone(),
+                            is_main: item.is_main,
+                            is_locked: item.is_locked,
+                        })
+                        .collect();
+                    let diff_paths: Vec<PathBuf> = this
+                        .sessions
+                        .iter()
+                        .map(|session| session.cwd.clone())
+                        .collect();
+                    let pids: Vec<u32> = this
+                        .sessions
+                        .iter()
+                        .filter_map(|session| session.pane.read(cx).pid())
+                        .collect();
+                    (worktrees, diff_paths, pids)
+                }) else {
+                    break;
+                };
+
+                let (snapshot, process_samples, next_prev) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let snapshot = rail::compute_status_snapshot(&worktrees, &diff_paths);
+                        let (process_samples, next_prev) =
+                            process_stats::sample_processes(&pids, prev_process_samples);
+                        (snapshot, process_samples, next_prev)
                     })
-                    .collect();
-                let diff_paths: Vec<PathBuf> = this
-                    .sessions
-                    .iter()
-                    .map(|session| session.cwd.clone())
-                    .collect();
-                (worktrees, diff_paths)
-            }) else {
-                break;
-            };
+                    .await;
+                prev_process_samples = next_prev;
 
-            let snapshot = cx
-                .background_executor()
-                .spawn(async move { rail::compute_status_snapshot(&worktrees, &diff_paths) })
-                .await;
-
-            let updated = this.update(cx, |this, cx| {
-                this.diff_cache = snapshot.diffs;
-                this.worktree_notes = snapshot.worktree_notes;
-                cx.notify();
-            });
-            if updated.is_err() {
-                break;
+                let updated = this.update(cx, |this, cx| {
+                    this.diff_cache = snapshot.diffs;
+                    this.worktree_notes = snapshot.worktree_notes;
+                    this.ahead_behind_cache = snapshot.ahead_behind;
+                    this.process_stats = process_samples;
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    break;
+                }
             }
         });
         self._status_poll_task = Some(task);
@@ -910,13 +936,13 @@ impl AdeApp {
         container
     }
 
-    /// Footer 28: real aggregate stats (`N worktrees · disk usage`) plus the real `prune`
-    /// action.
-    pub(super) fn render_rail_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Includes error'd entries - the count should match what `wt_core::list_worktrees`
-        // reported, problems included, not silently shrink.
-        let worktree_count = self.worktrees.len();
-        let disk_label = match self.disk_usage {
+    /// The real `Y GB` (`+` suffixed if [`Self::disk_usage`] was truncated) disk-usage label, or
+    /// `...` while the background scan hasn't reported a real total yet - shared by
+    /// [`Self::render_rail_footer`] and the status bar's worktrees cluster
+    /// (`root::status_bar::render_status_worktrees_cluster`), so the two can never format the
+    /// same real aggregate differently.
+    pub(super) fn disk_usage_label(&self) -> String {
+        match self.disk_usage {
             Some((bytes, truncated)) => {
                 let label = rail::format_bytes(bytes);
                 if truncated {
@@ -926,7 +952,16 @@ impl AdeApp {
                 }
             }
             None => "...".to_string(),
-        };
+        }
+    }
+
+    /// Footer 28: real aggregate stats (`N worktrees · disk usage`) plus the real `prune`
+    /// action.
+    pub(super) fn render_rail_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Includes error'd entries - the count should match what `wt_core::list_worktrees`
+        // reported, problems included, not silently shrink.
+        let worktree_count = self.worktrees.len();
+        let disk_label = self.disk_usage_label();
         let prunable_count = self.prunable_worktree_paths().len();
         let prune_label = if self.prune_in_flight {
             "pruning\u{2026}".to_string()

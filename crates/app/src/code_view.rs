@@ -18,7 +18,7 @@
 //! `vendor/zed/crates/language/src/outline.rs:102` (same `tree-sitter`/`tree-sitter-rust`
 //! version pair as this crate's `Cargo.toml`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::ops::Range;
@@ -70,6 +70,47 @@ pub fn detect_line_ending(bytes: &[u8]) -> LineEnding {
         }
     }
     LineEnding::Lf
+}
+
+/// How many of [`ParsedFile::lines`]' leading lines [`detect_indent_width`] scans before giving
+/// up - bounded the same way `wt_core::diff::MAX_HUNK_LINES_PER_FILE`-style caps are, so a huge
+/// file with no early space-indented line doesn't make this walk the whole thing.
+const INDENT_DETECTION_LINE_SCAN_CAP: usize = 200;
+
+/// A simple, honest heuristic for the file's real indent width, for the status bar's `N spaces`
+/// item: scans up to [`INDENT_DETECTION_LINE_SCAN_CAP`] lines, tallies the leading-space count of
+/// every line that starts with one or more spaces followed by real (non-whitespace-only)
+/// content, and returns the *modal* (most common) count among them - not just the first one
+/// found. Tab-indented lines are skipped entirely (a tab-indented file has no single "N spaces"
+/// answer to report); a whitespace-only line is skipped too (it says nothing about the file's
+/// real indent unit). Ties are broken by the smaller width, since a real single-width indent unit
+/// is the more common convention than an arbitrary larger one.
+///
+/// Taking the modal count rather than the first match matters for two real, unremarkable file
+/// shapes: a C-style block-comment header (` * Copyright ...`, a single leading space) and a
+/// one-off hanging-indent continuation line, either of which would otherwise get naively picked
+/// as "the" indent width just for appearing before any of the file's real, repeated body indent.
+///
+/// `None` if no space-indented line is found within the scanned window - an honestly-omitted
+/// value, not a fabricated default like `4`.
+pub fn detect_indent_width(lines: &[RenderedLine]) -> Option<usize> {
+    let mut counts: HashMap<usize, usize> = HashMap::new();
+    for line in lines.iter().take(INDENT_DETECTION_LINE_SCAN_CAP) {
+        let text = line.text.as_str();
+        if text.starts_with('\t') {
+            continue;
+        }
+        let leading_spaces = text.chars().take_while(|&ch| ch == ' ').count();
+        if leading_spaces > 0 && leading_spaces < text.len() {
+            *counts.entry(leading_spaces).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by(|(width_a, count_a), (width_b, count_b)| {
+            count_a.cmp(count_b).then(width_b.cmp(width_a))
+        })
+        .map(|(width, _)| width)
 }
 
 /// The status bar's language label, derived from `path`'s extension - the same
@@ -335,6 +376,14 @@ pub struct ParsedFile {
     /// `true` if the file on disk was larger than [`MAX_FILE_BYTES`] and this is only a prefix
     /// of it (cut back to the last line boundary within the cap - see [`load_file`]).
     pub truncated: bool,
+    /// `true` if the file's real raw bytes (up to the [`MAX_FILE_BYTES`] cap) were genuinely
+    /// valid UTF-8 - a real `std::str::from_utf8` check at load time, not assumed. `false` means
+    /// [`load_file`]'s `String::from_utf8_lossy` decode silently replaced at least one invalid
+    /// byte sequence with a `U+FFFD` replacement character (a Latin-1/UTF-16/binary-ish file),
+    /// so what's on screen is no longer a faithful rendering of the file's real bytes. The status
+    /// bar's `UTF-8` label reads this rather than assuming every loaded file is what it claims to
+    /// be.
+    pub is_valid_utf8: bool,
     pub lines: Vec<RenderedLine>,
 }
 
@@ -356,6 +405,10 @@ pub fn load_file(path: &Path) -> io::Result<ParsedFile> {
     }
 
     let line_ending = detect_line_ending(&bytes);
+    // Checked before the lossy decode below (which borrows `bytes`, so this doesn't need to run
+    // first, but conceptually it's answering "were the real bytes valid" before they get
+    // silently repaired) - a real, cheap validity check, not a hardcoded assumption.
+    let is_valid_utf8 = std::str::from_utf8(&bytes).is_ok();
     let source = String::from_utf8_lossy(&bytes).into_owned();
 
     let extension = path.extension().and_then(|ext| ext.to_str());
@@ -377,6 +430,7 @@ pub fn load_file(path: &Path) -> io::Result<ParsedFile> {
         language,
         line_ending,
         truncated,
+        is_valid_utf8,
         lines,
     })
 }
@@ -455,6 +509,125 @@ mod tests {
     #[test]
     fn a_file_with_no_newline_at_all_defaults_to_lf() {
         assert_eq!(detect_line_ending(b"no newline here"), LineEnding::Lf);
+    }
+
+    fn plain_line(text: &str) -> RenderedLine {
+        RenderedLine {
+            text: text.to_string(),
+            runs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn detect_indent_width_finds_the_first_real_space_indented_line() {
+        let lines: Vec<RenderedLine> = ["fn main() {", "    let x = 1;", "}"]
+            .iter()
+            .map(|text| plain_line(text))
+            .collect();
+        assert_eq!(detect_indent_width(&lines), Some(4));
+    }
+
+    #[test]
+    fn detect_indent_width_skips_tab_indented_lines() {
+        let lines: Vec<RenderedLine> = ["fn main() {", "\tlet x = 1;", "  let y = 2;"]
+            .iter()
+            .map(|text| plain_line(text))
+            .collect();
+        assert_eq!(
+            detect_indent_width(&lines),
+            Some(2),
+            "a tab-indented line has no single \"N spaces\" answer - keep scanning for a real \
+             space-indented one"
+        );
+    }
+
+    #[test]
+    fn detect_indent_width_skips_whitespace_only_lines() {
+        let lines: Vec<RenderedLine> = ["fn main() {", "    ", "      let x = 1;"]
+            .iter()
+            .map(|text| plain_line(text))
+            .collect();
+        assert_eq!(
+            detect_indent_width(&lines),
+            Some(6),
+            "a blank/whitespace-only line says nothing about the real indent unit"
+        );
+    }
+
+    #[test]
+    fn detect_indent_width_with_no_indentation_anywhere_is_none() {
+        let lines: Vec<RenderedLine> = ["fn main() {", "}"]
+            .iter()
+            .map(|text| plain_line(text))
+            .collect();
+        assert_eq!(detect_indent_width(&lines), None);
+    }
+
+    #[test]
+    fn detect_indent_width_on_an_empty_file_is_none() {
+        assert_eq!(detect_indent_width(&[]), None);
+    }
+
+    /// The audit's exact reproduction: a C-style block-comment header's single leading space
+    /// must not be naively picked as "the" indent width just for appearing before the file's
+    /// real, repeated 4-space body indent.
+    #[test]
+    fn detect_indent_width_is_not_fooled_by_a_single_block_comment_header_line() {
+        let lines: Vec<RenderedLine> = [
+            "/**",
+            " * Copyright 2024 Example Corp.",
+            " */",
+            "fn main() {",
+            "    let x = 1;",
+            "    let y = 2;",
+            "    let z = 3;",
+            "}",
+        ]
+        .iter()
+        .map(|text| plain_line(text))
+        .collect();
+        assert_eq!(
+            detect_indent_width(&lines),
+            Some(4),
+            "the real, repeated 4-space body indent should win over a one-off single leading \
+             space from a C-style block comment header"
+        );
+    }
+
+    /// The audit's other exact reproduction: a one-off hanging-indent continuation line must not
+    /// out-vote the file's real, repeated indent unit.
+    #[test]
+    fn detect_indent_width_is_not_fooled_by_a_single_hanging_indent_continuation_line() {
+        let lines: Vec<RenderedLine> = [
+            "let long_name =",
+            "  some_call(a, b);",
+            "fn main() {",
+            "    let x = 1;",
+            "    let y = 2;",
+            "}",
+        ]
+        .iter()
+        .map(|text| plain_line(text))
+        .collect();
+        assert_eq!(
+            detect_indent_width(&lines),
+            Some(4),
+            "a one-off 2-space hanging-indent continuation line must not out-vote the file's \
+             real, repeated 4-space indent"
+        );
+    }
+
+    #[test]
+    fn detect_indent_width_breaks_a_tie_toward_the_smaller_width() {
+        let lines: Vec<RenderedLine> = ["  two spaces", "    four spaces"]
+            .iter()
+            .map(|text| plain_line(text))
+            .collect();
+        assert_eq!(
+            detect_indent_width(&lines),
+            Some(2),
+            "an exact tie in occurrence count should prefer the smaller, more conventional width"
+        );
     }
 
     #[test]
@@ -651,6 +824,7 @@ mod tests {
             language: "Rust",
             line_ending: LineEnding::Lf,
             truncated: false,
+            is_valid_utf8: true,
             lines: Vec::new(),
         };
         assert!(cache_is_fresh(&cached, Path::new("src/main.rs"), None, 42));
@@ -673,6 +847,10 @@ mod tests {
         assert_eq!(parsed.language, "Rust");
         assert_eq!(parsed.line_ending, LineEnding::Crlf);
         assert!(!parsed.truncated);
+        assert!(
+            parsed.is_valid_utf8,
+            "a genuinely valid UTF-8 file must be reported as such"
+        );
         assert_eq!(parsed.lines.len(), 4);
         assert_eq!(parsed.lines[0].text, "fn main() {");
         let has_keyword_run = parsed.lines[0]
@@ -689,6 +867,37 @@ mod tests {
     fn load_file_on_a_missing_path_returns_a_real_io_error() {
         let missing = PathBuf::from("/definitely/not/a/real/path/for/ade/code-view-test.rs");
         assert!(load_file(&missing).is_err());
+    }
+
+    /// The audit's exact reproduction: a file whose real raw bytes are not valid UTF-8 (here,
+    /// Latin-1-encoded, containing a byte sequence that isn't valid UTF-8 at all) must be
+    /// reported as such, not silently labeled `UTF-8` after `String::from_utf8_lossy` quietly
+    /// replaces the invalid bytes with `U+FFFD`.
+    #[test]
+    fn load_file_detects_a_real_non_utf8_file_as_lossily_decoded() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("latin1.txt");
+        // 0xE9 alone (Latin-1 for "é") is not a valid UTF-8 byte sequence in this position.
+        let mut bytes = b"caf".to_vec();
+        bytes.push(0xE9);
+        bytes.extend_from_slice(b" latin-1\n");
+        fs::write(&path, &bytes).expect("write");
+
+        let parsed = load_file(&path).expect("load_file");
+        assert!(
+            !parsed.is_valid_utf8,
+            "a real non-UTF-8 file must not be reported as valid UTF-8"
+        );
+    }
+
+    #[test]
+    fn load_file_detects_a_real_ascii_file_as_valid_utf8() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("ascii.txt");
+        fs::write(&path, "plain ascii content\n").expect("write");
+
+        let parsed = load_file(&path).expect("load_file");
+        assert!(parsed.is_valid_utf8);
     }
 
     #[test]

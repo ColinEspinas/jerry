@@ -1,6 +1,6 @@
 use super::*;
 use crate::root::settings_widgets::ChoiceOption;
-use crate::root::widgets::{render_keycap_row, KeycapSize};
+use crate::root::widgets::{render_env_chip, render_keycap_row, KeycapSize};
 
 impl AdeApp {
     pub(super) fn handle_toggle_settings_action(
@@ -792,14 +792,16 @@ impl AdeApp {
     /// *General* - `Window controls` as a segmented `System | macOS | Windows/Linux` choice,
     /// wired live (`CHANGELOG.md`'s change 3) - see `Self::window_controls_style`'s own docs for
     /// how both this row and the command palette's three `Window controls: …` entries read/write
-    /// the same persisted field.
+    /// the same persisted field. `Default environment` shows the real, live-detected
+    /// `crate::env_info`/`crate::root::widgets::render_env_chip` environment chip (real WSL
+    /// detection - Revision R6's job, per the doc comment this replaced) - the same chip the
+    /// status bar and terminal footer render, not a fourth copy.
     ///
-    /// `Default environment`, `Restore sessions on launch`, and `Confirm before discarding a
-    /// worktree` - three more rows `Jerry.dc.html`'s own `settingsRows.general` fixture shows -
-    /// are left out for the same reason as the Agents/Worktrees toggle sections (see
-    /// `crate::settings`'s module docs): no WSL/environment detection exists anywhere in this
-    /// codebase, and session-restore-on-launch / a discard-confirmation flow are app behaviour
-    /// this build doesn't have, not settings plumbing around behaviour that already exists.
+    /// `Restore sessions on launch` and `Confirm before discarding a worktree` - two more rows
+    /// `Jerry.dc.html`'s own `settingsRows.general` fixture shows - stay left out for the same
+    /// reason as the Agents/Worktrees toggle sections (see `crate::settings`'s module docs):
+    /// session-restore-on-launch and a discard-confirmation flow are app behaviour this build
+    /// doesn't have, not settings plumbing around behaviour that already exists.
     pub(super) fn render_settings_general_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.window_controls_style().label().to_string();
         let choice = self.render_choice_control(
@@ -822,11 +824,17 @@ impl AdeApp {
                 this.set_window_controls_style(style, cx);
             },
         );
-        let row = self.render_settings_row(
+        let window_controls_row = self.render_settings_row(
             "Window controls",
             "Traffic lights on macOS, caption buttons on Windows and Linux. Follows the \
              platform unless you pin it - this switches live.",
             choice,
+        );
+        let environment_row = self.render_settings_row(
+            "Default environment",
+            "Where new sessions run - real WSL detection on Windows, real CPU architecture \
+             elsewhere. The same chip shown in the status bar and terminal footer.",
+            render_env_chip(),
         );
 
         div()
@@ -843,7 +851,8 @@ impl AdeApp {
                     .text_color(theme::palette::GROUP_HEADER)
                     .child("Window & launch"),
             )
-            .child(row)
+            .child(window_controls_row)
+            .child(environment_row)
             .child(self.render_snippet_block(settings_store::ConfigPage::General))
     }
 

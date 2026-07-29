@@ -72,6 +72,8 @@ impl AdeApp {
             filter_focus_handle: cx.focus_handle(),
             diff_cache: HashMap::new(),
             worktree_notes: HashMap::new(),
+            ahead_behind_cache: HashMap::new(),
+            process_stats: HashMap::new(),
             disk_usage: None,
             worktree_disk_usage: HashMap::new(),
             prune_status: None,
@@ -98,6 +100,7 @@ impl AdeApp {
             lsp_clients: HashMap::new(),
             lsp_opened_files: HashSet::new(),
             file_view_diagnostics: HashMap::new(),
+            file_view_error_count: None,
             _lsp_tasks: TaskPool::new(),
             _lsp_poll_task: None,
             hover: None,
@@ -277,6 +280,7 @@ impl AdeApp {
         self.file_load_state = FileLoadState::Idle;
         self.file_view_changed_lines = HashSet::new();
         self.code_cursor = None;
+        self.file_view_error_count = None;
         self.open_diff_file_cache = None;
         self._file_load_task = None;
         self.code_zoom_percent = AdeApp::ZOOM_DEFAULT_PERCENT;
