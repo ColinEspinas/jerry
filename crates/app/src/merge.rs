@@ -159,8 +159,10 @@ mod tests {
         ConflictHunk {
             ours_label: "HEAD".to_string(),
             ours: vec!["ours".to_string()],
+            ours_start_line: 2,
             theirs_label: "feature".to_string(),
             theirs: vec!["theirs".to_string()],
+            theirs_start_line: 4,
         }
     }
 

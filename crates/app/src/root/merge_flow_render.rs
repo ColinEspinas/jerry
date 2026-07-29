@@ -1,3 +1,4 @@
+use super::code_surface::zoom_scoped;
 use super::*;
 
 impl AdeApp {
@@ -7,12 +8,28 @@ impl AdeApp {
     /// currently in for `session`; every value shown (branch names, file paths, conflict line
     /// content) comes from the `wt_core::merge` call [`Self::start_merge`] made.
     ///
-    /// Deliberate simplifications vs. the design's full mockup: no per-line gutter numbers (a
-    /// `ConflictHunk`'s `ours`/`theirs` lines aren't tied to original file line numbers once
-    /// extracted from the markers, so inventing incrementing ones would be fabricated data);
-    /// the left ("ours"/base) column is labelled with the base branch name rather than an agent
-    /// identity, since `attempt_merge` always runs `git merge` from the base worktree - real
-    /// git state, not a running session, so there's no agent to attribute a tint to.
+    /// Real per-token syntax coloring ([`code_view::highlight_block`], cached in
+    /// [`Self::merge_highlight_cache`]) and a real two-column line-number gutter now render for
+    /// the active hunk, matching the Diff view's own treatment
+    /// (`code_surface::AdeApp::render_diff_file_detail`). Unlike the Diff view's gutter (genuine
+    /// old-file/new-file line numbers, since a diff hunk really does have two distinct files on
+    /// either side), this one is **not** an old/new pair: both numbers are real line positions
+    /// within the *same* conflicted working file - the file as it actually sits on disk, markers
+    /// and all - so "old/new" framing would incorrectly suggest "ours' version of the file" vs.
+    /// "theirs' version of the file" as two logically separate files, which they aren't here.
+    /// The gutter is real, not fabricated: `wt_core::merge::ConflictHunk::ours_start_line`/
+    /// `theirs_start_line` are captured while actually parsing the file's real
+    /// `<<<<<<</=======/>>>>>>>` markers (the 1-indexed line immediately after each marker), so
+    /// [`Self::render_conflict_columns`] just increments from a real anchor per rendered line -
+    /// this surface used to omit the gutter entirely because no such anchor existed yet; it does
+    /// now. [`Self::render_conflict_columns`] is a pure reader of [`Self::merge_highlight_cache`],
+    /// and the cache itself is only ever (re)computed at a real state-transition point (see
+    /// [`Self::ensure_active_merge_highlight_cache`]'s docs), never from this render path, so
+    /// this whole surface stays `&self`.
+    ///
+    /// The left ("ours"/base) column is labelled with the base branch name rather than an agent
+    /// identity, since `attempt_merge` always runs `git merge` from the base worktree - real git
+    /// state, not a running session, so there's no agent to attribute a tint to.
     pub(super) fn render_merge_flow_surface(
         &self,
         session: &Session,
@@ -191,7 +208,13 @@ impl AdeApp {
                             file.segments.get(target_hunk)
                         {
                             body = body
-                                .child(self.render_conflict_columns(base_branch, session, hunk, cx))
+                                .child(self.render_conflict_columns(
+                                    base_branch,
+                                    session,
+                                    &file.relative_path,
+                                    hunk,
+                                    cx,
+                                ))
                                 .child(self.render_take_both_row(cx));
                         } else {
                             body = body.child(div().flex_1());
@@ -265,18 +288,105 @@ impl AdeApp {
             })
     }
 
+    /// Ensures [`Self::merge_highlight_cache`] holds real per-side syntax highlighting for
+    /// `relative_path`'s `hunk` - recomputes (via [`code_view::highlight_block`]) only when the
+    /// `(path, hunk)` pair differs from what's cached (real `PathBuf`/[`ConflictHunk`] equality
+    /// checks - keyed on both, not the hunk alone, since highlighting depends on
+    /// `relative_path`'s extension too; see [`Self::merge_highlight_cache`]'s own docs for the
+    /// real, reachable bug keying on the hunk alone would allow).
+    fn ensure_merge_highlight_cache(&mut self, relative_path: &Path, hunk: &ConflictHunk) {
+        if self
+            .merge_highlight_cache
+            .as_ref()
+            .is_some_and(|(cached_path, cached_hunk, _, _)| {
+                cached_path == relative_path && cached_hunk == hunk
+            })
+        {
+            return;
+        }
+        let extension = relative_path.extension().and_then(|ext| ext.to_str());
+        let ours = code_view::highlight_block(hunk.ours.iter().map(String::as_str), extension);
+        let theirs = code_view::highlight_block(hunk.theirs.iter().map(String::as_str), extension);
+        self.merge_highlight_cache =
+            Some((relative_path.to_path_buf(), hunk.clone(), ours, theirs));
+    }
+
+    /// Ensures [`Self::merge_highlight_cache`] is fresh for whichever conflict hunk is currently
+    /// active in [`Self::merge_flow`] (a no-op if there's no active `Conflicted` hunk) - the
+    /// real, change-triggered hook this cache is (re)computed from: called from
+    /// `Self::start_merge`'s completion handler (a fresh `Conflicted` state) and
+    /// [`Self::resolve_active_hunk`]'s advance-to-next-hunk point, **never** from `render()` -
+    /// [`Self::render_conflict_columns`] only ever reads this cache. A stale cache there falls
+    /// back to plain, uncoloured text for the affected lines until the next real transition
+    /// recomputes it (see that method's own per-line fallback), rather than blocking the render
+    /// call on a `tree-sitter` parse. Conflict hunk content is small (a real conflict *region*,
+    /// not a whole file - unlike `wt_core::diff`'s hunks, `ConflictHunk` has no line cap, but a
+    /// merge conflict's own size is inherently bounded by where two branches' edits actually
+    /// overlap), so this stays a synchronous call at the real change point rather than a
+    /// background `cx.spawn()` task, the same real-cost-justified choice
+    /// `code_surface::AdeApp::ensure_diff_highlight_cache`'s docs explain for the Diff view.
+    pub(super) fn ensure_active_merge_highlight_cache(&mut self) {
+        let Some(flow) = self.merge_flow.as_ref() else {
+            return;
+        };
+        let merge::MergeFlowState::Conflicted {
+            files,
+            active_file,
+            active_hunk,
+            ..
+        } = &flow.state
+        else {
+            return;
+        };
+        let Some(ConflictedPath::Text(file)) = files.get(*active_file) else {
+            return;
+        };
+        let Some(ConflictSegment::Conflict(hunk)) = file.segments.get(*active_hunk) else {
+            return;
+        };
+        // Cloned out first (both cheap, real `Clone`s) so the call below doesn't have to hold
+        // this borrow of `self.merge_flow` alive across it - the same "take it out first" shape
+        // `Self::refresh_open_diff_file_cache` uses for the Diff view's own cache.
+        let relative_path = file.relative_path.clone();
+        let hunk = hunk.clone();
+        self.ensure_merge_highlight_cache(&relative_path, &hunk);
+    }
+
     /// Surface D's two-column split for the active conflict hunk - `ours`/`theirs` content
-    /// extracted from the file's on-disk conflict markers. See
-    /// [`Self::render_merge_flow_surface`]'s docs for why the left column is labelled with the
-    /// base branch rather than an agent identity.
+    /// extracted from the file's on-disk conflict markers, real per-token syntax coloring (a
+    /// pure read of [`Self::merge_highlight_cache`], kept fresh by
+    /// [`Self::ensure_active_merge_highlight_cache`]), a real gutter
+    /// (`hunk.ours_start_line`/`theirs_start_line` plus each line's index), and real editor zoom
+    /// (`zoom_scoped`, matching the Diff/File views). See [`Self::render_merge_flow_surface`]'s
+    /// docs for why the left column is labelled with the base branch rather than an agent
+    /// identity, and for where the gutter's real position data comes from.
+    ///
+    /// Row count for each column is driven by `hunk.ours`/`hunk.theirs` themselves - the real
+    /// ground truth - never by the cached `RenderedLine` `Vec`'s own length: a genuinely empty
+    /// side (real, reachable - base deletes a line, feature edits it) must render zero rows, and
+    /// a cache that hasn't caught up yet (or doesn't match `relative_path`/`hunk`) must still
+    /// show every real line (in plain, uncoloured text - see the per-line fallback below),
+    /// rather than either fabricating a phantom row or silently hiding real conflict content.
     pub(super) fn render_conflict_columns(
         &self,
         base_branch: &str,
         session: &Session,
+        relative_path: &Path,
         hunk: &ConflictHunk,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let (agent_fg, agent_bg) = work_surface::agent_tint(session.kind);
+        // A real, deliberate contrast fix: an earlier revision distinguished "theirs" from
+        // "ours" with a full-height `agent_bg` wash under the right column's text. Once real
+        // syntax coloring (`code_view::color_for_kind`) started owning that text, a real
+        // contrast check found `theme::syntax::COMMENT` against every real agent's `agent_bg`
+        // (`work_surface::agent_tint`) lands around 2.2-2.5:1 - well under WCAG AA's 4.5:1 for
+        // normal text - and the two columns wouldn't even match in readability, since the left
+        // column never had a wash under its text. Fixing this by narrowing the tint to a 3px
+        // left-edge accent bar (`agent_fg`, below) rather than adjusting `COMMENT` itself: that
+        // keeps `theme::syntax::COMMENT` a single real, unconditional token wherever it's used
+        // (the File/Diff views included) instead of a merge-view-specific override, and gets
+        // both columns to the same real legibility - neither has text sitting on a color wash.
+        let (agent_fg, _) = work_surface::agent_tint(session.kind);
         let session_branch = self
             .worktrees
             .iter()
@@ -284,14 +394,92 @@ impl AdeApp {
             .and_then(|item| item.branch.clone())
             .unwrap_or_else(|| hunk.theirs_label.clone());
 
-        let column = |label: String,
+        let rem_px = self.effective_code_rem_px();
+        let (ours_rendered, theirs_rendered): (
+            &[code_view::RenderedLine],
+            &[code_view::RenderedLine],
+        ) = self
+            .merge_highlight_cache
+            .as_ref()
+            .filter(|(cached_path, cached_hunk, _, _)| {
+                cached_path == relative_path && cached_hunk == hunk
+            })
+            .map(|(_, _, ours, theirs)| (ours.as_slice(), theirs.as_slice()))
+            .unwrap_or((&[], &[]));
+
+        let column = |side: &'static str,
+                      label: String,
                       sub: String,
-                      lines: &[String],
-                      fg: gpui::Rgba,
+                      raw_lines: &[String],
+                      rendered_lines: &[code_view::RenderedLine],
+                      start_line: usize,
                       take_id: &'static str,
                       take_label: &'static str,
                       choice: wt_core::merge::ConflictChoice,
+                      rem_px: f32,
                       cx: &mut Context<Self>| {
+            let code_rows = div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .p(px(10.0))
+                .font(font(theme::font::MONO))
+                .children(raw_lines.iter().enumerate().map(|(index, raw_line)| {
+                    let line_number = start_line + index;
+                    let mut row = div()
+                        .flex()
+                        .items_center()
+                        .text_size(rems(1.0))
+                        .line_height(rems(1.6))
+                        .debug_selector(move || format!("merge-{side}-code-row-{line_number}"));
+                    row = row.child(
+                        div()
+                            .flex_none()
+                            // Widened from an earlier px(28.0) to px(44.0), plus a real
+                            // whitespace/overflow backstop - a real conflicted file can be
+                            // thousands of real lines long, and a wrapped 5-digit gutter number
+                            // would grow this row past its neighbours', the same class of bug
+                            // Revision R5's audit fixed once already for the File view's own
+                            // gutter (see `code_surface::render_diff_gutter_number`'s matching
+                            // fix and docs).
+                            .w(px(44.0))
+                            .pr(px(6.0))
+                            .text_right()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_size(px(10.0))
+                            .text_color(theme::text::GUTTER)
+                            .child(line_number.to_string()),
+                    );
+                    // `rendered_lines.get(index)` - not indexing `rendered_lines` unconditionally
+                    // - so a still-stale/mismatched cache falls back to `raw_line`'s real,
+                    // plainly-coloured text rather than panicking or silently dropping the row
+                    // (mirrors `code_surface::render_diff_line`'s identical defensive fallback).
+                    let mut text_row = div().flex().flex_1().min_w_0();
+                    match rendered_lines.get(index) {
+                        Some(line) if !line.text.is_empty() => {
+                            for (run_text, kind) in &line.runs {
+                                text_row = text_row.child(
+                                    div()
+                                        .text_color(code_view::color_for_kind(*kind))
+                                        .child(run_text.clone()),
+                                );
+                            }
+                        }
+                        Some(_) => text_row = text_row.child("\u{a0}"),
+                        None => {
+                            text_row = text_row.child(div().text_color(theme::syntax::TEXT).child(
+                                if raw_line.is_empty() {
+                                    "\u{a0}".to_string()
+                                } else {
+                                    raw_line.clone()
+                                },
+                            ))
+                        }
+                    }
+                    row.child(text_row)
+                }));
+
             div()
                 .flex_1()
                 .min_w_0()
@@ -329,17 +517,7 @@ impl AdeApp {
                         .flex_1()
                         .min_h_0()
                         .overflow_hidden()
-                        .p(px(10.0))
-                        .font(font(theme::font::MONO))
-                        .text_size(px(11.5))
-                        .text_color(fg)
-                        .children(lines.iter().map(|line| {
-                            div().child(if line.is_empty() {
-                                "\u{a0}".to_string()
-                            } else {
-                                line.clone()
-                            })
-                        })),
+                        .child(zoom_scoped(rem_px, code_rows)),
                 )
                 .child(
                     div()
@@ -377,26 +555,46 @@ impl AdeApp {
                     .border_r_1()
                     .border_color(theme::border::ZONE)
                     .child(column(
+                        "ours",
                         base_branch.to_string(),
                         hunk.ours_label.clone(),
                         &hunk.ours,
-                        theme::text::SECONDARY,
+                        ours_rendered,
+                        hunk.ours_start_line,
                         "take-left",
                         "Take left",
                         wt_core::merge::ConflictChoice::Left,
+                        rem_px,
                         cx,
                     )),
             )
-            .child(div().flex_1().min_w_0().bg(agent_bg).child(column(
-                session.kind.label().to_string(),
-                session_branch,
-                &hunk.theirs,
-                agent_fg,
-                "take-right",
-                "Take right",
-                wt_core::merge::ConflictChoice::Right,
-                cx,
-            )))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .child(
+                        // The right column's real, deliberate legibility fix - a 3px left-edge
+                        // accent bar (matching `render_diff_line`'s own accent-bar precedent for
+                        // the Diff view's add/remove signal) instead of a full-height wash
+                        // sitting directly under real syntax-colored text. See this method's own
+                        // `agent_fg` binding for the real contrast numbers this replaces.
+                        div().flex_none().w(px(3.0)).self_stretch().bg(agent_fg),
+                    )
+                    .child(column(
+                        "theirs",
+                        session.kind.label().to_string(),
+                        session_branch,
+                        &hunk.theirs,
+                        theirs_rendered,
+                        hunk.theirs_start_line,
+                        "take-right",
+                        "Take right",
+                        wt_core::merge::ConflictChoice::Right,
+                        rem_px,
+                        cx,
+                    )),
+            )
     }
 
     /// The `Take both` action on the active hunk - `wt_core::merge::ConflictChoice::Both` keeps

@@ -93,6 +93,11 @@ impl AdeApp {
                         session_id: id,
                         state,
                     });
+                    // The real state-transition point a fresh `Conflicted` state's active hunk
+                    // (if any) needs its highlight cache filled - see
+                    // `Self::ensure_active_merge_highlight_cache`'s docs for why this must never
+                    // happen from `render()` instead.
+                    this.ensure_active_merge_highlight_cache();
                 }
                 cx.notify();
             });
@@ -146,12 +151,20 @@ impl AdeApp {
             *active_file = next_file;
             *active_hunk = next_hunk;
         }
+        // `session_id` (a plain `Copy` `u64`) read out now, while `flow` (borrowed from
+        // `self.merge_flow`) is still alive - `flow`/`files`/`active_file`/`active_hunk` are not
+        // used again past this point, so this is the last real use of that borrow.
+        let session_id = flow.session_id;
         cx.notify();
+        // The real state-transition point the newly-active hunk (if the advance above landed on
+        // a different one) needs its highlight cache filled - see
+        // `Self::ensure_active_merge_highlight_cache`'s docs for why this must never happen from
+        // `render()` instead. Safe to call now: the `flow`/`files` borrow above has ended.
+        self.ensure_active_merge_highlight_cache();
 
         let Some((worktree_path, resolved_file)) = write_back else {
             return;
         };
-        let session_id = flow.session_id;
         let worktree_path_for_check = worktree_path.clone();
         let task = cx.spawn(async move |this, cx| {
             let result = cx
@@ -733,5 +746,250 @@ mod merge_regression_tests {
             "the merge should have completed successfully now that both files are genuinely \
              resolved on disk"
         );
+    }
+
+    /// Real merge-surface zoom: the active hunk's code rows must genuinely grow with
+    /// `AdeApp::code_zoom_percent`, mirroring `code_surface::code_zoom_tests::
+    /// zoom_scales_text_but_not_the_gutter_width`'s real-bounds-measurement shape - see
+    /// `merge_flow_render::AdeApp::render_conflict_columns`'s `zoom_scoped` wrap. Reaches a real
+    /// `Conflicted` state through a real `git merge` (base and feature branches each edit line 2
+    /// of the same real `.rs` file differently), not a fabricated conflict string - the same
+    /// real-worktree harness this module's other regression tests use.
+    #[gpui::test]
+    fn merge_conflict_code_rows_genuinely_grow_with_zoom(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        fs::write(
+            repo.path().join("value.rs"),
+            "fn value() -> i32 {\n    1\n}\n",
+        )
+        .expect("write");
+        git(repo.path(), &["add", "value.rs"]);
+        git(repo.path(), &["commit", "-m", "seed value.rs"]);
+
+        let feature = add_worktree(repo.path(), "feature", "feature-wt");
+        fs::write(
+            repo.path().join("value.rs"),
+            "fn value() -> i32 {\n    2\n}\n",
+        )
+        .expect("write");
+        git(repo.path(), &["commit", "-am", "base changes value.rs"]);
+
+        fs::write(feature.join("value.rs"), "fn value() -> i32 {\n    3\n}\n").expect("write");
+        git(&feature, &["commit", "-am", "feature changes value.rs"]);
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let feature_session_id = app.update_in(cx, |app, window, cx| {
+            app.sessions.spawn(
+                SessionKind::Shell,
+                feature.clone(),
+                app.settings.appearance.terminal_font_size,
+                window,
+                cx,
+            )
+        });
+
+        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        cx.run_until_parked();
+
+        // Hand-verified real line numbers for the conflict git produces from this fixture:
+        // "fn value() -> i32 {"=1, "<<<<<<< HEAD"=2, "    2"=3 (ours_start_line), "======="=4,
+        // "    3"=5 (theirs_start_line), ">>>>>>> feature"=6, "}"=7.
+        let ours_start_line = app.read_with(cx, |app, _| {
+            let flow = app
+                .merge_flow
+                .as_ref()
+                .expect("merge_flow after start_merge");
+            let merge::MergeFlowState::Conflicted {
+                files,
+                active_file,
+                active_hunk,
+                ..
+            } = &flow.state
+            else {
+                panic!(
+                    "expected a conflicted merge - base and feature both changed line 2 of \
+                     value.rs"
+                );
+            };
+            let ConflictedPath::Text(file) = &files[*active_file] else {
+                panic!("expected a real text conflict for value.rs");
+            };
+            let ConflictSegment::Conflict(hunk) = &file.segments[*active_hunk] else {
+                panic!("expected the active segment to still be a real conflict hunk");
+            };
+            hunk.ours_start_line
+        });
+        assert_eq!(
+            ours_start_line, 3,
+            "hand-verified real position - see this test's own doc comment"
+        );
+
+        cx.run_until_parked();
+        let bounds_at_100 = cx.debug_bounds("merge-ours-code-row-3").expect(
+            "the active hunk's real ours-side code row should have really painted at 100% zoom",
+        );
+
+        app.update(cx, |app, cx| {
+            for _ in 0..10 {
+                app.zoom_in(cx); // 100% -> 200%
+            }
+        });
+        cx.run_until_parked();
+
+        let bounds_at_200 = cx.debug_bounds("merge-ours-code-row-3").expect(
+            "the active hunk's real ours-side code row should have really painted at 200% zoom",
+        );
+
+        assert!(
+            bounds_at_200.size.height > bounds_at_100.size.height,
+            "the real, rems()-sized merge conflict code row must genuinely grow taller at 200% \
+             zoom (line-height is rems(1.6), scoped through the same zoom_scoped mechanism the \
+             Diff/File views use) - got {:?} at 100% vs {:?} at 200%",
+            bounds_at_100.size,
+            bounds_at_200.size,
+        );
+    }
+
+    /// Proves `AdeApp::merge_highlight_cache` is genuinely *reused*, not silently recomputed
+    /// every time `Self::ensure_active_merge_highlight_cache` runs - pointer identity of the
+    /// cached `ours` `Vec`, since a fresh recompute would allocate a new one (mirrors
+    /// `code_surface::diff_render_tests`' identical technique for `diff_highlight_cache`, itself
+    /// mirroring `code_view_cache_tests`' original for `file_view_cache`). If the
+    /// `(relative_path, ConflictHunk)` freshness check were ever removed from
+    /// `ensure_merge_highlight_cache`, this would fail.
+    #[gpui::test]
+    fn repeated_cache_fills_of_the_same_active_hunk_reuse_the_cached_highlighting(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        fs::write(
+            repo.path().join("value.rs"),
+            "fn value() -> i32 {\n    1\n}\n",
+        )
+        .expect("write");
+        git(repo.path(), &["add", "value.rs"]);
+        git(repo.path(), &["commit", "-m", "seed value.rs"]);
+
+        let feature = add_worktree(repo.path(), "feature", "feature-wt");
+        fs::write(
+            repo.path().join("value.rs"),
+            "fn value() -> i32 {\n    2\n}\n",
+        )
+        .expect("write");
+        git(repo.path(), &["commit", "-am", "base changes value.rs"]);
+        fs::write(feature.join("value.rs"), "fn value() -> i32 {\n    3\n}\n").expect("write");
+        git(&feature, &["commit", "-am", "feature changes value.rs"]);
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let feature_session_id = app.update_in(cx, |app, window, cx| {
+            app.sessions.spawn(
+                SessionKind::Shell,
+                feature.clone(),
+                app.settings.appearance.terminal_font_size,
+                window,
+                cx,
+            )
+        });
+        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        cx.run_until_parked();
+
+        let first_ptr = app.read_with(cx, |app, _| {
+            app.merge_highlight_cache
+                .as_ref()
+                .expect("merge_highlight_cache should be populated after a real conflicted merge")
+                .2
+                .as_ptr()
+        });
+
+        // The real hook this cache is recomputed from, called again with nothing changed.
+        app.update(cx, |app, _cx| {
+            app.ensure_active_merge_highlight_cache();
+        });
+        let second_ptr = app.read_with(cx, |app, _| {
+            app.merge_highlight_cache
+                .as_ref()
+                .expect("merge_highlight_cache should still be populated")
+                .2
+                .as_ptr()
+        });
+        assert_eq!(
+            first_ptr, second_ptr,
+            "a second cache-fill call for the same, still-active hunk must reuse the cached \
+             highlighting, not rebuild it (a fresh heap allocation means highlight_block ran \
+             again for content that hadn't changed)"
+        );
+    }
+
+    /// The other half of the same cache's correctness: advancing to a genuinely different active
+    /// hunk (a different conflicted file, real two-file conflict) must recompute - not a cache
+    /// that never refreshes, and not stale content from the file just resolved.
+    #[gpui::test]
+    fn resolving_a_hunk_and_advancing_recomputes_the_merge_highlight_cache_for_the_new_file(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        fs::write(repo.path().join("a.rs"), "fn a() -> i32 {\n    1\n}\n").expect("write");
+        fs::write(repo.path().join("b.py"), "def b():\n    return 1\n").expect("write");
+        git(repo.path(), &["add", "a.rs", "b.py"]);
+        git(repo.path(), &["commit", "-m", "seed a.rs and b.py"]);
+
+        let feature = add_worktree(repo.path(), "feature", "feature-wt");
+        fs::write(repo.path().join("a.rs"), "fn a() -> i32 {\n    2\n}\n").expect("write");
+        fs::write(repo.path().join("b.py"), "def b():\n    return 2\n").expect("write");
+        git(
+            repo.path(),
+            &["commit", "-am", "base changes a.rs and b.py"],
+        );
+        fs::write(feature.join("a.rs"), "fn a() -> i32 {\n    3\n}\n").expect("write");
+        fs::write(feature.join("b.py"), "def b():\n    return 3\n").expect("write");
+        git(
+            &feature,
+            &["commit", "-am", "feature changes a.rs and b.py"],
+        );
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let feature_session_id = app.update_in(cx, |app, window, cx| {
+            app.sessions.spawn(
+                SessionKind::Shell,
+                feature.clone(),
+                app.settings.appearance.terminal_font_size,
+                window,
+                cx,
+            )
+        });
+        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        cx.run_until_parked();
+
+        let first_path = app.read_with(cx, |app, _| {
+            app.merge_highlight_cache
+                .as_ref()
+                .expect("merge_highlight_cache should be populated after a real conflicted merge")
+                .0
+                .clone()
+        });
+
+        app.update(cx, |app, cx| {
+            app.resolve_active_hunk(wt_core::merge::ConflictChoice::Left, cx);
+        });
+
+        app.read_with(cx, |app, _| {
+            let (cached_path, _hunk, ours, _theirs) = app
+                .merge_highlight_cache
+                .as_ref()
+                .expect("merge_highlight_cache should be populated for the newly active hunk");
+            assert_ne!(
+                cached_path, &first_path,
+                "advancing to the next conflicted file's hunk must recompute the cache for that \
+                 file, not keep serving the resolved file's stale highlighting"
+            );
+            let has_real_content = ours
+                .iter()
+                .any(|line| !line.runs.is_empty() || !line.text.is_empty());
+            assert!(
+                has_real_content,
+                "the newly active file's real conflict content should be genuinely highlighted, \
+                 not an empty leftover cache entry"
+            );
+        });
     }
 }

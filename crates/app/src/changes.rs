@@ -11,7 +11,7 @@ use std::path::Path;
 use gpui::Rgba;
 
 use crate::theme;
-use wt_core::diff::{DiffFile, DiffLineKind, FileChangeStatus};
+use wt_core::diff::{DiffFile, DiffHunk, DiffLineKind, FileChangeStatus};
 
 /// Added/removed line counts for one file, counted directly from its hunks.
 /// `wt_core::diff::DiffFile` has no separate stored counter for this, so it's recomputed here
@@ -237,6 +237,57 @@ pub fn parse_hunk_new_range(header: &str) -> Option<(usize, usize)> {
     Some((start, count))
 }
 
+/// Parses a `@@ -<old_start>[,<old_count>] +<new_start>[,<new_count>] @@...` hunk header's
+/// old-file range - mirrors [`parse_hunk_new_range`] exactly, around the `-` half instead of the
+/// `+` half.
+pub fn parse_hunk_old_range(header: &str) -> Option<(usize, usize)> {
+    let rest = header.strip_prefix("@@ ")?;
+    let minus_index = rest.find('-')?;
+    let after_minus = &rest[minus_index + 1..];
+    let range_end = after_minus.find(' ')?;
+    let range = &after_minus[..range_end];
+
+    let mut parts = range.splitn(2, ',');
+    let start: usize = parts.next()?.parse().ok()?;
+    let count: usize = match parts.next() {
+        Some(count_str) => count_str.parse().ok()?,
+        None => 1,
+    };
+    Some((start, count))
+}
+
+/// The real old-file/new-file line number pair for every line in `hunk`, in order - the Diff
+/// view's honest gutter data. Walks `hunk.lines` forward from the real `(old_start, new_start)`
+/// parsed off `hunk.header`, advancing exactly like [`crate::code_view::changed_line_set`]
+/// already does for the File view's git gutter: `Context` advances both counters (both `Some`);
+/// `Added` only exists in the new file (old side `None`); `Removed` only exists in the old file
+/// (new side `None`). `(None, None)` for every line if the header itself couldn't be parsed -
+/// real derived data or an honest blank, never a fabricated guess.
+pub fn hunk_line_numbers(hunk: &DiffHunk) -> Vec<(Option<usize>, Option<usize>)> {
+    let mut old_line = parse_hunk_old_range(&hunk.header).map(|(start, _)| start);
+    let mut new_line = parse_hunk_new_range(&hunk.header).map(|(start, _)| start);
+
+    hunk.lines
+        .iter()
+        .map(|line| {
+            let pair = match line.kind {
+                DiffLineKind::Context => (old_line, new_line),
+                DiffLineKind::Added => (None, new_line),
+                DiffLineKind::Removed => (old_line, None),
+            };
+            match line.kind {
+                DiffLineKind::Context => {
+                    old_line = old_line.map(|n| n + 1);
+                    new_line = new_line.map(|n| n + 1);
+                }
+                DiffLineKind::Added => new_line = new_line.map(|n| n + 1),
+                DiffLineKind::Removed => old_line = old_line.map(|n| n + 1),
+            }
+            pair
+        })
+        .collect()
+}
+
 /// How many unchanged lines sit between the end of one hunk and the start of the next, in the
 /// same file - the gap the design's fold marker (`⋯ N unchanged lines`) reports. `None` if
 /// either header couldn't be parsed, or the computed gap isn't positive (adjacent/back-to-back
@@ -410,6 +461,59 @@ mod tests {
     #[test]
     fn parse_hunk_new_range_rejects_a_malformed_header() {
         assert_eq!(parse_hunk_new_range("not a hunk header"), None);
+    }
+
+    #[test]
+    fn parse_hunk_old_range_reads_an_explicit_count() {
+        assert_eq!(
+            parse_hunk_old_range("@@ -10,5 +14,9 @@ fn foo() {"),
+            Some((10, 5))
+        );
+    }
+
+    #[test]
+    fn parse_hunk_old_range_defaults_a_missing_count_to_one() {
+        assert_eq!(parse_hunk_old_range("@@ -1 +1 @@"), Some((1, 1)));
+    }
+
+    #[test]
+    fn parse_hunk_old_range_rejects_a_malformed_header() {
+        assert_eq!(parse_hunk_old_range("not a hunk header"), None);
+    }
+
+    #[test]
+    fn hunk_line_numbers_advances_old_and_new_counters_per_real_line_kind() {
+        // Old range starts at 10 (5 lines); new range starts at 10 (6 lines, since one line was
+        // added) - a realistic mixed hunk: one context line, one removed, one added, one context.
+        let hunk = DiffHunk {
+            header: "@@ -10,5 +10,6 @@".to_string(),
+            lines: vec![
+                line(DiffLineKind::Context, "ctx1"),
+                line(DiffLineKind::Removed, "old line"),
+                line(DiffLineKind::Added, "new line a"),
+                line(DiffLineKind::Added, "new line b"),
+                line(DiffLineKind::Context, "ctx2"),
+            ],
+        };
+        assert_eq!(
+            hunk_line_numbers(&hunk),
+            vec![
+                (Some(10), Some(10)),
+                (Some(11), None),
+                (None, Some(11)),
+                (None, Some(12)),
+                (Some(12), Some(13)),
+            ]
+        );
+    }
+
+    #[test]
+    fn hunk_line_numbers_is_all_none_for_an_unparseable_header() {
+        let hunk = DiffHunk {
+            header: "garbage".to_string(),
+            lines: vec![line(DiffLineKind::Context, "ctx")],
+        };
+        assert_eq!(hunk_line_numbers(&hunk), vec![(None, None)]);
     }
 
     #[test]

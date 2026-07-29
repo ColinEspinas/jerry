@@ -365,9 +365,21 @@ pub struct ConflictHunk {
     /// content, since [`attempt_merge`] always runs `git merge` from the base worktree).
     pub ours_label: String,
     pub ours: Vec<String>,
+    /// 1-indexed real line number, in the original conflicted file on disk, of `ours`' first
+    /// content line - the line immediately after the `<<<<<<< label` marker line. Meaningless
+    /// when `ours` is empty (no real first content line exists - the marker's next line is
+    /// directly `=======`, so this equals `=======`'s own line number in that case): a caller
+    /// must gate any per-line gutter rendering on `ours.is_empty()`, never print this value for
+    /// a line that was never real (the `app` crate's merge-surface renderer drives row count off
+    /// the real highlighted line count, not this field alone, for exactly this reason).
+    pub ours_start_line: usize,
     /// The label git wrote after `>>>>>>> ` (the merged-in branch's name).
     pub theirs_label: String,
     pub theirs: Vec<String>,
+    /// 1-indexed real line number of `theirs`' first content line - the line immediately after
+    /// the `=======` marker line. Same "meaningless when empty" caveat as
+    /// [`Self::ours_start_line`].
+    pub theirs_start_line: usize,
 }
 
 /// One segment of a conflicted file: either ordinary (non-conflicted) lines, or one real
@@ -598,11 +610,18 @@ enum ParseState {
     Ours {
         ours_label: String,
         ours: Vec<String>,
+        /// Captured the moment this state was entered (the marker line's own number plus one) -
+        /// see [`ConflictHunk::ours_start_line`]'s docs.
+        ours_start_line: usize,
     },
     Theirs {
         ours_label: String,
         ours: Vec<String>,
+        ours_start_line: usize,
         theirs: Vec<String>,
+        /// Captured the moment this state was entered (the `=======` line's own number plus
+        /// one) - see [`ConflictHunk::theirs_start_line`]'s docs.
+        theirs_start_line: usize,
     },
 }
 
@@ -618,7 +637,9 @@ fn parse_conflict_segments(
         path: relative_path.to_path_buf(),
     };
 
-    for line in text.lines() {
+    for (index, line) in text.lines().enumerate() {
+        // 1-indexed real line number of `line` itself.
+        let line_number = index + 1;
         state = match state {
             ParseState::Outside => {
                 if let Some(label) = line
@@ -631,6 +652,7 @@ fn parse_conflict_segments(
                     ParseState::Ours {
                         ours_label: label.to_string(),
                         ours: Vec::new(),
+                        ours_start_line: line_number + 1,
                     }
                 } else {
                     common.push(line.to_string());
@@ -640,12 +662,15 @@ fn parse_conflict_segments(
             ParseState::Ours {
                 ours_label,
                 mut ours,
+                ours_start_line,
             } => {
                 if line == "=======" {
                     ParseState::Theirs {
                         ours_label,
                         ours,
+                        ours_start_line,
                         theirs: Vec::new(),
+                        theirs_start_line: line_number + 1,
                     }
                 } else if line.starts_with("|||||||") {
                     return Err(Error::MergeUnsupportedConflictStyle {
@@ -655,13 +680,19 @@ fn parse_conflict_segments(
                     return Err(malformed());
                 } else {
                     ours.push(line.to_string());
-                    ParseState::Ours { ours_label, ours }
+                    ParseState::Ours {
+                        ours_label,
+                        ours,
+                        ours_start_line,
+                    }
                 }
             }
             ParseState::Theirs {
                 ours_label,
                 ours,
+                ours_start_line,
                 mut theirs,
+                theirs_start_line,
             } => {
                 if let Some(label) = line
                     .strip_prefix(">>>>>>> ")
@@ -670,8 +701,10 @@ fn parse_conflict_segments(
                     segments.push(ConflictSegment::Conflict(ConflictHunk {
                         ours_label,
                         ours,
+                        ours_start_line,
                         theirs_label: label.to_string(),
                         theirs,
+                        theirs_start_line,
                     }));
                     ParseState::Outside
                 } else if line.starts_with("<<<<<<< ") || line == "=======" {
@@ -681,7 +714,9 @@ fn parse_conflict_segments(
                     ParseState::Theirs {
                         ours_label,
                         ours,
+                        ours_start_line,
                         theirs,
+                        theirs_start_line,
                     }
                 }
             }
@@ -1302,10 +1337,98 @@ mod tests {
         assert_eq!(hunk.ours, vec!["ours line".to_string()]);
         assert_eq!(hunk.theirs_label, "feature");
         assert_eq!(hunk.theirs, vec!["theirs line".to_string()]);
+        // Real line numbers: "before"=1, "<<<<<<< HEAD"=2, "ours line"=3, "======="=4,
+        // "theirs line"=5, ">>>>>>> feature"=6, "after"=7.
+        assert_eq!(hunk.ours_start_line, 3);
+        assert_eq!(hunk.theirs_start_line, 5);
         assert_eq!(
             segments[2],
             ConflictSegment::Common(vec!["after".to_string()])
         );
+    }
+
+    /// A real, reachable case: one side is genuinely empty (base deletes the line entirely,
+    /// feature edits it - a real two-branch `git merge` produces exactly this shape). `ours` is
+    /// empty and `ours_start_line` lands on `=======`'s own line - the documented "meaningless
+    /// when empty" case on [`ConflictHunk::ours_start_line`] - real callers must gate on
+    /// `ours.is_empty()`, not print this value as if it named a real line.
+    #[test]
+    fn parse_conflict_segments_handles_a_genuinely_empty_side() {
+        let text = "<<<<<<< HEAD\n=======\ntheirs line\n>>>>>>> feature\n";
+        let segments = parse_conflict_segments(text, Path::new("f.txt")).expect("parse");
+        let ConflictSegment::Conflict(hunk) = &segments[0] else {
+            panic!("expected a conflict segment");
+        };
+        assert!(hunk.ours.is_empty());
+        assert_eq!(hunk.theirs, vec!["theirs line".to_string()]);
+        // "<<<<<<< HEAD"=1, "======="=2, "theirs line"=3, ">>>>>>> feature"=4.
+        assert_eq!(
+            hunk.ours_start_line, 2,
+            "with zero ours lines, ours_start_line lands on the ======= line itself - the \
+             documented, honest 'meaningless when empty' case"
+        );
+        assert_eq!(hunk.theirs_start_line, 3);
+    }
+
+    /// Real position tracking across a MULTI-hunk, multi-line-per-side conflict - a single-line
+    /// hunk could pass this even with an off-by-one bug, so this fixture and its hand-verified
+    /// expected line numbers are deliberately larger.
+    #[test]
+    fn parse_conflict_segments_computes_real_start_lines_across_multiple_hunks() {
+        let text = "line1\n\
+<<<<<<< HEAD\n\
+ours a\n\
+ours b\n\
+=======\n\
+theirs a\n\
+theirs b\n\
+theirs c\n\
+>>>>>>> feature\n\
+line2\n\
+line3\n\
+<<<<<<< HEAD\n\
+second ours\n\
+=======\n\
+second theirs a\n\
+second theirs b\n\
+>>>>>>> feature\n\
+line4\n";
+        let segments = parse_conflict_segments(text, Path::new("f.txt")).expect("parse");
+        let hunks: Vec<&ConflictHunk> = segments
+            .iter()
+            .filter_map(|segment| match segment {
+                ConflictSegment::Conflict(hunk) => Some(hunk),
+                ConflictSegment::Common(_) => None,
+            })
+            .collect();
+        assert_eq!(hunks.len(), 2);
+
+        // First hunk: "line1"=1, "<<<<<<< HEAD"=2, "ours a"=3, "ours b"=4, "======="=5,
+        // "theirs a"=6, "theirs b"=7, "theirs c"=8, ">>>>>>> feature"=9.
+        assert_eq!(
+            hunks[0].ours,
+            vec!["ours a".to_string(), "ours b".to_string()]
+        );
+        assert_eq!(hunks[0].ours_start_line, 3);
+        assert_eq!(
+            hunks[0].theirs,
+            vec![
+                "theirs a".to_string(),
+                "theirs b".to_string(),
+                "theirs c".to_string()
+            ]
+        );
+        assert_eq!(hunks[0].theirs_start_line, 6);
+
+        // Second hunk: "line2"=10, "line3"=11, "<<<<<<< HEAD"=12, "second ours"=13,
+        // "======="=14, "second theirs a"=15, "second theirs b"=16, ">>>>>>> feature"=17.
+        assert_eq!(hunks[1].ours, vec!["second ours".to_string()]);
+        assert_eq!(hunks[1].ours_start_line, 13);
+        assert_eq!(
+            hunks[1].theirs,
+            vec!["second theirs a".to_string(), "second theirs b".to_string()]
+        );
+        assert_eq!(hunks[1].theirs_start_line, 15);
     }
 
     #[test]
@@ -1377,8 +1500,10 @@ mod tests {
             segments: vec![ConflictSegment::Conflict(ConflictHunk {
                 ours_label: "HEAD".to_string(),
                 ours: vec!["ours".to_string()],
+                ours_start_line: 2,
                 theirs_label: "feature".to_string(),
                 theirs: vec!["theirs".to_string()],
+                theirs_start_line: 4,
             })],
             trailing_newline: true,
         };

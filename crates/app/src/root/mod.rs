@@ -112,6 +112,17 @@ const MAX_RENDERED_DIFF_FILES: usize = 40;
 /// own per-file `MAX_HUNK_LINES_PER_FILE` cap (2000) on loaded data.
 const MAX_RENDERED_DIFF_LINES_PER_FILE: usize = 300;
 
+/// The Diff view's per-hunk syntax-highlight + gutter-number cache's real shape - see
+/// [`AdeApp::diff_highlight_cache`]'s own docs for what each element means and why the `DiffFile`
+/// is a real identity guard, not decoration. A named `type` (rather than the bare tuple type
+/// inline) so `clippy::type_complexity` doesn't fire, and so `code_surface`'s own
+/// `diff_highlight_cache_for` can share the exact same shape as the field it reads.
+pub(super) type DiffHighlightCache = (
+    DiffFile,
+    Vec<Vec<code_view::RenderedLine>>,
+    Vec<Vec<(Option<usize>, Option<usize>)>>,
+);
+
 /// How often [`AdeApp::ensure_lsp_poll_task`]'s background loop checks for a newly-arrived
 /// `publishDiagnostics` notification. Coarser than `crate::terminal_pane::POLL_INTERVAL` (33ms):
 /// pty output is latency-sensitive, rust-analyzer's diagnostics are not.
@@ -197,6 +208,21 @@ pub struct AdeApp {
     /// says otherwise, always written from [`Self::spawn_file_load`]'s background task, never
     /// synchronously during `render()`.
     file_view_cache: Option<code_view::ParsedFile>,
+    /// Cached per-hunk syntax highlighting (and per-hunk gutter line numbers, so
+    /// [`Self::render_diff_file_detail`]'s render loop never recomputes
+    /// [`changes::hunk_line_numbers`] itself) for whichever `DiffFile` this cache was built from,
+    /// with both outer `Vec`s index-aligned with `file.hunks`, inner with that hunk's `lines`.
+    /// Freshness is a cheap `DiffFile` equality check (see
+    /// [`Self::ensure_diff_highlight_cache`]), mirroring [`Self::file_view_cache`]'s "recompute
+    /// only when stale" discipline for the Diff view. The cached `DiffFile` (first tuple field)
+    /// is a real identity guard, not decoration: [`Self::render_diff_file_detail`] must filter on
+    /// it equalling the file it's actually rendering before reading either `Vec` positionally,
+    /// per that method's own docs, for the real bug (rendering one file's cached source lines
+    /// under another file's diff signs/gutter numbers) skipping this check would allow. Cleared
+    /// on a worktree switch alongside [`Self::open_diff_file_cache`] (see
+    /// [`Self::select_worktree`]) so it never retains a full file's highlighting from the
+    /// worktree just left.
+    diff_highlight_cache: Option<DiffHighlightCache>,
     /// Path and time [`Self::render_file_view`] last called `std::fs::metadata` for its
     /// freshness check, throttling that syscall to at most once per
     /// [`FILE_FRESHNESS_CHECK_INTERVAL`] instead of every render. `None` until the first check;
@@ -340,6 +366,20 @@ pub struct AdeApp {
     /// guards against a fast Abort-after-Complete double-click letting `git merge --abort` race
     /// an in-flight `git commit` and discard already-resolved conflict work.
     merge_op_in_flight: bool,
+    /// Cached per-side syntax highlighting for whichever conflict hunk is currently active in
+    /// [`Self::merge_flow`] - recomputed only at the real points that can change (`start_merge`
+    /// finding a `Conflicted` state, `resolve_active_hunk` advancing to the next hunk), never
+    /// from `render()`. Keyed on `(relative_path, ConflictHunk)`, not the hunk alone: two
+    /// different conflicted files can have byte-identical hunk content (same lines/labels/start
+    /// lines) but different extensions, which would otherwise incorrectly reuse one file's
+    /// highlighting for the other - `ConflictHunk` already derives `PartialEq`, `PathBuf`'s own
+    /// is a plain path compare.
+    merge_highlight_cache: Option<(
+        PathBuf,
+        ConflictHunk,
+        Vec<code_view::RenderedLine>,
+        Vec<code_view::RenderedLine>,
+    )>,
     _load_worktrees_task: Option<Task<()>>,
     _load_file_tree_task: Option<Task<()>>,
     _load_diff_task: Option<Task<()>>,

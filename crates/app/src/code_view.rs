@@ -144,7 +144,7 @@ pub fn highlighter_for_extension(
 /// A syntax span's classification - `design_handoff_jerry_ade/README.md`'s File view
 /// syntax-colour table ("keyword ... function ... type ... literal/self ... comment ...
 /// punctuation/text").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HighlightKind {
     Keyword,
     Function,
@@ -592,7 +592,7 @@ pub struct RenderedLine {
 /// list. A trailing range past the last `\n` is always included (a file with no trailing
 /// newline), and an empty `source` still yields one empty line, matching how an editor shows an
 /// empty file.
-fn build_lines(source: &str, spans: &[HighlightSpan]) -> Vec<RenderedLine> {
+pub(crate) fn build_lines(source: &str, spans: &[HighlightSpan]) -> Vec<RenderedLine> {
     let line_ranges = line_ranges(source);
 
     let mut sorted_spans = spans.to_vec();
@@ -669,6 +669,41 @@ fn line_ranges(source: &str) -> Vec<Range<usize>> {
     }
     ranges.push(line_start..bytes.len());
     ranges
+}
+
+/// Highlights an isolated block of lines - a diff hunk's interleaved add/remove/context lines,
+/// or one side of a merge conflict hunk - as its own real source unit: joins `lines` with `\n`,
+/// runs `extension`'s real highlighter (if any), and re-splits via [`build_lines`]. Shared by
+/// `crate::root::code_surface`'s Diff view and `crate::root::merge_flow_render`'s Merge view so
+/// both highlight the same way [`load_file`] does, rather than each re-deriving the
+/// join-highlight-split recipe.
+///
+/// This is a deliberate, honest simplification: a hunk/conflict side is highlighted on its own,
+/// not as part of the true old- or new-file content, since neither is fully available from a
+/// hunk/conflict block alone. `tree-sitter`'s own best-effort recovery on imperfect/partial input
+/// (this module's `highlighting_invalid_rust_still_returns_a_real_non_empty_span_list`-style
+/// tests) is what makes this reasonable, not a claim of perfect semantic accuracy.
+///
+/// Zero input lines yields an empty `Vec`, *not* [`build_lines`]'s own one-empty-line convention:
+/// that convention is correct for [`load_file`] (a genuinely empty *file* still has one real,
+/// empty line to show), but wrong here - a diff hunk/merge-conflict side with zero lines has zero
+/// real content, and a caller driving row count off this `Vec`'s length (`crate::root::
+/// merge_flow_render::AdeApp::render_conflict_columns`) must render zero rows for it, not one
+/// fabricated blank row.
+pub(crate) fn highlight_block<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    extension: Option<&str>,
+) -> Vec<RenderedLine> {
+    let lines: Vec<&str> = lines.into_iter().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let source = lines.join("\n");
+    let spans = match highlighter_for_extension(extension) {
+        Some(highlighter) => highlighter(&source),
+        None => Vec::new(),
+    };
+    build_lines(&source, &spans)
 }
 
 /// A file's parsed-and-highlighted content, cached in `crate::root::AdeApp::file_view_cache` so
@@ -1521,5 +1556,122 @@ mod tests {
         for rendered in &parsed.lines {
             assert!(rendered.text.is_empty() || rendered.text == "let value = 1;");
         }
+    }
+
+    // `highlight_block` coverage (Revision R9a's Diff/Merge highlighting helper) - proves real,
+    // non-flat classification on realistic diff-hunk-/merge-hunk-shaped multi-line source, for
+    // two different real languages, not just "doesn't panic".
+
+    #[test]
+    fn highlight_block_on_a_real_rust_diff_hunk_produces_real_non_flat_color_runs() {
+        // Shaped like a real diff hunk's interleaved lines, lifted from this very crate's own
+        // `highlighter_for_extension` - not a synthetic one-liner.
+        let lines = [
+            "pub fn highlighter_for_extension(",
+            "    extension: Option<&str>,",
+            ") -> Option<crate::language::HighlighterFn> {",
+            "    crate::language::entry_for_extension(extension)?.highlighter",
+            "}",
+        ];
+        let rendered = highlight_block(lines.iter().copied(), Some("rs"));
+        let kinds: HashSet<HighlightKind> = rendered
+            .iter()
+            .flat_map(|line| &line.runs)
+            .map(|(_, kind)| *kind)
+            .collect();
+        assert!(
+            kinds.len() > 1,
+            "a real multi-line Rust block must produce more than one distinct HighlightKind, \
+             got {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&HighlightKind::Keyword),
+            "pub/fn should be classified as keywords"
+        );
+        let has_fn_name = rendered
+            .iter()
+            .flat_map(|line| &line.runs)
+            .any(|(text, kind)| {
+                text.as_ref() == "highlighter_for_extension" && *kind == HighlightKind::Function
+            });
+        assert!(
+            has_fn_name,
+            "the real fn name should be classified as a function"
+        );
+    }
+
+    #[test]
+    fn highlight_block_on_a_real_python_merge_hunk_produces_real_non_flat_color_runs() {
+        let lines = [
+            "def resolve(choice):",
+            "    if choice == \"left\":",
+            "        return ours",
+            "    return theirs",
+        ];
+        let rendered = highlight_block(lines.iter().copied(), Some("py"));
+        let kinds: HashSet<HighlightKind> = rendered
+            .iter()
+            .flat_map(|line| &line.runs)
+            .map(|(_, kind)| *kind)
+            .collect();
+        assert!(
+            kinds.len() > 1,
+            "a real multi-line Python block must produce more than one distinct HighlightKind, \
+             got {kinds:?}"
+        );
+        let has_def_keyword = rendered
+            .iter()
+            .flat_map(|line| &line.runs)
+            .any(|(text, kind)| text.as_ref() == "def" && *kind == HighlightKind::Keyword);
+        assert!(has_def_keyword, "def should be classified as a keyword");
+        let has_string_literal = rendered
+            .iter()
+            .flat_map(|line| &line.runs)
+            .any(|(text, kind)| text.as_ref() == "\"left\"" && *kind == HighlightKind::Literal);
+        assert!(
+            has_string_literal,
+            "the real string literal should be classified as Literal"
+        );
+    }
+
+    #[test]
+    fn highlight_block_on_an_unregistered_extension_is_all_plain_text() {
+        let rendered = highlight_block(["key = \"value\"", "other = 1"], Some("toml"));
+        let kinds: HashSet<HighlightKind> = rendered
+            .iter()
+            .flat_map(|line| &line.runs)
+            .map(|(_, kind)| *kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            HashSet::from([HighlightKind::Text]),
+            "an extension with no wired grammar must render as plain text, matching load_file's \
+             own 'unlisted extensions render as plain monospace text' precedent"
+        );
+    }
+
+    /// Regression: a genuinely empty side (zero real lines - e.g. a merge conflict hunk where
+    /// one side deletes everything) must produce zero `RenderedLine`s, not one fabricated blank
+    /// line via `build_lines`' own "an empty file still has one empty line" convention. A caller
+    /// driving row/gutter-number count off this `Vec`'s length must never render a phantom row
+    /// for content that was never real.
+    #[test]
+    fn highlight_block_on_zero_input_lines_returns_zero_rendered_lines() {
+        let rendered = highlight_block(std::iter::empty(), Some("rs"));
+        assert!(
+            rendered.is_empty(),
+            "zero real input lines must produce zero RenderedLines, not build_lines' one-empty-\
+             line-for-an-empty-file convention: got {rendered:?}"
+        );
+    }
+
+    /// Distinct from the zero-lines case above: one real, genuinely blank line (e.g. a real
+    /// blank line inside a conflict hunk's content) must still render as one real empty line -
+    /// the fix must not overcorrect into dropping real blank lines too.
+    #[test]
+    fn highlight_block_on_one_real_blank_line_still_returns_one_rendered_line() {
+        let rendered = highlight_block([""], Some("rs"));
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0].text, "");
     }
 }

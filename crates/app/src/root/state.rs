@@ -50,6 +50,7 @@ impl AdeApp {
             code_focus: OverlayFocus::default(),
             file_view_scroll_handle: UniformListScrollHandle::new(),
             file_view_cache: None,
+            diff_highlight_cache: None,
             file_view_last_freshness_check: None,
             file_load_state: FileLoadState::Idle,
             file_view_changed_lines: HashSet::new(),
@@ -86,6 +87,7 @@ impl AdeApp {
             agent_rows: Vec::new(),
             merge_flow: None,
             merge_op_in_flight: false,
+            merge_highlight_cache: None,
             _load_worktrees_task: None,
             _load_file_tree_task: None,
             _load_diff_task: None,
@@ -282,6 +284,11 @@ impl AdeApp {
         self.code_cursor = None;
         self.file_view_error_count = None;
         self.open_diff_file_cache = None;
+        // The Diff view's syntax-highlight cache is keyed on a whole `DiffFile` from the
+        // worktree just left - reset alongside `open_diff_file_cache` above for the same reason
+        // (and so it can't retain a full file's highlighting from a worktree that's no longer
+        // active).
+        self.diff_highlight_cache = None;
         self._file_load_task = None;
         self.code_zoom_percent = AdeApp::ZOOM_DEFAULT_PERCENT;
         // The hover cache is per-file - clear it too, or a hover card from the worktree just
