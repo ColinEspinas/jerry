@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use gpui::Rgba;
 
+#[cfg(test)]
 use crate::theme;
 
 /// Defensive cap on how many entries [`build_file_tree`] will collect, regardless of how
@@ -104,20 +105,12 @@ pub struct LangChip {
 }
 
 /// Picks the real language chip for a file name by its extension (case-insensitive - `Cargo.TOML`
-/// gets the same chip as `Cargo.toml`), per [`LangChip`]'s docs.
+/// gets the same chip as `Cargo.toml`), per [`LangChip`]'s docs. Reads
+/// `crate::language::chip_for_extension` - the one canonical registry Revision R8 consolidated
+/// this table (and three others) into, rather than an independently-maintained match here.
 pub fn lang_chip_for_name(name: &str) -> LangChip {
-    let extension = Path::new(name)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase());
-
-    let (label, (fg, bg)) = match extension.as_deref() {
-        Some("rs") => ("rs", theme::lang::RS),
-        Some("toml") => ("to", theme::lang::TOML),
-        Some("md") => ("md", theme::lang::MD),
-        Some("sql") => ("sq", theme::lang::SQL),
-        _ => (".", theme::lang::UNKNOWN),
-    };
+    let extension = Path::new(name).extension().and_then(|ext| ext.to_str());
+    let (label, fg, bg) = crate::language::chip_for_extension(extension);
     LangChip { label, fg, bg }
 }
 

@@ -223,7 +223,7 @@ impl AdeApp {
                         .len()
                         .to_string(),
                 ),
-                SettingsPage::LanguageServers => Some(settings::LSP_LANGUAGES.len().to_string()),
+                SettingsPage::LanguageServers => Some(settings::lsp_languages().len().to_string()),
                 // Every other page has nothing real to count - omitted rather than invented.
                 _ => None,
             };

@@ -1,13 +1,16 @@
 //! Pure logic for Surface C's File view (`design_handoff_jerry_ade/README.md`'s "File view"
 //! subsection): reads a file off disk, detects its line-ending style, picks a language label
-//! from its extension, and - for `.rs` files - produces syntax-colored spans by parsing with
-//! `tree-sitter` and walking the resulting AST. Deliberately `gpui`-window-free (only
-//! [`gpui::Rgba`] is used, for plain colour data), mirroring this crate's split between pure
-//! logic modules and `crate::root`'s `Div` construction.
+//! from its extension, and - for a real subset of extensions - produces syntax-colored spans by
+//! parsing with `tree-sitter` and walking the resulting AST. Deliberately `gpui`-window-free
+//! (only [`gpui::Rgba`] is used, for plain colour data), mirroring this crate's split between
+//! pure logic modules and `crate::root`'s `Div` construction.
 //!
-//! Only `.rs` files get syntax spans; other extensions render as plain monospace text. A second
-//! grammar (`tree-sitter-toml`, ...) would just repeat [`highlight_rust`]'s parse-then-walk
-//! shape, left for a later phase.
+//! `.rs`/`.ts`/`.tsx`/`.js`/`.jsx`/`.py` get real syntax spans (Revision R8 added the latter
+//! five, following [`highlight_rust`]'s own parse-then-walk shape exactly - see [`Lexicon`] for
+//! how the shared walker is parameterized per language rather than duplicating the walk itself
+//! three times); other extensions (including `.vue` - see `crate::language`'s docs for why this
+//! phase doesn't spawn an LSP client for it, unrelated to highlighting) render as plain monospace
+//! text. A further grammar would just add one more [`Lexicon`] plus a thin wrapper.
 //!
 //! ## `tree-sitter` API usage
 //!
@@ -16,7 +19,11 @@
 //! used below in their ordinary, documented shapes. Verified against
 //! `vendor/zed/crates/language/src/language.rs:135,1376,1673` and
 //! `vendor/zed/crates/language/src/outline.rs:102` (same `tree-sitter`/`tree-sitter-rust`
-//! version pair as this crate's `Cargo.toml`).
+//! version pair as this crate's `Cargo.toml`). The TypeScript/TSX and Python node-kind names
+//! [`Lexicon`]'s three table instances below use were verified for real by parsing real sample
+//! source with each grammar and inspecting the actual emitted node kinds (not guessed/invented -
+//! see this crate's Revision R8 step report for the probe), the same "verify the real API before
+//! using it" discipline this project applies to `vendor/zed`.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -113,17 +120,25 @@ pub fn detect_indent_width(lines: &[RenderedLine]) -> Option<usize> {
         .map(|(width, _)| width)
 }
 
-/// The status bar's language label, derived from `path`'s extension - the same
-/// `.rs`/`.toml`/`.md`/`.sql` set `crate::file_tree::lang_chip_for_name` recognizes
-/// (case-insensitive), plus a generic fallback for anything else.
+/// The status bar's language label, derived from `path`'s extension - reads
+/// `crate::language::display_name_for_extension`, the one canonical registry every
+/// extension-keyed lookup in this crate now shares (case-insensitive; `"Plain Text"` for
+/// anything not in it).
 pub fn language_name_for_extension(extension: Option<&str>) -> &'static str {
-    match extension.map(|ext| ext.to_ascii_lowercase()).as_deref() {
-        Some("rs") => "Rust",
-        Some("toml") => "TOML",
-        Some("md") => "Markdown",
-        Some("sql") => "SQL",
-        _ => "Plain Text",
-    }
+    crate::language::display_name_for_extension(extension)
+}
+
+/// The real highlighter function `extension` should be parsed with, read straight off
+/// `crate::language`'s canonical registry - the single real source of truth
+/// `crate::language::ExtensionEntry::highlighter`'s own docs describe (Revision R8's
+/// consolidation of what used to be a second, independent extension -> highlighter `match`
+/// statement `load_file` maintained on its own, invisible to that registry). `None` for an
+/// extension absent from the registry, or present with no real grammar wired
+/// ([`crate::language::ExtensionEntry::highlighter`] itself `None` - TOML/Markdown/SQL/Vue/Go).
+pub fn highlighter_for_extension(
+    extension: Option<&str>,
+) -> Option<crate::language::HighlighterFn> {
+    crate::language::entry_for_extension(extension)?.highlighter
 }
 
 /// A syntax span's classification - `design_handoff_jerry_ade/README.md`'s File view
@@ -161,8 +176,73 @@ pub struct HighlightSpan {
     pub kind: HighlightKind,
 }
 
+/// One language's real node-kind vocabulary, feeding the single shared [`walk_node`] walker -
+/// see this module's top-level docs. Keeping one generic walker parameterized by a small table
+/// per language (rather than three near-identical copies of the walk itself) is the same
+/// "consolidate genuinely repeated shape, don't force an abstraction where fields would differ"
+/// call this codebase's Revision R5.5 already established elsewhere; the fields themselves are
+/// still just plain string-slice tables, no trait machinery.
+struct Lexicon {
+    /// Leaf-token kinds (`node.child_count() == 0`) whose literal text is a keyword.
+    keywords: &'static [&'static str],
+    /// Whole-node kinds classified as [`HighlightKind::Literal`] without descending into
+    /// children (a string node's inner quote/content/escape sub-nodes render as one span, not
+    /// three).
+    literal_kinds: &'static [&'static str],
+    /// Leaf texts, checked only when the leaf's own `kind()` is in [`Self::identifier_kinds`],
+    /// that should still be classified [`HighlightKind::Literal`] - exists for Python's `self`
+    /// specifically: unlike Rust (a dedicated `self`/`self_parameter` grammar node, already
+    /// covered by [`Self::literal_kinds`] without needing this) or TypeScript (`this` is a real
+    /// keyword token there), `tree-sitter-python`'s grammar has *no* distinct node kind for
+    /// `self` at all - it parses as a perfectly ordinary `identifier`, indistinguishable by kind
+    /// alone from any other name. Matching by literal text is the only way to give Python's
+    /// `self` the same Literal treatment Rust's own `self` gets, rather than leaving the two
+    /// languages inconsistently rendered for what plays the same syntactic role in both.
+    literal_identifier_texts: &'static [&'static str],
+    comment_kinds: &'static [&'static str],
+    /// Whole-node kinds classified as [`HighlightKind::Type`] without descending into children.
+    type_kinds: &'static [&'static str],
+    /// Leaf kinds eligible for [`HighlightKind::Function`]/[`HighlightKind::Type`] when
+    /// [`Self::declared_name_fields`] also matches that leaf's field name and its immediate
+    /// parent's real node kind matches [`Self::function_name_parent_kinds`]/
+    /// [`Self::type_name_parent_kinds`] respectively (Rust: `["identifier"]`; TypeScript
+    /// additionally needs `"property_identifier"` for a class method's own name).
+    identifier_kinds: &'static [&'static str],
+    /// Field names under which an [`Self::identifier_kinds`] leaf *might* be a declared/called
+    /// name, not a use - genuinely ambiguous on the field name alone (e.g. TypeScript's
+    /// `variable_declarator`, `function_declaration`, `interface_body` member, and JSX tag all
+    /// reuse the same `"name"` field for very different things), so [`walk_node`] also
+    /// requires the leaf's immediate *parent* node kind to appear in
+    /// [`Self::function_name_parent_kinds`]/[`Self::type_name_parent_kinds`] before actually
+    /// classifying it as [`HighlightKind::Function`]/[`HighlightKind::Type`] - see those fields'
+    /// own docs. Still the same narrow "declaration `name` field, or a plain-identifier call's
+    /// `function` field" heuristic [`highlight_rust`] originally established (still doesn't cover
+    /// `obj.foo()`'s `field_identifier`/`property_identifier` callee - an intentionally narrow,
+    /// documented gap carried over unchanged into TypeScript/Python, not widened here).
+    declared_name_fields: &'static [&'static str],
+    /// Real parent node kinds under which an [`Self::identifier_kinds`] leaf whose field name is
+    /// in [`Self::declared_name_fields`] is genuinely a function/method declaration's or a call
+    /// expression's own name - e.g. Rust's `function_item`/`function_signature_item`/
+    /// `call_expression`, not `variable_declarator`/`let_declaration`-shaped parents (Rust's own
+    /// `let` binding uses a `pattern` field, never `name`, so it was never at risk - see
+    /// [`RUST_LEXICON`]'s own docs; TypeScript/Python's `variable_declarator`/`class_definition`
+    /// *do* reuse `"name"`, which is exactly the real, live-verified collision this field exists
+    /// to rule out).
+    function_name_parent_kinds: &'static [&'static str],
+    /// Real parent node kinds under which an [`Self::identifier_kinds`] leaf whose field name is
+    /// in [`Self::declared_name_fields`] is genuinely a type's own declared name rather than a
+    /// function - exists specifically for Python's `class_definition`, whose `name` field is a
+    /// plain `identifier` (unlike Rust/TypeScript, where a class/struct/enum name is already a
+    /// distinct `type_identifier` node kind, caught by [`Self::type_kinds`] before this check is
+    /// ever reached - see [`PYTHON_LEXICON`]'s own docs). Empty for languages that don't need it.
+    type_name_parent_kinds: &'static [&'static str],
+}
+
 /// Rust keyword tokens - tree-sitter-rust's grammar represents each as an unnamed leaf node
-/// whose `kind()` is the literal keyword text (see this module's tests).
+/// whose `kind()` is the literal keyword text (see this module's tests). `self` is deliberately
+/// not here - it's real, but classified as [`HighlightKind::Literal`] instead (see
+/// [`RUST_LEXICON`]'s `literal_kinds`), matching how a self-reference reads visually closer to a
+/// value than a keyword.
 const RUST_KEYWORDS: &[&str] = &[
     "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
     "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
@@ -170,25 +250,230 @@ const RUST_KEYWORDS: &[&str] = &[
     "while", "yield",
 ];
 
-const LITERAL_KINDS: &[&str] = &[
-    "string_literal",
-    "raw_string_literal",
-    "char_literal",
-    "integer_literal",
-    "float_literal",
-    "boolean_literal",
+const RUST_LEXICON: Lexicon = Lexicon {
+    keywords: RUST_KEYWORDS,
+    literal_kinds: &[
+        "string_literal",
+        "raw_string_literal",
+        "char_literal",
+        "integer_literal",
+        "float_literal",
+        "boolean_literal",
+        "self",
+    ],
+    literal_identifier_texts: &[],
+    comment_kinds: &["line_comment", "block_comment"],
+    type_kinds: &["type_identifier", "primitive_type"],
+    identifier_kinds: &["identifier"],
+    declared_name_fields: &["name", "function"],
+    // Verified for real by parsing real sample source with `tree-sitter-rust` and inspecting the
+    // actual emitted tree while building this fix: a `fn` item's/trait method signature's own name
+    // is `name: identifier` under `function_item`/`function_signature_item`; a plain-identifier
+    // call's callee is `function: identifier` under `call_expression`. Rust's own `let` binding
+    // uses a `pattern` field (never `name`), so it was never at risk of this collision in the
+    // first place - see `declared_name_fields`' own docs.
+    function_name_parent_kinds: &[
+        "function_item",
+        "function_signature_item",
+        "call_expression",
+    ],
+    // Not needed for Rust: a struct/enum/trait name is already a distinct `type_identifier` node
+    // kind, caught by `type_kinds` above before this would ever be reached.
+    type_name_parent_kinds: &[],
+};
+
+/// TypeScript/TSX keyword tokens - verified for real against `tree-sitter-typescript@0.23.2`'s
+/// own bundled `queries/highlights.scm` (its real keyword list) plus a direct parse probe of
+/// sample source (see this module's top-level docs), not guessed. `this`/`super` are included
+/// here rather than treated like Rust's `self` (a [`Lexicon::literal_kinds`] entry) purely for
+/// simplicity - no test or real-world hover/highlight distinction in this app depends on which
+/// bucket they land in.
+const TYPESCRIPT_KEYWORDS: &[&str] = &[
+    "abstract",
+    "declare",
+    "enum",
+    "export",
+    "implements",
+    "interface",
+    "keyof",
+    "namespace",
+    "private",
+    "protected",
+    "public",
+    "type",
+    "readonly",
+    "override",
+    "satisfies",
+    "function",
+    "const",
+    "let",
+    "var",
+    "return",
+    "class",
+    "if",
+    "else",
+    "for",
+    "while",
+    "do",
+    "switch",
+    "case",
+    "default",
+    "break",
+    "continue",
+    "new",
+    "delete",
+    "typeof",
+    "instanceof",
+    "in",
+    "of",
+    "try",
+    "catch",
+    "finally",
+    "throw",
+    "yield",
+    "async",
+    "await",
+    "import",
+    "from",
+    "extends",
+    "as",
+    "void",
+    "get",
+    "set",
+    "this",
+    "super",
+    "static",
 ];
 
-const COMMENT_KINDS: &[&str] = &["line_comment", "block_comment"];
+/// Real node kinds verified by parsing sample TypeScript source with
+/// `tree_sitter_typescript::LANGUAGE_TYPESCRIPT` and inspecting the actual tree (see this
+/// module's top-level docs) - `predefined_type` (the `number`/`string`/`boolean`/`void`/...
+/// built-in type keywords) is a composite wrapper node, classified whole here rather than
+/// descended into, which is exactly what keeps its one anonymous leaf child (also, confusingly,
+/// often kind `"number"`/`"string"`/etc, colliding with the *literal* kinds below) from ever
+/// being reached as a separate leaf - the two never collide in practice because this whole-node
+/// check always wins first.
+const TYPESCRIPT_LEXICON: Lexicon = Lexicon {
+    keywords: TYPESCRIPT_KEYWORDS,
+    literal_kinds: &[
+        "string",
+        "template_string",
+        "number",
+        "true",
+        "false",
+        "null",
+        "undefined",
+        "regex",
+    ],
+    literal_identifier_texts: &[],
+    comment_kinds: &["comment"],
+    type_kinds: &["type_identifier", "predefined_type"],
+    identifier_kinds: &["identifier", "property_identifier"],
+    declared_name_fields: &["name", "function"],
+    // Verified for real by parsing real sample source with `tree-sitter-typescript` and inspecting
+    // the actual emitted tree while building this fix: a real, live-verified bug this narrows away -
+    // `variable_declarator`, `interface_body`'s `property_signature`, and a JSX tag
+    // (`jsx_self_closing_element`/`jsx_opening_element`/`jsx_closing_element`) all *also* reuse
+    // the `"name"` field, which is exactly why the old, parent-kind-unaware version misclassified
+    // `const s: string = ...`'s `s`, every interface member name, and every TSX tag name as
+    // Function. Only `function_declaration` (a real `fn`), `method_definition` (a real class
+    // method's own name), and `call_expression` (a real plain-identifier call's callee) actually
+    // are one.
+    function_name_parent_kinds: &[
+        "function_declaration",
+        "method_definition",
+        "call_expression",
+    ],
+    // Not needed for TypeScript: a class/interface name is already a distinct `type_identifier`
+    // node kind, caught by `type_kinds` above before this would ever be reached.
+    type_name_parent_kinds: &[],
+};
 
-const TYPE_KINDS: &[&str] = &["type_identifier", "primitive_type"];
+/// Real node kinds verified by parsing sample Python source with `tree_sitter_python::LANGUAGE`
+/// and inspecting the actual tree (see this module's top-level docs). `"type"` is the composite
+/// wrapper both a parameter's and a return type's real annotation uses (`def f(x: int) -> None:`
+/// puts both `int` and `None` inside one `type` node), classified whole the same way
+/// TypeScript's `predefined_type` is above.
+const PYTHON_KEYWORDS: &[&str] = &[
+    "def", "class", "return", "if", "elif", "else", "for", "while", "in", "not", "and", "or", "is",
+    "pass", "break", "continue", "import", "from", "as", "with", "try", "except", "finally",
+    "raise", "lambda", "yield", "global", "nonlocal", "del", "assert", "async", "await",
+];
+
+const PYTHON_LEXICON: Lexicon = Lexicon {
+    keywords: PYTHON_KEYWORDS,
+    literal_kinds: &["string", "integer", "float", "true", "false", "none"],
+    // Python's `self` has no dedicated grammar node the way Rust's does - see
+    // `Lexicon::literal_identifier_texts`' own docs for why matching by leaf text is the only way
+    // to give it the same Literal treatment Rust's own `self` gets (a deliberate, documented
+    // choice to match Rust's convention, not an oversight - `self`/`this` play the same syntactic
+    // role in both languages).
+    literal_identifier_texts: &["self"],
+    comment_kinds: &["comment"],
+    type_kinds: &["type"],
+    identifier_kinds: &["identifier"],
+    declared_name_fields: &["name", "function"],
+    // Verified for real by parsing real sample source with `tree-sitter-python` and inspecting the
+    // actual emitted tree while building this fix: a `def`'s own name is `name: identifier` under
+    // `function_definition`; a plain-identifier call's callee is `function: identifier` under
+    // `call` (Python's call node kind - not `call_expression`, unlike Rust/TypeScript).
+    function_name_parent_kinds: &["function_definition", "call"],
+    // The real, live-verified bug this narrows away: `class_definition`'s own `name` field is a
+    // plain `identifier` (unlike Rust/TypeScript, where a class/struct name is already a distinct
+    // `type_identifier` node kind caught by `type_kinds` above) - without this, `class Foo:`
+    // misclassified `Foo` as a Function instead of a Type.
+    type_name_parent_kinds: &["class_definition"],
+};
 
 /// Parses `source` with `tree-sitter-rust` and walks the resulting AST into classified
 /// [`HighlightSpan`]s. Returns an empty `Vec` (rather than panicking) if the grammar fails to
 /// load or the parse produces no tree - neither expected in practice, but not assumed away.
 pub fn highlight_rust(source: &str) -> Vec<HighlightSpan> {
+    highlight_with(source, tree_sitter_rust::LANGUAGE.into(), &RUST_LEXICON)
+}
+
+/// Parses `source` with `tree-sitter-typescript` and walks the resulting AST into classified
+/// [`HighlightSpan`]s, following [`highlight_rust`]'s exact shape. `is_tsx` selects the real TSX
+/// grammar variant (used for `.tsx`/`.jsx` - TSX's grammar is a superset that also parses plain
+/// JSX-free TypeScript/JavaScript correctly, and there is no separate JSX-only grammar in
+/// `tree-sitter-typescript`) over the plain TypeScript one (used for `.ts`/`.js` - TypeScript's
+/// grammar is itself a real syntactic superset of JavaScript, so `.js` deliberately reuses it
+/// rather than adding a third grammar dependency for plain JavaScript).
+pub fn highlight_typescript(source: &str, is_tsx: bool) -> Vec<HighlightSpan> {
+    let language: tree_sitter::Language = if is_tsx {
+        tree_sitter_typescript::LANGUAGE_TSX.into()
+    } else {
+        tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+    };
+    highlight_with(source, language, &TYPESCRIPT_LEXICON)
+}
+
+/// A real `fn(&str) -> Vec<HighlightSpan>` wrapper over [`highlight_typescript`] with `is_tsx:
+/// false` bound in - `crate::language::HighlighterFn`'s shape has no room for a second `bool`
+/// argument, and this is the plain `.ts`/`.js` half of [`highlight_typescript`]'s two real grammar
+/// variants (see [`crate::language::EXTENSIONS`]'s `ts`/`js` entries, which wire this in as their
+/// real [`crate::language::ExtensionEntry::highlighter`]).
+pub fn highlight_ts(source: &str) -> Vec<HighlightSpan> {
+    highlight_typescript(source, false)
+}
+
+/// The TSX/JSX half of [`highlight_typescript`] - see [`highlight_ts`]'s own docs.
+pub fn highlight_tsx(source: &str) -> Vec<HighlightSpan> {
+    highlight_typescript(source, true)
+}
+
+/// Parses `source` with `tree-sitter-python` and walks the resulting AST into classified
+/// [`HighlightSpan`]s, following [`highlight_rust`]'s exact shape.
+pub fn highlight_python(source: &str) -> Vec<HighlightSpan> {
+    highlight_with(source, tree_sitter_python::LANGUAGE.into(), &PYTHON_LEXICON)
+}
+
+fn highlight_with(
+    source: &str,
+    language: tree_sitter::Language,
+    lexicon: &Lexicon,
+) -> Vec<HighlightSpan> {
     let mut parser = tree_sitter::Parser::new();
-    let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
     if parser.set_language(&language).is_err() {
         return Vec::new();
     }
@@ -197,18 +482,29 @@ pub fn highlight_rust(source: &str) -> Vec<HighlightSpan> {
     };
 
     let mut spans = Vec::new();
-    walk_node(tree.root_node(), None, &mut spans);
+    walk_node(tree.root_node(), None, None, source, lexicon, &mut spans);
     spans
 }
 
+/// `field_name` is the field this node is held under on its immediate parent, if any (`None` for
+/// the root, or an unnamed child) - `parent_kind` is that immediate parent's own real node kind
+/// (also `None` for the root). Both are needed, together, to correctly classify a leaf whose
+/// field name alone is ambiguous across several different real parent shapes - see
+/// [`Lexicon::function_name_parent_kinds`]/[`Lexicon::type_name_parent_kinds`]'s own docs for why
+/// the field name by itself (this walker's original, Rust-only design) isn't enough once
+/// TypeScript/Python's grammars are in the mix. `source` is only consulted for
+/// [`Lexicon::literal_identifier_texts`]'s leaf-text check (Python's `self`).
 fn walk_node(
     node: tree_sitter::Node<'_>,
     field_name: Option<&str>,
+    parent_kind: Option<&str>,
+    source: &str,
+    lexicon: &Lexicon,
     spans: &mut Vec<HighlightSpan>,
 ) {
     let kind = node.kind();
 
-    if COMMENT_KINDS.contains(&kind) {
+    if lexicon.comment_kinds.contains(&kind) {
         spans.push(HighlightSpan {
             start: node.start_byte(),
             end: node.end_byte(),
@@ -216,7 +512,7 @@ fn walk_node(
         });
         return;
     }
-    if LITERAL_KINDS.contains(&kind) || kind == "self" {
+    if lexicon.literal_kinds.contains(&kind) {
         spans.push(HighlightSpan {
             start: node.start_byte(),
             end: node.end_byte(),
@@ -224,7 +520,7 @@ fn walk_node(
         });
         return;
     }
-    if TYPE_KINDS.contains(&kind) {
+    if lexicon.type_kinds.contains(&kind) {
         spans.push(HighlightSpan {
             start: node.start_byte(),
             end: node.end_byte(),
@@ -234,13 +530,25 @@ fn walk_node(
     }
 
     if node.child_count() == 0 {
-        let classified = if RUST_KEYWORDS.contains(&kind) {
+        let is_declared_name = lexicon.identifier_kinds.contains(&kind)
+            && field_name.is_some_and(|field| lexicon.declared_name_fields.contains(&field));
+        let classified = if lexicon.keywords.contains(&kind) {
             HighlightKind::Keyword
-        } else if kind == "identifier" && matches!(field_name, Some("name") | Some("function")) {
-            // A `function_item`'s `name` field, or a `call_expression`'s `function` field when
-            // the callee is a plain identifier (`foo()`, not `obj.foo()`, which uses
-            // `field_identifier` instead - out of scope here).
+        } else if is_declared_name
+            && parent_kind.is_some_and(|parent| lexicon.type_name_parent_kinds.contains(&parent))
+        {
+            HighlightKind::Type
+        } else if is_declared_name
+            && parent_kind
+                .is_some_and(|parent| lexicon.function_name_parent_kinds.contains(&parent))
+        {
             HighlightKind::Function
+        } else if lexicon.identifier_kinds.contains(&kind)
+            && node
+                .utf8_text(source.as_bytes())
+                .is_ok_and(|text| lexicon.literal_identifier_texts.contains(&text))
+        {
+            HighlightKind::Literal
         } else {
             HighlightKind::Text
         };
@@ -257,7 +565,7 @@ fn walk_node(
         loop {
             let child = cursor.node();
             let child_field = cursor.field_name();
-            walk_node(child, child_field, spans);
+            walk_node(child, child_field, Some(kind), source, lexicon, spans);
             if !cursor.goto_next_sibling() {
                 break;
             }
@@ -413,13 +721,9 @@ pub fn load_file(path: &Path) -> io::Result<ParsedFile> {
 
     let extension = path.extension().and_then(|ext| ext.to_str());
     let language = language_name_for_extension(extension);
-    let is_rust = extension
-        .map(|ext| ext.eq_ignore_ascii_case("rs"))
-        .unwrap_or(false);
-    let spans = if is_rust {
-        highlight_rust(&source)
-    } else {
-        Vec::new()
+    let spans = match highlighter_for_extension(extension) {
+        Some(highlighter) => highlighter(&source),
+        None => Vec::new(),
     };
     let lines = build_lines(&source, &spans);
 
@@ -716,6 +1020,306 @@ mod tests {
         // outright - confirm this doesn't panic and still classifies the keyword token present.
         let spans = highlight_rust("fn (((( broken");
         assert!(spans.iter().any(|span| span.kind == HighlightKind::Keyword));
+    }
+
+    // Real TypeScript highlighting coverage - mirrors `highlight_rust`'s own test shape above.
+    // Before this fix, none of `highlight_typescript`'s real, common-case behavior had any test
+    // coverage at all.
+
+    const SAMPLE_TYPESCRIPT: &str = "/** Adds one. */\nfunction add(left: number): number {\n    const name = \"x\";\n    return left + 1;\n}\n";
+
+    #[test]
+    fn typescript_function_keyword_is_classified_as_keyword() {
+        let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
+        let span = find_span(&spans, SAMPLE_TYPESCRIPT, "function").expect("function span");
+        assert_eq!(span.kind, HighlightKind::Keyword);
+    }
+
+    #[test]
+    fn typescript_string_literal_is_classified_as_literal() {
+        let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
+        let span = find_span(&spans, SAMPLE_TYPESCRIPT, "\"x\"").expect("string literal span");
+        assert_eq!(span.kind, HighlightKind::Literal);
+    }
+
+    #[test]
+    fn typescript_function_declaration_name_is_classified_as_function() {
+        let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
+        let span = find_span(&spans, SAMPLE_TYPESCRIPT, "add").expect("function name span");
+        assert_eq!(span.kind, HighlightKind::Function);
+    }
+
+    #[test]
+    fn typescript_predefined_type_is_classified_as_type() {
+        let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
+        let type_spans: Vec<_> = spans
+            .iter()
+            .filter(|span| SAMPLE_TYPESCRIPT[span.start..span.end] == *"number")
+            .collect();
+        assert!(!type_spans.is_empty());
+        assert!(type_spans
+            .iter()
+            .all(|span| span.kind == HighlightKind::Type));
+    }
+
+    #[test]
+    fn typescript_doc_comment_is_classified_as_comment() {
+        let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
+        let span =
+            find_span(&spans, SAMPLE_TYPESCRIPT, "/** Adds one. */").expect("doc comment span");
+        assert_eq!(span.kind, HighlightKind::Comment);
+    }
+
+    /// The real, live-verified regression this fix addresses: a `variable_declarator`'s own
+    /// `name` field collides with `function_declaration`'s `name` field in
+    /// `tree-sitter-typescript`'s real grammar, and the old, parent-kind-unaware matching
+    /// misclassified every `const`/`let`/`var` binding's name as a Function. `s` here must be
+    /// plain `Text` (a use/declaration of a variable, not a function).
+    #[test]
+    fn typescript_const_variable_name_is_not_misclassified_as_a_function() {
+        // The audit's exact reproduction. `find_span`'s plain substring search would otherwise
+        // match the embedded "s" inside "const" itself, so the real declared variable's own byte
+        // offset (right after "const ") is computed explicitly instead.
+        let source = "const s: string = \"hi\";\n";
+        let variable_start = source.find("const ").expect("const") + "const ".len();
+        let spans = highlight_typescript(source, false);
+        let span = spans
+            .iter()
+            .find(|span| span.start == variable_start && span.end == variable_start + 1)
+            .expect("variable name span");
+        assert_ne!(
+            span.kind,
+            HighlightKind::Function,
+            "a const/let/var binding's own name must never be classified as a function"
+        );
+    }
+
+    /// The same real collision, for an `interface` member name (`property_signature`'s `name`
+    /// field) - must not be classified as a function either.
+    #[test]
+    fn typescript_interface_member_name_is_not_misclassified_as_a_function() {
+        let source = "interface Point { x: number }\n";
+        let spans = highlight_typescript(source, false);
+        let span = find_span(&spans, source, "x").expect("interface member name span");
+        assert_ne!(span.kind, HighlightKind::Function);
+    }
+
+    /// The same real collision, for a class method's own name (`method_definition`'s `name`
+    /// field, a `property_identifier`) - this one, unlike the two above, genuinely *should* be
+    /// classified as a function.
+    #[test]
+    fn typescript_class_method_name_is_classified_as_a_function() {
+        let source = "class Point {\n    length() {\n        return 0;\n    }\n}\n";
+        let spans = highlight_typescript(source, false);
+        let span = find_span(&spans, source, "length").expect("method name span");
+        assert_eq!(span.kind, HighlightKind::Function);
+    }
+
+    /// The same real collision, for a real function call's callee (`call_expression`'s
+    /// `function` field) - genuinely a function, and must stay classified as one.
+    #[test]
+    fn typescript_call_expression_callee_is_classified_as_a_function() {
+        let source = "function top() {}\ntop();\n";
+        let spans = highlight_typescript(source, false);
+        let function_spans: Vec<_> = spans
+            .iter()
+            .filter(|span| source[span.start..span.end] == *"top")
+            .collect();
+        assert_eq!(function_spans.len(), 2, "the declaration and the call site");
+        assert!(function_spans
+            .iter()
+            .all(|span| span.kind == HighlightKind::Function));
+    }
+
+    /// A real TSX tag name (`jsx_self_closing_element`'s own `name` field) is the same real
+    /// collision one more time - must not render as a Function either.
+    #[test]
+    fn tsx_tag_name_is_not_misclassified_as_a_function() {
+        let source = "const el = <div />;\n";
+        let spans = highlight_typescript(source, true);
+        let span = find_span(&spans, source, "div").expect("tag name span");
+        assert_ne!(span.kind, HighlightKind::Function);
+    }
+
+    #[test]
+    fn highlighting_invalid_typescript_still_returns_a_real_non_empty_span_list() {
+        let spans = highlight_typescript("function (((( broken", false);
+        assert!(spans.iter().any(|span| span.kind == HighlightKind::Keyword));
+    }
+
+    // Real Python highlighting coverage - mirrors `highlight_rust`'s own test shape above.
+    // Before this fix, none of `highlight_python`'s real, common-case behavior had any test
+    // coverage at all.
+
+    const SAMPLE_PYTHON: &str =
+        "def add(left: int) -> int:\n    name = \"x\"\n    return left + 1\n";
+
+    #[test]
+    fn python_def_keyword_is_classified_as_keyword() {
+        let spans = highlight_python(SAMPLE_PYTHON);
+        let span = find_span(&spans, SAMPLE_PYTHON, "def").expect("def span");
+        assert_eq!(span.kind, HighlightKind::Keyword);
+    }
+
+    #[test]
+    fn python_string_literal_is_classified_as_literal() {
+        let spans = highlight_python(SAMPLE_PYTHON);
+        let span = find_span(&spans, SAMPLE_PYTHON, "\"x\"").expect("string literal span");
+        assert_eq!(span.kind, HighlightKind::Literal);
+    }
+
+    #[test]
+    fn python_function_definition_name_is_classified_as_function() {
+        let spans = highlight_python(SAMPLE_PYTHON);
+        let span = find_span(&spans, SAMPLE_PYTHON, "add").expect("function name span");
+        assert_eq!(span.kind, HighlightKind::Function);
+    }
+
+    #[test]
+    fn python_type_annotation_is_classified_as_type() {
+        let spans = highlight_python(SAMPLE_PYTHON);
+        let type_spans: Vec<_> = spans
+            .iter()
+            .filter(|span| SAMPLE_PYTHON[span.start..span.end] == *"int")
+            .collect();
+        assert!(!type_spans.is_empty());
+        assert!(type_spans
+            .iter()
+            .all(|span| span.kind == HighlightKind::Type));
+    }
+
+    #[test]
+    fn python_comment_is_classified_as_comment() {
+        let source = "# a real comment\nx = 1\n";
+        let spans = highlight_python(source);
+        let span = find_span(&spans, source, "# a real comment").expect("comment span");
+        assert_eq!(span.kind, HighlightKind::Comment);
+    }
+
+    /// Matches Rust's own `self_is_classified_as_literal_not_keyword` test - a deliberate,
+    /// documented choice that Python's `self` gets the same Literal treatment Rust's does (see
+    /// `PYTHON_LEXICON`'s own docs on why this needs a leaf-text check, unlike Rust's dedicated
+    /// grammar node).
+    #[test]
+    fn python_self_is_classified_as_literal_not_a_plain_identifier() {
+        let source = "class Foo:\n    def bar(self):\n        return self.value\n";
+        let spans = highlight_python(source);
+        let self_spans: Vec<_> = spans
+            .iter()
+            .filter(|span| source[span.start..span.end] == *"self")
+            .collect();
+        assert!(!self_spans.is_empty());
+        assert!(self_spans
+            .iter()
+            .all(|span| span.kind == HighlightKind::Literal));
+    }
+
+    /// The real, live-verified regression this fix addresses: `class_definition`'s own `name`
+    /// field is a plain `identifier` in `tree-sitter-python`'s real grammar (unlike Rust/
+    /// TypeScript, where it's a distinct `type_identifier` node), and the old, parent-kind-
+    /// unaware matching misclassified every class name as a Function instead of a Type.
+    #[test]
+    fn python_class_name_is_classified_as_type_not_function() {
+        let source = "class Foo:\n    pass\n";
+        let spans = highlight_python(source);
+        let span = find_span(&spans, source, "Foo").expect("class name span");
+        assert_eq!(
+            span.kind,
+            HighlightKind::Type,
+            "a class's own declared name should be a Type, not a Function"
+        );
+    }
+
+    /// The same fixture's `def`, to prove the two real, colliding `"name"`-field cases (function
+    /// vs. class) are correctly told apart within one real, combined parse - not just correct in
+    /// isolation.
+    #[test]
+    fn python_method_name_inside_a_class_is_still_classified_as_function() {
+        let source = "class Foo:\n    def bar(self):\n        pass\n";
+        let spans = highlight_python(source);
+        let span = find_span(&spans, source, "bar").expect("method name span");
+        assert_eq!(span.kind, HighlightKind::Function);
+    }
+
+    /// The real call-expression collision one more time, for Python's own `call` node kind
+    /// (distinct from Rust/TypeScript's `call_expression`).
+    #[test]
+    fn python_call_callee_is_classified_as_a_function() {
+        let source = "def top():\n    pass\n\ntop()\n";
+        let spans = highlight_python(source);
+        let function_spans: Vec<_> = spans
+            .iter()
+            .filter(|span| source[span.start..span.end] == *"top")
+            .collect();
+        assert_eq!(function_spans.len(), 2, "the definition and the call site");
+        assert!(function_spans
+            .iter()
+            .all(|span| span.kind == HighlightKind::Function));
+    }
+
+    #[test]
+    fn highlighting_invalid_python_still_returns_a_real_non_empty_span_list() {
+        let spans = highlight_python("def (((( broken");
+        assert!(spans.iter().any(|span| span.kind == HighlightKind::Keyword));
+    }
+
+    // Coverage for finding 5's fix: `highlighter_for_extension` reads from the real registry,
+    // not a second, independent table.
+
+    #[test]
+    fn highlighter_for_extension_reads_from_the_real_language_registry() {
+        assert!(highlighter_for_extension(Some("rs")).is_some());
+        assert!(highlighter_for_extension(Some("ts")).is_some());
+        assert!(highlighter_for_extension(Some("tsx")).is_some());
+        assert!(highlighter_for_extension(Some("js")).is_some());
+        assert!(highlighter_for_extension(Some("jsx")).is_some());
+        assert!(highlighter_for_extension(Some("py")).is_some());
+        assert!(highlighter_for_extension(Some("toml")).is_none());
+        assert!(highlighter_for_extension(Some("md")).is_none());
+        assert!(highlighter_for_extension(Some("vue")).is_none());
+        assert!(highlighter_for_extension(None).is_none());
+    }
+
+    #[test]
+    fn load_file_highlights_a_real_typescript_file_via_the_registry_dispatch() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("sample.ts");
+        fs::write(
+            &path,
+            "function add(x: number): number {\n    return x;\n}\n",
+        )
+        .expect("write");
+
+        let parsed = load_file(&path).expect("load_file");
+        assert_eq!(parsed.language, "TypeScript");
+        let has_keyword_run = parsed
+            .lines
+            .iter()
+            .flat_map(|line| &line.runs)
+            .any(|(_, kind)| *kind == HighlightKind::Keyword);
+        assert!(
+            has_keyword_run,
+            "load_file should dispatch through the registry to a real TypeScript highlighter"
+        );
+    }
+
+    #[test]
+    fn load_file_highlights_a_real_python_file_via_the_registry_dispatch() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("sample.py");
+        fs::write(&path, "def add(x):\n    return x\n").expect("write");
+
+        let parsed = load_file(&path).expect("load_file");
+        assert_eq!(parsed.language, "Python");
+        let has_keyword_run = parsed
+            .lines
+            .iter()
+            .flat_map(|line| &line.runs)
+            .any(|(_, kind)| *kind == HighlightKind::Keyword);
+        assert!(
+            has_keyword_run,
+            "load_file should dispatch through the registry to a real Python highlighter"
+        );
     }
 
     #[test]

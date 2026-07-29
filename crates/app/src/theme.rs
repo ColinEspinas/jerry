@@ -243,6 +243,12 @@ pub mod lang {
     pub const TOML: (Rgba, Rgba) = (hex(0x8b9197), hex(0x23272b)); // "to"
     pub const MD: (Rgba, Rgba) = (hex(0x7f9ad4), hex(0x1d2532)); // "md"
     pub const SQL: (Rgba, Rgba) = (hex(0x6ab97f), hex(0x1b2a20)); // "sq"
+                                                                  // Verified directly against `design_handoff_jerry_ade/revision/tokens.rs:149-160`'s real
+                                                                  // hex values, not paraphrased.
+    pub const TS: (Rgba, Rgba) = (hex(0x6b9bd1), hex(0x1b2838)); // "ts"
+    pub const VUE: (Rgba, Rgba) = (hex(0x5cb87f), hex(0x16261e)); // "vue"
+    pub const PY: (Rgba, Rgba) = (hex(0xc9b04a), hex(0x2a2612)); // "py"
+    pub const GO: (Rgba, Rgba) = (hex(0x5fa8c4), hex(0x152730)); // "go"
     pub const UNKNOWN: (Rgba, Rgba) = (hex(0x6b7178), hex(0x23272b)); // "."
 }
 
@@ -467,6 +473,90 @@ pub mod palette {
     /// `color:#7f9ad4`) - the same hex pair as [`super::lang::MD`], kept as its own token since
     /// a command chip and a Markdown-file chip are unrelated concepts.
     pub const COMMAND_CHIP: (Rgba, Rgba) = (hex(0x7f9ad4), hex(0x1d2532));
+}
+
+/// Revision R8's new `lang` chip tokens (item 6) - verified against the exact hex values in
+/// `design_handoff_jerry_ade/revision/tokens.rs:149-160`, independently reconstructed from the
+/// raw `u32` here rather than reusing [`hex`] (the same function under test), so a transcription
+/// error in [`lang::TS`]/[`lang::VUE`]/[`lang::PY`]/[`lang::GO`] would actually be caught rather
+/// than tautologically confirmed.
+#[cfg(test)]
+mod lang_token_tests {
+    use super::{lang, Rgba};
+
+    fn rgba_from_u32(v: u32) -> Rgba {
+        Rgba {
+            r: ((v >> 16) & 0xff) as f32 / 255.0,
+            g: ((v >> 8) & 0xff) as f32 / 255.0,
+            b: (v & 0xff) as f32 / 255.0,
+            a: 1.0,
+        }
+    }
+
+    // `Rgba` derives `PartialEq` but not `Debug` (`vendor/zed/crates/gpui/src/color.rs:37`), so
+    // `assert_eq!`/`assert_ne!` can't be used directly - same reason
+    // `crate::file_tree::tests::same` exists.
+    fn same(a: Rgba, b: Rgba) -> bool {
+        a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a
+    }
+    fn same_pair(a: (Rgba, Rgba), b: (Rgba, Rgba)) -> bool {
+        same(a.0, b.0) && same(a.1, b.1)
+    }
+
+    #[test]
+    fn ts_matches_the_real_spec_d_hex_pair() {
+        assert!(same_pair(
+            lang::TS,
+            (rgba_from_u32(0x6b9bd1), rgba_from_u32(0x1b2838))
+        ));
+    }
+
+    #[test]
+    fn vue_matches_the_real_spec_d_hex_pair() {
+        assert!(same_pair(
+            lang::VUE,
+            (rgba_from_u32(0x5cb87f), rgba_from_u32(0x16261e))
+        ));
+    }
+
+    #[test]
+    fn py_matches_the_real_spec_d_hex_pair() {
+        assert!(same_pair(
+            lang::PY,
+            (rgba_from_u32(0xc9b04a), rgba_from_u32(0x2a2612))
+        ));
+    }
+
+    #[test]
+    fn go_matches_the_real_spec_d_hex_pair() {
+        assert!(same_pair(
+            lang::GO,
+            (rgba_from_u32(0x5fa8c4), rgba_from_u32(0x152730))
+        ));
+    }
+
+    #[test]
+    fn every_lang_chip_color_is_distinct_from_every_other() {
+        let all = [
+            ("rs", lang::RS),
+            ("toml", lang::TOML),
+            ("md", lang::MD),
+            ("sql", lang::SQL),
+            ("ts", lang::TS),
+            ("vue", lang::VUE),
+            ("py", lang::PY),
+            ("go", lang::GO),
+            ("unknown", lang::UNKNOWN),
+        ];
+        for (i, (name_a, color_a)) in all.iter().enumerate() {
+            for (name_b, color_b) in all.iter().skip(i + 1) {
+                assert!(
+                    !same_pair(*color_a, *color_b),
+                    "{name_a} and {name_b} should not share an identical (fg, bg) chip color"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

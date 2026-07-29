@@ -40,6 +40,7 @@ use crate::env_info;
 use crate::file_tree::{self, FileTreeEntry, LangChip};
 use crate::hover_view;
 use crate::keymap::{self, WindowControlsStyle};
+use crate::language;
 use crate::layout;
 use crate::merge;
 use crate::palette;
@@ -363,17 +364,26 @@ pub struct AdeApp {
     /// cancel that earlier write (dropping a `Task` cancels it immediately) and leave real
     /// conflict markers on disk while the in-memory model reports it resolved.
     _merge_write_tasks: TaskPool,
-    /// A `lsp_core::LspClient` per repository root, keyed by [`Self::file_tree_root`] at the
-    /// time a Rust file was first opened under it. Spawned lazily (see
-    /// [`Self::ensure_lsp_client`]) and reused for every subsequent Rust file under that root.
-    /// See [`LspClientState`]'s own docs for the states a client can be in.
+    /// A `lsp_core::LspClient` per `(repository root, server binary)` pair - widened from a
+    /// bare `PathBuf` key (Revision R8) so more than one language's server can run
+    /// simultaneously under the same repo root without colliding in this map: opening a `.rs`
+    /// and a `.ts` file under the same worktree spawns two independent entries here, keyed by
+    /// `(file_tree_root, "rust-analyzer")` and `(file_tree_root, "typescript-language-server")`
+    /// respectively - see `crate::language::lsp_binary_for_extension` for where the second half
+    /// of the key comes from. Extensions that share one server (`.ts`/`.tsx`/`.js`/`.jsx` all
+    /// route to `typescript-language-server`) correctly reuse the same entry, since the key is
+    /// the shared *binary*, not a per-extension language id. Spawned lazily (see
+    /// [`Self::ensure_lsp_client`]) and reused for every subsequent file of that language under
+    /// that root. See [`LspClientState`]'s own docs for the states a client can be in.
     ///
     /// [`Self::evict_stale_lsp_clients`] (called on every worktree switch) tears down every
-    /// entry whose key isn't the newly active root - a deliberate "kill the non-active one"
-    /// choice over a small bounded LRU, since each `rust-analyzer` instance costs real GB
+    /// entry whose root isn't the newly active one - a deliberate "kill the non-active one"
+    /// choice over a small bounded LRU, since each language server instance costs real GB
     /// against this repo's own workspace and worktree switches are infrequent enough that
-    /// keeping more than one warm isn't worth the memory.
-    lsp_clients: HashMap<PathBuf, LspClientState>,
+    /// keeping more than one warm isn't worth the memory. This still applies per-root, not
+    /// per-(root, binary): switching worktrees evicts *every* language's client for the old
+    /// root, not just one - see `lsp::lsp_client_eviction_tests` for the regression test.
+    lsp_clients: HashMap<(PathBuf, &'static str), LspClientState>,
     /// Absolute paths that have already had `textDocument/didOpen` sent for their owning
     /// [`Self::lsp_clients`] entry - checked by [`Self::render_file_view`] so a re-render never
     /// re-sends `didOpen` with a stale version. Never removed on file close: this viewer

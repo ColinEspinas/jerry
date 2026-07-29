@@ -340,60 +340,60 @@ pub const THEME_DEFS: [ThemeDef; 6] = [
 ];
 
 /// One Language servers page row's static, per-language identity - the binary name
-/// [`detect_lsp_rows`] searches `$PATH` for. Binary names verified for real, not guessed:
-/// `typescript-language-server` (the npm package's own binary name), `vue-language-server` (the
-/// modern Volar-based `@vue/language-server` package - not the deprecated `vls`),
-/// `pyright-langserver` (`pyright`'s LSP-mode entry point, distinct from the plain `pyright`
-/// type-checker CLI).
+/// [`detect_lsp_rows`] searches `$PATH` for. Sourced from `crate::language`'s canonical registry
+/// (Revision R8) rather than an independently-authored table - see
+/// [`crate::language::ExtensionEntry::settings_row`]'s own docs for which entries produce a row
+/// here and why. Binary names verified for real, not guessed: `typescript-language-server` (the
+/// npm package's own binary name), `vue-language-server` (the modern Volar-based
+/// `@vue/language-server` package - not the deprecated `vls`), `pyright-langserver` (`pyright`'s
+/// LSP-mode entry point, distinct from the plain `pyright` type-checker CLI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LspLanguage {
     pub language: &'static str,
     /// The file extension chip label - fed to `crate::file_tree::lang_chip_for_name` (via a
     /// synthetic `"x.<ext>"` name) at the render call site, so this row's chip matches what a
-    /// file-tree row for that language would show. Extensions the chip table doesn't recognise
-    /// (`ts`/`vue`/`py`/`go` - only `rs`/`toml`/`md`/`sql` are wired) fall back to its neutral
-    /// chip rather than a fabricated coloured one.
+    /// file-tree row for that language would show.
     pub ext: &'static str,
     pub binary: &'static str,
     /// Generic descriptive copy, not a live count - `Jerry.dc.html`'s own `lspDefs` notes mix
     /// this with fabricated live data ("1,284 crates indexed") this app has no per-language
-    /// session summary to back (`crate::root::lsp`'s `rust-analyzer` client is keyed by
-    /// worktree, not surfaced here). Every note here is deliberately the descriptive kind only.
+    /// session summary to back (`crate::root::lsp`'s server clients are keyed by worktree, not
+    /// surfaced here). Every note here is deliberately the descriptive kind only.
     pub note: &'static str,
 }
 
-pub const LSP_LANGUAGES: [LspLanguage; 5] = [
-    LspLanguage {
-        language: "Rust",
-        ext: "rs",
-        binary: "rust-analyzer",
-        note: "starts when a .rs file opens",
-    },
-    LspLanguage {
-        language: "TypeScript",
-        ext: "ts",
-        binary: "typescript-language-server",
-        note: "starts when a .ts file opens",
-    },
-    LspLanguage {
-        language: "Vue",
-        ext: "vue",
-        binary: "vue-language-server",
-        note: "starts when a .vue file opens",
-    },
-    LspLanguage {
-        language: "Python",
-        ext: "py",
-        binary: "pyright-langserver",
-        note: "starts when a .py file opens",
-    },
-    LspLanguage {
-        language: "Go",
-        ext: "go",
-        binary: "gopls",
-        note: "installs when the first .go file opens",
-    },
-];
+/// The real, generic shape [`lsp_languages`] applies to whatever `entries` iterator it's given -
+/// pulled out on its own (rather than inlined into [`lsp_languages`]) so a test can exercise it
+/// directly against a synthetic entry list of any real length/shape, independent of
+/// [`crate::language::EXTENSIONS`]'s own current, real size. `filter_map` (not a fixed-size
+/// `std::array::from_fn`) means this genuinely cannot panic no matter how many entries `entries`
+/// yields, or how many of them carry `settings_row: None` - the old bug class (a hardcoded
+/// `LSP_LANGUAGES_COUNT` silently drifting from the real registry's actual size and panicking a
+/// render path) has no equivalent assumption left to drift.
+fn build_lsp_languages<'a>(
+    entries: impl Iterator<Item = &'a crate::language::ExtensionEntry>,
+) -> Vec<LspLanguage> {
+    entries
+        .filter_map(|entry| {
+            let row = entry.settings_row?;
+            Some(LspLanguage {
+                language: entry.display_name,
+                ext: entry.extension,
+                binary: row.binary,
+                note: row.note,
+            })
+        })
+        .collect()
+}
+
+/// Builds one [`LspLanguage`] per real [`crate::language::settings_lsp_entries`] entry - a plain
+/// `Vec`, not a fixed-size array, so a real language gaining/losing a `settings_row` (growing or
+/// shrinking the real underlying registry) can never desync from a hardcoded count and panic in
+/// a render path (`crate::root::detect_lsp_rows`, reached on every real render of the Settings ->
+/// Language Servers page). See [`build_lsp_languages`] for the actual, directly-testable shape.
+pub fn lsp_languages() -> Vec<LspLanguage> {
+    build_lsp_languages(crate::language::settings_lsp_entries())
+}
 
 /// One Language servers page row - see [`detect_lsp_rows`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,11 +423,11 @@ impl LspRow {
     }
 }
 
-/// Builds one [`LspRow`] per [`LSP_LANGUAGES`] entry via `resolve`, mirroring
+/// Builds one [`LspRow`] per [`lsp_languages`] entry via `resolve`, mirroring
 /// [`detect_agent_rows`] exactly (same `$PATH` search, same reason for taking `resolve` as a
 /// parameter).
 pub fn detect_lsp_rows(resolve: impl Fn(&str) -> Option<PathBuf>) -> Vec<LspRow> {
-    LSP_LANGUAGES
+    lsp_languages()
         .into_iter()
         .map(|def| LspRow {
             language: def.language,
@@ -802,10 +802,71 @@ mod tests {
         assert_eq!(THEME_DEFS[0].name, "Jerry Dark");
     }
 
+    /// [`lsp_languages`] now derives its length directly from
+    /// `crate::language::settings_lsp_entries` (a real `Vec`, not a fixed-size array), so there is
+    /// no separate count to drift - this just pins the real, current number of settings-row
+    /// languages so a change to that registry is still visible in a test diff.
+    #[test]
+    fn settings_lsp_entries_count_matches_lsp_languages_len() {
+        assert_eq!(
+            crate::language::settings_lsp_entries().count(),
+            lsp_languages().len()
+        );
+    }
+
+    /// A real proof that [`build_lsp_languages`] (the shape [`lsp_languages`] itself is a thin
+    /// wrapper over) cannot panic in a genuinely mismatched-count scenario - the exact bug class
+    /// the old `std::array::from_fn` + a hardcoded `LSP_LANGUAGES_COUNT` `.expect()` was
+    /// vulnerable to (a fixed-size array assuming an iterator yields exactly N items). This feeds
+    /// a synthetic entry list whose length and `settings_row`-presence doesn't match
+    /// [`crate::language::EXTENSIONS`]'s own real, current size at all (some `Some`, some `None`,
+    /// a different count entirely) and confirms it just filters, never panics.
+    #[test]
+    fn lsp_languages_never_panics_on_a_mismatched_entry_count() {
+        use crate::language::{ExtensionEntry, SettingsLspRow};
+
+        fn entry(extension: &'static str, has_row: bool) -> ExtensionEntry {
+            ExtensionEntry {
+                extension,
+                display_name: "Synthetic",
+                lsp_language_id: "synthetic",
+                chip_label: "sy",
+                chip_colors: crate::theme::lang::UNKNOWN,
+                lsp: None,
+                settings_row: has_row.then_some(SettingsLspRow {
+                    binary: "synthetic-binary",
+                    note: "synthetic",
+                }),
+                highlighter: None,
+            }
+        }
+
+        // Deliberately a different real count (7) than `EXTENSIONS`' own real current size, and a
+        // deliberate mix of `Some`/`None` settings_row - exactly the shape that would have
+        // panicked the old `std::array::from_fn`-against-a-stale-constant version.
+        let synthetic = [
+            entry("a", true),
+            entry("b", false),
+            entry("c", true),
+            entry("d", false),
+            entry("e", false),
+            entry("f", true),
+            entry("g", true),
+        ];
+
+        let languages = build_lsp_languages(synthetic.iter());
+        // No panic reaching this line is the real assertion; this also confirms only the real
+        // `Some(settings_row)` entries (4 of the 7) survived the filter.
+        assert_eq!(languages.len(), 4);
+        assert!(languages
+            .iter()
+            .all(|language| language.binary == "synthetic-binary"));
+    }
+
     #[test]
     fn detect_lsp_rows_reports_ready_for_a_resolver_that_finds_every_binary() {
         let rows = detect_lsp_rows(|name| Some(PathBuf::from(format!("/usr/bin/{name}"))));
-        assert_eq!(rows.len(), LSP_LANGUAGES.len());
+        assert_eq!(rows.len(), lsp_languages().len());
         assert!(rows.iter().all(|row| row.is_ready()));
         assert!(rows.iter().all(|row| row.status_label() == "ready"));
     }

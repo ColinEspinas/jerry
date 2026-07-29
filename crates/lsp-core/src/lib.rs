@@ -48,7 +48,10 @@ mod client;
 mod proc;
 mod transport;
 
-pub use client::{ClientUpdate, LspClient, LspError};
+pub use client::{
+    default_workspace_configuration, ClientUpdate, LspClient, LspError, ServerSpawnConfig,
+    WorkspaceConfigFn,
+};
 /// Re-exported so callers (the `app` crate) depend on exactly this crate's resolved
 /// `lsp-types` version rather than adding a second, potentially-drifting direct dependency -
 /// see this module's own docs.

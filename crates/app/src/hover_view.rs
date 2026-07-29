@@ -43,14 +43,23 @@
 //! with no signature - see [`looks_like_item_signature`] for why the signature check exists to
 //! keep that rare.
 //!
-//! ## Why plain text, not Markdown
+//! ## Why plain text, not Markdown - and the real Markdown fallback for when a server ignores it
 //!
-//! This client never sets `text_document.hover.content_format` in `ClientCapabilities`, so
-//! rust-analyzer falls back to its default, observed here to always be
-//! [`lsp_types::MarkupKind::PlainText`] (never `Markdown`). Any Markdown syntax in a doc comment
-//! therefore arrives un-rendered in [`HoverRenderModel::doc`] - this app has no Markdown
-//! rendering pipeline, a documented scope limit, not a bug. [`markup_text`] still handles the
-//! older [`lsp_types::HoverContents::Scalar`]/`Array` shapes defensively even though only
+//! `lsp_core::LspClient::initialize` now explicitly requests `PlainText` as this client's
+//! preferred `content_format` (Revision R8's generalization past rust-analyzer, which never
+//! needed to be asked - it was observed here to always default to
+//! [`lsp_types::MarkupKind::PlainText`] on its own). Pyright was directly observed (see
+//! `lsp_core::client`'s own real Python hover test) honoring that preference for real. But
+//! `typescript-language-server` was directly observed doing the opposite - sending `Markdown`
+//! regardless (see `lsp_core::client`'s own real TypeScript hover test, whose captured sample
+//! [`degrade_markdown_to_plain_text`]'s own tests reuse verbatim) - so this module can't assume
+//! every response is plain text just because it asked. [`markup_text`] checks the real
+//! `MarkupKind` on every `Markup` response and runs [`degrade_markdown_to_plain_text`] only over
+//! genuinely `Markdown`-kinded content: real fenced-code/heading/list/bold syntax characters are
+//! stripped so they never render literally, but this is deliberately *not* a structured Markdown
+//! parse - this module's paragraph/signature heuristics below stay Rust-hover-shaped (a
+//! documented, honest scope limit, not silently pretended away). [`markup_text`] still handles
+//! the older [`lsp_types::HoverContents::Scalar`]/`Array` shapes defensively even though only
 //! `Markup` has ever actually been observed.
 //!
 //! ## Position precision: per-token, not per-character
@@ -217,14 +226,19 @@ fn split_paragraphs(text: &str) -> Vec<&str> {
 }
 
 /// Text content from any of `lsp_types::HoverContents`' three shapes - `Markup` is the only one
-/// ever actually observed from rust-analyzer (see this module's top-level docs), but
-/// `Scalar`/`Array` (`lsp_types::MarkedString`, the LSP's older, deprecated hover shape) are
-/// still handled rather than assumed unreachable - a `LanguageString`'s `value` (its code text,
-/// with the `language` tag dropped, since there's no place to show it) stands in for a bare
-/// string the same way a `Markup`'s `value` does.
+/// ever actually observed from any of this app's supported servers (see this module's top-level
+/// docs), but `Scalar`/`Array` (`lsp_types::MarkedString`, the LSP's older, deprecated hover
+/// shape) are still handled rather than assumed unreachable - a `LanguageString`'s `value` (its
+/// code text, with the `language` tag dropped, since there's no place to show it) stands in for
+/// a bare string the same way a `Markup`'s `value` does. A `Markup` response whose real `kind` is
+/// `Markdown` is passed through [`degrade_markdown_to_plain_text`] first - see this module's
+/// top-level docs.
 fn markup_text(contents: &lsp_types::HoverContents) -> String {
     match contents {
-        lsp_types::HoverContents::Markup(markup) => markup.value.clone(),
+        lsp_types::HoverContents::Markup(markup) => match markup.kind {
+            lsp_types::MarkupKind::Markdown => degrade_markdown_to_plain_text(&markup.value),
+            lsp_types::MarkupKind::PlainText => markup.value.clone(),
+        },
         lsp_types::HoverContents::Scalar(marked) => marked_string_text(marked),
         lsp_types::HoverContents::Array(items) => items
             .iter()
@@ -232,6 +246,66 @@ fn markup_text(contents: &lsp_types::HoverContents) -> String {
             .collect::<Vec<_>>()
             .join("\n\n"),
     }
+}
+
+/// Degrades genuinely `Markdown`-kinded hover content into readable plain text - not a real
+/// structured Markdown parse (this module's own paragraph/signature heuristics stay Rust-hover-
+/// shaped regardless of what feeds them, see this module's top-level docs), just enough that a
+/// real fenced code block, heading, list bullet, or bold marker never renders as literal
+/// backtick/hash/asterisk syntax on screen. Verified against real, directly-observed
+/// `typescript-language-server` hover output (see this function's own tests, which reuse the
+/// exact captured sample `lsp_core::client`'s real TypeScript hover test produced), not
+/// synthetic Markdown invented for this function alone.
+///
+/// A fenced code block's own delimiter lines (`` ```lang ``/`` ``` ``) are dropped entirely, and
+/// closing one starts a new paragraph (an inserted blank line) - a real, observed
+/// typescript-language-server hover puts a fenced signature immediately followed, with no blank
+/// line, by doc prose (`` "\n```typescript\nfn...\n```\nAdds one..." ``); without this, the
+/// signature and doc prose would run together into what looks like one unbroken paragraph rather
+/// than the two visually distinct pieces a Rust-analyzer-style response would have delivered as.
+/// A leading `#`/`##`/... heading marker and a leading `- `/`* ` list bullet are stripped per
+/// line; `**`/`` ` `` are stripped wherever they appear (bold/inline-code markers) - a coarse,
+/// line/character-level pass, not a real Markdown AST walk, which this module's modest "degrade
+/// gracefully" scope (not "render Markdown") doesn't call for.
+///
+/// Deliberately does **not** strip a bare `__` the way it strips `**` - a real, common
+/// TypeScript/JavaScript identifier can itself contain a genuine double underscore (`__proto__`,
+/// `__dirname`, `__esModule`, ...), and that shape is *byte-for-byte indistinguishable* from real
+/// Markdown's own `__bold__` emphasis syntax: there is no rule that tells `__proto__` (an
+/// identifier) apart from `__proto__` (real bold text), paired or not - a "only strip balanced
+/// pairs" rule would still wrongly strip the identifier case. The real, live-verified hover
+/// output this app actually parses (`typescript-language-server`, captured in this module's own
+/// tests) uses `**` for emphasis, never `__` - so `__` is left alone entirely rather than risk
+/// silently corrupting a real identifier for a real server that doesn't even need it stripped.
+fn degrade_markdown_to_plain_text(markdown: &str) -> String {
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for raw_line in markdown.lines() {
+        if raw_line.trim_start().starts_with("```") {
+            let was_in_fence = in_fence;
+            in_fence = !in_fence;
+            if was_in_fence {
+                // Closing a fence: start a new paragraph after the code block rather than
+                // running it straight into whatever prose follows with no boundary at all.
+                out_lines.push(String::new());
+            }
+            continue;
+        }
+
+        let mut line = raw_line.to_string();
+        if !in_fence {
+            let heading_stripped = line.trim_start_matches('#');
+            if heading_stripped.len() != line.len() {
+                line = heading_stripped.trim_start().to_string();
+            }
+            if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+                line = rest.to_string();
+            }
+        }
+        out_lines.push(line);
+    }
+
+    out_lines.join("\n").replace("**", "").replace('`', "")
 }
 
 fn marked_string_text(marked: &lsp_types::MarkedString) -> String {
@@ -342,6 +416,90 @@ mod tests {
             }),
             range: None,
         }
+    }
+
+    fn markdown_hover(value: &str) -> lsp_types::Hover {
+        lsp_types::Hover {
+            contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
+                kind: lsp_types::MarkupKind::Markdown,
+                value: value.to_string(),
+            }),
+            range: None,
+        }
+    }
+
+    /// The exact real string captured from a real, running `typescript-language-server` (see
+    /// `lsp_core::client::tests::typescript_language_server_returns_a_real_hover_for_a_documented_function`,
+    /// whose own pinned `MarkupKind::Markdown` assertion guards this sample from silently going
+    /// stale) - not synthetic Markdown invented for this test.
+    const REAL_TYPESCRIPT_MARKDOWN_HOVER: &str =
+        "\n```typescript\nfunction addOne(x: number): number\n```\nAdds one to the given number.";
+
+    #[test]
+    fn degrade_markdown_to_plain_text_strips_a_real_fenced_code_block_and_starts_a_new_paragraph() {
+        let plain = degrade_markdown_to_plain_text(REAL_TYPESCRIPT_MARKDOWN_HOVER);
+        assert_eq!(
+            plain,
+            "\nfunction addOne(x: number): number\n\nAdds one to the given number."
+        );
+        assert!(!plain.contains('`'), "no backtick should survive degrading");
+    }
+
+    #[test]
+    fn a_real_markdown_typescript_hover_still_splits_into_a_readable_signature_and_doc() {
+        let hover = markdown_hover(REAL_TYPESCRIPT_MARKDOWN_HOVER);
+        let model = build_hover_render_model(&hover).expect("a real, non-empty response");
+        assert_eq!(model.signature, "function addOne(x: number): number");
+        assert_eq!(model.doc.as_deref(), Some("Adds one to the given number."));
+        assert!(!model.signature.contains('`'));
+        assert!(!model.doc.unwrap().contains('`'));
+    }
+
+    #[test]
+    fn degrade_markdown_to_plain_text_strips_headings_bullets_and_star_bold_markers() {
+        let plain = degrade_markdown_to_plain_text(
+            "## Foo\n\n- first point\n* second point\n\n**bold** and `code`",
+        );
+        assert!(!plain.contains('#'));
+        assert!(!plain.contains('*'));
+        assert!(!plain.contains('`'));
+        assert!(plain.contains("Foo"));
+        assert!(plain.contains("first point"));
+        assert!(plain.contains("second point"));
+        assert!(plain.contains("bold and code"));
+    }
+
+    /// Regression coverage for the real bug this fix addresses: a blanket `.replace("__", "")`
+    /// used to silently corrupt a real, common TypeScript/JavaScript identifier that happens to
+    /// contain a genuine double underscore whenever it showed up in real Markdown-formatted hover
+    /// text - `__proto__` becoming `proto`, `__dirname` becoming `dirname`. Real
+    /// `typescript-language-server` hover output (see this module's own captured sample) uses
+    /// `**` for emphasis, never `__`, so leaving `__` alone entirely costs nothing real.
+    #[test]
+    fn degrade_markdown_to_plain_text_never_mangles_a_real_double_underscore_identifier() {
+        let plain = degrade_markdown_to_plain_text(
+            "Access `__proto__` or `__dirname` directly, or use **bold** text.",
+        );
+        assert!(
+            plain.contains("__proto__"),
+            "a real identifier containing a double underscore must survive intact, got: {plain:?}"
+        );
+        assert!(
+            plain.contains("__dirname"),
+            "a real identifier containing a double underscore must survive intact, got: {plain:?}"
+        );
+        assert!(!plain.contains("**"));
+        assert!(plain.contains("bold"));
+    }
+
+    #[test]
+    fn a_plaintext_markup_response_is_never_run_through_the_markdown_degrader() {
+        // A `PlainText`-kinded response containing literal backtick-looking text (e.g. a doc
+        // comment that itself quotes code with backticks) must pass through completely
+        // unmodified - only a real `Markdown` kind should ever trigger stripping.
+        let hover = markup_hover("`not actually markdown` stays as-is");
+        let model = build_hover_render_model(&hover).expect("a real, non-empty response");
+        assert_eq!(model.signature, "`not actually markdown` stays as-is");
     }
 
     // The four real strings captured from a real, running `rust-analyzer` - see this module's

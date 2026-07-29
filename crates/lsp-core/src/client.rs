@@ -58,12 +58,62 @@ use std::time::Duration;
 use lsp_types::notification::Notification as LspNotification;
 use lsp_types::request::Request as LspRequest;
 use lsp_types::{
-    ClientCapabilities, DidOpenTextDocumentParams, InitializeParams, InitializedParams,
-    TextDocumentItem, Uri, WorkspaceFolder,
+    ClientCapabilities, DidOpenTextDocumentParams, HoverClientCapabilities, InitializeParams,
+    InitializedParams, MarkupKind, PublishDiagnosticsClientCapabilities,
+    TextDocumentClientCapabilities, TextDocumentItem, Uri, WorkspaceClientCapabilities,
+    WorkspaceFolder,
 };
 
 use crate::proc;
 use crate::transport;
+
+/// Answers a real `workspace/configuration` request's `section` (`None` for a scope-less,
+/// whole-item request) with the value this server should be told for it - see
+/// [`server_request_reply`]'s docs for why a bare `null` isn't always legal/safe, and
+/// [`default_workspace_configuration`] for the shared default every server not named here uses.
+/// A plain `fn` pointer (not a `Box<dyn Fn>`/closure) since every real value needed here is
+/// known statically per language - see `crate::language`'s registry in the `app` crate for where
+/// a per-server one gets built.
+pub type WorkspaceConfigFn = fn(section: Option<&str>) -> serde_json::Value;
+
+/// The shared default [`WorkspaceConfigFn`]: a real, spec-legal empty object `{}` for every
+/// section, correct for a server whose behavior doesn't depend on real settings coming back
+/// (rust-analyzer, typescript-language-server both tolerate this - see [`ServerSpawnConfig`]'s
+/// docs). Spec-legal because `workspace/configuration`'s result type is "the requested
+/// configuration item, or `null` if not found" - `{}` is a real, present, empty configuration
+/// object, a different (and for these servers, safer - see this module's top-level docs on why
+/// `null` can leave a server assuming stale/default settings) answer than "not found".
+pub fn default_workspace_configuration(_section: Option<&str>) -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+/// Real, per-language-server spawn configuration - the generalization point this crate exists
+/// to expose so it's no longer hardcoded to rust-analyzer (see this crate's top-level docs).
+/// This struct only defines the shape; `crate::language` in the `app` crate is the single real
+/// source of truth for which values fill it in for each supported language.
+#[derive(Debug, Clone)]
+pub struct ServerSpawnConfig {
+    /// Human-readable server name used in every log/error message this crate produces (e.g.
+    /// `"rust-analyzer"`, `"typescript-language-server"`, `"pyright"`) - see [`LspError`]'s docs
+    /// for why every variant now carries this instead of a hardcoded `"rust-analyzer"` string.
+    pub name: &'static str,
+    /// The binary [`Command::new`] spawns, looked up on `$PATH`.
+    pub binary: &'static str,
+    /// Real command-line arguments (e.g. `["--stdio"]` for typescript-language-server/
+    /// pyright-langserver/vue-language-server; rust-analyzer needs none). A `Vec<String>`
+    /// (not a `&'static [&'static str]`) so a real spawn config can carry a runtime-computed
+    /// value if a future language ever needs one.
+    pub args: Vec<String>,
+    /// The real `InitializeParams.initialization_options` payload for this server, if any -
+    /// `None` for a server that behaves well with none (rust-analyzer,
+    /// typescript-language-server), `Some` for one that expects real, server-specific settings
+    /// up front (Pyright - see `crate::language`'s registry in the `app` crate for the actual
+    /// value it builds).
+    pub initialization_options: Option<serde_json::Value>,
+    /// Answers this server's real `workspace/configuration` requests - see
+    /// [`WorkspaceConfigFn`]/[`default_workspace_configuration`]'s docs.
+    pub workspace_configuration: WorkspaceConfigFn,
+}
 
 /// How long [`LspClient::spawn`] waits for `rust-analyzer`'s `initialize` **response**
 /// specifically. Per the LSP spec a server may (and rust-analyzer does) respond to
@@ -101,8 +151,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// field, and would leak an opaque dependency type into this crate's public API).
 #[derive(Debug, thiserror::Error)]
 pub enum LspError {
-    #[error("failed to spawn `rust-analyzer` (is it installed and on PATH?): {0}")]
-    Spawn(#[source] std::io::Error),
+    #[error("failed to spawn `{server}` (is it installed and on PATH?): {source}")]
+    Spawn {
+        server: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("repository root {0:?} does not exist or is not a directory")]
     InvalidRoot(PathBuf),
     #[error("path {0:?} could not be converted to a file:// URI (it must be absolute)")]
@@ -112,20 +166,32 @@ pub enum LspError {
          malformed)"
     )]
     InvalidUri(String),
-    #[error("rust-analyzer's child process did not expose a piped stdio handle")]
-    MissingStdio,
-    #[error("I/O error communicating with rust-analyzer: {0}")]
-    Io(#[source] std::io::Error),
+    #[error("{server}'s child process did not expose a piped stdio handle")]
+    MissingStdio { server: &'static str },
+    #[error("I/O error communicating with {server}: {source}")]
+    Io {
+        server: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to serialize an LSP request/notification's params: {0}")]
     Serialize(#[source] serde_json::Error),
-    #[error("failed to deserialize rust-analyzer's response: {0}")]
-    Deserialize(#[source] serde_json::Error),
-    #[error("no response to `{0}` within the timeout")]
-    Timeout(&'static str),
-    #[error("rust-analyzer closed the connection")]
-    ConnectionClosed,
-    #[error("rust-analyzer returned an error response to `{method}`: {message} (code {code})")]
+    #[error("failed to deserialize {server}'s response: {source}")]
+    Deserialize {
+        server: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("no response to `{method}` from {server} within the timeout")]
+    Timeout {
+        server: &'static str,
+        method: &'static str,
+    },
+    #[error("{server} closed the connection")]
+    ConnectionClosed { server: &'static str },
+    #[error("{server} returned an error response to `{method}`: {message} (code {code})")]
     Response {
+        server: &'static str,
         method: &'static str,
         code: i64,
         message: String,
@@ -152,6 +218,9 @@ pub enum ClientUpdate {
 /// `Mutex`es) - the `app` crate keeps one `Arc<LspClient>` per repository root, shared across
 /// every open Rust file in that repo.
 pub struct LspClient {
+    /// The human-readable server name every log/error message this client produces is
+    /// parameterized by - see [`ServerSpawnConfig::name`]'s docs.
+    name: &'static str,
     child: Option<Child>,
     pid: u32,
     exited: bool,
@@ -171,12 +240,12 @@ pub struct LspClient {
 }
 
 impl LspClient {
-    /// Spawns `rust-analyzer` for the repository rooted at `repo_root`, performs an
-    /// `initialize` request (awaiting its response) followed by an `initialized` notification -
-    /// in that order, per this module's docs - and returns a client that's ready for
-    /// `didOpen`/other calls. `repo_root` must be an absolute, existing directory (relative
+    /// Spawns the server described by `config` for the repository rooted at `repo_root`,
+    /// performs an `initialize` request (awaiting its response) followed by an `initialized`
+    /// notification - in that order, per this module's docs - and returns a client that's ready
+    /// for `didOpen`/other calls. `repo_root` must be an absolute, existing directory (relative
     /// paths cannot be turned into a well-formed `file://` URI - see [`path_to_uri`]).
-    pub fn spawn(repo_root: &Path) -> Result<Self, LspError> {
+    pub fn spawn(repo_root: &Path, config: ServerSpawnConfig) -> Result<Self, LspError> {
         if !repo_root.is_dir() {
             return Err(LspError::InvalidRoot(repo_root.to_path_buf()));
         }
@@ -188,18 +257,32 @@ impl LspClient {
             .canonicalize()
             .map_err(|_| LspError::InvalidRoot(repo_root.to_path_buf()))?;
 
-        let mut command = Command::new("rust-analyzer");
+        let name = config.name;
+        let mut command = Command::new(config.binary);
         command
+            .args(&config.args)
             .current_dir(&repo_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().map_err(LspError::Spawn)?;
+        let mut child = command.spawn().map_err(|source| LspError::Spawn {
+            server: name,
+            source,
+        })?;
         let pid = child.id();
 
-        let stdin = child.stdin.take().ok_or(LspError::MissingStdio)?;
-        let stdout = child.stdout.take().ok_or(LspError::MissingStdio)?;
-        let stderr = child.stderr.take().ok_or(LspError::MissingStdio)?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or(LspError::MissingStdio { server: name })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(LspError::MissingStdio { server: name })?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or(LspError::MissingStdio { server: name })?;
 
         let stdin = Arc::new(Mutex::new(stdin));
         let pending: Arc<Mutex<HashMap<i64, SyncSender<PendingResponse>>>> =
@@ -208,19 +291,30 @@ impl LspClient {
             Arc::new(Mutex::new(HashMap::new()));
         let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(WAKE_CHANNEL_CAPACITY);
 
+        let workspace_configuration = config.workspace_configuration;
         let reader_thread = std::thread::spawn({
             let pending = Arc::clone(&pending);
             let diagnostics = Arc::clone(&diagnostics);
             let stdin_for_replies = Arc::clone(&stdin);
-            move || run_reader_loop(stdout, pending, diagnostics, wake_tx, stdin_for_replies)
+            move || {
+                run_reader_loop(
+                    stdout,
+                    pending,
+                    diagnostics,
+                    wake_tx,
+                    stdin_for_replies,
+                    workspace_configuration,
+                )
+            }
         });
-        // rust-analyzer's stderr is diagnostic/log output (not part of the LSP protocol) -
-        // drained on its own thread so a full OS pipe buffer on stderr can never backpressure
-        // rust-analyzer's stdout writes. Logged at debug level rather than discarded, so a
-        // startup failure (e.g. a version mismatch panic) is still observable.
-        let stderr_thread = std::thread::spawn(move || run_stderr_drain_loop(stderr));
+        // A server's stderr is diagnostic/log output (not part of the LSP protocol) - drained
+        // on its own thread so a full OS pipe buffer on stderr can never backpressure the
+        // server's stdout writes. Logged at debug level rather than discarded, so a startup
+        // failure (e.g. a version mismatch panic) is still observable.
+        let stderr_thread = std::thread::spawn(move || run_stderr_drain_loop(stderr, name));
 
         let client = LspClient {
+            name,
             child: Some(child),
             pid,
             exited: false,
@@ -233,27 +327,89 @@ impl LspClient {
             stderr_thread: Some(stderr_thread),
         };
 
-        client.initialize(&repo_root)?;
+        client.initialize(&repo_root, config.initialization_options)?;
         Ok(client)
+    }
+
+    /// The human-readable server name this client was spawned with (`config.name`, see
+    /// [`ServerSpawnConfig::name`]'s docs) - exposed so a caller (`crate::root::lsp` in the
+    /// `app` crate) can build its own server-specific log messages without re-deriving the name
+    /// from the process it already holds a handle to.
+    pub fn name(&self) -> &'static str {
+        self.name
     }
 
     /// The handshake body: see this module's top-level docs for why the request and
     /// notification are sent in exactly this order and why no other call can happen first.
-    fn initialize(&self, repo_root: &Path) -> Result<(), LspError> {
+    /// `initialization_options` is the real, server-specific value from
+    /// [`ServerSpawnConfig::initialization_options`] (`None` for a server that needs none).
+    fn initialize(
+        &self,
+        repo_root: &Path,
+        initialization_options: Option<serde_json::Value>,
+    ) -> Result<(), LspError> {
         let uri = path_to_uri(repo_root)?;
         let folder_name = repo_root
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| repo_root.to_string_lossy().into_owned());
 
-        #[allow(deprecated)] // `root_uri`/`root_path` are left `None`; only the modern
-        // `workspace_folders` field (below) is populated - see the module docs' handshake
-        // section. The `#[allow]` is required only because `InitializeParams`'s `Default` impl
-        // (used via `..Default::default()`) itself mentions those deprecated fields in its
-        // generated code path on some compiler versions; no deprecated field is set here.
+        // Explicitly prefers `PlainText` hover content (per item 7's generalization): a server
+        // that respects this (rust-analyzer already only ever sends `PlainText` by its own
+        // default - see `crate::root::hover_view`'s docs in the `app` crate) sends parseable
+        // plain text instead of Markdown; a server that ignores it anyway (observed for real
+        // against typescript-language-server/pyright-langserver - see that same module's docs
+        // for the real fallback this drives) still gets handled, just via a degrade-to-plain-text
+        // pass on the caller's side rather than a crash or raw Markdown syntax on screen.
+        let capabilities = ClientCapabilities {
+            text_document: Some(TextDocumentClientCapabilities {
+                hover: Some(HoverClientCapabilities {
+                    dynamic_registration: None,
+                    content_format: Some(vec![MarkupKind::PlainText]),
+                }),
+                // A real, live-verified interop gap surfaced by generalizing past
+                // rust-analyzer (which pushes `publishDiagnostics` unconditionally regardless of
+                // advertised capabilities): `typescript-language-server` was directly observed,
+                // via a live probe while building this integration, to never send a single
+                // `publishDiagnostics` notification - not even an empty one - for a real
+                // `didOpen`'d file until this capability is explicitly advertised. Harmless to
+                // set unconditionally for every server, including ones (rust-analyzer, Pyright)
+                // that don't require it.
+                publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
+                    related_information: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            // Real support for `workspace/configuration` now genuinely exists (see
+            // `ServerSpawnConfig::workspace_configuration`/[`server_request_reply`]'s docs), so
+            // this is advertised for real rather than left unset - Pyright in particular relies
+            // on this to decide it's safe to ask for real settings instead of assuming defaults.
+            workspace: Some(WorkspaceClientCapabilities {
+                configuration: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // `root_uri` is deprecated by the spec in favor of `workspace_folders` (below), and
+        // rust-analyzer never needed it - but generalizing this client past rust-analyzer (this
+        // crate's whole reason for existing as of Revision R8) surfaced a real, live-verified
+        // interop gap: `typescript-language-server`'s own TypeScript-discovery walk (finding a
+        // real, project-local `node_modules/typescript`) was directly observed, via a live probe
+        // while building this generalization, to fail with "Could not find a valid TypeScript
+        // installation" when only `workspace_folders` is sent - `root_uri` specifically is what
+        // it consults, `workspace_folders` alone isn't enough for that server's own real
+        // implementation despite being the modern, spec-preferred field. Sending both is legal
+        // per spec and does not regress rust-analyzer (still passes every one of its own e2e
+        // tests below with `root_uri` now set) - real, both-fields-populated behavior, not a
+        // guess.
+        #[allow(deprecated)]
         let params = InitializeParams {
             process_id: Some(std::process::id()),
-            capabilities: ClientCapabilities::default(),
+            initialization_options,
+            capabilities,
+            root_uri: Some(uri.clone()),
             workspace_folders: Some(vec![WorkspaceFolder {
                 uri: uri.clone(),
                 name: folder_name,
@@ -267,14 +423,23 @@ impl LspClient {
     }
 
     /// Sends a `textDocument/didOpen` notification for `path` with `text` as its current
-    /// content. Never called before `initialized` (see this module's docs) since a caller can
-    /// only ever hold an already-initialized `LspClient`.
-    pub fn did_open(&self, path: &Path, text: String, version: i32) -> Result<(), LspError> {
+    /// content, tagged with `language_id` (e.g. `"rust"`, `"typescript"`, `"tsx"`, `"python"` -
+    /// see `crate::language` in the `app` crate for the real per-extension mapping; even "the
+    /// TypeScript server" needs a real language id that varies by extension, not one constant).
+    /// Never called before `initialized` (see this module's docs) since a caller can only ever
+    /// hold an already-initialized `LspClient`.
+    pub fn did_open(
+        &self,
+        path: &Path,
+        text: String,
+        version: i32,
+        language_id: &str,
+    ) -> Result<(), LspError> {
         let uri = path_to_uri(path)?;
         let params = DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri,
-                language_id: "rust".to_string(),
+                language_id: language_id.to_string(),
                 version,
                 text,
             },
@@ -383,7 +548,10 @@ impl LspClient {
     ) -> Result<R::Result, LspError> {
         let params_value = serde_json::to_value(params).map_err(LspError::Serialize)?;
         let result_value = self.send_request_raw(R::METHOD, params_value, timeout)?;
-        serde_json::from_value(result_value).map_err(LspError::Deserialize)
+        serde_json::from_value(result_value).map_err(|source| LspError::Deserialize {
+            server: self.name,
+            source,
+        })
     }
 
     /// Sends a framed LSP notification (no response expected or awaited).
@@ -410,24 +578,33 @@ impl LspClient {
         });
         {
             let mut stdin = lock(&self.stdin);
-            if let Err(err) = transport::write_message(&mut *stdin, &message) {
+            if let Err(source) = transport::write_message(&mut *stdin, &message) {
                 lock(&self.pending).remove(&id);
-                return Err(LspError::Io(err));
+                return Err(LspError::Io {
+                    server: self.name,
+                    source,
+                });
             }
         }
 
         match rx.recv_timeout(timeout) {
             Ok(Ok(value)) => Ok(value),
             Ok(Err((code, message))) => Err(LspError::Response {
+                server: self.name,
                 method,
                 code,
                 message,
             }),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 lock(&self.pending).remove(&id);
-                Err(LspError::Timeout(method))
+                Err(LspError::Timeout {
+                    server: self.name,
+                    method,
+                })
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(LspError::ConnectionClosed),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(LspError::ConnectionClosed { server: self.name })
+            }
         }
     }
 
@@ -442,7 +619,10 @@ impl LspClient {
             "params": params,
         });
         let mut stdin = lock(&self.stdin);
-        transport::write_message(&mut *stdin, &message).map_err(LspError::Io)
+        transport::write_message(&mut *stdin, &message).map_err(|source| LspError::Io {
+            server: self.name,
+            source,
+        })
     }
 
     /// Deterministically tears the session down: a best-effort `shutdown` request
@@ -542,21 +722,30 @@ fn uri_to_path(uri: &Uri) -> Result<PathBuf, LspError> {
         .map_err(|_| LspError::InvalidUri(uri.as_str().to_string()))
 }
 
-/// Body of the background reader thread: reads framed messages from rust-analyzer's stdout in
+/// Body of the background reader thread: reads framed messages from the server's stdout in
 /// a loop, dispatching each one as a response (has `id`, no `method`), a server-initiated
-/// request (has both `id` and `method` - auto-replied to with a `null` result; see the inline
-/// comment below for why), or a notification (`method`, no `id`) - exits cleanly on EOF (the
-/// process died) or an I/O error.
+/// request (has both `id` and `method` - auto-replied to; see the inline comment below for how),
+/// or a notification (`method`, no `id`) - exits cleanly on EOF (the process died) or an I/O
+/// error. `workspace_configuration` answers real `workspace/configuration` requests - see
+/// [`server_request_reply`]'s docs.
 fn run_reader_loop(
     stdout: std::process::ChildStdout,
     pending: Arc<Mutex<HashMap<i64, SyncSender<PendingResponse>>>>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<lsp_types::Diagnostic>>>>,
     wake_tx: SyncSender<()>,
     stdin: Arc<Mutex<ChildStdin>>,
+    workspace_configuration: WorkspaceConfigFn,
 ) {
     let mut reader = BufReader::new(stdout);
     while let Ok(Some(value)) = transport::read_message(&mut reader) {
-        handle_incoming(value, &pending, &diagnostics, &wake_tx, &stdin);
+        handle_incoming(
+            value,
+            &pending,
+            &diagnostics,
+            &wake_tx,
+            &stdin,
+            workspace_configuration,
+        );
     }
     // The connection is gone: drop every still-pending response sender so any thread blocked in
     // `recv_timeout` gets a real, immediate `Disconnected` rather than waiting out its own
@@ -570,6 +759,7 @@ fn handle_incoming(
     diagnostics: &Arc<Mutex<HashMap<String, Vec<lsp_types::Diagnostic>>>>,
     wake_tx: &SyncSender<()>,
     stdin: &Arc<Mutex<ChildStdin>>,
+    workspace_configuration: WorkspaceConfigFn,
 ) {
     let Some(object) = value.as_object() else {
         return;
@@ -581,10 +771,11 @@ fn handle_incoming(
             // `client/registerCapability`, `window/workDoneProgress/create`) - this phase's
             // scope is diagnostics only, so every such request is answered generically with a
             // `null` result rather than left unanswered, except `workspace/configuration` -
-            // see [`server_request_reply`]'s docs for why that one gets a spec-shaped array
+            // see [`server_request_reply`]'s docs for why that one gets a real, server-aware
             // reply instead.
             let method = object.get("method").and_then(|m| m.as_str()).unwrap_or("");
-            let reply = server_request_reply(id, method, object.get("params"));
+            let reply =
+                server_request_reply(id, method, object.get("params"), workspace_configuration);
 
             // Written from a short-lived, detached thread rather than inline from this reader
             // thread: `transport::write_message` is a blocking `write_all` to the child's
@@ -653,26 +844,36 @@ fn handle_incoming(
 /// (`lsp_types::request::WorkspaceConfiguration`) is special-cased: its spec'd `Result` type
 /// is `Vec<serde_json::Value>`, one entry per requested `ConfigurationItem`, so a bare
 /// top-level `null` is not a legal reply shape for it, even though rust-analyzer tolerates one
-/// in practice. This client's `ClientCapabilities::default()` (see [`LspClient::initialize`])
-/// leaves `workspace.configuration` unset, so per spec a strictly compliant server should
-/// never send this request here - but rust-analyzer has been observed sending it anyway
-/// (wanting its own configuration sections regardless of advertised capabilities), so this
-/// special case is exercised behavior, not speculative. Every other server-initiated request
-/// method keeps the generic `null`-result fallback, which remains legal for methods whose
-/// result types vary/are optional.
+/// in practice. Each item's own value now comes from `workspace_configuration` (the server's
+/// real [`ServerSpawnConfig::workspace_configuration`]) rather than a hardcoded `null` - see
+/// [`default_workspace_configuration`]'s docs for the shared default, and `crate::language`'s
+/// registry in the `app` crate for Pyright's real, non-default one (this generalizes what used
+/// to be a rust-analyzer-only special case: rust-analyzer sends this request even though this
+/// client's capabilities never used to advertise `workspace.configuration`, and Pyright/
+/// typescript-language-server were observed, while building this generalization, to send it
+/// too). Every other server-initiated request method keeps the generic `null`-result fallback,
+/// which remains legal for methods whose result types vary/are optional.
 fn server_request_reply(
     id: &serde_json::Value,
     method: &str,
     params: Option<&serde_json::Value>,
+    workspace_configuration: WorkspaceConfigFn,
 ) -> serde_json::Value {
     if method == lsp_types::request::WorkspaceConfiguration::METHOD {
-        let item_count = params
+        let items = params
             .and_then(|params| params.get("items"))
-            .and_then(|items| items.as_array())
-            .map(|items| items.len())
-            .unwrap_or(0);
-        let result: Vec<serde_json::Value> =
-            std::iter::repeat_n(serde_json::Value::Null, item_count).collect();
+            .and_then(|items| items.as_array());
+        let result: Vec<serde_json::Value> = items
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        let section = item.get("section").and_then(|s| s.as_str());
+                        workspace_configuration(section)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         return serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -689,14 +890,15 @@ fn server_request_reply(
 
 /// Body of the stderr-draining background thread - see [`LspClient::spawn`]'s docs for why
 /// this exists (preventing a full stderr pipe from backpressuring the process). Each line is
-/// logged at `debug` level with a `rust-analyzer:` prefix rather than discarded, so a startup
-/// failure is still observable in this app's own logs.
-fn run_stderr_drain_loop(stderr: std::process::ChildStderr) {
+/// logged at `debug` level with a real `{server}:` prefix (not a hardcoded `"rust-analyzer:"`
+/// one - see [`ServerSpawnConfig::name`]'s docs) rather than discarded, so a startup failure is
+/// still observable in this app's own logs.
+fn run_stderr_drain_loop(stderr: std::process::ChildStderr, server: &'static str) {
     use std::io::BufRead;
     let reader = BufReader::new(stderr);
     for line in reader.lines() {
         match line {
-            Ok(line) => log::debug!("rust-analyzer: {line}"),
+            Ok(line) => log::debug!("{server}: {line}"),
             Err(_) => break,
         }
     }
@@ -720,6 +922,19 @@ mod tests {
         std::fs::create_dir(dir.path().join("src")).expect("mkdir src");
         std::fs::write(dir.path().join("src").join("main.rs"), main_rs).expect("write main.rs");
         dir
+    }
+
+    /// The real `ServerSpawnConfig` for rust-analyzer this test module spawns against - the
+    /// same shape `crate::language`'s registry builds in the `app` crate, kept as a local copy
+    /// here (rather than a cross-crate dependency) since `lsp-core` must stand alone.
+    fn rust_analyzer_config() -> ServerSpawnConfig {
+        ServerSpawnConfig {
+            name: "rust-analyzer",
+            binary: "rust-analyzer",
+            args: Vec::new(),
+            initialization_options: None,
+            workspace_configuration: default_workspace_configuration,
+        }
     }
 
     /// Whether a `GotoDefinitionResponse` carries zero locations - a distinct "not resolved
@@ -752,6 +967,7 @@ mod tests {
             &id,
             lsp_types::request::WorkspaceConfiguration::METHOD,
             Some(&params),
+            default_workspace_configuration,
         );
 
         assert_eq!(reply["id"], id);
@@ -766,7 +982,12 @@ mod tests {
             2,
             "one array entry per requested ConfigurationItem"
         );
-        assert!(array.iter().all(|entry| entry.is_null()));
+        // The default fn answers every section with a real, spec-legal empty object - not a
+        // fabricated `null` and not a real per-section value (no per-section value is owed here
+        // since the default is deliberately section-agnostic - see its own docs).
+        assert!(array
+            .iter()
+            .all(|entry| entry.is_object() && !entry.is_null()));
     }
 
     #[test]
@@ -778,6 +999,7 @@ mod tests {
             &id,
             lsp_types::request::WorkspaceConfiguration::METHOD,
             Some(&params),
+            default_workspace_configuration,
         );
 
         let array = reply["result"]
@@ -786,10 +1008,43 @@ mod tests {
         assert!(array.is_empty());
     }
 
+    /// A server-aware `workspace_configuration` fn (the real shape `crate::language`'s Pyright
+    /// entry in the `app` crate uses) is threaded all the way through to each array entry, keyed
+    /// by that item's own real `section` - not the same value repeated for every item.
+    #[test]
+    fn workspace_configuration_uses_the_real_per_section_answer_from_the_server_fn() {
+        fn fake_config(section: Option<&str>) -> serde_json::Value {
+            match section {
+                Some("python") => serde_json::json!({"pythonPath": "python3"}),
+                _ => serde_json::Value::Object(serde_json::Map::new()),
+            }
+        }
+        let id = serde_json::json!(9);
+        let params = serde_json::json!({
+            "items": [{ "section": "python" }, { "section": "python.analysis" }]
+        });
+
+        let reply = server_request_reply(
+            &id,
+            lsp_types::request::WorkspaceConfiguration::METHOD,
+            Some(&params),
+            fake_config,
+        );
+
+        let array = reply["result"].as_array().expect("real array");
+        assert_eq!(array[0]["pythonPath"], "python3");
+        assert_eq!(array[1], serde_json::json!({}));
+    }
+
     #[test]
     fn every_other_server_initiated_request_keeps_the_generic_null_reply() {
         let id = serde_json::json!(3);
-        let reply = server_request_reply(&id, "client/registerCapability", None);
+        let reply = server_request_reply(
+            &id,
+            "client/registerCapability",
+            None,
+            default_workspace_configuration,
+        );
         assert_eq!(reply["id"], id);
         assert!(
             reply["result"].is_null(),
@@ -800,7 +1055,7 @@ mod tests {
     #[test]
     fn spawn_performs_a_real_handshake_and_shutdown_leaves_no_orphan() {
         let project = write_scratch_project("fn main() {}\n");
-        let mut client = LspClient::spawn(project.path())
+        let mut client = LspClient::spawn(project.path(), rust_analyzer_config())
             .expect("spawning + initializing rust-analyzer should succeed");
         let pid = client.pid;
         assert!(
@@ -835,7 +1090,7 @@ mod tests {
     #[test]
     fn drop_without_shutdown_does_not_leave_an_orphaned_process() {
         let project = write_scratch_project("fn main() {}\n");
-        let client = LspClient::spawn(project.path())
+        let client = LspClient::spawn(project.path(), rust_analyzer_config())
             .expect("spawning + initializing rust-analyzer should succeed");
         let pid = client.pid;
         assert!(
@@ -859,7 +1114,7 @@ mod tests {
     #[test]
     fn a_second_request_after_the_connection_closes_fails_fast_not_after_the_full_timeout() {
         let project = write_scratch_project("fn main() {}\n");
-        let mut client = LspClient::spawn(project.path())
+        let mut client = LspClient::spawn(project.path(), rust_analyzer_config())
             .expect("spawning + initializing rust-analyzer should succeed");
         client.shutdown().expect("shutdown should succeed");
 
@@ -868,7 +1123,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(LspError::Io(_)) | Err(LspError::ConnectionClosed)
+                Err(LspError::Io { .. }) | Err(LspError::ConnectionClosed { .. })
             ),
             "a request sent after the connection is torn down should fail with a real \
              connection-closed/IO error, got: {result:?}"
@@ -912,11 +1167,11 @@ mod tests {
         let main_rs = project.path().join("src").join("main.rs");
         let source = std::fs::read_to_string(&main_rs).expect("read fixture source");
 
-        let mut client = LspClient::spawn(project.path())
+        let mut client = LspClient::spawn(project.path(), rust_analyzer_config())
             .expect("spawning + initializing rust-analyzer should succeed");
 
         client
-            .did_open(&main_rs, source, 1)
+            .did_open(&main_rs, source, 1, "rust")
             .expect("didOpen should send successfully");
 
         let deadline = Instant::now() + Duration::from_secs(180);
@@ -971,6 +1226,372 @@ mod tests {
             mismatch.range.start.line, 1,
             "expected the mismatch diagnostic's range to point at the real offending line, \
              got: {mismatch:#?}"
+        );
+
+        client.shutdown().expect("shutdown should succeed");
+    }
+
+    /// The real `ServerSpawnConfig` for typescript-language-server this test module spawns
+    /// against - a self-contained test-local copy (not a cross-crate dependency on the `app`
+    /// crate's `crate::language` registry, mirroring [`rust_analyzer_config`]'s own reasoning).
+    fn typescript_language_server_config() -> ServerSpawnConfig {
+        ServerSpawnConfig {
+            name: "typescript-language-server",
+            binary: "typescript-language-server",
+            args: vec!["--stdio".to_string()],
+            initialization_options: None,
+            workspace_configuration: default_workspace_configuration,
+        }
+    }
+
+    /// Writes a minimal real TypeScript project (`tsconfig.json` plus a `.ts` file) to a fresh
+    /// tempdir, then does a real, live `npm install typescript@5` into it.
+    ///
+    /// This step is not optional/conservative - it was discovered live, while building this
+    /// integration, to be genuinely required in this exact sandbox: `typescript-language-server`
+    /// has no bundled TypeScript of its own and refuses to `initialize` at all ("Could not find a
+    /// valid TypeScript installation") without a real, discoverable one, and this sandbox's own
+    /// *global* `typescript` install happens to be pinned to the new native Go-based rewrite
+    /// (`7.x`, `tsc`-only, no classic `lib/tsserver.js`), which does not satisfy that requirement
+    /// either - confirmed by a live probe against it before writing this helper. A real,
+    /// project-local classic `typescript@5` install is the one thing that reliably works.
+    fn write_scratch_ts_project(main_ts: &str) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            "{\"compilerOptions\": {\"strict\": true, \"target\": \"ES2020\"}}\n",
+        )
+        .expect("write tsconfig.json");
+        std::fs::write(dir.path().join("main.ts"), main_ts).expect("write main.ts");
+        let status = std::process::Command::new("npm")
+            .args([
+                "install",
+                "typescript@5",
+                "--no-audit",
+                "--no-fund",
+                "--silent",
+            ])
+            .current_dir(dir.path())
+            .status()
+            .expect("npm should be on PATH in this sandbox (real, live network install)");
+        assert!(
+            status.success(),
+            "npm install typescript@5 into the scratch project failed"
+        );
+        dir
+    }
+
+    /// The real, practical end-to-end proof for TypeScript (mirrors
+    /// [`rust_analyzer_reports_a_real_diagnostic_for_a_real_type_error`] above exactly): a real
+    /// `typescript-language-server`, spawned via the same generalized [`LspClient::spawn`] every
+    /// other language now shares, against a real scratch project with a genuine
+    /// `const bad: number = "not a number";` type mismatch, performs a real handshake, receives
+    /// a real `didOpen` tagged with the real `"typescript"` language id, and asynchronously
+    /// pushes back a real `textDocument/publishDiagnostics` referencing the introduced mismatch.
+    #[test]
+    fn typescript_language_server_reports_a_real_diagnostic_for_a_real_type_error() {
+        let project =
+            write_scratch_ts_project("const bad: number = \"not a number\";\nconsole.log(bad);\n");
+        let main_ts = project.path().join("main.ts");
+        let source = std::fs::read_to_string(&main_ts).expect("read fixture source");
+
+        let mut client = LspClient::spawn(project.path(), typescript_language_server_config())
+            .expect("spawning + initializing typescript-language-server should succeed");
+        client
+            .did_open(&main_ts, source, 1, "typescript")
+            .expect("didOpen should send successfully");
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let has_real_diagnostics = client
+                .diagnostics_for(&main_ts)
+                .is_some_and(|diagnostics| !diagnostics.is_empty());
+            if has_real_diagnostics {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "typescript-language-server never published a non-empty diagnostics set for \
+                 the fixture file within 120s"
+            );
+            match client.wait_for_update(remaining.min(Duration::from_secs(5))) {
+                ClientUpdate::Updated | ClientUpdate::Timeout => continue,
+                ClientUpdate::Closed => {
+                    panic!(
+                        "typescript-language-server's connection closed before publishing any \
+                         diagnostics"
+                    )
+                }
+            }
+        }
+
+        let diagnostics = client.diagnostics_for(&main_ts).expect(
+            "a diagnostics result should be present - the loop above only exits once one is",
+        );
+        let mismatch = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.to_lowercase().contains("not assignable"));
+        assert!(
+            mismatch.is_some(),
+            "expected a diagnostic referencing the real type mismatch, got: {diagnostics:#?}"
+        );
+
+        client.shutdown().expect("shutdown should succeed");
+    }
+
+    /// A real end-to-end proof of hover for TypeScript, mirroring
+    /// [`rust_analyzer_returns_a_real_hover_for_a_documented_function`] above.
+    #[test]
+    fn typescript_language_server_returns_a_real_hover_for_a_documented_function() {
+        let project = write_scratch_ts_project(
+            "/**\n * Adds one to the given number.\n */\nfunction addOne(x: number): number \
+             {\n  return x + 1;\n}\nconst result = addOne(41);\n",
+        );
+        let main_ts = project.path().join("main.ts");
+        let source = std::fs::read_to_string(&main_ts).expect("read fixture source");
+
+        let mut client = LspClient::spawn(project.path(), typescript_language_server_config())
+            .expect("spawning + initializing typescript-language-server should succeed");
+        client
+            .did_open(&main_ts, source, 1, "typescript")
+            .expect("didOpen should send successfully");
+
+        let uri = path_to_uri(&main_ts).expect("real file:// URI for the fixture file");
+        // Line 6 (0-based) is `const result = addOne(41);`; `"const result = "` is 15 real
+        // ASCII bytes, so character 17 lands inside the real `addOne` call-site identifier.
+        let params = lsp_types::HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: lsp_types::Position {
+                    line: 6,
+                    character: 17,
+                },
+            },
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let hover = loop {
+            match client.request::<lsp_types::request::HoverRequest>(
+                params.clone(),
+                Duration::from_secs(10),
+            ) {
+                Ok(Some(hover)) => break hover,
+                Ok(None) | Err(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "typescript-language-server never returned a real hover for the \
+                         fixture's call site within 120s"
+                    );
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+        };
+
+        let lsp_types::HoverContents::Markup(markup) = &hover.contents else {
+            panic!("expected a real Markup hover response, got: {hover:#?}");
+        };
+        // Real, observed-while-building-this-integration behavior, pinned here rather than just
+        // narrated: even though this client's `ClientCapabilities` now requests `PlainText` as
+        // the preferred `content_format` (see `LspClient::initialize`'s docs),
+        // typescript-language-server was directly observed to still send `Markdown` regardless -
+        // exactly the real "not every server honors that preference" case
+        // `crate::hover_view`'s Markdown-degrade fallback (in the `app` crate) exists for. The
+        // real, observed shape (captured verbatim while building this test):
+        // `"\n```typescript\nfunction addOne(x: number): number\n```\nAdds one to the given \
+        // number."`
+        assert_eq!(
+            markup.kind,
+            lsp_types::MarkupKind::Markdown,
+            "if typescript-language-server ever starts honoring the PlainText preference this \
+             would be real, welcome news - but `crate::hover_view`'s Markdown-degrade fallback \
+             was verified against real Markdown output, so a silent switch to PlainText deserves \
+             a human look before trusting the fallback is still exercised for real"
+        );
+        assert!(
+            markup.value.contains("addOne"),
+            "expected the real hover text to mention the real function name, got: {:?}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("number"),
+            "expected the real hover text to mention the function's real `number` signature \
+             type, got: {:?}",
+            markup.value
+        );
+
+        client.shutdown().expect("shutdown should succeed");
+    }
+
+    /// The real `ServerSpawnConfig` for pyright-langserver this test module spawns against -
+    /// mirrors `crate::language`'s Pyright entry in the `app` crate (a self-contained test-local
+    /// copy, same reasoning as [`typescript_language_server_config`]).
+    fn pyright_config() -> ServerSpawnConfig {
+        fn workspace_configuration(section: Option<&str>) -> serde_json::Value {
+            let analysis = serde_json::json!({
+                "autoSearchPaths": true,
+                "useLibraryCodeForTypes": true,
+                "diagnosticMode": "openFilesOnly",
+            });
+            match section {
+                Some("python") => serde_json::json!({ "analysis": analysis }),
+                Some("python.analysis") => analysis,
+                _ => serde_json::Value::Object(serde_json::Map::new()),
+            }
+        }
+        ServerSpawnConfig {
+            name: "pyright-langserver",
+            binary: "pyright-langserver",
+            args: vec!["--stdio".to_string()],
+            initialization_options: Some(serde_json::json!({
+                "python": {
+                    "analysis": {
+                        "autoSearchPaths": true,
+                        "useLibraryCodeForTypes": true,
+                        "diagnosticMode": "openFilesOnly",
+                    }
+                }
+            })),
+            workspace_configuration,
+        }
+    }
+
+    fn write_scratch_py_project(main_py: &str) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("main.py"), main_py).expect("write main.py");
+        dir
+    }
+
+    /// The real, practical end-to-end proof for Python: a real `pyright-langserver`, spawned
+    /// with the real, non-`null` `initializationOptions`/`workspace/configuration` answers this
+    /// generalization added specifically because Pyright (unlike rust-analyzer/
+    /// typescript-language-server) needs them to behave well, against a real scratch file with a
+    /// genuine `x: int = "not a number"` type error, performs a real handshake, receives a real
+    /// `didOpen` tagged `"python"`, and asynchronously pushes back a real diagnostic.
+    #[test]
+    fn pyright_reports_a_real_diagnostic_for_a_real_type_error() {
+        let project = write_scratch_py_project(
+            "def add_one(x: int) -> int:\n    return x + 1\n\nbad: int = \"not a number\"\n",
+        );
+        let main_py = project.path().join("main.py");
+        let source = std::fs::read_to_string(&main_py).expect("read fixture source");
+
+        let mut client = LspClient::spawn(project.path(), pyright_config())
+            .expect("spawning + initializing pyright-langserver should succeed");
+        client
+            .did_open(&main_py, source, 1, "python")
+            .expect("didOpen should send successfully");
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let has_real_diagnostics = client
+                .diagnostics_for(&main_py)
+                .is_some_and(|diagnostics| !diagnostics.is_empty());
+            if has_real_diagnostics {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "pyright-langserver never published a non-empty diagnostics set for the \
+                 fixture file within 120s"
+            );
+            match client.wait_for_update(remaining.min(Duration::from_secs(5))) {
+                ClientUpdate::Updated | ClientUpdate::Timeout => continue,
+                ClientUpdate::Closed => {
+                    panic!(
+                        "pyright-langserver's connection closed before publishing any diagnostics"
+                    )
+                }
+            }
+        }
+
+        let diagnostics = client.diagnostics_for(&main_py).expect(
+            "a diagnostics result should be present - the loop above only exits once one is",
+        );
+        // Real, observed-while-building-this-test Pyright message shape: it names the literal's
+        // own real inferred type (`Literal['not a number']`), not a bare `str` - so this checks
+        // for the real, distinguishing "not assignable ... int" wording actually seen, not a
+        // guessed-at "str" substring.
+        let mismatch = diagnostics.iter().find(|diagnostic| {
+            let message = diagnostic.message.to_lowercase();
+            message.contains("not assignable") && message.contains("int")
+        });
+        assert!(
+            mismatch.is_some(),
+            "expected a diagnostic referencing the real type mismatch, got: {diagnostics:#?}"
+        );
+
+        client.shutdown().expect("shutdown should succeed");
+    }
+
+    /// A real end-to-end proof of hover for Python, mirroring the TypeScript/rust-analyzer
+    /// hover tests above.
+    #[test]
+    fn pyright_returns_a_real_hover_for_a_documented_function() {
+        let project = write_scratch_py_project(
+            "def add_one(x: int) -> int:\n    \"\"\"Adds one to the given number.\"\"\"\n    \
+             return x + 1\n\n\nresult = add_one(41)\n",
+        );
+        let main_py = project.path().join("main.py");
+        let source = std::fs::read_to_string(&main_py).expect("read fixture source");
+
+        let mut client = LspClient::spawn(project.path(), pyright_config())
+            .expect("spawning + initializing pyright-langserver should succeed");
+        client
+            .did_open(&main_py, source, 1, "python")
+            .expect("didOpen should send successfully");
+
+        let uri = path_to_uri(&main_py).expect("real file:// URI for the fixture file");
+        // Line 5 (0-based) is `result = add_one(41)`; `"result = "` is 9 real ASCII bytes, so
+        // character 11 lands inside the real `add_one` call-site identifier.
+        let params = lsp_types::HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: lsp_types::Position {
+                    line: 5,
+                    character: 11,
+                },
+            },
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let hover = loop {
+            match client.request::<lsp_types::request::HoverRequest>(
+                params.clone(),
+                Duration::from_secs(10),
+            ) {
+                Ok(Some(hover)) => break hover,
+                Ok(None) | Err(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "pyright-langserver never returned a real hover for the fixture's call \
+                         site within 120s"
+                    );
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+        };
+
+        let lsp_types::HoverContents::Markup(markup) = &hover.contents else {
+            panic!("expected a real Markup hover response, got: {hover:#?}");
+        };
+        // Real, observed-while-building-this-test shape: `"(function) def add_one(x: int) -> \
+        // int\n\nAdds one to the given number."` - unlike typescript-language-server, Pyright
+        // was directly observed honoring the `PlainText` preference this client requests.
+        assert_eq!(
+            markup.kind,
+            lsp_types::MarkupKind::PlainText,
+            "Pyright was observed honoring the PlainText content_format preference for real - a \
+             switch to Markdown deserves a human look, same reasoning as the TypeScript hover \
+             test's own pinned assertion"
+        );
+        assert!(
+            markup.value.contains("add_one"),
+            "expected the real hover text to mention the real function name, got: {:?}",
+            markup.value
         );
 
         client.shutdown().expect("shutdown should succeed");
@@ -1033,10 +1654,10 @@ mod tests {
         let main_rs = project.path().join("src").join("main.rs");
         let source = std::fs::read_to_string(&main_rs).expect("read fixture source");
 
-        let mut client = LspClient::spawn(project.path())
+        let mut client = LspClient::spawn(project.path(), rust_analyzer_config())
             .expect("spawning + initializing rust-analyzer should succeed");
         client
-            .did_open(&main_rs, source, 1)
+            .did_open(&main_rs, source, 1, "rust")
             .expect("didOpen should send successfully");
 
         let uri = path_to_uri(&main_rs).expect("real file:// URI for the fixture file");
@@ -1112,10 +1733,10 @@ mod tests {
         let main_rs = project.path().join("src").join("main.rs");
         let source = std::fs::read_to_string(&main_rs).expect("read fixture source");
 
-        let mut client = LspClient::spawn(project.path())
+        let mut client = LspClient::spawn(project.path(), rust_analyzer_config())
             .expect("spawning + initializing rust-analyzer should succeed");
         client
-            .did_open(&main_rs, source, 1)
+            .did_open(&main_rs, source, 1, "rust")
             .expect("didOpen should send successfully");
 
         let uri = path_to_uri(&main_rs).expect("real file:// URI for the fixture file");

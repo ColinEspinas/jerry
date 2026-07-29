@@ -2,9 +2,16 @@ use super::*;
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
 
+/// [`AdeApp::lsp_clients`]' real key: a repository root paired with the real server binary
+/// running for it - see that field's own docs for why a bare `PathBuf` was widened to this
+/// (Revision R8) once more than one language could have a live client under the same root.
+pub(super) type LspClientKey = (PathBuf, &'static str);
+
 impl AdeApp {
-    /// Tears down every [`Self::lsp_clients`] entry whose key is not `active_root` - see that
-    /// field's own docs for the kill-on-switch-not-LRU choice. Also drops
+    /// Tears down every [`Self::lsp_clients`] entry whose *root* is not `active_root` - every
+    /// language's client for the old root, not just one (see this field's own docs and
+    /// `lsp_client_eviction_tests::switching_worktrees_evicts_every_language_client_for_the_old_root_not_just_one`
+    /// for the regression coverage this widened key needed). Also drops
     /// [`Self::lsp_opened_files`] entries for files under an evicted root, so a future
     /// [`Self::dispatch_did_open`] against a freshly-respawned client for that root won't
     /// wrongly believe the file is already open and skip sending `didOpen`.
@@ -23,27 +30,31 @@ impl AdeApp {
     /// happens in the rare case a clone outlives the switch, and "process gets `SIGKILL`ed
     /// instead of asked nicely" is an acceptable trade-off for never blocking the UI.
     pub(super) fn evict_stale_lsp_clients(&mut self, active_root: &Path, cx: &mut Context<Self>) {
-        let stale_roots = stale_lsp_client_roots(
+        let stale_keys = stale_lsp_client_keys(
             &self.lsp_clients.keys().cloned().collect::<Vec<_>>(),
             active_root,
         );
-        if stale_roots.is_empty() {
+        if stale_keys.is_empty() {
             return;
         }
 
-        for root in stale_roots {
-            self.lsp_opened_files
-                .retain(|path| !path.starts_with(&root));
+        let stale_roots: HashSet<PathBuf> =
+            stale_keys.iter().map(|(root, _)| root.clone()).collect();
+        for root in &stale_roots {
+            self.lsp_opened_files.retain(|path| !path.starts_with(root));
+        }
 
-            let Some(state) = self.lsp_clients.remove(&root) else {
+        for key in stale_keys {
+            let Some(state) = self.lsp_clients.remove(&key) else {
                 continue;
             };
             if let LspClientState::Ready(client) = state {
+                let server_name = client.name();
                 let task = cx.background_executor().spawn(async move {
                     match std::sync::Arc::try_unwrap(client) {
                         Ok(mut client) => {
                             if let Err(err) = client.shutdown() {
-                                log::warn!("failed to shut down rust-analyzer: {err}");
+                                log::warn!("failed to shut down {server_name}: {err}");
                             }
                         }
                         Err(client) => {
@@ -58,23 +69,46 @@ impl AdeApp {
             }
             // `Spawning`/`Failed` states hold no process to tear down. A `Spawning` one whose
             // background task is still in-flight will, once it resolves, re-insert an entry
-            // under `root` even though it's no longer active - harmless: the next eviction pass
+            // under `key` even though it's no longer active - harmless: the next eviction pass
             // catches it same as any other stale entry.
         }
     }
 
-    /// Lazily spawns (or reuses) an `lsp_core::LspClient` for `repo_root` - a no-op if a client
-    /// for this exact root already exists in any state (a previous failure is not retried on
-    /// every render; this is only called once per root per [`Self::render_file_view`] pass). The
-    /// `LspClient::spawn` call (process spawn plus the full `initialize`/`initialized`
-    /// handshake) runs on `cx.background_executor()`, mirroring [`Self::spawn_file_load`]'s
-    /// shape, since it's blocking I/O that must never run on the GPUI foreground thread.
-    pub(super) fn ensure_lsp_client(&mut self, repo_root: PathBuf, cx: &mut Context<Self>) {
-        if self.lsp_clients.contains_key(&repo_root) {
+    /// Lazily spawns (or reuses) an `lsp_core::LspClient` for `repo_root` running the server for
+    /// `extension` - a no-op if a client for this exact `(repo_root, binary)` key already exists
+    /// in any state (a previous failure is not retried on every render; this is only called once
+    /// per key per [`Self::render_file_view`] pass), or if `extension` has no real LSP identity
+    /// at all.
+    ///
+    /// ## Why `extension`, not an already-built `ServerSpawnConfig`
+    ///
+    /// This used to take a real `lsp_core::ServerSpawnConfig` built by the caller - which meant
+    /// [`Self::render_file_view`] had to call `crate::language::server_spawn_config` (and, for
+    /// Python, its real `$PATH` probing via `pyright_initialization_options`) on *every single
+    /// repaint*, just to find out whether a spawn was even needed, before this method's own
+    /// early-return on an already-present key ever got a chance to short-circuit that work. Now
+    /// only a cheap, static [`crate::language::lsp_binary_for_extension`] lookup happens on the
+    /// caller's (render) side; the real, possibly-expensive `ServerSpawnConfig` is built here,
+    /// inside the `cx.background_executor()` task, and only once this method has confirmed a
+    /// fresh spawn genuinely needs to happen - never on the GPUI foreground thread. `extension`
+    /// must be the registry's own canonical `&'static str` (e.g. from
+    /// `crate::language::entry_for_extension(..).map(|entry| entry.extension)`), not an arbitrary
+    /// borrowed slice off a `Path`, since it has to move into a `'static` background task.
+    pub(super) fn ensure_lsp_client(
+        &mut self,
+        repo_root: PathBuf,
+        extension: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(binary) = crate::language::lsp_binary_for_extension(extension) else {
+            return;
+        };
+        let key: LspClientKey = (repo_root.clone(), binary);
+        if self.lsp_clients.contains_key(&key) {
             return;
         }
         self.lsp_clients
-            .insert(repo_root.clone(), LspClientState::Spawning);
+            .insert(key.clone(), LspClientState::Spawning);
         cx.notify();
 
         let task = cx.spawn(async move |this, cx| {
@@ -82,21 +116,32 @@ impl AdeApp {
                 .background_executor()
                 .spawn({
                     let repo_root = repo_root.clone();
-                    async move { lsp_core::LspClient::spawn(&repo_root) }
+                    async move {
+                        // The real `ServerSpawnConfig` (including any `$PATH` probing it does,
+                        // e.g. Pyright's `pythonPath` resolution) is built here, off the GPUI
+                        // thread - see this method's own docs for why that moved from the caller.
+                        match crate::language::server_spawn_config(extension) {
+                            Some(config) => lsp_core::LspClient::spawn(&repo_root, config)
+                                .map_err(|err| err.to_string()),
+                            None => Err(format!(
+                                "no LSP server is configured for extension {extension:?}"
+                            )),
+                        }
+                    }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(client) => {
                         this.lsp_clients.insert(
-                            repo_root.clone(),
+                            key.clone(),
                             LspClientState::Ready(std::sync::Arc::new(client)),
                         );
                         this.ensure_lsp_poll_task(cx);
                     }
                     Err(error) => {
                         this.lsp_clients
-                            .insert(repo_root.clone(), LspClientState::Failed(error.to_string()));
+                            .insert(key.clone(), LspClientState::Failed(error));
                     }
                 }
                 cx.notify();
@@ -105,11 +150,33 @@ impl AdeApp {
         self._lsp_tasks.push(task);
     }
 
-    /// Sends a `textDocument/didOpen` for `path`, once per real path (see
-    /// [`Self::lsp_opened_files`]'s docs). The file content is read fresh here (separate from
-    /// [`Self::file_view_cache`]'s own cached parse; this only happens once per file open, not
-    /// per render). Runs on `cx.background_executor()` since both the file read and the write to
-    /// rust-analyzer's stdin are blocking I/O.
+    /// The already-`Ready` client for `path`'s own language, if any - looks up
+    /// `crate::language::lsp_binary_for_extension` off `path`'s extension to find the real
+    /// [`LspClientKey`] second half, so a hover/go-to-definition request against a `.ts` file
+    /// reaches the real typescript-language-server client rather than assuming Rust (this app's
+    /// only supported language before Revision R8). `None` for an extension with no LSP identity
+    /// at all (`.vue`/`.go`/anything unrecognized) or one whose client isn't `Ready` yet.
+    pub(super) fn lsp_client_for_path(
+        &self,
+        path: &Path,
+    ) -> Option<std::sync::Arc<lsp_core::LspClient>> {
+        let extension = path.extension().and_then(|ext| ext.to_str());
+        let binary = crate::language::lsp_binary_for_extension(extension)?;
+        match self
+            .lsp_clients
+            .get(&(self.file_tree_root.clone(), binary))?
+        {
+            LspClientState::Ready(client) => Some(client.clone()),
+            _ => None,
+        }
+    }
+
+    /// Sends a `textDocument/didOpen` for `path` tagged with `language_id` (see
+    /// `lsp_core::LspClient::did_open`'s own docs on why this varies per extension, not just per
+    /// server), once per real path (see [`Self::lsp_opened_files`]'s docs). The file content is
+    /// read fresh here (separate from [`Self::file_view_cache`]'s own cached parse; this only
+    /// happens once per file open, not per render). Runs on `cx.background_executor()` since
+    /// both the file read and the write to the server's stdin are blocking I/O.
     ///
     /// ## Judgment call: no `textDocument/didClose` is ever sent
     ///
@@ -126,6 +193,7 @@ impl AdeApp {
         &mut self,
         client: std::sync::Arc<lsp_core::LspClient>,
         path: PathBuf,
+        language_id: &'static str,
         cx: &mut Context<Self>,
     ) {
         if self.lsp_opened_files.contains(&path) {
@@ -138,8 +206,12 @@ impl AdeApp {
                 .spawn(async move {
                     match std::fs::read_to_string(&path) {
                         Ok(text) => {
-                            if let Err(err) = client.did_open(&path, text, 1) {
-                                log::warn!("failed to send didOpen for {}: {err}", path.display());
+                            if let Err(err) = client.did_open(&path, text, 1, language_id) {
+                                log::warn!(
+                                    "failed to send didOpen for {} to {}: {err}",
+                                    path.display(),
+                                    client.name()
+                                );
                             }
                         }
                         Err(err) => {
@@ -210,27 +282,28 @@ pub(super) enum LspClientState {
     Failed(String),
 }
 
-/// Which of `existing_roots` should be evicted once `active_root` becomes the newly active
-/// worktree root: every one of them that isn't `active_root` itself. Kept gpui-free/pure so the
-/// "which keys get removed" bookkeeping is unit-testable without a real `lsp_core::LspClient`,
-/// which can only be constructed by genuinely spawning `rust-analyzer`.
-pub(super) fn stale_lsp_client_roots(
-    existing_roots: &[PathBuf],
+/// Which of `existing_keys` should be evicted once `active_root` becomes the newly active
+/// worktree root: every key whose *root* half isn't `active_root`, regardless of which server
+/// binary the other half names - so every language's client for an old root is caught, not just
+/// one. Kept gpui-free/pure so the "which keys get removed" bookkeeping is unit-testable without
+/// a real `lsp_core::LspClient`, which can only be constructed by genuinely spawning a server.
+pub(super) fn stale_lsp_client_keys(
+    existing_keys: &[LspClientKey],
     active_root: &Path,
-) -> Vec<PathBuf> {
-    existing_roots
+) -> Vec<LspClientKey> {
+    existing_keys
         .iter()
-        .filter(|root| root.as_path() != active_root)
+        .filter(|(root, _)| root.as_path() != active_root)
         .cloned()
         .collect()
 }
 
-/// The `rust-analyzer` status this window's status bar shows for a `.rs` file. Every variant
-/// corresponds to a real, distinguishable server state (see [`LspClientState`]'s own docs);
-/// there is no variant that fabricates progress this app can't actually observe (rust-analyzer's
-/// real `$/progress` payloads carry a crate count, but this phase doesn't track `$/progress` at
-/// all, so [`LspFileStatus::Indexing`]'s coarser "no publishDiagnostics yet" signal is used
-/// instead).
+/// The language server status this window's status bar shows for the currently open file.
+/// Every variant corresponds to a real, distinguishable server state (see [`LspClientState`]'s
+/// own docs); there is no variant that fabricates progress this app can't actually observe (a
+/// server's real `$/progress` payloads carry richer detail, but this phase doesn't track
+/// `$/progress` at all, so [`LspFileStatus::Indexing`]'s coarser "no publishDiagnostics yet"
+/// signal is used instead).
 pub(super) enum LspFileStatus {
     Spawning,
     Failed(String),
@@ -310,21 +383,50 @@ mod lsp_client_eviction_tests {
     }
 
     #[test]
-    fn stale_lsp_client_roots_keeps_only_the_active_root() {
-        let roots = vec![
-            PathBuf::from("/a"),
-            PathBuf::from("/b"),
-            PathBuf::from("/c"),
+    fn stale_lsp_client_keys_keeps_only_the_active_root() {
+        let keys = vec![
+            (PathBuf::from("/a"), "rust-analyzer"),
+            (PathBuf::from("/b"), "rust-analyzer"),
+            (PathBuf::from("/c"), "rust-analyzer"),
         ];
-        let stale = stale_lsp_client_roots(&roots, Path::new("/b"));
-        assert_eq!(stale, vec![PathBuf::from("/a"), PathBuf::from("/c")]);
+        let stale = stale_lsp_client_keys(&keys, Path::new("/b"));
+        assert_eq!(
+            stale,
+            vec![
+                (PathBuf::from("/a"), "rust-analyzer"),
+                (PathBuf::from("/c"), "rust-analyzer"),
+            ]
+        );
     }
 
     #[test]
-    fn stale_lsp_client_roots_is_empty_when_the_active_root_is_the_only_one() {
-        let roots = vec![PathBuf::from("/a")];
-        let stale = stale_lsp_client_roots(&roots, Path::new("/a"));
+    fn stale_lsp_client_keys_is_empty_when_the_active_root_is_the_only_one() {
+        let keys = vec![(PathBuf::from("/a"), "rust-analyzer")];
+        let stale = stale_lsp_client_keys(&keys, Path::new("/a"));
         assert!(stale.is_empty());
+    }
+
+    /// The real regression test the widened `(PathBuf, &'static str)` key needed (see
+    /// `AdeApp::lsp_clients`'s own docs): every *language's* client for an evicted root must be
+    /// torn down on a worktree switch, not just whichever one happened to be first in the map -
+    /// seeds two entries (standing in for a Rust file and a TypeScript file both having been
+    /// opened under the same old worktree) and confirms both are gone after switching away.
+    #[test]
+    fn stale_lsp_client_keys_catches_every_binary_under_an_evicted_root_not_just_one() {
+        let keys = vec![
+            (PathBuf::from("/old"), "rust-analyzer"),
+            (PathBuf::from("/old"), "typescript-language-server"),
+            (PathBuf::from("/new"), "rust-analyzer"),
+        ];
+        let stale = stale_lsp_client_keys(&keys, Path::new("/new"));
+        assert_eq!(
+            stale,
+            vec![
+                (PathBuf::from("/old"), "rust-analyzer"),
+                (PathBuf::from("/old"), "typescript-language-server"),
+            ],
+            "both of the old root's language clients should be caught, not just one"
+        );
     }
 
     /// The end-to-end proof at the `AdeApp` level: browsing several worktrees, each with an
@@ -359,7 +461,7 @@ mod lsp_client_eviction_tests {
                 // process needed to prove the eviction bookkeeping.
                 let root = app.file_tree_root.clone();
                 app.lsp_clients
-                    .insert(root.clone(), LspClientState::Spawning);
+                    .insert((root.clone(), "rust-analyzer"), LspClientState::Spawning);
                 app.lsp_opened_files.insert(root.join("src/main.rs"));
             });
             cx.run_until_parked();
@@ -374,7 +476,8 @@ mod lsp_client_eviction_tests {
                 );
                 let root = &app.file_tree_root;
                 assert!(
-                    app.lsp_clients.contains_key(root),
+                    app.lsp_clients
+                        .contains_key(&(root.clone(), "rust-analyzer")),
                     "the surviving entry should be the newly active root's own"
                 );
                 assert!(
@@ -390,7 +493,8 @@ mod lsp_client_eviction_tests {
         app.update(cx, |app, cx| {
             app.select_worktree(0, cx);
             let root = app.file_tree_root.clone();
-            app.lsp_clients.insert(root, LspClientState::Spawning);
+            app.lsp_clients
+                .insert((root, "rust-analyzer"), LspClientState::Spawning);
         });
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
@@ -398,6 +502,70 @@ mod lsp_client_eviction_tests {
                 app.lsp_clients.len(),
                 1,
                 "revisiting an already-seen worktree must still evict the one just left"
+            );
+        });
+    }
+
+    /// The `AdeApp`-level proof (not just the pure `stale_lsp_client_keys` helper above) that a
+    /// worktree switch tears down **every** language's client for the old root - seeds both a
+    /// `rust-analyzer` and a `typescript-language-server` entry under the same old worktree
+    /// (standing in for a `.rs` and a `.ts` file both having been opened there, the exact real
+    /// scenario the widened `(PathBuf, &'static str)` key exists to support) and confirms both
+    /// are gone, and only the new root's entry remains, after switching.
+    #[gpui::test]
+    fn a_worktree_switch_evicts_every_language_client_for_the_old_root_not_just_one(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let worktree_old = tempfile::tempdir().expect("tempdir old");
+        let worktree_new = tempfile::tempdir().expect("tempdir new");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![
+                worktree_item(worktree_old.path().to_path_buf()),
+                worktree_item(worktree_new.path().to_path_buf()),
+            ];
+        });
+
+        app.update(cx, |app, cx| {
+            app.select_worktree(0, cx);
+            let root = app.file_tree_root.clone();
+            app.lsp_clients
+                .insert((root.clone(), "rust-analyzer"), LspClientState::Spawning);
+            app.lsp_clients.insert(
+                (root.clone(), "typescript-language-server"),
+                LspClientState::Spawning,
+            );
+            app.lsp_opened_files.insert(root.join("src/main.rs"));
+            app.lsp_opened_files.insert(root.join("web/app.ts"));
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.lsp_clients.len(),
+                2,
+                "both language clients should exist before the switch away"
+            );
+        });
+
+        app.update(cx, |app, cx| {
+            app.select_worktree(1, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.lsp_clients.len(),
+                0,
+                "both of the old root's language clients should be evicted, not just the first \
+                 one found - got: {:?}",
+                app.lsp_clients.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                app.lsp_opened_files.is_empty(),
+                "lsp_opened_files should have no entries left under the evicted old root"
             );
         });
     }
@@ -460,8 +628,10 @@ mod lsp_diagnostics_wiring_tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "no real diagnostic reached AdeApp::file_view_diagnostics within the real \
-                 180s deadline"
+                "no real diagnostic reached AdeApp::file_view_diagnostics within the caller's \
+                 real deadline (this helper is shared by callers with different real timeouts - \
+                 180s for rust-analyzer, 120s for typescript-language-server - so the message \
+                 deliberately doesn't hardcode either one)"
             );
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -567,6 +737,82 @@ mod lsp_diagnostics_wiring_tests {
                 1,
                 "opening a second Rust file under the same repo root must reuse the existing \
                  lsp_clients entry, not spawn a second one"
+            );
+        });
+    }
+
+    /// The real end-to-end proof that Revision R8's generalization actually reaches
+    /// `AdeApp`, not just `lsp_core` directly (that already-thorough proof lives in
+    /// `lsp_core::client::tests::typescript_language_server_reports_a_real_diagnostic_for_a_real_type_error`)
+    /// - the same `AdeApp::open_file_view` -> `render_center_pane` (-> the old `is_rust` gate,
+    /// now `crate::language::server_spawn_config`) -> `ensure_lsp_client` -> `dispatch_did_open`
+    /// path the Rust test above exercises, but for a real `.ts` file, proving the extension-based
+    /// dispatch that replaced the old boolean gate genuinely reaches a non-Rust language too.
+    #[gpui::test]
+    fn a_real_typescript_diagnostic_reaches_file_view_diagnostics_through_the_real_app_code_path(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            "{\"compilerOptions\": {\"strict\": true, \"target\": \"ES2020\"}}\n",
+        )
+        .expect("write tsconfig.json");
+        let main_ts = dir.path().join("main.ts");
+        std::fs::write(
+            &main_ts,
+            "const bad: number = \"not a number\";\nconsole.log(bad);\n",
+        )
+        .expect("write main.ts");
+        // See `lsp_core::client::tests::write_scratch_ts_project`'s own docs for why a real,
+        // project-local `npm install typescript@5` is genuinely required in this sandbox, not
+        // just conservative.
+        let status = std::process::Command::new("npm")
+            .args([
+                "install",
+                "typescript@5",
+                "--no-audit",
+                "--no-fund",
+                "--silent",
+            ])
+            .current_dir(dir.path())
+            .status()
+            .expect("npm should be on PATH in this sandbox (real, live network install)");
+        assert!(status.success(), "npm install typescript@5 failed");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, dir.path().to_path_buf());
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(main_ts.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        wait_for_real_diagnostics(&app, cx, deadline);
+
+        app.read_with(cx, |app, _| {
+            let all_diagnostics: Vec<&diagnostics_view::LineDiagnostic> =
+                app.file_view_diagnostics.values().flatten().collect();
+            let mismatch = all_diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.message.to_lowercase().contains("not assignable"));
+            assert!(
+                mismatch.is_some(),
+                "expected a real diagnostic referencing the genuine TypeScript type mismatch, \
+                 got: {all_diagnostics:#?}"
+            );
+
+            assert_eq!(
+                app.lsp_clients.len(),
+                1,
+                "exactly one real lsp_clients entry should exist, keyed by \
+                 (repo_root, \"typescript-language-server\") - the widened key from a bare root"
+            );
+            assert!(
+                app.lsp_clients
+                    .contains_key(&(dir.path().to_path_buf(), "typescript-language-server")),
+                "the real entry should be keyed by the real typescript-language-server binary, \
+                 not left over from some other server"
             );
         });
     }

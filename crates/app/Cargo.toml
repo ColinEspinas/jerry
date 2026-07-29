@@ -45,6 +45,18 @@ alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev 
 # vendor/zed's own `Cargo.lock` exactly), so it's left as a normal caret requirement.
 tree-sitter = "=0.26.9"
 tree-sitter-rust = "0.24.2"
+# Real TypeScript/TSX and Python syntax highlighting (`crate::code_view::highlight_typescript`/
+# `highlight_python`), following `highlight_rust`'s exact parse-then-walk shape - see this
+# crate's own `crate::code_view` module docs. Pinned to the exact version numbers
+# `vendor/zed/Cargo.lock` itself resolves (`tree-sitter-python = "0.25.0"`,
+# `tree-sitter-typescript = "0.23.2"`, verified directly against that lockfile), but sourced
+# from real crates.io rather than `vendor/zed`'s own git fork of `tree-sitter-typescript`
+# (`git+https://github.com/zed-industries/tree-sitter-typescript?rev=e2c53597...`) - the exact
+# same "real crates.io package, not zed's fork" call this crate's `lsp-core` dependency already
+# made for `lsp-types`, and crates.io happens to carry the identical `0.23.2` version number zed
+# verified against, so there's no functional gap from not using their fork.
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.25.0"
 # Real `~/.config/jerry/settings.toml` load/save (`crate::settings_store`) - see the workspace
 # `Cargo.toml`'s own comment for why these three are pinned the way they are.
 serde = { workspace = true }

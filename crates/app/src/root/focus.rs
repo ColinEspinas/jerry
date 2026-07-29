@@ -1000,8 +1000,9 @@ mod settings_focus_tests {
         cx.run_until_parked();
 
         let rows = app.read_with(cx, |app, _| app.lsp_rows.clone());
-        assert_eq!(rows.len(), settings::LSP_LANGUAGES.len());
-        for def in settings::LSP_LANGUAGES {
+        let languages = settings::lsp_languages();
+        assert_eq!(rows.len(), languages.len());
+        for def in languages {
             assert!(rows.iter().any(|row| row.language == def.language));
         }
     }

@@ -372,10 +372,9 @@ impl AdeApp {
             return;
         }
 
-        let Some(LspClientState::Ready(client)) =
-            self.lsp_clients.get(&self.file_tree_root).cloned()
-        else {
-            // No ready LSP client for this root yet; nothing to show, so clear any stale entry.
+        let Some(client) = self.lsp_client_for_path(&absolute_path) else {
+            // No ready LSP client for this file's language yet; nothing to show, so clear any
+            // stale entry.
             self.hover = None;
             cx.notify();
             return;
@@ -455,9 +454,7 @@ impl AdeApp {
         let path = hover.path.clone();
         let position = hover.position;
 
-        let Some(LspClientState::Ready(client)) =
-            self.lsp_clients.get(&self.file_tree_root).cloned()
-        else {
+        let Some(client) = self.lsp_client_for_path(&path) else {
             return;
         };
         let Ok(uri) = lsp_core::LspClient::uri_for_path(&path) else {
@@ -1056,19 +1053,29 @@ impl AdeApp {
             }
         }
 
-        // Diagnostics only apply to `.rs` files. `ensure_lsp_client`/`dispatch_did_open` are
+        // Diagnostics apply to any extension `crate::language`'s registry spawns a real LSP
+        // client for (Rust/TypeScript-family/Python as of Revision R8 - see that module's own
+        // docs for Vue/Go's deliberate scope-down). `ensure_lsp_client`/`dispatch_did_open` are
         // idempotent `&mut self` calls that must finish before the immutable `file_view_cache`
         // borrow below is taken.
-        let is_rust = absolute_path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"));
+        let extension = absolute_path.extension().and_then(|ext| ext.to_str());
+        let language_id = language::lsp_language_id_for_extension(extension);
+        let has_lsp = language_id.is_some();
 
-        let lsp_status = if is_rust {
+        let lsp_status = if let Some(language_id) = language_id {
             let repo_root = self.file_tree_root.clone();
-            self.ensure_lsp_client(repo_root.clone(), cx);
-            let state = self.lsp_clients.get(&repo_root).cloned();
+            // Only a cheap, static registry lookup happens here on every repaint - the real,
+            // possibly PATH-probing `ServerSpawnConfig` (e.g. Pyright's `pythonPath` resolution)
+            // is built inside `ensure_lsp_client` itself, off the render thread, and only when a
+            // spawn is actually needed (see that method's own docs for why this moved).
+            let canonical_extension =
+                language::entry_for_extension(extension).map(|entry| entry.extension);
+            self.ensure_lsp_client(repo_root.clone(), canonical_extension, cx);
+            let binary = language::lsp_binary_for_extension(extension);
+            let state =
+                binary.and_then(|binary| self.lsp_clients.get(&(repo_root, binary)).cloned());
             if let Some(LspClientState::Ready(client)) = &state {
-                self.dispatch_did_open(client.clone(), absolute_path.clone(), cx);
+                self.dispatch_did_open(client.clone(), absolute_path.clone(), language_id, cx);
             }
 
             // Computed once and reused below, since `uri_for_path` does a blocking
@@ -1112,9 +1119,9 @@ impl AdeApp {
         let truncated = parsed.truncated;
         let line_count = parsed.lines.len();
         let diagnostics_card = render_diagnostics_card(&self.file_view_diagnostics);
-        // Hover only applies to `.rs` files; cloned once here and reused per row for the same
-        // reason as `file_uri` above.
-        let hover_target = is_rust.then(|| absolute_path.clone());
+        // Hover only applies to a file whose extension has a real LSP identity; cloned once here
+        // and reused per row for the same reason as `file_uri` above.
+        let hover_target = has_lsp.then(|| absolute_path.clone());
         let hover_card = render_hover_card(self.hover.as_ref(), &absolute_path, cx);
 
         let code = uniform_list(
@@ -2463,7 +2470,8 @@ mod lsp_hover_wiring_tests {
             cx.run_until_parked();
             let ready = app.read_with(cx, |app, _| {
                 matches!(
-                    app.lsp_clients.get(project.path()),
+                    app.lsp_clients
+                        .get(&(project.path().to_path_buf(), "rust-analyzer")),
                     Some(LspClientState::Ready(_))
                 )
             });
@@ -2564,7 +2572,8 @@ mod lsp_hover_wiring_tests {
             cx.run_until_parked();
             let ready = app.read_with(cx, |app, _| {
                 matches!(
-                    app.lsp_clients.get(project.path()),
+                    app.lsp_clients
+                        .get(&(project.path().to_path_buf(), "rust-analyzer")),
                     Some(LspClientState::Ready(_))
                 )
             });
