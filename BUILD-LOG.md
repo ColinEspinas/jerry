@@ -1293,3 +1293,64 @@ per row that opens that server's real, correct install/docs page in the user's b
 reusing Revision R11's real cross-platform "open with the OS default handler" mechanism
 (the same one already used for opening the settings file) — not a button that runs arbitrary
 install commands on the user's behalf. Tracked as a new follow-up task, queued after R8.
+
+## Revision R9a — unify Diff/Merge rendering with the code editor
+
+Real per-token syntax highlighting for both the Diff view and the Merge conflict view,
+reusing the File view's own real tree-sitter highlighters (Revision R8) through a new
+`highlight_block` helper rather than a third bespoke implementation — both surfaces used to
+render flat, uncolored text with only add/remove/context or ours/theirs tinting. Real editor
+zoom (Revision R5) now applies to the merge surface, which previously ignored it entirely. A
+real gutter was added to the merge view — deliberately withheld in an earlier phase because
+"inventing incrementing ones would be fabricated data" — after finding genuinely derivable
+line-position data was available: real conflict-marker parsing already walks the file line
+by line, so capturing each hunk's real starting line for free, at parse time, was a small,
+honest addition rather than the fabrication the original decision correctly ruled out.
+Live-verified against multi-hunk real git conflicts with asymmetric side lengths and hunks
+not starting at line 1 — every rendered number resolves to exactly its own real line.
+
+No design mockup exists for any of this — the project's own design revision explicitly
+states "diff engine, conflict resolver... leave those alone," predating this ask — so the
+real engineering judgment calls (how syntax color and diff/conflict tinting share one line
+without fighting each other, where real caching belongs, what "no fabricated gutter" still
+permits) are this phase's own, matched to the app's existing visual language rather than a
+spec.
+
+The audit found the most severe class of bug this kind of caching work can produce: the
+Diff view's newly-added highlight cache was read purely by position (hunk index, line
+index) with no check that it still belonged to the file on screen. A stale cache wouldn't
+have shown wrong colors — it would have silently painted one file's real source lines into
+another file's rows, under that second file's own correct diff signs and gutter numbers,
+about as convincing a piece of wrong output as this app could produce. Fixed with a real
+identity guard that falls back to honest plain text on any mismatch. The same audit caught
+the merge view's per-hunk cache keying only on hunk content, not the file it came from —
+two conflicted files with structurally identical hunks but different real languages could
+have shared stale highlighting; and highlighting work running inline during render instead
+of only at the real points content actually changes, measured firsthand at up to ~80ms on
+this repo's own largest file before a real 300-line-per-file cap was added to bound it.
+
+Also fixed from the same audit: the merge view's real syntax-colored text sitting directly
+on the existing per-agent background wash measured below WCAG AA contrast for
+comment-colored text specifically — replaced the full-height wash with a left-edge accent
+bar so both conflict sides read equally well; the diff view's add/remove signal had gotten
+weaker now that syntax color owns the text instead of a uniform per-line color — restored
+and strengthened via the (now actually used, previously dead) add/remove color tokens plus
+a matching left-edge accent bar; a small per-render allocation recomputing diff gutter
+numbers on every frame moved into the same real cache the highlighting already needed; and
+the merge highlight cache wasn't cleared on a worktree switch, unlike every sibling
+per-worktree cache that already is.
+
+A process note worth recording: this phase's builder dispatch produced a confusing,
+near-empty final report, and it turned out to be because it had internally delegated a
+"fix round" to its own sub-agent rather than finishing the work itself — the orchestrating
+session read the actual diff directly (finding it solid) rather than trusting the report,
+dispatched an audit anyway, and that audit ran concurrently with the still-active sub-agent,
+producing a genuinely confusing "moving target" of gate results until both settled. The
+underlying design was sound throughout; the process hiccup was purely about report clarity
+and dispatch timing, not the work itself. R9b (agent-driven auto-resolve) is next, but a
+new phase — Revision R8.5, real text editing across File/Diff/Merge plus the design's own
+never-built Completions popup — was inserted ahead of it at the user's explicit request
+after noticing this app is currently 100% read-only for file content everywhere, including
+merge conflict resolution (only take-ours/take-theirs/take-both exist; there is no way to
+hand-edit a resolution). R9b will build on R8.5's real editing/file-write capability rather
+than a narrower, conflict-only version that would need to be redone.
