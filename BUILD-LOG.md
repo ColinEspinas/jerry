@@ -696,3 +696,57 @@ toolchain (which doesn't have the component installed) instead of the 1.95.0 too
 does, surfacing as an honest "rust-analyzer closed the connection" status rather than a
 silent failure — fixed by pinning the scratch repo's own toolchain file, same as this
 project's own.
+
+#### Phase H3 — real hover + go-to-definition (Jerry redesign complete)
+
+Real `textDocument/hover` on click, real signature/doc/module-path rendering derived from
+actual captured rust-analyzer output, real cross-file `textDocument/definition` via F12.
+Completions were deliberately scoped out rather than built — the File view is read-only, and
+a completions popup with an accept affordance that does nothing on every keypress is exactly
+the "component bound to nothing" this project's rules forbid; even a relabeled "inspector"
+framing was considered and rejected as still visually implying an action that doesn't happen.
+
+The audit found the most consequential regression of the whole redesign: opening a file or
+diff left window focus dangling on a node that had stopped rendering, silently breaking the
+command palette, Settings, and go-to-definition itself. Not really a new H3 bug so much as
+the same "focus left pointing at something no longer rendered" class already found and fixed
+twice before — Phase E's palette, Phase F's settings — recurring a third time in the code
+surface, and this codebase's own doc comments had already described the exact symptom once
+before without anyone connecting it to this new occurrence. Fixed with the same
+dedicated-focus-handle pattern both prior fixes established, verified by deliberately
+breaking it again and watching the exact predicted tests fail before restoring it. Also
+fixed: a go-to-definition race where navigating to a not-yet-loaded file could leak its
+target line onto whatever unrelated file the user opened next (or leak permanently after a
+failed load); an unreadable file path reachable from a real go-to-definition result
+triggering an unbounded render busy-loop — reproduced hanging a test past two minutes before
+the fix; hover misparsing struct fields and enum variants, inverting their signature and doc
+content; go-to-definition never actually scrolling the viewport to the line it claimed to
+navigate to; and unbounded concurrent hover requests that could pin multiple
+background-executor threads for a full 10-second timeout each during rust-analyzer's initial
+indexing.
+
+**Infra note:** an audit session interrupted by an unrelated hiccup left temporary debug
+instrumentation (a counter static and two ad-hoc test modules) sitting in `root.rs`
+mid-cycle — found and removed directly before the fix round, confirmed via a clean rebuild
+against the real, uncontaminated implementation.
+
+## Where the Jerry redesign leaves the project
+
+Phases A through H3 are all complete, committed, and each went through at least one real
+adversarial audit round — every phase but one turned up at least one genuine bug an audit
+found and a fix round closed, the same pattern the original five-step build established.
+The app went from a rough, newly-working three-pane tool to a close implementation of a
+high-fidelity design system: real window chrome, a session rail with real status derivation,
+a real terminal with real grid rendering, a real diff/changes review flow, a real command
+palette, a real settings surface, real git merge and conflict resolution, and a real code
+viewer with real syntax highlighting, real LSP diagnostics, and real hover/go-to-definition
+against a real language server.
+
+The user has since provided a design revision (`design_handoff_jerry_ade/revision/`, ten
+further deltas) and a substantial new work list — repo cleanup and module splitting,
+platform-dependent chrome, a rewritten settings surface, a real multi-tab work surface, an
+interactive terminal, editor/UI scaling, a rebuilt status bar, generalizing the LSP client
+beyond rust-analyzer, unifying diff/merge review with the code editor plus AI-assisted
+conflict resolution, an undo/redo command pattern, and cross-platform (Windows/macOS) plus
+native-WSL support with CI as the real verification path for platforms this sandbox can't
+build on directly. That work is tracked as revision phases R1 through R12 and picks up next.
