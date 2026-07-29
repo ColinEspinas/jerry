@@ -797,3 +797,52 @@ sites across 6 modules, sharing the same `cx.spawn(...)` + single-task-slot shap
 the pattern Phase G's second audit round found a real bug in (two operations sharing one
 cancellable slot). Consolidating this is a real opportunity, but bigger and riskier than
 this round's other fixes; left as a named follow-up rather than rushed.
+
+## Revision R2 — platform-dependent title bar and OS keymap
+
+Applied the 2026-07-29 design revision's changes 1 and 2: a real macOS (three dots) vs
+Windows/Linux (menu row + minimise/maximise/close caption buttons) title bar, and every
+shortcut in the product resolving through one OS-aware keymap instead of scattered literal
+glyphs.
+
+New `crates/app/src/keymap.rs` resolves a spec string (`"mod+shift+k"`) to a real per-OS
+glyph sequence — macOS symbols, Windows/Linux word labels — transcribed directly from the
+design mockup's own embedded resolver rather than guessed, with 10 unit tests. Every real
+call site that previously hardcoded a literal modifier glyph (diff footer, terminal header,
+palette footer, completion footer, hover-card footer, quick-fix chip, conflict header,
+change-list footer, empty-state hints, action buttons, rail `+`, status bar) now goes
+through it, via new `render_keycap_row` / `render_action_keycap_row` / `render_hint_row`
+widgets replacing the old two-arg hardcoded-glyph helper. `title_bar.rs` gained a real
+Windows/Linux variant — hoverable (non-interactive by design, matching the mockup) menu
+row plus caption buttons wired to the same real `Window::minimize_window()` /
+`zoom_window()` / `remove_window()` APIs the macOS dots already used; the close button's
+rotated-rect X is drawn with a real stroked `PathBuilder` path since GPUI has no CSS
+transform/rotate.
+
+The audit's most important finding: the phase had only fixed shortcut *rendering*, not the
+underlying key *bindings* it renders. `lib.rs` still registered every shortcut with a
+literal `"cmd-"` prefix, which GPUI maps to the Super/Windows key on Linux — completely
+independent of, and inconsistent with, what the newly platform-aware UI now displayed
+("Ctrl K"). Live-reproduced on a real X11 window: `Ctrl+K` did nothing (only `Super+K`
+opened the palette), and `Ctrl+,` didn't just fail silently — it fell through to the
+focused terminal and typed a literal comma into a live agent session. Root cause: GPUI's
+`"cmd"`/`"super"`/`"win"` binding-string aliases all resolve to `modifiers.platform` with
+no per-OS remapping, so hardcoding any one of them hardcodes the wrong physical key on
+every other OS. Fixed by switching every binding to GPUI's real `"secondary"` alias, which
+resolves to the correct platform modifier at bind time from the same OS fact the rendering
+side already used — one source of truth instead of two silently-independent ones. Extracted
+the binding list into `default_key_bindings()` so both `run()` and tests share it, and added
+real keystroke-simulation regression tests (`cx.bind_keys` + `cx.simulate_keystrokes`) —
+every one of the 277 pre-existing tests had only ever dispatched the GPUI action directly,
+never simulated an actual keystroke, which is exactly how a fully-green test suite shipped
+with this bug still in it. Independently re-verified live afterward on a clean X11 window:
+`Ctrl+K` reliably opens the palette, `Ctrl+,` reliably opens Settings, no comma leaks
+anywhere.
+
+Minor fixes from the same audit: the new hint-size keycap's row gap was hardcoded to the
+standard size's 3px instead of the mockup's 2px; a title-bar doc comment claimed both
+variants stop mouse-down propagation when only one does; `WindowControlsStyle`'s doc
+comment overclaimed live-rebinding, corrected to state plainly that the override is a
+rendering-only preview — real GPUI key bindings resolve once at startup, not per-render, so
+only the setting's real config-file/settings-page wiring (R3) can make the override affect
+which physical key actually works.
