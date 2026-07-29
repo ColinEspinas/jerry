@@ -441,8 +441,37 @@ impl AdeApp {
             )
     }
 
-    /// The palette's input row: scope-prefix glyph, typed query (or its placeholder), a caret,
-    /// and the clickable segmented scope control.
+    /// A 1.5×16 bar at the palette input's real insertion point - matching `Jerry.dc.html`'s own
+    /// `paletteEmpty`/`paletteTyped` fixture (`design_handoff_jerry_ade/revision/Jerry.dc.html`),
+    /// which renders the identical two-position caret rather than a fixed one, so this isn't a
+    /// new invention. `margin_right`/`margin_left` place it on whichever side of the text it sits
+    /// on: before the placeholder (empty query) or after the real typed text (non-empty).
+    fn render_palette_caret(
+        &self,
+        margin_right: gpui::Pixels,
+        margin_left: gpui::Pixels,
+    ) -> impl IntoElement {
+        div()
+            .flex_none()
+            .mr(margin_right)
+            .ml(margin_left)
+            .w(px(1.5))
+            .h(px(16.0))
+            .bg(theme::term::CURSOR)
+            // `debug_selector` is a no-op outside test builds; lets
+            // `palette_caret_tests::*` measure the caret's real painted x position in both
+            // states and assert it actually moved.
+            .debug_selector(|| "palette-caret".to_string())
+    }
+
+    /// The palette's input row: scope-prefix glyph, typed query (or its placeholder), a caret at
+    /// the real insertion point, and the clickable segmented scope control.
+    ///
+    /// The caret used to be a fixed bar rendered unconditionally *after* the text/placeholder,
+    /// which read as a UI artefact rather than a real insertion-point indicator (the design
+    /// audit's own wording). It now sits before the placeholder while the query is empty, and
+    /// immediately after the real typed text once something has been entered - matching
+    /// `Jerry.dc.html`'s own two-position fixture.
     pub(super) fn render_palette_input_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let has_query = !self.palette_query.is_empty();
 
@@ -471,6 +500,9 @@ impl AdeApp {
                     .min_w_0()
                     .flex()
                     .items_center()
+                    .when(!has_query, |el| {
+                        el.child(self.render_palette_caret(px(3.0), px(0.0)))
+                    })
                     .child(
                         div()
                             .font(font(theme::font::SANS))
@@ -484,16 +516,12 @@ impl AdeApp {
                                 self.palette_query.clone()
                             } else {
                                 "Type a command, file or session\u{2026}".to_string()
-                            }),
+                            })
+                            .debug_selector(|| "palette-query-text".to_string()),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .ml(px(1.0))
-                            .w(px(1.5))
-                            .h(px(16.0))
-                            .bg(theme::term::CURSOR),
-                    ),
+                    .when(has_query, |el| {
+                        el.child(self.render_palette_caret(px(0.0), px(2.0)))
+                    }),
             )
             .child(self.render_palette_scope_control(cx))
     }
@@ -854,4 +882,94 @@ pub(super) fn render_palette_label(
                 .child(matched.mid.clone()),
         )
         .child(div().text_color(fg).child(matched.post.clone()))
+}
+
+/// Real interaction coverage for the caret position fix above: proves the caret's *painted x
+/// position* actually differs between the empty-query and typed-query states, using
+/// `VisualTestContext::debug_bounds` - the same real-bounds-measurement technique
+/// `code_surface::zoom_scales_text_but_not_the_gutter_width` uses - rather than only reading the
+/// render code, since a doc comment claiming the right positioning can't catch a layout mistake
+/// (e.g. a `when` branch wired to the wrong condition) the way a real measured assertion can.
+#[cfg(test)]
+mod palette_caret_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn caret_sits_before_the_placeholder_when_empty_and_after_the_text_once_typed(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        cx.dispatch_action(TogglePalette);
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.palette_open),
+            "sanity check: the palette should actually be open"
+        );
+
+        let empty_caret = cx
+            .debug_bounds("palette-caret")
+            .expect("the caret should have really painted with an empty query");
+        let placeholder = cx
+            .debug_bounds("palette-query-text")
+            .expect("the placeholder text should have really painted");
+        assert!(
+            empty_caret.origin.x <= placeholder.origin.x,
+            "with an empty query, the real caret must sit before (at or left of) the \
+             placeholder's own start x, not after it - got caret {:?} vs placeholder {:?}",
+            empty_caret,
+            placeholder,
+        );
+
+        cx.simulate_input("ab");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.palette_query, "ab", "sanity check: real typed query");
+        });
+
+        let short_caret = cx
+            .debug_bounds("palette-caret")
+            .expect("the caret should have really painted with a short typed query");
+        let short_text = cx
+            .debug_bounds("palette-query-text")
+            .expect("the real typed text should have really painted");
+        assert!(
+            short_caret.origin.x >= short_text.origin.x + short_text.size.width,
+            "with a typed query, the real caret must sit at or after the typed text's own \
+             right edge, not before it - got caret {:?} vs text {:?}",
+            short_caret,
+            short_text,
+        );
+        assert!(
+            short_caret.origin.x > empty_caret.origin.x,
+            "the caret's real measured horizontal position must differ between the \
+             empty-query state (before the placeholder) and a typed-query state (after the \
+             real text) - got {:?} vs {:?}",
+            empty_caret.origin.x,
+            short_caret.origin.x,
+        );
+
+        cx.simulate_input("cdefgh");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.palette_query, "abcdefgh",
+                "sanity check: real longer typed query"
+            );
+        });
+
+        let long_caret = cx
+            .debug_bounds("palette-caret")
+            .expect("the caret should have really painted with a longer typed query");
+        assert!(
+            long_caret.origin.x > short_caret.origin.x,
+            "the real caret must keep tracking the typed text's length - typing more real \
+             characters should move it further right, got {:?} then {:?}",
+            short_caret.origin.x,
+            long_caret.origin.x,
+        );
+    }
 }

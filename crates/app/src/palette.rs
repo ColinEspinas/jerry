@@ -11,6 +11,41 @@
 //! an entry that only matched via a secondary field (a session's branch, a file's directory, a
 //! command's keywords) still qualifies but ranks after every primary-label match - see
 //! [`match_against`].
+//!
+//! ## The changelog's "History" group is deliberately not built here
+//!
+//! The 2026-07-29 revision's changelog entry 9 also describes a new default-scope group,
+//! **History** - `Undo — keep all changes` (`mod+Z`) and `Redo — discard worktree`
+//! (`mod+shift+Z`), each showing the affected session as a sub-line. Despite the "Undo"/"Redo"
+//! labels, this is not asking for a command-pattern undo/redo stack (that's tracked separately
+//! as Revision R10, `BUILD-LOG.md`'s "an undo/redo command pattern"); read plainly, the two
+//! entries describe a per-session "keep everything this session's worktree changed" action and
+//! a "throw it all away" action. Investigating this app's real capabilities before building
+//! anything (`crate::root::merge_flow`, `crate::root::rail_render`,
+//! `crate::root::work_surface_render`) found neither has a real, already-existing backing that
+//! actually matches, on demand, for an arbitrary session:
+//!
+//! - **"keep all changes"** - the only real commit path is
+//!   `crate::root::AdeApp::complete_merge_flow`, which finalizes an *already-running* merge
+//!   attempt (`AdeApp::merge_flow` must already be `Some`, in a `Clean` or fully-resolved
+//!   `Conflicted` state - reachable only after a real `Merge` click and, for conflicts, real
+//!   hunk resolution). It cannot commit an arbitrary session's changes cold, in one action,
+//!   the way a History row's `mod+Z` would need to.
+//! - **"discard worktree"** - the only real worktree-removal path is
+//!   `crate::root::AdeApp::execute_prune` (behind `request_prune`'s two-click confirmation),
+//!   which always removes every currently-prunable worktree at once and explicitly *excludes*
+//!   any worktree with a live session running in it
+//!   (`crate::rail::prunable_worktree_paths`/`is_prunable`) - see
+//!   `crate::root::settings_render`'s own "there is no prune only this one worktree code path"
+//!   doc comment. That is the opposite of what a History row names: a session that is still
+//!   running can never be one of prune's candidates.
+//!
+//! Wiring either palette entry to these real functions would either silently no-op for the
+//! named session (prune's live-session exclusion) or do something narrower/different than its
+//! own label promises (finalizing a merge attempt that was never started) - exactly the "fake
+//! functionality" this project's rules forbid. So the History group itself is left out of this
+//! revision entirely rather than half-built; it belongs in Revision R10, once that phase's real
+//! undo/redo architecture exists to back "keep all changes"/"discard worktree" for real.
 
 use std::path::PathBuf;
 
