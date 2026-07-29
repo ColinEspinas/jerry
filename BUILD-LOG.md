@@ -1117,3 +1117,28 @@ multi-round adversarial review across R1-R5.5, this revision ran with lighter-we
 — independent verification of all four gates plus a direct sanity check of the diff's shape,
 without a separate adversarial-checker dispatch — per an explicit, agreed calibration: review
 depth should scale with a phase's actual risk, not apply uniformly regardless of it.
+
+## Revision R7 — real command palette caret positioning
+
+Applied changelog entry 9's caret fix: the palette's input caret was a fixed bar always
+rendered after the placeholder text, which never actually moved to reflect where typing
+would land — a UI artefact, not a real insertion-point indicator. Now sits before the
+placeholder while the query is empty and immediately after the real typed text once
+something's been entered, matching the mockup's own two-position fixture exactly. Verified
+with a real interaction test measuring the caret's actual painted position in both states,
+confirmed non-vacuous by reverting the fix and watching the test fail before restoring it.
+
+The CHANGELOG's companion ask — a new palette "History" group with "Undo — keep all
+changes" / "Redo — discard worktree" entries — was investigated and deliberately not built.
+Neither label matches a real capability this app has today: the only real "keep" path
+(completing an in-progress merge) requires a merge to already be running and can't act on
+an arbitrary session cold; the only real "discard" path (worktree pruning) explicitly
+excludes any worktree with a live session in it, the opposite of what a History row's
+"affected session" sub-line would need. Wiring either label to what exists would mean the
+entry silently does something narrower than it promises — this project's rules treat that
+as worse than not building it at all. Left documented and deferred to Revision R10 (the
+tracked undo/redo command-pattern phase), where real backing will actually exist.
+
+This is the first revision run with the lighter review process discussed with the user:
+given its small, low-risk scope, it skipped the separate adversarial-checker round in favor
+of direct verification plus a spot-check of the diff.
