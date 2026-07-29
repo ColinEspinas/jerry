@@ -846,3 +846,71 @@ comment overclaimed live-rebinding, corrected to state plainly that the override
 rendering-only preview — real GPUI key bindings resolve once at startup, not per-render, so
 only the setting's real config-file/settings-page wiring (R3) can make the override affect
 which physical key actually works.
+
+## Revision R3 — settings rewrite with real config-file persistence
+
+Applied the 2026-07-29 design revision's change 3: a narrower, config-file-first settings
+surface with five new/expanded pages.
+
+New `crates/app/src/settings_store.rs` is a real `settings.toml` reader/writer at
+`~/.config/jerry/settings.toml` — `serde`/`toml` (pinned to the same major versions
+`vendor/zed`'s own `Cargo.toml` pins, matching this project's established shared-dependency
+convention), `#[serde(default)]` throughout so a hand-edited partial file still parses, a
+real default file written on first run rather than a silent in-memory-only fallback, and a
+sanitize step on load that clamps out-of-range hand-edited values to the same bounds the UI
+enforces. Settings width capped at a 700px content column (nav unchanged at 212), nav
+regrouped to Workspace/Interface/Editor/Other with a new General page as the default. New
+config-banner and snippet-block widgets show the real file path, a page's real config-key
+list, and a live TOML/JSON re-render of the actually-loaded struct — deliberately shown only
+on the three pages genuinely backed by real settings keys (General, Appearance & scaling,
+Themes), not on the live-detected Agents/Worktrees/Keybindings/Language servers pages, which
+would otherwise falsely advertise a config namespace they don't have.
+
+Window controls (the title bar variant R2 added) moved from an in-memory-only field to this
+real persisted store, with both the General page and the pre-existing palette override
+entries now reading and writing the same single field. Appearance & scaling and Themes
+round-trip real values through the file — interface scale, font sizes, theme selection,
+high-contrast diff — honestly disclosed as saved-but-not-yet-applied, since actually
+rendering at those values is Revision R5's job and a real runtime theme-swap engine is a
+separate, larger piece of follow-up work (`crate::theme` is currently ~500 compile-time
+`const` call sites, not a swappable resource). New Keybindings page derives its rows live
+from the real `default_key_bindings()` registration — keystroke, context, and order all
+come from the actual binding, with a test that fails if a future binding has no display
+label — replacing what the first builder pass had built as a second, hand-maintained list
+(see below). New Language servers page does real `$PATH` detection for rust-analyzer,
+typescript-language-server, vue-language-server, pyright-langserver, and gopls, mirroring
+the Agents page's existing real-detection pattern. The Editor page, and every toggle this
+codebase has no real behavior to back (format-on-save, inlay hints, WSL/environment
+detection, session restore, discard confirmation), were deliberately left out rather than
+faked — the same discipline `crate::settings`'s own docs already applied to Agents/
+Worktrees, now extended to the new pages.
+
+The first builder pass's own testing was thorough (305 passing tests, all four gates clean)
+but also caught a real bug independently: the shared GPUI test harness had started calling
+the real, production `AdeApp::new`, which after this change does a real settings-file
+load/write — meaning every `cargo test` run had begun silently touching the real developer
+machine's home directory. Fixed within that same pass by splitting out an explicit
+`AdeApp::new_with_settings` for tests to use, confirmed empirically clean before and after.
+
+The audit round found four further real defects the first pass's tests hadn't caught,
+because they were about *timing and process lifecycle*, not logic a synchronous unit test
+naturally exercises: settings saves raced on completion order — two fast edits (e.g.
+double-clicking a stepper) could let an older snapshot's write land after a newer one's,
+leaving the file holding a stale value that would then get reloaded at next startup,
+directly undermining the phase's own "the file is the real source of truth" premise. Fixed
+by collapsing an unbounded `Vec<Task<()>>` of independent save tasks into a single
+cancel-on-write task slot that reads `self.settings` fresh at write time rather than a
+value snapshotted at spawn time — matching this codebase's established "one slot,
+supersede the previous" shape for exactly this class of race. The "Open file" button leaked
+a zombie `xdg-open` child on every click (spawned, never reaped) and — separately — kept
+opening the real `.toml` path even while the banner next to it displayed a `.json` path
+that doesn't exist on disk, a real button/path mismatch; fixed by reaping and logging the
+child's exit and disabling the button specifically while JSON display is selected. The
+first pass's Keybindings page turned out not to be "derived live" as claimed — it was a
+second, hand-maintained row list that had already drifted from the real bindings (one
+global shortcut mislabeled with an "editor" context it doesn't have); fixed by deriving the
+page directly from `default_key_bindings()`'s real registration, with a new test that fails
+if a future binding is added without a matching display label, so this specific class of
+drift can't recur silently again. Also caught and fixed: user-facing subtitle copy that
+leaked internal project jargon ("Revision R5's job", "see the module docs") into real
+product UI text, reworded to plain honest disclosure without the internal references.
