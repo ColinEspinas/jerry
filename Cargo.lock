@@ -285,6 +285,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "ttf-parser",
+ "unicode-segmentation",
  "wt-core",
 ]
 

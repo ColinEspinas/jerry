@@ -57,6 +57,17 @@ impl AdeApp {
             code_cursor: None,
             code_zoom_percent: AdeApp::ZOOM_DEFAULT_PERCENT,
             file_zoom_percent: HashMap::new(),
+            edit_buffers: HashMap::new(),
+            file_view_row_layout: HashMap::new(),
+            file_view_last_layout: None,
+            file_view_last_bounds: None,
+            file_view_last_layout_for: None,
+            _rehighlight_tasks: HashMap::new(),
+            _file_save_tasks: HashMap::new(),
+            file_save_pending: HashSet::new(),
+            file_save_running: HashSet::new(),
+            file_save_error: None,
+            file_external_conflict: HashSet::new(),
             palette_open: false,
             palette_scope: palette::PaletteScope::default(),
             palette_query: String::new(),
@@ -273,6 +284,7 @@ impl AdeApp {
             &mut self.collapsed_dirs,
             &mut self.selected_tree_path,
             &mut self.file_zoom_percent,
+            &mut self.edit_buffers,
         );
         // The File view's own per-worktree state (a cached parse and diff lookup that are about
         // to belong to a different `file_tree_root`) - reset for the same reason as above.
@@ -284,6 +296,21 @@ impl AdeApp {
         self.code_cursor = None;
         self.file_view_error_count = None;
         self.open_diff_file_cache = None;
+        // The real text-editing state above (`edit_buffers`) is per-worktree-reset via the shared
+        // helper; its own transient/task-shaped siblings - which don't fit that helper's plain
+        // free-function signature - are reset directly here for the same reason. Dropping the
+        // task maps cancels every in-flight debounced re-highlight/save for the worktree just
+        // left, matching `_file_load_task`'s own reset above.
+        self.file_view_row_layout = HashMap::new();
+        self.file_view_last_layout = None;
+        self.file_view_last_bounds = None;
+        self.file_view_last_layout_for = None;
+        self._rehighlight_tasks = HashMap::new();
+        self._file_save_tasks = HashMap::new();
+        self.file_save_pending = HashSet::new();
+        self.file_save_running = HashSet::new();
+        self.file_save_error = None;
+        self.file_external_conflict = HashSet::new();
         // The Diff view's syntax-highlight cache is keyed on a whole `DiffFile` from the
         // worktree just left - reset alongside `open_diff_file_cache` above for the same reason
         // (and so it can't retain a full file's highlighting from a worktree that's no longer
@@ -333,6 +360,7 @@ pub(super) fn reset_per_worktree_ui_state(
     collapsed_dirs: &mut HashSet<PathBuf>,
     selected_tree_path: &mut Option<PathBuf>,
     file_zoom_percent: &mut HashMap<PathBuf, u16>,
+    edit_buffers: &mut HashMap<PathBuf, edit_buffer::EditBuffer>,
 ) {
     reviewed_files.clear();
     open_files.clear();
@@ -340,6 +368,10 @@ pub(super) fn reset_per_worktree_ui_state(
     collapsed_dirs.clear();
     *selected_tree_path = None;
     file_zoom_percent.clear();
+    // Real, live unsaved-edit state (Revision R8.5a) is just as worktree-relative-path-keyed as
+    // `file_zoom_percent` above - without this, a same-named file in a different worktree could
+    // silently inherit another worktree's in-memory buffer/cursor/selection.
+    edit_buffers.clear();
 }
 
 #[cfg(test)]
@@ -356,6 +388,7 @@ mod tests {
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
         let mut file_zoom_percent = HashMap::new();
+        let mut edit_buffers = HashMap::new();
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
@@ -364,6 +397,7 @@ mod tests {
             &mut collapsed_dirs,
             &mut selected_tree_path,
             &mut file_zoom_percent,
+            &mut edit_buffers,
         );
 
         assert!(reviewed_files.is_empty());
@@ -383,6 +417,7 @@ mod tests {
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
         let mut file_zoom_percent = HashMap::new();
+        let mut edit_buffers = HashMap::new();
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
@@ -391,6 +426,7 @@ mod tests {
             &mut collapsed_dirs,
             &mut selected_tree_path,
             &mut file_zoom_percent,
+            &mut edit_buffers,
         );
 
         assert!(
@@ -408,6 +444,7 @@ mod tests {
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
         let mut file_zoom_percent = HashMap::new();
+        let mut edit_buffers = HashMap::new();
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
@@ -416,6 +453,7 @@ mod tests {
             &mut collapsed_dirs,
             &mut selected_tree_path,
             &mut file_zoom_percent,
+            &mut edit_buffers,
         );
 
         assert!(reviewed_files.is_empty());
@@ -431,6 +469,7 @@ mod tests {
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
         let mut file_zoom_percent = HashMap::new();
+        let mut edit_buffers = HashMap::new();
         collapsed_dirs.insert(PathBuf::from("/repo/worktree-a/src"));
         collapsed_dirs.insert(PathBuf::from("/repo/worktree-a/tests"));
 
@@ -441,6 +480,7 @@ mod tests {
             &mut collapsed_dirs,
             &mut selected_tree_path,
             &mut file_zoom_percent,
+            &mut edit_buffers,
         );
 
         assert!(collapsed_dirs.is_empty());
@@ -454,6 +494,7 @@ mod tests {
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = Some(PathBuf::from("/repo/worktree-a/src/main.rs"));
         let mut file_zoom_percent = HashMap::new();
+        let mut edit_buffers = HashMap::new();
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
@@ -462,6 +503,7 @@ mod tests {
             &mut collapsed_dirs,
             &mut selected_tree_path,
             &mut file_zoom_percent,
+            &mut edit_buffers,
         );
 
         assert_eq!(selected_tree_path, None);
@@ -478,6 +520,7 @@ mod tests {
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
         let mut file_zoom_percent = HashMap::new();
+        let mut edit_buffers = HashMap::new();
         file_zoom_percent.insert(PathBuf::from("src/main.rs"), 150u16);
         file_zoom_percent.insert(PathBuf::from("Cargo.toml"), 80u16);
 
@@ -488,8 +531,45 @@ mod tests {
             &mut collapsed_dirs,
             &mut selected_tree_path,
             &mut file_zoom_percent,
+            &mut edit_buffers,
         );
 
         assert!(file_zoom_percent.is_empty());
+    }
+
+    /// `edit_buffers` is keyed the same way as `file_zoom_percent`/`open_files`; without this
+    /// reset, a same-named file's real unsaved edits from one worktree could silently reappear
+    /// (or be silently overwritten by) an unrelated file in a different worktree.
+    #[test]
+    fn reset_per_worktree_ui_state_clears_edit_buffers() {
+        let mut reviewed_files = HashSet::new();
+        let mut open_files = Vec::new();
+        let mut open_change = None;
+        let mut collapsed_dirs = HashSet::new();
+        let mut selected_tree_path = None;
+        let mut file_zoom_percent = HashMap::new();
+        let mut edit_buffers = HashMap::new();
+        edit_buffers.insert(
+            PathBuf::from("src/main.rs"),
+            edit_buffer::EditBuffer::new(
+                PathBuf::from("/repo/worktree-a/src/main.rs"),
+                "fn main() {}".to_string(),
+                Some("rs".to_string()),
+                None,
+                13,
+            ),
+        );
+
+        reset_per_worktree_ui_state(
+            &mut reviewed_files,
+            &mut open_files,
+            &mut open_change,
+            &mut collapsed_dirs,
+            &mut selected_tree_path,
+            &mut file_zoom_percent,
+            &mut edit_buffers,
+        );
+
+        assert!(edit_buffers.is_empty());
     }
 }

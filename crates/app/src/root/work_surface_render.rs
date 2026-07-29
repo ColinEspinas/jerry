@@ -374,6 +374,14 @@ impl AdeApp {
         let activate_path = path.to_path_buf();
         let close_path = activate_path.clone();
         let key = path.display().to_string();
+        // Real dirty-state indicator (Revision R8.5a): a small dot, shown only while this tab's
+        // real `EditBuffer` genuinely has unsaved edits (`EditBuffer::is_dirty`) - `false` for a
+        // tab with no buffer yet (still loading, or a truncated/read-only file - see
+        // `AdeApp::edit_buffers`' own docs), never a fabricated placeholder.
+        let is_dirty = self
+            .edit_buffers
+            .get(path)
+            .is_some_and(|buffer| buffer.is_dirty());
 
         div()
             .id(format!("file-tab-{key}"))
@@ -419,6 +427,17 @@ impl AdeApp {
                             .text_color(colors.label)
                             .child(file_name),
                     )
+                    .when(is_dirty, |el| {
+                        el.child(
+                            div()
+                                .id(format!("file-tab-dirty-{key}"))
+                                .flex_none()
+                                .w(px(6.0))
+                                .h(px(6.0))
+                                .rounded(theme::radius::CHIP)
+                                .bg(theme::status::ASK),
+                        )
+                    })
                     .child(
                         div()
                             .id(format!("close-file-tab-{key}"))

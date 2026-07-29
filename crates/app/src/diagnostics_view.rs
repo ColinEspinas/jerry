@@ -162,6 +162,18 @@ pub fn index_diagnostics_by_line(
 /// and a diagnostic range rarely share an exact boundary, so this intersection keeps the
 /// underline aligned to the diagnostic's own column range rather than rounded out to the
 /// nearest syntax-highlight token boundary.
+///
+/// Defensive against a real, live-reproduced panic: `diagnostics` is always indexed against
+/// whichever content was current when the language server last published it, which - for Surface
+/// C's editable File view (Revision R8.5a) - can genuinely diverge from `runs`' own text once a
+/// real edit changes the line (e.g. a multi-byte character shifts a byte offset that used to be a
+/// real char boundary onto one that no longer is). `crate::root::code_surface` gates diagnostic
+/// rendering off entirely for a dirty buffer specifically to make this unreachable in practice
+/// (see that module's own docs), but this function is still hardened independently, as a real,
+/// deliberate second line of defense, not left to rely solely on that caller-side gate: every
+/// candidate cut point is only ever added if it's a genuine char boundary within the run's own
+/// text, and the final slice is looked up with [`str::get`] (never a raw index) so a boundary that
+/// slips through anyway is skipped rather than panicking.
 pub fn overlay_diagnostic_runs(
     runs: &[(SharedString, HighlightKind)],
     diagnostics: &[LineDiagnostic],
@@ -182,10 +194,16 @@ pub fn overlay_diagnostic_runs(
 
         let mut cut_points: Vec<usize> = vec![run_start, run_end];
         for diagnostic in diagnostics {
-            if diagnostic.byte_range.start > run_start && diagnostic.byte_range.start < run_end {
+            if diagnostic.byte_range.start > run_start
+                && diagnostic.byte_range.start < run_end
+                && text.is_char_boundary(diagnostic.byte_range.start - run_start)
+            {
                 cut_points.push(diagnostic.byte_range.start);
             }
-            if diagnostic.byte_range.end > run_start && diagnostic.byte_range.end < run_end {
+            if diagnostic.byte_range.end > run_start
+                && diagnostic.byte_range.end < run_end
+                && text.is_char_boundary(diagnostic.byte_range.end - run_start)
+            {
                 cut_points.push(diagnostic.byte_range.end);
             }
         }
@@ -199,7 +217,15 @@ pub fn overlay_diagnostic_runs(
             }
             let local_start = segment_start - run_start;
             let local_end = segment_end - run_start;
-            let segment_text = &text.as_ref()[local_start..local_end];
+            // `get`, not a raw index: `local_start`/`local_end` are only ever real char
+            // boundaries of `text` by construction above (`run_start`/`run_end` themselves are
+            // always real boundaries - every `RenderedLine::runs` entry is a whole, valid `&str`
+            // - and every diagnostic-derived cut point in between was already boundary-checked),
+            // but this is still a genuine, independent defensive layer, not a redundant one: skip
+            // a segment that somehow isn't real, sliceable text rather than risk a panic.
+            let Some(segment_text) = text.as_ref().get(local_start..local_end) else {
+                continue;
+            };
             let is_diagnostic = diagnostics
                 .iter()
                 .any(|d| d.byte_range.start < segment_end && d.byte_range.end > segment_start);
@@ -453,5 +479,41 @@ mod tests {
             .map(|(text, _, _)| text.as_ref())
             .collect();
         assert_eq!(marked, " x: ");
+    }
+
+    /// HIGH regression coverage (finding 3): the real, live-reproduced panic an audit caught -
+    /// stale diagnostics indexed against last-*saved* content get sliced against the *edited*
+    /// buffer's real text once the File view (Revision R8.5a) makes that divergence possible.
+    /// "caf\u{e9}" - '\u{e9}' ("\u{e9}", i.e. é) is a real 2-byte UTF-8 character starting at byte
+    /// 3; byte 4 falls strictly inside it. A diagnostic computed against different, stale content
+    /// can end up with exactly this shape once a real edit shifts/changes the line's bytes -
+    /// `overlay_diagnostic_runs` must never index directly into that offset.
+    #[test]
+    fn a_diagnostic_byte_range_landing_mid_character_after_a_real_edit_does_not_panic() {
+        let runs = vec![(SharedString::new("caf\u{e9}"), HighlightKind::Text)];
+        // end (4) is not a real char boundary in "caf\u{e9}".
+        let diagnostics = vec![line_diag(2..4)];
+
+        let overlaid = overlay_diagnostic_runs(&runs, &diagnostics); // must not panic
+
+        let reconstructed: String = overlaid.iter().map(|(text, _, _)| text.as_ref()).collect();
+        assert_eq!(
+            reconstructed, "caf\u{e9}",
+            "no real bytes should be lost or duplicated even when a diagnostic's own byte range \
+             can no longer be sliced exactly"
+        );
+    }
+
+    /// The mirror case: the diagnostic's own *start* (not end) lands mid-character.
+    #[test]
+    fn a_diagnostic_byte_range_starting_mid_character_after_a_real_edit_does_not_panic() {
+        let runs = vec![(SharedString::new("caf\u{e9} x"), HighlightKind::Text)];
+        // start (4) is not a real char boundary in "caf\u{e9} x".
+        let diagnostics = vec![line_diag(4..6)];
+
+        let overlaid = overlay_diagnostic_runs(&runs, &diagnostics); // must not panic
+
+        let reconstructed: String = overlaid.iter().map(|(text, _, _)| text.as_ref()).collect();
+        assert_eq!(reconstructed, "caf\u{e9} x");
     }
 }

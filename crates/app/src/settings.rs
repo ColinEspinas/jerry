@@ -481,6 +481,25 @@ fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::JumpToSession6" => Some("Jump to session 6"),
         "app::JumpToSession7" => Some("Jump to session 7"),
         "app::JumpToSession8" => Some("Jump to session 8"),
+        "app::EditorBackspace" => Some("Editor: delete backward"),
+        "app::EditorDelete" => Some("Editor: delete forward"),
+        "app::EditorEnter" => Some("Editor: insert newline"),
+        "app::EditorLeft" => Some("Editor: move left"),
+        "app::EditorRight" => Some("Editor: move right"),
+        "app::EditorUp" => Some("Editor: move up"),
+        "app::EditorDown" => Some("Editor: move down"),
+        "app::EditorSelectLeft" => Some("Editor: extend selection left"),
+        "app::EditorSelectRight" => Some("Editor: extend selection right"),
+        "app::EditorSelectUp" => Some("Editor: extend selection up"),
+        "app::EditorSelectDown" => Some("Editor: extend selection down"),
+        "app::EditorHome" => Some("Editor: go to line start"),
+        "app::EditorEnd" => Some("Editor: go to line end"),
+        "app::EditorSelectAll" => Some("Editor: select all"),
+        "app::EditorCopy" => Some("Editor: copy"),
+        "app::EditorCut" => Some("Editor: cut"),
+        "app::EditorPaste" => Some("Editor: paste"),
+        "app::EditorSave" => Some("Editor: save file"),
+        "app::EditorSaveAnyway" => Some("Editor: save file (overwrite external change)"),
         _ => None,
     }
 }
@@ -940,6 +959,25 @@ mod tests {
                 "Jump to session 6",
                 "Jump to session 7",
                 "Jump to session 8",
+                "Editor: delete backward",
+                "Editor: delete forward",
+                "Editor: insert newline",
+                "Editor: move left",
+                "Editor: move right",
+                "Editor: move up",
+                "Editor: move down",
+                "Editor: extend selection left",
+                "Editor: extend selection right",
+                "Editor: extend selection up",
+                "Editor: extend selection down",
+                "Editor: go to line start",
+                "Editor: go to line end",
+                "Editor: select all",
+                "Editor: copy",
+                "Editor: cut",
+                "Editor: paste",
+                "Editor: save file",
+                "Editor: save file (overwrite external change)",
             ]
         );
     }
@@ -948,21 +986,40 @@ mod tests {
     fn keybinding_rows_report_the_real_global_context_for_every_default_binding() {
         // Regression coverage for the bug this replaced: a hand-copied list once labeled
         // `Go to definition` `context: "editor"` even though it's actually registered global.
+        //
+        // Revision R8.5a added a second real scoped context (`"file-editor"`, the real File
+        // view text-editing actions) alongside the pre-existing `"diff"` one (`]` ->
+        // `NextChangedFile`) - both are deliberately non-global for the same real reason
+        // (swallowing ordinary keystrokes in a focused terminal session), so the scoped count
+        // grew from 1 to 1 + 19 real `Editor*` bindings (a fix round added `EditorSaveAnyway`,
+        // the real escape hatch for a permanently-stuck `AdeApp::file_external_conflict`). A
+        // later fix round changed `]`'s own registered predicate from `Some("diff")` to
+        // `Some("diff && !file-editor")` (a real, live-reproduced bug: since `"file-editor"` is
+        // *added onto* the same node's context rather than replacing `"diff"`, the bare
+        // `"diff"` predicate kept matching - and kept swallowing a literal `]` keystroke - even
+        // while a file was actively being edited) - `KeybindingRow::context` only ever reports
+        // the coarse `"global"`/`"scoped"` distinction (see its own docs), so that predicate
+        // change doesn't move this test's own counts, but `]` is still exactly as "scoped" as
+        // before.
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings);
         assert!(!rows.is_empty());
+        let scoped: Vec<&KeybindingRow> =
+            rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
-            rows.iter().filter(|row| row.context != "global").count(),
-            1,
-            "exactly one binding (] -> NextChangedFile) is deliberately scoped, not global - \
-             see crate::default_key_bindings' own docs for the terminal-input conflict that \
-             scoping prevents"
+            scoped.len(),
+            20,
+            "expected exactly `] -> NextChangedFile` (1) plus every real Editor* binding (19) \
+             to be scoped, not global"
         );
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.context != "global")
-                .map(|row| row.command),
-            Some("Next changed file")
+        assert!(
+            scoped.iter().any(|row| row.command == "Next changed file"),
+            "the diff-scoped (now diff && !file-editor) ] binding must still be reported as \
+             scoped"
+        );
+        assert!(
+            scoped.iter().any(|row| row.command == "Editor: save file"),
+            "a real file-editor-scoped binding must be reported as scoped too"
         );
     }
 
@@ -1004,8 +1061,10 @@ mod tests {
     fn filter_keybinding_rows_matches_context_too() {
         let rows = keymap_page_rows();
         let filtered = filter_keybinding_rows(&rows, "global");
-        // All but the one deliberately-scoped `] -> NextChangedFile` row.
-        assert_eq!(filtered.len(), rows.len() - 1);
+        // All but the deliberately-scoped `"diff"`/`"file-editor"` rows (20 total - see
+        // `keybinding_rows_report_the_real_global_context_for_every_default_binding`).
+        let scoped_count = rows.iter().filter(|row| row.context != "global").count();
+        assert_eq!(filtered.len(), rows.len() - scoped_count);
     }
 
     #[test]

@@ -68,6 +68,14 @@ serde_json = { workspace = true }
 # crate, not a GPUI API, so it needs no `vendor/zed` call-site verification the way GPUI calls
 # do - only the version-pin convention applies).
 regex = "1.5"
+# Real grapheme-cluster-aware cursor movement for `crate::edit_buffer::EditBuffer` (Revision
+# R8.5a's File view text editing), ported from `vendor/zed/crates/gpui/examples/input.rs`'s own
+# `previous_boundary`/`next_boundary` - so Left/Right/Backspace/Delete never split a multi-byte
+# grapheme cluster (an emoji, an accented character built from combining marks, a CRLF pair) in
+# half. Already resolved transitively (via `gpui`'s own text-shaping stack), so this promotes an
+# already-locked crate to a direct dependency rather than adding new version surface - pinned to
+# the exact version this workspace's `Cargo.lock` already resolves.
+unicode-segmentation = "1.13.3"
 
 # Real per-target `gpui_platform` backend selection (Revision R11). `gpui_platform`'s own
 # Cargo.toml (`vendor/zed/crates/gpui_platform/Cargo.toml`) pulls in `gpui_macos`/

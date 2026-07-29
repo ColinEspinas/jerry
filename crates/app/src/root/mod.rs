@@ -36,6 +36,7 @@ use wt_core::merge::{ConflictHunk, ConflictSegment, ConflictedPath};
 use crate::changes::{self, ChangeTag};
 use crate::code_view;
 use crate::diagnostics_view;
+use crate::edit_buffer;
 use crate::env_info;
 use crate::file_tree::{self, FileTreeEntry, LangChip};
 use crate::hover_view;
@@ -73,6 +74,12 @@ use crate::root::task_pool::TaskPool;
 // `JumpToSession1`..`JumpToSession8` are eight distinct zero-sized actions, one per keystroke,
 // since a bound `KeyBinding` maps one literal keystroke to one action value and `actions!`-
 // generated unit structs carry no data a single handler could branch on by position.
+// The `Editor*` actions below (Revision R8.5a) back the File view's real text editing -
+// `crate::root::editing`'s `EntityInputHandler` impl and action handlers. Bound with a
+// `key_context` of `Some("file-editor")` in `crate::default_key_bindings`, scoped to only the
+// editable File view container (`crate::root::code_surface::render_file_view`'s inner container,
+// not the shared outer Diff/File surface `.key_context("diff")` also uses) - see that function's
+// own docs for why the Diff view must never receive these bindings.
 actions!(
     app,
     [
@@ -91,6 +98,25 @@ actions!(
         JumpToSession6,
         JumpToSession7,
         JumpToSession8,
+        EditorBackspace,
+        EditorDelete,
+        EditorEnter,
+        EditorLeft,
+        EditorRight,
+        EditorUp,
+        EditorDown,
+        EditorSelectLeft,
+        EditorSelectRight,
+        EditorSelectUp,
+        EditorSelectDown,
+        EditorHome,
+        EditorEnd,
+        EditorSelectAll,
+        EditorCopy,
+        EditorCut,
+        EditorPaste,
+        EditorSave,
+        EditorSaveAnyway,
     ]
 );
 
@@ -251,6 +277,92 @@ pub struct AdeApp {
     /// [`Self::code_zoom_percent`]. Keyed like [`Self::open_files`], so it gets the same
     /// per-worktree reset in `reset_per_worktree_ui_state`.
     file_zoom_percent: HashMap<PathBuf, u16>,
+    /// Real, live per-tab text-editing state for the File view (Revision R8.5a) - keyed the same
+    /// way as [`Self::open_files`]/[`Self::file_zoom_percent`] (a worktree-relative path), so
+    /// switching between open file tabs never loses unsaved edits in a background tab. Created
+    /// lazily the first time a file is opened in File view (see
+    /// [`crate::root::code_surface::AdeApp::render_file_view`]), seeded from the exact same
+    /// background read [`Self::spawn_file_load`] already performs. [`Self::file_view_cache`]
+    /// stays the freshness-check/diagnostics/hover source of truth (the last-*saved* snapshot,
+    /// per this phase's own scope); this map is what's actually on screen and what an explicit
+    /// save writes. Deliberately **not** removed on an ordinary tab close
+    /// ([`crate::root::code_surface::AdeApp::close_file_tab`]) - dropping unsaved edits just
+    /// because a tab was closed (with no "save before closing?" prompt - out of scope this
+    /// phase) would be a real, silent data-loss risk; reopening the same file later restores the
+    /// exact in-memory buffer. Reset alongside `open_files` in `reset_per_worktree_ui_state` so a
+    /// worktree switch doesn't leak another worktree's buffers, matching the same
+    /// per-worktree-reset convention `open_files`/`file_zoom_percent` already follow.
+    edit_buffers: HashMap<PathBuf, edit_buffer::EditBuffer>,
+    /// Every visible File-view row's real painted bounds and shaped line, captured by
+    /// `crate::root::editing`'s per-row `gpui::canvas` paint callback each render - read back by
+    /// a row's own click handler to hit-test a click into a real byte offset
+    /// (`gpui::LineLayout::closest_index_for_x`) for real click-to-place-cursor. Keyed by 1-based
+    /// line number (matching [`Self::code_cursor`]'s convention). Transient/best-effort: entries
+    /// for rows no longer visible are simply never refreshed again (harmless - a stale entry is
+    /// only ever read for a row-click hit test, and a scrolled-away row can't be clicked), so this
+    /// is cleared wholesale only on a worktree switch, not pruned every frame.
+    file_view_row_layout: HashMap<usize, (gpui::Bounds<Pixels>, gpui::ShapedLine)>,
+    /// The real shaped line, bounds, and 0-indexed buffer line that painted the *caret's own* row
+    /// most recently - `crate::root::editing`'s `EntityInputHandler::bounds_for_range`/
+    /// `character_index_for_point` read these three together (never `file_view_row_layout`, which
+    /// only serves click hit-testing) and honestly return `None` when the caret's row wasn't
+    /// actually painted last frame (e.g. scrolled out of view) - the same real, structural
+    /// "degrade honestly when the query can't be answered" behavior
+    /// `vendor/zed/crates/gpui/examples/input.rs`'s own `TextInput::last_layout`/`last_bounds`
+    /// have, scoped here to whichever path/line they're actually for so a stale entry from a
+    /// different file/line can never be misapplied.
+    file_view_last_layout: Option<gpui::ShapedLine>,
+    file_view_last_bounds: Option<gpui::Bounds<Pixels>>,
+    /// The path and 0-indexed buffer line [`Self::file_view_last_layout`]/
+    /// [`Self::file_view_last_bounds`] are for - `None` until the first paint of a caret row.
+    file_view_last_layout_for: Option<(PathBuf, usize)>,
+    /// Every in-flight debounced real re-highlight (`code_view`'s real `tree-sitter` parse) for a
+    /// dirty [`Self::edit_buffers`] entry, keyed by the same relative path - see
+    /// [`edit_buffer`]'s own "Re-highlighting cost" docs for why this is debounced rather than
+    /// run inline on every keystroke. A single slot per path (not a `TaskPool`): only the most
+    /// recent keystroke's debounce for a given file should ever fire, so a fresh keystroke
+    /// re-arming the same path's entry correctly cancels (drops) whatever shorter-lived timer was
+    /// still waiting - no risk of an out-of-order *write*, unlike
+    /// [`Self::_file_save_tasks`]'s real disk writes, since this only ever reads
+    /// `edit_buffers`/writes back into it, gated by [`crate::edit_buffer::EditBuffer::
+    /// apply_highlight`]'s own real content-snapshot equality check.
+    _rehighlight_tasks: HashMap<PathBuf, Task<()>>,
+    /// Every in-flight explicit `crate::root::editing::AdeApp::save_active_file` background
+    /// write, one slot per path - see [`Self::file_save_pending`]/[`Self::file_save_running`]'s
+    /// own docs for the serial-writer-loop discipline (mirroring
+    /// [`Self::_settings_save_task`]'s own, per-path rather than global) that keeps two saves of
+    /// the *same* file from ever racing on disk, the exact class of bug Revision R5.5 fixed once
+    /// for settings.
+    _file_save_tasks: HashMap<PathBuf, Task<()>>,
+    /// Paths with a save requested while that same path's serial writer loop
+    /// ([`Self::_file_save_tasks`]) was already running - picked up by the loop's own next
+    /// iteration rather than racing a second, independent `std::fs::write` against the same file.
+    file_save_pending: HashSet<PathBuf>,
+    /// Paths whose serial writer loop is currently alive - guards against spawning a second loop
+    /// for a path that already has one draining [`Self::file_save_pending`].
+    file_save_running: HashSet<PathBuf>,
+    /// The most recent explicit save's real failure, if any (e.g. a permission error, disk full) -
+    /// surfaced honestly near the File view's tab strip rather than silently dropped. Also holds
+    /// the real external-change-conflict message (see [`Self::file_external_conflict`]) sharing
+    /// this same small error-surfacing convention. Cleared only by a subsequent successful save
+    /// (ordinary or the real `EditorSaveAnyway` override) of the same path - **not** by closing
+    /// that tab: [`Self::edit_buffers`] is itself deliberately preserved across a tab close (see
+    /// that field's own docs, "not removed on an ordinary tab close") so real unsaved edits
+    /// survive, and a real unresolved save error/conflict for that same still-dirty buffer is
+    /// exactly as real after the tab closes as before - silently dropping the warning just
+    /// because the tab isn't visible would be the same "looks resolved, isn't" risk this whole
+    /// mechanism exists to avoid.
+    file_save_error: Option<(PathBuf, String)>,
+    /// Paths currently flagged with a real, detected conflict: an unsaved (dirty) edit buffer
+    /// whose underlying file has genuinely changed on disk since it was loaded/last saved (some
+    /// other process - git, the agent CLI in a terminal tab, an external editor - touched it).
+    /// Set by [`crate::root::code_surface::AdeApp::render_file_view`]'s existing freshness check
+    /// when it fires while the buffer is dirty; cleared once the check no longer finds a mismatch.
+    /// [`crate::root::editing::AdeApp::save_active_file`] refuses to save (with its own,
+    /// authoritative fresh `std::fs::metadata` check, not just this render-throttled flag) while
+    /// a path is in this set - see that method's own docs for why silently overwriting the
+    /// external change, or silently discarding the user's own unsaved edits, are both wrong.
+    file_external_conflict: HashSet<PathBuf>,
     /// Whether the command palette (⌘K) overlay is open.
     palette_open: bool,
     /// The palette's active scope (`All`/`Commands`/`Files`).
@@ -1016,6 +1128,7 @@ mod settings_persist_tests {
 }
 
 mod code_surface;
+mod editing;
 mod focus;
 mod lsp;
 mod merge_flow;

@@ -652,7 +652,13 @@ pub(crate) fn build_lines(source: &str, spans: &[HighlightSpan]) -> Vec<Rendered
     lines
 }
 
-fn line_ranges(source: &str) -> Vec<Range<usize>> {
+/// Real line-boundary byte ranges within `source`, excluding line-ending bytes (`\n`, and a
+/// preceding `\r` for a CRLF line) - the same ranges [`build_lines`] slices `RenderedLine::text`
+/// from. `pub(crate)` (not private) so `crate::edit_buffer::EditBuffer` can derive its own
+/// byte-offset<->line/column mapping from exactly this function rather than a second,
+/// independently-maintained line-splitting implementation that could silently disagree with what
+/// [`build_lines`] actually displays (a real CRLF off-by-one bug class this sharing avoids).
+pub(crate) fn line_ranges(source: &str) -> Vec<Range<usize>> {
     let bytes = source.as_bytes();
     let mut ranges = Vec::new();
     let mut line_start = 0usize;
@@ -734,6 +740,16 @@ pub struct ParsedFile {
 /// language, and - for a `.rs` file - runs it through [`highlight_rust`]. The `io::Error` is
 /// propagated rather than swallowed; the caller renders it as an honest error message.
 pub fn load_file(path: &Path) -> io::Result<ParsedFile> {
+    Ok(load_file_with_source(path)?.0)
+}
+
+/// [`load_file`]'s real implementation, also handing back the decoded source text - used by
+/// `crate::root::AdeApp::spawn_file_load` to lazily seed a `crate::edit_buffer::EditBuffer` from
+/// the exact same background read/decode this already does, rather than a second, independent
+/// disk read of the same file. `load_file` itself is now a thin wrapper that discards the source,
+/// kept as the public entry point every other existing caller (and this module's own tests)
+/// already uses unchanged.
+pub fn load_file_with_source(path: &Path) -> io::Result<(ParsedFile, String)> {
     let metadata = fs::metadata(path)?;
     let len = metadata.len();
     let mtime = metadata.modified().ok();
@@ -762,7 +778,7 @@ pub fn load_file(path: &Path) -> io::Result<ParsedFile> {
     };
     let lines = build_lines(&source, &spans);
 
-    Ok(ParsedFile {
+    let parsed = ParsedFile {
         path: path.to_path_buf(),
         mtime,
         len,
@@ -771,7 +787,8 @@ pub fn load_file(path: &Path) -> io::Result<ParsedFile> {
         truncated,
         is_valid_utf8,
         lines,
-    })
+    };
+    Ok((parsed, source))
 }
 
 /// Whether `cached` is still an up-to-date parse of `path` - true iff the path matches and both

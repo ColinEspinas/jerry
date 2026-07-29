@@ -11,6 +11,7 @@
 pub mod changes;
 pub mod code_view;
 pub mod diagnostics_view;
+pub mod edit_buffer;
 pub mod env_info;
 pub mod file_tree;
 pub mod fonts;
@@ -80,17 +81,46 @@ use gpui::{
 ///   once for `secondary-,`. Unlike `"]"` below, there's no narrower `key_context` available
 ///   (the palette must be openable from any focus target, including a focused terminal). The `+`
 ///   menu row itself is still a working, click-only way to open the palette scoped to files.
-/// - `"]"` (Next changed file) has no modifier, and is scoped to `Some("diff")` rather than
-///   global - the only one of this app's bindings with a non-`'rail'`/`'session'` context. A
-///   global `"]"` would swallow a literal `]` typed into any focused terminal/agent session
-///   (closing a bracket, an array literal, a regex class) - the same bug class as above. Scoping
-///   to `"diff"` (`crate::root::code_surface`'s `.key_context("diff")` on the Surface C
+/// - `"]"` (Next changed file) has no modifier, and is scoped to `Some("diff && !file-editor")`
+///   rather than global - the only one of this app's bindings with a non-`'rail'`/`'session'`
+///   context. A global `"]"` would swallow a literal `]` typed into any focused terminal/agent
+///   session (closing a bracket, an array literal, a regex class) - the same bug class as above.
+///   Scoping to `"diff"` (`crate::root::code_surface`'s `.key_context("diff")` on the Surface C
 ///   container) means it only fires while a file tab already has focus, matching the design's
 ///   intent: `]` cycles *through an already-open review*, not a global "jump into reviewing"
-///   shortcut.
+///   shortcut. The `&& !file-editor` half is a real, live-reproduced fix (not part of the
+///   original design): Revision R8.5a's real File view text editing adds a `"file-editor"`
+///   context *alongside* `"diff"` on that same container (see the `Editor*` entry below) rather
+///   than replacing it, so a bare `Some("diff")` predicate kept matching - and kept swallowing a
+///   literal `]` keystroke before it ever reached the real edit buffer - even while a file was
+///   actively being edited, reproduced live by typing `]` into real content. `!`/`&&` are real,
+///   supported `KeyBindingContextPredicate` syntax (`vendor/zed/crates/gpui/src/keymap/
+///   context.rs:172-420`'s own `Not`/`And` variants and parser), not invented here.
 /// - `"secondary-1"` through `"secondary-8"` back the tab strip's session-jump keycaps
 ///   (`root::AdeApp::jump_to_session_at`), expanding the design's `mod+1…8` spec into eight
 ///   individually bound keystrokes since GPUI has no "N" wildcard keystroke component.
+/// - The `Editor*` entries (Revision R8.5a's real File view text editing) are scoped to
+///   `Some("file-editor")`, a real *additional* context alongside `"diff"` above - both live on
+///   the *same* focused "code-surface" container (`root::code_surface::AdeApp::
+///   render_code_surface`'s outer div, the one `code_focus_handle` is actually `track_focus`'d
+///   on), with `"file-editor"` only added to that node's own context string (space-separated:
+///   `"diff file-editor"`) while the editable File view - not the read-only Diff view - is
+///   showing for an open tab with a real `EditBuffer`. GPUI's real key dispatch only bubbles
+///   `on_action`/context from the *focused* node up through its ancestors, never down into a
+///   descendant, so binding these on a separate inner container (an earlier draft of this code
+///   tried exactly that) would never actually fire - see `render_code_surface`'s own docs for the
+///   real, live-verified bug this was. The read-only Diff view genuinely never receives a single
+///   one of these bindings: its context string never gains `"file-editor"`. Plain letters/arrows
+///   are deliberately *not* globally bound (unlike, say, `f12`) - binding them at `None` scope
+///   would swallow ordinary typing in every focused terminal session the same way an unscoped
+///   `"]"` would have (see that entry's own docs above) - `"file-editor"` is the only context
+///   they're ever active in. `EditorSave` is `"secondary-s"`, following this list's own
+///   `"secondary-"` convention (verified against this same list: no other entry already claims
+///   it). `EditorSaveAnyway` (`"secondary-shift-s"`) is the real, explicit, opt-in override for
+///   an `AdeApp::file_external_conflict` - see `root::editing::AdeApp::force_save_active_file`'s
+///   own docs for the real permanent-deadlock bug (a conflict that, once flagged, could never
+///   clear again through the ordinary save path) this exists to let the user deliberately break
+///   out of.
 pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
     vec![
         gpui::KeyBinding::new("secondary-n", root::NewSession, None),
@@ -99,7 +129,7 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("f12", root::GotoDefinition, None),
         gpui::KeyBinding::new("ctrl-shift-t", root::NewTerminal, None),
         gpui::KeyBinding::new("secondary-shift-n", root::NewAgentPane, None),
-        gpui::KeyBinding::new("]", root::NextChangedFile, Some("diff")),
+        gpui::KeyBinding::new("]", root::NextChangedFile, Some("diff && !file-editor")),
         gpui::KeyBinding::new("secondary-1", root::JumpToSession1, None),
         gpui::KeyBinding::new("secondary-2", root::JumpToSession2, None),
         gpui::KeyBinding::new("secondary-3", root::JumpToSession3, None),
@@ -108,6 +138,29 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("secondary-6", root::JumpToSession6, None),
         gpui::KeyBinding::new("secondary-7", root::JumpToSession7, None),
         gpui::KeyBinding::new("secondary-8", root::JumpToSession8, None),
+        gpui::KeyBinding::new("backspace", root::EditorBackspace, Some("file-editor")),
+        gpui::KeyBinding::new("delete", root::EditorDelete, Some("file-editor")),
+        gpui::KeyBinding::new("enter", root::EditorEnter, Some("file-editor")),
+        gpui::KeyBinding::new("left", root::EditorLeft, Some("file-editor")),
+        gpui::KeyBinding::new("right", root::EditorRight, Some("file-editor")),
+        gpui::KeyBinding::new("up", root::EditorUp, Some("file-editor")),
+        gpui::KeyBinding::new("down", root::EditorDown, Some("file-editor")),
+        gpui::KeyBinding::new("shift-left", root::EditorSelectLeft, Some("file-editor")),
+        gpui::KeyBinding::new("shift-right", root::EditorSelectRight, Some("file-editor")),
+        gpui::KeyBinding::new("shift-up", root::EditorSelectUp, Some("file-editor")),
+        gpui::KeyBinding::new("shift-down", root::EditorSelectDown, Some("file-editor")),
+        gpui::KeyBinding::new("home", root::EditorHome, Some("file-editor")),
+        gpui::KeyBinding::new("end", root::EditorEnd, Some("file-editor")),
+        gpui::KeyBinding::new("secondary-a", root::EditorSelectAll, Some("file-editor")),
+        gpui::KeyBinding::new("secondary-c", root::EditorCopy, Some("file-editor")),
+        gpui::KeyBinding::new("secondary-x", root::EditorCut, Some("file-editor")),
+        gpui::KeyBinding::new("secondary-v", root::EditorPaste, Some("file-editor")),
+        gpui::KeyBinding::new("secondary-s", root::EditorSave, Some("file-editor")),
+        gpui::KeyBinding::new(
+            "secondary-shift-s",
+            root::EditorSaveAnyway,
+            Some("file-editor"),
+        ),
     ]
 }
 

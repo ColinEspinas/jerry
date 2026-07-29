@@ -305,17 +305,60 @@ impl AdeApp {
     pub(super) fn spawn_file_load(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.file_load_state = FileLoadState::Loading(path.clone());
         cx.notify();
+        // The worktree-relative key `Self::edit_buffers` uses, matching `Self::open_files`' own
+        // convention - computed synchronously here (a cheap prefix-strip, no I/O) so the
+        // background closure below can move it in without needing `&self` later.
+        let relative_path = path
+            .strip_prefix(&self.file_tree_root)
+            .map(|stripped| stripped.to_path_buf())
+            .unwrap_or_else(|_| path.clone());
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_string());
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn({
                     let path = path.clone();
-                    async move { code_view::load_file(&path) }
+                    async move { code_view::load_file_with_source(&path) }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok(parsed) => {
+                    Ok((parsed, source)) => {
+                        // Lazily seed a real edit buffer the first time this file is opened in
+                        // File view - never overwrite an existing entry (which may hold real
+                        // unsaved edits and a live cursor/selection); see `Self::edit_buffers`'
+                        // own docs. A truncated file (see `code_view::MAX_FILE_BYTES`) is
+                        // deliberately excluded: editing a partial view and saving it would
+                        // silently discard everything past the cap - the same reasoning that
+                        // already justifies the cap itself - so such a file stays read-only. A
+                        // file whose real bytes aren't valid UTF-8 is excluded for the same real
+                        // reason: `code_view::load_file_with_source`'s `source` is already a
+                        // lossy `String::from_utf8_lossy` decode at that point, with every
+                        // invalid byte sequence silently replaced by `U+FFFD` - seeding an
+                        // editable buffer from it and later saving would overwrite the file's
+                        // real original bytes with those replacement characters. `parsed.
+                        // is_valid_utf8` is the exact real flag `code_view::load_file` already
+                        // computes for this (already surfaced in the status bar's `UTF-8`
+                        // label) - reused here rather than a second check.
+                        if !parsed.truncated
+                            && parsed.is_valid_utf8
+                            && !this.edit_buffers.contains_key(&relative_path)
+                        {
+                            this.edit_buffers.insert(
+                                relative_path.clone(),
+                                edit_buffer::EditBuffer::from_highlighted(
+                                    path.clone(),
+                                    source,
+                                    extension.clone(),
+                                    parsed.lines.clone(),
+                                    parsed.mtime,
+                                    parsed.len,
+                                ),
+                            );
+                        }
                         this.file_view_cache = Some(parsed);
                         // A pending go-to-definition target line applies only if it names the
                         // file that just finished loading, so an unrelated file's load can't
@@ -735,6 +778,32 @@ impl AdeApp {
             _ => self.render_file_view(relative_path, cx),
         };
 
+        // Whether the real, editable File view (Revision R8.5a) - not the read-only Diff view -
+        // is showing right now, with a real `EditBuffer` actually backing it.
+        //
+        // `"file-editor"` is added to the *same* node's key context as the pre-existing
+        // `"diff"` one (space-separated - `gpui::KeyContext` treats a context string as a real
+        // set of identifiers, matched independently, not a single opaque token; verified against
+        // `vendor/zed/crates/gpui/src/keymap/context.rs`), rather than on a separate inner
+        // container the way an earlier version of this code tried: GPUI's real key dispatch
+        // builds its context stack (and bubbles `on_action`) from the *focused* node up through
+        // its ancestors only (`vendor/zed/crates/gpui/src/window.rs::dispatch_key_event`, via
+        // `focus_node_id_in_rendered_frame`/`dispatch_path`) - a context or `on_action` set on a
+        // *descendant* of the focused node (which `code_focus_handle`'s own `track_focus` below
+        // already pins to *this* outer div) is never reachable from a real dispatch, a real,
+        // live-verified bug an earlier version of this code shipped with (real keystroke
+        // simulation tests against `EditorLeft`/`EditorSave`/etc. failed until this moved here).
+        // The Diff view still genuinely never receives these bindings: `is_file_editor` is false
+        // whenever `effective_view` isn't `File`, so the context string never gains
+        // `"file-editor"` in that case.
+        let is_file_editor = effective_view == code_view::CodeView::File
+            && self.edit_buffers.contains_key(relative_path);
+        let key_context = if is_file_editor {
+            "diff file-editor"
+        } else {
+            "diff"
+        };
+
         div()
             .id("code-surface")
             // Focus target for the whole Diff/File surface - see `code_focus_handle`'s docs for
@@ -742,8 +811,33 @@ impl AdeApp {
             // identical `track_focus` fixes for the Settings surface.
             .track_focus(&self.code_focus_handle)
             // Scopes `]` (`NextChangedFile`) to only fire while a file tab has focus - see that
-            // binding's docs for the terminal-input-swallowing bug this prevents.
-            .key_context("diff")
+            // binding's docs for the terminal-input-swallowing bug this prevents. `"file-editor"`
+            // (Revision R8.5a's real File view text editing) is added the same way - see this
+            // method's own docs, above, for why both live on this one node.
+            .key_context(key_context)
+            // Harmless when `key_context` doesn't include `"file-editor"` (the Diff view, or a
+            // File view with no buffer yet): none of `crate::default_key_bindings`' real
+            // `"file-editor"`-scoped bindings can ever be found in that case, and every handler
+            // below is independently guarded by `AdeApp::active_editable_path` regardless.
+            .on_action(cx.listener(Self::handle_editor_backspace_action))
+            .on_action(cx.listener(Self::handle_editor_delete_action))
+            .on_action(cx.listener(Self::handle_editor_enter_action))
+            .on_action(cx.listener(Self::handle_editor_left_action))
+            .on_action(cx.listener(Self::handle_editor_right_action))
+            .on_action(cx.listener(Self::handle_editor_up_action))
+            .on_action(cx.listener(Self::handle_editor_down_action))
+            .on_action(cx.listener(Self::handle_editor_select_left_action))
+            .on_action(cx.listener(Self::handle_editor_select_right_action))
+            .on_action(cx.listener(Self::handle_editor_select_up_action))
+            .on_action(cx.listener(Self::handle_editor_select_down_action))
+            .on_action(cx.listener(Self::handle_editor_home_action))
+            .on_action(cx.listener(Self::handle_editor_end_action))
+            .on_action(cx.listener(Self::handle_editor_select_all_action))
+            .on_action(cx.listener(Self::handle_editor_copy_action))
+            .on_action(cx.listener(Self::handle_editor_cut_action))
+            .on_action(cx.listener(Self::handle_editor_paste_action))
+            .on_action(cx.listener(Self::handle_editor_save_action))
+            .on_action(cx.listener(Self::handle_editor_save_anyway_action))
             .flex()
             .flex_col()
             .flex_1()
@@ -1096,6 +1190,47 @@ impl AdeApp {
                 .is_some_and(|cached| cached.path == absolute_path)
         };
 
+        // The real, up-to-the-instant external-change-vs-unsaved-edit conflict (Revision R8.5a) -
+        // see `AdeApp::file_external_conflict`'s own docs. Must run here, alongside the freshness
+        // check itself and *before* the `!cache_fresh` early return below (which shows a "loading"
+        // placeholder instead of reaching any of this function's later code this render) - a
+        // dirty buffer's file going stale is exactly the `!cache_fresh` case, so detecting it only
+        // reachable from the "already fresh" fall-through path below would make this dead code.
+        //
+        // Deliberately compared against the buffer's *own* `saved_mtime`/`saved_len` (the same
+        // real authoritative basis `AdeApp::save_active_file`'s own check uses), not against
+        // `cache_fresh`/`file_view_cache` above: `spawn_file_load` always refreshes
+        // `file_view_cache` to match whatever's really on disk, *regardless of whether the edit
+        // buffer is dirty* (it's the diagnostics/hover source of truth, not the editor) - so
+        // `cache_fresh` becomes `true` again on the very next throttled check after that refresh
+        // even while the buffer is still genuinely diverged from the new disk content. Basing
+        // this on `cache_fresh` instead (an earlier version of this code did) let the conflict
+        // banner silently self-clear a `FILE_FRESHNESS_CHECK_INTERVAL` or two after the external
+        // change, while the real conflict - a dirty buffer that still doesn't match disk - was
+        // still fully present; `save_active_file`'s own independent check meant this never risked
+        // actual data loss, but the *visible warning* disappearing on its own would have been a
+        // real, deceptive regression from "surface a real warning".
+        if should_check {
+            match self.edit_buffers.get(relative_path) {
+                Some(buffer) if buffer.is_dirty() => {
+                    let metadata = std::fs::metadata(&absolute_path).ok();
+                    let disk_mtime = metadata.as_ref().and_then(|meta| meta.modified().ok());
+                    let disk_len = metadata.as_ref().map(|meta| meta.len());
+                    let unchanged_since_buffer_loaded =
+                        disk_mtime == buffer.saved_mtime && disk_len == Some(buffer.saved_len);
+                    if unchanged_since_buffer_loaded {
+                        self.file_external_conflict.remove(relative_path);
+                    } else {
+                        self.file_external_conflict
+                            .insert(relative_path.to_path_buf());
+                    }
+                }
+                _ => {
+                    self.file_external_conflict.remove(relative_path);
+                }
+            }
+        }
+
         if !cache_fresh {
             // A load already in flight, or a previous read failure, for this exact path must not
             // respawn another load on every render. Without also checking `FileLoadState::Error`
@@ -1212,17 +1347,139 @@ impl AdeApp {
         let cursor = self.code_cursor;
         let status_bar = render_file_status_bar(parsed, cursor, lsp_status.as_ref());
         let truncated = parsed.truncated;
-        let line_count = parsed.lines.len();
-        let diagnostics_card = render_diagnostics_card(&self.file_view_diagnostics);
+        // Real, editable file-view state (Revision R8.5a): whichever `EditBuffer`
+        // `spawn_file_load`'s completion already lazily seeded for `relative_path` (`None` only
+        // for a truncated file, which stays read-only - see that method's own docs). Its `lines`,
+        // not `parsed.lines`, is what's actually on screen from here on whenever it exists -
+        // `parsed`/`file_view_cache` stays the freshness-check/diagnostics/hover source of truth
+        // (the last-*saved* snapshot), never the live edited text, per this phase's own scope.
+        let relative_path_buf = relative_path.to_path_buf();
+        let line_count = self
+            .edit_buffers
+            .get(&relative_path_buf)
+            .map(|buffer| buffer.lines.len())
+            .unwrap_or_else(|| parsed.lines.len());
+        // `true` while the real edit buffer for this file has genuine unsaved changes - the
+        // real, honest gate finding 4's fix hinges on. `self.file_view_diagnostics`/
+        // `self.file_view_changed_lines` are both keyed by line numbers derived from the
+        // last-*saved* content (see this method's own docs above); once the buffer is dirty,
+        // those line numbers can no longer be trusted to name the same real line in the *edited*
+        // text an inserted/removed line anywhere above a diagnostic/change shifts every
+        // subsequent one onto the wrong row. Rather than confidently painting a diagnostic
+        // underline/red row background/git-gutter stripe on what may now be the *wrong* line,
+        // every per-row decoration below is suppressed while dirty, and one honest banner (below)
+        // takes their place - this phase's own scope (LSP reflects last-saved content only)
+        // honestly justifies *stale* diagnostics, not *confidently mis-anchored* ones.
+        let buffer_dirty = self
+            .edit_buffers
+            .get(&relative_path_buf)
+            .is_some_and(|buffer| buffer.is_dirty());
+        let diagnostics_card = if buffer_dirty {
+            None
+        } else {
+            render_diagnostics_card(&self.file_view_diagnostics)
+        };
         // Hover only applies to a file whose extension has a real LSP identity; cloned once here
         // and reused per row for the same reason as `file_uri` above.
         let hover_target = has_lsp.then(|| absolute_path.clone());
         let hover_card = render_hover_card(self.hover.as_ref(), &absolute_path, cx);
+        let row_line_height = px(self.effective_code_rem_px() * 1.6);
+        let code_focus_handle = self.code_focus_handle.clone();
+        let entity = cx.entity();
+        let conflict = self.file_external_conflict.contains(&relative_path_buf);
+        let save_error = self
+            .file_save_error
+            .as_ref()
+            .filter(|(path, _)| path == &relative_path_buf)
+            .map(|(_, message)| message.clone());
 
         let code = uniform_list(
             "file-view-code",
             line_count,
             cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
+                let relative_path = relative_path_buf.clone();
+                let has_buffer = this.edit_buffers.contains_key(&relative_path);
+                if has_buffer {
+                    let total = this
+                        .edit_buffers
+                        .get(&relative_path)
+                        .map(|buffer| buffer.lines.len())
+                        .unwrap_or(0);
+                    let start = range.start.min(total);
+                    let end = range.end.min(total);
+                    // `AdeApp::file_view_row_layout` is transient/best-effort (see its own docs)
+                    // but was never pruned per-frame, only cleared wholesale on a worktree
+                    // switch - a real, measured unbounded-growth risk (one `(Bounds, ShapedLine)`
+                    // retained per line ever scrolled past, for the life of the worktree
+                    // session). Pruned here to just this frame's own visible range (1-based, to
+                    // match the map's own key convention): any entry this drops for a row that's
+                    // about to be rebuilt below is harmless - that row's own real paint, moments
+                    // later this same pass, reinserts it fresh anyway.
+                    let visible_line_numbers = (start + 1)..=end;
+                    this.file_view_row_layout
+                        .retain(|line_number, _| visible_line_numbers.contains(line_number));
+                    let cursor_line = this.code_cursor;
+                    let cursor_line_index = this
+                        .edit_buffers
+                        .get(&relative_path)
+                        .map(|buffer| buffer.line_col_for_offset(buffer.cursor_offset()).0);
+                    let mut rows = Vec::with_capacity(end.saturating_sub(start));
+                    for index in start..end {
+                        let Some(buffer) = this.edit_buffers.get(&relative_path) else {
+                            break;
+                        };
+                        let Some(line) = buffer.lines.get(index) else {
+                            break;
+                        };
+                        let line_number = index + 1;
+                        let is_current = cursor_line == Some(line_number);
+                        // Suppressed while dirty - see this method's own `buffer_dirty` docs
+                        // above for why a stale-line-numbered decoration painted on the wrong
+                        // real row is worse than none at all.
+                        let is_changed =
+                            !buffer_dirty && this.file_view_changed_lines.contains(&line_number);
+                        let empty_diagnostics: Vec<diagnostics_view::LineDiagnostic> = Vec::new();
+                        let line_diagnostics = if buffer_dirty {
+                            &empty_diagnostics
+                        } else {
+                            this.file_view_diagnostics
+                                .get(&line_number)
+                                .unwrap_or(&empty_diagnostics)
+                        }
+                        .clone();
+                        let hovered_byte_range = this.hover.as_ref().and_then(|entry| {
+                            (entry.path == absolute_path && entry.line_number == line_number)
+                                .then(|| entry.byte_range.clone())
+                        });
+                        let selection_local = buffer.selection_within_line(index);
+                        let cursor_local = buffer.cursor_within_line(index);
+                        let marked_local = buffer.marked_within_line(index);
+                        let context = crate::root::editing::EditableLineContext {
+                            entity: entity.clone(),
+                            focus_handle: code_focus_handle.clone(),
+                            path: relative_path.clone(),
+                            line_index: index,
+                            line_number,
+                            line,
+                            is_current,
+                            is_changed,
+                            is_cursor_line: cursor_line_index == Some(index),
+                            selection_local,
+                            cursor_local,
+                            marked_local,
+                            diagnostics: &line_diagnostics,
+                            hovered_byte_range,
+                            hover_target: hover_target.as_deref(),
+                        };
+                        rows.push(crate::root::editing::render_editable_file_view_line(
+                            context,
+                            row_line_height,
+                            cx,
+                        ));
+                    }
+                    return rows;
+                }
+
                 let Some(parsed) = &this.file_view_cache else {
                     return Vec::new();
                 };
@@ -1270,19 +1527,55 @@ impl AdeApp {
         .text_size(rems(1.0))
         .line_height(rems(1.6));
 
+        // The real `"file-editor"` key context and `Editor*` `on_action` handlers (Revision
+        // R8.5a) live on `Self::render_code_surface`'s outer, focused "code-surface" div, not
+        // here - see that method's own docs for why (GPUI's real key dispatch only reaches
+        // ancestors of the focused node, and this `body` is a descendant of it).
         let mut body = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
-            .child(render_file_breadcrumb(relative_path))
-            .child(zoom_scoped(self.effective_code_rem_px(), code));
+            .child(render_file_breadcrumb(relative_path));
+
+        if buffer_dirty {
+            // The one honest banner finding 4's fix replaces every per-row diagnostic/change-
+            // marker/hover decoration with, right below the breadcrumb where it's genuinely hard
+            // to miss - see `buffer_dirty`'s own docs above for the real, confidently-wrong-row
+            // bug this exists instead of. `debug_selector`'d (matching `render_file_view_line`'s
+            // own `file-view-gutter-{n}` precedent) so a real test can assert on its real,
+            // painted presence/absence rather than only on the underlying boolean.
+            body = body.child(
+                div()
+                    .debug_selector(|| "file-view-dirty-diagnostics-banner".to_string())
+                    .child(render_sidebar_message(
+                        "unsaved edits: diagnostics, change markers, and hover-to-inspect below \
+                         reflect the last saved version, not your live edits - save to refresh \
+                         them"
+                            .to_string(),
+                        theme::text::FAINT,
+                    )),
+            );
+        }
+
+        body = body.child(zoom_scoped(self.effective_code_rem_px(), code));
 
         if truncated {
             body = body.child(render_sidebar_message(
-                "... file truncated (larger than 2 MiB)".to_string(),
+                "... file truncated (larger than 2 MiB) - read-only".to_string(),
                 theme::text::FAINT,
             ));
+        }
+        if conflict {
+            body = body.child(render_sidebar_message(
+                "external change detected: this file changed on disk while you have unsaved \
+                 edits - secondary-s is blocked; press secondary-shift-s to overwrite the \
+                 external change with your edits anyway"
+                    .to_string(),
+                theme::status::FAIL,
+            ));
+        } else if let Some(message) = save_error {
+            body = body.child(render_sidebar_message(message, theme::status::FAIL));
         }
         if let Some(card) = diagnostics_card {
             body = body.child(card);
@@ -2444,6 +2737,84 @@ mod code_view_cache_tests {
             updated_line_count > original_line_count,
             "once the throttle window passed, the same real on-disk change should finally have \
              been picked up"
+        );
+    }
+}
+
+/// Regression coverage (finding 4): once a File view's real `EditBuffer` is dirty,
+/// `file_view_diagnostics`/`file_view_changed_lines` (both keyed by line numbers from the last-
+/// *saved* content) can no longer be trusted to name the same real row in the *edited* text - see
+/// `AdeApp::render_file_view`'s own `buffer_dirty` docs for the full "confidently mis-anchored,
+/// not just stale" reasoning. Confirms the real, honest banner this fix adds is genuinely absent
+/// on a clean buffer (the legitimate case must not regress) and genuinely present once the same
+/// buffer becomes dirty.
+#[cfg(test)]
+mod dirty_buffer_stale_decoration_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    const BANNER_SELECTOR: &str = "file-view-dirty-diagnostics-banner";
+
+    #[gpui::test]
+    fn the_honest_stale_decoration_banner_is_absent_on_a_clean_buffer_and_present_once_dirty(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn main() {\n    1\n}\n").expect("write sample.rs");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+
+        // A real, synthetic diagnostic/changed-line entry - standing in for what a real language
+        // server/git diff would otherwise populate, so this test doesn't need a real spawned
+        // rust-analyzer to exercise the real gating logic under test.
+        app.update(cx, |app, _cx| {
+            app.file_view_changed_lines.insert(2);
+            app.file_view_diagnostics.insert(
+                2,
+                vec![diagnostics_view::LineDiagnostic {
+                    byte_range: 0..1,
+                    severity: diagnostics_view::Severity::Error,
+                    message: "a real synthetic diagnostic".to_string(),
+                    source: None,
+                    code: None,
+                }],
+            );
+        });
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+
+        assert!(
+            cx.debug_bounds(BANNER_SELECTOR).is_none(),
+            "the legitimate, clean-buffer case must not regress: a clean buffer with real \
+             diagnostics/changed lines must not show the dirty-staleness banner"
+        );
+
+        // Dirty the buffer with a real edit.
+        let relative = PathBuf::from("sample.rs");
+        app.update(cx, |app, cx| {
+            app.edit_buffers
+                .get_mut(&relative)
+                .expect("real edit buffer should have been seeded for sample.rs")
+                .replace_range(None, "// ");
+            cx.notify();
+        });
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+
+        assert!(
+            cx.debug_bounds(BANNER_SELECTOR).is_some(),
+            "once the buffer is genuinely dirty, the real honest banner must be shown instead of \
+             confidently painting decorations that may now be anchored to the wrong real row"
         );
     }
 }
