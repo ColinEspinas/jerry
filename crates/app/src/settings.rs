@@ -529,6 +529,18 @@ fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::TogglePalette" => Some("Command palette"),
         "app::ToggleSettings" => Some("Open settings"),
         "app::GotoDefinition" => Some("Go to definition"),
+        // Revision R4a's tab-strip `+` menu and session-jump keycaps.
+        "app::NewTerminal" => Some("New terminal"),
+        "app::NewAgentPane" => Some("New agent pane"),
+        "app::NextChangedFile" => Some("Next changed file"),
+        "app::JumpToSession1" => Some("Jump to session 1"),
+        "app::JumpToSession2" => Some("Jump to session 2"),
+        "app::JumpToSession3" => Some("Jump to session 3"),
+        "app::JumpToSession4" => Some("Jump to session 4"),
+        "app::JumpToSession5" => Some("Jump to session 5"),
+        "app::JumpToSession6" => Some("Jump to session 6"),
+        "app::JumpToSession7" => Some("Jump to session 7"),
+        "app::JumpToSession8" => Some("Jump to session 8"),
         _ => None,
     }
 }
@@ -932,6 +944,17 @@ mod tests {
                 "Command palette",
                 "Open settings",
                 "Go to definition",
+                "New terminal",
+                "New agent pane",
+                "Next changed file",
+                "Jump to session 1",
+                "Jump to session 2",
+                "Jump to session 3",
+                "Jump to session 4",
+                "Jump to session 5",
+                "Jump to session 6",
+                "Jump to session 7",
+                "Jump to session 8",
             ]
         );
     }
@@ -940,12 +963,25 @@ mod tests {
     fn keybinding_rows_report_the_real_global_context_for_every_default_binding() {
         // The real bug this replaced: the old hand-copied list labeled `Go to definition`
         // `context: "editor"`, but `crate::default_key_bindings` actually registers it (like
-        // every other entry) with `KeyBinding::new(.., None)` - a real, global context. Every
-        // row here is derived from that same real `None`, so every row must say `"global"`.
+        // every other entry except `NextChangedFile`, see below) with `KeyBinding::new(..,
+        // None)` - a real, global context. Every row here is derived from that same real
+        // registration, so every row but one must say `"global"`.
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings);
         assert!(!rows.is_empty());
-        assert!(rows.iter().all(|row| row.context == "global"));
+        assert_eq!(
+            rows.iter().filter(|row| row.context != "global").count(),
+            1,
+            "exactly one real binding (] -> NextChangedFile) is deliberately scoped, not \
+             global - see crate::default_key_bindings' own docs for the real terminal-input \
+             conflict that scoping prevents"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.context != "global")
+                .map(|row| row.command),
+            Some("Next changed file")
+        );
     }
 
     #[test]
@@ -977,15 +1013,21 @@ mod tests {
     fn filter_keybinding_rows_matches_command_case_insensitively() {
         let rows = keymap_page_rows();
         let filtered = filter_keybinding_rows(&rows, "PALETTE");
+        // Exactly one real row matches - `secondary-k` is the only real keystroke bound to
+        // `TogglePalette` (the `+` menu's "Open file…" row has no real global keybinding of its
+        // own - see `crate::default_key_bindings`'s own docs for the real Ctrl+P/readline
+        // conflict that ruled one out).
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].command, "Command palette");
+        assert!(filtered.iter().all(|row| row.command == "Command palette"));
     }
 
     #[test]
     fn filter_keybinding_rows_matches_context_too() {
         let rows = keymap_page_rows();
         let filtered = filter_keybinding_rows(&rows, "global");
-        assert_eq!(filtered.len(), rows.len(), "every real row is global");
+        // All but the one deliberately-scoped `] -> NextChangedFile` row - see
+        // `keybinding_rows_report_the_real_global_context_for_every_default_binding`'s own docs.
+        assert_eq!(filtered.len(), rows.len() - 1);
     }
 
     #[test]

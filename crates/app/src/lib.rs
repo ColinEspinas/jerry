@@ -64,12 +64,85 @@ use gpui::{
 /// `target_os` - `crate::keymap::WindowControlsStyle`'s runtime title-bar/keycap override can't
 /// change which physical key this list matches (see that type's own docs for why, and why that's
 /// an honest, documented limitation rather than a bug).
+///
+/// ## The `+` menu / tab-strip bindings added alongside this (Revision R4a)
+///
+/// `"ctrl-shift-t"` is deliberately *not* `"secondary-shift-t"` - the mockup's own
+/// `Jerry.dc.html` `keymapDefs`/`plusItems` fixture literally specs `New terminal in worktree` as
+/// `ctrl+shift+T` (`{ cmd: 'New terminal in worktree', spec: 'ctrl+shift+T', ctx: 'session', src:
+/// 'user' }`), not `mod+shift+T` - a real, literal Ctrl on every OS including macOS, unlike every
+/// other binding in this list. `"ctrl"` is confirmed as GPUI's real, always-`modifiers.control`
+/// component (distinct from `"secondary"`'s per-OS alias - see this function's own docs, above)
+/// at `vendor/zed/crates/gpui/src/platform/keystroke.rs`'s `Keystroke::parse`.
+///
+/// `"secondary-shift-n"` (New agent pane) does use the real `"secondary-"` alias, per the
+/// mockup's own `mod+shift+N` spec for that row.
+///
+/// The `+` menu's fourth row, "Open file…", has **no** real global keybinding at all, despite the
+/// mockup's own `mod+P` spec for it - a real, live-reproduced conflict found in audit, not an
+/// oversight: `crate::terminal_pane::keystroke_to_bytes` maps an unmodified `Ctrl+<letter>`
+/// keystroke to the real terminal control byte a focused shell expects
+/// (`letter.to_ascii_uppercase() as u8 & 0x1f`), and Ctrl+P (`0x10`) is a real, standard readline
+/// binding (`previous-history`) every real shell relies on. GPUI dispatches a matched, registered
+/// `KeyBinding`'s action *before* a focused element's own `on_key_down`
+/// (`vendor/zed/crates/gpui/src/window.rs`'s `dispatch_key_event`), so a *global* `"secondary-p"`
+/// binding here would silently swallow that real keystroke in every focused terminal/agent
+/// session on Linux/Windows (where `"secondary"` resolves to plain `Ctrl`), breaking real shell
+/// history navigation - the same real "app-level shortcut steals real terminal input" bug class
+/// this crate's own R2 audit already found and fixed once for `secondary-,`. Unlike `"]"` (below),
+/// there's no `key_context` that can scope this the same way: the palette has to be openable from
+/// *any* real focus target, including a focused terminal (that's exactly what `"secondary-k"`
+/// already does, and still does), so there's no narrower context to require. The `+` menu row
+/// itself is still a real, working, click-only way to open the palette scoped to files - see
+/// `root::AdeApp::render_plus_menu`'s own docs.
+///
+/// `"]"` (Next changed file) has no modifier at all - the mockup's own spec is the bare key,
+/// confirmed against `vendor/zed/crates/gpui/src/platform/keystroke.rs`'s `Keystroke::parse`,
+/// which accepts a single unrecognized component as the key on its own with no modifiers set.
+/// Unlike every other binding here, it's scoped to `Some("diff")` (matching the mockup's own
+/// `keymapDefs` entry - `{ cmd: 'Next changed file', spec: ']', ctx: 'diff', src: 'base' }` -
+/// the *only* one of this app's real global bindings with a non-`'rail'`/`'session'` context),
+/// not `None` (global) - a real, live-verified reason, not just literal spec-following: GPUI
+/// dispatches a matched `KeyBinding`'s action *before* a focused element's own `on_key_down`
+/// (`vendor/zed/crates/gpui/src/window.rs`'s `dispatch_key_event`, whose `match_result.bindings`
+/// loop runs, and unconditionally sets `cx.propagate_event = false` on a real match, ahead of
+/// `finish_dispatch_key_event` - the function that actually invokes `on_key_down` listeners like
+/// `crate::terminal_pane::TerminalPane::handle_key_down`). A *global* `"]"` binding would
+/// therefore have silently swallowed a literal `]` keystroke typed into any live, focused
+/// terminal/agent session - closing a bracket, an array literal, a regex character class - and
+/// forwarded it to `NextChangedFile` instead, exactly the "app-level shortcut steals real
+/// terminal input" bug class this crate's own R2 audit already found and fixed once for
+/// `secondary-,`. Scoping to `"diff"` (via `crate::root::code_surface`'s own `.key_context
+/// ("diff")` on the Surface C/diff-file container - real, verified at `vendor/zed/crates/gpui/
+/// src/elements/div.rs`'s `Styled::key_context`) means it only fires while a real file tab
+/// already has focus, which is also a real, defensible reading of the design's own intent: `]`
+/// cycles *through an already-open review*, not a global "jump into reviewing from anywhere"
+/// shortcut - the `+` menu's own "Next changed file" row (a mouse click, not a keystroke) still
+/// works from any tab regardless of this scoping.
+///
+/// `"secondary-1"` through `"secondary-8"` back the tab strip's real session-jump keycaps
+/// (`root::AdeApp::jump_to_session_at`) - the design's own `mod+1…8` spec
+/// (`Jerry.dc.html`'s `keymapDefs`: `{ cmd: 'Jump to session by position', spec: 'mod+1…8', ctx:
+/// 'rail', src: 'base' }`) expanded into eight real, individually bound keystrokes, since GPUI
+/// has no "N" wildcard keystroke component - only eight separate literal bindings actually make
+/// each number jump to that position.
 pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
     vec![
         gpui::KeyBinding::new("secondary-n", root::NewSession, None),
         gpui::KeyBinding::new("secondary-k", root::TogglePalette, None),
         gpui::KeyBinding::new("secondary-,", root::ToggleSettings, None),
         gpui::KeyBinding::new("f12", root::GotoDefinition, None),
+        gpui::KeyBinding::new("ctrl-shift-t", root::NewTerminal, None),
+        gpui::KeyBinding::new("secondary-shift-n", root::NewAgentPane, None),
+        gpui::KeyBinding::new("]", root::NextChangedFile, Some("diff")),
+        gpui::KeyBinding::new("secondary-1", root::JumpToSession1, None),
+        gpui::KeyBinding::new("secondary-2", root::JumpToSession2, None),
+        gpui::KeyBinding::new("secondary-3", root::JumpToSession3, None),
+        gpui::KeyBinding::new("secondary-4", root::JumpToSession4, None),
+        gpui::KeyBinding::new("secondary-5", root::JumpToSession5, None),
+        gpui::KeyBinding::new("secondary-6", root::JumpToSession6, None),
+        gpui::KeyBinding::new("secondary-7", root::JumpToSession7, None),
+        gpui::KeyBinding::new("secondary-8", root::JumpToSession8, None),
     ]
 }
 

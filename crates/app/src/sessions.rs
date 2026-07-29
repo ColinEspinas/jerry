@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use gpui::{AppContext as _, Context, Entity};
+use gpui::{App, AppContext as _, Context, Entity, Focusable as _, Window};
 
 use crate::root::AdeApp;
 use crate::terminal_pane::{TerminalPane, TerminalSpec};
@@ -128,6 +128,28 @@ impl Sessions {
     /// worktree's real path, or the repo root if none is selected - see
     /// `crate::root::AdeApp::active_session_cwd`), appends it as a new tab, and makes it the
     /// active tab. Returns the new session's id.
+    ///
+    /// ## Real keyboard focus is the caller's job, not this method's
+    ///
+    /// This used to also move `Window::focus` onto the new session's own pane unconditionally,
+    /// right here - correct as long as the centre pane only ever showed a session, but a real,
+    /// live-reproduced bug once Revision R4a's unified tab strip let a *file* tab be the thing
+    /// showing instead: `crate::root::AdeApp::render_center_pane` never mounts any
+    /// `TerminalPane` while a file tab (`AdeApp::open_change`) is active - so spawning a second
+    /// session while a file tab was showing still pointed `Window::focus` at a pane
+    /// `render_center_pane` never renders that frame. GPUI's own focus resolution falls back to
+    /// the dispatch tree's synthetic root node when that happens - a node that sits *above*
+    /// every one of `crate::root::AdeApp::render`'s own `on_action` handlers, so **every** bound
+    /// keyboard shortcut would silently stop working (reproduced live: open a file tab, press
+    /// `ctrl-shift-t`, then `ctrl-k` did nothing) until the next click re-established real
+    /// focus.
+    ///
+    /// Only the caller - `crate::root::AdeApp` - knows whether a file tab is currently the thing
+    /// occupying the centre pane, so the decision of *whether* to move focus onto the freshly
+    /// spawned session now lives there too: every real call site
+    /// (`AdeApp::new_session`/`open_companion_terminal`/`respawn_session`/`new_agent_pane`, plus
+    /// the initial shell `AdeApp::new_with_settings` spawns) calls [`Self::focus_active`]
+    /// itself, guarded by `AdeApp::open_change.is_none()`, right after this returns.
     pub fn spawn(
         &mut self,
         kind: SessionKind,
@@ -156,13 +178,35 @@ impl Sessions {
         }
     }
 
+    /// Moves real keyboard focus onto the currently active session's own terminal pane, if
+    /// there is one - a real no-op (nothing focused) when [`Self::active`] is `None`. Shared by
+    /// every real caller that needs to (re)point `Window::focus` at "whichever session is active
+    /// right now": [`Self::spawn`]'s own real call sites (see that method's docs for why the
+    /// guard itself has to live in the caller) and [`Self::close`] (see that method's docs).
+    pub fn focus_active(&self, window: &mut Window, cx: &mut App) {
+        if let Some(session) = self.active() {
+            window.focus(&session.pane.focus_handle(cx), cx);
+        }
+    }
+
     /// Closes a tab: deterministically tears down its real `PtySession` via
     /// `TerminalPane::shutdown` (see that method's docs) *before* dropping the
     /// `Entity<TerminalPane>`, so closing a tab never just hides it while its process leaks.
     /// If the closed tab was active, activates the tab that slides into its old index
     /// (i.e. its right neighbor), falling back to its left neighbor, falling back to no
-    /// active tab if it was the last one open.
-    pub fn close(&mut self, id: SessionId, cx: &mut Context<AdeApp>) {
+    /// active tab if it was the last one open - and, if a new tab did become active,
+    /// moves real keyboard focus onto its pane via [`Self::focus_active`], unless
+    /// `file_tab_active` says a file tab is what's really occupying the centre pane right now
+    /// (the same real condition, and the same real dangling-`Window::focus` bug, [`Self::spawn`]'s
+    /// own docs describe - the caller, `crate::root::AdeApp::close_session`, computes it from
+    /// `AdeApp::open_change.is_some()`, the one thing here that can't know it itself).
+    pub fn close(
+        &mut self,
+        id: SessionId,
+        file_tab_active: bool,
+        window: &mut Window,
+        cx: &mut Context<AdeApp>,
+    ) {
         let Some(index) = self.sessions.iter().position(|session| session.id == id) else {
             return;
         };
@@ -180,6 +224,9 @@ impl Sessions {
             } else {
                 None
             };
+            if !file_tab_active {
+                self.focus_active(window, cx);
+            }
         }
     }
 }

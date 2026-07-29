@@ -72,9 +72,24 @@ impl AdeApp {
         self._load_diff_task = Some(task);
     }
 
+    /// Pushes `path` onto [`Self::open_files`] (in "open order", at the end) if it isn't already
+    /// present - the one real place every source that can open a file tab
+    /// ([`Self::open_change_diff`], [`Self::open_file_view`]) records it in the tab list, so none
+    /// of them can independently forget to and let the tab strip silently disagree with which
+    /// files [`Self::open_change`] can actually point at. Reopening an already-open file (a
+    /// second click on the same Changes row, or a palette/go-to-definition hit on a file that
+    /// already has a tab) is a real no-op here - it doesn't duplicate the tab, only
+    /// [`Self::open_change`] itself moves.
+    fn push_open_file(&mut self, path: &Path) {
+        if !self.open_files.iter().any(|open| open.as_path() == path) {
+            self.open_files.push(path.to_path_buf());
+        }
+    }
+
     /// Opens `path`'s real diff in the centre pane - the Changes row's own click handler
     /// (`design_handoff_jerry_ade/README.md`: "clicking a change row sets ... open_change =
-    /// row"). See [`Self::open_change`]'s docs for what this actually swaps in.
+    /// row"). See [`Self::open_change`]'s docs for what this actually swaps in, and
+    /// [`Self::push_open_file`]'s for the real tab-list bookkeeping this now also does.
     pub(super) fn open_change_diff(
         &mut self,
         path: PathBuf,
@@ -82,6 +97,7 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         self.focus_code_surface(window, cx);
+        self.push_open_file(&path);
         self.open_change = Some(path);
         self.code_view = code_view::CodeView::Diff;
         self.refresh_open_diff_file_cache();
@@ -116,6 +132,7 @@ impl AdeApp {
             .strip_prefix(&self.file_tree_root)
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|_| path.clone());
+        self.push_open_file(&relative);
         self.open_change = Some(relative);
         self.code_view = code_view::CodeView::File;
         self.selected_tree_path = Some(path);
@@ -125,22 +142,135 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Closes the centre's file-diff/file view and returns to the active session's terminal -
-    /// the diff/file surface's own real "back"/close affordance. Restores real keyboard focus the
-    /// same way [`Self::close_settings`] does, and for the same documented reason - see
-    /// [`Self::code_focus_handle`]'s own docs for the bug this fixes.
-    pub(super) fn close_change_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_change = None;
+    /// Activates a file tab (the unified tab strip's own click handler for a file tab's hit row -
+    /// `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change 4), as opposed
+    /// to [`Self::open_change_diff`]/[`Self::open_file_view`], which are for *opening* a file
+    /// that might not have a tab yet. Calls [`Self::push_open_file`] itself (idempotent, so a
+    /// caller that already pushed - the tab strip's own click handler - pays nothing extra) so
+    /// `Self::open_change` can never be pointed at a path `Self::open_files` doesn't actually
+    /// list, a structural invariant rather than one only the one real caller happens to uphold.
+    ///
+    /// ## Real per-tab view restore
+    ///
+    /// Switching to a *different* tab that has a real diff available sets [`Self::code_view`]
+    /// back to `Diff` - matching what a freshly opened changed file already gets via
+    /// [`Self::open_change_diff`] - rather than silently inheriting whatever `Diff`/`File` toggle
+    /// state a completely different file happened to leave [`Self::code_view`] in (a real, live
+    /// bug: `code_view` is one global field, not per-tab, so opening a plain file in `File` view
+    /// and then switching back to an already-diffed tab used to incorrectly keep showing `File`).
+    /// A file with no real diff has nothing to restore either way - [`Self::render_code_surface`]'s
+    /// own `effective_view` already forces `File` for it regardless of `code_view`.
+    ///
+    /// ## Re-activating an already-"active" tab is not always a real no-op
+    ///
+    /// A file tab can be "active" (`Self::open_change == Some(path)`) without actually being
+    /// *shown* - e.g. its diff disappeared after the underlying change was reverted, so
+    /// [`Self::render_center_pane`]'s own `has_diff_or_file_view` check falls back to rendering
+    /// the active session instead, while the tab strip still paints that file tab as active.
+    /// Re-clicking such a tab must still be a real action, not a dead no-op: this falls back to
+    /// `code_view = File`, which - per that same `has_diff_or_file_view` check - always has real
+    /// content to show.
+    pub(super) fn activate_file_tab(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_open_file(&path);
+
+        if self.open_change.as_deref() == Some(path.as_path()) {
+            self.code_view = code_view::CodeView::File;
+            cx.notify();
+            return;
+        }
+
+        self.focus_code_surface(window, cx);
+        let has_diff = self
+            .current_diff()
+            .is_some_and(|diff| diff.files.iter().any(|file| file.path == path));
+        self.open_change = Some(path);
+        self.code_view = if has_diff {
+            code_view::CodeView::Diff
+        } else {
+            code_view::CodeView::File
+        };
         self.refresh_open_diff_file_cache();
         self.hover = None;
-        restore_focus(
-            &self.sessions,
-            &mut self.code_return_focus,
-            &mut self.code_opened_session,
-            window,
-            cx,
-        );
+        self.code_cursor = None;
+        self.prune_confirm_armed = false;
         cx.notify();
+    }
+
+    /// Closes file tab `path` for real - removes it from [`Self::open_files`], not just from
+    /// view (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change 4: each
+    /// file tab's own 15×15 `×` hit box). If `path` was the active tab, activates a sensible
+    /// neighbor: the tab that was immediately to its right, else the one to its left, else - no
+    /// tabs left at all - falls back to the active session's terminal, restoring real keyboard
+    /// focus the same way [`Self::close_settings`] does and for the same documented reason (see
+    /// [`Self::code_focus_handle`]'s own docs for the bug that fixes). Closing a tab that *isn't*
+    /// active is a real no-op beyond removing it from the list - whichever tab (or session) was
+    /// showing keeps showing, unchanged.
+    ///
+    /// A real no-op if `path` isn't actually an open tab (e.g. a stale/duplicate click) - nothing
+    /// here assumes the caller already checked membership.
+    pub(super) fn close_file_tab(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.open_files.iter().position(|open| open == &path) else {
+            return;
+        };
+        self.open_files.remove(index);
+        let was_active = self.open_change.as_deref() == Some(path.as_path());
+        if was_active {
+            // After `Vec::remove`, whatever was immediately to the right of the closed tab (if
+            // any) has shifted down into this same index - checked first, per the design's own
+            // "prefer the tab to the right" rule; falling back to the one now at `index - 1` (the
+            // real left neighbor, untouched by the removal) only when there's nothing to the
+            // right.
+            let neighbor = self.open_files.get(index).cloned().or_else(|| {
+                index
+                    .checked_sub(1)
+                    .and_then(|left| self.open_files.get(left).cloned())
+            });
+            match neighbor {
+                Some(next_path) => {
+                    self.open_change = Some(next_path);
+                    self.refresh_open_diff_file_cache();
+                    self.hover = None;
+                }
+                None => {
+                    self.open_change = None;
+                    self.refresh_open_diff_file_cache();
+                    self.hover = None;
+                    restore_focus(
+                        &self.sessions,
+                        &mut self.code_return_focus,
+                        &mut self.code_opened_session,
+                        window,
+                        cx,
+                    );
+                }
+            }
+        }
+        self.prune_confirm_armed = false;
+        cx.notify();
+    }
+
+    /// Closes the centre's currently *active* file tab (`Self::open_change`, if any) - the
+    /// diff/file surface's own real "× close" toolbar affordance
+    /// (`Self::render_code_surface`'s toolbar, kept as a real, still-distinct-from-the-tab-strip
+    /// affordance per `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change
+    /// 4). Delegates to [`Self::close_file_tab`] - the exact same real "remove from
+    /// `open_files`, activate a sensible neighbor or fall back to the active session" behavior a
+    /// click on the tab's own `×` performs, so this app never has two different, silently
+    /// diverging ideas of what "close" means for a file. A real no-op if nothing is active.
+    pub(super) fn close_change_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.open_change.clone() {
+            self.close_file_tab(path, window, cx);
+        }
     }
 
     /// Recomputes [`Self::open_diff_file_cache`] (and, since it depends only on the diff's own
@@ -1336,12 +1466,16 @@ impl AdeApp {
             // fixes (the same real bug class `Self::render_settings`'s own identical
             // `track_focus` already fixes for the Settings surface).
             .track_focus(&self.code_focus_handle)
+            // Scopes `]` (`NextChangedFile`, `crate::default_key_bindings`) to only fire while a
+            // real file tab has focus - see that binding's own docs for the real terminal-input-
+            // swallowing bug this exists to prevent, and the real, verified `Styled::key_context`
+            // API this uses.
+            .key_context("diff")
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
             .min_h_0()
-            .h_full()
             .overflow_hidden()
             .bg(theme::surface::CENTER)
             .child(toolbar)
@@ -3336,5 +3470,454 @@ mod lsp_hover_wiring_tests {
                 app.read_with(cx, |app, _| app.code_cursor)
             );
         }
+    }
+}
+
+/// Real, deterministic regression coverage for Revision R4a's multi-file tab-strip
+/// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change 4) - the real
+/// `Self::open_files` open/close/switch state transitions this phase introduced:
+/// [`AdeApp::open_change_diff`]/[`AdeApp::open_file_view`] no longer discard a file from
+/// existence when the user navigates elsewhere, [`AdeApp::activate_file_tab`] switches which one
+/// is showing without touching the list, and [`AdeApp::close_file_tab`] is the one real place a
+/// tab actually leaves the list.
+#[cfg(test)]
+mod multi_file_tab_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Writes three real files under `dir` and returns both their real absolute paths (what
+    /// `AdeApp::open_file_view` takes) and the real repo-relative paths `AdeApp::open_change`/
+    /// `AdeApp::open_files`/`AdeApp::activate_file_tab`/`AdeApp::close_file_tab` actually key by
+    /// (`AdeApp::open_file_view`'s own `strip_prefix` against `file_tree_root`) - every assertion
+    /// and every `activate_file_tab`/`close_file_tab` call below uses the relative form, the same
+    /// real coordinate space the tab strip itself operates in.
+    fn write_three_files(
+        dir: &std::path::Path,
+    ) -> ((PathBuf, PathBuf, PathBuf), (PathBuf, PathBuf, PathBuf)) {
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        let c = dir.join("c.txt");
+        std::fs::write(&a, "a\n").expect("write a.txt");
+        std::fs::write(&b, "b\n").expect("write b.txt");
+        std::fs::write(&c, "c\n").expect("write c.txt");
+        let rel = (
+            PathBuf::from("a.txt"),
+            PathBuf::from("b.txt"),
+            PathBuf::from("c.txt"),
+        );
+        ((a, b, c), rel)
+    }
+
+    /// Opening the same file twice must not append a second tab - `Self::push_open_file`'s own
+    /// real no-duplicate rule.
+    #[gpui::test]
+    fn opening_the_same_file_twice_does_not_duplicate_its_tab(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ((a, _b, _c), (a_rel, _, _)) = write_three_files(repo.path());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(a.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(a, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_files.len()),
+            1,
+            "opening an already-open file a second time must activate the existing tab, not \
+             append a duplicate"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(a_rel)
+        );
+    }
+
+    /// Closing the active tab activates a sensible neighbor: the tab that was to its right first
+    /// - `Self::close_file_tab`'s own documented "prefer right, then left, then fall back to the
+    /// active session" order.
+    #[gpui::test]
+    fn closing_the_active_tab_activates_the_tab_that_was_to_its_right(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ((a, b, c), (a_rel, b_rel, c_rel)) = write_three_files(repo.path());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        for path in [a, b, c] {
+            app.update_in(cx, |app, window, cx| {
+                app.open_file_view(path, window, cx);
+            });
+            cx.run_until_parked();
+        }
+        // Opening a, then b, then c in order leaves `open_files == [a, b, c]` with `c` (the
+        // most recently opened) active - reactivate the middle one (`b`) so there's a real
+        // right *and* left neighbor to prove the "prefer right" order against.
+        app.update_in(cx, |app, window, cx| {
+            app.activate_file_tab(b_rel.clone(), window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(b_rel.clone())
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.close_file_tab(b_rel, window, cx);
+        });
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_files.clone()),
+            vec![a_rel.clone(), c_rel.clone()],
+            "b should be gone from the tab list"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(c_rel),
+            "closing the active middle tab should activate the tab that was to its right, not \
+             the one to its left"
+        );
+
+        // Closing the now-active last tab (`c`) has no tab to its right left, so it should fall
+        // back to the one on its left (`a`).
+        app.update_in(cx, |app, window, cx| {
+            let active = app.open_change.clone().expect("c should be active");
+            app.close_file_tab(active, window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(a_rel)
+        );
+
+        // Closing the last remaining tab falls all the way back to no active file at all (the
+        // active session shows through instead).
+        app.update_in(cx, |app, window, cx| {
+            let active = app.open_change.clone().expect("a should be active");
+            app.close_file_tab(active, window, cx);
+        });
+        assert_eq!(app.read_with(cx, |app, _| app.open_change.clone()), None);
+        assert!(app.read_with(cx, |app, _| app.open_files.is_empty()));
+    }
+
+    /// Closing a tab that is *not* the active one must not change what's currently active - the
+    /// other real half of [`AdeApp::close_file_tab`]'s contract.
+    #[gpui::test]
+    fn closing_a_non_active_tab_does_not_change_what_is_active(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ((a, b, _c), (a_rel, b_rel, _)) = write_three_files(repo.path());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(a, window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(b, window, cx);
+        });
+        cx.run_until_parked();
+        // Reactivate `a` so `b` (opened more recently) is the real non-active tab under test.
+        app.update_in(cx, |app, window, cx| {
+            app.activate_file_tab(a_rel.clone(), window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(a_rel.clone())
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.close_file_tab(b_rel, window, cx);
+        });
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(a_rel),
+            "closing a tab that wasn't active must leave the active tab unchanged"
+        );
+        assert_eq!(app.read_with(cx, |app, _| app.open_files.len()), 1);
+    }
+
+    /// Clicking a session tab while a file tab is active deactivates the file (it stops being
+    /// shown) without closing it - it stays in `open_files`, exactly like switching away from a
+    /// browser tab doesn't close it.
+    #[gpui::test]
+    fn selecting_a_session_deactivates_the_open_file_tab_without_closing_it(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ((a, _b, _c), (a_rel, _, _)) = write_three_files(repo.path());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let session_id = app.read_with(cx, |app, _| {
+            app.sessions
+                .active_id()
+                .expect("a fresh window has one real session")
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(a, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(a_rel.clone())
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.select_session(session_id, window, cx);
+        });
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            None,
+            "selecting a session tab should deactivate the file tab"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_files.clone()),
+            vec![a_rel],
+            "the file tab must still be in open_files, just not active"
+        );
+
+        // The centre pane must actually render the session again, not silently panic/show
+        // nothing - a real smoke check on top of the state assertions above.
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+    }
+
+    /// [`AdeApp::next_changed_file`]'s real "no active file -> first entry, otherwise advance,
+    /// wrapping around past the last entry" behavior, against a real `git`-backed diff (not a
+    /// fabricated `DiffFile` list) so this also exercises `Self::current_diff`'s real data.
+    #[gpui::test]
+    fn next_changed_file_advances_through_every_changed_file_and_wraps_around(
+        cx: &mut TestAppContext,
+    ) {
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .expect("failed to spawn git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+                args,
+                dir,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("a.txt"), "1\n").expect("write a.txt");
+        std::fs::write(repo.path().join("b.txt"), "1\n").expect("write b.txt");
+        std::fs::write(repo.path().join("c.txt"), "1\n").expect("write c.txt");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo.path().join("a.txt"), "1\nchanged\n").expect("rewrite a.txt");
+        std::fs::write(repo.path().join("b.txt"), "1\nchanged\n").expect("rewrite b.txt");
+        std::fs::write(repo.path().join("c.txt"), "1\nchanged\n").expect("rewrite c.txt");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let order: Vec<PathBuf> = app.read_with(cx, |app, _| {
+            app.current_diff()
+                .expect("a real diff against main should have loaded")
+                .files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect()
+        });
+        assert_eq!(
+            order.len(),
+            3,
+            "sanity check: all three files should be changed"
+        );
+
+        assert_eq!(app.read_with(cx, |app, _| app.open_change.clone()), None);
+
+        app.update_in(cx, |app, window, cx| {
+            app.next_changed_file(window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(order[0].clone()),
+            "with nothing active, the first real changed file should open"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.next_changed_file(window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(order[1].clone())
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.next_changed_file(window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(order[2].clone())
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.next_changed_file(window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(order[0].clone()),
+            "advancing past the last changed file should wrap around to the first"
+        );
+    }
+
+    fn git_repo(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Regression test for the "switching tabs shows the wrong Diff/File view" bug:
+    /// `Self::code_view` is a single global field, not per-tab, so switching from a tab left in
+    /// `File` view to a *different* tab that has a real diff used to incorrectly stay in `File`
+    /// view instead of forcing `Diff` back - `Self::activate_file_tab` never touched `code_view`
+    /// at all, and `Self::render_code_surface`'s own `effective_view` only ever *forces* `File`
+    /// when there's no diff, never forces `Diff` back when one exists.
+    #[gpui::test]
+    fn switching_to_a_tab_with_a_real_diff_shows_the_diff_not_the_last_view_mode(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        git_repo(repo.path(), &["init", "-b", "main"]);
+        git_repo(repo.path(), &["config", "user.email", "test@example.com"]);
+        git_repo(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("changed.txt"), "1\n").expect("write changed.txt");
+        std::fs::write(repo.path().join("plain.txt"), "plain\n").expect("write plain.txt");
+        git_repo(repo.path(), &["add", "."]);
+        git_repo(repo.path(), &["commit", "-m", "initial"]);
+        git_repo(repo.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo.path().join("changed.txt"), "1\nchanged\n")
+            .expect("rewrite changed.txt");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let changed_rel = PathBuf::from("changed.txt");
+        let plain_abs = repo.path().join("plain.txt");
+
+        // Open the real diff file first - lands in Diff view, matching `open_change_diff`'s own
+        // real default.
+        app.update_in(cx, |app, window, cx| {
+            app.open_change_diff(changed_rel.clone(), window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_view),
+            code_view::CodeView::Diff
+        );
+
+        // Open a second, unrelated, unchanged file - forced into File view (it has no real
+        // diff).
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(plain_abs, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_view),
+            code_view::CodeView::File
+        );
+
+        // Switch back to the changed file's tab - it has a real diff, so it must show that diff
+        // again, not silently inherit the File view the plain file just left `code_view` in.
+        app.update_in(cx, |app, window, cx| {
+            app.activate_file_tab(changed_rel.clone(), window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(changed_rel)
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_view),
+            code_view::CodeView::Diff,
+            "switching back to a tab with a real diff must show that diff, not the File view \
+             the previously active tab happened to leave code_view in"
+        );
+    }
+
+    /// Regression test for the "active but not actually showing" gap: a file tab can stay
+    /// `Self::open_change`-active even after its real diff disappears (e.g. the underlying
+    /// change was reverted), at which point `Self::render_center_pane`'s own
+    /// `has_diff_or_file_view` check falls back to rendering the active session instead - but the
+    /// tab strip still paints that file tab as active. Before the fix, `Self::activate_file_tab`
+    /// early-returned as a dead no-op whenever `path` already equalled `Self::open_change`,
+    /// regardless of whether anything was actually showing; re-clicking such a tab did nothing.
+    #[gpui::test]
+    fn reactivating_a_tab_whose_diff_disappeared_shows_real_content_again(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        git_repo(repo.path(), &["init", "-b", "main"]);
+        git_repo(repo.path(), &["config", "user.email", "test@example.com"]);
+        git_repo(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("a.txt"), "1\n").expect("write a.txt");
+        git_repo(repo.path(), &["add", "."]);
+        git_repo(repo.path(), &["commit", "-m", "initial"]);
+        git_repo(repo.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo.path().join("a.txt"), "1\nchanged\n").expect("rewrite a.txt");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let rel = PathBuf::from("a.txt");
+        app.update_in(cx, |app, window, cx| {
+            app.open_change_diff(rel.clone(), window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_view),
+            code_view::CodeView::Diff
+        );
+
+        // Revert the change on disk and reload the diff - the file's real `DiffFile` disappears
+        // from the loaded diff, but `open_change` still names it (nothing closed the tab).
+        std::fs::write(repo.path().join("a.txt"), "1\n").expect("revert a.txt");
+        app.update(cx, |app, cx| app.load_diff(repo.path().to_path_buf(), cx));
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app
+                .current_diff()
+                .is_some_and(|diff| diff.files.iter().any(|file| file.path == rel))),
+            "sanity: the file should no longer be in the loaded diff"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(rel.clone()),
+            "the tab is still 'active' by name, even though the surface has nothing real left to \
+             show for it"
+        );
+
+        // Re-click the same, now-content-less tab - before the fix, `activate_file_tab`'s early
+        // return (path already equals `open_change`) made this a dead no-op.
+        app.update_in(cx, |app, window, cx| {
+            app.activate_file_tab(rel, window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_view),
+            code_view::CodeView::File,
+            "re-activating a tab that's active-but-not-really-showing must fall back to File \
+             view, which always has real content, instead of staying a dead no-op"
+        );
     }
 }

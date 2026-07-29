@@ -433,8 +433,8 @@ impl AdeApp {
                 &keymap::resolve_combo("mod+N", self.window_controls_style().is_macos()),
                 KeycapSize::Standard,
             ))
-            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                this.new_session(SessionKind::Shell, cx);
+            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                this.new_session(SessionKind::Shell, window, cx);
             }))
     }
 
@@ -821,8 +821,8 @@ impl AdeApp {
             .when(!is_selected, |el| {
                 el.hover(|el| el.bg(theme::surface::ROW_HOVER))
             })
-            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                this.select_session(id, cx);
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.select_session(id, window, cx);
             }))
             .child(
                 div()

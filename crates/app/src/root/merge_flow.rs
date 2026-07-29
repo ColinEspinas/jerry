@@ -581,7 +581,9 @@ mod merge_regression_tests {
         // Before that commit has actually run, close (archive) the session it belongs to -
         // exactly the "click Complete, then immediately click Archive/the tab x" race from the
         // bug report.
-        app.update(cx, |app, cx| app.close_session(feature_session_id, cx));
+        app.update_in(cx, |app, window, cx| {
+            app.close_session(feature_session_id, window, cx)
+        });
 
         // Now let both the pending real `git commit` and its completion handler actually run.
         cx.run_until_parked();
@@ -630,7 +632,9 @@ mod merge_regression_tests {
         app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
         cx.run_until_parked();
         app.update(cx, |app, cx| app.complete_merge_flow(cx));
-        app.update(cx, |app, cx| app.close_session(feature_session_id, cx));
+        app.update_in(cx, |app, window, cx| {
+            app.close_session(feature_session_id, window, cx)
+        });
         cx.run_until_parked();
 
         // A second, independent worktree/session/merge against the same base repo must work

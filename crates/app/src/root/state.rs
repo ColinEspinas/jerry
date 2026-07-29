@@ -47,6 +47,7 @@ impl AdeApp {
             diff_totals: None,
             collapsed_dirs: HashSet::new(),
             reviewed_files: HashSet::new(),
+            open_files: Vec::new(),
             open_change: None,
             open_diff_file_cache: None,
             selected_tree_path: None,
@@ -117,23 +118,24 @@ impl AdeApp {
             _lsp_rows_task: None,
             settings_keymap_filter: String::new(),
             settings_keymap_filter_focus_handle: cx.focus_handle(),
+            plus_menu_open: false,
+            plus_button_bounds: gpui::Bounds::default(),
+            _new_agent_pane_task: Vec::new(),
         };
         // A fresh window shouldn't open with zero tabs and no way to see anything running -
         // start with one real shell in the repo root, exactly like step 3's single terminal
         // did, except now it's a tab like any other rather than the only pane that can
-        // exist.
+        // exist. `open_change` is always `None` this early (it's initialized a few fields up,
+        // above), so this always moves real keyboard focus onto the fresh session's own pane
+        // (see `Sessions::focus_active`'s own docs for the real bug this fixes) - a freshly
+        // opened window would otherwise start with `Window::focus == None`, and every bound
+        // action (⌘K/⌘N) would fall back to dispatch against the root node, which has no
+        // `on_action` handler of its own registered (see `Self::render`'s docs on why those
+        // handlers live where they do), until the user manually clicked into the terminal
+        // first.
         this.sessions
             .spawn(SessionKind::Shell, repo_path.clone(), cx);
-        // A freshly opened window starts with `Window::focus == None` - nothing is focused
-        // until the user clicks something. Left alone, that means every bound action
-        // (⌘K/⌘N) falls back to dispatch against the root node, which has no `on_action`
-        // handler of its own registered (see `Self::render`'s docs on why those handlers
-        // live where they do), so neither works until the user manually clicks into the
-        // terminal first. Focusing the initial session's real terminal pane here closes that
-        // gap the same way a click into it would.
-        if let Some(session) = this.sessions.active() {
-            window.focus(&session.pane.focus_handle(cx), cx);
-        }
+        this.sessions.focus_active(window, cx);
         this.load_worktrees(cx);
         this.load_file_tree(repo_path.clone(), cx);
         this.load_diff(repo_path, cx);
@@ -272,6 +274,7 @@ impl AdeApp {
         // lets `collapsed_dirs` grow forever across however many worktrees get browsed.
         reset_per_worktree_ui_state(
             &mut self.reviewed_files,
+            &mut self.open_files,
             &mut self.open_change,
             &mut self.collapsed_dirs,
             &mut self.selected_tree_path,
@@ -321,24 +324,27 @@ impl AdeApp {
 }
 
 /// Clears every piece of per-worktree UI state that would otherwise survive a worktree switch
-/// ([`AdeApp::reviewed_files`], [`AdeApp::open_change`], [`AdeApp::collapsed_dirs`]) - called
-/// from [`AdeApp::select_worktree`] on every switch. `reviewed_files`/`open_change` are keyed by
-/// repo-relative paths, so without this reset a file reviewed (or opened) in worktree A would
-/// silently read as already-reviewed - or reopen a same-named file - in worktree B just because
-/// it happens to share the same relative path; neither has any per-worktree scoping of its own.
-/// `collapsed_dirs` is keyed by absolute path (so it never visually bleeds the same way - two
-/// worktrees are different directories on disk), but nothing ever removed a past worktree's
-/// entries either, so it grew unboundedly across however many worktrees got browsed in a
-/// session; clearing it here on every switch is the same fix applied for the same reason.
+/// ([`AdeApp::reviewed_files`], [`AdeApp::open_files`], [`AdeApp::open_change`],
+/// [`AdeApp::collapsed_dirs`]) - called from [`AdeApp::select_worktree`] on every switch.
+/// `reviewed_files`/`open_files`/`open_change` are keyed by repo-relative paths, so without this
+/// reset a file reviewed (or opened) in worktree A would silently read as already-reviewed - or
+/// reopen a same-named file, or leave a stale tab in the strip - in worktree B just because it
+/// happens to share the same relative path; none of the three has any per-worktree scoping of
+/// its own. `collapsed_dirs` is keyed by absolute path (so it never visually bleeds the same way,
+/// since two worktrees are different directories on disk), but nothing ever removed a past
+/// worktree's entries either, so it grew unboundedly across however many worktrees got browsed
+/// in a session; clearing it here on every switch is the same fix applied for the same reason.
 /// Pulled out as a free, `gpui`-free function (rather than an `AdeApp` method) so this behavior
 /// is directly unit-testable without needing a `Context<AdeApp>` to construct an `AdeApp` first.
 pub(super) fn reset_per_worktree_ui_state(
     reviewed_files: &mut HashSet<PathBuf>,
+    open_files: &mut Vec<PathBuf>,
     open_change: &mut Option<PathBuf>,
     collapsed_dirs: &mut HashSet<PathBuf>,
     selected_tree_path: &mut Option<PathBuf>,
 ) {
     reviewed_files.clear();
+    open_files.clear();
     *open_change = None;
     collapsed_dirs.clear();
     *selected_tree_path = None;
@@ -358,12 +364,14 @@ mod tests {
         let mut reviewed_files = HashSet::new();
         reviewed_files.insert(PathBuf::from("src/main.rs"));
         reviewed_files.insert(PathBuf::from("Cargo.toml"));
+        let mut open_files = Vec::new();
         let mut open_change = Some(PathBuf::from("src/main.rs"));
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
+            &mut open_files,
             &mut open_change,
             &mut collapsed_dirs,
             &mut selected_tree_path,
@@ -373,15 +381,49 @@ mod tests {
         assert_eq!(open_change, None);
     }
 
+    /// The same worktree-relative-path bleed [`reset_per_worktree_ui_state_clears_reviewed_files_and_open_change`]
+    /// covers for `open_change`, extended to the new `open_files` tab list: every open tab from
+    /// the worktree just left must be gone, not just deactivated - otherwise a stale tab in the
+    /// strip would keep pointing at a repo-relative path that means something else (or nothing at
+    /// all) in the newly selected worktree.
+    #[test]
+    fn reset_per_worktree_ui_state_clears_every_open_file_tab() {
+        let mut reviewed_files = HashSet::new();
+        let mut open_files = vec![
+            PathBuf::from("src/main.rs"),
+            PathBuf::from("Cargo.toml"),
+            PathBuf::from("README.md"),
+        ];
+        let mut open_change = Some(PathBuf::from("Cargo.toml"));
+        let mut collapsed_dirs = HashSet::new();
+        let mut selected_tree_path = None;
+
+        reset_per_worktree_ui_state(
+            &mut reviewed_files,
+            &mut open_files,
+            &mut open_change,
+            &mut collapsed_dirs,
+            &mut selected_tree_path,
+        );
+
+        assert!(
+            open_files.is_empty(),
+            "every open file tab from the worktree just left must be cleared, not just \
+             deactivated"
+        );
+    }
+
     #[test]
     fn reset_per_worktree_ui_state_is_a_no_op_when_already_empty() {
         let mut reviewed_files = HashSet::new();
+        let mut open_files = Vec::new();
         let mut open_change = None;
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
+            &mut open_files,
             &mut open_change,
             &mut collapsed_dirs,
             &mut selected_tree_path,
@@ -399,6 +441,7 @@ mod tests {
     #[test]
     fn reset_per_worktree_ui_state_clears_collapsed_dirs_too() {
         let mut reviewed_files = HashSet::new();
+        let mut open_files = Vec::new();
         let mut open_change = None;
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
@@ -407,6 +450,7 @@ mod tests {
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
+            &mut open_files,
             &mut open_change,
             &mut collapsed_dirs,
             &mut selected_tree_path,
@@ -418,12 +462,14 @@ mod tests {
     #[test]
     fn reset_per_worktree_ui_state_clears_selected_tree_path() {
         let mut reviewed_files = HashSet::new();
+        let mut open_files = Vec::new();
         let mut open_change = None;
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = Some(PathBuf::from("/repo/worktree-a/src/main.rs"));
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
+            &mut open_files,
             &mut open_change,
             &mut collapsed_dirs,
             &mut selected_tree_path,

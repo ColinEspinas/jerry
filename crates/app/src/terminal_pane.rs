@@ -1321,4 +1321,28 @@ mod keystroke_tests {
         let ks = keystroke("n", Modifiers::default());
         assert_eq!(keystroke_to_bytes(&ks), Some(b"n".to_vec()));
     }
+
+    /// Real, direct proof of the control-byte mapping the audit's `secondary-p`/Ctrl+P finding
+    /// depends on: `crate::default_key_bindings` deliberately has no real global keybinding for
+    /// Ctrl+P anymore (see that function's own docs) specifically *because* this mapping sends
+    /// the real, standard readline "previous history" control byte (`0x10`) a focused terminal
+    /// needs to actually receive it - a global binding dispatched ahead of this would have
+    /// silently swallowed it instead. Mirrors `crate::root::focus::tab_strip_keybinding_tests::
+    /// ctrl_p_does_not_open_the_palette_while_a_terminal_is_focused`'s own docs: that test proves
+    /// the app-level dispatch doesn't intercept it; this one proves what actually reaches the
+    /// pty once it doesn't.
+    #[test]
+    fn ctrl_p_maps_to_the_real_readline_previous_history_control_byte() {
+        let modifiers = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        let ks = keystroke("p", modifiers);
+        assert_eq!(
+            keystroke_to_bytes(&ks),
+            Some(vec![0x10]),
+            "Ctrl+P must map to the real Ctrl+<letter> control code (0x10), the standard \
+             readline 'previous history' byte every real shell relies on"
+        );
+    }
 }

@@ -93,6 +93,14 @@ pub mod surface {
     /// (`design_handoff_jerry_ade/Jerry.dc.html`'s close caption button `style-hover="background:
     /// #8c3a38"`, confirmed by `CHANGELOG.md`'s "close hover bg `#8c3a38`").
     pub const TITLE_BAR_CLOSE_HOVER: Rgba = hex(0x8c3a38);
+    /// The tab strip's `+` menu popover row hover fill (`design_handoff_jerry_ade/revision/
+    /// Jerry.dc.html`'s plus-menu row template: `style-hover="background:#1d2226"`) - distinct
+    /// from [`ROW_HOVER`]/[`ROW_HOVER_ALT`], neither of which match this exact value.
+    pub const PLUS_MENU_ROW_HOVER: Rgba = hex(0x1d2226);
+    /// A file tab's real close-affordance hover fill (`design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s change 4: "15×15 hit box, radius 3, hover `#23282c`") - one hex step off
+    /// [`CHIP_NEUTRAL`] (`#23272b`), so kept as its own token rather than reused.
+    pub const TAB_CLOSE_HOVER: Rgba = hex(0x23282c);
 }
 
 pub mod border {
@@ -405,6 +413,9 @@ pub mod band {
     /// buttons pinned to the right edge, 44 wide × full band" - confirmed against
     /// `Jerry.dc.html`'s `width:44px`.
     pub const TITLE_BAR_CAPTION_BUTTON: Pixels = px(44.0);
+    /// The tab strip's `+` menu popover's real row height (`design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s change 4: "29-high rows").
+    pub const PLUS_MENU_ROW: Pixels = px(29.0);
 }
 
 pub mod zone {
@@ -422,6 +433,9 @@ pub mod zone {
     pub const SETTINGS_CONTENT_MAX_WIDTH: Pixels = px(700.0);
     pub const PALETTE_WIDTH: Pixels = px(684.0);
     pub const COMPOSER_WIDTH: Pixels = px(560.0);
+    /// The tab strip's `+` menu popover's real width (`design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s change 4: "a 326-wide popover").
+    pub const PLUS_MENU_WIDTH: Pixels = px(326.0);
 }
 
 /// The only shadows in the product. Drop them if GPUI makes them awkward - the borders
@@ -431,6 +445,11 @@ pub mod shadow {
 
     pub const POPOVER: (Pixels, Pixels, Pixels) = (px(0.0), px(8.0), px(20.0)); // rgba(0,0,0,0.50)
     pub const PALETTE: (Pixels, Pixels, Pixels) = (px(0.0), px(12.0), px(34.0));
+    // rgba(0,0,0,0.55)
+    /// The tab strip's `+` menu popover's own shadow (`design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s change 4: "shadow `0 14 30 / .55`") - a real, distinct figure from
+    /// [`PALETTE`]'s `0 12 34`.
+    pub const PLUS_MENU: (Pixels, Pixels, Pixels) = (px(0.0), px(14.0), px(30.0));
     // rgba(0,0,0,0.55)
 }
 

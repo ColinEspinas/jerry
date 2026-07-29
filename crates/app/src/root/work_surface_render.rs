@@ -1,21 +1,66 @@
 use super::*;
 use crate::root::widgets::{render_action_keycap_row, render_keycap_row, KeycapSize};
 
+/// Defines one `JumpToSessionN` real action handler - see [`AdeApp::jump_to_session_at`]'s docs
+/// for why eight separate, near-identical handlers (one per real keystroke `secondary-1`..
+/// `secondary-8`, registered in `crate::default_key_bindings`) are the correct shape here, not
+/// avoidable duplication: a `gpui::KeyBinding` maps one keystroke to one action *value*, and
+/// `actions!`-generated unit structs carry no positional data a single shared handler could
+/// branch on - so eight distinct action *types* each need their own `on_action` handler
+/// regardless. This macro exists only so the eight bodies (each just forwarding a literal
+/// position to [`AdeApp::jump_to_session_at`]) can't drift from one another the way eight
+/// separately hand-copied functions could.
+macro_rules! session_jump_action_handler {
+    ($fn_name:ident, $action:ty, $position:expr) => {
+        pub(super) fn $fn_name(
+            &mut self,
+            _action: &$action,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            self.jump_to_session_at($position, window, cx);
+        }
+    };
+}
+
 impl AdeApp {
-    pub(super) fn new_session(&mut self, kind: SessionKind, cx: &mut Context<Self>) {
+    pub(super) fn new_session(
+        &mut self,
+        kind: SessionKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let cwd = self.active_session_cwd();
         self.sessions.spawn(kind, cwd, cx);
+        self.focus_newly_spawned_session(window, cx);
         self.prune_confirm_armed = false;
         cx.notify();
+    }
+
+    /// Moves real keyboard focus onto whichever session [`Sessions::spawn`] just made active -
+    /// but only when doing so is actually correct: a file tab ([`Self::open_change`]), not a
+    /// session's own `TerminalPane`, is what [`Self::render_center_pane`] renders whenever one
+    /// is active, so focusing a session's pane while that's true would point `Window::focus` at
+    /// a node nothing in the rendered tree tracks - the exact real bug [`Sessions::spawn`]'s own
+    /// docs describe. Shared by every real call site that spawns a session, so none of them can
+    /// independently get this guard wrong.
+    pub(super) fn focus_newly_spawned_session(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.open_change.is_none() {
+            self.sessions.focus_active(window, cx);
+        }
     }
 
     pub(super) fn handle_new_session_action(
         &mut self,
         _action: &NewSession,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.new_session(SessionKind::Shell, cx);
+        self.new_session(SessionKind::Shell, window, cx);
     }
 
     /// Activates session `id`'s tab and, if it maps to a currently-listed worktree, also
@@ -25,9 +70,37 @@ impl AdeApp {
     /// "current worktree": the right sidebar is still driven by [`Self::selected`], since
     /// Zone 2/3 (which the design's state model has as `focused_session`-driven) hasn't been
     /// rebuilt yet.
-    pub(super) fn select_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
+    ///
+    /// Since the tab strip unified sessions and file tabs (`design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s 2026-07-29 entry, change 4), clicking a session tab while a file tab is
+    /// active must switch the centre pane back to showing this session - `Self::open_change`
+    /// only ever names a file *or* lets a session's own pane show through (see that field's
+    /// docs), never both. This deactivates the file tab (`Self::open_change = None`) without
+    /// closing it - it stays in [`Self::open_files`], exactly like clicking a different browser
+    /// tab doesn't close the one you switched away from - and restores real keyboard focus onto
+    /// the newly active session's pane the same documented way [`Self::close_file_tab`] does when
+    /// no file tabs are left, reusing the same [`restore_focus`] helper rather than a fourth
+    /// hand-copied focus-restore block (see that function's own docs for why).
+    pub(super) fn select_session(
+        &mut self,
+        id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.sessions.set_active(id);
         self.prune_confirm_armed = false;
+        if self.open_change.is_some() {
+            self.open_change = None;
+            self.refresh_open_diff_file_cache();
+            self.hover = None;
+            restore_focus(
+                &self.sessions,
+                &mut self.code_return_focus,
+                &mut self.code_opened_session,
+                window,
+                cx,
+            );
+        }
         let cwd = self
             .sessions
             .iter()
@@ -80,14 +153,21 @@ impl AdeApp {
     /// (outline) · `Archive` (ghost)") - closes the tab via [`Self::close_session`] (see that
     /// method's docs for why every real tab-close path goes through it, not
     /// `Sessions::close` directly).
-    pub(super) fn archive_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        self.close_session(id, cx);
+    pub(super) fn archive_session(
+        &mut self,
+        id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_session(id, window, cx);
         self.prune_confirm_armed = false;
         cx.notify();
     }
 
     /// Closes session `id`'s real tab (`Sessions::close` - deterministically tears down its
-    /// real child process) and, if `id` is the session whose `Merge` click started
+    /// real child process, and moves real keyboard focus onto whichever session becomes active
+    /// as a result - see that method's own docs for the real "no file tab is showing instead"
+    /// guard it applies) and, if `id` is the session whose `Merge` click started
     /// [`Self::merge_flow`], cleans that up too (see [`Self::clear_merge_flow_for_closed_session`]).
     ///
     /// Every real place a session tab closes - [`Self::archive_session`], [`Self::
@@ -100,8 +180,14 @@ impl AdeApp {
     /// longer existed - Surface D could never render again to finish or abort it, and
     /// `Self::render_merge_button`'s `self.merge_flow.is_some()` disabled check stayed `true`
     /// forever, silently disabling the `Merge` button for *every* session in the app.
-    pub(super) fn close_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        self.sessions.close(id, cx);
+    pub(super) fn close_session(
+        &mut self,
+        id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let file_tab_active = self.open_change.is_some();
+        self.sessions.close(id, file_tab_active, window, cx);
         if self
             .merge_flow
             .as_ref()
@@ -131,14 +217,20 @@ impl AdeApp {
     /// process is genuinely torn down, a new one genuinely started), just not literally
     /// "resume where it left off" - `crate::work_surface::ActionKind::Respawn`'s docs name
     /// this same trade-off.
-    pub(super) fn respawn_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
+    pub(super) fn respawn_session(
+        &mut self,
+        id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
             return;
         };
         let kind = session.kind;
         let cwd = session.cwd.clone();
-        self.close_session(id, cx);
+        self.close_session(id, window, cx);
         self.sessions.spawn(kind, cwd, cx);
+        self.focus_newly_spawned_session(window, cx);
         self.prune_confirm_armed = false;
         cx.notify();
     }
@@ -149,16 +241,22 @@ impl AdeApp {
     /// session" (each session is its own independent tab/process - see `crate::sessions`'
     /// module docs), so "open terminal" here means "get me a shell in this worktree", the same
     /// real capability the rail's own "+ New Shell" button already provides.
-    pub(super) fn open_companion_terminal(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
+    pub(super) fn open_companion_terminal(
+        &mut self,
+        cwd: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let existing = self
             .sessions
             .iter()
             .find(|session| session.kind == SessionKind::Shell && session.cwd == cwd)
             .map(|session| session.id);
         match existing {
-            Some(id) => self.select_session(id, cx),
+            Some(id) => self.select_session(id, window, cx),
             None => {
                 self.sessions.spawn(SessionKind::Shell, cwd, cx);
+                self.focus_newly_spawned_session(window, cx);
                 self.prune_confirm_armed = false;
                 cx.notify();
             }
@@ -191,8 +289,8 @@ impl AdeApp {
                         .text_color(theme::text::PRIMARY)
                 })
                 .child(label)
-                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                    this.new_session(kind, cx);
+                .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                    this.new_session(kind, window, cx);
                 }))
         };
 
@@ -220,11 +318,17 @@ impl AdeApp {
             )
     }
 
-    /// The tab strip (34) - `design_handoff_jerry_ade/README.md`'s spec: one 14×14 kind chip
-    /// per tab (see [`render_tab_chip`]), active/inactive bg/underline/label colours (see
-    /// `crate::work_surface::tab_colors`), a real `+` (spawns a new default shell session,
-    /// same real action as the rail's own `+`), and the real, platform-resolved `mod`/`1…8`
-    /// keycap hint pinned right (`⌘`/`1…8` on macOS, `Ctrl`/`1…8` on Windows/Linux).
+    /// The tab strip (34) - `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29
+    /// entry, change 4: "Was: three fixed peer tabs acting as a pane selector (agent | terminal
+    /// | file). Now: agent tab + shell tab + one tab per open file, in open order." Renders one
+    /// [`render_session_tab`] per real, live [`crate::sessions::Session`] (unchanged rendering/
+    /// behavior from before this change - agent CLI and shell sessions are still peer tabs, one
+    /// per session), followed by one [`Self::render_file_tab`] per entry of [`Self::open_files`]
+    /// in that `Vec`'s own order - the real, unified tab list this change introduces. Then the
+    /// real `+` menu button ([`Self::render_tab_strip_plus`]), and the real, right-aligned
+    /// session-jump keycaps + `session` label (replacing the old decorative `mod`/`1…8` pair -
+    /// see [`Self::jump_to_session_at`]'s docs for why that pair was never a real binding until
+    /// now).
     pub(super) fn render_tab_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut bar = div()
             .id("tab-strip")
@@ -240,40 +344,519 @@ impl AdeApp {
             bar = bar.child(self.render_session_tab(session, cx));
         }
 
-        bar = bar.child(
+        for path in &self.open_files {
+            bar = bar.child(self.render_file_tab(path, cx));
+        }
+
+        bar = bar.child(self.render_tab_strip_plus(cx));
+
+        // Only real keycaps for sessions that actually exist - "don't show keycap 6 if there
+        // are only 4 sessions" (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29
+        // entry, change 4). `secondary-1`..`secondary-8` are the only ones actually bound (see
+        // `crate::default_key_bindings`), so this never shows a keycap past 8 either.
+        let session_count = self.sessions.iter().count().min(8);
+        let jump_keys: Vec<String> = (1..=session_count).map(|n| n.to_string()).collect();
+
+        bar.child(div().flex_1()).child(
             div()
-                .id("tab-strip-new")
                 .flex_none()
                 .flex()
                 .items_center()
-                .px(px(11.0))
-                .cursor_pointer()
-                .font(font(theme::font::MONO))
-                .text_size(px(13.0))
-                .text_color(theme::text::GHOST)
-                .hover(|el| el.text_color(theme::text::MUTED))
-                .child("+")
-                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                    this.new_session(SessionKind::Shell, cx);
-                })),
-        );
+                .gap(px(6.0))
+                .px(px(12.0))
+                .child(render_keycap_row(&jump_keys, KeycapSize::Standard))
+                .child(
+                    div()
+                        .font(font(theme::font::SANS))
+                        .text_size(px(10.0))
+                        .text_color(theme::text::PATH)
+                        .child("session"),
+                ),
+        )
+    }
 
-        bar.child(div().flex_1())
+    /// A file tab - `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change
+    /// 4: the file's real language chip (same table as the file tree, `file_tree::
+    /// lang_chip_for_name`, dimmed to the same neutral a session tab's own chip dims to when
+    /// inactive - see `crate::work_surface::file_tab_chip_colors`'s docs), the file's real name,
+    /// and a real 15×15 close hit box (hover `theme::surface::TAB_CLOSE_HOVER`, `×` coloured
+    /// `theme::text::DIMMER` on the active tab or `theme::text::DISABLED` otherwise). Clicking
+    /// the tab body activates it ([`Self::activate_file_tab`]); clicking the `×` closes it for
+    /// real ([`Self::close_file_tab`]) and stops the click from also bubbling up to the body's
+    /// own activate handler (`cx.stop_propagation()`, the same pattern
+    /// [`render_session_tab`]'s own close button already uses). Same active/inactive bg/
+    /// underline/label colours as a session tab (`crate::work_surface::tab_colors`) - a file
+    /// tab is a real peer of a session tab now, not a second, differently-styled kind of thing.
+    pub(super) fn render_file_tab(&self, path: &Path, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_active = self.open_change.as_deref() == Some(path);
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let lang = file_tree::lang_chip_for_name(&file_name);
+        let chip_colors = work_surface::file_tab_chip_colors(lang, is_active);
+        let colors = work_surface::tab_colors(is_active);
+        let close_color = if is_active {
+            theme::text::DIMMER
+        } else {
+            theme::text::DISABLED
+        };
+        let activate_path = path.to_path_buf();
+        let close_path = activate_path.clone();
+        let key = path.display().to_string();
+
+        div()
+            .id(format!("file-tab-{key}"))
+            .flex()
+            .flex_none()
+            .flex_col()
+            .border_r_1()
+            .border_color(theme::border::INNER)
+            .bg(colors.bg)
             .child(
                 div()
-                    .flex_none()
+                    .id(format!("file-tab-hit-{key}"))
+                    .flex_1()
                     .flex()
                     .items_center()
-                    .px(px(12.0))
-                    .child(render_keycap_row(
-                        &keymap::resolve_combo(
-                            "mod+1\u{2026}8",
-                            self.window_controls_style().is_macos(),
-                        ),
-                        KeycapSize::Standard,
-                    )),
+                    .gap(px(7.0))
+                    .px(px(13.0))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                        this.activate_file_tab(activate_path.clone(), window, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(14.0))
+                            .h(px(14.0))
+                            .rounded(theme::radius::CHIP)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(chip_colors.bg)
+                            .font(font(theme::font::MONO))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_size(px(7.0))
+                            .text_color(chip_colors.fg)
+                            .child(lang.label),
+                    )
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_size(px(11.0))
+                            .text_color(colors.label)
+                            .child(file_name),
+                    )
+                    .child(
+                        div()
+                            .id(format!("close-file-tab-{key}"))
+                            .w(px(15.0))
+                            .h(px(15.0))
+                            .rounded(theme::radius::CHIP)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|el| el.bg(theme::surface::TAB_CLOSE_HOVER))
+                            .font(font(theme::font::MONO))
+                            .text_size(px(11.0))
+                            .text_color(close_color)
+                            .child("\u{d7}")
+                            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.close_file_tab(close_path.clone(), window, cx);
+                            })),
+                    ),
+            )
+            .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline))
+    }
+
+    /// The tab strip's real `+` menu button (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s
+    /// 2026-07-29 entry, change 4: "`+` became a menu button (`+ ▾`, active bg `#171a1d`)
+    /// opening a 326-wide popover") - toggles [`Self::plus_menu_open`] rather than
+    /// unconditionally spawning a shell the way this button used to (that real, always-shell
+    /// behavior stays on the rail's own separate `+`, which the design doesn't respec - see
+    /// [`crate::root::rail_render::render_new_session_button`]). A `gpui::canvas` child captures
+    /// this button's own real painted bounds into [`Self::plus_button_bounds`] on every render -
+    /// see that field's docs for why [`Self::render_plus_menu`] positions the popover off of it
+    /// rather than a second, hand-computed offset. Opening the menu also kicks off a real
+    /// [`Self::load_agent_rows`] refresh, so the "New agent pane" row's own sub-label
+    /// ([`Self::resolved_new_agent_kind`]) reflects a reasonably fresh `$PATH` search rather than
+    /// whatever (possibly empty, if Settings was never opened) snapshot happened to be cached.
+    pub(super) fn render_tab_strip_plus(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_open = self.plus_menu_open;
+
+        div()
+            .id("tab-strip-new")
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .px(px(10.0))
+            .cursor_pointer()
+            .bg(if is_open {
+                theme::surface::SEGMENT_TRACK
+            } else {
+                work_surface::TRANSPARENT
+            })
+            .hover(|el| el.bg(theme::surface::SEGMENT_TRACK))
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(13.0))
+                    .text_color(theme::text::GHOST)
+                    .child("+"),
+            )
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(8.5))
+                    .text_color(theme::text::PATH)
+                    .child("\u{25be}"),
+            )
+            .child({
+                let this = cx.entity();
+                gpui::canvas(
+                    move |bounds, _window, cx| {
+                        this.update(cx, |this, _cx| {
+                            this.plus_button_bounds = bounds;
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            })
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                this.plus_menu_open = !this.plus_menu_open;
+                if this.plus_menu_open {
+                    this.load_agent_rows(cx);
+                }
+                cx.notify();
+            }))
+    }
+
+    /// The tab strip's `+` menu popover itself (`design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s 2026-07-29 entry, change 4) - a real, absolutely-positioned scrim +
+    /// panel painted as an unconditional child of [`Render::render`]'s root div, the exact same
+    /// real overlay shape [`Self::render_palette`]'s own docs describe (a transparent, not
+    /// dimmed, scrim here - the design has no full-window dimming for this smaller popover -
+    /// whose own `on_click` closes the menu, with the panel itself stopping that click from
+    /// bubbling up via `cx.stop_propagation()`). Positioned directly off
+    /// [`Self::plus_button_bounds`] rather than a hand-computed pixel offset - see that field's
+    /// own docs.
+    ///
+    /// Four real rows: *New terminal* ([`Self::new_session`] with [`SessionKind::Shell`]), *New
+    /// agent pane* ([`Self::new_agent_pane`]), *Open file…* ([`Self::open_palette`], scoped to
+    /// [`palette::PaletteScope::Files`] - see this row's own click handler, below), and *Next
+    /// changed file* ([`Self::next_changed_file`]). The first, second, and fourth each dispatch
+    /// the same real method their own real global keybinding does (see
+    /// [`crate::default_key_bindings`]) and show that real binding's keycap; *Open file…* has no
+    /// real global keybinding of its own (see that function's own docs for the real
+    /// Ctrl+P/readline conflict that ruled one out) and so shows no keycap at all - a click-only
+    /// row, not a decorative shortcut hint for one that doesn't actually fire. Every row's own
+    /// click handler also closes the menu.
+    pub(super) fn render_plus_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let macos = self.window_controls_style().is_macos();
+        let bounds = self.plus_button_bounds;
+        let (shadow_x, shadow_y, shadow_blur) = theme::shadow::PLUS_MENU;
+
+        let resolved_kind = self.resolved_new_agent_kind();
+        let (agent_fg, agent_bg) = work_surface::agent_tint(resolved_kind);
+        let agent_initial = work_surface::agent_initial(resolved_kind);
+        let agent_label = resolved_kind.label();
+        let changed_count = self
+            .current_diff()
+            .map(|diff| diff.files.len())
+            .unwrap_or(0);
+
+        div()
+            .id("plus-menu-scrim")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .bg(work_surface::TRANSPARENT)
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                this.plus_menu_open = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("plus-menu-popover")
+                    .absolute()
+                    .left(bounds.origin.x + px(2.0))
+                    .top(bounds.origin.y + bounds.size.height)
+                    .w(theme::zone::PLUS_MENU_WIDTH)
+                    .py(px(4.0))
+                    .bg(theme::surface::PALETTE)
+                    .border_1()
+                    .border_color(theme::border::POPOVER)
+                    .rounded(theme::radius::CARD)
+                    .shadow(vec![BoxShadow::new(
+                        shadow_x,
+                        shadow_y,
+                        gpui::black().opacity(0.55),
+                    )
+                    .blur_radius(shadow_blur)])
+                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        render_plus_menu_row(
+                            "\u{276f}",
+                            theme::text::DIM,
+                            theme::surface::CHIP_NEUTRAL,
+                            "New terminal",
+                            "in this worktree".to_string(),
+                            keymap::resolve_combo("ctrl+shift+T", macos),
+                        )
+                        .on_click(cx.listener(
+                            |this, _event: &ClickEvent, window, cx| {
+                                this.new_session(SessionKind::Shell, window, cx);
+                                this.plus_menu_open = false;
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(
+                        render_plus_menu_row(
+                            agent_initial,
+                            agent_fg,
+                            agent_bg,
+                            "New agent pane",
+                            agent_label.to_string(),
+                            keymap::resolve_combo("mod+shift+N", macos),
+                        )
+                        .on_click(cx.listener(
+                            |this, _event: &ClickEvent, _window, cx| {
+                                this.new_agent_pane(cx);
+                                this.plus_menu_open = false;
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(
+                        render_plus_menu_row(
+                            "@",
+                            theme::palette::COMMAND_CHIP.0,
+                            theme::palette::COMMAND_CHIP.1,
+                            "Open file\u{2026}",
+                            "search this worktree".to_string(),
+                            // No real keycap - see `Self::render_plus_menu`'s own docs for why
+                            // this row has no real global keybinding to show a shortcut for
+                            // (`render_keycap_row` renders nothing for an empty slice, the same
+                            // "no real binding behind it" convention `render_hint_pair`'s own
+                            // docs establish).
+                            Vec::new(),
+                        )
+                        .on_click(cx.listener(
+                            |this, _event: &ClickEvent, window, cx| {
+                                this.plus_menu_open = false;
+                                this.open_palette(window, cx);
+                                // Real files-only scope: `palette::PaletteScope::Files` already
+                                // exists, with a real segment, `@` prefix, and real file results
+                                // - `open_palette` itself always resets `palette_scope` back to
+                                // `PaletteScope::default()` (`All`), so this has to be set right
+                                // after it returns, not before.
+                                this.palette_scope = palette::PaletteScope::Files;
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(
+                        render_plus_menu_row(
+                            "]",
+                            theme::text::DIM,
+                            theme::surface::CHIP_NEUTRAL,
+                            "Next changed file",
+                            format!("{changed_count} changed"),
+                            keymap::resolve_combo("]", macos),
+                        )
+                        .on_click(cx.listener(
+                            |this, _event: &ClickEvent, window, cx| {
+                                this.plus_menu_open = false;
+                                this.next_changed_file(window, cx);
+                            },
+                        )),
+                    ),
             )
     }
+
+    /// Which real agent kind the `+` menu's "New agent pane" row would spawn right now, and
+    /// shows as its own sub-label/chip - the first [`settings::AGENT_KINDS`] entry a real
+    /// `$PATH` search ([`Self::agent_rows`], refreshed on menu open - see
+    /// [`Self::render_tab_strip_plus`]'s docs) confirms is actually installed, or
+    /// `AGENT_KINDS[0]` if none are (or `agent_rows` hasn't been populated yet - e.g. a menu
+    /// opened before its own `load_agent_rows` call resolves). [`Self::new_agent_pane`] runs the
+    /// same real detection independently, off the foreground thread, at the moment it actually
+    /// spawns - this is a *display* best-effort matching it as closely as this render's already-
+    /// cached data allows, not the source of truth for what gets spawned.
+    pub(super) fn resolved_new_agent_kind(&self) -> SessionKind {
+        settings::AGENT_KINDS
+            .into_iter()
+            .find(|kind| {
+                self.agent_rows
+                    .iter()
+                    .any(|row| row.kind == *kind && row.is_ready())
+            })
+            .unwrap_or(settings::AGENT_KINDS[0])
+    }
+
+    /// The `+` menu's real "New agent pane" action (`ctrl-shift-T`'s sibling,
+    /// `secondary-shift-n`) - spawns the first [`settings::AGENT_KINDS`] entry a real,
+    /// background `$PATH` search (`pty_core::resolve_on_path`, the same real search
+    /// [`Self::load_agent_rows`] runs for the Settings › Agents page) confirms is actually
+    /// installed, mirroring [`Self::load_agent_rows`]'s own "gather on foreground, search on
+    /// background" shape rather than blocking the click on a real filesystem walk.
+    ///
+    /// If *no* configured agent is installed, this does not silently no-op - it spawns
+    /// `AGENT_KINDS[0]` anyway, exactly like the session toolbar's own `+ claude`/`+ codex`
+    /// buttons already do when that binary isn't on `$PATH` (`Self::render_session_toolbar`'s
+    /// docs): the process genuinely fails to spawn and a real, non-panicking spawn error shows
+    /// in the new tab (`TerminalPane::spawn_error`), the same honest failure path this app
+    /// already has, not a second, different "nothing to do" behavior invented just for this
+    /// button.
+    pub(super) fn new_agent_pane(&mut self, cx: &mut Context<Self>) {
+        let cwd = self.active_session_cwd();
+        let task = cx.spawn(async move |this, cx| {
+            let installed = cx
+                .background_executor()
+                .spawn(async move {
+                    settings::AGENT_KINDS.into_iter().find(|kind| {
+                        kind.agent_binary_name()
+                            .and_then(pty_core::resolve_on_path)
+                            .is_some()
+                    })
+                })
+                .await;
+            // Needs real `Window` access to move focus onto the newly spawned session's own
+            // pane (`Self::focus_newly_spawned_session`'s own docs) - `Entity::update_in` gets
+            // it anyway, the same real `AsyncApp::with_window` mechanism
+            // `Self::navigate_to_definition`'s own background completion already relies on for
+            // the same reason.
+            let _ = this.update_in(cx, |this, window, cx| {
+                let kind = installed.unwrap_or(settings::AGENT_KINDS[0]);
+                this.sessions.spawn(kind, cwd, cx);
+                this.focus_newly_spawned_session(window, cx);
+                this.prune_confirm_armed = false;
+                cx.notify();
+            });
+        });
+        // A `Vec`, not a single `Option` slot - see `Self::_new_agent_pane_task`'s own docs for
+        // the real, live bug a single slot had: two rapid "New agent pane" clicks before the
+        // first click's background `$PATH` search resolved used to drop (and so immediately
+        // cancel, per GPUI's real "dropping a `Task` cancels it immediately" semantics) the
+        // first click's task the instant the second one was assigned here, silently spawning
+        // only one session for two real clicks. Mirrors `Self::_lsp_tasks`/
+        // `Self::_goto_definition_tasks`'s own "independent operations, dropping an unrelated
+        // one would cancel it" shape - pruned of already-finished entries before each push.
+        self._new_agent_pane_task.retain(|task| !task.is_ready());
+        self._new_agent_pane_task.push(task);
+    }
+
+    /// The `+` menu's real "Next changed file" action (`]`) - given the currently active file
+    /// tab (or, if none is active, the first entry of the real Changes list -
+    /// `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change 4), opens the
+    /// next real changed file after it as a tab, **wrapping around** to the first changed file
+    /// once the last one is passed (a documented choice over stopping at the end - a repeatable
+    /// `]` press cycles through every changed file indefinitely, matching how the session-jump
+    /// keycaps and palette arrow keys already treat "next"/"previous" as a real loop rather than
+    /// a dead end). If the active file isn't itself a changed file (e.g. opened from the file
+    /// tree, not Changes), or nothing is active at all, this opens the *first* real changed file,
+    /// since there's no real "current position" in the changed-file list to advance from
+    /// otherwise. A real no-op when there is no loaded diff, or it has no changed files.
+    pub(super) fn next_changed_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let next_path = {
+            let Some(diff) = self.current_diff() else {
+                return;
+            };
+            if diff.files.is_empty() {
+                return;
+            }
+            let current_index = self
+                .open_change
+                .as_ref()
+                .and_then(|active| diff.files.iter().position(|file| &file.path == active));
+            let next_index = match current_index {
+                Some(index) => (index + 1) % diff.files.len(),
+                None => 0,
+            };
+            diff.files[next_index].path.clone()
+        };
+        self.open_change_diff(next_path, window, cx);
+    }
+
+    /// The tab strip's real session-jump keycaps (`secondary-1`..`secondary-8`) - jumps to the
+    /// session at 1-indexed `position` in the same real, live order [`Self::render_tab_strip`]
+    /// already iterates (`Self::sessions.iter()`), via [`Self::select_session`] (the exact same
+    /// real switch a session tab's own click performs). A real no-op if fewer than `position`
+    /// sessions currently exist - this closes a real "looks real but isn't" gap: before this,
+    /// the tab strip rendered a `mod`/`1…8` keycap pair with no matching `secondary-1`..
+    /// `secondary-8` binding anywhere (`crate::keymap::resolve_combo`'s own docs call `"1…8"` a
+    /// placeholder token it passes through unresolved), so every one of those keycaps was purely
+    /// decorative.
+    pub(super) fn jump_to_session_at(
+        &mut self,
+        position: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = position
+            .checked_sub(1)
+            .and_then(|index| self.sessions.iter().nth(index))
+            .map(|session| session.id)
+        else {
+            return;
+        };
+        self.select_session(id, window, cx);
+    }
+
+    /// [`NewTerminal`]'s real, bound `ctrl-shift-T` action handler - the `+` menu's "New
+    /// terminal" row's own keybinding, spawning a real [`SessionKind::Shell`] session exactly
+    /// like the row's own click handler does.
+    pub(super) fn handle_new_terminal_action(
+        &mut self,
+        _action: &NewTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_session(SessionKind::Shell, window, cx);
+    }
+
+    /// [`NewAgentPane`]'s real, bound `secondary-shift-n` action handler - see
+    /// [`Self::new_agent_pane`]'s docs.
+    pub(super) fn handle_new_agent_pane_action(
+        &mut self,
+        _action: &NewAgentPane,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_agent_pane(cx);
+    }
+
+    /// [`NextChangedFile`]'s real, bound `]` action handler - see [`Self::next_changed_file`]'s
+    /// docs.
+    pub(super) fn handle_next_changed_file_action(
+        &mut self,
+        _action: &NextChangedFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.next_changed_file(window, cx);
+    }
+
+    session_jump_action_handler!(handle_jump_to_session_1_action, JumpToSession1, 1);
+    session_jump_action_handler!(handle_jump_to_session_2_action, JumpToSession2, 2);
+    session_jump_action_handler!(handle_jump_to_session_3_action, JumpToSession3, 3);
+    session_jump_action_handler!(handle_jump_to_session_4_action, JumpToSession4, 4);
+    session_jump_action_handler!(handle_jump_to_session_5_action, JumpToSession5, 5);
+    session_jump_action_handler!(handle_jump_to_session_6_action, JumpToSession6, 6);
+    session_jump_action_handler!(handle_jump_to_session_7_action, JumpToSession7, 7);
+    session_jump_action_handler!(handle_jump_to_session_8_action, JumpToSession8, 8);
 
     /// One tab: a 14×14 kind chip, the real label (the resolved binary name for an agent CLI
     /// tab, or the literal `terminal` for a shell tab - `design_handoff_jerry_ade/README.md`'s
@@ -316,8 +899,8 @@ impl AdeApp {
                     .gap(px(7.0))
                     .px(px(13.0))
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                        this.select_session(id, cx);
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                        this.select_session(id, window, cx);
                     }))
                     .child(render_tab_chip(session.kind, is_active))
                     .child(
@@ -342,13 +925,11 @@ impl AdeApp {
                             .text_color(theme::text::GHOST)
                             .hover(|el| el.text_color(theme::button::DANGER_FG))
                             .child("\u{d7}")
-                            .on_click(cx.listener(
-                                move |this, _event: &ClickEvent, _window, cx| {
-                                    cx.stop_propagation();
-                                    this.close_session(id, cx);
-                                    cx.notify();
-                                },
-                            )),
+                            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.close_session(id, window, cx);
+                                cx.notify();
+                            })),
                     ),
             )
             .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline))
@@ -520,8 +1101,8 @@ impl AdeApp {
             .text_color(theme::text::FAINT)
             .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
             .child("Archive")
-            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                this.archive_session(id, cx);
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.archive_session(id, window, cx);
             }))
     }
 
@@ -738,13 +1319,13 @@ impl AdeApp {
                 .cursor_pointer()
                 .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
                 .on_click(
-                    cx.listener(move |this, _event: &ClickEvent, _window, cx| match kind {
+                    cx.listener(move |this, _event: &ClickEvent, window, cx| match kind {
                         work_surface::ActionKind::Interrupt => this.interrupt_session(id, cx),
                         work_surface::ActionKind::OpenTerminal => {
-                            this.open_companion_terminal(cwd.clone(), cx)
+                            this.open_companion_terminal(cwd.clone(), window, cx)
                         }
-                        work_surface::ActionKind::Respawn => this.respawn_session(id, cx),
-                        work_surface::ActionKind::Archive => this.archive_session(id, cx),
+                        work_surface::ActionKind::Respawn => this.respawn_session(id, window, cx),
+                        work_surface::ActionKind::Archive => this.archive_session(id, window, cx),
                         work_surface::ActionKind::Unimplemented => {}
                     }),
                 );
@@ -755,10 +1336,15 @@ impl AdeApp {
         button
     }
 
-    /// The centre pane's content: either the real active session's terminal (the pre-existing
-    /// behavior), or - while [`Self::open_change`] names a file - that file's real Surface C
-    /// (`Self::render_code_surface`): its real diff if one is loaded and `Self::code_view` is
-    /// `Diff`, or its real syntax-highlighted File view otherwise (`crate::code_view`).
+    /// The centre pane's content - `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29
+    /// entry, change 4: the unified tab strip ([`Self::render_tab_strip`]) always renders first,
+    /// as a real sibling above whichever body follows, rather than being something the file-view
+    /// code path bypasses entirely the way it used to (this method used to `return` a whole
+    /// separate, tab-strip-less subtree the instant a file was open). Below it: either the real
+    /// active file tab's own Surface C (`Self::render_code_surface`) if [`Self::open_change`]
+    /// names one, or the real active session's toolbar/context-bar/pty otherwise - the exact
+    /// same two bodies this method already rendered, just both now stacked under one shared tab
+    /// strip instead of the file body replacing it.
     ///
     /// A file opened via a Changes-row click (`Self::open_change_diff`) always has a real
     /// `DiffFile` to show; a file opened via a Files-tree row click (`Self::open_file_view`) may
@@ -774,6 +1360,16 @@ impl AdeApp {
     /// `vendor/zed/crates/workspace/src/status_bar.rs`'s own real `.flex_1().min_w_0()` use for
     /// exactly this situation).
     pub(super) fn render_center_pane(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut surface = div()
+            .id("work-surface")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .bg(theme::surface::CENTER)
+            .child(self.render_tab_strip(cx));
+
         if let Some(open_path) = self.open_change.clone() {
             // `Self::open_diff_file_cache` already holds the real, up-to-date `DiffFile` for
             // `open_path` (kept fresh by `Self::refresh_open_diff_file_cache`, called at every
@@ -787,23 +1383,14 @@ impl AdeApp {
             let has_diff_or_file_view =
                 diff_file.is_some() || self.code_view == code_view::CodeView::File;
             if has_diff_or_file_view {
-                let surface = self.render_code_surface(&open_path, diff_file.as_ref(), cx);
+                let body = self.render_code_surface(&open_path, diff_file.as_ref(), cx);
                 self.open_diff_file_cache = diff_file;
-                return surface;
+                return surface.child(body).into_any_element();
             }
             self.open_diff_file_cache = diff_file;
         }
 
-        let surface = div()
-            .id("work-surface")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .bg(theme::surface::CENTER)
-            .child(self.render_session_toolbar(cx))
-            .child(self.render_tab_strip(cx));
+        surface = surface.child(self.render_session_toolbar(cx));
 
         match self.sessions.active() {
             Some(session) => {
@@ -854,6 +1441,73 @@ impl AdeApp {
         }
         .into_any_element()
     }
+}
+
+/// One row of the tab strip's `+` menu popover (`design_handoff_jerry_ade/revision/
+/// CHANGELOG.md`'s 2026-07-29 entry, change 4: "29-high rows of chip · label (nowrap) · dim sub
+/// · hint keycaps"). Returns the row with no click handler wired yet - `Self::render_plus_menu`
+/// attaches each row's own real action via `.on_click(cx.listener(...))` after the fact, since a
+/// free function has no `Context<AdeApp>` of its own to build a listener from. `keys` is already
+/// platform-resolved (`crate::keymap::resolve_combo`'s output), rendered through the existing
+/// [`render_keycap_row`] at [`KeycapSize::Hint`] - reused as-is rather than a new one-off keycap
+/// renderer, per this project's own "don't hand-roll new keycap rendering" convention; the
+/// mockup's own popover row happens to use a 3px keycap gap where [`KeycapSize::Hint`]'s
+/// established gap is 2px (see that type's own docs for the real, deliberate precedent this
+/// mirrors instead), a one-pixel difference accepted in favor of reusing the real, shared widget.
+fn render_plus_menu_row(
+    chip_glyph: &'static str,
+    chip_fg: gpui::Rgba,
+    chip_bg: gpui::Rgba,
+    label: &'static str,
+    sub: String,
+    keys: Vec<String>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(format!("plus-menu-row-{label}"))
+        .flex()
+        .items_center()
+        .gap(px(9.0))
+        .h(theme::band::PLUS_MENU_ROW)
+        .px(px(10.0))
+        .cursor_pointer()
+        .hover(|el| el.bg(theme::surface::PLUS_MENU_ROW_HOVER))
+        .child(
+            div()
+                .flex_none()
+                .w(px(14.0))
+                .h(px(14.0))
+                .rounded(theme::radius::CHIP)
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(chip_bg)
+                .font(font(theme::font::MONO))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_size(px(8.0))
+                .text_color(chip_fg)
+                .child(chip_glyph),
+        )
+        .child(
+            div()
+                .flex_none()
+                .font(font(theme::font::SANS))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_size(px(11.5))
+                .text_color(theme::text::HEADING)
+                .child(label),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .truncate()
+                .font(font(theme::font::MONO))
+                .text_size(px(10.0))
+                .text_color(theme::text::FAINTER)
+                .child(sub),
+        )
+        .child(render_keycap_row(&keys, KeycapSize::Hint))
 }
 
 /// The tab strip's 14×14 kind chip - a `❯` glyph tinted with the session's real agent colour

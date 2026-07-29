@@ -10,6 +10,7 @@
 
 use gpui::Rgba;
 
+use crate::file_tree::LangChip;
 use crate::sessions::SessionKind;
 use crate::status::Status;
 use crate::theme;
@@ -82,6 +83,25 @@ pub fn tab_chip_colors(kind: SessionKind, active: bool) -> ChipColors {
     if active {
         let (fg, bg) = agent_tint(kind);
         ChipColors { bg, fg }
+    } else {
+        ChipColors {
+            bg: theme::border::ZONE,
+            fg: theme::text::FAINTER,
+        }
+    }
+}
+
+/// A file tab's real chip colours (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 4:
+/// "the file's language chip, same table as the file tree" for the active state, dimmed to the
+/// exact same `bg`/`fg` [`tab_chip_colors`] already dims a session tab's chip to when inactive -
+/// `Jerry.dc.html`'s own tab computation applies the identical `chipBg: on ? chip.bg : '#1e2225',
+/// chipFg: on ? chip.fg : '#5e646a'` rule regardless of whether the tab is a session or a file).
+pub fn file_tab_chip_colors(lang: LangChip, active: bool) -> ChipColors {
+    if active {
+        ChipColors {
+            bg: lang.bg,
+            fg: lang.fg,
+        }
     } else {
         ChipColors {
             bg: theme::border::ZONE,
@@ -389,6 +409,31 @@ mod tests {
         let (claude_fg, claude_bg) = theme::agent::SONNET;
         assert!(same(claude.fg, claude_fg));
         assert!(same(claude.bg, claude_bg));
+    }
+
+    #[test]
+    fn an_active_file_tab_chip_is_tinted_with_its_own_language_colour() {
+        let rs = LangChip {
+            label: "rs",
+            fg: theme::lang::RS.0,
+            bg: theme::lang::RS.1,
+        };
+        let colors = file_tab_chip_colors(rs, true);
+        assert!(same(colors.fg, theme::lang::RS.0));
+        assert!(same(colors.bg, theme::lang::RS.1));
+    }
+
+    #[test]
+    fn an_inactive_file_tab_chip_is_dimmed_to_the_same_neutral_a_session_tab_chip_uses() {
+        let rs = LangChip {
+            label: "rs",
+            fg: theme::lang::RS.0,
+            bg: theme::lang::RS.1,
+        };
+        let file_colors = file_tab_chip_colors(rs, false);
+        let session_colors = tab_chip_colors(SessionKind::Shell, false);
+        assert!(same(file_colors.bg, session_colors.bg));
+        assert!(same(file_colors.fg, session_colors.fg));
     }
 
     #[test]

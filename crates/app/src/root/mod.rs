@@ -107,9 +107,41 @@ use crate::root::sidebar_render::RightSidebarView;
 // same real symbol/position a hover request would use is exactly what a definition request
 // needs) rather than an arbitrary one. A real no-op (not an error, not a fabricated navigation)
 // when nothing has been clicked yet, or the click wasn't on a real `.rs` file.
+// `NewTerminal` (`ctrl+shift+T`), `NewAgentPane` (`secondary-shift-n`) and `NextChangedFile`
+// (`]`) back the tab strip's real `+` menu (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s
+// 2026-07-29 entry, change 4) - see `Self::render_plus_menu`'s docs for the popover itself, and
+// `crate::default_key_bindings`'s docs for why each of these three literal keystroke specs was
+// chosen over `"secondary-"` (the mockup's own `Jerry.dc.html` `keymapDefs`/`plusItems` fixture
+// literally specs `ctrl+shift+T`, not `mod`-anything, for the first). The popover's fourth row,
+// "Open file…", dispatches `TogglePalette` from its own click handler (also setting
+// `Self::palette_scope` to `PaletteScope::Files` right after - see `Self::render_plus_menu`'s own
+// docs), but has no real global keybinding of its own - see `crate::default_key_bindings`'s own
+// docs for the real Ctrl+P/readline conflict that ruled one out.
+//
+// `JumpToSession1`..`JumpToSession8` back the tab strip's real, right-aligned session-jump
+// keycaps (change 4: "Right end of the strip: session-jump keycaps ... (was a bare `⌘ 1…8`
+// pair)") - eight distinct zero-sized actions, one per keystroke, since a bound `gpui::
+// KeyBinding` maps one literal keystroke to one action *value*, and `actions!`-generated unit
+// structs carry no data a single handler could branch on by position.
 actions!(
     app,
-    [NewSession, TogglePalette, ToggleSettings, GotoDefinition]
+    [
+        NewSession,
+        TogglePalette,
+        ToggleSettings,
+        GotoDefinition,
+        NewTerminal,
+        NewAgentPane,
+        NextChangedFile,
+        JumpToSession1,
+        JumpToSession2,
+        JumpToSession3,
+        JumpToSession4,
+        JumpToSession5,
+        JumpToSession6,
+        JumpToSession7,
+        JumpToSession8,
+    ]
 );
 
 /// How often the rail's real background status refresh (real `wt_core::diff::
@@ -194,11 +226,29 @@ pub struct AdeApp {
     /// not decoration - `Self::render_changes_header`'s progress bar and `N reviewed` count are
     /// both computed directly from its real membership.
     reviewed_files: HashSet<PathBuf>,
-    /// The file whose real diff is currently opened in the centre pane (`design_handoff_
-    /// jerry_ade/README.md`'s `open_change` state field), set by clicking a Changes row.
-    /// `render_center_pane` shows this file's diff instead of the active session's terminal
-    /// while it's `Some` - see that method's docs for the judgment call on how far this stands
-    /// in for the design's full Surface C.
+    /// The real, ordered list of currently-open file tabs (`design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s 2026-07-29 entry, change 4: "agent tab + shell tab + one tab per open
+    /// file, in open order") - `Self::render_tab_strip` renders one [`Self::render_file_tab`]
+    /// per entry, in this `Vec`'s order, after every session's own tab. No duplicates: opening
+    /// an already-open file (`Self::open_change_diff`/`Self::open_file_view`, via the shared
+    /// `Self::push_open_file`) just activates its existing entry rather than appending a second
+    /// one. A path is removed from here only when its tab is explicitly closed
+    /// (`Self::close_file_tab`) or the owning worktree is left (`reset_per_worktree_ui_state` -
+    /// these are worktree-relative paths, so they'd be meaningless, and could even collide with
+    /// an unrelated file, once the worktree changes - the exact same reasoning that function's
+    /// own docs already give for [`Self::open_change`]).
+    open_files: Vec<PathBuf>,
+    /// Which file tab (if any) the centre pane is currently *showing* instead of a session -
+    /// `Some(path)` iff `path` is also present in [`Self::open_files`]. This is the same real
+    /// "which file is open in the centre" state this field already held before file tabs became
+    /// a real, multi-entry `Vec` (`design_handoff_jerry_ade/README.md`'s `open_change` state
+    /// field) - the only change is that switching away from a file (clicking a session tab, or
+    /// another file tab) no longer discards it from existence; it just stops being this pointer's
+    /// target while it stays in `open_files`. Set by clicking a Changes row
+    /// (`Self::open_change_diff`), a Files-tree row (`Self::open_file_view`), or an already-open
+    /// file's own tab (`Self::activate_file_tab`); cleared by clicking a session tab
+    /// (`Self::select_session`) or closing the active tab down to no files left
+    /// (`Self::close_file_tab`).
     open_change: Option<PathBuf>,
     /// The real, already-found-and-cloned `DiffFile` for whichever path [`Self::open_change`]
     /// currently names (`None` if that file has no real diff, or nothing is open) - kept up to
@@ -680,6 +730,35 @@ pub struct AdeApp {
     /// [`Self::handle_settings_keymap_filter_key_down`]).
     settings_keymap_filter: String,
     settings_keymap_filter_focus_handle: FocusHandle,
+    /// Whether the tab strip's real `+` menu popover (`design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s 2026-07-29 entry, change 4) is currently open - see
+    /// [`Self::render_plus_menu`]. Closed by its own scrim click, by picking any real row (each
+    /// row's own click handler sets this back to `false` after running its action), and
+    /// defensively by [`Self::open_palette`]/[`Self::open_settings`] (opening either overlay
+    /// while this popover happened to still be open would otherwise leave it painting on top of
+    /// a surface it no longer makes sense over, since it's rendered as an unconditional sibling
+    /// of both - see [`Self::render`]'s own child list).
+    plus_menu_open: bool,
+    /// The tab strip's real `+` button's own painted bounds, captured every render by a
+    /// `gpui::canvas` child of that button (see [`Self::render_tab_strip_plus`]) - the same real
+    /// measuring pattern [`Self::body_bounds`]'s own docs describe, applied to one button instead
+    /// of the whole body. [`Self::render_plus_menu`] positions the popover directly off this
+    /// (`left = origin.x + 2px`, `top = origin.y + height` - "34 below it", per the design, since
+    /// the button itself already spans the tab strip's full 34px height) rather than a second,
+    /// independently-computed pixel offset that could drift from where the button actually
+    /// renders once the rail's own adjustable width shifts everything to its right.
+    /// `gpui::Bounds::default()` (zero origin/size) until the first paint; harmless, since
+    /// nothing reads it before the popover can ever be opened.
+    plus_button_bounds: gpui::Bounds<Pixels>,
+    /// Every real, in-flight [`Self::new_agent_pane`] background `$PATH` detection - a `Vec`,
+    /// mirroring [`Self::_lsp_tasks`]/[`Self::_goto_definition_tasks`]'s own "independent
+    /// operations, dropping an unrelated one would cancel it" shape, pruned of already-finished
+    /// entries before each push. This used to be a single `Option` slot - a real, live bug:
+    /// two rapid "New agent pane" clicks before the first click's background `$PATH` search had
+    /// resolved silently produced only one new session instead of two, since assigning the
+    /// second click's task into the same slot dropped (and so immediately cancelled) the
+    /// first's.
+    _new_agent_pane_task: Vec<Task<()>>,
 }
 
 impl AdeApp {
@@ -761,6 +840,17 @@ impl Render for AdeApp {
             .on_action(cx.listener(Self::handle_toggle_palette_action))
             .on_action(cx.listener(Self::handle_toggle_settings_action))
             .on_action(cx.listener(Self::handle_goto_definition_action))
+            .on_action(cx.listener(Self::handle_new_terminal_action))
+            .on_action(cx.listener(Self::handle_new_agent_pane_action))
+            .on_action(cx.listener(Self::handle_next_changed_file_action))
+            .on_action(cx.listener(Self::handle_jump_to_session_1_action))
+            .on_action(cx.listener(Self::handle_jump_to_session_2_action))
+            .on_action(cx.listener(Self::handle_jump_to_session_3_action))
+            .on_action(cx.listener(Self::handle_jump_to_session_4_action))
+            .on_action(cx.listener(Self::handle_jump_to_session_5_action))
+            .on_action(cx.listener(Self::handle_jump_to_session_6_action))
+            .on_action(cx.listener(Self::handle_jump_to_session_7_action))
+            .on_action(cx.listener(Self::handle_jump_to_session_8_action))
             .child(self.render_title_bar(cx))
             // The Settings surface (`design_handoff_jerry_ade/README.md`: "a separate surface,
             // not a modal: it replaces the three zones while the title bar and status bar
@@ -773,6 +863,9 @@ impl Render for AdeApp {
                 self.render_workspace_body(cx).into_any_element()
             })
             .child(self.render_status_bar(cx))
+            .when(self.plus_menu_open, |el| {
+                el.child(self.render_plus_menu(cx))
+            })
             .when(self.palette_open, |el| el.child(self.render_palette(cx)))
     }
 }

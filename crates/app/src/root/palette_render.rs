@@ -235,9 +235,13 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         match command {
-            palette::PaletteCommand::NewShell => self.new_session(SessionKind::Shell, cx),
-            palette::PaletteCommand::NewClaudeSession => self.new_session(SessionKind::Claude, cx),
-            palette::PaletteCommand::NewCodexSession => self.new_session(SessionKind::Codex, cx),
+            palette::PaletteCommand::NewShell => self.new_session(SessionKind::Shell, window, cx),
+            palette::PaletteCommand::NewClaudeSession => {
+                self.new_session(SessionKind::Claude, window, cx)
+            }
+            palette::PaletteCommand::NewCodexSession => {
+                self.new_session(SessionKind::Codex, window, cx)
+            }
             palette::PaletteCommand::ToggleFilesChanges => {
                 // `Self::new_session`/`Self::toggle_rail_mode` (the other non-prune branches
                 // here) already clear `prune_confirm_armed` themselves; this is the one
@@ -333,7 +337,7 @@ impl AdeApp {
                 palette::EntryTarget::Command(command) => {
                     self.execute_palette_command(command, window, cx)
                 }
-                palette::EntryTarget::Session(id) => self.select_session(id, cx),
+                palette::EntryTarget::Session(id) => self.select_session(id, window, cx),
                 palette::EntryTarget::File(path) => self.open_palette_file_result(path, window, cx),
             }
         }

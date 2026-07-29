@@ -34,6 +34,10 @@ impl AdeApp {
     /// execute.
     pub(super) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = true;
+        // See `Self::plus_menu_open`'s own docs: the tab strip's `+` menu is rendered as an
+        // unconditional sibling of the palette, so leaving it open here would paint it on top
+        // of (or under) a surface it no longer makes sense over.
+        self.plus_menu_open = false;
         self.palette_return_focus = window.focused(cx);
         self.palette_opened_session = self.sessions.active_id();
         self.palette_scope = palette::PaletteScope::default();
@@ -113,6 +117,8 @@ impl AdeApp {
         if self.palette_open {
             self.close_palette(window, cx);
         }
+        // See `Self::open_palette`'s identical guard, and `Self::plus_menu_open`'s own docs.
+        self.plus_menu_open = false;
         self.settings_open = true;
         self.settings_return_focus = window.focused(cx);
         self.settings_opened_session = self.sessions.active_id();
@@ -350,6 +356,518 @@ pub(in crate::root) mod palette_focus_tests {
              dispatch - must open the palette through crate::default_key_bindings' real \
              KeyBinding registration; this is exactly the path the old \"cmd-k\" binding broke \
              on Linux (Ctrl+K did nothing) without any test catching it"
+        );
+    }
+}
+
+/// Real, interactive regression coverage for Revision R4a's new global keybindings (`ctrl-shift-
+/// T`, `secondary-shift-n`, `secondary-p`, `]`, `secondary-1`..`secondary-8`) - the exact same
+/// real `cx.bind_keys(crate::default_key_bindings())` + `cx.simulate_keystrokes(..)` shape
+/// [`palette_focus_tests::secondary_keystroke_opens_the_palette_through_the_real_key_bindings`]
+/// established in Revision R2 for exactly this reason: a test that only calls
+/// `cx.dispatch_action(..)` directly proves the *handler* works, never that the real, literal
+/// keystroke string in `crate::default_key_bindings` actually resolves to that action - which is
+/// exactly the class of bug R2's own `"cmd-k"` incident shipped with a fully green, dispatch-only
+/// test suite.
+#[cfg(test)]
+mod tab_strip_keybinding_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn bind_real_keys(cx: &mut gpui::VisualTestContext) {
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+    }
+
+    /// The `+` menu popover is rendered as an unconditional sibling of both the palette and
+    /// Settings (`AdeApp::plus_menu_open`'s own docs) - opening either while it happened to
+    /// still be open must close it, or it would paint on top of a surface it no longer makes
+    /// sense over.
+    #[gpui::test]
+    fn opening_the_palette_closes_an_already_open_plus_menu(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, cx| {
+            app.plus_menu_open = true;
+            cx.notify();
+        });
+        cx.dispatch_action(TogglePalette);
+
+        assert!(app.read_with(cx, |app, _| app.palette_open));
+        assert!(
+            !app.read_with(cx, |app, _| app.plus_menu_open),
+            "opening the palette should have closed the still-open plus menu"
+        );
+    }
+
+    #[gpui::test]
+    fn opening_settings_closes_an_already_open_plus_menu(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, cx| {
+            app.plus_menu_open = true;
+            cx.notify();
+        });
+        cx.dispatch_action(ToggleSettings);
+
+        assert!(app.read_with(cx, |app, _| app.settings_open));
+        assert!(
+            !app.read_with(cx, |app, _| app.plus_menu_open),
+            "opening Settings should have closed the still-open plus menu"
+        );
+    }
+
+    /// `ctrl-shift-T` is a real, literal Ctrl combo on every OS (not `secondary`-aliased - see
+    /// `crate::default_key_bindings`'s own docs for why) - simulated literally here rather than
+    /// branching on `cfg!(target_os = "macos")` the way the `secondary-` bindings' own tests do.
+    #[gpui::test]
+    fn ctrl_shift_t_spawns_a_real_shell_session_through_the_real_key_bindings(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        bind_real_keys(cx);
+
+        let sessions_before = app.read_with(cx, |app, _| app.sessions.iter().count());
+
+        cx.simulate_keystrokes("ctrl-shift-t");
+
+        let (sessions_after, active_kind) = app.read_with(cx, |app, _| {
+            (
+                app.sessions.iter().count(),
+                app.sessions.active().map(|session| session.kind),
+            )
+        });
+        assert_eq!(
+            sessions_after,
+            sessions_before + 1,
+            "a real, simulated ctrl-shift-t keystroke should have spawned exactly one new \
+             session through crate::default_key_bindings' real ctrl-shift-t -> NewTerminal \
+             binding"
+        );
+        assert_eq!(
+            active_kind,
+            Some(SessionKind::Shell),
+            "New terminal always spawns a real Shell session"
+        );
+    }
+
+    #[gpui::test]
+    fn secondary_shift_n_spawns_a_real_agent_session_through_the_real_key_bindings(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        bind_real_keys(cx);
+
+        let sessions_before = app.read_with(cx, |app, _| app.sessions.iter().count());
+
+        let secondary_shift_n = if cfg!(target_os = "macos") {
+            "cmd-shift-n"
+        } else {
+            "ctrl-shift-n"
+        };
+        cx.simulate_keystrokes(secondary_shift_n);
+        // `AdeApp::new_agent_pane`'s real `$PATH` detection runs on the background executor -
+        // drive it to completion before checking the real result, the same real reason every
+        // other background-dispatching test in this crate calls `run_until_parked`.
+        cx.run_until_parked();
+
+        let sessions_after = app.read_with(cx, |app, _| app.sessions.iter().count());
+        assert_eq!(
+            sessions_after,
+            sessions_before + 1,
+            "a real, simulated {secondary_shift_n} keystroke should have spawned exactly one \
+             new agent session through crate::default_key_bindings' real \
+             secondary-shift-n -> NewAgentPane binding"
+        );
+    }
+
+    /// The mirror-image regression the audit specifically called out as missing: the `+` menu's
+    /// "Open file…" row used to be backed by a real global `secondary-p` binding - removed (see
+    /// `crate::default_key_bindings`'s own docs) once audit found it silently ate a real,
+    /// standard readline control byte (Ctrl+P, `0x10`, "previous history") out of every focused
+    /// terminal session on Linux/Windows, since GPUI dispatches a matched, registered
+    /// `KeyBinding`'s action *before* a focused element's own `on_key_down`. With no real
+    /// binding registered for it anymore, a real, simulated `ctrl-p` keystroke - with the
+    /// window's real initial terminal pane focused, exactly like a completely ordinary "browsing
+    /// the terminal" moment - must not open the palette at all; it should be free to reach the
+    /// focused terminal as literal input instead. This test only proves the palette didn't open
+    /// (the state-level half of the same two-part proof `bracket_does_not_fire_globally_while_a_
+    /// terminal_is_focused` uses for `]`); `terminal_pane`'s own `keystroke_tests` module covers
+    /// the real pty-forwarding half (`ctrl-p` really does map to the real `0x10` control byte).
+    #[gpui::test]
+    fn ctrl_p_does_not_open_the_palette_while_a_terminal_is_focused(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        bind_real_keys(cx);
+
+        assert!(
+            !app.read_with(cx, |app, _| app.palette_open),
+            "sanity check: the palette must start closed"
+        );
+
+        let secondary_p = if cfg!(target_os = "macos") {
+            "cmd-p"
+        } else {
+            "ctrl-p"
+        };
+        cx.simulate_keystrokes(secondary_p);
+
+        assert!(
+            !app.read_with(cx, |app, _| app.palette_open),
+            "a real, simulated {secondary_p} keystroke must NOT open the palette - there is no \
+             real global keybinding for it anymore (crate::default_key_bindings' own docs), so \
+             it must be free to reach the focused terminal pane as literal input instead of \
+             being intercepted at the dispatch level"
+        );
+    }
+
+    fn secondary_k() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "cmd-k"
+        } else {
+            "ctrl-k"
+        }
+    }
+
+    /// CRITICAL regression test, the exact sequence the audit reproduced live: open a file tab
+    /// (so `AdeApp::open_change` is `Some` and `Self::render_center_pane` is showing that file,
+    /// not any session's `TerminalPane`), press `ctrl-shift-t` (`NewTerminal`, which spawns a new
+    /// session), then confirm `ctrl-k` still opens the palette. Before the fix,
+    /// `Sessions::spawn` unconditionally moved `Window::focus` onto the freshly spawned
+    /// session's own pane even though it wasn't rendered anywhere that frame, leaving
+    /// `Window::focus` pointing at a node with no `on_action` handlers above it - silently
+    /// killing every bound shortcut, `ctrl-k` included, until the next click.
+    #[gpui::test]
+    fn ctrl_k_still_works_after_ctrl_shift_t_with_a_file_tab_active(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo.path().join("a.txt"), "hello\n").expect("write a.txt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        bind_real_keys(cx);
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(repo.path().join("a.txt"), window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.open_change.is_some()),
+            "sanity check: a file tab should now be active"
+        );
+
+        cx.simulate_keystrokes("ctrl-shift-t");
+        assert!(
+            app.read_with(cx, |app, _| app.sessions.iter().count()) >= 2,
+            "sanity check: ctrl-shift-t should have spawned a real new session"
+        );
+
+        let key = secondary_k();
+        cx.simulate_keystrokes(key);
+
+        assert!(
+            app.read_with(cx, |app, _| app.palette_open),
+            "a real {key} keystroke after ctrl-shift-t, with a file tab active, must still open \
+             the palette - before the fix, Sessions::spawn's unconditional focus pointed \
+             Window::focus at the new session's pane even though render_center_pane was still \
+             showing the file tab, leaving no real dispatch path to any on_action handler"
+        );
+    }
+
+    /// CRITICAL regression test for the identical gap in `Sessions::close`: closing the *active*
+    /// session's tab (the tab strip's own `×`, exercised here via `AdeApp::close_session`, its
+    /// real handler) picks a new active session but, before the fix, never moved real keyboard
+    /// focus onto it - leaving `ctrl-k` dead afterward exactly like the `Sessions::spawn` gap
+    /// above.
+    #[gpui::test]
+    fn ctrl_k_still_works_after_closing_the_active_session_tab(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        bind_real_keys(cx);
+
+        let first_id = app.read_with(cx, |app, _| {
+            app.sessions.active_id().expect("the initial shell session")
+        });
+        app.update(cx, |app, cx| {
+            app.sessions
+                .spawn(SessionKind::Shell, repo.path().to_path_buf(), cx)
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_session(first_id, window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.sessions.active_id()),
+            Some(first_id),
+            "sanity check: the first session should be active again before closing it"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.close_session(first_id, window, cx);
+        });
+
+        let key = secondary_k();
+        cx.simulate_keystrokes(key);
+
+        assert!(
+            app.read_with(cx, |app, _| app.palette_open),
+            "a real {key} keystroke after closing the active session's own tab must still open \
+             the palette - Sessions::close must move real keyboard focus onto whichever session \
+             became active as a result, not leave Window::focus dangling"
+        );
+    }
+
+    /// The other real, live reproduction path the audit found for the same `Sessions::close`
+    /// gap: archiving the active session from the rail (`AdeApp::archive_session`, which
+    /// delegates to `Self::close_session`).
+    #[gpui::test]
+    fn ctrl_k_still_works_after_archiving_the_active_session(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        bind_real_keys(cx);
+
+        let first_id = app.read_with(cx, |app, _| {
+            app.sessions.active_id().expect("the initial shell session")
+        });
+        app.update(cx, |app, cx| {
+            app.sessions
+                .spawn(SessionKind::Shell, repo.path().to_path_buf(), cx)
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_session(first_id, window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.sessions.active_id()),
+            Some(first_id),
+            "sanity check: the first session should be active again before archiving it"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.archive_session(first_id, window, cx);
+        });
+
+        let key = secondary_k();
+        cx.simulate_keystrokes(key);
+
+        assert!(
+            app.read_with(cx, |app, _| app.palette_open),
+            "a real {key} keystroke after archiving the active session must still open the \
+             palette - archiving goes through the same Sessions::close real focus-restore path \
+             closing a tab does"
+        );
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[gpui::test]
+    fn bracket_advances_to_the_next_changed_file_through_the_real_key_bindings(
+        cx: &mut TestAppContext,
+    ) {
+        // `]` is deliberately scoped to `Some("diff")` (`crate::default_key_bindings`'s own
+        // docs), not global - real, live-verified against GPUI's own dispatch order: a *global*
+        // bare `]` binding would silently swallow a literal `]` typed into any focused terminal/
+        // agent session (closing a bracket, an array literal, ...) instead of forwarding it to
+        // the real pty, since GPUI dispatches a matched action *before* a focused element's own
+        // `on_key_down`. This test therefore first opens a real file (establishing real
+        // `"diff"`-context focus, via `AdeApp::open_change_diff`) before simulating the
+        // keystroke - proving the real, scoped binding still works from the surface it's meant
+        // to, not that it works from literally anywhere.
+        let repo = tempfile::tempdir().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("a.txt"), "1\n").expect("write a.txt");
+        std::fs::write(repo.path().join("b.txt"), "1\n").expect("write b.txt");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo.path().join("a.txt"), "1\nchanged\n").expect("rewrite a.txt");
+        std::fs::write(repo.path().join("b.txt"), "1\nchanged\n").expect("rewrite b.txt");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        bind_real_keys(cx);
+
+        let order: Vec<PathBuf> = app.read_with(cx, |app, _| {
+            app.current_diff()
+                .expect("a real diff against main should have loaded")
+                .files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect()
+        });
+        assert_eq!(order.len(), 2, "sanity check: both files should be changed");
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_change_diff(order[0].clone(), window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(order[0].clone())
+        );
+
+        cx.simulate_keystrokes("]");
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(order[1].clone()),
+            "a real, simulated ] keystroke, with a real file tab already focused, must advance \
+             to the next real changed file through crate::default_key_bindings' real, \
+             \"diff\"-scoped ] -> NextChangedFile binding"
+        );
+    }
+
+    /// The other real half of the scoping above: with *no* file tab focused (only the initial
+    /// session's terminal pane, as in a completely ordinary "browsing the terminal" moment), a
+    /// real `]` keystroke must **not** reach [`NextChangedFile`] at all - it should be a real
+    /// no-op at the dispatch level, leaving the keystroke free to reach the focused terminal
+    /// instead (this test only proves the state didn't change; `terminal_pane`'s own
+    /// `keystroke_tests` module covers the pty-forwarding half separately).
+    ///
+    /// Asserts a real diff with at least one file actually loaded before checking the negative
+    /// keystroke behavior - a hardening fix so this test can't silently go vacuous: without it,
+    /// a future change to the test fixture that stopped producing a real diff (e.g. a git config
+    /// or branch-detection regression) would leave `open_change` at `None` before *and* after the
+    /// `]` keystroke for a completely different, uninteresting reason - there being nothing to
+    /// navigate to at all - and this test would keep passing trivially forever without ever
+    /// exercising the real scoping it claims to.
+    #[gpui::test]
+    fn bracket_does_not_fire_globally_while_a_terminal_is_focused(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("a.txt"), "1\n").expect("write a.txt");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo.path().join("a.txt"), "1\nchanged\n").expect("rewrite a.txt");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        bind_real_keys(cx);
+
+        assert!(
+            app.read_with(cx, |app, _| app
+                .current_diff()
+                .is_some_and(|diff| !diff.files.is_empty())),
+            "sanity check: a real diff with at least one changed file must actually have loaded, \
+             or the negative assertion below would trivially pass for the wrong reason (nothing \
+             to navigate to at all, rather than the real ] scoping doing its job)"
+        );
+
+        assert_eq!(app.read_with(cx, |app, _| app.open_change.clone()), None);
+
+        cx.simulate_keystrokes("]");
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            None,
+            "with only a terminal focused (no real \"diff\" context anywhere in the dispatch \
+             path), a real ] keystroke must not open anything - it should be free to reach the \
+             focused terminal as literal input instead"
+        );
+    }
+
+    /// Spawns four extra real shell sessions (five total, including the one `AdeApp::new` starts)
+    /// and confirms `secondary-3` really jumps to the third one in real session order - not just
+    /// that `AdeApp::jump_to_session_at(3, ..)` does when called directly.
+    #[gpui::test]
+    fn secondary_3_jumps_to_the_third_real_session_through_the_real_key_bindings(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        bind_real_keys(cx);
+
+        for _ in 0..4 {
+            app.update_in(cx, |app, window, cx| {
+                app.new_session(SessionKind::Shell, window, cx);
+            });
+        }
+        let third_id = app.read_with(cx, |app, _| {
+            app.sessions
+                .iter()
+                .nth(2)
+                .map(|session| session.id)
+                .expect("five real sessions should exist by now")
+        });
+        assert_ne!(
+            app.read_with(cx, |app, _| app.sessions.active_id()),
+            Some(third_id),
+            "sanity check: the most recently spawned session (the fifth), not the third, should \
+             be active before the jump"
+        );
+
+        let secondary_3 = if cfg!(target_os = "macos") {
+            "cmd-3"
+        } else {
+            "ctrl-3"
+        };
+        cx.simulate_keystrokes(secondary_3);
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.sessions.active_id()),
+            Some(third_id),
+            "a real, simulated {secondary_3} keystroke must activate the session at position 3 \
+             through crate::default_key_bindings' real secondary-3 -> JumpToSession3 binding"
+        );
+    }
+
+    /// [`AdeApp::jump_to_session_at`]'s own direct-call coverage (as opposed to the keystroke
+    /// simulation above) for every position 1..=8, plus the real "fewer sessions than the
+    /// position" no-op.
+    #[gpui::test]
+    fn jump_to_session_at_activates_the_right_session_by_position(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let mut ids = vec![app.read_with(cx, |app, _| {
+            app.sessions.active_id().expect("the initial shell session")
+        })];
+        for _ in 0..3 {
+            let id = app.update(cx, |app, cx| {
+                app.sessions
+                    .spawn(SessionKind::Shell, repo.path().to_path_buf(), cx)
+            });
+            ids.push(id);
+        }
+        // Four real sessions now exist, in spawn order `ids[0..4]`.
+
+        for (position, expected_id) in ids.iter().enumerate() {
+            let position = position + 1;
+            app.update_in(cx, |app, window, cx| {
+                app.jump_to_session_at(position, window, cx);
+            });
+            assert_eq!(
+                app.read_with(cx, |app, _| app.sessions.active_id()),
+                Some(*expected_id),
+                "position {position} should activate session {expected_id}"
+            );
+        }
+
+        // A real no-op: there is no fifth session.
+        let active_before = app.read_with(cx, |app, _| app.sessions.active_id());
+        app.update_in(cx, |app, window, cx| {
+            app.jump_to_session_at(5, window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.sessions.active_id()),
+            active_before,
+            "jumping to a position with no real session there must be a no-op"
         );
     }
 }
