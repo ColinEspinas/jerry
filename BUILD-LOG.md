@@ -1239,3 +1239,57 @@ correct for a phase's first build pass but wrong for a fix round that needs to c
 already sitting in an existing worktree — two fix-round dispatches had to be corrected
 mid-flight to operate on the right directory directly instead. R8, R9, and R10 return to
 strictly sequential dispatch, since all three converge heavily on the same core files.
+
+## Revision R8 — generalize the LSP client beyond rust-analyzer
+
+Real, live-tested TypeScript and Python support — real spawn, real handshake, real
+diagnostics, real hover — verified against actual `typescript-language-server` and
+`pyright-langserver` processes installed for real in this environment, not mocked.
+`lsp-core`'s protocol handling generalized from four rust-analyzer-only assumptions to real
+per-server configuration: binary+args, per-extension `language_id`, real
+`initializationOptions`, and real per-section `workspace/configuration` replies instead of
+`null` for everything. New `crates/app/src/language.rs` is one real canonical language
+registry (extension, display name, LSP identity, chip color) replacing four independently-
+maintained tables that had no shared source of truth. Real `tree-sitter-typescript`/
+`tree-sitter-python` grammars added, sharing one generalized walker with the existing Rust
+highlighter. Extended language chip colors (ts/vue/py/go) added to match the design
+revision's real spec.
+
+Vue was investigated and deliberately deferred, not silently skipped: the real, installed
+`@vue/language-server` crashes computing diagnostics for any `.vue` file because its default
+"hybrid mode" expects a companion `typescript-language-server` process this architecture
+doesn't coordinate — real two-process LSP coordination is legitimate future work, not
+something to fake a single-process approximation of.
+
+The build's own testing reported "fully real, end-to-end, live-tested" for TypeScript, but
+an audit that actually ran the tests rather than reading the diff found the opposite for
+diagnostics specifically: the one real capability flag that makes `typescript-language-
+server` ever send a diagnostic at all was still unset, so the diagnostics test failed 120
+seconds into its own timeout on every single run — not flaky, deterministic, confirmed
+independently before dispatching the fix. Corrected to match what the code's own comment
+already, correctly, said should happen. The same audit found real misclassification bugs in
+the new TypeScript/Python syntax highlighting neither language had a single test for —
+Rust's grammar happens to structure `let` bindings under a different field than function
+names, so the shared highlighter's function-detection never collided there, but
+TypeScript's `const`/`let`/`var` declarations and Python's `class` names share exactly the
+field the highlighter was matching on, painting ordinary variable and class names as
+functions. Fixed by matching on real parent-node shape, not just field name, with real test
+coverage added for both languages.
+
+Also fixed: two production `.expect()` calls on the Settings Language Servers page that
+could panic if a fixed-size-array assumption ever drifted from the real registry's actual
+length; a real `$PATH` resolution running unconditionally on every single repaint of a
+Python file instead of only when a server actually needs spawning; a Vue deferral doc whose
+own cited evidence turned out to be backwards (the flag it called "actively harmful" is
+actually what prevents the real crash the doc uses to justify avoiding it — the underlying
+decision to defer was still correct for a different, verified reason); and a blanket
+Markdown-emphasis-stripping heuristic in hover text that would have silently corrupted real
+identifiers like `__proto__`/`__dirname` into wrong text.
+
+During this phase the user asked why the Settings Language Servers page's "not installed"
+rows don't have a working install action at all (per the original mockup) rather than being
+honestly omitted. Discussed and landed on a real, well-scoped version: an "Install" action
+per row that opens that server's real, correct install/docs page in the user's browser,
+reusing Revision R11's real cross-platform "open with the OS default handler" mechanism
+(the same one already used for opening the settings file) — not a button that runs arbitrary
+install commands on the user's behalf. Tracked as a new follow-up task, queued after R8.
