@@ -12,15 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 gpui = { workspace = true }
-# Only the `wayland` backend is enabled by default: the `x11` feature link-fails on this
-# dev machine because `libxkbcommon-x11`/`libxcb-xkb` aren't installed system packages here
-# and there's no passwordless sudo to install them (see the step-3 report for how `x11` was
-# still verified to render correctly, via a temporary local workaround). WSLg (this dev
-# machine) provides a real Wayland compositor (`WAYLAND_DISPLAY=wayland-0`), so `wayland`
-# alone is sufficient for `cargo build -p app` to produce a working, launchable binary here.
-gpui_platform = { path = "../../vendor/zed/crates/gpui_platform", features = [
-    "wayland",
-] }
 wt-core = { path = "../wt-core" }
 pty-core = { path = "../pty-core" }
 # Real LSP client (spawns `rust-analyzer`, real initialize/initialized handshake, real
@@ -65,6 +56,45 @@ serde_json = { workspace = true }
 # crate, not a GPUI API, so it needs no `vendor/zed` call-site verification the way GPUI calls
 # do - only the version-pin convention applies).
 regex = "1.5"
+
+# Real per-target `gpui_platform` backend selection (Revision R11). `gpui_platform`'s own
+# Cargo.toml (`vendor/zed/crates/gpui_platform/Cargo.toml`) pulls in `gpui_macos`/
+# `gpui_windows` unconditionally via its own `[target.'cfg(target_os = "...")'.dependencies]`
+# sections - there is no top-level feature to request for those two backends, they're
+# selected automatically by `target_os` alone. `wayland`/`x11` are real features of that
+# crate, but only meaningful ones: `wayland = ["gpui_linux/wayland"]` /
+# `x11 = ["gpui_linux/x11"]`, and `gpui_linux` itself is only a dependency at all under
+# `cfg(any(target_os = "linux", target_os = "freebsd"))` - so only the Linux/FreeBSD block
+# below requests either. `x11` stays disabled here, matching the original (pre-R11) decision
+# this crate's own history recorded: `libxkbcommon-x11`/`libxcb-xkb`'s `-dev` packages still
+# aren't installed on this sandbox and there's still no passwordless `sudo` to add them
+# (re-checked for this revision: `pkg-config --exists xkbcommon-x11` still fails, `sudo -n
+# true` still fails) - the reason has not gone away.
+#
+# This section's own `cfg` predicate is deliberately `cfg(any(target_os = "linux", target_os =
+# "freebsd"))`, matching `gpui_linux`'s own gate exactly, NOT a `target_os = "linux"`-only
+# predicate. An earlier version of this revision used the narrower, Linux-only predicate here,
+# which silently regressed FreeBSD: `gpui_linux` (and so a real, working GPUI backend) was
+# genuinely reachable on FreeBSD via this same crate before this revision's Cargo.toml change,
+# and a Linux-only `cfg` here would leave FreeBSD with no `gpui_platform` dependency at all -
+# a hard, silent compile failure on a platform this app could previously target, and one this
+# same revision's own `an_unrecognized_target_os_falls_back_to_xdg_open` test (which uses
+# `"freebsd"` as one of its real cases) already treats as a supported target elsewhere in this
+# crate.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui_platform = { path = "../../vendor/zed/crates/gpui_platform", features = [
+    "wayland",
+] }
+
+# macOS: `gpui_macos` is pulled in by `gpui_platform` itself purely from `target_os`, so no
+# feature request is needed or possible here.
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_platform = { path = "../../vendor/zed/crates/gpui_platform" }
+
+# Windows: same as macOS - `gpui_windows` (and `gpui`'s own `windows-manifest` feature) are
+# pulled in automatically by `gpui_platform`'s own Windows target section.
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui_platform = { path = "../../vendor/zed/crates/gpui_platform" }
 
 [dev-dependencies]
 tempfile = "3"

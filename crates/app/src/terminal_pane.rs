@@ -32,6 +32,25 @@
 //! needs more `alacritty_terminal` terminal-mode state than this pane threads through, e.g.
 //! application cursor-key mode) - enough to type commands, use arrow keys, and send
 //! `Ctrl-C`, not a full VT100 keymap.
+//!
+//! ## Windows: process-exit detection can't rely on pty EOF
+//!
+//! [`Self::spawn_process`]'s poll loop has exactly one unix-native trigger for "the process
+//! ended": `pty_core::PtySession::output()`'s channel disconnecting (`TryRecvError::
+//! Disconnected`), which fires once the reader thread inside `pty-core` observes real pty EOF.
+//! On unix that happens quickly after the child exits. On Windows it structurally can't be
+//! relied on at all: `pty_core`'s Windows reader thread only observes EOF once
+//! `PtySession::master` itself is dropped (a `ClosePseudoConsole` chain - see that crate's
+//! `run_reader_loop` docs), which killing/reaping the child does **not** do on its own. Left to
+//! only the channel-disconnect path, a killed Windows process would never be noticed here:
+//! [`Self::session`] would stay `Some` forever, [`Self::is_running`] would stay `true`,
+//! [`Self::exit_status`] would stay `None`, and [`TerminalGrid::mark_ended`] would never run -
+//! this pane's entire "the process ended" story silently breaks on that platform. So the poll
+//! loop's live-session branch also independently polls `pty_core::PtySession::try_wait`
+//! directly every tick under `#[cfg(windows)]`, regardless of channel state - real, cheap
+//! (`GetExitCodeProcess`, non-blocking), and correct even when pty I/O itself never signals
+//! anything - and feeds a confirmed exit into the exact same `newly_exited`/`process_ended`
+//! state transition the unix EOF path already uses.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::TryRecvError;
@@ -202,10 +221,12 @@ pub struct TerminalPane {
     session: Option<PtySession>,
     spawn_error: Option<String>,
     /// The process's exit status, once it has exited - captured via a non-blocking
-    /// `PtySession::try_wait` the moment the poll loop observes the output channel disconnect
-    /// (see `Self::spawn_process`'s docs). `None` while running, before ever spawned, or if a
-    /// spawn attempt itself failed (see [`Self::spawn_error`] for that case - a process that
-    /// never started has no `ExitStatus` to report).
+    /// `PtySession::try_wait` the moment the poll loop notices the process ended: on unix, when
+    /// the output channel disconnects (real pty EOF); on Windows, from an independent
+    /// `try_wait` poll every tick, since pty EOF can't be relied on there (see the module docs'
+    /// "Windows: process-exit detection can't rely on pty EOF" section). `None` while running,
+    /// before ever spawned, or if a spawn attempt itself failed (see [`Self::spawn_error`] for
+    /// that case - a process that never started has no `ExitStatus` to report).
     exit_status: Option<ExitStatus>,
     /// The last time this pane's process is known to have produced output, or - if it hasn't
     /// produced any yet - the moment it started. `None` only before any process has ever
@@ -584,6 +605,32 @@ impl TerminalPane {
                                     }
                                     break;
                                 }
+                            }
+                        }
+
+                        // Windows has no channel-disconnect signal to react to, ever - see
+                        // `pty_core`'s crate-level "Platform scope" docs. On unix, a dead
+                        // child's reader thread hits real pty EOF quickly, which closes
+                        // `output_tx` and trips the `TryRecvError::Disconnected` arm above.
+                        // On Windows, `run_reader_loop`'s reader thread only observes EOF once
+                        // `PtySession::master` itself is dropped - which killing/reaping the
+                        // child does NOT do on its own (see that function's docs for the full
+                        // ConPTY/`ClosePseudoConsole` ownership chain) - so a killed Windows
+                        // process would otherwise leave `session` `Some` forever and this poll
+                        // loop would spin indefinitely believing it was still running:
+                        // `is_running()` stuck `true`, `exit_status()` stuck `None`,
+                        // `grid.mark_ended()` never called. So Windows independently polls
+                        // `PtySession::try_wait` directly, every tick, regardless of channel
+                        // state - a real, cheap, non-blocking `GetExitCodeProcess` check (see
+                        // `pty_core`'s docs) that works whether or not the pty's own I/O ever
+                        // signals anything. Reuses the exact same `newly_exited`/
+                        // `process_ended` transition the unix EOF path above uses, rather than
+                        // a second, parallel one.
+                        #[cfg(windows)]
+                        if !process_ended {
+                            if let Ok(Some(status)) = session.try_wait() {
+                                newly_exited = Some(status);
+                                process_ended = true;
                             }
                         }
                     }

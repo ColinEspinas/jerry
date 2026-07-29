@@ -15,15 +15,60 @@
 //! (a later step) owns `alacritty_terminal`'s `Term` grid, driven by the raw bytes this crate
 //! streams out.
 //!
-//! ## Platform scope: unix only, for now
+//! ## Platform scope: full on unix, narrower (but real) on Windows
 //!
 //! The reader-thread shutdown signaling (a self-pipe polled alongside the pty fd) and the
-//! process-tree kill (process-group signals plus a `/proc` descendant walk) are
-//! unix-specific. `portable-pty` itself is cross-platform, but equivalent non-blocking-
-//! shutdown and tree-kill primitives on Windows (job objects, IOCP) are a distinct API
-//! surface this crate has no reference implementation for - an explicit, documented scope
-//! cut rather than a guess. This repo's target (a Linux/WSL2 desktop tool) is unix, so it
-//! isn't a blocking gap for now.
+//! process-tree kill (process-group signals plus a `/proc` descendant walk) are `#[cfg(unix)]`.
+//! `child_pids_of`/`pid_exists` read Linux's `/proc` specifically; on a non-Linux unix (e.g.
+//! macOS) they already degrade gracefully to "found nothing" (see their own docs), so
+//! `terminate_process_tree` still sends real signals to the child's process group there, just
+//! without the escaped-grandchild walk.
+//!
+//! Windows (`#[cfg(windows)]` - deliberately not the broader `#[cfg(not(unix))]`, see below)
+//! gets a real, but intentionally narrower, equivalent rather than a blanket refusal to
+//! compile: [`PtySession::kill`]/`Drop` call `portable_pty::Child`'s own cross-platform
+//! `kill()` (a safe wrapper this crate doesn't need `unsafe` to call), which terminates the
+//! direct child only - no process-group or descendant-tree kill, since neither concept exists
+//! on Windows without job objects (a distinct, `unsafe`-FFI-heavy API surface this project's
+//! own no-`unsafe` rule rules out here). That means a killed child's own grandchildren (e.g. a
+//! subprocess an agent CLI spawned) can survive as real orphans on Windows - a genuine,
+//! tracked regression relative to the unix path, not fixed here (see [`PtySession::kill`]'s
+//! `#[cfg(windows)]` docs and BUILD-LOG.md's R11 entry).
+//!
+//! The reader thread also can't be proactively interrupted the way `#[cfg(unix)]`'s self-pipe
+//! does: `filedescriptor` 0.8.3's Windows `poll_impl` is backed by `WSAPoll`, which only
+//! accepts sockets, and a ConPTY master handle is a named pipe, not a socket - so there is no
+//! safe self-pipe-style signal available. `run_reader_loop`'s `#[cfg(windows)]` variant just
+//! blocks in `read` until the pty naturally closes (EOF/error) - see that function's own docs
+//! for exactly when that happens: only once `PtySession::master` itself is dropped, NOT merely
+//! once the child is killed/reaped. That has two real, load-bearing consequences fixed in this
+//! revision:
+//!
+//! - **Process-exit detection can't rely on the output channel disconnecting.** On unix, a
+//!   dead child's reader thread hits real EOF quickly and its dropped `output_tx` is what the
+//!   rest of the app (`crate::terminal_pane` in the `app` crate) reacts to. On Windows that
+//!   channel disconnect may never happen - a killed/reaped process leaves `master` untouched,
+//!   so the reader thread stays blocked in `read` indefinitely. Callers on Windows must instead
+//!   poll [`PtySession::try_wait`] directly and independently of channel state (real,
+//!   non-blocking `GetExitCodeProcess` under the hood - see `portable-pty-0.9.0/src/win/mod.rs`),
+//!   the way `crate::terminal_pane`'s `#[cfg(windows)]` poll-loop branch in the `app` crate now
+//!   does.
+//! - **[`PtySession::shutdown`]'s Windows twin now explicitly drops `master` itself**, before
+//!   joining the reader thread, rather than handing that join to a detached thread and hoping a
+//!   later `Drop` closes `master` eventually - see that function's own docs.
+//!
+//! None of the `#[cfg(windows)]` code paths below have run on a real Windows machine - this
+//! crate has only ever executed on Linux/WSL2. They're reasoned from `portable-pty` 0.9.0's and
+//! `filedescriptor` 0.8.3's own real source and checked with
+//! `cargo check --target x86_64-pc-windows-gnu`, not verified by running.
+//!
+//! `#[cfg(windows)]`, not `#[cfg(not(unix))]`, is deliberate throughout this file: every one of
+//! these code paths is reasoned specifically about ConPTY/`%PATHEXT%`/Windows semantics, and
+//! would be silently wrong (not just untested) if it also compiled in on some other, genuinely
+//! different non-unix target this project doesn't support (e.g. `wasm32-unknown-unknown`,
+//! already installable in this sandbox - `std::env::split_paths` alone has different real
+//! semantics there). `cfg(windows)` makes such a target fail to compile loudly instead of
+//! silently picking up Windows-specific logic that makes no sense for it.
 //!
 //! ## Output streaming
 //!
@@ -105,21 +150,23 @@
 //! returning [`PtyError::InvalidCwd`] otherwise.
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+#[cfg(unix)]
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+// Only `#[cfg(unix)]` code below (the process-tree kill path, and the two grace-period
+// consts) uses `Duration` outside of `#[cfg(test)]`; the test module below imports it
+// again itself so it's in scope there regardless of platform.
+#[cfg(unix)]
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 use thiserror::Error;
-
-#[cfg(not(unix))]
-compile_error!(
-    "pty-core's reader-shutdown and process-tree-kill implementation is unix-only \
-     right now (this repo targets Linux/WSL2); see the crate-level docs for why."
-);
 
 pub use portable_pty::ExitStatus;
 
@@ -132,11 +179,17 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 256;
 const READ_BUF_SIZE: usize = 4096;
 /// How long [`PtySession::shutdown`] waits for a graceful exit (after `SIGHUP`) before
 /// unconditionally following up with `SIGKILL`. `Drop`'s fast path uses zero grace.
+/// Unix-only: Windows has no `SIGHUP`-equivalent graceful signal available without
+/// `unsafe` FFI, so the non-unix `kill`/`shutdown`/`Drop` paths just call
+/// `portable_pty::Child::kill()` once - see the crate-level docs.
+#[cfg(unix)]
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(200);
 /// Poll interval while waiting out [`SHUTDOWN_GRACE_PERIOD`].
+#[cfg(unix)]
 const SHUTDOWN_GRACE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Depth cap for the `/proc` descendant-tree walk, purely defensive against
 /// pathological process trees; realistic terminal workloads are nowhere near this deep.
+#[cfg(unix)]
 const TREE_WALK_MAX_DEPTH: usize = 8;
 
 /// Errors that can occur while spawning, driving, or tearing down a [`PtySession`].
@@ -267,6 +320,7 @@ pub fn resolve_on_path(program: &str) -> Option<PathBuf> {
 /// requires it as of this workspace's edition) and would be racy against any other test
 /// concurrently reading the environment (e.g. via `portable_pty`'s `get_base_env`, exercised
 /// by sibling tests through real `spawn` calls), since `cargo test` runs tests concurrently.
+#[cfg(unix)]
 fn resolve_in_path_var(path_var: &OsStr, program: &str) -> Option<PathBuf> {
     for dir in std::env::split_paths(path_var) {
         let candidate = dir.join(program);
@@ -279,6 +333,7 @@ fn resolve_in_path_var(path_var: &OsStr, program: &str) -> Option<PathBuf> {
 
 /// Real executable-bit check via `std::fs::Metadata` - see [`resolve_on_path`]'s docs for
 /// why this is used instead of a real `access(2)` call.
+#[cfg(unix)]
 fn is_executable(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     const EXEC_BITS: u32 = 0o111; // owner, group, other execute bits
@@ -287,12 +342,61 @@ fn is_executable(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Windows has no execute-bit concept - a real, checkable equivalent instead: `%PATHEXT%`
+/// (default `.EXE` when unset, matching what `portable-pty` 0.9.0's own Windows
+/// `CommandBuilder::search_path` - `portable-pty-0.9.0/src/cmdbuilder.rs:581-606` - falls back
+/// to) lists the extensions Windows treats as directly runnable. Mirrors that real algorithm,
+/// the bare candidate first then each `PATHEXT` extension in turn, with two small, deliberate
+/// divergences worth documenting as intentional rather than drift: a real `is_file()` check at
+/// each candidate (upstream instead uses `exists()`, which would also match a same-named
+/// directory - see `resolve_on_path_skips_a_same_named_directory` in the test module for the
+/// unix equivalent of this guard), and `trim_start_matches('.')` to strip a `PATHEXT` entry's
+/// leading dot (upstream instead slices `&ext[1..]`, which panics if an entry were ever empty;
+/// this version just skips it instead - see the `filter_map` below).
+///
+/// Inherited caveat, NOT fixed here: like upstream, `with_extension` below *replaces* rather
+/// than appends an extension (`std::path::Path::with_extension`'s own documented behavior) - so
+/// for a candidate whose bare name already contains a `.` (e.g. `python3.11`), this produces
+/// `python3.EXE`, not `python3.11.EXE`. Upstream's own comment
+/// (`portable-pty-0.9.0/src/cmdbuilder.rs:592-594`) calls this "potentially wrong"; mirrored
+/// faithfully here rather than silently diverging from the algorithm [`spawn`] itself
+/// ultimately relies on via `CommandBuilder` for real (non-`resolve_on_path`) spawns.
+#[cfg(windows)]
+fn resolve_in_path_var(path_var: &OsStr, program: &str) -> Option<PathBuf> {
+    let pathext = std::env::var_os("PATHEXT").unwrap_or_else(|| ".EXE".into());
+    let extensions: Vec<String> = std::env::split_paths(&pathext)
+        .filter_map(|extension| {
+            let extension = extension.to_str()?.trim_start_matches('.');
+            (!extension.is_empty()).then(|| extension.to_string())
+        })
+        .collect();
+
+    for dir in std::env::split_paths(path_var) {
+        let candidate = dir.join(program);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        for extension in &extensions {
+            let candidate = candidate.with_extension(extension);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 /// A running process attached to a PTY.
 ///
 /// See the crate-level docs for the design of output streaming, input writing, and the
 /// `Drop` vs. [`shutdown`](PtySession::shutdown) split.
 pub struct PtySession {
-    master: Box<dyn MasterPty + Send>,
+    // `Option` (not a bare `Box`) so [`PtySession::shutdown`]'s `#[cfg(windows)]` twin can
+    // explicitly `.take()`/drop this *before* joining the reader thread - see that function's
+    // docs for why an early, explicit drop of this specific field is load-bearing on Windows
+    // (it's what actually closes the ConPTY and unblocks the reader's blocked `read`), not
+    // just cleanup.
+    master: Option<Box<dyn MasterPty + Send>>,
     child: Option<Box<dyn Child + Send + Sync>>,
     exited: Option<ExitStatus>,
     output_rx: Receiver<Vec<u8>>,
@@ -343,10 +447,6 @@ pub fn spawn(options: SpawnOptions) -> Result<PtySession, PtyError> {
     // See the doc comment above: this drop is load-bearing for EOF delivery, not cleanup.
     drop(pair.slave);
 
-    let master_fd = pair
-        .master
-        .as_raw_fd()
-        .ok_or_else(|| PtyError::Open("pty master exposed no raw file descriptor".to_string()))?;
     let reader = pair
         .master
         .try_clone_reader()
@@ -356,15 +456,33 @@ pub fn spawn(options: SpawnOptions) -> Result<PtySession, PtyError> {
         .take_writer()
         .map_err(|err| PtyError::Writer(err.to_string()))?;
 
-    let filedescriptor::Pipe {
-        read: shutdown_read,
-        write: shutdown_write,
-    } = filedescriptor::Pipe::new().map_err(|err| PtyError::ShutdownPipe(err.to_string()))?;
-
     let (output_tx, output_rx) = mpsc::sync_channel::<Vec<u8>>(OUTPUT_CHANNEL_CAPACITY);
-    let reader_thread = std::thread::spawn(move || {
-        run_reader_loop(reader, master_fd, shutdown_read, output_tx);
-    });
+
+    // See the crate-level "Platform scope" docs: unix gets a self-pipe the reader thread
+    // polls alongside the pty fd for deterministic shutdown; non-unix has no safe
+    // equivalent (`WSAPoll` is socket-only, a ConPTY master handle isn't a socket), so its
+    // reader thread just blocks in `read` until the pty naturally closes.
+    #[cfg(unix)]
+    let (reader_thread, shutdown_write) = {
+        let master_fd = pair.master.as_raw_fd().ok_or_else(|| {
+            PtyError::Open("pty master exposed no raw file descriptor".to_string())
+        })?;
+        let filedescriptor::Pipe {
+            read: shutdown_read,
+            write: shutdown_write,
+        } = filedescriptor::Pipe::new().map_err(|err| PtyError::ShutdownPipe(err.to_string()))?;
+        let reader_thread = std::thread::spawn(move || {
+            run_reader_loop(reader, master_fd, shutdown_read, output_tx);
+        });
+        (reader_thread, Some(shutdown_write))
+    };
+    #[cfg(windows)]
+    let (reader_thread, shutdown_write) = {
+        let reader_thread = std::thread::spawn(move || {
+            run_reader_loop(reader, output_tx);
+        });
+        (reader_thread, None)
+    };
 
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>();
     let writer_thread = std::thread::spawn(move || {
@@ -372,14 +490,14 @@ pub fn spawn(options: SpawnOptions) -> Result<PtySession, PtyError> {
     });
 
     Ok(PtySession {
-        master: pair.master,
+        master: Some(pair.master),
         child: Some(child),
         exited: None,
         output_rx,
         reader_thread: Some(reader_thread),
         writer_tx: Some(writer_tx),
         writer_thread: Some(writer_thread),
-        shutdown_write: Some(shutdown_write),
+        shutdown_write,
     })
 }
 
@@ -401,6 +519,7 @@ fn resolve_cwd(cwd: Option<PathBuf>) -> Result<PathBuf, PtyError> {
 /// chunk when the master is readable, and exits the moment the shutdown pipe becomes
 /// readable, regardless of echo state or whether `master`/`writer` have been dropped
 /// elsewhere. See the crate-level docs for why this replaced an fd-closure-based design.
+#[cfg(unix)]
 fn run_reader_loop(
     mut reader: Box<dyn Read + Send>,
     master_fd: RawFd,
@@ -433,6 +552,40 @@ fn run_reader_loop(
             continue;
         }
 
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if output_tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+/// Windows-only body of the background reader thread: no self-pipe/poll shutdown signal is
+/// available here (see the crate-level "Platform scope" docs), so this just blocks in `read`
+/// until the pty naturally closes. That EOF/error is NOT triggered by killing the child -
+/// `kill()`/`TerminateProcess` never touches `master`, so on its own it leaves this thread
+/// blocked forever. It fires only once ConPTY itself is torn down: `portable-pty`'s Windows
+/// backend (`portable-pty-0.9.0/src/win/conpty.rs` + `win/psuedocon.rs`) calls the real
+/// `ClosePseudoConsole` inside `PsuedoCon`'s own `Drop`, which only runs once every `Arc`
+/// reference to the shared `Inner` (held by `MasterPty`/`SlavePty` clones) is gone - [`spawn`]
+/// already drops its `SlavePty` clone (`pair.slave`) right after spawning, so
+/// `PtySession::master` ends up the *only* remaining reference. Dropping it is what makes
+/// conhost release its handle to the output pipe's write side, which is what actually
+/// unblocks this thread's `read`. Concretely, that happens: explicitly and promptly inside
+/// [`PtySession::shutdown`]'s `#[cfg(windows)]` twin (which takes `master` itself before
+/// joining this thread - see that function's docs); or incidentally on `Drop`, today only
+/// because `master` is declared *before* `reader_thread` in the [`PtySession`] struct, so it
+/// drops first as the struct's fields go out of scope in order - not because `Drop`'s own code
+/// touches `master` directly.
+#[cfg(windows)]
+fn run_reader_loop(mut reader: Box<dyn Read + Send>, output_tx: mpsc::SyncSender<Vec<u8>>) {
+    let mut buf = [0u8; READ_BUF_SIZE];
+    loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
@@ -486,6 +639,8 @@ impl PtySession {
     /// child (e.g. via `SIGWINCH` on unix).
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), PtyError> {
         self.master
+            .as_ref()
+            .ok_or(PtyError::AlreadyShutDown)?
             .resize(PtySize {
                 rows,
                 cols,
@@ -518,6 +673,11 @@ impl PtySession {
     /// direct child if it has already exited. Does not wait for termination to
     /// complete or join the reader/writer threads; use [`shutdown`](PtySession::shutdown)
     /// when you need that guarantee.
+    ///
+    /// Unix only - see the `#[cfg(windows)]` twin below for the narrower,
+    /// direct-child-only equivalent (no process-group/tree concept on that platform; see
+    /// the crate-level "Platform scope" docs).
+    #[cfg(unix)]
     pub fn kill(&mut self) -> Result<(), PtyError> {
         if self.exited.is_some() {
             return Ok(());
@@ -533,6 +693,31 @@ impl PtySession {
         Ok(())
     }
 
+    /// Windows equivalent of [`Self::kill`]: terminates the direct child only, via
+    /// `portable_pty::Child::kill()` (`TerminateProcess` under the hood - see
+    /// `portable-pty-0.9.0/src/win/mod.rs`) - see the crate-level "Platform scope" docs for why
+    /// there is no process-tree kill here.
+    ///
+    /// This is a real, known regression relative to the unix path, not a cosmetic gap: any
+    /// grandchild process the killed child had itself spawned (e.g. a subprocess an agent CLI
+    /// started) is NOT terminated by this and can survive as a real orphan. Windows has no
+    /// signal-based process-group equivalent without job objects, a distinct `unsafe`-FFI-heavy
+    /// API surface this project's own no-`unsafe` rule deliberately rules out adding. Tracked as
+    /// a real, named follow-up in BUILD-LOG.md's R11 entry rather than fixed here.
+    #[cfg(windows)]
+    pub fn kill(&mut self) -> Result<(), PtyError> {
+        if self.exited.is_some() {
+            return Ok(());
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            if let Ok(Some(status)) = child.try_wait() {
+                self.exited = Some(status);
+            }
+        }
+        Ok(())
+    }
+
     /// Deterministically tears the session down: signals the child's process tree
     /// (`SIGHUP`, a bounded grace period, then `SIGKILL`), blocks until the direct
     /// child is reaped, signals the reader thread to stop via the shutdown pipe and
@@ -541,6 +726,11 @@ impl PtySession {
     /// [`SHUTDOWN_GRACE_PERIOD`] plus however long the child takes to actually exit
     /// after `SIGKILL`, which in practice is fast but is not itself bounded by this
     /// function). Safe to call more than once.
+    ///
+    /// Unix only - see the `#[cfg(windows)]` twin below, which (unlike an earlier version of
+    /// this crate) now also makes the reader-thread join fully deterministic, by explicitly
+    /// dropping `master` itself before joining.
+    #[cfg(unix)]
     pub fn shutdown(&mut self) -> Result<(), PtyError> {
         if self.exited.is_none() {
             if let Some(pid) = self.process_id() {
@@ -569,14 +759,73 @@ impl PtySession {
 
         Ok(())
     }
+
+    /// Windows equivalent of [`Self::shutdown`]. Kills the direct child (see the
+    /// `#[cfg(windows)]` [`Self::kill`] docs) and blocks until it's reaped, then explicitly
+    /// drops the ConPTY master handle (`self.master = None`) *before* joining the reader
+    /// thread.
+    ///
+    /// That ordering is load-bearing, not stylistic. There is no safe way to proactively
+    /// interrupt this platform's blocked `read` (see the crate-level docs) - the *only* real
+    /// thing that unblocks it is ConPTY itself closing, which only happens once every
+    /// reference to `master` is gone (see [`run_reader_loop`]'s `#[cfg(windows)]` docs for the
+    /// full `PsuedoCon`/`ClosePseudoConsole` chain). Killing the child alone does **not** do
+    /// this - `child.kill()` only calls `TerminateProcess`, which never touches `master`. An
+    /// earlier version of this function knew that and worked around it by handing the reader
+    /// thread's `.join()` off to a detached background thread instead of blocking here - which
+    /// meant `shutdown()` itself returned promptly, but the reader thread (and its OS thread)
+    /// kept running, genuinely unjoined, until whatever later happened to drop the whole
+    /// `PtySession` finally closed `master` for it. That's not really `shutdown()` doing its
+    /// own job - it's `shutdown()` relying on its caller's own cleanup to finish it, and this
+    /// crate's one real call site (`crate::terminal_pane::TerminalPane::shutdown` in the `app`
+    /// crate) happened to always do that, but a future caller that kept the session alive after
+    /// calling `shutdown()` would leak two permanently-blocked OS threads per session. Taking
+    /// `master` here instead means the join below is genuinely bounded by this function's own
+    /// return, matching what a caller reasonably expects from a function named `shutdown`.
+    #[cfg(windows)]
+    pub fn shutdown(&mut self) -> Result<(), PtyError> {
+        if self.exited.is_none() {
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.kill();
+                let status = child.wait().map_err(PtyError::Wait)?;
+                self.exited = Some(status);
+            }
+        }
+
+        // Load-bearing, not cleanup - see this function's docs above for why dropping
+        // `master` here (rather than leaving it for `PtySession`'s own eventual `Drop`) is
+        // what actually closes ConPTY and unblocks the reader thread's `read`.
+        self.master = None;
+
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
+        }
+
+        self.writer_tx = None; // closes the channel, ending the writer thread's recv loop
+        if let Some(handle) = self.writer_thread.take() {
+            let _ = handle.join();
+        }
+
+        Ok(())
+    }
 }
 
 impl Drop for PtySession {
     fn drop(&mut self) {
         if self.exited.is_none() {
+            #[cfg(unix)]
             if let Some(pid) = self.process_id() {
                 // Zero grace: Drop must not block the caller (see crate-level docs).
                 terminate_process_tree(pid, Duration::ZERO);
+            }
+            // Windows: no process-tree concept (see the crate-level "Platform scope" docs)
+            // - `child.kill()` below is the direct-child-only equivalent, and (like
+            // `Self::kill`'s Windows twin) leaves any grandchild the killed process itself
+            // spawned as a real, un-terminated orphan - see that function's docs and
+            // BUILD-LOG.md's R11 entry for this tracked, real gap.
+            #[cfg(windows)]
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.kill();
             }
 
             let reaped_immediately = self
@@ -616,6 +865,7 @@ impl Drop for PtySession {
 /// Best-effort: returns an empty list if the file can't be read (process already gone,
 /// non-Linux unix, permissions, etc.) rather than erroring - this is used for cleanup,
 /// where "found nothing to additionally clean up" is an acceptable fallback.
+#[cfg(unix)]
 fn child_pids_of(pid: u32) -> Vec<u32> {
     let path = PathBuf::from(format!("/proc/{pid}/task/{pid}/children"));
     std::fs::read_to_string(&path)
@@ -631,6 +881,7 @@ fn child_pids_of(pid: u32) -> Vec<u32> {
 /// Breadth-first, depth-capped walk of `root_pid`'s descendant tree via `/proc`. Must be
 /// called *before* signaling anything: reading it after a process starts dying races
 /// against the kernel reparenting its children out from under `children`.
+#[cfg(unix)]
 fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
     let mut discovered = Vec::new();
     let mut visited: HashSet<u32> = HashSet::new();
@@ -655,6 +906,7 @@ fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
     discovered
 }
 
+#[cfg(unix)]
 fn pid_exists(pid: u32) -> bool {
     PathBuf::from(format!("/proc/{pid}")).exists()
 }
@@ -667,6 +919,7 @@ fn pid_exists(pid: u32) -> bool {
 /// (e.g. `ESRCH` because something already exited) are intentionally ignored - this
 /// function's job is "make a best effort to ensure nothing survives," not to report
 /// which of potentially many targets could or couldn't be signaled.
+#[cfg(unix)]
 fn terminate_process_tree(root_pid: u32, grace: Duration) {
     let descendants = collect_descendant_pids(root_pid);
     let pgid = nix::unistd::Pid::from_raw(root_pid as i32);
@@ -703,6 +956,7 @@ fn terminate_process_tree(root_pid: u32, grace: Duration) {
 mod tests {
     use super::*;
     use std::sync::mpsc::RecvTimeoutError;
+    use std::time::{Duration, Instant};
 
     /// Reads from `session.output()` until `needle` appears in the accumulated (lossy
     /// UTF-8) output or `timeout` elapses, returning whatever was collected either way.
@@ -731,6 +985,10 @@ mod tests {
     /// returning the rest of that line (trimmed of the newline). Used to have a spawned
     /// shell report a background job's pid back to us deterministically, instead of
     /// racing on `/proc` to discover it.
+    ///
+    /// unix-only: its one caller (`drop_terminates_entire_process_tree_including_escaped_grandchild`)
+    /// is `#[cfg(unix)]`.
+    #[cfg(unix)]
     fn read_line_after_prefix(
         session: &PtySession,
         prefix: &str,
@@ -769,6 +1027,9 @@ mod tests {
         );
     }
 
+    // unix-only: uses pid_exists/is_executable directly, which are #[cfg(unix)]
+    // helper functions (see the crate-level "Platform scope" docs).
+    #[cfg(unix)]
     #[test]
     fn drop_kills_child_and_it_does_not_become_an_orphan() {
         let session = spawn(SpawnOptions::new("sleep").arg("100"))
@@ -796,6 +1057,9 @@ mod tests {
         }
     }
 
+    // unix-only: uses pid_exists/is_executable directly, which are #[cfg(unix)]
+    // helper functions (see the crate-level "Platform scope" docs).
+    #[cfg(unix)]
     #[test]
     fn drop_terminates_entire_process_tree_including_escaped_grandchild() {
         // Regression test for a process that escapes the child's process group by
@@ -841,6 +1105,9 @@ mod tests {
         }
     }
 
+    // unix-only: uses pid_exists/is_executable directly, which are #[cfg(unix)]
+    // helper functions (see the crate-level "Platform scope" docs).
+    #[cfg(unix)]
     #[test]
     fn shutdown_reaps_child_deterministically_without_lingering_zombie() {
         let mut session = spawn(SpawnOptions::new("sleep").arg("100"))
@@ -956,6 +1223,8 @@ mod tests {
 
         let size_after = session
             .master
+            .as_ref()
+            .expect("session should still have a live master handle")
             .get_size()
             .expect("get_size should succeed after a resize");
         assert_eq!(size_after.rows, 40);
@@ -983,12 +1252,17 @@ mod tests {
         }
     }
 
-    /// `sh` is as close to a guaranteed-present binary as a unix test environment gets
-    /// (this crate is unix-only already - see the crate-level `compile_error!`, and every
-    /// other test here already spawns real coreutils/shell binaries like `echo`/`sleep`/
-    /// `sh` unconditionally). Real end-to-end proof that [`resolve_on_path`] finds a real
-    /// binary and returns a path that is itself real (exists, is a file, is executable) -
-    /// not just "found something".
+    /// `sh` is as close to a guaranteed-present binary as a unix test environment gets.
+    /// This crate now *builds* cross-platform (see the crate-level "Platform scope"
+    /// docs), but its test suite - this test included - still assumes a real unix shell
+    /// environment throughout (every other test here spawns coreutils/shell binaries like
+    /// `echo`/`sleep`/`sh` unconditionally too), matching this project's CI, which only
+    /// runs `cargo build` (not `cargo test`) on non-Linux. Real end-to-end proof that
+    /// [`resolve_on_path`] finds a real binary and returns a path that is itself real
+    /// (exists, is a file, is executable) - not just "found something".
+    // unix-only: uses pid_exists/is_executable directly, which are #[cfg(unix)]
+    // helper functions (see the crate-level "Platform scope" docs).
+    #[cfg(unix)]
     #[test]
     fn resolve_on_path_finds_a_real_binary_and_the_path_is_itself_real() {
         let resolved = resolve_on_path("sh").expect("`sh` should be found on PATH");

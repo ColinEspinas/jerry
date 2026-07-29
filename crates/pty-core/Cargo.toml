@@ -10,14 +10,19 @@ description = "Real PTY process spawning, I/O streaming, resizing, and process-t
 portable-pty = "0.9.0"
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+# The self-pipe (unix) `PtySession::shutdown_write` field's type - a real, already-resolved
+# transitive dep of `portable-pty` 0.9.0 on every platform (its own Windows backend uses it
+# too, see `portable-pty-0.9.0/src/win/conpty.rs`), so this is unconditional even though only
+# the `#[cfg(unix)]` code paths in src/lib.rs actually construct a `Pipe`/poll it - see the
+# crate-level "Platform scope" docs for why non-unix has no self-pipe/poll shutdown signal.
+filedescriptor = "0.8"
 
-# Reader-thread shutdown signaling (self-pipe + poll) and process-tree kill are
-# currently unix-only; see the crate-level doc comment in src/lib.rs for why. Both
-# crates are already transitive deps of portable-pty 0.9.0 on unix (pinned here to the
-# exact versions already resolved in Cargo.lock, so this adds no new version surface).
+# Process-group signals and the `/proc` descendant walk are unix-only; see the crate-level
+# doc comment in src/lib.rs for why non-unix instead calls `portable_pty::Child::kill()`
+# directly. Already a transitive dep of `portable-pty` 0.9.0 on unix (pinned here to the
+# exact version already resolved in Cargo.lock, so this adds no new version surface).
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28", default-features = false, features = ["signal"] }
-filedescriptor = "0.8"
 
 [dev-dependencies]
 # Test-only: `resolve_on_path_skips_a_same_named_directory` needs a real, isolated temporary

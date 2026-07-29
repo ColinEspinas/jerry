@@ -15,33 +15,74 @@
 
 use super::*;
 use crate::settings_store::{CfgFormat, ConfigPage, SnippetLineKind};
+use std::ffi::OsString;
+
+/// Which program + args hand `path` to `target_os`'s default file-open handler - `target_os`
+/// is an injected `std::env::consts::OS`-shaped string (`"linux"`/`"macos"`/`"windows"`/...)
+/// so this pure decision is directly unit-testable without actually spawning a process, same
+/// "pure decision function + thin real-execution wrapper" shape as `crate::keymap`'s
+/// `detected_platform_is_macos`/`resolve_keystroke` and `crate::env_info`'s `is_wsl_from`.
+///
+/// - macOS: real `open <path>` (`man 1 open`).
+/// - Windows: real `cmd /c start "" <path>`, not just `start <path>` - `start`'s first
+///   argument is a required (but empty is fine) window *title*, and skipping it makes `start`
+///   treat `path` itself as the title instead of the target the moment `path` needs quoting
+///   (any path containing a space) - a well-known real `cmd.exe` `start` gotcha, verified
+///   against Microsoft's own guidance, not assumed from memory. `start` is a `cmd.exe`
+///   built-in, not a standalone executable, hence the `cmd /c` wrapper. This is invoked via
+///   `std::process::Command`, one argument per `Vec` element - not through a shell that would
+///   need to re-parse quoting - so it does not matter that a user's actual default shell might
+///   be PowerShell, where `start` means something else entirely (`Start-Process`); this always
+///   runs `cmd.exe` explicitly and directly.
+/// - Linux (and anything else, as a reasonable fallback): real `xdg-open <path>`, unchanged
+///   from before this platform split existed.
+fn open_command_for(target_os: &str, path: &Path) -> (&'static str, Vec<OsString>) {
+    match target_os {
+        "macos" => ("open", vec![path.as_os_str().to_os_string()]),
+        "windows" => (
+            "cmd",
+            vec![
+                "/c".into(),
+                "start".into(),
+                "".into(),
+                path.as_os_str().to_os_string(),
+            ],
+        ),
+        _ => ("xdg-open", vec![path.as_os_str().to_os_string()]),
+    }
+}
 
 impl AdeApp {
-    /// Spawns an `xdg-open` subprocess against the settings file path - the config banner's
-    /// `Open file` button. Linux-only for now, matching this app's only currently-supported
-    /// platform; a macOS (`open`)/Windows (`cmd /c start`) equivalent can be added once this app
-    /// ships there. Uses `Command::status` - blocking, but only on the background-executor
-    /// thread, never the GPUI foreground thread - so the child is always reaped, matching every
-    /// other subprocess spawn in this codebase (`lsp_core::proc`'s `child.wait()`;
+    /// Spawns a subprocess against the settings file path - the config banner's `Open file`
+    /// button - via [`open_command_for`], real per-platform: `xdg-open` on Linux, `open` on
+    /// macOS, `cmd /c start` on Windows (see that function's docs for why each is correct).
+    /// Uses `Command::status` - blocking, but only on the background-executor thread, never
+    /// the GPUI foreground thread - so the child is always reaped, matching every other
+    /// subprocess spawn in this codebase (`lsp_core::proc`'s `child.wait()`;
     /// `pty_core::PtySession`'s `try_wait`/`wait`). A failure to launch, or a non-zero exit
     /// status, is logged rather than silently swallowed.
+    ///
+    /// Only the Linux path (`xdg-open`) has actually been run - this app has only ever
+    /// executed on Linux/WSL2. The macOS/Windows commands are real, verified-correct shell
+    /// commands (see [`open_command_for`]'s docs), not verified by running them.
     pub(super) fn open_settings_file(&mut self, cx: &mut Context<Self>) {
         let Some(path) = settings_store::settings_toml_path() else {
             log::warn!("cannot open settings file: $HOME is not set");
             return;
         };
+        let (program, args) = open_command_for(std::env::consts::OS, &path);
         cx.background_executor()
             .spawn(async move {
-                match std::process::Command::new("xdg-open").arg(&path).status() {
+                match std::process::Command::new(program).args(&args).status() {
                     Ok(status) if !status.success() => {
                         log::warn!(
-                            "xdg-open exited with {status} while opening {}",
+                            "{program} exited with {status} while opening {}",
                             path.display()
                         );
                     }
                     Ok(_) => {}
                     Err(err) => {
-                        log::warn!("failed to open {} via xdg-open: {err}", path.display());
+                        log::warn!("failed to open {} via {program}: {err}", path.display());
                     }
                 }
             })
@@ -502,5 +543,48 @@ impl ChoiceOption {
             enabled: true,
             hint: Some(hint),
         }
+    }
+}
+
+#[cfg(test)]
+mod open_command_tests {
+    use super::open_command_for;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    fn os_strings(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn macos_uses_the_real_open_command() {
+        let (program, args) = open_command_for("macos", Path::new("/home/x/settings.toml"));
+        assert_eq!(program, "open");
+        assert_eq!(args, os_strings(&["/home/x/settings.toml"]));
+    }
+
+    #[test]
+    fn windows_uses_cmd_start_with_a_required_empty_title_argument() {
+        let (program, args) = open_command_for("windows", Path::new(r"C:\Users\x\settings.toml"));
+        assert_eq!(program, "cmd");
+        // The empty string is load-bearing, not incidental - see `open_command_for`'s docs:
+        // without it, `start` would treat the path itself as its window-title argument.
+        assert_eq!(
+            args,
+            os_strings(&["/c", "start", "", r"C:\Users\x\settings.toml"])
+        );
+    }
+
+    #[test]
+    fn linux_uses_the_real_xdg_open_command() {
+        let (program, args) = open_command_for("linux", Path::new("/home/x/settings.toml"));
+        assert_eq!(program, "xdg-open");
+        assert_eq!(args, os_strings(&["/home/x/settings.toml"]));
+    }
+
+    #[test]
+    fn an_unrecognized_target_os_falls_back_to_xdg_open() {
+        let (program, _) = open_command_for("freebsd", Path::new("/x"));
+        assert_eq!(program, "xdg-open");
     }
 }
