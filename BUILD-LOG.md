@@ -1142,3 +1142,48 @@ tracked undo/redo command-pattern phase), where real backing will actually exist
 This is the first revision run with the lighter review process discussed with the user:
 given its small, low-risk scope, it skipped the separate adversarial-checker round in favor
 of direct verification plus a spot-check of the diff.
+
+## Revision R11 — cross-platform build support (Windows/macOS/Linux)
+
+Real per-target Cargo configuration: `gpui_platform` moved from one unconditional
+`wayland`-only dependency to real target-specific sections — Linux/FreeBSD request
+`wayland` (`x11` stays off; re-verified the original blocker from Revision R1 still holds
+— no `xkbcommon-x11` dev headers, no passwordless sudo to install them), macOS and Windows
+pull in their real backends with no feature flag needed at all, per how `gpui_platform`'s
+own `Cargo.toml` actually gates them.
+
+Found and fixed the actual real blocker: `pty-core` had a hard `compile_error!` on any
+non-unix target, so this application could not previously compile on Windows at all — not
+a missing feature, a hard stop. Removed it and gave real platform-conditional
+implementations to every affected function, correctly scoped to `cfg(windows)` rather than
+the broader `cfg(not(unix))` a first draft used, so a target this project doesn't actually
+support yet (this sandbox has `wasm32-unknown-unknown` installed, a real example) fails to
+compile loudly instead of silently building nonsense path-resolution logic. Added a real
+Windows equivalent for the one Linux-only "open the settings file" command.
+
+An audit traced through the real vendored ConPTY source (not just read the diff) and found
+a genuinely critical, silent gap in the first pass's Windows support: this app's only
+process-exit signal is a channel disconnect from its reader thread, and on Windows that
+thread cannot observe EOF merely from a process being killed or reaped — only from the pty
+handle itself being dropped, which killing a process doesn't do. Every terminal tab would
+have spun forever believing its process was still running. Fixed with a real, explicit poll
+added specifically for Windows, and a `shutdown()` that now actually closes the pty handle
+itself instead of relying on a mechanism that, on closer inspection, only worked by accident
+of field drop order for the one case that happened to exercise it. Also fixed a silent
+FreeBSD regression the first pass's own `Cargo.toml` change had introduced — that target
+used to build via the same Linux backend and had quietly lost it.
+
+Two real gaps intentionally left as documented, tracked follow-ups rather than rushed or
+hidden: Windows process cleanup only terminates the direct child, not any real subprocess an
+agent CLI spawned itself, since a proper fix needs Windows job-object FFI this project's
+no-`unsafe` rule forbids; and this project's CI cross-platform job currently only exercises
+a debug build, which would report success even though a real Windows *release* build
+hard-fails in `gpui_windows`'s own shader build script for an unrelated toolchain reason
+(no `fxc.exe`) debug builds never touch.
+
+This sandbox is Linux-only and this repository has never been pushed to a remote, so CI has
+never actually executed — nothing in this revision is a claim of a real Windows/macOS run,
+only of careful cross-target type-checking (rustup-added Windows/FreeBSD targets, clippy
+against each) and close reading of the real vendored dependencies' own source, honestly
+distinguished throughout from what remains genuinely unverified until this runs on real
+hardware or a real CI pipeline.
