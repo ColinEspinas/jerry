@@ -1417,3 +1417,21 @@ edits, plus the real Completions popup the original design specs but this app ha
 built), then R8.5c (real editing in the Diff and Merge views, plus a real arbitrary-content
 write path in `wt-core` for merge resolution), before returning to R9b (agent-driven
 auto-resolve, which needs R8.5's real file-write capability to apply what it proposes).
+
+## Real "Install" action for the Language Servers settings page
+
+The user asked why the Settings → Language Servers page's "not installed" rows had no
+action at all, given the original mockup shows one — Revision R3 had honestly omitted it
+since no real install mechanism existed. Rather than build a real subprocess-based installer
+(discussed and explicitly ruled out: real complexity and risk from differing package
+managers, real install failures, and running arbitrary commands on the user's behalf), the
+agreed, narrower, real version links each not-installed row to that specific server's real,
+verified official install/docs page in the user's default browser — the user does the actual
+install themselves, following real official instructions. Reuses Revision R11's real
+cross-platform open-command mechanism (`xdg-open`/`open`/`cmd start`), generalized from file
+paths to arbitrary targets so the settings-file-open action and this one share one real
+implementation rather than two independently-maintained copies. Only appears for a row
+that's genuinely not installed, using the same live `$PATH` detection the rest of the page
+already relies on. All five URLs (rust-analyzer, typescript-language-server, vue-language-
+server, pyright, gopls) were checked against each project's own real, current official
+source, not guessed.
