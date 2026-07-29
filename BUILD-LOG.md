@@ -1354,3 +1354,66 @@ after noticing this app is currently 100% read-only for file content everywhere,
 merge conflict resolution (only take-ours/take-theirs/take-both exist; there is no way to
 hand-edit a resolution). R9b will build on R8.5's real editing/file-write capability rather
 than a narrower, conflict-only version that would need to be redone.
+
+## Revision R8.5a — the File view becomes a real text editor
+
+This app has never had any text-editing capability anywhere until now — every surface,
+including the File view's own real syntax highlighting and LSP integration, has only ever
+been a read-only viewer. New `edit_buffer.rs`/`root/editing.rs` implement GPUI's real
+`EntityInputHandler` trait (verified against the real `vendor/zed` source and its own
+minimal reference implementation, not Zed's much larger multi-cursor `editor` crate) — real
+cursor and selection, real typing, real IME composition with real UTF-16 conversion, real
+Backspace/Delete/Enter/arrows/Home/End/Select-All/Copy/Cut/Paste, real click and
+shift-click, and real explicit save-to-disk with a real dirty indicator on the tab. A
+deliberate line was drawn around scope: no undo/redo (the already-tracked Revision R10 owns
+that properly), no drag-to-select, no editing in the Diff or Merge views yet (their own
+later phase), and diagnostics/hover intentionally keep reflecting only the last-saved
+version of a file rather than trying to stay live-accurate to unsaved edits.
+
+This was, by a wide margin, the highest-risk single phase this project has built — the
+first time this codebase has ever touched real keyboard text input, real IME, or real
+file-content writes, none of which any prior phase's testing or audit discipline had ever
+had reason to exercise. It got two full audit rounds as a result, on top of the build's own
+internal one.
+
+The build's own internal audit already caught and fixed a real crash on every single click
+(a double-entity-lease panic), text that was present but literally unclickable past the
+first character or two (a bare canvas element has no intrinsic layout size, so real content
+never affected real hit-testing), silent corruption of non-UTF-8 files on save, a conflict
+state that could never be recovered from for the rest of a session, and a per-keystroke cost
+bug measured at ~1.8ms brought down to ~1µs. A second, fully independent audit — dispatched
+specifically because a feature this novel deserved more than trusting its own internal
+review — went looking hardest in the two places most likely to still be wrong, and found
+real, live-reproducible bugs in both. Real Japanese IME composition input, followed by an
+ordinary keystroke, panicked every time: the platform's real IME protocol reports a
+composing caret's position relative to the text currently being composed, and the code was
+converting it as if it were relative to the whole open file instead, landing on a byte
+offset that wasn't a real character boundary. And typing a literal `]` while editing — one
+of the single most common characters in real source code, not an edge case — was silently
+swallowed by an unrelated pre-existing keybinding that turned out to still be globally
+active during editing, the same "a shortcut steals a keystroke a text field needed" bug
+this project has now shipped four separate times (Revisions R2, R4a, R4b, and this one)
+despite every prior instance getting fixed. Both were live-reproduced, fixed, and proven
+with real keystroke-simulation regression tests before this landed — plus a full,
+documented sweep of every other global keybinding for the same collision, and a further
+panic the same audit found one step downstream: a stale diagnostic's position, computed
+against last-saved content, being sliced against live-edited content at what was no longer
+a valid character boundary once real multi-byte characters were involved.
+
+The same audit also caught real diagnostics and changed-line markers being confidently
+painted on the wrong line once an edit shifted line numbers, with nothing telling the user
+any of it might be stale — not itself a crash, but a real, actively misleading result for a
+feature whose whole point is telling a developer where the real problem is. Fixed by
+suppressing that decoration entirely while a file has unsaved edits and showing one honest
+banner instead. And a second, sibling instance of the exact per-keystroke O(whole-buffer)
+cost class the build's own internal audit had already found and fixed once in this same
+file — this one in the plain-text line rebuild that runs after every single edit regardless
+of whether syntax highlighting needs to recompute — measured and fixed the same way, real
+splice-in-place logic replacing a full rebuild, verified against a differential test proving
+byte-for-byte equivalence to the slow path it replaced.
+
+Next: R8.5b (live LSP `textDocument/didChange` sync so diagnostics/hover can track unsaved
+edits, plus the real Completions popup the original design specs but this app has never
+built), then R8.5c (real editing in the Diff and Merge views, plus a real arbitrary-content
+write path in `wt-core` for merge resolution), before returning to R9b (agent-driven
+auto-resolve, which needs R8.5's real file-write capability to apply what it proposes).
