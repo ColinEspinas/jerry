@@ -1080,3 +1080,40 @@ are excessively verbose, and — backed by concrete evidence from this very revi
 of the false/stale-comment findings above were caught specifically because a comment's claim
 had drifted from what the code actually did) — a follow-up task (#32, "Revision R5.6") was
 added to trim comment density down to load-bearing rationale only, queued to run next.
+
+## Revision R5.6 — trim comment density to load-bearing rationale
+
+The user's follow-up concern, raised while reviewing R5.5's diff: this codebase's doc
+comments had grown "huge and everywhere" — multi-paragraph justification blocks on nearly
+every function, well past idiomatic Rust style, and demonstrably risky rather than merely
+verbose, since R5.5's own audits had just caught several real bugs that were specifically
+comments making false claims that had drifted from the code they described.
+
+Trimmed `crates/app/src` from 30,710 to 27,579 lines; spot-checked `wt-core`/`pty-core`/
+`lsp-core` and found them already reasonably terse. This was calibration, not a blanket
+strip — every genuinely load-bearing note (deliberate scope decisions that would otherwise
+look like oversights, real invariants, still-accurate `vendor/zed` citations) was kept;
+narration of what the code already says through its own naming, project-history narrative
+already captured in commit messages and this log, and rationale duplicated across multiple
+places were cut down to one real home plus cross-references.
+
+While trimming, every checkable claim was actively verified rather than just preserved or
+deleted on faith, and the concern turned out to be well-founded: a parameter documented as
+optional when its real signature was never `Option`; a "no global binding uses a literal
+`ctrl-` modifier" claim directly contradicted by a binding added two revisions ago; a
+"Settings rewrite hasn't happened yet" note for a feature Revision R3 had already shipped,
+sitting alongside an accurate version of the same comment in a different file; two
+`vendor/zed` citations pointing at the wrong file/line; a doc describing four separate
+per-call-site focus checks when only one shared wrapper actually exists; a render call-site
+count off by nearly 2x; an internally self-contradictory performance claim backed by no
+benchmark anywhere in the repo; several dangling references to functions renamed or removed
+in earlier revisions. None of these were behavior bugs — the code itself was correct
+throughout — but every one was a comment a future reader, human or agent, would have trusted
+and been actively misled by.
+
+Given this pass's low functional risk (documentation only, verified via a direct diff check
+that no non-comment lines changed) and the substantial resource cost already spent on
+multi-round adversarial review across R1-R5.5, this revision ran with lighter-weight review
+— independent verification of all four gates plus a direct sanity check of the diff's shape,
+without a separate adversarial-checker dispatch — per an explicit, agreed calibration: review
+depth should scale with a phase's actual risk, not apply uniformly regardless of it.
