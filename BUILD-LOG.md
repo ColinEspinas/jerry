@@ -914,3 +914,33 @@ if a future binding is added without a matching display label, so this specific 
 drift can't recur silently again. Also caught and fixed: user-facing subtitle copy that
 leaked internal project jargon ("Revision R5's job", "see the module docs") into real
 product UI text, reworded to plain honest disclosure without the internal references.
+
+## Revision R4a — unify session and file tabs into one real strip
+
+Applied the first half of changelog entry 4 ("Tab strip is a real tab list"): file tabs no
+longer wholesale-replace the center pane through a single `Option<PathBuf>` — a real
+`open_files: Vec<PathBuf>` now tracks every open file in open order, each rendered as its
+own tab (real close affordance) alongside session tabs in one shared strip, instead of a
+special "opening a file hides everything else" mode. The tab strip's `+` became a real
+4-row menu (new terminal, new agent pane, open file, next changed file) instead of a
+button that always spawned a shell; session-jump keycaps (`secondary-1`..`8`) went from a
+documented-as-decorative placeholder to real bindings.
+
+The audit round caught this phase reintroducing the exact bug class Revision R2 shipped and
+fixed once already: a global keybinding silently stealing a real keystroke out of a focused
+terminal. `]` (next changed file) was caught before commit and scoped to the diff surface
+only. `secondary-p` (open file) reached an intermediate pass and genuinely did swallow
+Ctrl+P — bash/zsh's own readline "previous history" binding — in every terminal on
+Linux/Windows; removed outright rather than scoped, since a palette-open shortcut has no
+context that makes it safe to bind globally the way `]`'s diff-only scoping does. The same
+round also caught this phase's own new focus-management code (added specifically to fix an
+older dangling-focus bug) focusing/defocusing unconditionally, so spawning or closing a
+session while a file tab was active pointed real keyboard focus at an unmounted pane and
+silently killed every shortcut — reproduced live across four ordinary actions (new
+terminal, new agent pane, closing the active session tab, archiving the active session),
+fixed by making the focus move conditional on whether a file tab is actually showing, with
+a keystroke-simulation regression test per path. Also fixed: switching to a tab with a real
+diff was showing the previous tab's Diff/File toggle state instead of the diff; rapid
+double-invocation of "new agent pane" silently produced one session instead of two (a
+single task slot dropping the older request); a tab whose diff disappeared out from under
+it (change reverted) could go permanently inert despite showing as active in the strip.
