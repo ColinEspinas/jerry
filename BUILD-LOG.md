@@ -1034,3 +1034,49 @@ senior-maintainer code-quality pass that resolves R1's deferred `cx.spawn()`/sin
 consolidation finding for real (rather than deferring it again) and runs a fresh full-repo
 audit for patterns/reusability/organization now that R1-R5 have substantially grown the
 codebase past what R1 originally looked at. Queued to run next, before Revision R6.
+
+## Revision R5.5 — senior-maintainer code-quality pass
+
+The user, after reviewing the last several revisions, pointed out that the deferred finding
+from Revision R1 ("roughly 20 near-identical background-task-dispatch call sites... left as
+a named follow-up rather than rushed") had never actually been picked back up, and asked for
+a real pass that fixes findings rather than cataloguing them again. Three independent audits
+(task-slot consolidation specifically, code duplication/reusability broadly, and a fresh
+performance sweep of everything built since R1) were run against the current codebase before
+any fix work started.
+
+The performance sweep came back clean — no new instance of the "expensive work every render"
+bug class in any of the newer R2-R5 surface area. The other two audits found real, concrete
+work. Two previously-unfixed concurrency bugs of the exact shape this project has now hit
+three times: worktree pruning had no in-flight guard at all (unlike the merge flow's own
+equivalent), so a second confirm click while a batch was still running could silently drop
+the first batch's work or leave the UI stuck stale; and settings persistence, even after
+Revision R3's fix, still had a narrow residual race, since dropping a superseded save `Task`
+cannot interrupt a disk write that had already started — two real concurrent writes to the
+same file were still possible in a tight window. Both were fixed, and both fixes were
+adversarially re-verified by deliberately reverting each one and confirming its own
+regression test failed without it — which caught that the first round's tests for both bugs
+were themselves vacuous (passed identically whether the fix was present or not), a direct
+instance of the false-confidence risk this project's own history keeps warning about.
+
+Real, non-forced consolidation: the same "prune finished tasks, then push" two-line idiom,
+copy-pasted across 6 call sites for 4 different task-list fields, replaced with one small
+`TaskPool` type. The roughly 14 single-slot `Option<Task>` fields were deliberately left as
+individual fields rather than wrapped in a shared type — each one's correctness depends on
+site-specific reasoning a generic wrapper would hide, not express, matching this project's
+stated preference for a few similar lines over a forced abstraction. Also consolidated: a
+segmented-control widget Revision R3 had already generalized but never reused, migrated onto
+all four hand-rolled copies of the same visual (switching their dispatch from a fragile
+label-string match to a real structural index along the way); and overlay focus-capture
+state for the code surface/palette/settings surfaces, which had stayed triplicated even
+after R1 consolidated the matching restore-focus logic specifically because that
+triplication had caused the same dangling-focus bug three separate times before. 679 lines
+of merge-conflict rendering moved out of `code_surface.rs` (named for its file/diff viewer,
+not the merge flow) into a new `merge_flow_render.rs` alongside the merge logic that already
+lived there alone, verified byte-for-byte identical to the code it replaced.
+
+The user separately raised a second concern during this pass: the codebase's doc comments
+are excessively verbose, and — backed by concrete evidence from this very revision (several
+of the false/stale-comment findings above were caught specifically because a comment's claim
+had drifted from what the code actually did) — a follow-up task (#32, "Revision R5.6") was
+added to trim comment density down to load-bearing rationale only, queued to run next.
