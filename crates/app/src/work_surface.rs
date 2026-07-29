@@ -232,6 +232,11 @@ pub enum ActionKind {
 pub struct FooterAction {
     pub kind: ActionKind,
     pub label: &'static str,
+    /// A real keybinding **spec string** (`"mod+enter"`, `"ctrl+C"`), not an already-resolved
+    /// glyph - `crate::root::work_surface_render::render_footer_action_button` runs it through
+    /// `crate::keymap::resolve_combo` at render time, so the same spec renders `⌘⏎`/`⌃C` on
+    /// macOS and `Ctrl Enter`/`Ctrl C` on Windows/Linux, never a hardcoded platform-specific
+    /// literal (`design_handoff_jerry_ade/CHANGELOG.md`'s 2026-07-29 entry, change 2).
     pub keycap: Option<&'static str>,
     pub style: ActionStyle,
     /// Whether this action kind has real backing logic wired up in this phase at all (a
@@ -245,7 +250,9 @@ pub struct FooterAction {
 }
 
 /// The footer action strip for one [`Status`] - `design_handoff_jerry_ade/README.md`'s
-/// Surface A footer spec, one list per status:
+/// Surface A footer spec, one list per status (keybinding spec strings shown resolved to
+/// their macOS glyphs here for readability - see [`FooterAction::keycap`]'s docs for why the
+/// stored value is the unresolved spec, not this literal glyph):
 /// review: `Keep all ⌘⏎` (green) · `Review diff` · `Open in editor` · `Discard worktree`;
 /// ask: `Open terminal` · `Interrupt ⌃C`; fail: `Retry ⌘R` · `Open terminal` ·
 /// `Discard worktree`; run: `Interrupt ⌃C` · `Open terminal`; idle: `Resume ⌘⏎` (blue) ·
@@ -256,7 +263,7 @@ pub fn footer_actions(status: Status) -> Vec<FooterAction> {
             FooterAction {
                 kind: ActionKind::Unimplemented,
                 label: "Keep all",
-                keycap: Some("\u{2318}\u{23ce}"),
+                keycap: Some("mod+enter"),
                 style: ActionStyle::PrimaryGreen,
                 implemented: false,
             },
@@ -293,7 +300,7 @@ pub fn footer_actions(status: Status) -> Vec<FooterAction> {
             FooterAction {
                 kind: ActionKind::Interrupt,
                 label: "Interrupt",
-                keycap: Some("\u{2303}C"),
+                keycap: Some("ctrl+C"),
                 style: ActionStyle::Ghost,
                 implemented: true,
             },
@@ -302,7 +309,7 @@ pub fn footer_actions(status: Status) -> Vec<FooterAction> {
             FooterAction {
                 kind: ActionKind::Respawn,
                 label: "Retry",
-                keycap: Some("\u{2318}R"),
+                keycap: Some("mod+R"),
                 style: ActionStyle::Outline,
                 implemented: true,
             },
@@ -325,7 +332,7 @@ pub fn footer_actions(status: Status) -> Vec<FooterAction> {
             FooterAction {
                 kind: ActionKind::Interrupt,
                 label: "Interrupt",
-                keycap: Some("\u{2303}C"),
+                keycap: Some("ctrl+C"),
                 style: ActionStyle::Outline,
                 implemented: true,
             },
@@ -341,7 +348,7 @@ pub fn footer_actions(status: Status) -> Vec<FooterAction> {
             FooterAction {
                 kind: ActionKind::Respawn,
                 label: "Resume",
-                keycap: Some("\u{2318}\u{23ce}"),
+                keycap: Some("mod+enter"),
                 style: ActionStyle::PrimaryBlue,
                 implemented: true,
             },

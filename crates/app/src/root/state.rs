@@ -81,6 +81,7 @@ impl AdeApp {
             _hover_request_task: None,
             _goto_definition_tasks: Vec::new(),
             pending_cursor_line: None,
+            window_controls_style: WindowControlsStyle::default(),
         };
         // A fresh window shouldn't open with zero tabs and no way to see anything running -
         // start with one real shell in the repo root, exactly like step 3's single terminal

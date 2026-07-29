@@ -81,8 +81,18 @@ pub mod surface {
     pub const SEGMENT_TRACK: Rgba = hex(0x171a1d);
     pub const SEGMENT_ACTIVE: Rgba = hex(0x242a2f);
     pub const KEYCAP: Rgba = hex(0x181c1f);
+    /// The hint-size keycap's own background - `design_handoff_jerry_ade/CHANGELOG.md`'s
+    /// 2026-07-29 entry, change 2: "hint size 14-high, padding 0 3.5, bg `#15181a`, border
+    /// `#23272b`" - confirmed against `Jerry.dc.html`'s own `takeLeftCaps`/etc. template
+    /// (`background:#15181a;border:1px solid #23272b`), a real, distinct token from
+    /// [`KEYCAP`]'s standard-size `#181c1f`.
+    pub const KEYCAP_HINT: Rgba = hex(0x15181a);
     pub const CHIP_NEUTRAL: Rgba = hex(0x23272b);
     pub const CURRENT_LINE: Rgba = hex(0x181c20);
+    /// The Windows/Linux title bar's close caption button's real hover fill
+    /// (`design_handoff_jerry_ade/Jerry.dc.html`'s close caption button `style-hover="background:
+    /// #8c3a38"`, confirmed by `CHANGELOG.md`'s "close hover bg `#8c3a38`").
+    pub const TITLE_BAR_CLOSE_HOVER: Rgba = hex(0x8c3a38);
 }
 
 pub mod border {
@@ -100,6 +110,9 @@ pub mod border {
     pub const BUTTON: Rgba = hex(0x2a2f34); // outline button
     pub const BUTTON_DISABLED: Rgba = hex(0x1f2327);
     pub const KEYCAP: Rgba = hex(0x272c31);
+    /// The hint-size keycap's own border - see [`super::surface::KEYCAP_HINT`]'s docs for the
+    /// same real source (`Jerry.dc.html`'s `border:1px solid #23272b`).
+    pub const KEYCAP_HINT: Rgba = hex(0x23272b);
     pub const SELECTED_EDGE: Rgba = hex(0x3f5b74); // 2px left edge on a selected row
 }
 
@@ -367,6 +380,18 @@ pub mod band {
     pub const CHANGE_ROW: Pixels = px(27.0);
     pub const TREE_ROW: Pixels = px(22.0);
     pub const KEYCAP: Pixels = px(15.0);
+    /// The hint-size keycap's height (`design_handoff_jerry_ade/CHANGELOG.md`'s 2026-07-29
+    /// entry, change 2: "hint size 14-high" - confirmed against `Jerry.dc.html`'s own
+    /// `height:14px;min-width:14px` template).
+    pub const KEYCAP_HINT: Pixels = px(14.0);
+    /// The Windows/Linux title bar's menu row item height (`CHANGELOG.md`'s 2026-07-29 entry,
+    /// change 1: "22-high items" - confirmed against `Jerry.dc.html`'s `height:22px`).
+    pub const TITLE_BAR_MENU_ITEM: Pixels = px(22.0);
+    /// One Windows/Linux caption button's width (minimise/maximise/close), pinned to the
+    /// title bar's right edge - `CHANGELOG.md`'s 2026-07-29 entry, change 1: "three caption
+    /// buttons pinned to the right edge, 44 wide × full band" - confirmed against
+    /// `Jerry.dc.html`'s `width:44px`.
+    pub const TITLE_BAR_CAPTION_BUTTON: Pixels = px(44.0);
 }
 
 pub mod zone {

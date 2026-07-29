@@ -2,7 +2,9 @@ use super::*;
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
 use crate::root::lsp::{lsp_file_status, LspClientState, LspFileStatus};
-use crate::root::widgets::{render_keycap, render_sidebar_message, render_tag_pill};
+use crate::root::widgets::{
+    render_action_keycap_row, render_keycap, render_sidebar_message, render_tag_pill,
+};
 
 impl AdeApp {
     /// Loads (or reloads) the real diff of `root` against its detected base branch, per
@@ -1305,7 +1307,9 @@ impl AdeApp {
                     .h(px(16.0))
                     .bg(theme::border::DIVIDER),
             )
-            .child(render_accept_file_button())
+            .child(render_accept_file_button(
+                self.window_controls_style.is_macos(),
+            ))
             .child(
                 div()
                     .id("close-diff-surface")
@@ -2005,6 +2009,12 @@ pub(super) fn render_hover_card(
                     .items_center()
                     .gap(px(3.0))
                     .cursor_pointer()
+                    // `F12` is a real function key, not one of `crate::keymap`'s eight
+                    // mod/alt/ctrl/shift/enter/esc/tab/bksp tokens - `Jerry.dc.html`'s own
+                    // reference keymap resolver hardcodes it identically on both platforms
+                    // (`def: [plat === 'macos' ? 'F12' : 'F12']`), so this literal is exempt
+                    // from the "no literal glyph in calling code" rule (it names no modifier
+                    // glyph at all) and correctly bypasses `crate::keymap::resolve_combo`.
                     .child(render_keycap("F12"))
                     .child(
                         div()
@@ -2072,19 +2082,39 @@ pub(super) fn render_diff_line(line: &wt_core::diff::DiffLine) -> impl IntoEleme
 /// accept" - deliberately given no `cursor_pointer()`/`on_click` at all, rather than a click
 /// handler that would silently do nothing (that would be exactly the kind of fake, bound-to-
 /// nothing affordance this project's conventions forbid).
-pub(super) fn render_accept_file_button() -> impl IntoElement {
+///
+/// The trailing `⏎` used to be baked directly into this button's label string
+/// (`"Accept file \u{23ce}"`) - a literal glyph in calling code, exactly what
+/// `design_handoff_jerry_ade/CHANGELOG.md`'s 2026-07-29 entry (change 2) eliminates. It's now a
+/// real, separate `enter` keycap resolved through `crate::keymap::resolve_combo` (so it reads
+/// `Enter` on Windows/Linux instead of always showing the macOS `⏎` glyph), styled with the
+/// same dimmed `GHOSTER`/`BUTTON_DISABLED` tint the rest of this always-disabled button already
+/// uses.
+pub(super) fn render_accept_file_button(macos: bool) -> impl IntoElement {
+    let parts = keymap::resolve_combo("enter", macos);
     div()
         .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
         .px(px(8.0))
         .py(px(3.0))
         .rounded(theme::radius::BUTTON)
         .border_1()
         .border_color(theme::border::BUTTON_DISABLED)
-        .font(font(theme::font::SANS))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_size(px(10.5))
-        .text_color(theme::text::GHOSTER)
-        .child("Accept file \u{23ce}")
+        .child(
+            div()
+                .font(font(theme::font::SANS))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_size(px(10.5))
+                .text_color(theme::text::GHOSTER)
+                .child("Accept file"),
+        )
+        .child(render_action_keycap_row(
+            &parts,
+            theme::text::GHOSTER,
+            theme::border::BUTTON_DISABLED,
+        ))
 }
 
 /// The File view's real breadcrumb (`design_handoff_jerry_ade/README.md`: "Breadcrumb 26 (`src ›

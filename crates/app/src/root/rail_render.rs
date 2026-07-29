@@ -1,5 +1,5 @@
 use super::*;
-use crate::root::widgets::render_keycap_pair;
+use crate::root::widgets::{render_keycap_row, KeycapSize};
 
 impl AdeApp {
     pub(super) fn toggle_rail_mode(&mut self, cx: &mut Context<Self>) {
@@ -408,8 +408,10 @@ impl AdeApp {
             }))
     }
 
-    /// The `+` control with its ⌘N keycap pair - spawns a real new shell session (see
-    /// [`NewSession`]'s docs for the judgment call on the keybinding side of this).
+    /// The `+` control with its real, platform-resolved `mod+N` keycap pair (`⌘N` on macOS,
+    /// `Ctrl N` on Windows/Linux - `crate::keymap::resolve_combo`) - spawns a real new shell
+    /// session (see [`NewSession`]'s docs for the judgment call on the keybinding side of
+    /// this).
     pub(super) fn render_new_session_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("rail-new-session")
@@ -427,7 +429,10 @@ impl AdeApp {
                     .text_size(px(11.0))
                     .child("+"),
             )
-            .child(render_keycap_pair("\u{2318}", "N"))
+            .child(render_keycap_row(
+                &keymap::resolve_combo("mod+N", self.window_controls_style.is_macos()),
+                KeycapSize::Standard,
+            ))
             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                 this.new_session(SessionKind::Shell, cx);
             }))

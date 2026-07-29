@@ -1,5 +1,5 @@
 use super::*;
-use crate::root::widgets::{render_action_keycap, render_keycap_pair};
+use crate::root::widgets::{render_action_keycap_row, render_keycap_row, KeycapSize};
 
 impl AdeApp {
     pub(super) fn new_session(&mut self, kind: SessionKind, cx: &mut Context<Self>) {
@@ -223,7 +223,8 @@ impl AdeApp {
     /// The tab strip (34) - `design_handoff_jerry_ade/README.md`'s spec: one 14×14 kind chip
     /// per tab (see [`render_tab_chip`]), active/inactive bg/underline/label colours (see
     /// `crate::work_surface::tab_colors`), a real `+` (spawns a new default shell session,
-    /// same real action as the rail's own `+`), and the `⌘`/`1…8` keycap hint pinned right.
+    /// same real action as the rail's own `+`), and the real, platform-resolved `mod`/`1…8`
+    /// keycap hint pinned right (`⌘`/`1…8` on macOS, `Ctrl`/`1…8` on Windows/Linux).
     pub(super) fn render_tab_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut bar = div()
             .id("tab-strip")
@@ -257,14 +258,21 @@ impl AdeApp {
                 })),
         );
 
-        bar.child(div().flex_1()).child(
-            div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .px(px(12.0))
-                .child(render_keycap_pair("\u{2318}", "1\u{2026}8")),
-        )
+        bar.child(div().flex_1())
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px(px(12.0))
+                    .child(render_keycap_row(
+                        &keymap::resolve_combo(
+                            "mod+1\u{2026}8",
+                            self.window_controls_style.is_macos(),
+                        ),
+                        KeycapSize::Standard,
+                    )),
+            )
     }
 
     /// One tab: a 14×14 kind chip, the real label (the resolved binary name for an agent CLI
@@ -715,13 +723,14 @@ impl AdeApp {
                     .child(label),
             );
 
-        if let Some(cap) = action.keycap {
+        if let Some(spec) = action.keycap {
             let (keycap_fg, keycap_border) = if enabled {
                 (colors.keycap_fg, colors.keycap_border)
             } else {
                 (theme::text::GHOSTER, theme::border::BUTTON_DISABLED)
             };
-            button = button.child(render_action_keycap(cap, keycap_fg, keycap_border));
+            let parts = keymap::resolve_combo(spec, self.window_controls_style.is_macos());
+            button = button.child(render_action_keycap_row(&parts, keycap_fg, keycap_border));
         }
 
         if enabled {

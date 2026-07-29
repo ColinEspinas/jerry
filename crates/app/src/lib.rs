@@ -14,6 +14,7 @@ pub mod diagnostics_view;
 pub mod file_tree;
 pub mod fonts;
 pub mod hover_view;
+pub mod keymap;
 pub mod layout;
 pub mod merge;
 pub mod palette;
@@ -34,6 +35,42 @@ use gpui::{
     px, size, App, AppContext, Bounds, Size, TitlebarOptions, WindowBounds, WindowDecorations,
     WindowOptions,
 };
+
+/// The app's real, globally-bound keyboard shortcuts - the single list both [`run`] (production
+/// startup) and this crate's own regression test
+/// (`root::focus::palette_focus_tests::secondary_keystroke_opens_the_palette`) bind, so the two
+/// can never silently drift apart the way a copy-pasted duplicate list could.
+///
+/// `"secondary-"`, not `"cmd-"`, is deliberate and was the fix for a real, live-reproduced bug:
+/// GPUI's keystroke parser (verified at `vendor/zed/crates/gpui/src/platform/keystroke.rs:127-
+/// 159`) treats `"cmd"`/`"super"`/`"win"` as three spellings of the *same* alias, which always
+/// sets `modifiers.platform` regardless of OS - on Linux/Windows that's the Super/Windows key,
+/// never Ctrl. Binding `"cmd-k"` therefore left the real shortcut on Super+K while this app's own
+/// `crate::keymap` rendering (correctly) shows a `Ctrl` keycap on those platforms - a real,
+/// demonstrated mismatch: `Ctrl+K` did nothing, and `Ctrl+,` fell through to whatever had
+/// keyboard focus and typed a literal `,` into it (e.g. a live terminal session), since nothing
+/// intercepted it as an app-level action.
+///
+/// `"secondary"` (same file, lines 143-150) is GPUI's own documented answer to exactly this: it
+/// resolves to the `platform` modifier on macOS (`cfg!(target_os = "macos")`) and `control`
+/// everywhere else at compile time - the same OS fact `crate::keymap::detected_platform_is_macos`
+/// resolves for rendering, so this is one source of truth by construction, not two that could
+/// disagree. `f12` is untouched: it's the same physical key on every OS, so no per-platform alias
+/// applies - confirmed against `vendor/zed/assets/keymaps/default-linux.json`'s own real
+/// `"f12": "editor::GoToDefinition"` binding.
+///
+/// Note this list is bound once, at real app startup, and is fixed by the *real* compiled-in
+/// `target_os` - `crate::keymap::WindowControlsStyle`'s runtime title-bar/keycap override can't
+/// change which physical key this list matches (see that type's own docs for why, and why that's
+/// an honest, documented limitation rather than a bug).
+pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
+    vec![
+        gpui::KeyBinding::new("secondary-n", root::NewSession, None),
+        gpui::KeyBinding::new("secondary-k", root::TogglePalette, None),
+        gpui::KeyBinding::new("secondary-,", root::ToggleSettings, None),
+        gpui::KeyBinding::new("f12", root::GotoDefinition, None),
+    ]
+}
 
 /// Opens the ADE window against `repo_path` and runs the GPUI event loop until the window
 /// is closed. Blocks the calling thread for the lifetime of the application, mirroring
@@ -59,24 +96,15 @@ pub fn run(repo_path: PathBuf) {
             // docs for the real, verified `actions!`/`KeyBinding` pattern this follows,
             // taken directly from `vendor/zed/crates/gpui/examples/input.rs`, and for the
             // documented judgment call on how far its focus-priority interaction with a
-            // focused terminal tab was verified). `cmd-k` follows the exact same
+            // focused terminal tab was verified). `secondary-k` follows the exact same
             // `actions!`/`KeyBinding` pattern for the command palette (see
-            // `crate::root::TogglePalette`'s docs). `cmd-,` follows it again for the
-            // Settings surface (see `crate::root::ToggleSettings`'s docs for the real
-            // `vendor/zed/assets/keymaps/default-macos.json` precedent this literal
-            // keystroke string was verified against). `f12` follows the exact same real
-            // `actions!`/`KeyBinding` pattern for the File view's go-to-definition (see
-            // `crate::root::GotoDefinition`'s own docs) - the literal keystroke string `"f12"`
-            // was verified against `vendor/zed/assets/keymaps/default-linux.json`'s own real
-            // `"f12": "editor::GoToDefinition"` binding, and `vendor/zed/crates/gpui/src/
-            // platform/keystroke.rs` lists `"f12"` among the keystroke parser's own recognized
-            // function-key names.
-            cx.bind_keys([
-                gpui::KeyBinding::new("cmd-n", root::NewSession, None),
-                gpui::KeyBinding::new("cmd-k", root::TogglePalette, None),
-                gpui::KeyBinding::new("cmd-,", root::ToggleSettings, None),
-                gpui::KeyBinding::new("f12", root::GotoDefinition, None),
-            ]);
+            // `crate::root::TogglePalette`'s docs). `secondary-,` follows it again for the
+            // Settings surface (see `crate::root::ToggleSettings`'s docs). `f12` follows the
+            // exact same real `actions!`/`KeyBinding` pattern for the File view's
+            // go-to-definition (see `crate::root::GotoDefinition`'s own docs). See
+            // `default_key_bindings`'s own docs, above, for why `"secondary-"` (not `"cmd-"`)
+            // is the real, verified-correct prefix for the first three.
+            cx.bind_keys(default_key_bindings());
 
             let bounds = Bounds::centered(None, size(px(1440.0), px(928.0)), cx);
             let opened = cx.open_window(

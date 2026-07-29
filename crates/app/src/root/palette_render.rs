@@ -1,6 +1,33 @@
 use super::*;
 use crate::root::sidebar_render::RightSidebarView;
-use crate::root::widgets::render_keycap;
+use crate::root::widgets::{render_hint_pair, render_hint_row, render_keycap_row, KeycapSize};
+
+/// The real, live secondary line for one of the three `Window controls: …` palette commands
+/// (`palette::PaletteCommand::WindowControlsSystem`/`WindowControlsMacos`/
+/// `WindowControlsWindowsLinux`) - names which real chrome that option currently resolves to
+/// (`⌘`-style dots vs. caption buttons), and flags the one that's already active, exactly like
+/// `Self::build_palette_groups`'s other live-state secondaries (e.g.
+/// `PaletteCommand::ToggleRailGrouping`'s "switch to {label}").
+///
+/// These three commands change [`WindowControlsStyle`] - a rendering-only preview of another
+/// platform's title bar and keycap glyphs, never a rebinding of this session's real, globally-
+/// bound shortcuts (fixed at compile time by the real OS - see `crate::keymap`'s own "This is a
+/// cosmetic preview, not a rebinding" docs for the full reasoning). Picking "macOS" here on a
+/// real Linux/Windows box makes every keycap in the app render `⌘`-style glyphs while the key
+/// that actually works is still, and can only ever be, Ctrl - a deliberate, documented tradeoff,
+/// not an oversight.
+fn window_controls_secondary(current: WindowControlsStyle, option: WindowControlsStyle) -> String {
+    let resolved = if option.is_macos() {
+        "macOS dots"
+    } else {
+        "Windows/Linux caption buttons"
+    };
+    if current == option {
+        format!("{resolved} - already active")
+    } else {
+        format!("switch to {resolved}")
+    }
+}
 
 impl AdeApp {
     pub(super) fn handle_toggle_palette_action(
@@ -26,7 +53,7 @@ impl AdeApp {
     /// that could drift" shape for the *result*.
     ///
     /// The `sessions`/`commands` candidate inputs are themselves built fresh here every call -
-    /// they're cheap (bounded by open-tab count plus a fixed 7 commands) and a session's status
+    /// they're cheap (bounded by open-tab count plus a fixed 10 commands) and a session's status
     /// dot is genuinely live per-render data with no stable point to cache against (see
     /// [`Self::palette_file_candidates`]'s docs). The `files` candidate input is the one
     /// genuinely expensive part (up to `file_tree::MAX_ENTRIES` = 5000 entries, each needing a
@@ -94,6 +121,27 @@ impl AdeApp {
             palette::CommandCandidate {
                 command: palette::PaletteCommand::OpenSettings,
                 secondary: "agents, worktrees, and the rest of the settings surface".to_string(),
+            },
+            palette::CommandCandidate {
+                command: palette::PaletteCommand::WindowControlsSystem,
+                secondary: window_controls_secondary(
+                    self.window_controls_style,
+                    WindowControlsStyle::System,
+                ),
+            },
+            palette::CommandCandidate {
+                command: palette::PaletteCommand::WindowControlsMacos,
+                secondary: window_controls_secondary(
+                    self.window_controls_style,
+                    WindowControlsStyle::MacosStyle,
+                ),
+            },
+            palette::CommandCandidate {
+                command: palette::PaletteCommand::WindowControlsWindowsLinux,
+                secondary: window_controls_secondary(
+                    self.window_controls_style,
+                    WindowControlsStyle::WindowsLinuxStyle,
+                ),
             },
         ];
 
@@ -206,6 +254,24 @@ impl AdeApp {
             palette::PaletteCommand::ToggleRailGrouping => self.toggle_rail_mode(cx),
             palette::PaletteCommand::PruneWorktrees => self.request_prune(cx),
             palette::PaletteCommand::OpenSettings => self.open_settings(window, cx),
+            // See `crate::keymap`'s module docs and `palette::PaletteCommand::
+            // WindowControlsSystem`'s own docs for why these three exist here rather than on a
+            // real Settings page: a real, in-memory-only override that actually re-renders live
+            // (explicit `cx.notify()`, mirroring every other direct-field-mutation branch in
+            // this match, e.g. `Self::toggle_rail_mode`'s own), never persisted to a config
+            // file (that's R3's job).
+            palette::PaletteCommand::WindowControlsSystem => {
+                self.window_controls_style = WindowControlsStyle::System;
+                cx.notify();
+            }
+            palette::PaletteCommand::WindowControlsMacos => {
+                self.window_controls_style = WindowControlsStyle::MacosStyle;
+                cx.notify();
+            }
+            palette::PaletteCommand::WindowControlsWindowsLinux => {
+                self.window_controls_style = WindowControlsStyle::WindowsLinuxStyle;
+                cx.notify();
+            }
         }
     }
 
@@ -702,8 +768,11 @@ impl AdeApp {
                     .bg(color),
             );
         }
-        if let Some(shortcut) = entry.shortcut {
-            row = row.child(render_keycap(shortcut));
+        if let Some(spec) = entry.shortcut {
+            row = row.child(render_keycap_row(
+                &keymap::resolve_combo(spec, self.window_controls_style.is_macos()),
+                KeycapSize::Standard,
+            ));
         }
 
         row.on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
@@ -716,7 +785,28 @@ impl AdeApp {
     /// close, plus the result count") - `total` is exactly how many rows are actually rendered
     /// (post [`palette::MAX_ENTRIES_PER_GROUP`]-style capping inside `crate::palette::
     /// build_groups`), so this count can never overstate what's really on screen.
+    ///
+    /// The hint list used to be one bare-text string with `⏎`/`⇥` baked in as literal glyphs -
+    /// exactly what `design_handoff_jerry_ade/CHANGELOG.md`'s 2026-07-29 entry (change 2) names
+    /// the palette footer as one of the real, explicitly converted call sites for. It's now four
+    /// real `[keycap] label` pairs (`crate::root::widgets::render_hint_pair`/`render_hint_row`),
+    /// each keycap resolved through `crate::keymap::resolve_combo` at the hint size - `↑↓` has
+    /// no real modifier/key token behind it (not one of the eight `mod`/`alt`/.../`bksp` spec
+    /// names), so it passes through `resolve_combo` unchanged, the same real "unrecognized token"
+    /// path a bare letter like `N` takes.
     pub(super) fn render_palette_footer(&self, total: usize) -> impl IntoElement {
+        let macos = self.window_controls_style.is_macos();
+        let hints = [
+            ("\u{2191}\u{2193}", "move"),
+            ("enter", "run"),
+            ("tab", "next scope"),
+            ("esc", "close"),
+        ]
+        .into_iter()
+        .map(|(spec, label)| {
+            render_hint_pair(&keymap::resolve_combo(spec, macos), label).into_any_element()
+        });
+
         div()
             .flex_none()
             .flex()
@@ -727,16 +817,7 @@ impl AdeApp {
             .bg(theme::surface::FOOTER)
             .border_t_1()
             .border_color(theme::border::CARD)
-            .child(
-                div()
-                    .flex_1()
-                    .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
-                    .text_color(theme::text::HINT)
-                    .child(
-                        "\u{2191}\u{2193} move \u{b7} \u{23ce} run \u{b7} \u{21e5} next scope \u{b7} esc close",
-                    ),
-            )
+            .child(div().flex_1().child(render_hint_row(hints)))
             .child(
                 div()
                     .flex_none()

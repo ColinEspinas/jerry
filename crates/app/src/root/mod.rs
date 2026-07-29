@@ -47,6 +47,7 @@ use crate::code_view;
 use crate::diagnostics_view;
 use crate::file_tree::{self, FileTreeEntry, LangChip};
 use crate::hover_view;
+use crate::keymap::{self, WindowControlsStyle};
 use crate::layout;
 use crate::merge;
 use crate::palette;
@@ -84,10 +85,16 @@ use crate::root::sidebar_render::RightSidebarView;
 //
 // `ToggleSettings` (⌘,) follows the exact same pattern again - see
 // `Self::handle_toggle_settings_action` and `crate::lib::run`'s matching `cx.bind_keys` entry.
-// The literal keystroke string `"cmd-,"` was verified against a real precedent before use:
+// The literal keystroke string `"secondary-,"` was verified against two real precedents:
 // `vendor/zed/assets/keymaps/default-macos.json` binds Zed's own `zed::OpenSettings` action to
-// exactly `"cmd-,"` (and its Linux keymap the `ctrl-,` equivalent), confirming GPUI's real
-// keystroke parser accepts a bare `,` as a keystroke's key component.
+// `"cmd-,"` (and its Linux keymap the `ctrl-,` equivalent), confirming GPUI's real keystroke
+// parser accepts a bare `,` as a keystroke's key component; and
+// `vendor/zed/crates/gpui/src/platform/keystroke.rs:143-150` confirms `"secondary"` is a real,
+// separately-recognized modifier alias that resolves to exactly those two per-OS modifiers at
+// compile time (`platform`/Cmd on macOS, `control` elsewhere) - see `crate::default_key_bindings`'s
+// own docs for the real, live-reproduced bug that made `"cmd-,"` the wrong choice here (it always
+// means the Super/Windows key on Linux/Windows, never Ctrl, regardless of what `crate::keymap`'s
+// rendering shows).
 //
 // `GotoDefinition` (`F12`) follows the exact same pattern once more - see
 // `Self::handle_goto_definition_action` and `crate::lib::run`'s matching `cx.bind_keys` entry
@@ -355,7 +362,7 @@ pub struct AdeApp {
     /// "recompute expensive work every render instead of caching" cost `file_view_cache`/
     /// `open_diff_file_cache`/`tree_change_marks` were already fixed for elsewhere in this file.
     /// Sessions/commands candidates are deliberately *not* cached the same way - they're bounded
-    /// by the number of open tabs (a handful) plus a fixed 7 commands, and a session's status
+    /// by the number of open tabs (a handful) plus a fixed 10 commands, and a session's status
     /// dot is genuinely live per-render data (`Self::session_status` reads the pane's current
     /// `is_running()`/`idle_duration()` directly) with no stable mutation point to invalidate a
     /// cache on; caching them would trade a real perf problem for a real staleness bug for no
@@ -619,6 +626,17 @@ pub struct AdeApp {
     /// file's later load - and by `spawn_file_load`'s own failed-load branch, so a real read error
     /// can't leave it to misapply onto whatever loads successfully next.
     pending_cursor_line: Option<(PathBuf, usize)>,
+    /// Which platform's title-bar variant/keycap glyphs render right now
+    /// (`design_handoff_jerry_ade/CHANGELOG.md`'s 2026-07-29 entry, changes 1 and 2 - see
+    /// `crate::keymap`'s module docs for why this one field drives both). Defaults to
+    /// [`WindowControlsStyle::System`] (real OS detection); overridden live, in-memory only
+    /// (never persisted - that's R3's config-file-backed Settings job), by the command
+    /// palette's three `Window controls: …` entries
+    /// (`crate::root::palette_render::execute_palette_command`'s
+    /// `WindowControlsSystem`/`WindowControlsMacos`/`WindowControlsWindowsLinux` branches) - a
+    /// deliberate, documented placeholder entry point for this phase, until R3's real General
+    /// settings page gives it a permanent home.
+    window_controls_style: WindowControlsStyle,
 }
 
 impl Render for AdeApp {

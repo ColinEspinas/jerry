@@ -1,5 +1,5 @@
 use super::*;
-use crate::root::widgets::render_keycap;
+use crate::root::widgets::{render_keycap_row, KeycapSize};
 
 impl AdeApp {
     pub(super) fn handle_toggle_settings_action(
@@ -129,7 +129,13 @@ impl AdeApp {
                             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                                 this.close_settings(window, cx);
                             }))
-                            .child(render_keycap("esc")),
+                            .child(render_keycap_row(
+                                &keymap::resolve_combo(
+                                    "esc",
+                                    self.window_controls_style.is_macos(),
+                                ),
+                                KeycapSize::Standard,
+                            )),
                     ),
             )
             .child(

@@ -157,10 +157,25 @@ pub enum PaletteCommand {
     /// keyed exactly like `Jerry.dc.html`'s own palette fixture entry (`paletteData.all`'s
     /// Commands group: `{ k: 'c', label: 'Open settings', sub: '', key: '⌘,' }`).
     OpenSettings,
+    /// Pins `crate::keymap::WindowControlsStyle::System` (real OS detection) -
+    /// `crate::root::AdeApp::execute_palette_command`'s
+    /// `WindowControlsSystem`/`WindowControlsMacos`/`WindowControlsWindowsLinux` trio is a
+    /// deliberate, documented placeholder entry point for `design_handoff_jerry_ade/
+    /// CHANGELOG.md`'s 2026-07-29 entry, change 1's real, live title-bar/keycap override -
+    /// R3's config-file-backed Settings rewrite (change 3's "General" page `Window controls`
+    /// segmented choice) is where this permanently belongs; these three palette commands exist
+    /// only because that page doesn't exist yet.
+    WindowControlsSystem,
+    /// Pins `crate::keymap::WindowControlsStyle::MacosStyle` - see
+    /// [`Self::WindowControlsSystem`]'s docs.
+    WindowControlsMacos,
+    /// Pins `crate::keymap::WindowControlsStyle::WindowsLinuxStyle` - see
+    /// [`Self::WindowControlsSystem`]'s docs.
+    WindowControlsWindowsLinux,
 }
 
 impl PaletteCommand {
-    pub const ALL: [PaletteCommand; 7] = [
+    pub const ALL: [PaletteCommand; 10] = [
         PaletteCommand::NewShell,
         PaletteCommand::NewClaudeSession,
         PaletteCommand::NewCodexSession,
@@ -168,6 +183,9 @@ impl PaletteCommand {
         PaletteCommand::ToggleRailGrouping,
         PaletteCommand::PruneWorktrees,
         PaletteCommand::OpenSettings,
+        PaletteCommand::WindowControlsSystem,
+        PaletteCommand::WindowControlsMacos,
+        PaletteCommand::WindowControlsWindowsLinux,
     ];
 
     pub fn label(self) -> &'static str {
@@ -179,6 +197,9 @@ impl PaletteCommand {
             PaletteCommand::ToggleRailGrouping => "Toggle Rail Grouping",
             PaletteCommand::PruneWorktrees => "Prune Worktrees",
             PaletteCommand::OpenSettings => "Open Settings",
+            PaletteCommand::WindowControlsSystem => "Window Controls: System Default",
+            PaletteCommand::WindowControlsMacos => "Window Controls: macOS Style",
+            PaletteCommand::WindowControlsWindowsLinux => "Window Controls: Windows/Linux Style",
         }
     }
 
@@ -193,19 +214,33 @@ impl PaletteCommand {
             PaletteCommand::ToggleRailGrouping => "rail grouping urgency project sessions",
             PaletteCommand::PruneWorktrees => "prune worktree remove delete cleanup merged",
             PaletteCommand::OpenSettings => "settings preferences agents worktrees config",
+            PaletteCommand::WindowControlsSystem => {
+                "window controls title bar caption buttons dots platform override reset"
+            }
+            PaletteCommand::WindowControlsMacos => {
+                "window controls title bar dots traffic lights keycap platform override macos"
+            }
+            PaletteCommand::WindowControlsWindowsLinux => {
+                "window controls title bar caption buttons menu keycap platform override windows linux"
+            }
         }
     }
 
-    /// The real, already-bound keyboard shortcut for this command, if it has one -
-    /// `Some("⌘N")` for [`Self::NewShell`] (`cmd-n`) and `Some("⌘,")` for
-    /// [`Self::OpenSettings`] (`cmd-,`) - the two real, globally-bound keybindings among these
-    /// actions (`crate::lib::run`'s `cx.bind_keys` call). Every other command has no dedicated
-    /// shortcut in this app yet, so this deliberately returns `None` for them rather than
-    /// displaying a keycap that would silently do nothing if pressed.
+    /// The real, already-bound keyboard shortcut for this command, if it has one - a spec
+    /// string (`crate::keymap::resolve_combo`'s real input, not an already-resolved glyph):
+    /// `Some("mod+N")` for [`Self::NewShell`] (real binding: `secondary-n`) and `Some("mod+,")`
+    /// for [`Self::OpenSettings`] (real binding: `secondary-,`) - the two real, globally-bound
+    /// keybindings among these actions (`crate::default_key_bindings`). `crate::root::palette_render::
+    /// render_palette_row` resolves this through the real OS keymap at render time, so it reads
+    /// `⌘N`/`⌘,` on macOS and `Ctrl N`/`Ctrl ,` on Windows/Linux - never a hardcoded
+    /// platform-specific literal (`design_handoff_jerry_ade/CHANGELOG.md`'s 2026-07-29 entry,
+    /// change 2). Every other command has no dedicated shortcut in this app yet, so this
+    /// deliberately returns `None` for them rather than displaying a keycap that would
+    /// silently do nothing if pressed.
     pub fn shortcut(self) -> Option<&'static str> {
         match self {
-            PaletteCommand::NewShell => Some("\u{2318}N"),
-            PaletteCommand::OpenSettings => Some("\u{2318},"),
+            PaletteCommand::NewShell => Some("mod+N"),
+            PaletteCommand::OpenSettings => Some("mod+,"),
             _ => None,
         }
     }
@@ -661,10 +696,10 @@ mod tests {
         for command in PaletteCommand::ALL {
             match command {
                 PaletteCommand::NewShell => {
-                    assert_eq!(command.shortcut(), Some("\u{2318}N"))
+                    assert_eq!(command.shortcut(), Some("mod+N"))
                 }
                 PaletteCommand::OpenSettings => {
-                    assert_eq!(command.shortcut(), Some("\u{2318},"))
+                    assert_eq!(command.shortcut(), Some("mod+,"))
                 }
                 _ => assert_eq!(
                     command.shortcut(),

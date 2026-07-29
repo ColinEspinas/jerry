@@ -589,8 +589,8 @@ pub(super) enum RightSidebarView {
 
 /// The Changes list's real footer 29 (`design_handoff_jerry_ade/README.md`: "Footer 29: `click
 /// a file to open its diff in the centre · ] next file`"). The `] next file` portion of that
-/// spec text is deliberately dropped here: `]` isn't actually bound to anything (only `cmd-n`
-/// is a real, wired-up keybinding - see `crate::lib`'s `cx.bind_keys` call), and advertising a
+/// spec text is deliberately dropped here: `]` isn't actually bound to anything (only
+/// `secondary-n` is a real, wired-up keybinding - see `crate::default_key_bindings`), and advertising a
 /// shortcut that silently does nothing if pressed is worse than a shorter, accurate footer.
 pub(super) fn render_changes_footer() -> impl IntoElement {
     div()

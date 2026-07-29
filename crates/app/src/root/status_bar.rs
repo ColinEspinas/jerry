@@ -1,5 +1,5 @@
 use super::*;
-use crate::root::widgets::render_keycap_pair;
+use crate::root::widgets::{render_keycap_row, KeycapSize};
 
 impl AdeApp {
     /// The 26px status bar (`design_handoff_jerry_ade/README.md`'s Layout table: height 26,
@@ -7,8 +7,8 @@ impl AdeApp {
     /// `{{ statusLine }}` template placeholder still need git plumbing this phase doesn't build,
     /// so they're left out (rendering those would be exactly the "component bound to nothing"
     /// this project's constraints forbid) - but the `⌘K commands` hint is now real: the command
-    /// palette exists as of this phase, so clicking it (or pressing the real `cmd-k` binding -
-    /// see [`TogglePalette`]) really opens it, the same as `Jerry.dc.html`'s own
+    /// palette exists as of this phase, so clicking it (or pressing the real `secondary-k`
+    /// binding - see [`TogglePalette`]) really opens it, the same as `Jerry.dc.html`'s own
     /// `onClick={{onOpenPalette}}`. The mockup's second `⌘⇧K sessions` hint is deliberately
     /// omitted: that binding was never wired up in this phase (see the "Command palette" task
     /// docs' own scope), so showing a keycap for it would advertise a shortcut that silently
@@ -54,7 +54,10 @@ impl AdeApp {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .child(render_keycap_pair("\u{2318}", "K"))
+                    .child(render_keycap_row(
+                        &keymap::resolve_combo("mod+K", self.window_controls_style.is_macos()),
+                        KeycapSize::Standard,
+                    ))
                     .child(
                         div()
                             .font(font(theme::font::SANS))
