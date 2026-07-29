@@ -1,13 +1,13 @@
 //! `/proc`-based process-tree discovery and signaling, mirroring `pty-core`'s own kill
 //! implementation (`crates/pty-core/src/lib.rs`'s `child_pids_of`/`collect_descendant_pids`/
-//! `terminate_process_tree`) - not a literal shared dependency (pty-core doesn't expose these
-//! as `pub`, and the two crates' processes are spawned differently: pty-core's child is a pty
-//! session/process-group leader signaled via `killpg`, while `rust-analyzer` here is spawned as
-//! a plain `std::process::Command` child with no pty and no `setsid()`, so only a plain `kill`
-//! to each discovered pid is needed, not a process-group signal) - but the same real
-//! reasoning applies: `rust-analyzer` spawns its own child processes (`cargo check`, `rustc`,
-//! proc-macro server processes, ...) while indexing, and killing only the direct
-//! `rust-analyzer` pid would not necessarily reach those - see [`collect_descendant_pids`].
+//! `terminate_process_tree`), though not a literal shared dependency: pty-core doesn't expose
+//! those as `pub`, and pty-core's child is a pty session/process-group leader signaled via
+//! `killpg`, while `rust-analyzer` here is a plain `std::process::Command` child with no pty
+//! and no `setsid()`, so a plain `kill` to each discovered pid is needed, not a process-group
+//! signal. The same reasoning applies though: `rust-analyzer` spawns its own child processes
+//! (`cargo check`, `rustc`, proc-macro server processes, ...) while indexing, and killing only
+//! the direct `rust-analyzer` pid would not necessarily reach those - see
+//! [`collect_descendant_pids`].
 
 use std::collections::HashSet;
 use std::path::PathBuf;

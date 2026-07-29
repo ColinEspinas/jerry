@@ -1,19 +1,13 @@
 //! Pure logic for Surface C's File view *Diagnostic* state (`design_handoff_jerry_ade/
-//! README.md`'s "Language server UI" subsection): turning a real `Vec<lsp_types::Diagnostic>`
-//! (as published by a real `rust-analyzer`, via `lsp_core::LspClient::diagnostics_for`) into
-//! real, per-line, byte-range-addressed data `crate::root`'s renderer can draw a dotted
-//! underline/row tint/inline message/card from - deliberately `gpui`-window-free, mirroring
-//! `crate::code_view`'s and `crate::changes`'s own established split between pure logic and
-//! `crate::root`'s actual `Div` construction.
+//! README.md`'s "Language server UI" subsection): turns a `Vec<lsp_types::Diagnostic>` (as
+//! published by `rust-analyzer` via `lsp_core::LspClient::diagnostics_for`) into per-line,
+//! byte-range-addressed data `crate::root`'s renderer draws a dotted underline/row tint/inline
+//! message/card from. Deliberately `gpui`-window-free, mirroring `crate::code_view`'s split
+//! between pure logic and `crate::root`'s `Div` construction.
 //!
-//! ## Completions/hover are explicitly out of scope here
-//!
-//! `design_handoff_jerry_ade/README.md`'s `lsp_popup` state also covers `Completions` and
-//! `Hover` - both a later phase (H3)'s job, not this one's. Nothing in this module (or
-//! `lsp_core` itself) is diagnostics-specific at the *protocol* layer - `lsp_core::LspClient`'s
-//! generic `request`/`notify` methods are exactly as usable for `textDocument/completion` or
-//! `textDocument/hover` later - only this module's own mapping logic is diagnostics-specific,
-//! by design.
+//! Completions and Hover (`design_handoff_jerry_ade/README.md`'s `lsp_popup` state) are out of
+//! scope here - `lsp_core::LspClient`'s generic `request`/`notify` methods are equally usable
+//! for those later; only this module's mapping logic is diagnostics-specific.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -23,9 +17,9 @@ use lsp_core::lsp_types;
 
 use crate::code_view::{HighlightKind, RenderedLine};
 
-/// A diagnostic's real severity, collapsed from `lsp_types::DiagnosticSeverity`'s four real
-/// levels into this app's own type (kept separate from `lsp_types`'s so `crate::root`'s
-/// rendering code never has to depend on `lsp_core` for a value this simple).
+/// A diagnostic's severity, collapsed from `lsp_types::DiagnosticSeverity`'s four levels into
+/// this app's own type so `crate::root`'s rendering code doesn't need to depend on `lsp_core`
+/// for a value this simple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     Error,
@@ -35,12 +29,9 @@ pub enum Severity {
 }
 
 impl Severity {
-    /// The LSP spec: "The diagnostic's severity. Can be omitted. If omitted it is up to the
-    /// client to interpret diagnostics as error, warning, info or hint." This client interprets
-    /// an omitted severity as [`Severity::Error`] - the design's own Diagnostic state only
-    /// defines a treatment for errors (`#e0625c` dotted underline, `#e3908b` card message), and
-    /// real-world `rust-analyzer` always sets a real severity in practice, so this branch is a
-    /// defensive fallback, not an expected real path.
+    /// The LSP spec leaves an omitted severity to client interpretation; this client treats it
+    /// as [`Severity::Error`] - the design only defines a treatment for errors, and
+    /// `rust-analyzer` always sets a severity in practice, so this is a defensive fallback.
     pub fn from_lsp(severity: Option<lsp_types::DiagnosticSeverity>) -> Self {
         match severity {
             Some(lsp_types::DiagnosticSeverity::WARNING) => Severity::Warning,
@@ -50,13 +41,9 @@ impl Severity {
         }
     }
 
-    /// Real ordering from most to least severe: `Error` > `Warning` > `Information` > `Hint` -
-    /// the obvious, conventional real-editor ordering (matches e.g. how VS Code/`rustc` itself
-    /// rank these), used as this app's documented tie-break (see [`Severity::worst`]) for what
-    /// a *line's* single row-level treatment should be when it carries diagnostics of more than
-    /// one real severity (e.g. a real `rust-analyzer` `Error` and a real secondary `Hint`
-    /// annotation both touching the same line) - not left as "whichever happens to be first in
-    /// the `Vec`", which would depend on nothing more meaningful than server-side ordering.
+    /// Ordering from most to least severe, used as the tie-break in [`Severity::worst`] when a
+    /// line carries diagnostics of more than one severity - not "whichever is first in the
+    /// `Vec`", which would depend on server-side ordering.
     fn rank(self) -> u8 {
         match self {
             Severity::Error => 3,
@@ -66,11 +53,9 @@ impl Severity {
         }
     }
 
-    /// The single most severe real [`Severity`] among `diagnostics` - `None` only for a genuinely
-    /// empty slice. "Worst wins" is this app's documented, explicit tie-break for a line's own
-    /// row-level treatment (underline colour, row background tint) when it carries diagnostics
-    /// of mixed severity - see [`Severity::rank`]'s own docs for why this ordering, not some
-    /// other one.
+    /// The single most severe [`Severity`] among `diagnostics` - `None` only for an empty slice.
+    /// "Worst wins" is the tie-break for a line's row-level treatment (underline colour, row
+    /// background tint) when it carries diagnostics of mixed severity.
     pub fn worst(diagnostics: &[LineDiagnostic]) -> Option<Severity> {
         diagnostics
             .iter()
@@ -79,10 +64,10 @@ impl Severity {
     }
 }
 
-/// One real diagnostic's contribution to one real, specific line of a file: the real UTF-8 byte
-/// range *within that line's own text* the dotted underline should span (see
-/// [`utf16_offset_to_byte_offset`] for the real position-encoding conversion this comes from),
-/// plus the real message/source/code/severity to show in the inline message and card.
+/// One diagnostic's contribution to a specific line: the UTF-8 byte range *within that line's
+/// text* the dotted underline should span (see [`utf16_offset_to_byte_offset`] for the
+/// position-encoding conversion this comes from), plus the message/source/code/severity to show
+/// in the inline message and card.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LineDiagnostic {
     pub byte_range: Range<usize>,
@@ -92,13 +77,10 @@ pub struct LineDiagnostic {
     pub code: Option<String>,
 }
 
-/// Converts an LSP `Position`'s `character` value (a UTF-16 code-unit offset - the LSP spec's
-/// required-to-support default encoding, `PositionEncodingKind::UTF16`; this client never
-/// negotiates a different one in `ClientCapabilities`, so a real server is only ever allowed to
-/// send this kind) into a real UTF-8 byte offset within `line_text`. Clamps to `line_text`'s own
-/// byte length for a `character` past the real line's end - the spec's own documented behavior
-/// ("if the character value is greater than the line length it defaults back to the line
-/// length"), not an out-of-bounds bug.
+/// Converts an LSP `Position`'s `character` value (a UTF-16 code-unit offset - the spec's
+/// default `PositionEncodingKind::UTF16`, and the only kind this client ever negotiates) into a
+/// UTF-8 byte offset within `line_text`. Clamps to `line_text`'s byte length for a `character`
+/// past the line's end, per the spec ("defaults back to the line length").
 fn utf16_offset_to_byte_offset(line_text: &str, utf16_offset: u32) -> usize {
     let mut utf16_count = 0u32;
     for (byte_index, ch) in line_text.char_indices() {
@@ -110,11 +92,9 @@ fn utf16_offset_to_byte_offset(line_text: &str, utf16_offset: u32) -> usize {
     line_text.len()
 }
 
-/// [`LineDiagnostic::code`]'s real source value - `lsp_types::NumberOrString` is a real,
-/// genuine either/or (rust-analyzer sends its own error codes, like the real `E0308` observed
-/// while writing this module's own tests, as a string, not a number - see
-/// [`lsp_types::NumberOrString`]'s own docs), converted here to a plain `String` either way
-/// since this app's own UI only ever displays it as text.
+/// [`LineDiagnostic::code`]'s source value - `lsp_types::NumberOrString` is an either/or
+/// (rust-analyzer sends its own error codes, e.g. `E0308`, as a string, not a number), converted
+/// here to a plain `String` since this app's UI only ever displays it as text.
 fn number_or_string_to_string(code: &lsp_types::NumberOrString) -> String {
     match code {
         lsp_types::NumberOrString::Number(number) => number.to_string(),
@@ -122,15 +102,12 @@ fn number_or_string_to_string(code: &lsp_types::NumberOrString) -> String {
     }
 }
 
-/// Builds a real, per-line (1-based, matching `code_view`/`crate::root`'s own convention) index
-/// of every diagnostic that touches at least one real line of `lines` (`code_view::RenderedLine`'s
-/// own already-loaded text - never a second, independent file read). A diagnostic whose real LSP
-/// range spans multiple lines is real-recorded on *every* line it touches, clipped to each line's
-/// own bounds (the rest of the line, past the diagnostic's own start column, on every line but the
-/// last; up to the diagnostic's own end column on the last) - real, visible coverage on every
-/// affected row, not only the first. A diagnostic naming a line past the end of `lines` (should
-/// not happen against a freshly-loaded file, but never assumed) is silently skipped rather than
-/// panicking.
+/// Builds a per-line (1-based, matching `code_view`/`crate::root`'s convention) index of every
+/// diagnostic that touches at least one line of `lines`. A diagnostic whose range spans multiple
+/// lines is recorded on *every* line it touches, clipped to each line's own bounds (from the
+/// start column on the first line, to the end column on the last, the whole line in between) -
+/// visible coverage on every affected row, not only the first. A diagnostic naming a line past
+/// the end of `lines` is silently skipped rather than panicking.
 pub fn index_diagnostics_by_line(
     diagnostics: &[lsp_types::Diagnostic],
     lines: &[RenderedLine],
@@ -157,8 +134,8 @@ pub fn index_diagnostics_by_line(
             } else {
                 line.text.len()
             };
-            // Defensive: never hand back an inverted range. A real single-point diagnostic
-            // (start == end) legitimately produces a zero-width range here - real, not an error.
+            // Never hand back an inverted range. A single-point diagnostic (start == end)
+            // legitimately produces a zero-width range here.
             let end_byte = end_byte.max(start_byte);
 
             by_line
@@ -177,17 +154,14 @@ pub fn index_diagnostics_by_line(
     by_line
 }
 
-/// Splits `runs` (a [`RenderedLine::runs`] slice - already gapless/contiguous by byte length,
-/// per that field's own docs, so each run's byte range can be reconstructed purely from a
-/// running length total, with no separate byte-range field needed on `RenderedLine` itself)
-/// further at any [`LineDiagnostic::byte_range`] boundary that falls inside a run, tagging each
-/// resulting segment with whether it's real diagnostic-covered text - the real per-segment data
-/// `crate::root::render_file_view_line` draws a dotted underline under, without needing to know
-/// anything about diagnostics itself beyond "is this segment marked or not". A syntax highlight
-/// run and a diagnostic range only rarely share an exact boundary, so this real intersection
-/// (not just "which whole run does a diagnostic start in") is what keeps the rendered underline
-/// aligned to the diagnostic's own real column range rather than rounded out to the nearest
-/// syntax-highlight token boundary.
+/// Splits `runs` (a [`RenderedLine::runs`] slice - gapless/contiguous by byte length, so each
+/// run's byte range is reconstructed from a running length total) further at any
+/// [`LineDiagnostic::byte_range`] boundary that falls inside a run, tagging each resulting
+/// segment with whether it's diagnostic-covered - the per-segment data
+/// `crate::root::render_file_view_line` draws a dotted underline under. A syntax-highlight run
+/// and a diagnostic range rarely share an exact boundary, so this intersection keeps the
+/// underline aligned to the diagnostic's own column range rather than rounded out to the
+/// nearest syntax-highlight token boundary.
 pub fn overlay_diagnostic_runs(
     runs: &[(SharedString, HighlightKind)],
     diagnostics: &[LineDiagnostic],

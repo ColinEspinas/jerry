@@ -1,12 +1,9 @@
 //! The session rail's data model: pure, GPUI-free types and functions for grouping,
 //! filtering, and the "by project" worktree-without-a-session inclusion logic
-//! (`design_handoff_jerry_ade/README.md`'s Zone 1). Deliberately has no `gpui` dependency so
-//! the interesting logic - group order, filter matching, which worktrees get a plain row
-//! versus a session row - is unit-testable directly (see the tests below) without a real
-//! window, a real terminal, or real git state. `crate::root` is the one place that gathers
-//! real signals (a live `TerminalPane`, `wt_core::list_worktrees`,
-//! `wt_core::diff::diff_against_base`) into the plain data types this module operates on, and
-//! renders the result as real GPUI elements.
+//! (`design_handoff_jerry_ade/README.md`'s Zone 1). No `gpui` dependency, so this logic is
+//! unit-testable without a real window, terminal, or git state. `crate::root` gathers the
+//! real signals (`TerminalPane`, `wt_core::list_worktrees`, `wt_core::diff::diff_against_base`)
+//! into the plain types this module operates on, and renders the result as GPUI elements.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -40,10 +37,9 @@ impl RailMode {
     }
 }
 
-/// One session, already reduced to exactly what the rail row needs to render - built in
-/// `crate::root` from a real `crate::sessions::Session` (its `TerminalPane`'s live process
-/// signal and grid content) plus a real `wt_core::diff::diff_against_base` result for its
-/// worktree. See `crate::status::derive_status` for how `status` itself was computed.
+/// One session, reduced to exactly what the rail row needs to render - built in `crate::root`
+/// from a `crate::sessions::Session` plus a `wt_core::diff::diff_against_base` result for its
+/// worktree. See `crate::status::derive_status` for how `status` was computed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionRow {
     pub id: crate::sessions::SessionId,
@@ -52,27 +48,22 @@ pub struct SessionRow {
     pub cwd: PathBuf,
     pub status: Status,
     pub branch: Option<String>,
-    /// Real `+added -deleted` line counts from `wt_core::diff::diff_against_base`, summed
-    /// across every changed file. Both `0` if the diff hasn't loaded yet or there are no
-    /// changes.
+    /// `+added -deleted` line counts from `wt_core::diff::diff_against_base`, summed across
+    /// every changed file. Both `0` if the diff hasn't loaded yet or there are no changes.
     pub add: usize,
     pub del: usize,
-    /// Real tail-of-pty text for a waiting session (`crate::terminal_pane::TerminalPane::
-    /// visible_text_lines`, trimmed down to the last non-blank line) - `design_handoff_jerry_ade/
-    /// README.md`'s "question preview". Only ever populated for [`Status::Ask`] rows; the
-    /// design reserves this UI for waiting sessions specifically.
+    /// Tail-of-pty text for a waiting session (`TerminalPane::visible_text_lines`, trimmed to
+    /// the last non-blank line) - the design's "question preview". Only populated for
+    /// [`Status::Ask`] rows.
     pub question_preview: Option<String>,
-    /// The real process exit code (`pty_core::ExitStatus::exit_code`), only for
-    /// [`Status::Fail`]/[`Status::Review`]/session-exited-Idle rows. `None` while the
-    /// process is still running or never started - see `crate::root::AdeApp::
-    /// build_session_rows` for where this is read.
+    /// The process exit code, only for [`Status::Fail`]/[`Status::Review`]/exited-`Idle`
+    /// rows. `None` while still running or never started.
     pub exit_code: Option<u32>,
 }
 
 impl SessionRow {
     /// Whether this row matches a rail filter query - case-insensitive substring match
-    /// against the title, the branch name, and the agent/session kind label. Real filtering
-    /// (used by `crate::root`'s filter row), not decorative.
+    /// against the title, branch name, and session kind label.
     pub fn matches_filter(&self, query: &str) -> bool {
         let query = query.trim();
         if query.is_empty() {
@@ -89,17 +80,16 @@ impl SessionRow {
 }
 
 /// Filters `rows` down to those matching `query` - see [`SessionRow::matches_filter`]. A
-/// blank query (including one that's only whitespace) matches everything.
+/// blank query matches everything.
 pub fn filter_sessions<'a>(rows: &'a [SessionRow], query: &str) -> Vec<&'a SessionRow> {
     rows.iter()
         .filter(|row| row.matches_filter(query))
         .collect()
 }
 
-/// Real `+added -deleted` totals for one worktree/session cwd, summed across every changed
-/// file's hunks - built from a real `wt_core::diff::diff_against_base` result via
-/// [`sum_diff_stat`], never fabricated. `has_changes` is `files` being non-empty (mirrors
-/// `crate::status::derive_status`'s `has_reviewable_diff` input).
+/// `+added -deleted` totals for one worktree/session cwd, summed across every changed file's
+/// hunks via [`sum_diff_stat`]. `has_changes` mirrors `crate::status::derive_status`'s
+/// `has_reviewable_diff` input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DiffSummary {
     pub add: usize,
@@ -107,11 +97,9 @@ pub struct DiffSummary {
     pub has_changes: bool,
 }
 
-/// Sums added/deleted line counts across every hunk of every file in a real
-/// [`WorktreeDiff`] - the rail's `+N -M` stat is this, not a re-derivation of `git diff
-/// --stat` (which this module doesn't call; the full line-level diff is already loaded by
-/// `wt_core::diff::diff_against_base`, so re-parsing a second `--stat` invocation just to get
-/// the same numbers would be redundant I/O).
+/// Sums added/deleted line counts across every hunk of every file in a [`WorktreeDiff`] -
+/// the full line-level diff is already loaded by `wt_core::diff::diff_against_base`, so this
+/// avoids a second, redundant `git diff --stat` invocation.
 pub fn sum_diff_stat(diff: &WorktreeDiff) -> (usize, usize) {
     let mut add = 0usize;
     let mut del = 0usize;
@@ -130,18 +118,15 @@ pub fn sum_diff_stat(diff: &WorktreeDiff) -> (usize, usize) {
 }
 
 /// One group in "by urgency" mode: a status plus every session row with that status, in the
-/// order they were given (stable - `crate::root` is responsible for a sensible input order,
-/// e.g. session-creation order).
+/// order they were given (stable - `crate::root` picks the input order, e.g. creation order).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusGroup {
     pub status: Status,
     pub rows: Vec<SessionRow>,
 }
 
-/// Groups `rows` by [`Status`], in the exact urgency order
-/// `design_handoff_jerry_ade/README.md` specifies (`Status::ORDER`: `Needs input → Failed →
-/// Review ready → Running → Idle`). Empty groups are omitted entirely rather than rendered as
-/// a header with zero rows under it.
+/// Groups `rows` by [`Status`], in `Status::ORDER` (`Needs input → Failed → Review ready →
+/// Running → Idle`). Empty groups are omitted rather than rendered as a header with no rows.
 pub fn group_by_urgency(rows: &[SessionRow]) -> Vec<StatusGroup> {
     Status::ORDER
         .into_iter()
@@ -163,42 +148,32 @@ pub fn group_by_urgency(rows: &[SessionRow]) -> Vec<StatusGroup> {
         .collect()
 }
 
-/// Real clean/merged state for one worktree row in "by project" mode - computed from
-/// `wt_core::is_dirty` and `wt_core::diff::merge_status_against_base`, never fabricated. See
-/// [`Self::label`] for how this becomes the design's `checkout · clean` /
-/// `merged HH:MM · prunable` text.
+/// Clean/merged state for one worktree row in "by project" mode - computed from
+/// `wt_core::is_dirty` and `wt_core::diff::merge_status_against_base`. See [`Self::label`]
+/// for how this becomes the `checkout · clean` / `merged HH:MM · prunable` text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorktreeNote {
-    /// The main checkout is always labeled `checkout`, never `merged ... prunable` - pruning
-    /// the main worktree isn't a real `git worktree remove` operation (git refuses it
-    /// outright) and it can't sensibly be "merged into" its own base.
+    /// The main checkout is always labeled `checkout`, never `merged ... prunable` - `git
+    /// worktree remove` refuses it outright, and it can't be "merged into" its own base.
     pub is_main: bool,
-    /// `None` if `wt_core::is_dirty` itself failed (surfaced as a blank note rather than a
-    /// guess - see [`Self::label`]).
+    /// `None` if `wt_core::is_dirty` itself failed (a blank note rather than a guess).
     pub clean: Option<bool>,
-    /// `None` if no base branch could be detected for this worktree (mirrors
-    /// `wt_core::diff::DiffBase::NoBaseFound`) - a worktree with no detectable base is never
-    /// treated as prunable, since "merged into what?" has no real answer.
+    /// `None` if no base branch could be detected (mirrors `DiffBase::NoBaseFound`) - such a
+    /// worktree is never treated as prunable, since "merged into what?" has no answer.
     pub merge: Option<WorktreeMergeStatus>,
-    /// From `wt_core::Worktree::is_locked` (real `git worktree lock` state) - a locked
-    /// worktree is never offered as prunable, even if it's otherwise merged and clean:
-    /// `git worktree lock` is an explicit user signal ("don't remove or move this"), most
-    /// commonly because it lives on removable/networked storage that may be absent right
-    /// now rather than genuinely abandoned. See [`Self::is_prunable`].
+    /// From `wt_core::Worktree::is_locked` - a locked worktree is never offered as prunable
+    /// even if otherwise merged and clean, since `git worktree lock` is an explicit "don't
+    /// touch this" signal. See [`Self::is_prunable`].
     pub is_locked: bool,
 }
 
 impl WorktreeNote {
-    /// A worktree is a real prune candidate exactly when it is not the main checkout, is not
-    /// locked, has no uncommitted changes (`wt_core::remove_worktree` would refuse a dirty
-    /// one anyway - this mirrors that same safety check up front rather than only
-    /// discovering it when `prune` is clicked), and its branch is fully merged into the
+    /// A prune candidate: not the main checkout, not locked, clean (mirroring
+    /// `wt_core::remove_worktree`'s own dirty-tree refusal up front), and merged into its
     /// detected base.
     ///
-    /// This alone is **not** sufficient to actually remove a worktree - it says nothing
-    /// about whether a live session is currently running inside it. See
-    /// `crate::rail::prunable_worktree_paths` (the function `crate::root::AdeApp::
-    /// prune_worktrees` actually calls) for that additional, separate exclusion.
+    /// Not sufficient on its own to remove a worktree - says nothing about a live session
+    /// running inside it. See [`prunable_worktree_paths`] for that additional exclusion.
     pub fn is_prunable(&self) -> bool {
         !self.is_main
             && !self.is_locked
@@ -242,11 +217,10 @@ impl WorktreeNote {
     }
 }
 
-/// Formats a Unix timestamp as `HH:MM` **in UTC**, not the viewer's local timezone. A
-/// deliberate, documented simplification: `std` has no timezone database, and pulling one in
-/// (`chrono-tz`, or the `time` crate's `local-offset` feature, which is unsound-by-default on
-/// unix per its own advisory and requires opting back in) was judged not worth the dependency
-/// weight for a single `HH:MM` label in a worktree note. Real timestamp, just not localized.
+/// Formats a Unix timestamp as `HH:MM` **in UTC**, not the viewer's local timezone -
+/// deliberate: `std` has no timezone database, and pulling one in (`chrono-tz`, or the
+/// `time` crate's `local-offset` feature, unsound-by-default on unix) wasn't worth it for a
+/// single label.
 fn format_utc_hhmm(unix_seconds: i64) -> String {
     let seconds_in_day = unix_seconds.rem_euclid(86_400);
     let hours = seconds_in_day / 3600;
@@ -254,8 +228,8 @@ fn format_utc_hhmm(unix_seconds: i64) -> String {
     format!("{hours:02}:{minutes:02}")
 }
 
-/// One real worktree, as input to [`build_project_children`] - `crate::root`'s reduction of
-/// `wt_core::WorktreeResult` (via `crate::worktrees::WorktreeItem`) plus its real, separately
+/// One worktree, as input to [`build_project_children`] - `crate::root`'s reduction of
+/// `wt_core::WorktreeResult` (via `crate::worktrees::WorktreeItem`) plus its separately
 /// computed [`WorktreeNote`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorktreeEntry {
@@ -264,27 +238,23 @@ pub struct WorktreeEntry {
     pub branch: Option<String>,
     pub note: WorktreeNote,
     /// `Some(message)` if this worktree's metadata failed to read (mirrors
-    /// `crate::worktrees::WorktreeItem::error`) - see `crate::root::AdeApp::
-    /// build_worktree_entries`'s docs for why these are kept in the list (rendered as a
-    /// real, visible error row) rather than silently filtered out, per `worktrees.rs`'s own
-    /// documented intent for `WorktreeItem`.
+    /// `crate::worktrees::WorktreeItem::error`) - kept as a visible error row rather than
+    /// filtered out, per that type's documented intent.
     pub error: Option<String>,
 }
 
-/// One child row under a project header in "by project" mode: either a real session (if one
-/// is running in that worktree) or a bare worktree row with its real clean/prunable note.
+/// One child row under a project header in "by project" mode: either a session (if one is
+/// running in that worktree) or a bare worktree row with its clean/prunable note.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProjectChild {
     Session(SessionRow),
     Worktree(WorktreeEntry),
 }
 
-/// Builds the real "by project" child list: one entry per worktree, in the same order
-/// `worktrees` was given, each replaced by its matching session row if one is currently open
-/// in that exact worktree path. This is the concrete implementation of the README's "the
-/// reason this mode exists" claim - **every** worktree appears here, including ones with no
-/// session at all (e.g. `main`, or a merged/prunable leftover), not just the ones that happen
-/// to have an active session.
+/// Builds the "by project" child list: one entry per worktree, in the given order, each
+/// replaced by its matching session row if one is open in that exact worktree path. Every
+/// worktree appears here, including ones with no session (e.g. `main`, or a merged/prunable
+/// leftover) - not just the ones with an active session.
 pub fn build_project_children(
     worktrees: &[WorktreeEntry],
     sessions: &[SessionRow],
@@ -317,11 +287,9 @@ pub fn status_dot_cluster(children: &[ProjectChild]) -> Vec<Status> {
 
 /// Whether a bare worktree row (no open session) matches a rail filter query - the "by
 /// project" equivalent of [`SessionRow::matches_filter`], matched against its label, branch,
-/// and real filesystem path. The path is a real, additional search target (not just
-/// label/branch): `crate::worktrees::WorktreeItem::label` is always a *short* name (the
-/// branch, or at most one directory-name segment - see that module's `label_for`), never a
-/// full path, so a query for an ancestor directory component (e.g. a leftover-worktrees
-/// container directory) would otherwise never match anything.
+/// and full filesystem path. The path is an additional search target because
+/// `crate::worktrees::WorktreeItem::label` is always a short name (never a full path), so a
+/// query for an ancestor directory component would otherwise never match.
 pub fn matches_filter_worktree_entry(entry: &WorktreeEntry, query: &str) -> bool {
     let query = query.trim();
     if query.is_empty() {
@@ -345,10 +313,9 @@ pub fn project_child_matches(child: &ProjectChild, query: &str) -> bool {
     }
 }
 
-/// Filters a real "by project" child list down to those matching `query` - applied *after*
+/// Filters a "by project" child list down to those matching `query` - applied *after*
 /// [`build_project_children`], so which worktrees get a session row versus a plain worktree
-/// row is always decided from the complete, unfiltered session list first (see
-/// `crate::root`'s docs on why filtering must not itself change that assignment).
+/// row is always decided from the complete, unfiltered session list first.
 pub fn filter_project_children<'a>(
     children: &'a [ProjectChild],
     query: &str,
@@ -359,24 +326,20 @@ pub fn filter_project_children<'a>(
         .collect()
 }
 
-/// One real, already-completed round of the rail's periodic background refresh (see
-/// `crate::root`'s status-polling task): real `+N -M` diff totals for every session's
-/// worktree, and real clean/merged notes for every listed worktree. Performs blocking I/O
-/// (spawns `git diff`/`git status` and reads the object database via `gix` for each distinct
-/// path) - always run this via a background executor, never on a GPUI foreground thread; see
-/// `wt_core`'s own crate-level docs for the same rule.
+/// One completed round of the rail's periodic background refresh: `+N -M` diff totals for
+/// every session's worktree, and clean/merged notes for every listed worktree. Performs
+/// blocking I/O (`git diff`/`git status`, `gix` object-database reads) - always run via a
+/// background executor, never on the GPUI foreground thread.
 pub struct StatusSnapshot {
-    /// Keyed by worktree/session cwd (real diffs are per-directory, and more than one open
-    /// session can share the same worktree, so this is deduplicated by path rather than by
-    /// session id).
+    /// Keyed by worktree/session cwd - deduplicated by path since more than one open session
+    /// can share a worktree.
     pub diffs: HashMap<PathBuf, DiffSummary>,
     /// Keyed by worktree path.
     pub worktree_notes: HashMap<PathBuf, WorktreeNote>,
 }
 
-/// One real worktree to compute a [`WorktreeNote`] for, as input to
-/// [`compute_status_snapshot`] - `crate::root::AdeApp::start_status_polling`'s reduction of
-/// `crate::worktrees::WorktreeItem`.
+/// One worktree to compute a [`WorktreeNote`] for, as input to [`compute_status_snapshot`] -
+/// `crate::root::AdeApp::start_status_polling`'s reduction of `crate::worktrees::WorktreeItem`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeQuery {
     pub path: PathBuf,
@@ -384,13 +347,11 @@ pub struct WorktreeQuery {
     pub is_locked: bool,
 }
 
-/// Computes one real [`StatusSnapshot`]: a `wt_core::diff::diff_against_base` for every
-/// distinct path in `diff_paths` (deduplicated), plus a real `wt_core::is_dirty` +
-/// `wt_core::diff::merge_status_against_base` for every [`WorktreeQuery`] in `worktrees`. A
-/// failure computing any single path's diff or note is treated as "unknown for this path"
-/// (an absent/default entry) rather than aborting the whole snapshot - one unreadable
-/// worktree (e.g. one mid-deletion by something outside the app) must not blank out every
-/// other row's real status.
+/// Computes one [`StatusSnapshot`]: a `diff_against_base` for every distinct path in
+/// `diff_paths` (deduplicated), plus an `is_dirty` + `merge_status_against_base` for every
+/// [`WorktreeQuery`] in `worktrees`. A failure computing any single path's diff or note is
+/// treated as "unknown for this path" rather than aborting the whole snapshot - one
+/// unreadable worktree must not blank out every other row's status.
 pub fn compute_status_snapshot(
     worktrees: &[WorktreeQuery],
     diff_paths: &[PathBuf],
@@ -446,29 +407,24 @@ pub fn compute_status_snapshot(
     }
 }
 
-/// Whether `path` is a real prune candidate on its own merits: not the main checkout, not
-/// locked, clean, and merged - see [`WorktreeNote::is_prunable`]. This does **not** know
-/// about live sessions; see [`prunable_worktree_paths`] for the function that actually
-/// combines this with the live-session exclusion before anything is ever offered for
-/// removal.
+/// Whether `path` is a prune candidate on its own merits - see [`WorktreeNote::is_prunable`].
+/// Does **not** know about live sessions; see [`prunable_worktree_paths`] for the function
+/// that combines this with the live-session exclusion before anything is offered for removal.
 pub fn is_prunable(worktree_notes: &HashMap<PathBuf, WorktreeNote>, path: &Path) -> bool {
     worktree_notes
         .get(path)
         .is_some_and(WorktreeNote::is_prunable)
 }
 
-/// The real, final list of worktree paths `crate::root::AdeApp::prune_worktrees` is allowed
-/// to remove: every path that is a prune candidate per [`is_prunable`] **and** has no live
-/// session currently running with its cwd inside it.
+/// The final list of worktree paths `crate::root::AdeApp::prune_worktrees` is allowed to
+/// remove: every path that is a prune candidate per [`is_prunable`] **and** has no live
+/// session running with its cwd inside it.
 ///
-/// This second condition is not implied by `is_prunable`'s own dirty check: a running
-/// process with no uncommitted changes doesn't make git consider the worktree dirty (an
-/// agent that's just sitting there, or a shell with nothing typed, leaves a perfectly clean
-/// tree), but removing the worktree directory out from under a still-running process is real
-/// data loss and a real broken process - not merely an unwanted deletion `wt_core::
-/// remove_worktree`'s own safety check would catch. This function exists specifically so
-/// that exclusion happens once, before `wt_core::remove_worktree` is ever called for any
-/// candidate, rather than being left to that lower-level safety net alone.
+/// The live-session check isn't implied by `is_prunable`'s dirty check: a running process
+/// with no uncommitted changes still leaves a clean tree, but removing its worktree directory
+/// out from under it is real data loss - `wt_core::remove_worktree`'s own safety check has no
+/// way to catch that. This exclusion happens once here, before `remove_worktree` is called
+/// for any candidate.
 pub fn prunable_worktree_paths(
     worktree_paths: &[PathBuf],
     worktree_notes: &HashMap<PathBuf, WorktreeNote>,
@@ -483,26 +439,18 @@ pub fn prunable_worktree_paths(
 }
 
 /// Cap on how many files a single worktree's disk-usage walk will sum before giving up and
-/// reporting a truncated (real, but incomplete lower-bound) total - see [`disk_usage_bytes`].
-/// This project's own repository (which its rail footer walks when the app is run against
-/// itself for verification) contains a full nested `vendor/zed` checkout - tens of thousands
-/// of files on its own - so an unbounded recursive walk would make the rail footer's cost
-/// unpredictable. 50,000 keeps a realistic worktree's walk complete while still bounding the
-/// pathological case.
+/// reporting a truncated (lower-bound) total - see [`disk_usage_bytes`]. This project's own
+/// repository contains a full nested `vendor/zed` checkout (tens of thousands of files), so
+/// an unbounded walk would make the rail footer's cost unpredictable.
 pub const DISK_USAGE_WALK_FILE_CAP: usize = 50_000;
 
-/// Sums real file sizes (`std::fs::Metadata::len`) recursively under `root`, via
-/// `std::fs::read_dir` - a genuine, if bounded and best-effort, disk-usage figure, not a
-/// fabricated placeholder. Returns `(total_bytes, truncated)`; `truncated` is `true` if
-/// [`DISK_USAGE_WALK_FILE_CAP`] was hit, meaning `total_bytes` is real but incomplete (a real
-/// lower bound, never an overcount). Symlinks are not followed (`DirEntry::metadata` on unix
-/// is `lstat`-based, i.e. does not dereference symlinks), so a cyclic symlink can't loop this
-/// walk. Unreadable entries (permission errors, or a concurrent delete racing this read) are
-/// skipped rather than aborting the whole walk - a disk-usage estimate should degrade
-/// gracefully, not go blank because of one unreadable subdirectory.
+/// Sums file sizes recursively under `root`. Returns `(total_bytes, truncated)`; `truncated`
+/// is `true` if [`DISK_USAGE_WALK_FILE_CAP`] was hit, meaning `total_bytes` is a real but
+/// incomplete lower bound. Symlinks are not followed (`DirEntry::metadata` on unix is
+/// `lstat`-based), so a cyclic symlink can't loop this walk. Unreadable entries are skipped
+/// rather than aborting the whole walk.
 ///
-/// Performs blocking filesystem I/O; callers must offload this to a background executor (see
-/// `crate::root::AdeApp::load_disk_usage`), never call it from a GPUI foreground thread.
+/// Performs blocking filesystem I/O; callers must offload this to a background executor.
 pub fn disk_usage_bytes(root: &Path) -> (u64, bool) {
     let mut total = 0u64;
     let mut visited_files = 0usize;
@@ -727,10 +675,8 @@ mod tests {
 
     #[test]
     fn worktree_note_locked_merged_clean_worktree_is_never_prunable_but_label_says_locked() {
-        // A locked worktree can be genuinely merged and clean - `git worktree lock` is an
-        // explicit "don't touch this" signal independent of merge/dirty state (e.g. it lives
-        // on removable storage) - so it must never be offered as prunable, even though every
-        // other prunability condition holds.
+        // A locked worktree can be genuinely merged and clean - lock state is independent of
+        // merge/dirty state.
         let note = WorktreeNote {
             is_main: false,
             clean: Some(true),
@@ -754,10 +700,8 @@ mod tests {
 
     fn worktree_entry(path: &str, note: WorktreeNote) -> WorktreeEntry {
         let path_buf = PathBuf::from(path);
-        // Realistic label shape: `crate::worktrees::WorktreeItem::label` (via `label_for`)
-        // is always a short name - the branch, or at most one directory-name segment - never
-        // a full path. A test helper that instead sets `label` to the whole path would
-        // exercise filter behavior the real app can never produce.
+        // `crate::worktrees::WorktreeItem::label` is always a short name, never a full path -
+        // match that shape here so this exercises real filter behavior.
         let label = path_buf
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -845,11 +789,8 @@ mod tests {
     #[test]
     fn filter_project_children_matches_session_title_worktree_label_or_worktree_path() {
         let session_child = ProjectChild::Session(row(1, Status::Run, "Fix rate limiter", "/a"));
-        // Real `WorktreeEntry::label` shape (via `worktree_entry`'s helper, matching
-        // `crate::worktrees::label_for`) is just the leaf name - "leftover-branch" - never
-        // the full path, so a query for the *container* directory
-        // ("repo-worktrees") can only ever match through the real path-search fallback in
-        // `matches_filter_worktree_entry`, not through the label.
+        // "leftover-branch" is the label (leaf name only); "repo-worktrees" can only match
+        // via the path fallback in `matches_filter_worktree_entry`, not the label.
         let worktree_child = ProjectChild::Worktree(worktree_entry(
             "/repo-worktrees/leftover-branch",
             clean_note(false),
@@ -897,10 +838,6 @@ mod tests {
 
     #[test]
     fn prunable_worktree_paths_excludes_a_path_with_a_live_session_even_if_otherwise_prunable() {
-        // The critical fix: a worktree that is genuinely merged and clean (a real prune
-        // candidate per `is_prunable` alone) must never be offered for removal while a
-        // session's cwd is inside it - `wt_core::is_dirty` has no way to know a live,
-        // clean-tree process is running there, so this exclusion must happen independently.
         let merged_clean_path = PathBuf::from("/repo-wt/merged-clean-but-in-use");
         let mut notes = HashMap::new();
         notes.insert(
@@ -1040,10 +977,9 @@ mod tests {
         dir
     }
 
-    /// Real end-to-end proof (a genuine tempdir git repo, real `git`/`gix` calls - the same
-    /// pattern `wt_core`'s own tests use) that [`compute_status_snapshot`] reports a
+    /// End-to-end, against a real tempdir git repo: [`compute_status_snapshot`] reports a
     /// prunable, clean, merged worktree correctly, and a dirty one as not prunable, in one
-    /// real snapshot covering both the diff side and the worktree-note side at once.
+    /// snapshot covering both the diff side and the worktree-note side.
     #[test]
     fn compute_status_snapshot_reports_real_diff_and_merge_state() {
         let repo = init_repo();

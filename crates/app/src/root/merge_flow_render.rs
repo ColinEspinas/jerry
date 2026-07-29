@@ -1,23 +1,18 @@
 use super::*;
 
 impl AdeApp {
-    /// Surface D - the real merge-conflict resolution surface (`design_handoff_jerry_ade/
-    /// README.md`'s "Surface D — merge conflict"), replacing the pty/diff body below the tab
-    /// strip and session context bar (which both keep rendering normally - only the body
-    /// changes) exactly like Surface B/C already do. Renders whichever real
-    /// [`merge::MergeFlowState`] `self.merge_flow` is currently in for `session`; every value
-    /// shown here (branch names, file paths, conflict line content) comes from the real
-    /// `wt_core::merge` call `Self::start_merge` made, never fabricated sample data.
+    /// Surface D - the merge-conflict resolution surface, replacing the pty/diff body below the
+    /// tab strip and session context bar (which keep rendering normally) exactly like Surface
+    /// B/C already do. Renders whichever [`merge::MergeFlowState`] `self.merge_flow` is
+    /// currently in for `session`; every value shown (branch names, file paths, conflict line
+    /// content) comes from the `wt_core::merge` call [`Self::start_merge`] made.
     ///
-    /// Deliberate simplifications vs. the design's full mockup, all honest rather than faked:
-    /// no per-line gutter numbers (a `ConflictHunk`'s `ours`/`theirs` lines aren't tied to real
-    /// original file line numbers once extracted from the markers - inventing incrementing
-    /// numbers here would be exactly the kind of fabricated-looking-real data this project's
-    /// conventions forbid); the left ("ours"/base) column is labelled with the real base branch
-    /// name rather than an agent identity, since `wt_core::merge::attempt_merge` always runs
-    /// `git merge` from the base worktree - the base branch is real git state, not a running
-    /// session, so it has no real agent to attribute the tint to (see [`Self::start_merge`]'s
-    /// docs for the plumbing this reflects).
+    /// Deliberate simplifications vs. the design's full mockup: no per-line gutter numbers (a
+    /// `ConflictHunk`'s `ours`/`theirs` lines aren't tied to original file line numbers once
+    /// extracted from the markers, so inventing incrementing ones would be fabricated data);
+    /// the left ("ours"/base) column is labelled with the base branch name rather than an agent
+    /// identity, since `attempt_merge` always runs `git merge` from the base worktree - real
+    /// git state, not a running session, so there's no agent to attribute a tint to.
     pub(super) fn render_merge_flow_surface(
         &self,
         session: &Session,
@@ -189,9 +184,8 @@ impl AdeApp {
                             ),
                     );
                 } else if let Some((target_file, target_hunk)) = merge::first_unresolved(files) {
-                    // `merge::first_unresolved` only ever points at a real
-                    // `ConflictedPath::Text` entry with a real remaining `Conflict` segment -
-                    // see that function's own docs - so both of these always match.
+                    // `merge::first_unresolved` only ever points at a `ConflictedPath::Text`
+                    // entry with a remaining `Conflict` segment, so both always match.
                     if let Some(ConflictedPath::Text(file)) = files.get(target_file) {
                         if let Some(ConflictSegment::Conflict(hunk)) =
                             file.segments.get(target_hunk)
@@ -206,11 +200,9 @@ impl AdeApp {
                         body = body.child(div().flex_1());
                     }
                 } else {
-                    // Not resolved, but no real text hunk left to show either: every
-                    // remaining unresolved entry is a real modify/delete or binary conflict
-                    // this app has no text-hunk resolution action for - see
-                    // `crate::merge::unmergeable_paths`'s docs. A distinct, honest panel
-                    // (never silently falling through to "conflicts resolved").
+                    // No text hunk left, but not resolved either: every remaining entry is a
+                    // modify/delete or binary conflict with no text-hunk resolution action -
+                    // a distinct panel rather than falling through to "conflicts resolved".
                     body =
                         body.child(self.render_unmergeable_panel(merge::unmergeable_paths(files)));
                 }
@@ -221,9 +213,8 @@ impl AdeApp {
         }
     }
 
-    /// Surface D's header row: `Resolve merge`, the real base branch, and `hunk X of Y` for
-    /// whichever file/hunk is currently active - `crate::merge::hunk_position_in_file`/
-    /// `crate::merge::hunk_count`'s real, computed positions, not a hardcoded label.
+    /// Surface D's header row: `Resolve merge`, the base branch, and `hunk X of Y` for whichever
+    /// file/hunk is active, computed from `crate::merge::hunk_position_in_file`/`hunk_count`.
     pub(super) fn render_merge_header(
         &self,
         base_branch: &str,
@@ -274,10 +265,10 @@ impl AdeApp {
             })
     }
 
-    /// Surface D's real two-column split for the currently active conflict hunk - real
-    /// `ours`/`theirs` content extracted from the file's real on-disk conflict markers, never
-    /// simulated. See [`Self::render_merge_flow_surface`]'s docs for why the left column is
-    /// labelled with the real base branch rather than an agent identity.
+    /// Surface D's two-column split for the active conflict hunk - `ours`/`theirs` content
+    /// extracted from the file's on-disk conflict markers. See
+    /// [`Self::render_merge_flow_surface`]'s docs for why the left column is labelled with the
+    /// base branch rather than an agent identity.
     pub(super) fn render_conflict_columns(
         &self,
         base_branch: &str,
@@ -408,11 +399,9 @@ impl AdeApp {
             )))
     }
 
-    /// The real `Take both` action (`design_handoff_jerry_ade/README.md`'s Result strip -
-    /// "Jerry proposes the answer") on the currently active hunk - real, tested
-    /// `wt_core::merge::ConflictChoice::Both` (keeps *both* sides' lines, ours then theirs),
-    /// the same real function [`Self::render_conflict_columns`]'s own Take-left/Take-right
-    /// buttons call.
+    /// The `Take both` action on the active hunk - `wt_core::merge::ConflictChoice::Both` keeps
+    /// both sides' lines (ours then theirs), via the same function
+    /// [`Self::render_conflict_columns`]'s Take-left/Take-right buttons call.
     pub(super) fn render_take_both_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex_none()
@@ -445,14 +434,11 @@ impl AdeApp {
             )
     }
 
-    /// The real, distinct panel for [`wt_core::merge::ConflictedPath::Unmergeable`] entries -
-    /// modify/delete or binary conflicts this app has no text-hunk resolution action for (see
-    /// that type's docs). Deliberately never rendered as if these were resolved or as the
-    /// normal two-column text editor (there is no real hunk to show for either reason) -
-    /// lists each real path and reason, and points at a real terminal as the honest way to
-    /// resolve them by hand, matching this app's own established fallback for other real
-    /// gaps (e.g. `crate::work_surface::ActionKind::Unimplemented`'s own "no fake action"
-    /// precedent).
+    /// The distinct panel for [`wt_core::merge::ConflictedPath::Unmergeable`] entries - modify/
+    /// delete or binary conflicts with no text-hunk resolution action (see that type's docs).
+    /// Never rendered as resolved or as the normal two-column editor, since there's no hunk to
+    /// show either way - lists each path and reason, and points at a terminal to resolve by
+    /// hand.
     pub(super) fn render_unmergeable_panel(
         &self,
         paths: Vec<(&std::path::Path, wt_core::merge::UnmergeableReason)>,
@@ -510,13 +496,12 @@ impl AdeApp {
             }))
     }
 
-    /// Surface D's footer: `Complete merge` (real `git commit`, enabled only once
-    /// `resolved`) and `Abort merge` (real `git merge --abort`, always available while a flow
-    /// is active) - see [`Self::complete_merge_flow`]/[`Self::abort_merge_flow`]'s docs.
-    /// `in_flight` (`Self::merge_op_in_flight`) dims and disables both while a real background
-    /// commit/abort from a previous click is still running, so a second click can't spawn a
-    /// second, racing real git operation (defense in depth alongside the guard clause each of
-    /// those methods already has - see their docs).
+    /// Surface D's footer: `Complete merge` (`git commit`, enabled once `resolved`) and
+    /// `Abort merge` (`git merge --abort`, always available) - see
+    /// [`Self::complete_merge_flow`]/[`Self::abort_merge_flow`]'s docs. `in_flight`
+    /// (`Self::merge_op_in_flight`) dims and disables both while a previous click's background
+    /// operation is still running, defense in depth alongside the guard clause each of those
+    /// methods already has.
     pub(super) fn render_merge_flow_footer(
         &self,
         resolved: bool,
@@ -597,10 +582,10 @@ impl AdeApp {
             .child(complete)
     }
 
-    /// A simple real-message panel (`AlreadyUpToDate`/`Error` states) - a title, the real
-    /// message text, a real `Abort merge` action when `abortable_worktree` is `Some` (a real
-    /// merge is genuinely still in progress there - see `merge::MergeFlowState::Error`'s
-    /// docs), and a `Dismiss` action that clears [`Self::merge_flow`] without touching git.
+    /// A simple message panel (`AlreadyUpToDate`/`Error` states) - a title, the message text, an
+    /// `Abort merge` action when `abortable_worktree` is `Some` (a merge is still in progress -
+    /// see `merge::MergeFlowState::Error`'s docs), and a `Dismiss` action that clears
+    /// [`Self::merge_flow`] without touching git.
     pub(super) fn render_merge_message(
         &self,
         title: String,

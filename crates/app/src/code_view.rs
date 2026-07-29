@@ -1,51 +1,22 @@
 //! Pure logic for Surface C's File view (`design_handoff_jerry_ade/README.md`'s "File view"
-//! subsection): reading a real file off disk, detecting its real line-ending style, picking its
-//! real language label from its extension, and - for `.rs` files - producing real syntax-colored
-//! spans by parsing the file with a real `tree-sitter` grammar and walking the resulting AST.
-//! Deliberately `gpui`-window-free (only [`gpui::Rgba`] is used, for the same reason
-//! `crate::changes`/`crate::file_tree` already use it: colours are still plain data, not a
-//! rendered element), mirroring this crate's established split between pure logic modules and
-//! `crate::root`'s actual `Div` construction.
+//! subsection): reads a file off disk, detects its line-ending style, picks a language label
+//! from its extension, and - for `.rs` files - produces syntax-colored spans by parsing with
+//! `tree-sitter` and walking the resulting AST. Deliberately `gpui`-window-free (only
+//! [`gpui::Rgba`] is used, for plain colour data), mirroring this crate's split between pure
+//! logic modules and `crate::root`'s `Div` construction.
 //!
-//! ## Scope: Rust only
+//! Only `.rs` files get syntax spans; other extensions render as plain monospace text. A second
+//! grammar (`tree-sitter-toml`, ...) would just repeat [`highlight_rust`]'s parse-then-walk
+//! shape, left for a later phase.
 //!
-//! Only `.rs` files get real syntax spans. Every other extension (`.toml`, `.md`, `.sql`, ...)
-//! renders as plain, unhighlighted monospace text - a documented scope limit for this phase, not
-//! a bug: a second real grammar (`tree-sitter-toml`, ...) is a mechanical repeat of the same
-//! parse-then-walk shape [`highlight_rust`] already establishes, not a new capability, so it's
-//! left for a later phase rather than half-done here.
+//! ## `tree-sitter` API usage
 //!
-//! ## The real `tree-sitter` API surface used here
-//!
-//! Verified directly against `vendor/zed/crates/language/src/language.rs`, the one real,
-//! already-building consumer of this exact `tree-sitter`/`tree-sitter-rust` version pair in this
-//! workspace (`vendor/zed/Cargo.toml`: `tree-sitter = "0.26.9"`, `tree-sitter-rust = "0.24.2"` -
-//! this crate's own `Cargo.toml` pins the identical versions):
-//!
-//! - `tree_sitter::Parser::new()` - `language.rs:135`.
-//! - `tree_sitter_rust::LANGUAGE` (a `LanguageFn`) converted to a real `tree_sitter::Language`
-//!   via `.into()` - `language.rs:1672`'s own test (`test_with_parser_resets_after_cancellation`):
-//!   `let rust_language: TsLanguage = tree_sitter_rust::LANGUAGE.into();`.
-//! - `Parser::set_language(&self, language: &Language) -> Result<(), LanguageError>` -
-//!   `language.rs:1690`'s `parser.set_language(&rust_language).unwrap()` and `language.rs:1376`'s
-//!   `.set_language(&grammar.ts_language)`.
-//! - `Node::walk() -> TreeCursor`, `TreeCursor::goto_first_child()`/`goto_next_sibling()` (real,
-//!   ordinary tree-sitter cursor traversal) - `vendor/zed/crates/language/src/outline.rs:102`
-//!   (`let mut cursor = node.walk();`) and `crates/language/src/buffer.rs:4120`/`4262`/`4329`/
-//!   `4380`/`4422` (`let mut cursor = layer.node().walk();`, the same real pattern repeated at
-//!   five separate real call sites in that file).
-//! - `Parser::parse(&mut self, text: impl AsRef<[u8]>, old_tree: Option<&Tree>) -> Option<Tree>`
-//!   and `Tree::root_node() -> Node` are tree-sitter's own long-stable top-level entry points
-//!   (the simpler, non-cancellable sibling of the `parse_with_options` call `language.rs:1693`
-//!   exercises directly) - not separately grepped for since `language.rs`'s own
-//!   `parse_with_options` call confirms `Parser`/`Tree`'s real shape, and `cargo build` is the
-//!   final, authoritative check that `parse`/`root_node` exist with this signature.
-//! - `TreeCursor::field_name(&self) -> Option<&'static str>` - tree-sitter's own standard cursor
-//!   introspection method (not separately exercised in `vendor/zed`'s own code, since Zed's
-//!   incremental `SyntaxSnapshot` walks via its own `highlights_query`/`Query` machinery instead
-//!   of a raw field-name check) - used here only to tell a `function_item`'s own name apart from
-//!   a `call_expression`'s callee, both real, ordinary `Node`/`TreeCursor` methods whose presence
-//!   `cargo build`/`cargo test` (run before this phase was reported done) confirm directly.
+//! `tree_sitter::Parser::new()`, `set_language`, `Node::walk()`/`TreeCursor::goto_first_child`/
+//! `goto_next_sibling`, `Parser::parse`/`Tree::root_node`, and `TreeCursor::field_name` are all
+//! used below in their ordinary, documented shapes. Verified against
+//! `vendor/zed/crates/language/src/language.rs:135,1376,1673` and
+//! `vendor/zed/crates/language/src/outline.rs:102` (same `tree-sitter`/`tree-sitter-rust`
+//! version pair as this crate's `Cargo.toml`).
 
 use std::collections::HashSet;
 use std::fs;
@@ -61,15 +32,12 @@ use crate::theme;
 use wt_core::diff::{DiffFile, DiffLineKind};
 
 /// Cap on how many bytes of a file [`load_file`] will actually read and highlight, matching
-/// `wt_core::diff`'s own `MAX_DIFF_OUTPUT_BYTES` cap (`crates/wt-core/src/diff.rs:87`, also
-/// 2 MiB) - the same "don't let one pathological file stall the UI" reasoning applies equally
-/// here, and reusing the already-established number keeps the two caps consistent rather than
-/// picking a second, arbitrary one.
+/// `wt_core::diff`'s `MAX_DIFF_OUTPUT_BYTES` (`crates/wt-core/src/diff.rs:87`) so both caps stay
+/// consistent rather than picking a second, arbitrary number.
 pub const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 
-/// Which of Surface C's two views is currently showing for the file named by
-/// `crate::root::AdeApp::open_change` - `design_handoff_jerry_ade/README.md`'s `code_view` state
-/// field (`Diff | File`).
+/// Which of Surface C's two views is showing - `design_handoff_jerry_ade/README.md`'s
+/// `code_view` state field (`Diff | File`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CodeView {
     #[default]
@@ -77,7 +45,7 @@ pub enum CodeView {
     File,
 }
 
-/// A real file's detected line-ending style, read directly from its own bytes - never assumed.
+/// A file's detected line-ending style, read directly from its bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineEnding {
     Lf,
@@ -93,9 +61,8 @@ impl LineEnding {
     }
 }
 
-/// Detects `bytes`' real line-ending style by inspecting the byte immediately before its first
-/// `\n` - `Crlf` if that byte is `\r`, `Lf` otherwise (including files with no newline at all,
-/// which have no evidence of `Crlf` to detect).
+/// Detects `bytes`' line-ending style from the byte immediately before its first `\n` - `Crlf`
+/// if that byte is `\r`, `Lf` otherwise (including a file with no newline at all).
 pub fn detect_line_ending(bytes: &[u8]) -> LineEnding {
     if let Some(newline_index) = bytes.iter().position(|&byte| byte == b'\n') {
         if newline_index > 0 && bytes[newline_index - 1] == b'\r' {
@@ -105,10 +72,9 @@ pub fn detect_line_ending(bytes: &[u8]) -> LineEnding {
     LineEnding::Lf
 }
 
-/// The status bar's real language label, derived from `path`'s extension - the same
-/// `.rs`/`.toml`/`.md`/`.sql` set `crate::file_tree::lang_chip_for_name` already recognizes
-/// (case-insensitive, matching that function's own behavior), plus a generic fallback for
-/// anything else rather than a blank label.
+/// The status bar's language label, derived from `path`'s extension - the same
+/// `.rs`/`.toml`/`.md`/`.sql` set `crate::file_tree::lang_chip_for_name` recognizes
+/// (case-insensitive), plus a generic fallback for anything else.
 pub fn language_name_for_extension(extension: Option<&str>) -> &'static str {
     match extension.map(|ext| ext.to_ascii_lowercase()).as_deref() {
         Some("rs") => "Rust",
@@ -119,7 +85,7 @@ pub fn language_name_for_extension(extension: Option<&str>) -> &'static str {
     }
 }
 
-/// A syntax span's real classification - `design_handoff_jerry_ade/README.md`'s File view
+/// A syntax span's classification - `design_handoff_jerry_ade/README.md`'s File view
 /// syntax-colour table ("keyword ... function ... type ... literal/self ... comment ...
 /// punctuation/text").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,8 +111,8 @@ pub fn color_for_kind(kind: HighlightKind) -> Rgba {
     }
 }
 
-/// One real, classified leaf token from a real `tree-sitter` parse - byte offsets into the
-/// whole-file source [`highlight_rust`] parsed.
+/// One classified leaf token from a `tree-sitter` parse - byte offsets into the whole-file
+/// source [`highlight_rust`] parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HighlightSpan {
     pub start: usize,
@@ -154,9 +120,8 @@ pub struct HighlightSpan {
     pub kind: HighlightKind,
 }
 
-/// Real Rust keyword tokens - tree-sitter-rust's grammar represents each of these as an
-/// unnamed leaf node whose own `kind()` is the literal keyword text (verified by parsing real
-/// Rust source and asserting on the resulting spans - see this module's tests).
+/// Rust keyword tokens - tree-sitter-rust's grammar represents each as an unnamed leaf node
+/// whose `kind()` is the literal keyword text (see this module's tests).
 const RUST_KEYWORDS: &[&str] = &[
     "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
     "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
@@ -177,12 +142,9 @@ const COMMENT_KINDS: &[&str] = &["line_comment", "block_comment"];
 
 const TYPE_KINDS: &[&str] = &["type_identifier", "primitive_type"];
 
-/// Parses real Rust source with a real `tree-sitter` grammar and walks the resulting AST
-/// (`tree_sitter::TreeCursor::goto_first_child`/`goto_next_sibling`, see this module's own docs
-/// for exactly where each call is verified) into real, classified [`HighlightSpan`]s. Returns an
-/// empty `Vec` (never a fabricated span) if the grammar fails to load or the parse itself
-/// produces no tree - both defensive, since neither is expected to actually happen with the
-/// bundled `tree-sitter-rust` grammar, but never assumed away.
+/// Parses `source` with `tree-sitter-rust` and walks the resulting AST into classified
+/// [`HighlightSpan`]s. Returns an empty `Vec` (rather than panicking) if the grammar fails to
+/// load or the parse produces no tree - neither expected in practice, but not assumed away.
 pub fn highlight_rust(source: &str) -> Vec<HighlightSpan> {
     let mut parser = tree_sitter::Parser::new();
     let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
@@ -234,9 +196,9 @@ fn walk_node(
         let classified = if RUST_KEYWORDS.contains(&kind) {
             HighlightKind::Keyword
         } else if kind == "identifier" && matches!(field_name, Some("name") | Some("function")) {
-            // A `function_item`'s own `name` field, or a `call_expression`'s direct `function`
-            // field when the callee is a plain identifier (`foo()`, not `obj.foo()` - see this
-            // module's doc comment on the deliberate `field_identifier`/method-call scope limit).
+            // A `function_item`'s `name` field, or a `call_expression`'s `function` field when
+            // the callee is a plain identifier (`foo()`, not `obj.foo()`, which uses
+            // `field_identifier` instead - out of scope here).
             HighlightKind::Function
         } else {
             HighlightKind::Text
@@ -262,31 +224,25 @@ fn walk_node(
     }
 }
 
-/// One real, already-highlighted display line: its own text (never including its line-ending
-/// bytes) plus a real, gapless run list covering every byte of it (unhighlighted stretches are
-/// real [`HighlightKind::Text`] runs, not left implicit) - computed once by [`build_lines`] and
-/// cached in [`ParsedFile`], never recomputed per render.
+/// One already-highlighted display line: its text (never including line-ending bytes) plus a
+/// gapless run list covering every byte of it (unhighlighted stretches are explicit
+/// [`HighlightKind::Text`] runs) - computed once by [`build_lines`] and cached in [`ParsedFile`],
+/// never recomputed per render.
 ///
-/// Each run's text is a real, already-allocated [`SharedString`] (not a byte [`Range`] sliced
-/// again on every render) - `crate::root::AdeApp::render_file_view`'s row builder used to call
-/// `.to_string()` on a freshly-sliced range for every run of every visible row on every single
-/// render (measured at ~24ms/frame at this crate's own render cap in a debug build - the same
-/// "don't redo real work every frame" bug class [`ParsedFile`]'s own caching already avoids for
-/// the parse itself, just showing up one level down). Allocating each run's owned text once here,
-/// alongside the parse, and cloning the cheap, `Arc`-backed [`SharedString`] at render time
-/// instead removes that per-frame allocation entirely.
+/// Each run's text is a pre-allocated [`SharedString`], not a byte [`Range`] re-sliced on every
+/// render - `Arc`-backed, so cloning it at render time is cheap, avoiding a per-frame allocation
+/// per run per visible row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedLine {
     pub text: String,
     pub runs: Vec<(SharedString, HighlightKind)>,
 }
 
-/// Splits `source`'s real line boundaries (LF or CRLF alike - the trailing `\r`, if any, is
-/// excluded from the returned range, matching [`RenderedLine::text`] never including line-ending
-/// bytes) into byte ranges, then clips `spans` against each one to build a real, gapless
-/// [`RenderedLine`] list. A trailing byte range past the last `\n` is always included (covering a
-/// file with no trailing newline), and a completely empty `source` still yields exactly one
-/// empty line - matching how a real editor shows an empty file as one empty line, not zero.
+/// Splits `source`'s line boundaries (LF or CRLF alike - the trailing `\r`, if any, is excluded)
+/// into byte ranges, then clips `spans` against each one to build a gapless [`RenderedLine`]
+/// list. A trailing range past the last `\n` is always included (a file with no trailing
+/// newline), and an empty `source` still yields one empty line, matching how an editor shows an
+/// empty file.
 fn build_lines(source: &str, spans: &[HighlightSpan]) -> Vec<RenderedLine> {
     let line_ranges = line_ranges(source);
 
@@ -331,10 +287,8 @@ fn build_lines(source: &str, spans: &[HighlightSpan]) -> Vec<RenderedLine> {
         }
 
         let line_text = source[range.clone()].to_string();
-        // Each run's owned `SharedString` is sliced from `line_text` (a range relative to the
-        // *line's own* start, matching how the ranges above were built) once, here - not
-        // re-sliced/re-allocated by `crate::root::render_file_view_line` on every render (see
-        // this struct's own docs).
+        // Sliced from `line_text` (relative to the line's own start) once here, not re-sliced by
+        // `crate::root::render_file_view_line` on every render - see `RenderedLine`'s docs.
         let owned_runs = runs
             .into_iter()
             .map(|(relative_range, kind)| (SharedString::new(&line_text[relative_range]), kind))
@@ -368,10 +322,9 @@ fn line_ranges(source: &str) -> Vec<Range<usize>> {
     ranges
 }
 
-/// A real file's parsed-and-highlighted content, cached in `crate::root::AdeApp::file_view_cache`
-/// so [`load_file`]/[`highlight_rust`] run at most once per real file-content change - see
-/// [`cache_is_fresh`]'s docs for the exact staleness check `crate::root::AdeApp::render_file_view`
-/// runs before reusing (rather than recomputing) one of these on every render.
+/// A file's parsed-and-highlighted content, cached in `crate::root::AdeApp::file_view_cache` so
+/// [`load_file`]/[`highlight_rust`] run at most once per file-content change - see
+/// [`cache_is_fresh`] for the staleness check.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedFile {
     pub path: PathBuf,
@@ -379,18 +332,15 @@ pub struct ParsedFile {
     pub len: u64,
     pub language: &'static str,
     pub line_ending: LineEnding,
-    /// `true` if the real file on disk was larger than [`MAX_FILE_BYTES`] and this is only a
-    /// prefix of it (cut back to the last real line boundary within the cap - see [`load_file`]).
+    /// `true` if the file on disk was larger than [`MAX_FILE_BYTES`] and this is only a prefix
+    /// of it (cut back to the last line boundary within the cap - see [`load_file`]).
     pub truncated: bool,
     pub lines: Vec<RenderedLine>,
 }
 
-/// Reads a real file from disk (reusing `std::fs::read`/`std::fs::metadata`, the same real I/O
-/// primitives `crate::file_tree` already uses), caps it at [`MAX_FILE_BYTES`], detects its real
-/// line-ending style and language, and - for a `.rs` file - runs it through a real
-/// [`highlight_rust`] parse. Never fabricates content for a file that fails to read; the error is
-/// propagated to the caller (`crate::root::AdeApp::render_file_view`), which renders it as a
-/// real, honest message rather than silently showing nothing.
+/// Reads a file from disk, caps it at [`MAX_FILE_BYTES`], detects its line-ending style and
+/// language, and - for a `.rs` file - runs it through [`highlight_rust`]. The `io::Error` is
+/// propagated rather than swallowed; the caller renders it as an honest error message.
 pub fn load_file(path: &Path) -> io::Result<ParsedFile> {
     let metadata = fs::metadata(path)?;
     let len = metadata.len();
@@ -431,11 +381,10 @@ pub fn load_file(path: &Path) -> io::Result<ParsedFile> {
     })
 }
 
-/// Whether `cached` is still a real, up-to-date parse of `path` - true iff the path matches and
-/// both the real, freshly-read `mtime`/`len` are unchanged from what produced `cached`. Used by
-/// `crate::root::AdeApp::render_file_view` to decide whether to reuse `cached` as-is or call
-/// [`load_file`] again - the caching half of this phase's "don't reparse every frame" requirement
-/// (see `crate::root::AdeApp::file_view_cache`'s own docs for how that's actually verified).
+/// Whether `cached` is still an up-to-date parse of `path` - true iff the path matches and both
+/// the freshly-read `mtime`/`len` are unchanged from what produced `cached`. Used by
+/// `crate::root::AdeApp::render_file_view` to decide whether to reuse `cached` or call
+/// [`load_file`] again.
 pub fn cache_is_fresh(
     cached: &ParsedFile,
     path: &Path,
@@ -445,10 +394,9 @@ pub fn cache_is_fresh(
     cached.path == path && cached.mtime == mtime && cached.len == len
 }
 
-/// The File view breadcrumb's real path segments (`design_handoff_jerry_ade/README.md`: "`src ›
-/// db › query_builder.rs`") - every real `Normal` path component of `path`, in order. Root/prefix/
-/// `.`/`..` components are skipped (a repo-relative diff/file-tree path never has any in practice,
-/// but this is never assumed - see this module's tests).
+/// The File view breadcrumb's path segments (`design_handoff_jerry_ade/README.md`: "`src ›
+/// db › query_builder.rs`") - every `Normal` path component of `path`, in order. Root/prefix/
+/// `.`/`..` components are skipped.
 pub fn breadcrumb_segments(path: &Path) -> Vec<String> {
     path.components()
         .filter_map(|component| match component {
@@ -458,13 +406,11 @@ pub fn breadcrumb_segments(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The File view's real 3px git-gutter marker set (`design_handoff_jerry_ade/README.md`: "a 3px
-/// git gutter (`#2c6244` for agent-touched lines, transparent otherwise)") - the real, new-file
-/// line numbers (1-indexed) that a hunk actually *added*, derived from `file`'s own real hunks
-/// (reusing `crate::changes::parse_hunk_new_range`'s real `@@ ... @@` header parse - never a
-/// second, hand-rolled diff). Context lines advance the new-file line counter without being
-/// marked (they already existed before the change); removed lines don't exist in the new file at
-/// all, so they never advance it or get marked.
+/// The File view's 3px git-gutter marker set (`design_handoff_jerry_ade/README.md`: "a 3px git
+/// gutter (`#2c6244` for agent-touched lines, transparent otherwise)") - the new-file line
+/// numbers (1-indexed) a hunk actually *added*, derived from `file`'s hunks via
+/// `crate::changes::parse_hunk_new_range`. Context lines advance the new-file line counter
+/// without being marked; removed lines don't exist in the new file, so they never advance it.
 pub fn changed_line_set(file: &DiffFile) -> HashSet<usize> {
     let mut changed = HashSet::new();
     for hunk in &file.hunks {
@@ -561,8 +507,8 @@ mod tests {
     #[test]
     fn a_type_identifier_is_classified_as_type() {
         let spans = highlight_rust(SAMPLE_RUST);
-        // "i32" is a primitive type token, appearing twice (parameter type, return type) -
-        // just confirm at least one real occurrence was classified as Type.
+        // "i32" appears twice (parameter type, return type); just confirm at least one
+        // occurrence was classified as Type.
         let type_spans: Vec<_> = spans
             .iter()
             .filter(|span| SAMPLE_RUST[span.start..span.end] == *"i32")
@@ -576,10 +522,8 @@ mod tests {
     #[test]
     fn a_doc_comment_is_classified_as_comment() {
         let spans = highlight_rust(SAMPLE_RUST);
-        // The real `line_comment` node's own byte range includes its trailing newline (verified
-        // by walking a real parse tree - see this module's docs) - the whole node is treated as
-        // one comment span (never recursed into, unlike a plain expression node) since its own
-        // children (`outer_doc_comment_marker`, `doc_comment`) are just its lexical pieces, not
+        // The `line_comment` node's byte range includes its trailing newline; it's treated as
+        // one span rather than recursed into, since its children are just lexical pieces, not
         // separately-colourable syntax.
         let span = find_span(&spans, SAMPLE_RUST, "/// Adds one.\n").expect("doc comment span");
         assert_eq!(span.kind, HighlightKind::Comment);
@@ -595,9 +539,8 @@ mod tests {
 
     #[test]
     fn highlighting_invalid_rust_still_returns_a_real_non_empty_span_list() {
-        // Tree-sitter always produces a best-effort tree for malformed input rather than
-        // failing outright - confirm this doesn't panic and still classifies the one real
-        // keyword token present.
+        // Tree-sitter produces a best-effort tree for malformed input rather than failing
+        // outright - confirm this doesn't panic and still classifies the keyword token present.
         let spans = highlight_rust("fn (((( broken");
         assert!(spans.iter().any(|span| span.kind == HighlightKind::Keyword));
     }
@@ -609,12 +552,8 @@ mod tests {
         let lines = build_lines(source, &spans);
         assert_eq!(lines.len(), 3, "two real lines plus the trailing empty one");
         for line in &lines {
-            // Every run's own real, already-allocated text, concatenated back together in
-            // order, must reconstruct the line's own text exactly - no gap, overlap, or
-            // out-of-order run (the same "gapless coverage" property the old byte-`Range`-based
-            // version of this test checked, just verified against owned `SharedString`s now
-            // that `RenderedLine::runs` caches those instead of ranges - see that struct's docs
-            // for why).
+            // Every run's text, concatenated in order, must reconstruct the line's text exactly
+            // - no gap, overlap, or out-of-order run.
             let reconstructed: String = line.runs.iter().map(|(text, _)| text.as_ref()).collect();
             assert_eq!(reconstructed, line.text);
             assert!(

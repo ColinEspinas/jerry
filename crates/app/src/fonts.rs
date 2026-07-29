@@ -1,91 +1,66 @@
-//! Bundles the two real font families `design_handoff_jerry_ade/README.md`'s "Design
-//! tokens" section requires ("Fonts: IBM Plex Sans ... and IBM Plex Mono ... Nothing
-//! else. Both are OFL - bundle them.") and registers them with GPUI's real text system.
+//! Bundles the two font families the design requires (IBM Plex Sans, IBM Plex Mono; both OFL)
+//! and registers them with GPUI's text system.
 //!
 //! ## Source
 //!
-//! The `.ttf` files under `assets/fonts/` are the real, unmodified static weights from
-//! IBM's own upstream releases (`github.com/IBM/plex`, the canonical OFL-licensed
-//! source Zed's own bundled `IBM Plex Sans` also comes from - see
-//! `vendor/zed/assets/fonts/ibm-plex-sans/`): `@ibm/plex-sans@1.1.0`'s
-//! `ibm-plex-sans.zip` and `@ibm/plex-mono@2.5.0`'s `ibm-plex-mono.zip` release assets,
-//! `fonts/complete/ttf/`. Every weight the design handoff requires (see `crate::theme`'s
-//! `font` module docs) has a real static file upstream - no "closest available weight"
-//! substitution was needed for those:
+//! The `.ttf` files under `assets/fonts/` are IBM's own unmodified static weights
+//! (`github.com/IBM/plex`, the same source Zed's own bundled `IBM Plex Sans` comes from - see
+//! `vendor/zed/assets/fonts/ibm-plex-sans/`): `@ibm/plex-sans@1.1.0` and `@ibm/plex-mono@2.5.0`'s
+//! `fonts/complete/ttf/` release assets.
 //!
 //! | Weight | Sans file | Mono file |
 //! |---|---|---|
 //! | 400 | `IBMPlexSans-Regular.ttf` | `IBMPlexMono-Regular.ttf` |
 //! | 450 | `IBMPlexSans-Text.ttf` | `IBMPlexMono-Text.ttf` |
 //! | 500 | `IBMPlexSans-Medium.ttf` | `IBMPlexMono-Medium.ttf` |
-//! | 600 | `IBMPlexSans-SemiBold.ttf` | `IBMPlexMono-SemiBold.ttf` (bundled for ANSI bold, see below) |
+//! | 600 | `IBMPlexSans-SemiBold.ttf` | `IBMPlexMono-SemiBold.ttf` (bundled for ANSI bold, below) |
 //!
-//! Each of `assets/fonts/ibm-plex-{sans,mono}/LICENSE.txt` is IBM's real, unmodified SIL
-//! Open Font License 1.1 text, copied alongside the files it covers.
+//! Each `assets/fonts/ibm-plex-{sans,mono}/LICENSE.txt` is IBM's unmodified OFL 1.1 text.
 //!
 //! ## `IBMPlexMono-SemiBold.ttf`: bundled for ANSI bold, not a design-token weight
 //!
-//! The design handoff's own weight table only calls for Mono 400/450/500 - 600 isn't a
-//! Jerry UI weight. It's bundled anyway because `crate::terminal_pane::render_row` asks
-//! for `FontWeight::BOLD` (700) whenever a cell's ANSI `SGR 1` (bold) flag is set, and
-//! without *some* bundled Mono weight above 500, GPUI's real weight-matching
-//! (`cosmic_text_system.rs`'s `find_best_match`) would silently resolve every "bold"
-//! terminal cell to whichever bundled weight is numerically closest to 700 - which, before
-//! this file was added, was 500 (Medium): visually not bold at all, a real regression from
-//! the plain system-monospace fallback this pane used before real fonts were bundled (a
-//! system fallback almost always has a real 700 weight). 600 (SemiBold) is the closest
-//! *available* weight to 700 once bundled, per the same "closest available weight" leeway
-//! the design handoff itself allows - see `crate::terminal_pane::render_row`'s own doc
-//! comment for where `FontWeight::BOLD` is requested.
+//! The design only calls for Mono 400/450/500, but `crate::terminal_pane::render_row` requests
+//! `FontWeight::BOLD` (700) for ANSI `SGR 1` cells. Without a bundled Mono weight above 500,
+//! GPUI's weight-matching would resolve "bold" to whichever bundled weight is numerically
+//! closest to 700 - which, before this file existed, was 500 (Medium): visibly not bold. 600
+//! (SemiBold) is the closest available weight.
 //!
 //! ## Unused-for-now, not dead code
 //!
-//! Nothing in this app yet requests any weight other than the default (`FontWeight::NORMAL`,
-//! 400) and - for ANSI-bold terminal cells - `FontWeight::BOLD` (700, resolving to the
-//! 600 file above). Sans 450/500/600 and Mono 450 are real, loaded, and available the
-//! moment a later phase's UI actually calls `.font_weight(..)` for them (the session
-//! rail, tab strip, etc. per the design handoff's type scale) - they are groundwork, not
-//! leftover dead code a cleanup pass should remove.
+//! Nothing yet requests Sans 450/500/600 or Mono 450 - they're loaded and available for a later
+//! phase's UI to use per the design's type scale, not leftover code a cleanup pass should remove.
 //!
-//! ## Weight resolution, verified against the real pinned `fontdb`
+//! ## Weight resolution
 //!
-//! A static `.ttf`'s *legacy* family name (name table ID 1) is unique per weight (e.g.
-//! `"IBM Plex Sans Medm"` for the Medium file) - only its *typographic* family (name ID
-//! 16) is the shared `"IBM Plex Sans"`. Verified with `fontTools` against every file
-//! bundled here that the non-Regular weights do carry a real ID 16 (`"IBM Plex
-//! Sans"`/`"IBM Plex Mono"`) plus the correct `OS/2.usWeightClass` (450/500/600), and
-//! that `fontdb` 0.23.0 - the exact version this workspace's `Cargo.lock` resolves for
-//! `cosmic-text` 0.19.0, which backs GPUI's real Linux text system
-//! (`vendor/zed/crates/gpui_wgpu/src/cosmic_text_system.rs`, `impl PlatformTextSystem`) -
-//! prefers ID 16 over ID 1 when building each face's family list
-//! (`fontdb-0.23.0/src/lib.rs`'s `parse_names`: `collect_families(TYPOGRAPHIC_FAMILY,
-//! ..)`, falling back to `FAMILY` only when empty). So a `Font { family: "IBM Plex
-//! Sans".into(), weight: FontWeight(500.0), .. }` query really does resolve every
-//! bundled weight as one family, distinguished by real weight matching
-//! (`cosmic_text_system.rs`'s `find_best_match`, `font_kit::matching::find_best_match`
-//! against each candidate's real `OS/2.usWeightClass`) - not a guess.
+//! A static `.ttf`'s legacy family name (name table ID 1) is unique per weight; only the
+//! typographic family (ID 16) is the shared `"IBM Plex Sans"`/`"IBM Plex Mono"`. `fontdb`
+//! (which backs GPUI's Linux text system, `vendor/zed/crates/gpui_wgpu/src/
+//! cosmic_text_system.rs`) prefers ID 16 over ID 1 (`fontdb-0.23.0/src/lib.rs`'s
+//! `parse_names`), so every bundled weight resolves as one family, distinguished by real
+//! `OS/2.usWeightClass` matching. The
+//! `bundled_font_weights_and_family_names_match_the_module_docs` test below checks this
+//! directly against the embedded bytes, so a future edit that swaps in the wrong weight file
+//! can't silently drift from this table.
 //!
-//! ## Registration, verified against `vendor/zed/crates/zed/src/main.rs`
+//! ## Registration
 //!
-//! [`Assets`] implements the real `gpui::AssetSource` trait (`vendor/zed/crates/gpui/src/
-//! assets.rs:13`); [`load_embedded_fonts`] mirrors Zed's own `load_embedded_fonts`
-//! (`vendor/zed/crates/zed/src/main.rs:1806`) almost exactly: list `"fonts"` via
-//! `cx.asset_source()`, load each entry's real bytes, and hand them to the real
-//! `cx.text_system().add_fonts(..)` (`vendor/zed/crates/gpui/src/text_system.rs:101`).
-//! `crate::run` wires `Assets` in via `Application::with_assets` (`vendor/zed/crates/
-//! gpui/src/app.rs:198`, the same method Zed's own `main.rs:343` uses) before opening the
-//! window, and calls [`load_embedded_fonts`] as the very first thing inside the launch
-//! callback - see that function's docs for why a failure there is logged, not
-//! `.unwrap()`ed.
+//! [`Assets`] implements `gpui::AssetSource` (`vendor/zed/crates/gpui/src/assets.rs:13`);
+//! [`load_embedded_fonts`] mirrors Zed's own `load_embedded_fonts`
+//! (`vendor/zed/crates/zed/src/main.rs:1806`): list `"fonts"` via `cx.asset_source()`, load each
+//! entry's bytes, hand them to `cx.text_system().add_fonts(..)`
+//! (`vendor/zed/crates/gpui/src/text_system.rs:102`). `crate::run` wires `Assets` in via
+//! `Application::with_assets` (`vendor/zed/crates/gpui/src/app.rs:199`) before opening the
+//! window, calling [`load_embedded_fonts`] first inside the launch callback - see that
+//! function's docs for why a failure there is logged, not `.unwrap()`ed.
 
 use std::borrow::Cow;
 
 use anyhow::Result;
 use gpui::{App, AssetSource, SharedString};
 
-/// `(asset path, real font bytes)` for every bundled weight - see the module docs' table.
-/// `include_bytes!` embeds the real file contents into the binary at compile time, so
-/// there is no runtime dependency on `assets/fonts/` existing on disk once built.
+/// `(asset path, embedded bytes)` for every bundled weight - see the module docs' table.
+/// `include_bytes!` embeds the files at compile time, so there's no runtime dependency on
+/// `assets/fonts/` existing on disk once built.
 const FONT_FILES: &[(&str, &[u8])] = &[
     (
         "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
@@ -121,9 +96,8 @@ const FONT_FILES: &[(&str, &[u8])] = &[
     ),
 ];
 
-/// A real [`gpui::AssetSource`] serving only the bundled font files above - this app has
-/// no other assets (per the design handoff's "Assets: None ... every icon is composed
-/// from rects and text glyphs").
+/// The only [`gpui::AssetSource`] this app needs - it has no other assets (per the design
+/// handoff's "Assets: None ... every icon is composed from rects and text glyphs").
 pub struct Assets;
 
 impl AssetSource for Assets {
@@ -147,12 +121,11 @@ impl AssetSource for Assets {
     }
 }
 
-/// Loads every bundled font into GPUI's real text system, so `theme::font::SANS`/
-/// `theme::font::MONO` resolve to the real bundled glyphs rather than silently falling
-/// back to a system default. Returns an error (never panics) if a bundled asset is
-/// missing or GPUI's text system rejects it - the caller logs and continues rather than
-/// treating a font-loading failure as fatal to the whole app (matching this workspace's
-/// "no `.unwrap()`/`.expect()` outside `#[cfg(test)]`" rule).
+/// Loads every bundled font into GPUI's text system, so `theme::font::SANS`/`theme::font::MONO`
+/// resolve to the bundled glyphs instead of silently falling back to a system default. Returns
+/// an error rather than panicking if a bundled asset is missing or the text system rejects it -
+/// the caller logs and continues rather than treating a font-loading failure as fatal to the
+/// whole app (this workspace's "no `.unwrap()`/`.expect()` outside `#[cfg(test)]`" rule).
 pub fn load_embedded_fonts(cx: &App) -> Result<()> {
     let asset_source = cx.asset_source().clone();
     let mut embedded_fonts = Vec::new();
@@ -220,14 +193,10 @@ mod tests {
             .is_none());
     }
 
-    /// Checks every bundled file's real name table (ID 16, falling back to ID 1 exactly
-    /// the way `fontdb::parse_names` does - see the module docs' "Weight resolution"
-    /// section) and `OS/2.usWeightClass` directly against the embedded bytes, via
-    /// `ttf_parser` (the same crate `fontdb` itself is built on). This is what makes the
-    /// module docs' weight table and "Weight resolution" claims checkable by `cargo test`
-    /// rather than only by a one-time `fontTools` inspection that could silently drift out
-    /// of sync with the actual bundled files (e.g. a future edit that swaps in the wrong
-    /// weight, or a copy-paste error in the doc table).
+    /// Checks every bundled file's real name table (ID 16, falling back to ID 1 exactly the
+    /// way `fontdb::parse_names` does) and `OS/2.usWeightClass` directly against the embedded
+    /// bytes, via `ttf_parser` (the same crate `fontdb` is built on) - so the module docs'
+    /// weight table stays checkable by `cargo test` rather than only by a one-time inspection.
     #[test]
     fn bundled_font_weights_and_family_names_match_the_module_docs() {
         let expectations: &[(&str, &str, u16)] = &[

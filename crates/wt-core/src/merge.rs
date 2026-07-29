@@ -1,58 +1,48 @@
-//! Real `git merge` of a session's worktree branch into the repository's detected default
-//! ("base") branch: attempting the merge, detecting real conflicts from git's own conflict
-//! markers, and resolving them (take-left/take-right/take-both) by writing real content back
-//! to disk and staging it.
+//! `git merge` of a session's worktree branch into the repository's detected default
+//! ("base") branch: attempting the merge, detecting conflicts from git's own conflict
+//! markers, and resolving them (take-left/take-right/take-both) by writing content back to
+//! disk and staging it.
 //!
 //! ## Worktree-checkout collision
 //!
 //! A git worktree has its own `HEAD`, but the *object database* (refs included) is shared
-//! across every worktree of a repository. Git enforces one hard rule on top of that shared
-//! state, verified empirically against a real repo before writing this module: the same
-//! branch can never be checked out in two worktrees at once -
-//! `git checkout <branch that's checked out elsewhere>` fails outright with `fatal:
-//! '<branch>' is already used by worktree at '<path>'`. That rules out the naive approach of
-//! checking out the base branch somewhere temporary (or into the session's own worktree) and
-//! merging there.
+//! across every worktree of a repository. The same branch can never be checked out in two
+//! worktrees at once - `git checkout <branch checked out elsewhere>` fails outright with
+//! `fatal: '<branch>' is already used by worktree at '<path>'`. That rules out checking out
+//! the base branch somewhere temporary (or into the session's own worktree) and merging
+//! there.
 //!
-//! The correct plumbing (also verified empirically - see this crate's own tests below, and
-//! the module-level docs of `crate::diff` for the sibling convention this follows): `git
-//! merge <branch-name>` merges a *ref*, not a directory, so it can be run from any worktree
-//! that already has the *target* branch checked out. [`attempt_merge`] finds the worktree
-//! that already has the detected base branch checked out (via [`crate::list_worktrees`]) and
-//! runs `git -C <that worktree> merge <session-branch-name>` there - never a `git checkout`
-//! of any kind. If no worktree has the base branch checked out at all (a real, testable edge
-//! case - e.g. the main worktree is on some other branch or detached), this is refused with
+//! `git merge <branch-name>` merges a *ref*, not a directory, so it can instead be run from
+//! any worktree that already has the *target* branch checked out. [`attempt_merge`] finds
+//! the worktree with the detected base branch checked out (via [`crate::list_worktrees`])
+//! and runs `git -C <that worktree> merge <session-branch-name>` there - never a `git
+//! checkout`. If no worktree has the base branch checked out at all, this is refused with
 //! [`Error::MergeBaseBranchNotCheckedOut`] rather than fabricating a checkout.
 //!
-//! ## `--no-commit --no-ff`, verified empirically
+//! ## `--no-commit --no-ff`
 //!
-//! `git merge --no-commit <branch>` normally still auto-commits a fast-forward merge (per
-//! `git-merge(1)`: "fast-forward updates do not create a merge commit and therefore there is
-//! no way to stop those merges with `--no-commit`"), which would defeat the point of pausing
-//! before committing on *every* merge outcome so the UI can show what happened first. Adding
-//! `--no-ff` forces a real merge commit even when a fast-forward is possible, which combined
-//! with `--no-commit` reliably stops before committing in every case: verified empirically
-//! (see the tests below) across a real fast-forwardable merge, a real non-fast-forward
-//! three-way merge, and a real conflicting merge - `MERGE_HEAD` exists and the working tree
-//! holds the real merge result (or real conflict markers) in every case, and nothing is ever
-//! auto-committed. The one real exception is "already up to date" (the session branch
-//! contributes nothing new) - `git merge` still exits `0` there but never creates `MERGE_HEAD`
-//! at all, which is why [`attempt_merge`] checks for `MERGE_HEAD` explicitly rather than
-//! trusting exit status alone (see [`MergeOutcome::AlreadyUpToDate`]).
+//! `git merge --no-commit <branch>` still auto-commits a fast-forward merge on its own
+//! (`git-merge(1)`: "fast-forward updates ... there is no way to stop those merges with
+//! `--no-commit`"), which would defeat pausing before committing on *every* outcome so the
+//! UI can show what happened first. Adding `--no-ff` forces a real merge commit even when a
+//! fast-forward is possible, so combined with `--no-commit` nothing is ever auto-committed
+//! (verified in the tests below across fast-forwardable, three-way, and conflicting merges).
+//! The one exception is "already up to date": `git merge` exits `0` but never creates
+//! `MERGE_HEAD` at all, which is why [`attempt_merge`] checks for `MERGE_HEAD` explicitly
+//! rather than trusting exit status alone (see [`MergeOutcome::AlreadyUpToDate`]).
 //!
-//! `merge.conflictStyle=merge` is pinned via `-c` (the same "explicit config, not caller
-//! defaults" convention `crate::diff` uses for `git diff`), so a conflicted file's markers are
-//! always the two-way `<<<<<<</=======/>>>>>>>` form this module's parser understands, never
-//! `diff3`-style (`|||||||` base section) - regardless of the caller's own git config.
+//! `merge.conflictStyle=merge` is pinned via `-c` (same convention `crate::diff` uses for
+//! `git diff`), so a conflicted file's markers are always the two-way
+//! `<<<<<<</=======/>>>>>>>` form this module's parser understands, never `diff3`-style
+//! (`|||||||` base section) - regardless of the caller's own git config.
 //!
 //! ## Not auto-committing
 //!
-//! Neither a clean merge nor a fully-resolved conflicted merge is auto-committed here.
-//! [`complete_merge`] is a separate, explicit step for both cases (the same "real, no-commit
-//! staged state until the UI shows it and the user confirms" behavior either way) - see its
-//! docs for why unifying the two cases into one explicit action is deliberate.
+//! Neither a clean merge nor a fully-resolved conflicted merge is auto-committed here;
+//! [`complete_merge`] is a separate, explicit step for both, so the repository stays in a
+//! staged-but-uncommitted state until the UI shows it and the user confirms.
 //!
-//! Performs blocking I/O everywhere in this module (shells out to real `git`); see the
+//! Performs blocking I/O everywhere in this module (shells out to `git`); see the
 //! crate-level docs on offloading this to a background thread.
 
 use std::collections::HashMap;
@@ -63,9 +53,9 @@ use crate::diff::detect_default_base;
 use crate::error::{Error, GitExit};
 use crate::{check_success, format_args, git_command, is_dirty, list_worktrees, open_repo};
 
-/// Where a real merge attempt actually happened, and against what - returned alongside
-/// [`MergeOutcome`] so a caller/UI never has to re-derive "which worktree did this run in"
-/// or "what was the base branch" from scratch.
+/// Where a merge attempt happened, and against what - returned alongside [`MergeOutcome`]
+/// so a caller never has to re-derive "which worktree did this run in" or "what was the
+/// base branch" from scratch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeStart {
     pub base_branch: String,
@@ -217,25 +207,21 @@ pub fn abort_merge(base_worktree_path: &Path) -> Result<(), Error> {
     check_success(&args, &output)
 }
 
-/// Finish an in-progress merge in `base_worktree_path` with a real `git commit`, using the
-/// merge message git already prepared in `MERGE_MSG` (`--no-edit` - no interactive editor, no
-/// fabricated message). Valid to call both when [`attempt_merge`] returned
-/// [`MergeOutcome::Clean`] and when every file from a [`MergeOutcome::Conflicted`] result has
-/// been resolved and staged via [`write_resolved_file`]: both leave the repository in the
-/// exact same real "index updated, `MERGE_HEAD`/`MERGE_MSG` present, nothing committed yet"
-/// state, so one real completion step covers both rather than two separately-tested code
-/// paths for what is, to git, the same operation.
+/// Finish an in-progress merge in `base_worktree_path` with `git commit --no-edit`, using
+/// the merge message git already prepared in `MERGE_MSG`. Valid to call both when
+/// [`attempt_merge`] returned [`MergeOutcome::Clean`] and when every file from a
+/// [`MergeOutcome::Conflicted`] result has been resolved and staged via
+/// [`write_resolved_file`]: both leave the repository in the same "index updated,
+/// `MERGE_HEAD`/`MERGE_MSG` present, nothing committed yet" state.
 ///
-/// Real defense in depth, independent of whatever a caller's own UI-level "is this resolved"
-/// check believes: before ever running `git commit`, this re-checks git's own ground truth
-/// directly - [`Error::MergeNotInProgress`] if `MERGE_HEAD` doesn't even exist, and
+/// Defense in depth: before running `git commit`, this re-checks git's own ground truth
+/// directly rather than trusting a caller's UI-level "is this resolved" belief -
+/// [`Error::MergeNotInProgress`] if `MERGE_HEAD` doesn't exist, and
 /// [`Error::MergeFilesStillConflicted`] if `git diff --name-only --diff-filter=U` still
-/// reports any real unmerged path. This matters because a caller's notion of "resolved" can be
-/// wrong in a way that's entirely reasonable to get wrong once: a conflict-marker parser (like
-/// [`ConflictedFile::is_resolved`]) only ever sees *text* conflicts - a modify/delete conflict
-/// or a binary conflict leaves git's index genuinely unmerged with zero `<<<<<<<` markers
-/// anywhere on disk to parse (see [`ConflictedPath::classify`]'s docs) - so this module's own
-/// commit step never trusts that check alone.
+/// reports an unmerged path. This matters because a conflict-marker parser (like
+/// [`ConflictedFile::is_resolved`]) only ever sees *text* conflicts - a modify/delete or
+/// binary conflict leaves git's index unmerged with zero `<<<<<<<` markers to parse (see
+/// [`classify_conflicted_file`]'s docs).
 ///
 /// Performs blocking I/O.
 pub fn complete_merge(base_worktree_path: &Path) -> Result<(), Error> {
@@ -259,14 +245,11 @@ pub fn complete_merge(base_worktree_path: &Path) -> Result<(), Error> {
     check_success(&args, &output)
 }
 
-/// Best-effort real check for whether the repository's detected base branch's worktree
-/// currently has a merge in progress (`MERGE_HEAD` present) - used to offer a real `Abort
-/// merge` action after some *other* real failure (e.g. a read error partway through
-/// classifying conflicted files) left a caller's UI in an error state, without assuming a
-/// worktree path that might not even be resolvable any more. Returns `Ok(None)` (not an
-/// error) if the base branch can't be detected or isn't checked out anywhere - the same "no
-/// fabricated answer" contract the rest of this crate follows, since that just means there's
-/// nothing real for this function to check.
+/// Best-effort check for whether the repository's detected base branch's worktree currently
+/// has a merge in progress (`MERGE_HEAD` present) - used to offer an `Abort merge` action
+/// after some other failure left a caller's UI in an error state, without assuming a
+/// worktree path that might not even be resolvable any more. Returns `Ok(None)`, not an
+/// error, if the base branch can't be detected or isn't checked out anywhere.
 ///
 /// Performs blocking I/O.
 pub fn find_in_progress_merge(repo_path: &Path) -> Result<Option<PathBuf>, Error> {
@@ -284,10 +267,9 @@ pub fn find_in_progress_merge(repo_path: &Path) -> Result<Option<PathBuf>, Error
     }
 }
 
-/// Real, direct check for whether `worktree_path` currently has a merge in progress
-/// (`MERGE_HEAD` resolves) - `pub` so a caller that already knows a specific worktree path
-/// (rather than needing to re-derive it via [`find_in_progress_merge`]) can check the same
-/// real ground truth directly, e.g. before offering a real `Abort merge` action.
+/// Direct check for whether `worktree_path` currently has a merge in progress (`MERGE_HEAD`
+/// resolves) - `pub` so a caller that already knows a specific worktree path can check
+/// directly, without re-deriving it via [`find_in_progress_merge`].
 ///
 /// Performs blocking I/O.
 pub fn merge_head_exists(worktree_path: &Path) -> Result<bool, Error> {
@@ -306,15 +288,13 @@ pub fn merge_head_exists(worktree_path: &Path) -> Result<bool, Error> {
     Ok(output.status.success())
 }
 
-/// Files with real, git-reported conflict markers still present (index has unmerged stages).
+/// Files with git-reported conflict markers still present (index has unmerged stages).
 ///
-/// Pins `-c core.quotePath=false`, matching `crate::diff`'s own documented reasoning for the
-/// same pin on `git diff`: without it, a non-ASCII path (e.g. `café.txt`) comes back
-/// octal-escaped and double-quoted (`"caf\303\251.txt"`) instead of as the real bare path.
-/// [`parse_paths`] would then take that literally - `load_conflicted_file`/
-/// `write_resolved_file` would silently look up/create a file named `"caf\303\251.txt"`
-/// (quote marks included) instead of the real `café.txt`, which is exactly the kind of silent
-/// wrong-file write this project's own conventions treat as a serious bug, not a cosmetic one.
+/// Pins `-c core.quotePath=false`, matching `crate::diff`'s reasoning for the same pin on
+/// `git diff`: without it, a non-ASCII path (e.g. `café.txt`) comes back octal-escaped and
+/// quoted (`"caf\303\251.txt"`), and [`parse_paths`] would take that literally -
+/// `load_conflicted_file`/`write_resolved_file` would then silently look up/create a
+/// wrongly-named file instead of the real one.
 fn conflicted_files(worktree_path: &Path) -> Result<Vec<PathBuf>, Error> {
     let args: Vec<OsString> = vec![
         "-c".into(),
@@ -399,17 +379,16 @@ pub enum ConflictSegment {
     Conflict(ConflictHunk),
 }
 
-/// A real conflicted file's content, parsed from its actual `<<<<<<</=======/>>>>>>>` markers
-/// on disk - never simulated or hardcoded conflict content.
+/// A conflicted file's content, parsed from its actual `<<<<<<</=======/>>>>>>>` markers on
+/// disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictedFile {
     pub relative_path: PathBuf,
     pub segments: Vec<ConflictSegment>,
-    /// Whether the real file on disk ended with a trailing newline - preserved on
+    /// Whether the file on disk ended with a trailing newline - preserved on
     /// [`ConflictedFile::render`] so resolving conflicts never spuriously adds or removes
-    /// one. `pub` (not an invariant-guarded field - a plain fact about the real file) so
-    /// callers outside this crate (`app::merge`'s tests) can construct one directly rather
-    /// than needing a dedicated test-only constructor.
+    /// one. `pub` (a plain fact, not an invariant-guarded field) so callers outside this
+    /// crate (`app::merge`'s tests) can construct one directly.
     pub trailing_newline: bool,
 }
 
@@ -426,10 +405,10 @@ impl ConflictedFile {
         self.remaining_conflicts() == 0
     }
 
-    /// Reconstruct the file's real text content from its (possibly partially resolved)
-    /// segments. Still-conflicted hunks round-trip as real conflict markers, so this is
-    /// always safe to call (e.g. for a live preview) even before every hunk is resolved -
-    /// only [`write_resolved_file`] refuses an unresolved file.
+    /// Reconstruct the file's text content from its (possibly partially resolved) segments.
+    /// Still-conflicted hunks round-trip as conflict markers, so this is safe to call (e.g.
+    /// for a live preview) even before every hunk is resolved - only [`write_resolved_file`]
+    /// refuses an unresolved file.
     pub fn render(&self) -> String {
         let mut lines: Vec<String> = Vec::new();
         for segment in &self.segments {
@@ -491,13 +470,13 @@ impl StagePresence {
     }
 }
 
-/// Real per-path stage presence for every currently-unmerged path in `worktree_path`, via one
-/// real `git ls-files -u` subprocess. [`classify_conflicted_file`] calls this fresh on every
-/// invocation, so a caller classifying multiple conflicted paths (e.g. `run_merge_attempt`'s own
-/// per-file loop) currently pays one subprocess per path rather than a single batched call -
-/// correctness isn't affected (each call re-reads the same real, current index state), just
-/// worth knowing if this shows up as real, measured overhead on a merge with many conflicted
-/// files. Pins `-c core.quotePath=false` - see [`conflicted_files`]'s docs for why.
+/// Per-path stage presence for every currently-unmerged path in `worktree_path`, via one
+/// `git ls-files -u` subprocess. [`classify_conflicted_file`] calls this fresh on every
+/// invocation, so a caller classifying multiple conflicted paths pays one subprocess per
+/// path rather than a single batched call - correctness isn't affected (each call re-reads
+/// the same current index state), just worth knowing if it shows up as measured overhead on
+/// a merge with many conflicted files. Pins `-c core.quotePath=false` - see
+/// [`conflicted_files`]'s docs for why.
 fn unmerged_stage_presence(worktree_path: &Path) -> Result<HashMap<PathBuf, StagePresence>, Error> {
     let args: Vec<OsString> = vec![
         "-c".into(),
@@ -533,38 +512,35 @@ fn unmerged_stage_presence(worktree_path: &Path) -> Result<HashMap<PathBuf, Stag
     Ok(map)
 }
 
-/// Why a conflicted path could not be represented as real, resolvable `<<<<<<<` text markers.
+/// Why a conflicted path could not be represented as resolvable `<<<<<<<` text markers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnmergeableReason {
     /// One side deleted the file entirely; the other modified it. `git ls-files -u` shows
-    /// only two of the three real stages (whichever side deleted it has none) - verified
-    /// empirically: the working tree is left holding the *other* side's content verbatim,
-    /// with no conflict markers at all, and `git status` reports `DU`/`UD`.
+    /// only two of the three stages (whichever side deleted it has none); the working tree
+    /// is left holding the *other* side's content verbatim, with no conflict markers, and
+    /// `git status` reports `DU`/`UD`.
     ModifyDelete,
-    /// All three real stages are present (a genuine two-sided conflict), but the working
-    /// tree contains no real `<<<<<<<` markers - verified empirically: git's own
-    /// binary-content heuristic (present even for a file that happens to be valid UTF-8, e.g.
-    /// one containing an embedded NUL byte) leaves one side's content in the tree verbatim
-    /// instead of attempting a textual merge.
+    /// All three stages are present (a genuine two-sided conflict), but the working tree
+    /// contains no `<<<<<<<` markers - git's binary-content heuristic (which can trigger
+    /// even for valid UTF-8, e.g. a file containing an embedded NUL byte) leaves one side's
+    /// content in the tree verbatim instead of attempting a textual merge.
     Binary,
 }
 
-/// One real conflicted path, classified by [`classify_conflicted_file`] into either a real,
-/// resolvable text conflict or one this module has no text-hunk resolution for at all.
-/// Deliberately *not* the same as "no `ConflictSegment::Conflict` entries were parsed" -
-/// `git`'s own index (via [`unmerged_stage_presence`]) is the ground truth for whether a path
-/// is genuinely unmerged, never just "the parser didn't find any markers this time" (see
-/// [`UnmergeableReason`]'s docs for the two real cases where that distinction matters: a
-/// naive "zero parsed conflict segments means resolved" check would silently treat either one
-/// as already resolved, which is exactly the bug this type exists to prevent).
+/// One conflicted path, classified by [`classify_conflicted_file`] into either a resolvable
+/// text conflict or one this module has no text-hunk resolution for. Deliberately *not* the
+/// same as "no `ConflictSegment::Conflict` entries were parsed" - git's own index (via
+/// [`unmerged_stage_presence`]) is the ground truth for whether a path is genuinely
+/// unmerged, not just "the parser found no markers" (see [`UnmergeableReason`]'s docs: a
+/// naive "zero parsed segments means resolved" check would wrongly treat either of those
+/// cases as already resolved).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConflictedPath {
-    /// Real, parseable `<<<<<<<` markers - resolvable via [`resolve_hunk`] +
-    /// [`write_resolved_file`].
+    /// Parseable `<<<<<<<` markers - resolvable via [`resolve_hunk`] + [`write_resolved_file`].
     Text(ConflictedFile),
-    /// A real conflict this module has no text-hunk resolution for - see
-    /// [`UnmergeableReason`]. Never silently treated as resolved; there is deliberately no
-    /// `is_resolved`-style method here that could default to `true`.
+    /// A conflict this module has no text-hunk resolution for - see [`UnmergeableReason`].
+    /// Never silently treated as resolved; there is deliberately no `is_resolved`-style
+    /// method here that could default to `true`.
     Unmergeable {
         relative_path: PathBuf,
         reason: UnmergeableReason,
@@ -580,14 +556,12 @@ impl ConflictedPath {
     }
 }
 
-/// Classify one real conflicted path (already known-conflicted, e.g. from
-/// [`MergeOutcome::Conflicted::conflicted_files`]) into a [`ConflictedPath`] - the real,
-/// git-ground-truth-checked replacement for calling [`load_conflicted_file`] directly, which
-/// has no way to tell "a real two-sided text conflict with zero markers because it's binary"
-/// or "a modify/delete conflict" apart from "already resolved". Always consults
-/// [`unmerged_stage_presence`] first; only calls [`load_conflicted_file`] (and only trusts an
-/// all-`Common`, zero-marker parse as *evidence* rather than a text conflict) once the real
-/// stage shape confirms this is a genuine two-sided conflict.
+/// Classify one already-known-conflicted path (e.g. from
+/// [`MergeOutcome::Conflicted::conflicted_files`]) into a [`ConflictedPath`] - the
+/// ground-truth-checked replacement for calling [`load_conflicted_file`] directly, which has
+/// no way to tell a binary or modify/delete conflict apart from "already resolved". Always
+/// consults [`unmerged_stage_presence`] first, and only trusts a zero-marker parse as
+/// evidence of `Binary` once the stage shape confirms a genuine two-sided conflict.
 pub fn classify_conflicted_file(
     worktree_path: &Path,
     relative_path: &Path,
@@ -769,11 +743,11 @@ pub fn resolve_hunk(
     Ok(())
 }
 
-/// Write a fully-resolved [`ConflictedFile`]'s real content back to disk at
-/// `worktree_path.join(&file.relative_path)`, then `git add` it (real `Command` argv, staging
-/// exactly that path). Refuses ([`Error::MergeFileNotFullyResolved`]) if the file still has
-/// unresolved conflict hunks - this is the only path that ever writes a conflicted file back
-/// to disk, and it never writes one that still contains real conflict markers.
+/// Write a fully-resolved [`ConflictedFile`]'s content back to disk at
+/// `worktree_path.join(&file.relative_path)`, then `git add` it. Refuses
+/// ([`Error::MergeFileNotFullyResolved`]) if the file still has unresolved conflict hunks -
+/// this is the only path that ever writes a conflicted file back to disk, and it never
+/// writes one that still contains conflict markers.
 pub fn write_resolved_file(worktree_path: &Path, file: &ConflictedFile) -> Result<(), Error> {
     if !file.is_resolved() {
         return Err(Error::MergeFileNotFullyResolved {

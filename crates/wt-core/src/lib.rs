@@ -161,11 +161,9 @@ fn describe_worktree(
 }
 
 /// If `path` is relative, resolve it against `base` instead of the process's current
-/// working directory. Every function in this module that runs `git` does so with
+/// working directory - every function in this module that runs `git` uses
 /// `current_dir(repo_path)` (or the worktree-local equivalent), so a relative
-/// `worktree_path` must always be resolved the same way `git` itself would resolve it,
-/// consistently, everywhere it's used, rather than against whatever the process's actual
-/// CWD happens to be.
+/// `worktree_path` must resolve the same way `git` itself would.
 fn absolutize(path: &Path, base: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -250,16 +248,14 @@ pub fn remove_worktree(repo_path: &Path, worktree_path: &Path, force: bool) -> R
 /// Conservatively determine whether `worktree_dir` has uncommitted changes: any modified
 /// tracked file (staged or not) or any untracked file counts as dirty.
 ///
-/// Reads at most one byte of `git status --porcelain` output: any output at all means
-/// dirty, so we never buffer the (potentially large, for a worktree with a huge untracked
-/// tree) rest of it in memory. Since we stop reading before the child may be done writing,
-/// we don't wait for it normally in that case (which could deadlock if the unread output
-/// exceeds the OS pipe buffer and `git` blocks trying to write more); instead we kill it
-/// and then wait, only to reap the process rather than leave a zombie.
+/// Reads at most one byte of `git status --porcelain` output - any output at all means
+/// dirty - so a huge untracked tree is never buffered in memory. Since the child may still
+/// be writing when we stop reading, we kill it rather than risk blocking on a full pipe,
+/// then wait it to reap the process.
 ///
-/// Public (not just used internally by [`remove_worktree`]): the session rail's "by
-/// project" mode needs the same real clean/dirty signal to label a worktree row `checkout
-/// · clean` or hide a dirty worktree from `prune` candidacy - see `app::rail`'s docs.
+/// Public because the session rail's "by project" mode needs the same clean/dirty signal
+/// too (see `app::rail`'s docs), not just [`remove_worktree`] internally.
+///
 /// Performs blocking I/O; see the crate-level docs.
 pub fn is_dirty(worktree_dir: &Path) -> Result<bool, Error> {
     let args: Vec<OsString> = vec![

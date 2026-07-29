@@ -16,11 +16,10 @@ impl AdeApp {
         }
     }
 
-    /// The Settings surface's own key handler - just real `Esc`-to-close
-    /// (`design_handoff_jerry_ade/README.md`: "esc (rendered as a keycap in the nav header)
-    /// returns to the workspace"). No other Settings keyboard affordance is documented in the
-    /// design (nav is click-only - `Jerry.dc.html`'s own nav rows have no keyboard binding),
-    /// so unlike [`Self::handle_palette_key_down`] this doesn't need arrow-key/tab handling.
+    /// The Settings surface's own key handler - just `Esc`-to-close
+    /// (`design_handoff_jerry_ade/README.md`: "esc ... returns to the workspace"). Nav is
+    /// click-only, so unlike [`Self::handle_palette_key_down`] this needs no arrow-key/tab
+    /// handling.
     pub(super) fn handle_settings_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -39,17 +38,13 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Recomputes [`Self::agent_rows`] - a real `$PATH` search via `pty_core::resolve_on_path`
-    /// (the same real search `pty-core`'s own spawn path performs, per that function's docs) for
-    /// each known agent kind, via `crate::settings::detect_agent_rows`. Offloaded to the
-    /// background executor and cached, mirroring [`Self::load_disk_usage`]'s exact shape: a
-    /// not-found `resolve_on_path` call has no early exit and walks every `$PATH` entry (~30ms
-    /// measured on a real dev machine for `codex`, genuinely absent), so running it inline in
-    /// `render()` - which used to happen here - would block the foreground/GPUI thread for that
-    /// long on every single frame the Agents page was open, and again on every one of
-    /// `start_status_polling`'s 3s re-renders. Run once when Settings opens
-    /// ([`Self::open_settings`]), not on every render or on the 3s poll cadence - the set of
-    /// agent binaries actually on `$PATH` essentially never changes while the app is running.
+    /// Recomputes [`Self::agent_rows`] via `crate::settings::detect_agent_rows`, offloaded to
+    /// the background executor and cached, mirroring [`Self::load_disk_usage`]'s shape: a
+    /// not-found `resolve_on_path` call walks every `$PATH` entry with no early exit, so running
+    /// it inline in `render()` would block the foreground/GPUI thread on every frame the Agents
+    /// page is open. Run once when Settings opens ([`Self::open_settings`]), not on every render
+    /// or on the 3s status-poll cadence - the set of binaries on `$PATH` essentially never
+    /// changes while the app is running.
     pub(super) fn load_agent_rows(&mut self, cx: &mut Context<Self>) {
         let task = cx.spawn(async move |this, cx| {
             let rows = cx
@@ -64,9 +59,8 @@ impl AdeApp {
         self._agent_rows_task = Some(task);
     }
 
-    /// Recomputes [`Self::lsp_rows`] - the Language servers page's real `$PATH` search, exactly
-    /// mirroring [`Self::load_agent_rows`]'s own shape and reasoning (`crate::settings::
-    /// detect_lsp_rows`, offloaded to the background executor, run once when Settings opens).
+    /// Recomputes [`Self::lsp_rows`] via `crate::settings::detect_lsp_rows`, mirroring
+    /// [`Self::load_agent_rows`]'s shape and reasoning exactly.
     pub(super) fn load_lsp_rows(&mut self, cx: &mut Context<Self>) {
         let task = cx.spawn(async move |this, cx| {
             let rows = cx
@@ -82,10 +76,10 @@ impl AdeApp {
     }
 
     /// The Settings surface (`design_handoff_jerry_ade/README.md`'s "Settings" section): a
-    /// 212px nav plus a content column. `track_focus`/`on_key_down` here are what make real
-    /// `Esc` actually reach [`Self::handle_settings_key_down`] - the same real pattern
-    /// `Self::render_palette` already uses for its own panel (`vendor/zed/crates/gpui/src/
-    /// elements/div.rs`'s real `Div::track_focus`/`Interactivity::on_key_down`).
+    /// 212px nav plus a content column. `track_focus`/`on_key_down` here are what make `Esc`
+    /// actually reach [`Self::handle_settings_key_down`] - the same pattern `Self::render_palette`
+    /// uses for its own panel (`vendor/zed/crates/gpui/src/elements/div.rs`'s `Div::track_focus`/
+    /// `Interactivity::on_key_down`).
     pub(super) fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("settings-surface")
@@ -100,15 +94,11 @@ impl AdeApp {
 
     /// The 212px nav column - `design_handoff_jerry_ade/revision/README.md`: "Nav 212 wide ...
     /// Groups (Workspace, Interface, Editor, Other) with the same 9.5px uppercase header as the
-    /// rail." Every one of the eleven real pages is real, clickable navigation
-    /// (`crate::settings::nav_groups`); seven render real content past this point - see
-    /// `crate::settings`'s module docs.
+    /// rail." All eleven pages are clickable navigation (`crate::settings::nav_groups`); seven
+    /// render real content past this point - see `crate::settings`'s module docs.
     pub(super) fn render_settings_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let groups = settings::nav_groups();
-        // Real counts, not the mockup's fabricated `4`/`11`/`3` badges - `crate::settings::
-        // AGENT_KINDS.len()` is exactly how many rows `self.agent_rows` will show, and
-        // `self.worktrees.len()` is exactly how many rows the Worktrees page's card will show
-        // (including any real error rows - see `Self::render_settings_worktree_row`).
+        // Real counts, not the mockup's fabricated badges.
         let agent_count = settings::AGENT_KINDS.len();
         let worktree_count = self.worktrees.len();
 
@@ -184,13 +174,9 @@ impl AdeApp {
                             .font(font(theme::font::MONO))
                             .text_size(px(10.0))
                             .text_color(theme::text::HINT)
-                            // Real crate name/version (`env!` reads this crate's own real
-                            // `Cargo.toml` at compile time), not `Jerry.dc.html`'s fabricated
-                            // "jerry 0.4.2" - now a genuinely real "settings.toml" caption too
-                            // (Revision R3): `crate::settings_store::Settings` really is loaded
-                            // from, and saved back to, a real file on disk (see that module's
-                            // docs), unlike the "no settings.toml yet" this footer said before
-                            // that phase existed.
+                            // Real crate name/version (`env!` reads this crate's own
+                            // `Cargo.toml` at compile time), not Jerry.dc.html's fabricated
+                            // "jerry 0.4.2".
                             .child(format!(
                                 "{} {} \u{b7} settings.toml",
                                 env!("CARGO_PKG_NAME"),
@@ -228,10 +214,9 @@ impl AdeApp {
             let badge = match page {
                 SettingsPage::Agents => Some(agent_count.to_string()),
                 SettingsPage::Worktrees => Some(worktree_count.to_string()),
-                // Real, live counts - not `Jerry.dc.html`'s fabricated sample badges (`6` for
-                // Themes happens to match by coincidence; Keybindings' mockup `48` and Language
-                // servers' mockup `5` don't - `crate::settings::keybinding_rows`'s own docs
-                // explain why this app's real, honest count is smaller).
+                // Live counts, not Jerry.dc.html's fabricated sample badges (Keybindings' mockup
+                // `48` doesn't match this app's real, smaller count - see
+                // `crate::settings::keybinding_rows`'s own docs).
                 SettingsPage::Theme => Some(settings::THEME_DEFS.len().to_string()),
                 SettingsPage::Keymap => Some(
                     settings::keybinding_rows(&crate::default_key_bindings())
@@ -239,8 +224,7 @@ impl AdeApp {
                         .to_string(),
                 ),
                 SettingsPage::LanguageServers => Some(settings::LSP_LANGUAGES.len().to_string()),
-                // Every other page has nothing real to count - omitted rather than invented,
-                // matching `crate::settings`'s own documented scope.
+                // Every other page has nothing real to count - omitted rather than invented.
                 _ => None,
             };
             el = el.child(self.render_settings_nav_row(page, badge, cx));
@@ -284,10 +268,7 @@ impl AdeApp {
                     .min_w_0()
                     .overflow_hidden()
                     .font(font(theme::font::SANS))
-                    // `Self::ui_text_size`, not a literal `px(11.5)` - the Settings surface is
-                    // the first real, live-scaling surface for `Settings.appearance.
-                    // interface_scale_percent` (`design_handoff_jerry_ade/revision/CHANGELOG.
-                    // md`'s 2026-07-29 entry, "Sizing" section) - see that method's own docs.
+                    // `Self::ui_text_size`, not a literal `px(11.5)` - see that method's docs.
                     .text_size(self.ui_text_size(11.5))
                     .text_color(if active {
                         theme::text::SELECTED
@@ -308,13 +289,11 @@ impl AdeApp {
             })
     }
 
-    /// The content column: header block (title + real subtitle) plus whichever page's real (or
+    /// The content column: header block (title + subtitle) plus whichever page's real (or
     /// honestly placeholder) body - `design_handoff_jerry_ade/revision/README.md`'s "Content
-    /// column" section. `design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3 narrows
-    /// this: both the header and the scrollable body are capped at
-    /// `theme::zone::SETTINGS_CONTENT_MAX_WIDTH` (700px), left-aligned inside the unchanged
-    /// 26px padding - matching `Jerry.dc.html`'s own `style="width:100%;max-width:700px"`
-    /// wrapper on each.
+    /// column" section. Header and scrollable body are both capped at
+    /// `theme::zone::SETTINGS_CONTENT_MAX_WIDTH` (700px), left-aligned inside the 26px padding -
+    /// matching `Jerry.dc.html`'s own `max-width:700px` wrapper.
     pub(super) fn render_settings_content(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let page = self.settings_page;
 
@@ -399,10 +378,9 @@ impl AdeApp {
 
     /// *Agents › Installed* - `design_handoff_jerry_ade/README.md`: "bordered card ... of four
     /// rows ... agent badge ... name ... binary path ... model ... a `default` pill ... green
-    /// dot + 'ready' ... Edit." This app's real version drops the `model`/`default`/`Edit`
-    /// pieces - see `crate::settings`'s module docs for why - and shows exactly
-    /// [`settings::AGENT_KINDS`]'s two real rows (`claude`, `codex`) instead of the mockup's
-    /// four fabricated ones, each with a real, live PATH-search-derived status.
+    /// dot + 'ready' ... Edit." This app drops the `model`/`default`/`Edit` pieces (see
+    /// `crate::settings`'s module docs for why) and shows [`settings::AGENT_KINDS`]'s two real
+    /// rows instead of the mockup's four fabricated ones, each with a live PATH-derived status.
     pub(super) fn render_settings_agents_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = &self.agent_rows;
         let last_index = rows.len().saturating_sub(1);
@@ -444,8 +422,7 @@ impl AdeApp {
         let (badge_fg, badge_bg) = work_surface::agent_tint(row.kind);
         let path_text = match &row.resolved_path {
             Some(path) => path.display().to_string(),
-            // Real, honest - not "unknown"/blank - the exact reason a "ready" dot isn't shown:
-            // a real `$PATH` search for this literal binary name came back empty.
+            // The exact reason a "ready" dot isn't shown, not just "unknown"/blank.
             None => format!("{} not found on PATH", row.binary_name),
         };
         let dot_color = if row.is_ready() {
@@ -522,10 +499,9 @@ impl AdeApp {
     }
 
     /// The Installed card's footer - `design_handoff_jerry_ade/README.md`: "Card footer ...
-    /// '+ Add an agent — any binary that speaks a resumable session on stdin'." Rendered real
-    /// and dimmed/inert (no `on_click`, no fake modal) - `crate::sessions::SessionKind` is a
-    /// fixed Rust enum, so there is no real runtime "register a new agent binary" flow to wire
-    /// this to yet; see `crate::settings`'s module docs for the judgment call this documents.
+    /// '+ Add an agent — any binary that speaks a resumable session on stdin'." Rendered dimmed
+    /// and inert (no `on_click`) - `crate::sessions::SessionKind` is a fixed Rust enum, so there
+    /// is no runtime "register a new agent binary" flow to wire this to yet.
     pub(super) fn render_settings_agents_footer(&self) -> impl IntoElement {
         div()
             .flex_none()
@@ -560,13 +536,12 @@ impl AdeApp {
 
     /// *Worktrees › Disk* - `design_handoff_jerry_ade/README.md`: "same card shape: status dot
     /// ... worktree path ... branch ... size ... a right-aligned Open ... or Prune ...
-    /// action. Footer totals ... and a Prune 1 merged action." Every row and every total here
-    /// is the exact real data Phase B already built (`Self::worktrees`, `Self::worktree_notes`,
-    /// `Self::worktree_disk_usage`/`Self::disk_usage`) - not a re-derivation of it - and Prune
-    /// (both the row action and the footer action) dispatches through the exact same
-    /// `Self::request_prune`/`Self::execute_prune` two-click-confirmation path the rail footer
-    /// and command palette already use (see [`Self::render_settings_worktree_row`]'s docs for
-    /// why a *row's* Prune click isn't scoped to only that one row).
+    /// action. Footer totals ... and a Prune 1 merged action." Every row and total here reads
+    /// existing state (`Self::worktrees`, `Self::worktree_notes`, `Self::worktree_disk_usage`/
+    /// `Self::disk_usage`), and Prune - both the row action and the footer action - dispatches
+    /// through the same `Self::request_prune`/`Self::execute_prune` two-click-confirmation path
+    /// the rail footer and command palette use (see [`Self::render_settings_worktree_row`]'s
+    /// docs for why a row's Prune click isn't scoped to only that one row).
     pub(super) fn render_settings_worktrees_page(
         &self,
         cx: &mut Context<Self>,
@@ -658,19 +633,16 @@ impl AdeApp {
             )
     }
 
-    /// One real Worktrees-page row. `Open` selects that worktree in the real workspace and
-    /// switches back to it (`Self::select_worktree_by_path` + `Self::close_settings`, exactly
-    /// what clicking a worktree in the rail already does, plus leaving Settings). `Prune`
-    /// deliberately calls the exact same [`Self::request_prune`] the footer's own
-    /// `Prune N merged` button and the command palette's `Prune Worktrees` command call -
-    /// there is no separate "prune only this one worktree" code path in this app, since the
-    /// one real, safety-checked removal primitive (`Self::prunable_worktree_paths` plus
-    /// `Self::execute_prune`) always operates on *every* currently-prunable worktree at once,
-    /// live-session-excluded. A row's `Prune` button is only ever shown when that row's own
-    /// worktree is itself one of those candidates (`settings::worktree_row_action`), so
-    /// clicking it is always a real, honest prune that includes this worktree - it just isn't
-    /// scoped to *only* this worktree if others also happen to be prunable at the same moment,
-    /// exactly like the footer button it reuses.
+    /// One Worktrees-page row. `Open` selects that worktree in the workspace and switches back
+    /// to it (`Self::select_worktree_by_path` + `Self::close_settings`). `Prune` deliberately
+    /// calls the same [`Self::request_prune`] the footer's `Prune N merged` button and the
+    /// command palette's `Prune Worktrees` command call: there is no "prune only this one
+    /// worktree" code path, since the one safety-checked removal primitive
+    /// (`Self::prunable_worktree_paths` + `Self::execute_prune`) always operates on every
+    /// currently-prunable worktree at once, live-session-excluded. A row's `Prune` button only
+    /// shows when that row's own worktree is one of those candidates
+    /// (`settings::worktree_row_action`), so clicking it always includes this worktree - it just
+    /// isn't scoped to *only* this worktree if others are also prunable at the same moment.
     pub(super) fn render_settings_worktree_row(
         &self,
         item: &WorktreeItem,
@@ -817,20 +789,17 @@ impl AdeApp {
         }
     }
 
-    /// *General* - the one real settings row this phase wires
-    /// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3: `Window controls` as a
-    /// segmented `System | macOS | Windows/Linux` choice, wired live - see
-    /// `Self::window_controls_style`'s own docs for how both this row and the command palette's
-    /// three `Window controls: …` entries now read/write the exact same real, persisted field).
+    /// *General* - `Window controls` as a segmented `System | macOS | Windows/Linux` choice,
+    /// wired live (`CHANGELOG.md`'s change 3) - see `Self::window_controls_style`'s own docs for
+    /// how both this row and the command palette's three `Window controls: …` entries read/write
+    /// the same persisted field.
     ///
     /// `Default environment`, `Restore sessions on launch`, and `Confirm before discarding a
     /// worktree` - three more rows `Jerry.dc.html`'s own `settingsRows.general` fixture shows -
-    /// are deliberately left out, matching `crate::settings`'s own documented Agents/Worktrees
-    /// precedent: no real WSL/environment detection exists anywhere in this codebase yet
-    /// (that's Revision R6's job), and session-restore-on-launch / a discard-confirmation flow
-    /// are real app *behaviour* this phase doesn't build, not settings-surface plumbing around
-    /// an existing behaviour - rendering a toggle for either would be a control bound to
-    /// nothing.
+    /// are left out for the same reason as the Agents/Worktrees toggle sections (see
+    /// `crate::settings`'s module docs): no WSL/environment detection exists anywhere in this
+    /// codebase, and session-restore-on-launch / a discard-confirmation flow are app behaviour
+    /// this build doesn't have, not settings plumbing around behaviour that already exists.
     pub(super) fn render_settings_general_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.window_controls_style().label().to_string();
         let choice = self.render_choice_control(
@@ -843,9 +812,8 @@ impl AdeApp {
             selected,
             cx,
             |this, index, cx| {
-                // Structural, not a label re-match: index 0 is `System`, index 1 is `macOS`,
-                // index 2 is `Windows/Linux`, per the `options` array literal right above - see
-                // `Self::render_choice_control`'s own docs for why dispatch is index-based.
+                // Index into the `options` array above, not a label re-match - see
+                // `Self::render_choice_control`'s docs for why.
                 let style = match index {
                     1 => WindowControlsStyle::MacosStyle,
                     2 => WindowControlsStyle::WindowsLinuxStyle,
@@ -879,31 +847,18 @@ impl AdeApp {
             .child(self.render_snippet_block(settings_store::ConfigPage::General))
     }
 
-    /// *Appearance & scaling* - every row here is real, persisted, and round-trips through
-    /// [`Self::settings`] (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3), and
-    /// this page is now itself one of the real, live consumers of `interface_scale_percent`
-    /// (`Self::ui_text_size`, applied to this page's own nav row/header/row labels and hints,
-    /// *and* - closing a real audit finding, see `crate::root::settings_widgets`'s module docs -
-    /// every row's own control: the stepper value, the choice-segment labels (including this
-    /// very page's own "Interface scale" segment control, which used to visibly fail to scale
-    /// itself while its label grew beside it), and the config banner/snippet block - see that
-    /// method's own docs) - editing the choice control below visibly rescales this very page's
-    /// text, not just this page's four preview cards.
+    /// *Appearance & scaling* - every row here is persisted and round-trips through
+    /// [`Self::settings`] (`CHANGELOG.md`'s change 3). This page is itself a live consumer of
+    /// `interface_scale_percent` (`Self::ui_text_size`, applied to its own labels, hints, *and*
+    /// every row's control - stepper value, choice-segment labels, config banner/snippet block -
+    /// see `crate::root::settings_widgets`'s module docs), so editing the choice control below
+    /// visibly rescales this page's own text, not just its four preview cards.
     ///
-    /// What's still real-but-partial, by deliberate scope (see `theme::ui_scale`'s module
-    /// docs, which carries the real, current, specific list of exactly which surfaces read this
-    /// setting and which don't yet - kept there, not duplicated here, so there is exactly one
-    /// place to keep it honest as coverage changes): only *text* sizes respond -
-    /// `crate::theme`'s other ~500 call sites (padding, icon/chip dimensions, fixed chrome) are
-    /// compile-time `const`s this phase does not attempt to make scale, and several of the
-    /// app's other surfaces (chips/badges/keycaps, the terminal, Surface C's own code text, most
-    /// of `crate::root::work_surface_render`'s chrome) don't read this setting either - each for
-    /// its own real, documented reason. `editor_font_size`/`terminal_font_size` are real,
-    /// separately-applied baselines for Surface C's zoom (`Self::effective_code_rem_px`) and
-    /// `crate::terminal_pane` respectively, not this same interface-scale multiplier - the
-    /// design's own copy already distinguishes "Interface scale" from the two font-size rows
-    /// beneath it, and this implementation keeps that same real separation rather than
-    /// conflating three different real numbers into one.
+    /// Only *text* sizes respond, by deliberate scope - `theme::ui_scale`'s module docs carry
+    /// the current list of which surfaces read this setting and which don't (kept there, not
+    /// duplicated here). `editor_font_size`/`terminal_font_size` are separately-applied
+    /// baselines for Surface C's zoom (`Self::effective_code_rem_px`) and `crate::terminal_pane`
+    /// respectively, distinct from the interface-scale multiplier above them.
     pub(super) fn render_settings_appearance_page(
         &self,
         cx: &mut Context<Self>,
@@ -927,9 +882,7 @@ impl AdeApp {
             format!("{selected_percent}%"),
             cx,
             |this, index, cx| {
-                // Structural, not a label re-match/parse: each index maps to a real percent,
-                // per the `options` array literal right above - see
-                // `Self::render_choice_control`'s own docs for why dispatch is index-based.
+                // Index into the `options` array above, not a label re-match/parse.
                 const PERCENTS: [u16; 4] = [90, 100, 110, 125];
                 if let Some(percent) = PERCENTS.get(index).copied() {
                     this.set_interface_scale_percent(percent, cx);
@@ -1016,11 +969,10 @@ impl AdeApp {
             .child(self.render_snippet_block(settings_store::ConfigPage::Appearance))
     }
 
-    /// One Appearance page preview card - real, static approximation of `percent`'s scale on a
-    /// fixed sample row (font sizes scaled by `percent / 100`, not a live re-render of any real
-    /// pane - see [`Self::render_settings_appearance_page`]'s own docs). Selection state
-    /// (border/background) is real and live, tied to [`Self::settings`]'s own
-    /// `appearance.interface_scale_percent`.
+    /// One Appearance page preview card - a static approximation of `percent`'s scale on a fixed
+    /// sample row (font sizes scaled by `percent / 100`, not a live re-render of any real pane).
+    /// Selection state (border/background) is live, tied to
+    /// `Self::settings.appearance.interface_scale_percent`.
     fn render_appearance_preview_card(
         &self,
         percent: u16,
@@ -1092,16 +1044,13 @@ impl AdeApp {
             }))
     }
 
-    /// *Themes* - the six real cards from `crate::settings::THEME_DEFS`, real swatch colours,
-    /// real (persisted) selection. Selecting a card other than "Jerry Dark" persists correctly
-    /// (`Self::settings.theme.name` round-trips through `settings.toml`) but does **not** yet
-    /// re-skin the running app - `crate::theme` is a set of compile-time `const` colour tokens
-    /// read directly by roughly 500 render call sites across this codebase, not a runtime-
-    /// swappable resource. Turning that into a live theme-swap engine is real, substantial
-    /// follow-up work in its own right (a named, deliberately deferred item - not something to
-    /// fake with, say, a global colour-multiplier hack), tracked the same way this project has
-    /// always named a deferred item rather than silently shipping a partial one (see
-    /// `BUILD-LOG.md`'s Revision R1 background-task-dispatch note for the precedent).
+    /// *Themes* - the six cards from `crate::settings::THEME_DEFS`, with persisted selection.
+    /// Selecting a card other than "Jerry Dark" persists correctly (`Self::settings.theme.name`
+    /// round-trips through `settings.toml`) but does **not** yet re-skin the running app -
+    /// `crate::theme` is hundreds of compile-time `const` colour tokens, not a runtime-swappable
+    /// resource. A live theme-swap engine is substantial follow-up work, named and deliberately
+    /// deferred rather than faked with something like a global colour-multiplier hack (see
+    /// `BUILD-LOG.md`'s Revision R1 background-task-dispatch note for the same pattern).
     pub(super) fn render_settings_theme_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let cards = div().flex().flex_wrap().gap(px(8.0)).children(
             settings::THEME_DEFS
@@ -1243,14 +1192,13 @@ impl AdeApp {
             }))
     }
 
-    /// *Keybindings* - every row here is real, derived at render time from
-    /// `crate::default_key_bindings()`'s actual, live-registered `gpui::KeyBinding`s
-    /// (`crate::settings::keybinding_rows` - see that function's own docs for why this replaced a
-    /// second, hand-maintained parallel list, and the real inaccuracies that list had already
-    /// produced). No config banner/snippet here - these rows aren't `settings.toml` keys, they're
-    /// derived from compiled-in code (`crate::settings_store::ConfigPage` deliberately has no
-    /// `Keymap` variant). Read-only: no rebind UI, since this app has no real keymap-file-writing
-    /// infrastructure to back one.
+    /// *Keybindings* - every row is derived at render time from
+    /// `crate::default_key_bindings()`'s live-registered `gpui::KeyBinding`s
+    /// (`crate::settings::keybinding_rows` - see that function's docs for why this replaced a
+    /// hand-maintained parallel list). No config banner/snippet here - these rows aren't
+    /// `settings.toml` keys, they're derived from compiled-in code
+    /// (`crate::settings_store::ConfigPage` has no `Keymap` variant). Read-only: no rebind UI,
+    /// since this app has no keymap-file-writing infrastructure to back one.
     pub(super) fn render_settings_keymap_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let macos = self.window_controls_style().is_macos();
         let bindings = crate::default_key_bindings();
@@ -1340,8 +1288,8 @@ impl AdeApp {
     }
 
     /// Same minimal append/backspace/escape-clears shape as [`Self::handle_filter_key_down`] -
-    /// see that method's own docs for the deliberate scope cut (no cursor positioning, no
-    /// selection, no IME).
+    /// see that method's docs for the deliberate scope cut (no cursor positioning, no selection,
+    /// no IME).
     pub(super) fn handle_settings_keymap_filter_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -1386,11 +1334,9 @@ impl AdeApp {
             .collect();
         div()
             .id(format!("settings-keybinding-row-{}", row.command))
-            // Test-only (`#[cfg(any(test, feature = "test-support"))]` - a real no-op in a
-            // release build): lets `VisualTestContext::debug_bounds` confirm which rows the real
-            // render call actually produced for a given filter query, not just what the pure
-            // `settings::filter_keybinding_rows` logic function returns - see this file's own
-            // `settings_keymap_filter_tests` module.
+            // Test-only, no-op in release builds - lets `VisualTestContext::debug_bounds`
+            // confirm which rows the render call actually produced for a filter query - see
+            // `settings_keymap_filter_tests` below.
             .debug_selector(move || format!("keybinding-row-{}", row.command))
             .flex()
             .items_center()
@@ -1440,13 +1386,13 @@ impl AdeApp {
             )
     }
 
-    /// *Language servers* - real PATH-detection rows, following the exact same pattern as
+    /// *Language servers* - PATH-detection rows, following the same pattern as
     /// [`Self::render_settings_agents_page`] (`crate::settings::detect_lsp_rows`, cached in
-    /// [`Self::lsp_rows`]). `format on save`/`inlay hints`/`diagnostics in the rail` toggles
-    /// from `Jerry.dc.html`'s own `settingsRows.lsp` fixture are left out - no real backing
-    /// exists anywhere in this codebase for any of the three, matching `crate::settings`'s own
-    /// documented Agents/Worktrees precedent. No config banner/snippet either: these rows are
-    /// live-detected `$PATH` state, not `settings.toml` keys.
+    /// [`Self::lsp_rows`]). `format on save`/`inlay hints`/`diagnostics in the rail` toggles from
+    /// `Jerry.dc.html`'s own `settingsRows.lsp` fixture are left out for the same reason as the
+    /// Agents/Worktrees toggle sections (see `crate::settings`'s module docs). No config
+    /// banner/snippet either: these rows are live-detected `$PATH` state, not `settings.toml`
+    /// keys.
     pub(super) fn render_settings_lsp_page(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let rows = &self.lsp_rows;
         let last_index = rows.len().saturating_sub(1);
@@ -1579,16 +1525,14 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// `pub(super)`, not private: `crate::root::work_surface_render`'s own real end-to-end test
-    /// (`changing_terminal_font_size_recomputes_grid_dimensions_and_resizes_the_real_pty`)
-    /// drives this directly, the same real edit path the Appearance page's stepper click
-    /// itself invokes, rather than a second, test-only setter.
+    /// `pub(super)`, not private: `terminal_font_size_tests` below drives this directly, the
+    /// same edit path the Appearance page's stepper click invokes, rather than a second,
+    /// test-only setter.
     ///
-    /// Real, live application (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29
-    /// entry, "Sizing" section): the new value isn't only persisted, it's also pushed into
-    /// every currently open session's [`crate::terminal_pane::TerminalPane`] via
-    /// [`crate::sessions::Sessions::set_terminal_font_size`] - see that method's own docs for
-    /// why every open pane, not just newly spawned ones, has to hear about this.
+    /// The new value isn't only persisted - it's also pushed into every currently open session's
+    /// [`crate::terminal_pane::TerminalPane`] via
+    /// [`crate::sessions::Sessions::set_terminal_font_size`], so already-open panes pick it up
+    /// too, not just newly spawned ones.
     pub(super) fn adjust_terminal_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.settings.appearance.terminal_font_size = (self.settings.appearance.terminal_font_size
             + delta)
@@ -1599,20 +1543,15 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Real toggle, still real-but-persisted-only per R3's own honest disclosure -
-    /// investigated for real as part of wiring `interface_scale_percent`
-    /// (`Self::ui_text_size`) and `terminal_font_size`/`editor_font_size` to real rendering:
-    /// this vendored GPUI checkout genuinely has no Linux API for a system text-scale
-    /// accessibility preference to follow. `vendor/zed/crates/gpui/src/platform.rs`'s
-    /// `PlatformWindow::appearance`/`on_appearance_changed` only carry light/dark mode: no
-    /// text-scale variant. `vendor/zed/crates/gpui_linux/src/linux/xdg_desktop_portal.rs`'s
-    /// real XDG Desktop Portal integration reads `org.gnome.desktop.interface` for
-    /// `cursor-theme`/`cursor-size`/`color-scheme` only - `text-scaling-factor` is never read,
-    /// and the client's own `Xft.dpi` handling (`.../x11/client.rs`) is pixel-density DPI, a
-    /// different, unrelated concept from a text-size accessibility preference. Wiring a fake
-    /// signal (e.g. silently treating DPI as if it were text scale) would be exactly the kind
-    /// of invented functionality this project's conventions forbid, so this stays exactly what
-    /// R3 already documented: real, persisted, not yet applied.
+    /// Persisted-only, not yet applied: this vendored GPUI checkout has no Linux API for a
+    /// system text-scale accessibility preference to follow.
+    /// `vendor/zed/crates/gpui/src/platform.rs`'s `PlatformWindow::appearance`/
+    /// `on_appearance_changed` only carry light/dark mode. The XDG Desktop Portal integration
+    /// (`vendor/zed/crates/gpui_linux/src/linux/xdg_desktop_portal.rs`) reads
+    /// `org.gnome.desktop.interface`'s `cursor-theme`/`cursor-size`/`color-scheme` only, never
+    /// `text-scaling-factor`; the client's `Xft.dpi` handling (`.../x11/client.rs`) is
+    /// pixel-density DPI, a different concept. Treating DPI as if it were text scale would be
+    /// fabricated functionality, so this stays real, persisted, not yet applied.
     fn toggle_follow_system_text_size(&mut self, cx: &mut Context<Self>) {
         self.settings.appearance.follow_system_text_size =
             !self.settings.appearance.follow_system_text_size;
@@ -1620,26 +1559,15 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// `pub(super)`, not private - `crate::root::code_surface`'s own real per-tab-zoom tests
-    /// (`code_zoom_tests::per_tab_zoom_on_remembers_.../per_tab_zoom_off_shares_.../
-    /// turning_per_tab_zoom_on_seeds_every_open_tab_with_the_current_shared_zoom`) drive this
-    /// directly, the same real edit path the Appearance page's toggle click itself invokes.
+    /// `pub(super)`, not private - `crate::root::code_surface`'s `code_zoom_tests` module drives
+    /// this directly, the same edit path the Appearance page's toggle click invokes.
     ///
-    /// ## Real bug this closes: turning per-tab zoom on used to silently discard the live shared
-    /// zoom
-    ///
-    /// `Self::file_zoom_percent` (the per-tab map `Self::restore_zoom_for_open_change` reads
-    /// once per-tab mode is on) is only ever *written* to while per-tab mode is already on
-    /// (`Self::set_code_zoom`'s own real write path) - so flipping `false -> true` with a live,
-    /// non-default shared `Self::code_zoom_percent` used to leave the map completely empty for
-    /// every already-open tab. The very next tab switch/reopen then fell through
-    /// `Self::restore_zoom_for_open_change`'s own "never-zoomed tab" branch straight to
-    /// `Self::ZOOM_DEFAULT_PERCENT`, silently resetting a real, user-set zoom the moment the
-    /// user turned per-tab zoom *on* - the opposite of what "remember each tab's own zoom"
-    /// should do to zoom nobody has touched yet. Seeding every currently-open tab
-    /// (`Self::open_files`) with the shared value *before* the mode flips means every tab keeps
-    /// showing exactly the zoom it was already showing; only a *later* zoom change on one tab
-    /// makes it actually diverge from the others, which is the real, intended per-tab behavior.
+    /// Seeds every currently-open tab (`Self::open_files`) with the shared zoom *before* the
+    /// mode flips on: `Self::file_zoom_percent` is only ever written while per-tab mode is
+    /// already on, so without this seeding, turning it on would leave the map empty and the
+    /// next tab switch would silently reset a real, user-set zoom back to
+    /// `Self::ZOOM_DEFAULT_PERCENT` via `Self::restore_zoom_for_open_change`'s "never-zoomed
+    /// tab" branch.
     pub(super) fn toggle_per_tab_zoom(&mut self, cx: &mut Context<Self>) {
         let turning_on = !self.settings.appearance.per_tab_zoom;
         if turning_on {
@@ -1672,13 +1600,9 @@ impl AdeApp {
     }
 }
 
-/// A nav-only Settings page's real, honest placeholder body - `Jerry.dc.html`'s own `setStub`
-/// state's exact copy (line ~857: `not designed in this mockup`). Used for every page
-/// [`SettingsPage::is_implemented`] reports `false` for (`Editor`, `Notifications`,
-/// `Integrations`, `About`) - see `crate::settings`'s module docs for why this is a documented
-/// act of fidelity to the source design, not a shortcut: `Editor` in particular has zero real
-/// backing anywhere in this codebase for indentation/soft-wrap/whitespace-display, so it stays
-/// here rather than growing fake controls just because the mockup shows some.
+/// A nav-only Settings page's placeholder body - `Jerry.dc.html`'s own `setStub` copy, "not
+/// designed in this mockup". Used for every page [`SettingsPage::is_implemented`] reports
+/// `false` for - see `crate::settings`'s module docs for why.
 pub(super) fn render_settings_placeholder_page() -> impl IntoElement {
     div()
         .py(px(26.0))
@@ -1688,13 +1612,11 @@ pub(super) fn render_settings_placeholder_page() -> impl IntoElement {
         .child("not designed in this mockup")
 }
 
-/// Real, interactive regression coverage for the Keybindings page's filter row - unlike
+/// Interactive regression coverage for the Keybindings page's filter row - unlike
 /// `crate::settings`'s own `filter_keybinding_rows_*` tests (which call the pure logic function
-/// directly), this drives the *actual rendered UI*: a real, focused GPUI element receiving real
-/// simulated keystrokes, then checks (via `VisualTestContext::debug_bounds`, keyed by each row's
-/// real `Self::render_settings_keybinding_row` `debug_selector`) which rows the real render call
-/// actually painted - proving the interactive filter field is really wired to the real render
-/// path, not just that the standalone filter function it happens to call is correct.
+/// directly), this drives the actual rendered UI: a focused GPUI element receiving simulated
+/// keystrokes, checked via `VisualTestContext::debug_bounds` (keyed by each row's
+/// `debug_selector`) against which rows the render call actually painted.
 #[cfg(test)]
 mod settings_keymap_filter_tests {
     use super::*;
@@ -1753,10 +1675,9 @@ mod settings_keymap_filter_tests {
     }
 }
 
-/// Real, end-to-end coverage for `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29
-/// entry, "Sizing" section - `appearance.terminal_font_size` isn't just a persisted number, it
-/// actually changes how `crate::terminal_pane::TerminalPane` measures cells and, through that,
-/// what real `(rows, cols)` its grid *and* its live child pty are resized to.
+/// End-to-end coverage: `appearance.terminal_font_size` isn't just a persisted number, it
+/// changes how `crate::terminal_pane::TerminalPane` measures cells and, through that, what
+/// `(rows, cols)` its grid *and* its live child pty are resized to.
 #[cfg(test)]
 mod terminal_font_size_tests {
     use super::*;
@@ -1775,12 +1696,8 @@ mod terminal_font_size_tests {
             .read_with(cx, |app, _| app.sessions.active().map(|s| s.pane.clone()))
             .expect("a fresh test window has one real, active shell session");
 
-        // `TerminalPane::grid_dimensions` (`TerminalGrid::dimensions`'s own docs) reports a
-        // real `(cols, rows)` pair - the info footer's `148×38` display order - while
-        // `resize_sync_state_for_test`'s `ResizeLatch` fields are real `(rows, cols)` (the
-        // order `TerminalPane::resize_to`'s own real parameters use). Both are internally
-        // consistent (and already real/tested) on their own; this test just has to respect the
-        // one place they meet, rather than assuming they share a convention.
+        // `grid_dimensions` reports `(cols, rows)` but `resize_sync_state_for_test` reports
+        // `(rows, cols)` - hence the swap below.
         let before_dims = pane.read_with(cx, |pane, _| pane.grid_dimensions());
         let before_dims_rows_cols = (before_dims.1, before_dims.0);
         let (_, before_session_sync) =
@@ -1791,9 +1708,7 @@ mod terminal_font_size_tests {
             "the initial spawn's own resize must have already reached the real live pty"
         );
 
-        // A large jump (default is 12.5px) so the resulting cell size - and so the resulting
-        // grid dimensions - can't coincidentally land back on the same real integer (rows,
-        // cols) the smaller font size already produced.
+        // A large jump so the resulting grid dimensions can't coincidentally match the old ones.
         app.update(cx, |app, cx| {
             app.adjust_terminal_font_size(18.0 - app.settings.appearance.terminal_font_size, cx);
         });

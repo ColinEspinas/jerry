@@ -1,50 +1,35 @@
-//! The Settings surface's pure data model - `design_handoff_jerry_ade/revision/README.md`'s
-//! "Settings" section: "a separate surface, not a modal: it replaces the three zones while the
-//! title bar and status bar stay." Mirrors `crate::rail`/`crate::palette`/`crate::work_surface`'s
-//! own split: only the mapping from already-real app state (which agent binaries are actually on
-//! `$PATH`, the real worktree list Phase B already built, the real global keybindings
-//! `crate::default_key_bindings` registers) to what a settings row should show lives here,
-//! directly unit-testable without a live GPUI window; turning the result into actual `gpui::Div`
-//! trees happens in `crate::root`, which owns the `Context<AdeApp>` real actions (opening a
-//! worktree, pruning) need. Real, config-file-backed values (`crate::settings_store::Settings`)
-//! live in that separate module, not here - this one stays about live app state, not disk state.
+//! Pure data model for the Settings surface (`design_handoff_jerry_ade/revision/README.md`'s
+//! "Settings" section). Maps already-real app state (agent binaries on `$PATH`, the worktree
+//! list, the registered global keybindings) to what a settings row should show, with no `gpui`
+//! dependency so it's directly unit-testable; `crate::root` turns the result into `gpui::Div`
+//! trees. Config-file-backed values live in `crate::settings_store` instead - this module is
+//! about live app state, not disk state.
 //!
-//! ## Which pages are real (Revision R3)
+//! ## Which pages are real
 //!
-//! `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change 3 adds five real
-//! pages to the two Phase F already built: **Appearance & scaling**, **Themes**, **Keybindings**
-//! (`SettingsPage::Keymap`), and **Language servers** all now render real, live-derived content,
-//! alongside the pre-existing **Agents**/**Worktrees**. **General** gains one real row (`Window
-//! controls`) but is not otherwise fully "designed" the way those five are - see its own
-//! `subtitle`/`crate::root::settings_render` docs for the two rows this phase deliberately
-//! leaves out and why. **Editor** stays nav-only: zero real backing exists anywhere in this
-//! codebase for indentation/soft-wrap/whitespace-display, and building a plausible-looking
-//! control for any of them would be exactly the "component bound to nothing" this project's
-//! constraints forbid - the same judgment call this module's own "Why the Agents/Worktrees
-//! toggle sections are left out" section (below) already made once. Notifications/Integrations/
-//! About remain honest, nav-only "not designed in this mockup" placeholders - `Jerry.dc.html`'s
-//! own `setStub` state's exact real copy (line ~857: `not designed in this mockup`).
+//! General, Agents, Worktrees, Appearance, Themes, Keybindings, and Language servers render
+//! real, live-derived content (see [`SettingsPage::is_implemented`]). Editor, Notifications,
+//! Integrations, and About are honest nav-only placeholders - `Jerry.dc.html`'s own `setStub`
+//! copy, "not designed in this mockup". Editor in particular has no real backing anywhere in
+//! this codebase for indentation/soft-wrap/whitespace-display, so it stays a placeholder rather
+//! than growing controls bound to nothing.
 //!
-//! ## Why the Agents/Worktrees `setRows` "Behaviour"/"Policy" toggle sections are left out
+//! ## Why the Agents/Worktrees "Behaviour"/"Policy" toggle sections are left out
 //!
-//! `Jerry.dc.html`'s `settingsRows.agents`/`settingsRows.worktrees` fixtures (a "Plan before
-//! editing" toggle, a "Max parallel sessions" stepper, a "Worktree root" path field, and so on)
-//! are sample *settings values* with no real, per-agent/per-worktree persistence layer behind
-//! them in this app (even R3's new `crate::settings_store::Settings` is a flat, global struct -
-//! it has nowhere to hang a *per-agent* `plan_before_editing` bool). Rendering them anyway would
-//! be exactly the kind of decorative, bound-to-nothing control this project's constraints
-//! forbid. Only the two sections this phase can back with real, already-loaded application
-//! state (the Installed agents card, the Disk worktrees card) are built; see `crate::root`'s
-//! Settings render methods for where those real data sources are.
+//! `Jerry.dc.html`'s `settingsRows.agents`/`settingsRows.worktrees` fixtures show toggles like
+//! "Plan before editing" or a "Worktree root" path field, but nothing in this app persists a
+//! value per agent or per worktree (even `crate::settings_store::Settings` is a flat, global
+//! struct with nowhere to hang a per-agent bool). Rendering them anyway would be a control bound
+//! to nothing, so only the two sections backed by real, already-loaded state - the Installed
+//! agents card and the Disk worktrees card - are built.
 
 use std::path::PathBuf;
 
 use crate::rail::WorktreeNote;
 use crate::sessions::SessionKind;
 
-/// Every real page `design_handoff_jerry_ade/revision/Jerry.dc.html`'s `settingsNavDefs`
-/// fixture lists, in the exact left-to-right, top-to-bottom order the design's four nav groups
-/// present them (see [`nav_groups`]).
+/// Every page `Jerry.dc.html`'s `settingsNavDefs` fixture lists, in the order the design's four
+/// nav groups present them (see [`nav_groups`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsPage {
     General,
@@ -91,10 +76,8 @@ impl SettingsPage {
         }
     }
 
-    /// A stable, unique string for this page - used as the GPUI element id suffix for its nav
-    /// row and content column (`crate::root`'s Settings render methods), so every page's row
-    /// keeps an identity GPUI can track across renders independent of its (constant, but
-    /// spelled-out-for-humans) [`Self::label`].
+    /// A stable, unique string used as the GPUI element id suffix for this page's nav row and
+    /// content column, independent of its human-readable [`Self::label`].
     pub fn id(self) -> &'static str {
         match self {
             SettingsPage::General => "general",
@@ -127,15 +110,10 @@ impl SettingsPage {
     }
 
     /// The content column's one-line rationale under the page title
-    /// (`design_handoff_jerry_ade/revision/README.md`'s "Content column" section). Real,
-    /// specific text for every implemented page (rewritten from `Jerry.dc.html`'s own
-    /// `settingsMeta` fixture where that fixture describes a section this app doesn't build -
-    /// see the module docs). This subtitle itself is app-authored explanatory text, not copy
-    /// from the mockup for the nav-only pages - `Jerry.dc.html` has no per-page subtitle
-    /// fixture at all for nav-only pages, so every nav-only page shares the same honest,
-    /// app-written "not designed in this mockup" explanation below it. (The placeholder page
-    /// *body*, separately, in `crate::root::render_settings_placeholder_page`, is the mockup's
-    /// actual verbatim `setStub` copy - see that function's docs; this subtitle is not that.)
+    /// (`design_handoff_jerry_ade/revision/README.md`'s "Content column" section) - app-authored
+    /// text, not copy from the mockup (`Jerry.dc.html` has no per-page subtitle fixture). Every
+    /// nav-only page shares the same placeholder text; the placeholder page *body* is separately
+    /// the mockup's verbatim `setStub` copy - see `crate::root::render_settings_placeholder_page`.
     pub fn subtitle(self) -> &'static str {
         match self {
             SettingsPage::General => {
@@ -164,17 +142,16 @@ impl SettingsPage {
     }
 }
 
-/// One of the Settings nav's four grouped sections (`design_handoff_jerry_ade/revision/
-/// CHANGELOG.md`'s change 3: "Nav regrouped: Workspace ... Interface ... Editor ... Other").
+/// One of the Settings nav's four grouped sections (`CHANGELOG.md`'s change 3: "Nav regrouped:
+/// Workspace ... Interface ... Editor ... Other").
 pub struct NavGroup {
     pub label: &'static str,
     pub pages: Vec<SettingsPage>,
 }
 
-/// The real, fixed nav structure - `Jerry.dc.html`'s own `settingsNavDefs` grouping, unchanged
-/// (every page listed there is included here, in the same order), so every page the design
-/// lists is real, clickable navigation even though not every page renders real content past
-/// that point (see [`SettingsPage::is_implemented`]).
+/// The fixed nav structure - `Jerry.dc.html`'s own `settingsNavDefs` grouping and order,
+/// unchanged. Every page is clickable navigation even though not every page renders real
+/// content past that point (see [`SettingsPage::is_implemented`]).
 pub fn nav_groups() -> Vec<NavGroup> {
     vec![
         NavGroup {
@@ -208,26 +185,21 @@ pub fn nav_groups() -> Vec<NavGroup> {
     ]
 }
 
-/// Every real agent kind this app knows how to spawn as an "agent" (as opposed to a plain
-/// shell) - `crate::sessions::SessionKind::Shell` is deliberately excluded, mirroring
-/// `crate::work_surface::agent_tint`'s own docs: the design's Settings › Agents card is a list
-/// of *agent CLIs*, and a shell isn't one.
+/// Agent kinds this app can spawn as an "agent" - `SessionKind::Shell` is deliberately excluded,
+/// since the Settings › Agents card lists agent CLIs, not shells.
 pub const AGENT_KINDS: [SessionKind; 2] = [SessionKind::Claude, SessionKind::Codex];
 
-/// One real row for the Agents page's Installed card - see [`detect_agent_rows`].
+/// One row for the Agents page's Installed card - see [`detect_agent_rows`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRow {
     pub kind: SessionKind,
-    /// The exact literal command name `crate::sessions::SessionKind::agent_binary_name` hands
-    /// to `TerminalSpec::command` at real spawn time - the same name [`resolved_path`] was
-    /// searched for.
-    ///
-    /// [`resolved_path`]: AgentRow::resolved_path
+    /// The exact command name `SessionKind::agent_binary_name` hands to `TerminalSpec::command`
+    /// at spawn time - the same name [`Self::resolved_path`] was searched for.
     pub binary_name: &'static str,
-    /// `Some(path)` if a real `$PATH` search (`pty_core::resolve_on_path`, injected via
-    /// [`detect_agent_rows`]'s `resolve` parameter so this stays testable without touching the
-    /// real filesystem/environment) found the binary; `None` if it genuinely isn't installed on
-    /// this machine - never a guess either way.
+    /// `Some(path)` if a real `$PATH` search found the binary, `None` if it genuinely isn't
+    /// installed - never a guess. The search (`pty_core::resolve_on_path`) checks file
+    /// permission bits, not a real `access(2)` call, so it can't account for ACLs or the
+    /// calling process's specific uid/gid.
     pub resolved_path: Option<PathBuf>,
 }
 
@@ -236,8 +208,8 @@ impl AgentRow {
         self.resolved_path.is_some()
     }
 
-    /// The real status label next to the row's status dot - `design_handoff_jerry_ade/
-    /// README.md`'s "green dot + 'ready'", or the honest opposite when the binary wasn't found.
+    /// The status label next to the row's status dot ("green dot + 'ready'" per
+    /// `design_handoff_jerry_ade/revision/README.md`), or the honest opposite when not found.
     pub fn status_label(&self) -> &'static str {
         if self.is_ready() {
             "ready"
@@ -247,18 +219,11 @@ impl AgentRow {
     }
 }
 
-/// Builds one real [`AgentRow`] per [`AGENT_KINDS`] entry, resolving each one's real binary name
-/// via `resolve` - in `crate::root`, always `pty_core::resolve_on_path` (the same real `$PATH`
-/// search `pty-core`'s own spawn path effectively performs - see that function's docs), so a
-/// row's "ready"/"not found" status reflects a real `$PATH` + execute-bit search, not a fabricated
-/// guess. This is *not* an absolute guarantee that spawning would actually succeed -
-/// `pty_core::resolve_on_path`'s own docs disclose the same gap this carries forward: its
-/// executable check is real file-permission-bit metadata, not a real `access(2)` call, so it
-/// doesn't itself account for ACLs or a process's specific uid/gid (e.g. a file with only a
-/// group-execute bit set can pass this check while the calling process still can't actually run
-/// it). Takes `resolve` as a parameter (rather than calling `pty_core` directly) so this mapping
-/// is unit-testable with a fake, deterministic resolver instead of depending on which binaries
-/// happen to be installed on whatever machine runs the test suite.
+/// Builds one [`AgentRow`] per [`AGENT_KINDS`] entry via `resolve` (in production,
+/// `pty_core::resolve_on_path` - see [`AgentRow::resolved_path`] for the one disclosed gap in
+/// that search, which this is not an absolute guarantee against). Takes `resolve` as a parameter
+/// so this is unit-testable with a fake resolver, independent of which binaries happen to be
+/// installed on the machine running the test suite.
 pub fn detect_agent_rows(resolve: impl Fn(&str) -> Option<PathBuf>) -> Vec<AgentRow> {
     AGENT_KINDS
         .into_iter()
@@ -272,22 +237,22 @@ pub fn detect_agent_rows(resolve: impl Fn(&str) -> Option<PathBuf>) -> Vec<Agent
         .collect()
 }
 
-/// A worktree row's real status dot state on the Worktrees page - derived from the exact same
-/// [`WorktreeNote`] Phase B's rail already computes (`crate::rail::compute_status_snapshot`),
-/// never a second, independent notion of worktree health.
+/// A worktree row's status dot state on the Worktrees page - derived from the same
+/// [`WorktreeNote`] the rail already computes (`crate::rail::compute_status_snapshot`), never a
+/// second, independent notion of worktree health.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorktreeDotStatus {
     /// The main checkout - never prunable, never "dirty" in the sense that matters here.
     Main,
     /// Clean and not (yet) merged - nothing to do.
     Clean,
-    /// Real uncommitted changes - matches [`WorktreeNote::clean`] being `Some(false)`.
+    /// Uncommitted changes - matches [`WorktreeNote::clean`] being `Some(false)`.
     Dirty,
-    /// A real prune candidate on its own merits - see [`WorktreeNote::is_prunable`]. This is
-    /// *not* the final "safe to remove right now" answer (a live session could still exclude
-    /// it - see `crate::rail::prunable_worktree_paths`), just this row's own real, local state.
+    /// A prune candidate on its own merits (see [`WorktreeNote::is_prunable`]) - not the final
+    /// "safe to remove right now" answer, since a live session could still exclude it (see
+    /// `crate::rail::prunable_worktree_paths`); just this row's own local state.
     Prunable,
-    /// `wt_core::is_dirty` itself failed for this path - genuinely unknown, not a guess.
+    /// `wt_core::is_dirty` failed for this path - genuinely unknown, not a guess.
     Unknown,
 }
 
@@ -305,14 +270,13 @@ pub fn worktree_dot_status(is_main: bool, note: &WorktreeNote) -> WorktreeDotSta
     }
 }
 
-/// A worktree row's real right-aligned action - `design_handoff_jerry_ade/README.md`'s "a
-/// right-aligned Open ... or Prune ... action", matching `Jerry.dc.html`'s own `wtDefs` fixture
-/// shape exactly (the main checkout's row has no action at all; every other row is `Open` or
-/// `Prune`, never both).
+/// A worktree row's right-aligned action - `design_handoff_jerry_ade/README.md`'s "a
+/// right-aligned Open ... or Prune ... action" (the main checkout's row has no action at all;
+/// every other row is `Open` or `Prune`, never both).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorktreeRowAction {
-    /// The main checkout - `git worktree remove` refuses it outright and there is nowhere else
-    /// to "open" it (it's the initial worktree browsing already defaults to).
+    /// The main checkout - `git worktree remove` refuses it outright, and there's nowhere else
+    /// to "open" it.
     None,
     Open,
     Prune,
@@ -328,12 +292,10 @@ pub fn worktree_row_action(is_main: bool, note: &WorktreeNote) -> WorktreeRowAct
     WorktreeRowAction::Open
 }
 
-/// One real Themes-page card - `design_handoff_jerry_ade/revision/Jerry.dc.html`'s own
-/// `themeDefs` fixture, transcribed verbatim (name, subtitle, five real swatch hex colours).
-/// `crate::root::settings_render` converts each `swatches` entry to a real `gpui::Rgba` via
-/// `gpui::rgb` at the render call site (matching `crate::terminal_pane`'s own precedent for a
-/// one-off literal colour that isn't a `crate::theme` token) - kept as plain `u32` here so this
-/// module stays free of a `gpui` dependency, mirroring its own module docs' "pure data" split.
+/// One Themes-page card - `Jerry.dc.html`'s own `themeDefs` fixture, transcribed verbatim (name,
+/// subtitle, five swatch hex colours). Kept as plain `u32` (converted to `gpui::Rgba` at the
+/// render call site, like `crate::terminal_pane`'s own one-off literal colours) so this module
+/// stays free of a `gpui` dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThemeDef {
     pub name: &'static str,
@@ -341,10 +303,9 @@ pub struct ThemeDef {
     pub swatches: [u32; 5],
 }
 
-/// The Themes page's six real cards - transcribed verbatim from `Jerry.dc.html`'s `themeDefs`.
-/// `crate::settings_store::ThemeSettings::name` (not this fixture's own `on` field, which this
-/// app never reads) is the real, persisted source of truth for which one is selected - see
-/// `crate::root::settings_render`'s Themes page docs.
+/// The Themes page's six cards, transcribed verbatim from `Jerry.dc.html`'s `themeDefs`.
+/// `crate::settings_store::ThemeSettings::name` - not this fixture's own `on` field, which this
+/// app never reads - is the persisted source of truth for which one is selected.
 pub const THEME_DEFS: [ThemeDef; 6] = [
     ThemeDef {
         name: "Jerry Dark",
@@ -378,31 +339,26 @@ pub const THEME_DEFS: [ThemeDef; 6] = [
     },
 ];
 
-/// One real Language servers page row's static, per-language identity - the real binary name
-/// `crate::root::settings_render` searches `$PATH` for via [`detect_lsp_rows`]. Binary names
-/// verified for real (not guessed): `rust-analyzer`, `typescript-language-server` (the
-/// `typescript-language-server` npm package's own real binary name), `vue-language-server`
-/// (the modern Volar-based `@vue/language-server` package's real binary - not the older,
-/// deprecated `vls`), `pyright-langserver` (`pyright`'s own real LSP-mode entry point, distinct
-/// from the plain `pyright` CLI type-checker binary), `gopls`.
+/// One Language servers page row's static, per-language identity - the binary name
+/// [`detect_lsp_rows`] searches `$PATH` for. Binary names verified for real, not guessed:
+/// `typescript-language-server` (the npm package's own binary name), `vue-language-server` (the
+/// modern Volar-based `@vue/language-server` package - not the deprecated `vls`),
+/// `pyright-langserver` (`pyright`'s LSP-mode entry point, distinct from the plain `pyright`
+/// type-checker CLI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LspLanguage {
     pub language: &'static str,
     /// The file extension chip label - fed to `crate::file_tree::lang_chip_for_name` (via a
-    /// synthetic `"x.<ext>"` name) at the real render call site, so this row's chip is the
-    /// exact same real, extension-derived chip a file-tree row for that language would show -
-    /// never a hand-assigned colour. Extensions this app's chip table doesn't yet recognise
-    /// (`ts`/`vue`/`py`/`go` - only `rs`/`toml`/`md`/`sql` are wired, see that function's own
-    /// docs) honestly fall back to its real neutral chip rather than a fabricated coloured one.
+    /// synthetic `"x.<ext>"` name) at the render call site, so this row's chip matches what a
+    /// file-tree row for that language would show. Extensions the chip table doesn't recognise
+    /// (`ts`/`vue`/`py`/`go` - only `rs`/`toml`/`md`/`sql` are wired) fall back to its neutral
+    /// chip rather than a fabricated coloured one.
     pub ext: &'static str,
     pub binary: &'static str,
-    /// Real, generic descriptive copy - not a live count. `Jerry.dc.html`'s own `lspDefs` notes
-    /// mix genuine descriptive copy ("installs when the first .go file opens") with fabricated
-    /// live session data ("1,284 crates indexed", "tsserver 5.6 · 2 tsconfig projects") this
-    /// app cannot actually know per-Settings-page (there is no live, per-language LSP session
-    /// summary to read here - `crate::root::lsp`'s real `rust-analyzer` client is keyed by
-    /// worktree, not surfaced to this page). Every note here is deliberately the former kind
-    /// only.
+    /// Generic descriptive copy, not a live count - `Jerry.dc.html`'s own `lspDefs` notes mix
+    /// this with fabricated live data ("1,284 crates indexed") this app has no per-language
+    /// session summary to back (`crate::root::lsp`'s `rust-analyzer` client is keyed by
+    /// worktree, not surfaced here). Every note here is deliberately the descriptive kind only.
     pub note: &'static str,
 }
 
@@ -439,16 +395,15 @@ pub const LSP_LANGUAGES: [LspLanguage; 5] = [
     },
 ];
 
-/// One real Language servers page row - see [`detect_lsp_rows`].
+/// One Language servers page row - see [`detect_lsp_rows`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LspRow {
     pub language: &'static str,
     pub ext: &'static str,
     pub binary: &'static str,
     pub note: &'static str,
-    /// `Some(path)` if a real `$PATH` search found `binary`; `None` if it genuinely isn't
-    /// installed - same real-search contract as `AgentRow::resolved_path`, see that field's
-    /// own docs for the one real, disclosed gap (a file-permission-bit check, not `access(2)`).
+    /// Same search contract as [`AgentRow::resolved_path`] - see that field's docs for the one
+    /// disclosed gap.
     pub resolved_path: Option<PathBuf>,
 }
 
@@ -457,9 +412,8 @@ impl LspRow {
         self.resolved_path.is_some()
     }
 
-    /// `Jerry.dc.html`'s own `lspDefs` fixture's real word for the not-found state
-    /// (`"not installed"`, distinct from the Agents page's `"not found"` - each page keeps its
-    /// own mockup's real wording rather than a homogenized one).
+    /// `Jerry.dc.html`'s own word for the not-found state - `"not installed"`, distinct from the
+    /// Agents page's `"not found"`; each page keeps its own mockup's wording.
     pub fn status_label(&self) -> &'static str {
         if self.is_ready() {
             "ready"
@@ -469,10 +423,9 @@ impl LspRow {
     }
 }
 
-/// Builds one real [`LspRow`] per [`LSP_LANGUAGES`] entry, resolving each one's real binary name
-/// via `resolve` - in `crate::root`, always `pty_core::resolve_on_path`, the same real `$PATH`
-/// search [`detect_agent_rows`] uses for the Agents page. Takes `resolve` as a parameter for the
-/// same unit-testability reason [`detect_agent_rows`] does.
+/// Builds one [`LspRow`] per [`LSP_LANGUAGES`] entry via `resolve`, mirroring
+/// [`detect_agent_rows`] exactly (same `$PATH` search, same reason for taking `resolve` as a
+/// parameter).
 pub fn detect_lsp_rows(resolve: impl Fn(&str) -> Option<PathBuf>) -> Vec<LspRow> {
     LSP_LANGUAGES
         .into_iter()
@@ -486,50 +439,37 @@ pub fn detect_lsp_rows(resolve: impl Fn(&str) -> Option<PathBuf>) -> Vec<LspRow>
         .collect()
 }
 
-/// One row of the Keybindings settings page - real data, built by [`keybinding_rows`] from
-/// `crate::default_key_bindings`'s actual, live-registered `gpui::KeyBinding`s, never a second,
-/// hand-maintained parallel list. This replaced exactly that: a hand-transcribed `[KeybindingRow;
-/// 4]` array with its own re-typed spec strings (`"mod+K"`, ...) and its own re-typed `context`
-/// per row, positioned in a hand-chosen order - independent of `crate::default_key_bindings`'s
-/// real registrations, so nothing caught it when the two quietly disagreed: the real `F12`
-/// binding is registered with context `None` (global), but the old hand-copied row said
-/// `"editor"`. `context`/`keystrokes` here are always read straight off the real `KeyBinding` -
-/// there is no way for this row to describe a binding differently than what's really registered,
-/// because it *is* that registration, reshaped for rendering.
+/// One row of the Keybindings settings page, built by [`keybinding_rows`] straight from
+/// `crate::default_key_bindings`'s live-registered `gpui::KeyBinding`s - not a hand-maintained
+/// parallel list, which had already drifted once (a hand-copied row claimed context `"editor"`
+/// for a binding registered as global). `context`/`keystrokes` are always read straight off the
+/// real `KeyBinding`, so a row can't describe a binding differently than what's actually
+/// registered.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeybindingRow {
     pub command: &'static str,
     pub context: &'static str,
-    /// The real, already-registered keystroke(s) for this binding (almost always exactly one -
-    /// none of this app's real global bindings are multi-keystroke chords right now) - resolved
-    /// to real per-platform keycaps via `crate::keymap::resolve_keystroke` at the render call
-    /// site, never a literal glyph or a hand-authored spec string here.
+    /// The registered keystroke(s) for this binding (almost always exactly one), resolved to
+    /// per-platform keycaps via `crate::keymap::resolve_keystroke` at the render call site.
     pub keystrokes: Vec<gpui::Keystroke>,
 }
 
-/// A small, real mapping from this app's globally-bound `gpui::Action` types to the Keybindings
-/// page's human command label, keyed by each action's own real, compiler-generated
-/// [`gpui::Action::name`] (e.g. `"app::NewSession"` - stable per action type, not guessed). This
-/// is the fallback [`keybinding_rows`]'s own docs describe: there is no existing, reusable
-/// action-to-label mapping this app can pull from for these four (the command palette's own
-/// `crate::palette::PaletteCommand::label` is close for three of them, but
-/// `TogglePalette`/`GotoDefinition` have no `PaletteCommand` counterpart at all - the palette
-/// can't open itself, and go-to-definition isn't a palette command), so this table exists
-/// specifically for this page.
+/// Maps this app's globally-bound `gpui::Action` types to the Keybindings page's human command
+/// label, keyed by each action's compiler-generated [`gpui::Action::name`]. Exists because no
+/// existing label source covers all four: the palette's `PaletteCommand::label` covers three,
+/// but `TogglePalette`/`GotoDefinition` have no `PaletteCommand` counterpart (the palette can't
+/// open itself, and go-to-definition isn't a palette command).
 ///
-/// The test `every_registered_global_keybinding_has_a_real_keybindings_page_label` (below) is the
-/// real drift guard this table needs in place of the position/order guarantees a hand-authored
-/// row list used to (accidentally) provide: it iterates the real `crate::default_key_bindings()`
-/// and asserts every one of them resolves to `Some` here, so adding a new global binding without
-/// adding its label here fails a test - not silently renders blank or missing on the Keybindings
-/// page.
+/// The test `every_registered_global_keybinding_has_a_real_keybindings_page_label` (below) is
+/// the drift guard: it asserts every binding in `crate::default_key_bindings()` resolves to
+/// `Some` here, so a new global binding without a matching label fails a test rather than
+/// silently rendering blank on the Keybindings page.
 fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
     match action.name() {
         "app::NewSession" => Some("New session"),
         "app::TogglePalette" => Some("Command palette"),
         "app::ToggleSettings" => Some("Open settings"),
         "app::GotoDefinition" => Some("Go to definition"),
-        // Revision R4a's tab-strip `+` menu and session-jump keycaps.
         "app::NewTerminal" => Some("New terminal"),
         "app::NewAgentPane" => Some("New agent pane"),
         "app::NextChangedFile" => Some("Next changed file"),
@@ -545,15 +485,11 @@ fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
     }
 }
 
-/// Builds the Keybindings page's real rows straight from `bindings` (in production, always
-/// `crate::default_key_bindings()`) - see [`KeybindingRow`]'s own docs for why this replaced a
-/// second, hand-maintained parallel list. Row order is always real registration order (there is
-/// no separate order to drift). `context` is `"global"` when the real `gpui::KeyBinding` has no
-/// context predicate (every one of this app's four real global bindings today - see
-/// `crate::default_key_bindings`'s own `KeyBinding::new(.., None)` calls) and `"scoped"`
-/// otherwise - a real reduction of the real predicate, not a guess. A binding whose action has no
-/// [`action_label`] entry is skipped rather than shown with a blank/fabricated label - see that
-/// function's own docs for the test that keeps this from happening silently.
+/// Builds the Keybindings page's rows straight from `bindings` (in production,
+/// `crate::default_key_bindings()`) - row order is registration order, so there is no separate
+/// order to drift. `context` is `"global"` when the `KeyBinding` has no context predicate and
+/// `"scoped"` otherwise. A binding whose action has no [`action_label`] entry is skipped rather
+/// than shown with a blank label - see that function's docs for the test guarding against that.
 pub fn keybinding_rows(bindings: &[gpui::KeyBinding]) -> Vec<KeybindingRow> {
     bindings
         .iter()
@@ -578,11 +514,10 @@ pub fn keybinding_rows(bindings: &[gpui::KeyBinding]) -> Vec<KeybindingRow> {
         .collect()
 }
 
-/// The Keybindings page's real filter row logic (`design_handoff_jerry_ade/revision/
-/// CHANGELOG.md`'s change 3: "filter row (`/ filter N bindings`, right-aligned count)") - a
-/// case-insensitive substring match against a row's command name or context, matching
-/// `crate::rail::filter_sessions`'s own real filtering shape. An empty (or all-whitespace)
-/// query matches every row, same as that function's own empty-query behaviour.
+/// The Keybindings page's filter row logic (`CHANGELOG.md`'s change 3: "filter row (`/ filter N
+/// bindings`, right-aligned count)") - a case-insensitive substring match against a row's
+/// command name or context, matching `crate::rail::filter_sessions`'s shape. An empty (or
+/// all-whitespace) query matches every row.
 pub fn filter_keybinding_rows<'a>(
     rows: &'a [KeybindingRow],
     query: &str,
@@ -621,7 +556,6 @@ mod tests {
             );
         }
         seen.sort_by_key(|page| SettingsPage::ALL.iter().position(|p| p == page));
-        // No duplicates: every real page appears in exactly one group.
         let mut dedup = seen.clone();
         dedup.dedup();
         assert_eq!(
@@ -742,9 +676,7 @@ mod tests {
 
     #[test]
     fn detect_agent_rows_can_report_mixed_real_and_not_found_status() {
-        // Exactly this app's real, honest dev-machine state at the time this phase shipped:
-        // `claude` present, `codex` absent (see `crate::sessions::SessionKind::Codex`'s own
-        // module docs) - proof the two rows' statuses are independent, not all-or-nothing.
+        // Proves the two rows' statuses are independent, not all-or-nothing.
         let rows = detect_agent_rows(|name| {
             if name == "claude" {
                 Some(PathBuf::from("/usr/bin/claude"))
@@ -819,11 +751,8 @@ mod tests {
 
     #[test]
     fn worktree_dot_status_locked_merged_clean_is_not_prunable_matching_worktree_note() {
-        // Mirrors `crate::rail`'s own
-        // `worktree_note_locked_merged_clean_worktree_is_never_prunable_but_label_says_locked`
-        // test - a locked worktree must never show as `Prunable` here either, since this
-        // function is a thin, real reduction of `WorktreeNote::is_prunable`, not a second
-        // implementation of the same rule.
+        // Mirrors `crate::rail`'s own locked-worktree test - this function is a thin reduction
+        // of `WorktreeNote::is_prunable`, not a second implementation of the same rule.
         let locked = note(Some(true), true, true);
         assert_eq!(
             worktree_dot_status(false, &locked),
@@ -911,10 +840,7 @@ mod tests {
 
     #[test]
     fn every_registered_global_keybinding_has_a_real_keybindings_page_label() {
-        // The real drift guard `action_label`'s own docs describe: if `crate::default_key_bindings`
-        // ever grows a new global binding without a matching `action_label` entry, this fails -
-        // silently rendering that binding blank/missing on the Keybindings page never ships
-        // unnoticed the way a purely positional/length-only check could miss.
+        // The drift guard `action_label`'s docs describe.
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings);
         assert_eq!(
@@ -932,8 +858,6 @@ mod tests {
 
     #[test]
     fn keybinding_rows_are_derived_in_real_registration_order() {
-        // There is no separate, hand-authored order to drift from real registration order
-        // anymore - `keybinding_rows` just reads `crate::default_key_bindings()`'s own order.
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings);
         let commands: Vec<&str> = rows.iter().map(|row| row.command).collect();
@@ -961,20 +885,17 @@ mod tests {
 
     #[test]
     fn keybinding_rows_report_the_real_global_context_for_every_default_binding() {
-        // The real bug this replaced: the old hand-copied list labeled `Go to definition`
-        // `context: "editor"`, but `crate::default_key_bindings` actually registers it (like
-        // every other entry except `NextChangedFile`, see below) with `KeyBinding::new(..,
-        // None)` - a real, global context. Every row here is derived from that same real
-        // registration, so every row but one must say `"global"`.
+        // Regression coverage for the bug this replaced: a hand-copied list once labeled
+        // `Go to definition` `context: "editor"` even though it's actually registered global.
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings);
         assert!(!rows.is_empty());
         assert_eq!(
             rows.iter().filter(|row| row.context != "global").count(),
             1,
-            "exactly one real binding (] -> NextChangedFile) is deliberately scoped, not \
-             global - see crate::default_key_bindings' own docs for the real terminal-input \
-             conflict that scoping prevents"
+            "exactly one binding (] -> NextChangedFile) is deliberately scoped, not global - \
+             see crate::default_key_bindings' own docs for the terminal-input conflict that \
+             scoping prevents"
         );
         assert_eq!(
             rows.iter()
@@ -1013,10 +934,7 @@ mod tests {
     fn filter_keybinding_rows_matches_command_case_insensitively() {
         let rows = keymap_page_rows();
         let filtered = filter_keybinding_rows(&rows, "PALETTE");
-        // Exactly one real row matches - `secondary-k` is the only real keystroke bound to
-        // `TogglePalette` (the `+` menu's "Open file…" row has no real global keybinding of its
-        // own - see `crate::default_key_bindings`'s own docs for the real Ctrl+P/readline
-        // conflict that ruled one out).
+        // Exactly one row matches - `secondary-k` is the only keystroke bound to TogglePalette.
         assert_eq!(filtered.len(), 1);
         assert!(filtered.iter().all(|row| row.command == "Command palette"));
     }
@@ -1025,8 +943,7 @@ mod tests {
     fn filter_keybinding_rows_matches_context_too() {
         let rows = keymap_page_rows();
         let filtered = filter_keybinding_rows(&rows, "global");
-        // All but the one deliberately-scoped `] -> NextChangedFile` row - see
-        // `keybinding_rows_report_the_real_global_context_for_every_default_binding`'s own docs.
+        // All but the one deliberately-scoped `] -> NextChangedFile` row.
         assert_eq!(filtered.len(), rows.len() - 1);
     }
 

@@ -1,36 +1,15 @@
-//! The command palette's (⌘K) real data model: pure, GPUI-free scope/matching/ranking/grouping
-//! logic for `design_handoff_jerry_ade/README.md`'s "Command palette (⌘K)" section, mirroring
-//! `crate::rail`/`crate::changes`/`crate::work_surface`'s own split - only the mapping from
-//! already-real app state (open sessions, the loaded file tree, a fixed real-command list) to
-//! which rows the palette should show lives here, directly unit-testable without a live GPUI
-//! window; turning the result into actual `gpui::Div` trees and real click/key handlers happens
-//! in `crate::root`, which owns the `Context<AdeApp>` those need.
-//!
-//! ## Real data sources (no fake results)
-//!
-//! - **Sessions** come from `crate::root::AdeApp`'s real `crate::sessions::Sessions` (the same
-//!   live session list the rail renders - see [`SessionCandidate`]). Running a session result
-//!   focuses that real tab, exactly like clicking its rail row.
-//! - **Files** come from the real file tree `crate::file_tree::build_file_tree` already loaded
-//!   (see [`FileCandidate`]) - every real file under the repo root, not a synthetic list.
-//!   Running a changed file's result opens its real diff (reusing the Changes list's own
-//!   click-through - see `crate::root::AdeApp::open_change_diff`); an unchanged file's result
-//!   reveals and highlights it in the real file tree instead, since there is no diff to open.
-//! - **Commands** are a small, fixed, real list ([`PaletteCommand`]) - every one names an action
-//!   this app can already genuinely perform (spawning a real session, toggling a real panel,
-//!   pruning real worktrees through the same two-click-confirm path the rail footer uses). No
-//!   command here is a stub: `crate::root::AdeApp::execute_palette_command` dispatches every
-//!   variant to the exact same method its existing, real UI affordance calls.
-//!
-//! ## Matching
+//! Pure, GPUI-free data model for the command palette (⌘K): scope/matching/ranking/grouping
+//! over already-real app state (open sessions, the loaded file tree, a fixed command list),
+//! kept unit-testable without a live GPUI window. `crate::root`'s `palette_render` turns the
+//! result into `gpui::Div` trees and real click/key handlers, since it owns the `Context<AdeApp>`
+//! those need. Every [`PaletteCommand`] variant maps one-to-one onto an existing `AdeApp` method
+//! (see `crate::root::AdeApp::execute_palette_command`) - none is a stub.
 //!
 //! Matching is a plain, deterministic, case-insensitive (ASCII-fold) leftmost substring search
-//! (see [`substring_match`]) - not a skip-char fuzzy matcher. This matches
-//! `design_handoff_jerry_ade/Jerry.dc.html`'s own row template, which highlights exactly one
-//! contiguous `pre`/`mid`/`post` span per row, never a scattered set of matched characters.
-//! Results are ranked by how early the match starts (earlier is better), with entries that only
-//! matched via a secondary field (a session's branch, a file's directory, a command's
-//! keywords/description) ranked after every entry that matched in its own primary label - see
+//! ([`substring_match`]), not fuzzy/skip-char matching, so a match highlights one contiguous
+//! span per row rather than scattered characters. Results rank by how early the match starts;
+//! an entry that only matched via a secondary field (a session's branch, a file's directory, a
+//! command's keywords) still qualifies but ranks after every primary-label match - see
 //! [`match_against`].
 
 use std::path::PathBuf;
@@ -38,14 +17,12 @@ use std::path::PathBuf;
 use crate::sessions::{SessionId, SessionKind};
 use crate::status::Status;
 
-/// Defensive cap on how many rows a single group ([`PaletteGroup`]) contributes, independent of
-/// how many real candidates matched - mirrors `file_tree::MAX_RENDERED_FILE_ENTRIES`'s own
-/// reasoning (a palette meant to answer "which of these am I looking for" in a glance stops
-/// being that the moment one group scrolls past a screenful).
+/// Cap on how many rows a single group ([`PaletteGroup`]) contributes, independent of how many
+/// candidates matched - a palette meant to answer "which of these am I looking for" at a glance
+/// stops being that once a group scrolls past a screenful.
 const MAX_ENTRIES_PER_GROUP: usize = 8;
 
-/// Which of the palette's three real scopes is active - `design_handoff_jerry_ade/README.md`'s
-/// "Added state: palette_scope (All | Commands | Files)", matching the input row's segmented
+/// Which of the palette's three scopes is active, matching the input row's segmented
 /// `All ⇥ / Commands › / Files @` control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaletteScope {
@@ -56,9 +33,9 @@ pub enum PaletteScope {
 }
 
 impl PaletteScope {
-    /// Advances to the next scope in the segmented control's own left-to-right order - the
-    /// footer's real `⇥ next scope` action (`Tab`, while the palette has focus - distinct from
-    /// the *typed-prefix* route in [`typed_scope_prefix`]).
+    /// Advances to the next scope in the segmented control's left-to-right order - the
+    /// footer's `⇥ next scope` action, distinct from the typed-prefix route in
+    /// [`typed_scope_prefix`].
     pub fn cycle(self) -> Self {
         match self {
             PaletteScope::All => PaletteScope::Commands,
@@ -75,8 +52,7 @@ impl PaletteScope {
         }
     }
 
-    /// The segmented control's own per-scope key hint (`Jerry.dc.html`'s
-    /// `paletteScopes`: `[['all','All','⇥'], ['commands','Commands','›'], ['files','Files','@']]`).
+    /// The segmented control's per-scope key hint.
     pub fn segment_key(self) -> &'static str {
         match self {
             PaletteScope::All => "\u{21e5}",
@@ -85,10 +61,8 @@ impl PaletteScope {
         }
     }
 
-    /// The input row's own prefix glyph (`Jerry.dc.html`'s `palettePrefix` binding). Not a
-    /// typo that `All` and `Commands` share the same glyph - `Jerry.dc.html`'s own
-    /// `paletteData.all.prefix` fixture is `'›'` too, the same as `paletteData.commands.prefix`;
-    /// only `Files`' `'@'` differs.
+    /// The input row's prefix glyph. `All` and `Commands` deliberately share `'›'` - the
+    /// design's own fixture gives them the same prefix; only `Files`' `'@'` differs.
     pub fn prefix_glyph(self) -> &'static str {
         match self {
             PaletteScope::All | PaletteScope::Commands => "\u{203A}",
@@ -97,14 +71,12 @@ impl PaletteScope {
     }
 }
 
-/// Detects the real "type the prefix character to switch scope" gesture
-/// (`design_handoff_jerry_ade/README.md`: "Scope is reachable both by clicking and by typing
-/// the prefix"). `>` (the character an actual keyboard types for `Shift`+`.` on a US layout;
-/// `Jerry.dc.html`'s own `›` typographic glyph is also accepted in case it's pasted) switches to
-/// [`PaletteScope::Commands`]; `@` switches to [`PaletteScope::Files`]. A pure, stateless
-/// single-character test - the caller (`crate::root::AdeApp::handle_palette_key_down`) is
-/// responsible for only consulting this for the very first character typed into an otherwise
-/// empty query, and for not appending the consumed character to the query itself.
+/// Detects the "type the prefix character to switch scope" gesture: `>` (what a US keyboard
+/// types for `Shift`+`.`; the typographic `›` is also accepted in case it's pasted) switches to
+/// [`PaletteScope::Commands`], `@` switches to [`PaletteScope::Files`]. Pure and stateless - the
+/// caller (`crate::root::AdeApp::handle_palette_key_down`) is responsible for only consulting
+/// this for the first character typed into an otherwise-empty query, and for not appending the
+/// consumed character to the query itself.
 pub fn typed_scope_prefix(ch: char) -> Option<PaletteScope> {
     match ch {
         '>' | '\u{203A}' => Some(PaletteScope::Commands),
@@ -113,9 +85,8 @@ pub fn typed_scope_prefix(ch: char) -> Option<PaletteScope> {
     }
 }
 
-/// A real, already-open session, reduced to exactly what a palette row needs -
-/// `crate::root::AdeApp::build_palette_groups`'s reduction of `crate::sessions::Sessions`, the
-/// same live list the rail (`crate::rail::SessionRow`) renders.
+/// An already-open session, reduced to what a palette row needs - built from the same live
+/// `crate::sessions::Sessions` list the rail (`crate::rail::SessionRow`) renders.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionCandidate {
     pub id: SessionId,
@@ -125,52 +96,35 @@ pub struct SessionCandidate {
     pub status: Status,
 }
 
-/// One real, fixed command this app can genuinely perform right now - every variant maps
-/// one-to-one to an existing, already-real `crate::root::AdeApp` method (see
-/// `crate::root::AdeApp::execute_palette_command`), never a stub for a feature that doesn't
-/// exist yet (no settings, no conflict resolution - those are later phases).
+/// A fixed command this app can perform right now - every variant maps one-to-one to an
+/// existing `crate::root::AdeApp` method (see `crate::root::AdeApp::execute_palette_command`),
+/// never a stub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteCommand {
-    /// Spawns a real shell session - `crate::root::AdeApp::new_session(SessionKind::Shell, ..)`,
-    /// the same real action the rail's `+`/⌘N control and the session toolbar's `+ shell`
-    /// button already perform.
+    /// `crate::root::AdeApp::new_session(SessionKind::Shell, ..)`, same as the rail's `+`/⌘N.
     NewShell,
-    /// Spawns a real `claude` session - `crate::root::AdeApp::new_session(SessionKind::Claude,
-    /// ..)`, the same real action the session toolbar's `+ claude` button already performs.
+    /// `crate::root::AdeApp::new_session(SessionKind::Claude, ..)`.
     NewClaudeSession,
-    /// Spawns a real `codex` session - the session toolbar's `+ codex` button's real action.
+    /// `crate::root::AdeApp::new_session(SessionKind::Codex, ..)`.
     NewCodexSession,
-    /// Switches Zone 3 between the real Files tree and the real Changes list -
-    /// `crate::root::AdeApp::set_right_sidebar_view`, the same real action the panel's own
-    /// `Files | Changes` segmented control performs.
+    /// `crate::root::AdeApp::set_right_sidebar_view`, same as the `Files | Changes` control.
     ToggleFilesChanges,
-    /// Switches the rail's real grouping mode - `crate::root::AdeApp::toggle_rail_mode`, the
-    /// same real action the rail header's `by urgency ▾ / by project ▾` control performs.
+    /// `crate::root::AdeApp::toggle_rail_mode`, same as the rail header's grouping control.
     ToggleRailGrouping,
-    /// Runs the rail footer's real, two-click-confirmation-safe prune action -
-    /// `crate::root::AdeApp::request_prune`. Selecting this from the palette goes through the
-    /// exact same confirmation gate as clicking the footer's own `prune` button - it never
-    /// bypasses it, even when invoked a second time from the palette rather than the footer.
+    /// `crate::root::AdeApp::request_prune` - goes through the same two-click confirmation gate
+    /// as the rail footer's own `prune` button, never bypassing it.
     PruneWorktrees,
-    /// Opens the real Settings surface - `crate::root::AdeApp::open_settings`, the same real
-    /// action the status bar/title bar's own entry point (once one exists) performs. Named and
-    /// keyed exactly like `Jerry.dc.html`'s own palette fixture entry (`paletteData.all`'s
-    /// Commands group: `{ k: 'c', label: 'Open settings', sub: '', key: '⌘,' }`).
+    /// `crate::root::AdeApp::open_settings`.
     OpenSettings,
-    /// Pins `crate::keymap::WindowControlsStyle::System` (real OS detection) -
-    /// `crate::root::AdeApp::execute_palette_command`'s
-    /// `WindowControlsSystem`/`WindowControlsMacos`/`WindowControlsWindowsLinux` trio is a
-    /// deliberate, documented placeholder entry point for `design_handoff_jerry_ade/
-    /// CHANGELOG.md`'s 2026-07-29 entry, change 1's real, live title-bar/keycap override -
-    /// R3's config-file-backed Settings rewrite (change 3's "General" page `Window controls`
-    /// segmented choice) is where this permanently belongs; these three palette commands exist
-    /// only because that page doesn't exist yet.
+    /// Pins `crate::keymap::WindowControlsStyle::System`. These three variants and the
+    /// Settings "General" page's `Window controls` row both call
+    /// `crate::root::AdeApp::set_window_controls_style`, which mutates and persists the same
+    /// setting - two entry points, one real write, never a second independent copy.
     WindowControlsSystem,
-    /// Pins `crate::keymap::WindowControlsStyle::MacosStyle` - see
-    /// [`Self::WindowControlsSystem`]'s docs.
+    /// Pins `crate::keymap::WindowControlsStyle::MacosStyle` - see [`Self::WindowControlsSystem`].
     WindowControlsMacos,
     /// Pins `crate::keymap::WindowControlsStyle::WindowsLinuxStyle` - see
-    /// [`Self::WindowControlsSystem`]'s docs.
+    /// [`Self::WindowControlsSystem`].
     WindowControlsWindowsLinux,
 }
 
@@ -203,7 +157,7 @@ impl PaletteCommand {
         }
     }
 
-    /// Extra, real search terms beyond [`Self::label`] - matched but never highlighted (see
+    /// Extra search terms beyond [`Self::label`] - matched but never highlighted (see
     /// [`match_against`]), so e.g. typing "terminal" still finds "New Shell".
     fn keywords(self) -> &'static str {
         match self {
@@ -226,17 +180,11 @@ impl PaletteCommand {
         }
     }
 
-    /// The real, already-bound keyboard shortcut for this command, if it has one - a spec
-    /// string (`crate::keymap::resolve_combo`'s real input, not an already-resolved glyph):
-    /// `Some("mod+N")` for [`Self::NewShell`] (real binding: `secondary-n`) and `Some("mod+,")`
-    /// for [`Self::OpenSettings`] (real binding: `secondary-,`) - the two real, globally-bound
-    /// keybindings among these actions (`crate::default_key_bindings`). `crate::root::palette_render::
-    /// render_palette_row` resolves this through the real OS keymap at render time, so it reads
-    /// `⌘N`/`⌘,` on macOS and `Ctrl N`/`Ctrl ,` on Windows/Linux - never a hardcoded
-    /// platform-specific literal (`design_handoff_jerry_ade/CHANGELOG.md`'s 2026-07-29 entry,
-    /// change 2). Every other command has no dedicated shortcut in this app yet, so this
-    /// deliberately returns `None` for them rather than displaying a keycap that would
-    /// silently do nothing if pressed.
+    /// The bound keyboard shortcut for this command, if any - a `crate::keymap::resolve_combo`
+    /// spec string, not an already-resolved glyph, so `render_palette_row` renders `⌘N`/`⌘,` on
+    /// macOS and `Ctrl N`/`Ctrl ,` elsewhere rather than a hardcoded platform literal. Every
+    /// other command has no dedicated shortcut, so this returns `None` for them rather than
+    /// showing a keycap that would silently do nothing if pressed.
     pub fn shortcut(self) -> Option<&'static str> {
         match self {
             PaletteCommand::NewShell => Some("mod+N"),
@@ -246,44 +194,41 @@ impl PaletteCommand {
     }
 }
 
-/// One real command candidate, paired with a real, live secondary/description line -
-/// `crate::root::AdeApp::build_palette_groups` fills `secondary` from current app state (e.g.
-/// [`PaletteCommand::PruneWorktrees`]'s real prunable count), so the palette shows the same live
-/// numbers the rail footer does, not a static mockup string.
+/// A command candidate paired with a live secondary/description line - filled in by
+/// `crate::root::AdeApp::build_palette_groups` from current app state (e.g.
+/// [`PaletteCommand::PruneWorktrees`]'s prunable count), so this shows the same live numbers
+/// the rail footer does.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandCandidate {
     pub command: PaletteCommand,
     pub secondary: String,
 }
 
-/// Whether a real file result was added or deleted in the currently loaded diff - the palette
-/// row's optional status dot (`design_handoff_jerry_ade/README.md`: "Optional status dot").
-/// `None` for a modified/renamed/unchanged file (no single dot colour the design defines for
-/// those).
+/// Whether a file result was added or deleted in the currently loaded diff - the palette row's
+/// optional status dot. `None` for a modified/renamed/unchanged file (no dot colour is defined
+/// for those).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileChangeKind {
     Added,
     Deleted,
 }
 
-/// One real file from the already-loaded file tree (`crate::file_tree::build_file_tree`),
-/// reduced to what a palette row needs - `crate::root::AdeApp::build_palette_groups`'s
-/// reduction, with real `add`/`del`/[`FileChangeKind`] merged in from the currently loaded diff
-/// where the file has one (`0`/`None` otherwise, never fabricated).
+/// A file from the already-loaded file tree (`crate::file_tree::build_file_tree`), reduced to
+/// what a palette row needs, with `add`/`del`/[`FileChangeKind`] merged in from the currently
+/// loaded diff where the file has one (`0`/`None` otherwise).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileCandidate {
     pub path: PathBuf,
     pub name: String,
     /// Repo-relative directory, `""` for a root-level file - mirrors
-    /// `crate::changes::split_dir_name`'s own `dir` shape.
+    /// `crate::changes::split_dir_name`'s `dir` shape.
     pub dir: String,
     pub add: u32,
     pub del: u32,
     pub changed: Option<FileChangeKind>,
 }
 
-/// What running a selected [`PaletteEntry`] actually does -
-/// `crate::root::AdeApp::run_palette_entry`'s dispatch target.
+/// What running a selected [`PaletteEntry`] actually does.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EntryTarget {
     Command(PaletteCommand),
@@ -294,10 +239,9 @@ pub enum EntryTarget {
     File(PathBuf),
 }
 
-/// A label already split around its real matched substring, for `pre`/`mid`/`post` rendering
-/// (`design_handoff_jerry_ade/Jerry.dc.html`'s own row template: three adjacent spans, the
-/// middle one tinted). `mid`/`post` are both empty when there was no real match to highlight
-/// (an empty query, or a match that only came through a secondary field - see
+/// A label split around its matched substring, for `pre`/`mid`/`post` rendering (three adjacent
+/// spans, the middle one tinted). `mid`/`post` are both empty when there was no match to
+/// highlight (an empty query, or a match that only came through a secondary field - see
 /// [`match_against`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchedText {
@@ -330,35 +274,33 @@ impl MatchedText {
     }
 }
 
-/// One real, ready-to-run palette result row.
+/// One ready-to-run palette result row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaletteEntry {
     pub label: MatchedText,
     pub secondary: String,
     pub shortcut: Option<&'static str>,
-    /// Only set for a [`EntryTarget::Session`] row - the rail's real status colour, reused
-    /// verbatim (`design_handoff_jerry_ade/README.md`: "so the palette inherits the rail's
-    /// colour coding").
+    /// Only set for an [`EntryTarget::Session`] row - the rail's status colour, reused verbatim
+    /// so the palette inherits the rail's colour coding.
     pub status: Option<Status>,
-    /// Only set for a [`EntryTarget::File`] row that is a real add/delete in the loaded diff.
+    /// Only set for an [`EntryTarget::File`] row that is an add/delete in the loaded diff.
     pub file_change: Option<FileChangeKind>,
-    /// Only set for a [`EntryTarget::Session`] row - which real agent badge/tint to draw.
+    /// Only set for an [`EntryTarget::Session`] row - which agent badge/tint to draw.
     pub session_kind: Option<SessionKind>,
     pub target: EntryTarget,
 }
 
-/// One real result group - `crate::root::AdeApp::render_palette_groups`'s section header plus
-/// its rows.
+/// One result group - a section header plus its rows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaletteGroup {
     pub label: &'static str,
     pub entries: Vec<PaletteEntry>,
 }
 
-/// Flattens every group's entries into one ordered list, matching the palette's real visual
-/// (and keyboard-selectable) row order top to bottom - `crate::root::AdeApp`'s single source of
-/// truth for what index `palette_selected` refers to, so the rendered highlight and the real
-/// `⏎`-run target can never disagree about which row is "row N".
+/// Flattens every group's entries into one ordered list, matching the palette's visual (and
+/// keyboard-selectable) row order top to bottom - the single source of truth for what index
+/// `palette_selected` refers to, so the rendered highlight and the `⏎`-run target can never
+/// disagree about which row is "row N".
 pub fn flatten(groups: &[PaletteGroup]) -> Vec<&PaletteEntry> {
     groups
         .iter()
@@ -366,21 +308,19 @@ pub fn flatten(groups: &[PaletteGroup]) -> Vec<&PaletteEntry> {
         .collect()
 }
 
-/// Reimplements a small, position-preserving ASCII-fold of `text` (only ASCII letters are
-/// case-folded; every other `char` - including non-ASCII ones - passes through unchanged), so a
-/// matched span's `(char_index, char_len)` always indexes correctly back into the *original*
-/// string. A full Unicode case fold (`str::to_lowercase`) can change a string's char count
-/// (e.g. `'İ'` folds to two chars), which would silently misalign that mapping - not a concern
-/// this app's real content (filenames, branch names, command labels) exercises, so the simpler,
-/// alignment-safe ASCII fold is used instead of guarding against it.
+/// A position-preserving ASCII-fold of `text` (only ASCII letters are case-folded; every other
+/// `char` passes through unchanged), so a matched span's `(char_index, char_len)` always indexes
+/// back correctly into the *original* string. A full Unicode fold (`str::to_lowercase`) can
+/// change a string's char count (e.g. `'İ'` folds to two chars), which would misalign that
+/// mapping - not worth guarding against for this app's content, so the simpler, alignment-safe
+/// ASCII fold is used instead.
 fn ascii_fold(text: &str) -> Vec<char> {
     text.chars().map(|c| c.to_ascii_lowercase()).collect()
 }
 
-/// A plain, deterministic, leftmost case-insensitive substring search - see the module docs'
-/// "Matching" section for why this is a straight substring search, not fuzzy/skip-char
-/// matching. Returns the match's `(start_char_index, len_in_chars)`, or `None` if `needle` is
-/// empty or doesn't occur in `haystack`.
+/// Leftmost case-insensitive substring search (see the module docs for why this is plain
+/// substring matching, not fuzzy/skip-char). Returns `(start_char_index, len_in_chars)`, or
+/// `None` if `needle` is empty or doesn't occur in `haystack`.
 pub fn substring_match(haystack: &str, needle: &str) -> Option<(usize, usize)> {
     if needle.is_empty() {
         return None;
@@ -399,14 +339,12 @@ pub fn substring_match(haystack: &str, needle: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// Whether `primary` or any of `aux` real qualifies a candidate for `query`, and its real sort
-/// rank - `Some((highlight_span, rank))` if it matches at all. An empty `query` matches
-/// everything with rank `0` and no highlight (the palette's real "browse everything" state).
-/// A match in `primary` itself is highlighted and ranked by how early it starts (`0` is best).
-/// A match that only occurs in one of `aux` (a session's branch, a file's directory, a
-/// command's keywords) still qualifies the candidate - it's a real match, just not one the
-/// label itself can visually point at - so it's included but ranked after every `primary`
-/// match, at `usize::MAX`.
+/// Whether `primary` or any of `aux` qualifies a candidate for `query`, and its sort rank -
+/// `Some((highlight_span, rank))` if it matches at all. An empty `query` matches everything with
+/// rank `0` and no highlight (the "browse everything" state). A match in `primary` is
+/// highlighted and ranked by how early it starts (`0` is best). A match found only in `aux` (a
+/// session's branch, a file's directory, a command's keywords) still qualifies but has nothing
+/// for the label to highlight, so it ranks last, at `usize::MAX`.
 fn match_against(
     primary: &str,
     aux: &[&str],
@@ -525,23 +463,17 @@ fn filter_files(files: &[FileCandidate], query: &str) -> Vec<PaletteEntry> {
     finish_group(scored)
 }
 
-/// Builds the palette's real result groups for the current `scope`/`query` -
-/// `crate::root::AdeApp::build_palette_groups`'s one real call into this module. Group order is
-/// always Sessions, Commands, Files (`Jerry.dc.html`'s own `paletteData.all.groups` order); a
-/// group with zero real matches is omitted entirely, matching `crate::rail::group_by_urgency`'s
-/// own "empty groups aren't rendered as a header with nothing under it" convention.
+/// Builds the palette's result groups for the current `scope`/`query`. Group order is always
+/// Sessions, Commands, Files; a group with zero matches is omitted entirely rather than shown
+/// as an empty header.
 ///
-/// Sessions only ever appear in [`PaletteScope::All`] (there is no dedicated Sessions segment in
-/// the scope control - `design_handoff_jerry_ade/README.md`'s segmented control is only
-/// `All / Commands / Files`). For an empty query in a scope that shows files, the file
-/// candidates are first narrowed to only real changed files (`FileCandidate::changed.is_some()`)
-/// under a `"Recent Files"` label - `design_handoff_jerry_ade/README.md`: "Empty query shows
-/// Sessions ..., Commands and Recent files together". This app has no real file-access/mtime
-/// history to rank true recency by, so "recent" is defined here as "currently has real
-/// uncommitted changes" - the one real recency-adjacent signal this app's data model actually
-/// has (see `crate::root::AdeApp::build_palette_groups`'s docs for the same judgment call
-/// stated at its call site). A non-empty query searches every real file in the tree instead,
-/// under a plain `"Files"` label.
+/// Sessions only appear in [`PaletteScope::All`] - there is no dedicated Sessions segment in the
+/// scope control. For an empty query in a scope that shows files, the file candidates are first
+/// narrowed to changed files (`FileCandidate::changed.is_some()`) under a `"Recent Files"`
+/// label: this app has no file-access/mtime history to rank true recency by, so "recent" is
+/// defined as "currently has uncommitted changes" - the one recency-adjacent signal the data
+/// model actually has. A non-empty query searches every file in the tree instead, under a plain
+/// `"Files"` label.
 pub fn build_groups(
     scope: PaletteScope,
     query: &str,
@@ -862,12 +794,9 @@ mod tests {
         );
     }
 
-    /// Regression coverage for what the cap test above never actually exercised: every one of
-    /// its synthetic files matches `"target"` at the exact same offset (`src/modN/target.rs`'s
-    /// basename is always exactly `target.rs`), so it could never have caught a ranking bug -
-    /// only ever asserted the cap. This uses two file names that match the same query at two
-    /// different offsets and asserts `finish_group`'s real `sort_by_key(rank)` puts the earlier
-    /// match first, not just whichever order the candidates were passed in.
+    /// The cap test above can't catch a ranking bug: every one of its synthetic files matches
+    /// `"target"` at the same offset. This uses two files matching at different offsets to
+    /// assert `finish_group` actually sorts by rank rather than passthrough order.
     #[test]
     fn group_entries_in_the_same_group_are_ranked_by_earliest_match_offset() {
         // "logger.rs" matches "log" at offset 0; "my_logger.rs" matches it at offset 3. Passed

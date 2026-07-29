@@ -1,54 +1,30 @@
 //! Pure logic for Surface C's File view *Hover* state (`design_handoff_jerry_ade/README.md`'s
-//! "Language server UI" subsection) - turning a real `lsp_types::Hover` response (as returned by
-//! a real `rust-analyzer`, via a real `textDocument/hover` request sent through
-//! `lsp_core::LspClient::request` - see `crate::root::AdeApp::request_hover`) into a real render
-//! model `crate::root` can draw a signature/doc/module-path card from, plus the small position-
-//! encoding helper the click-to-hover trigger needs to build that request in the first place.
-//! Deliberately `gpui`-window-free (no `gpui` type is used at all here, unlike
-//! `crate::code_view`/`crate::diagnostics_view`, which still touch `gpui::Rgba`/
-//! `gpui::SharedString` for colour/text data - this module's own output is plain `String`s, left
-//! for `crate::root` to wrap in a `SharedString` at render time), mirroring this crate's
-//! established split between pure logic modules and `crate::root`'s actual `Div` construction.
+//! "Language server UI" subsection) - turns an `lsp_types::Hover` response (returned by
+//! `rust-analyzer` via `lsp_core::LspClient::request`, see `crate::root::AdeApp::request_hover`)
+//! into a render model `crate::root` draws a signature/doc/module-path card from, plus the
+//! position-encoding helper the click-to-hover trigger needs to build that request. Deliberately
+//! `gpui`-window-free (no `gpui` type is used at all - output is plain `String`s, wrapped in a
+//! `SharedString` by `crate::root` at render time).
 //!
-//! ## Scope decision: hover and go-to-definition are real; completions are not built at all
+//! ## Completions are out of scope
 //!
-//! `design_handoff_jerry_ade/README.md`'s `lsp_popup` state also covers `Completions` - not
-//! this phase's job, and not a later phase's either without a real prerequisite this app
-//! doesn't have. The design's Completions popup assumes a real, editable caret position mid-edit
-//! (`⏎ accept` inserts the selected candidate's text at that caret) - `crate::code_view`'s File
-//! view is, by an explicit, documented H1 scope decision, **read-only**: no caret is rendered, no
-//! text is ever inserted anywhere, and `AdeApp::code_cursor` tracks only "which line was last
-//! clicked", not an editable insertion point. Building a Completions popup that shows real
-//! `textDocument/completion` candidates but has no way to actually insert one would be exactly
-//! the kind of "component bound to nothing" this project's own conventions forbid: a `⏎ accept`
-//! footer hint implies a real action that would silently do nothing on every real keypress. This
-//! phase's real, deliberate choice is (a) from the two the step brief laid out - scope
-//! Completions out entirely, build nothing that looks like it accepts a completion, and leave a
-//! real text-editing surface (which a completions UI would need to sit honestly on top of) for a
-//! future phase - rather than (b), a relabelled "inspector" popup: even a popup honestly framed
-//! as non-interactive would still visually look like the design's own interactive completions
-//! list (the same 290px candidate column, the same selected-row highlight, the same kind chips),
-//! which risks reading as "this does something" regardless of a disclaimer's wording - the safer,
-//! more defensible default the step brief itself names. Hover and go-to-definition have no such
-//! problem: both are real, complete actions in a read-only viewer (`textDocument/hover` shows
-//! real information; `textDocument/definition` navigates real existing view state,
-//! `AdeApp::open_change`/`AdeApp::code_cursor` - see `crate::root::AdeApp::trigger_goto_definition`)
-//! - neither one implies an edit that never happens.
+//! `design_handoff_jerry_ade/README.md`'s `lsp_popup` state also covers `Completions`, not built
+//! here. The design's Completions popup assumes an editable caret mid-edit (`⏎ accept` inserts
+//! the selected candidate) - `crate::code_view`'s File view is read-only, with no caret and no
+//! text insertion, so a Completions popup would show real candidates with no way to accept one:
+//! a component bound to nothing, which this project's conventions forbid. Hover and
+//! go-to-definition have no such problem - both are complete, read-only actions - so they're
+//! built; Completions is left for a future phase with a real editing surface.
 //!
-//! ## Real, observed rust-analyzer hover shape - not guessed
+//! ## Observed rust-analyzer hover shape
 //!
-//! `design_handoff_jerry_ade/README.md`'s Hover state asks for "signature, doc prose, `core::
-//! convert` + `F12 definition` footer" - three real pieces `rust-analyzer`'s own hover response
-//! does *not* return as three separate structured fields: `lsp_types::Hover::contents` is a
-//! single markup blob, and the LSP spec says nothing about its internal structure. The real,
-//! observed convention this module's [`build_hover_render_model`] parses was reverse-engineered
-//! from actual responses - not the spec - by spawning a real `rust-analyzer` against small
-//! scratch fixtures and inspecting real replies directly (the same technique
-//! `lsp_core::client`'s own end-to-end diagnostics test established as this project's way of
-//! avoiding fabricated LSP behaviour, and which this phase's own `lsp_core::client` hover/
-//! definition end-to-end tests reuse). Four real examples captured this way, reused verbatim as
-//! this module's own test fixtures below (a documented free function hovered at its call site; a
-//! local variable; a function parameter; an integer literal):
+//! `lsp_types::Hover::contents` is a single unstructured markup blob - the LSP spec says nothing
+//! about its internal structure, so the module path/signature/doc split
+//! [`build_hover_render_model`] parses was reverse-engineered by spawning a real
+//! `rust-analyzer` against scratch fixtures and inspecting replies directly (the same technique
+//! `lsp_core::client`'s hover/definition end-to-end tests use). Four examples captured this way,
+//! reused as this module's test fixtures (a documented function at its call site; a local
+//! variable; a function parameter; an integer literal):
 //!
 //! ```text
 //! "hover_probe_fixture\n\nfn add_one(x: i32) -> i32\n\n\nAdds one to the given number.\n\nReturns the incremented value."
@@ -57,60 +33,46 @@
 //! "i32\n\n\nvalue of literal: 41 (0x29|0b101001)"
 //! ```
 //!
-//! The real, observed convention: the response is a sequence of blank-line-separated
-//! "paragraphs". An item with a real module path (a real crate/module-qualified symbol - a
-//! function, struct, etc.) puts that path on its own first paragraph, immediately followed by a
-//! paragraph that is itself a real item signature (starts with `fn `/`struct `/... - see
-//! [`looks_like_item_signature`]); anything else (a local, a parameter, a literal - none of which
-//! *have* a module path) starts directly with its own signature/type paragraph instead. Every
-//! remaining paragraph, if any, is real doc/explanatory prose. [`build_hover_render_model`]
-//! encodes exactly this, structurally - a parsed real convention (verified against the four real
-//! shapes above, kept as this module's own tests), not a fabricated field. The heuristic is
-//! honestly imperfect (a bare single-segment paragraph that happens to itself be an item's own
-//! whole hover, with no signature paragraph following it, could in principle be misread as a
-//! module path with no signature) - see [`looks_like_item_signature`]'s own docs for why the
-//! signature-paragraph check exists specifically to keep that failure mode rare in practice.
+//! The observed convention: the response is a sequence of blank-line-separated paragraphs. An
+//! item with a module path puts it on the first paragraph, immediately followed by a paragraph
+//! that is itself an item signature (starts with `fn `/`struct `/... - see
+//! [`looks_like_item_signature`]); anything else (a local, parameter, literal - none of which
+//! have a module path) starts directly with its signature/type paragraph. Any remaining
+//! paragraph is doc prose. The heuristic is imperfect: a bare paragraph that is itself a whole
+//! hover, with no signature paragraph following, could in principle be misread as a module path
+//! with no signature - see [`looks_like_item_signature`] for why the signature check exists to
+//! keep that rare.
 //!
 //! ## Why plain text, not Markdown
 //!
-//! `lsp_core::client::LspClient::initialize`'s `ClientCapabilities` never sets
-//! `text_document.hover.content_format`, so rust-analyzer has nothing to negotiate against and
-//! falls back to its own default - observed here to always be [`lsp_types::MarkupKind::PlainText`]
-//! (confirmed directly in every real captured response above; never `Markdown`, and never the
-//! older [`lsp_types::HoverContents::Scalar`]/`Array` `MarkedString` shapes either, though
-//! [`markup_text`] still handles those defensively rather than assuming only `Markup` can ever
-//! arrive). A real consequence: any Markdown syntax a doc comment happens to use arrives
-//! un-rendered in [`HoverRenderModel::doc`] - a documented, honest scope limit (this app has no
-//! Markdown rendering pipeline at all), not a bug.
+//! This client never sets `text_document.hover.content_format` in `ClientCapabilities`, so
+//! rust-analyzer falls back to its default, observed here to always be
+//! [`lsp_types::MarkupKind::PlainText`] (never `Markdown`). Any Markdown syntax in a doc comment
+//! therefore arrives un-rendered in [`HoverRenderModel::doc`] - this app has no Markdown
+//! rendering pipeline, a documented scope limit, not a bug. [`markup_text`] still handles the
+//! older [`lsp_types::HoverContents::Scalar`]/`Array` shapes defensively even though only
+//! `Markup` has ever actually been observed.
 //!
 //! ## Position precision: per-token, not per-character
 //!
-//! [`byte_offset_to_utf16_offset`] converts a real byte offset into the real UTF-16 `character`
-//! offset the LSP spec's position encoding requires, but the byte offset it's given
-//! (`crate::root::render_file_view_line`'s own click handler) is always the *start* of whichever
-//! already-highlighted token/run the user clicked, not a genuinely sub-token pixel-accurate
-//! position - this app has no character-level mouse hit-testing against a monospace text run
-//! (the same documented scope limit `AdeApp::code_cursor`'s own docs already state for the status
-//! bar's omitted `col N`). In practice this is indistinguishable from real per-character
-//! precision for hover purposes: `rust-analyzer` resolves a hover/definition query to whichever
-//! whole symbol/token contains the given position, and a token's own start position always falls
-//! inside that same token - so this is a real, honest simplification with no observable downside
-//! for what it's used for, not a fabricated fallback.
+//! [`byte_offset_to_utf16_offset`] converts a byte offset into the UTF-16 `character` offset the
+//! LSP position encoding requires, but the byte offset it's given
+//! (`crate::root::render_file_view_line`'s click handler) is always the *start* of whichever
+//! highlighted token the user clicked, not a sub-token pixel-accurate position - this app has no
+//! character-level mouse hit-testing against monospace text. In practice this is
+//! indistinguishable from per-character precision: `rust-analyzer` resolves a hover/definition
+//! query to whichever whole token contains the position, and a token's start always falls inside
+//! that same token.
 
 use std::ops::Range;
 
 use lsp_core::lsp_types;
 
-/// Converts a real UTF-8 byte offset within `line_text` into the UTF-16 code-unit offset the LSP
-/// spec's default `character` position encoding requires (`lsp_core::client`'s
-/// `ClientCapabilities` never negotiates a different one - see
-/// `crate::diagnostics_view::index_diagnostics_by_line`'s own docs for the identical real
-/// reasoning, applied here in the opposite direction: turning a real click position *into* a
-/// request, rather than turning a real response *into* a render position). Clamps to
-/// `line_text`'s own real length for a `byte_offset` past the line's end, and never panics on a
-/// `byte_offset` that doesn't land on a real `char` boundary (walks `char_indices` rather than
-/// slicing) - defensive, since every real caller only ever passes a token/run boundary (always a
-/// real `char` boundary in practice), but never assumed.
+/// Converts a UTF-8 byte offset within `line_text` into the UTF-16 code-unit offset the LSP
+/// `character` position encoding requires - the reverse direction of
+/// `crate::diagnostics_view::index_diagnostics_by_line`'s UTF-16-to-byte conversion. Clamps to
+/// `line_text`'s length for a `byte_offset` past the line's end, and never panics on an offset
+/// that doesn't land on a `char` boundary (walks `char_indices` rather than slicing).
 pub fn byte_offset_to_utf16_offset(line_text: &str, byte_offset: usize) -> u32 {
     let clamped = byte_offset.min(line_text.len());
     line_text
@@ -120,11 +82,10 @@ pub fn byte_offset_to_utf16_offset(line_text: &str, byte_offset: usize) -> u32 {
         .sum()
 }
 
-/// Builds the real `lsp_types::Position` for a real click at `byte_offset` (within `line_text`,
-/// itself line index `line_index_zero_based` - a real, 0-based LSP line number, one less than
-/// `crate::root::AdeApp::code_cursor`'s own 1-based convention) - the position
-/// `crate::root::AdeApp::request_hover`/`trigger_goto_definition` send in a real
-/// `textDocument/hover`/`textDocument/definition` request.
+/// Builds the `lsp_types::Position` for a click at `byte_offset` within `line_text`, on line
+/// `line_index_zero_based` (0-based, one less than `crate::root::AdeApp::code_cursor`'s 1-based
+/// convention) - the position `crate::root::AdeApp::request_hover`/`trigger_goto_definition`
+/// send in a `textDocument/hover`/`textDocument/definition` request.
 pub fn position_for_line_byte_offset(
     line_index_zero_based: u32,
     line_text: &str,
@@ -136,30 +97,26 @@ pub fn position_for_line_byte_offset(
     }
 }
 
-/// A real, already-parsed hover response, ready for `crate::root::render_hover_card` to draw -
-/// see this module's own top-level docs for exactly how [`build_hover_render_model`] derives
-/// these three fields from `rust-analyzer`'s real, unstructured markup blob.
+/// An already-parsed hover response, ready for `crate::root::render_hover_card` to draw - see
+/// this module's top-level docs for how [`build_hover_render_model`] derives these three fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HoverRenderModel {
-    /// The real crate/module path prefix (`design_handoff_jerry_ade/README.md`: "`core::
-    /// convert`"), when the hovered symbol is a real, path-qualified item and rust-analyzer's own
-    /// response included one - `None` for a local/parameter/literal/anything else that has no
-    /// real module path of its own (see this module's docs for the real, observed cases).
+    /// The crate/module path prefix (`design_handoff_jerry_ade/README.md`: "`core::convert`"),
+    /// when the hovered symbol is path-qualified and rust-analyzer's response included one -
+    /// `None` for a local/parameter/literal/anything else with no module path.
     pub module_path: Option<String>,
-    /// The real signature/type line - always present for any real, non-empty hover response.
+    /// The signature/type line - always present for a non-empty hover response.
     pub signature: String,
-    /// Real remaining doc/explanatory prose, if the response had any left after `module_path`/
-    /// `signature` were taken - `None` for a symbol with no doc comment (a parameter, a literal
-    /// with no further note, ...), never a fabricated empty string standing in for "no doc".
+    /// Remaining doc/explanatory prose, if any - `None` for a symbol with no doc comment, never
+    /// a fabricated empty string standing in for "no doc".
     pub doc: Option<String>,
 }
 
-/// Real item-signature keywords `rust-analyzer`'s own hover convention was observed to always
-/// start a real signature paragraph with (see this module's top-level docs). Deliberately not
-/// `let ` (a real local variable's own hover, e.g. `"let result: i32"`, starts with it too, but a
-/// local has no module path preceding it in practice - including `let` here would make
-/// [`looks_like_item_signature`] misfire on exactly the two-paragraph local-variable shape this
-/// module's own tests capture).
+/// Item-signature keywords `rust-analyzer`'s hover convention was observed to always start a
+/// signature paragraph with (see this module's top-level docs). Deliberately not `let ` - a
+/// local variable's hover (e.g. `"let result: i32"`) starts with it too, but a local has no
+/// module path preceding it; including `let` here would make [`looks_like_item_signature`]
+/// misfire on the two-paragraph local-variable shape this module's tests capture.
 const ITEM_SIGNATURE_KEYWORDS: &[&str] = &[
     "fn ",
     "struct ",
@@ -175,15 +132,12 @@ const ITEM_SIGNATURE_KEYWORDS: &[&str] = &[
     "extern ",
 ];
 
-/// Whether `paragraph` looks like a real Rust item signature (see
-/// [`ITEM_SIGNATURE_KEYWORDS`]'s own docs) - real, deliberately narrow evidence
-/// [`build_hover_render_model`] uses to decide whether the paragraph *before* this one is a real
-/// module path (an item's hover) or should itself be treated as the signature (a local/parameter/
-/// literal's hover, which has no module path at all - see this module's top-level docs for the
-/// real, observed shapes both cases produce). A real leading visibility qualifier (`pub`,
-/// `pub(crate)`, `pub(super)`, `pub(in ...)`) is stripped first, so `"pub fn foo()"` is recognized
-/// identically to `"fn foo()"` - real rust-analyzer signatures include real visibility when the
-/// item has one.
+/// Whether `paragraph` looks like a Rust item signature (see [`ITEM_SIGNATURE_KEYWORDS`]) -
+/// deliberately narrow evidence [`build_hover_render_model`] uses to decide whether the
+/// paragraph *before* this one is a module path or should itself be treated as the signature
+/// (a local/parameter/literal's hover, which has no module path). A leading visibility qualifier
+/// (`pub`, `pub(crate)`, `pub(super)`, `pub(in ...)`) is stripped first, so `"pub fn foo()"` is
+/// recognized identically to `"fn foo()"`.
 fn looks_like_item_signature(paragraph: &str) -> bool {
     let mut rest = paragraph;
     if let Some(after_pub) = rest.strip_prefix("pub") {
@@ -201,12 +155,10 @@ fn looks_like_item_signature(paragraph: &str) -> bool {
         || looks_like_enum_variant(rest)
 }
 
-/// The real, leading identifier-shaped prefix of `text` - the run of ASCII alphanumeric/`_`
-/// characters starting at byte `0`, as long as `text` actually starts with an identifier (an
-/// ASCII letter or `_`, never a digit). `0` for anything that doesn't start with a real
-/// identifier at all (an empty string, or a paragraph starting with punctuation/whitespace) -
-/// [`looks_like_field_declaration`]/[`looks_like_enum_variant`] both treat that as "not a match"
-/// rather than misreading an empty identifier as a real one.
+/// The leading identifier-shaped prefix of `text` - the run of ASCII alphanumeric/`_`
+/// characters starting at byte `0`, as long as `text` starts with an identifier (an ASCII letter
+/// or `_`, never a digit). `0` for anything that doesn't start with an identifier at all -
+/// [`looks_like_field_declaration`]/[`looks_like_enum_variant`] both treat that as "not a match".
 fn leading_identifier_len(text: &str) -> usize {
     match text.chars().next() {
         Some(first) if first.is_ascii_alphabetic() || first == '_' => text
@@ -216,15 +168,13 @@ fn leading_identifier_len(text: &str) -> usize {
     }
 }
 
-/// Whether `text` (already stripped of any leading `pub`/`pub(...)` visibility - see
-/// [`looks_like_item_signature`]'s own stripping step, reused here) looks like a real Rust struct
-/// field declaration - real, captured `rust-analyzer` shape for a struct field's own hover, e.g.
-/// `"h3probe::Point\n\npub x: f64"`: after visibility is stripped, `"x: f64"` is a bare identifier
-/// immediately followed by `:`. Deliberately requires the colon to follow the identifier with no
-/// other real token in between (only optional whitespace), so this does not also misfire on the
-/// real literal-value doc-prose paragraph (`"value of literal: 41 (0x29|0b101001)"`) - that
-/// paragraph's own leading identifier (`value`) is followed by `" of literal: 41 ..."`, not
-/// directly by a colon, so [`leading_identifier_len`]'s own real match stops before it.
+/// Whether `text` (already stripped of leading `pub`/`pub(...)` visibility, see
+/// [`looks_like_item_signature`]) looks like a Rust struct field declaration - captured
+/// `rust-analyzer` shape for a field's hover, e.g. `"h3probe::Point\n\npub x: f64"`: after
+/// visibility is stripped, `"x: f64"` is a bare identifier immediately followed by `:`.
+/// Deliberately requires the colon to follow with only optional whitespace in between, so this
+/// doesn't misfire on the literal-value doc-prose paragraph (`"value of literal: 41 ..."`) -
+/// there, `value` is followed by `" of literal: ..."`, not directly by a colon.
 fn looks_like_field_declaration(text: &str) -> bool {
     let identifier_len = leading_identifier_len(text);
     if identifier_len == 0 {
@@ -233,16 +183,14 @@ fn looks_like_field_declaration(text: &str) -> bool {
     text[identifier_len..].trim_start().starts_with(':')
 }
 
-/// Whether `text` (already stripped of any leading `pub`/`pub(...)` visibility, same as
-/// [`looks_like_field_declaration`]) looks like a real Rust enum variant's own hover - real,
-/// captured `rust-analyzer` shape: a bare, capitalized identifier, either standing entirely alone
-/// (a unit variant, e.g. `"Red"`) or immediately followed by a real tuple/struct variant's own
-/// `(`/`{` (e.g. `"Rgb(u8, u8, u8)"`/`"Rgb { r: u8, g: u8, b: u8 }"` - not directly captured from a
-/// real response, but the same real Rust variant-declaration grammar the captured unit-variant
-/// case is one instance of). A leading uppercase letter is real, load-bearing evidence here (every
-/// other real paragraph shape this module parses - a signature keyword, a field, a local, a
-/// literal - starts lowercase in practice), keeping this from misfiring on an ordinary capitalized
-/// type name that happens to appear as some other paragraph's own leading word.
+/// Whether `text` (already stripped of leading visibility, same as
+/// [`looks_like_field_declaration`]) looks like a Rust enum variant's hover - captured
+/// `rust-analyzer` shape: a bare, capitalized identifier, standing alone (a unit variant, e.g.
+/// `"Red"`) or immediately followed by a tuple/struct variant's `(`/`{` (e.g. `"Rgb(u8, u8,
+/// u8)"`/`"Rgb { r: u8, g: u8, b: u8 }"` - same variant-declaration grammar, not directly
+/// captured but following the same pattern). The leading uppercase letter is load-bearing: every
+/// other paragraph shape this module parses starts lowercase in practice, keeping this from
+/// misfiring on an ordinary capitalized type name.
 fn looks_like_enum_variant(text: &str) -> bool {
     match text.chars().next() {
         Some(first) if first.is_ascii_uppercase() => {}
@@ -256,13 +204,11 @@ fn looks_like_enum_variant(text: &str) -> bool {
     rest.is_empty() || rest.starts_with('(') || rest.starts_with('{')
 }
 
-/// Splits `text` into real, non-empty "paragraphs" - runs of text separated by one or more real
-/// blank lines (`rust-analyzer`'s own hover convention uses both a single blank line, between a
-/// module path and its signature, and a double blank line, between a signature and its doc prose,
-/// see this module's top-level docs for the real captured examples of both). `str::split`'s own
-/// non-overlapping-match semantics mean a real `"\n\n\n"` run still yields exactly one boundary
-/// here (verified directly in this module's own tests against the real captured triple-newline
-/// example), not three, and not a spurious empty paragraph in between.
+/// Splits `text` into non-empty "paragraphs" - runs of text separated by one or more blank lines
+/// (rust-analyzer's hover convention uses both a single blank line, between a module path and
+/// its signature, and a double blank line, between a signature and its doc prose - see this
+/// module's top-level docs). `str::split`'s non-overlapping-match semantics mean a `"\n\n\n"` run
+/// still yields exactly one boundary, not a spurious empty paragraph in between.
 fn split_paragraphs(text: &str) -> Vec<&str> {
     text.split("\n\n")
         .map(|segment| segment.trim_matches('\n').trim())
@@ -270,13 +216,12 @@ fn split_paragraphs(text: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Real text content from any of `lsp_types::HoverContents`' three real shapes - `Markup` is the
-/// only one ever actually observed from this client's own real `rust-analyzer` (see this module's
-/// top-level docs for why), but `Scalar`/`Array` (`lsp_types::MarkedString`, the LSP's older,
-/// deprecated-but-still-real hover shape) are still handled for real rather than assumed
-/// unreachable - a `LanguageString`'s own `value` (its code text, with the `language` tag itself
-/// dropped - there is no real place to show it, and the code text alone is still real, useful
-/// content) stands in for a bare string the same way a `Markup`'s `value` does.
+/// Text content from any of `lsp_types::HoverContents`' three shapes - `Markup` is the only one
+/// ever actually observed from rust-analyzer (see this module's top-level docs), but
+/// `Scalar`/`Array` (`lsp_types::MarkedString`, the LSP's older, deprecated hover shape) are
+/// still handled rather than assumed unreachable - a `LanguageString`'s `value` (its code text,
+/// with the `language` tag dropped, since there's no place to show it) stands in for a bare
+/// string the same way a `Markup`'s `value` does.
 fn markup_text(contents: &lsp_types::HoverContents) -> String {
     match contents {
         lsp_types::HoverContents::Markup(markup) => markup.value.clone(),
@@ -296,10 +241,10 @@ fn marked_string_text(marked: &lsp_types::MarkedString) -> String {
     }
 }
 
-/// Parses a real `lsp_types::Hover` response into a real [`HoverRenderModel`] - see this module's
-/// top-level docs for exactly how the real, observed paragraph convention is decoded. `None` only
-/// for a genuinely empty/whitespace-only response (no real paragraph at all) - an honest "nothing
-/// to show", never a fabricated empty-string signature.
+/// Parses an `lsp_types::Hover` response into a [`HoverRenderModel`] - see this module's
+/// top-level docs for how the observed paragraph convention is decoded. `None` only for an
+/// empty/whitespace-only response - an honest "nothing to show", never a fabricated empty-string
+/// signature.
 pub fn build_hover_render_model(hover: &lsp_types::Hover) -> Option<HoverRenderModel> {
     let text = markup_text(&hover.contents);
     let paragraphs = split_paragraphs(&text);
@@ -326,18 +271,14 @@ pub fn build_hover_render_model(hover: &lsp_types::Hover) -> Option<HoverRenderM
     })
 }
 
-/// Picks the real, first usable `(Uri, Range)` out of a real `lsp_types::GotoDefinitionResponse`,
-/// a real, untagged three-way union per the LSP spec (a single `Location`, a `Vec<Location>`, or
-/// a `Vec<LocationLink>` - see [`lsp_types::GotoDefinitionResponse`]'s own docs), verified against
-/// a real `rust-analyzer` response in `lsp_core::client`'s own end-to-end definition test (observed
-/// there to reply with the `Array` shape for a real call-site query). Only the *first* real
-/// location is used: `design_handoff_jerry_ade/README.md`'s own `F12 definition` footer navigates
-/// to one place, not a disambiguation list (out of scope here, same as the rest of this phase's
-/// real, documented simplifications). `Range` (not just a line number) is returned so the caller
-/// can navigate to the real target's own line without a second lookup;
-/// `crate::root::AdeApp::trigger_goto_definition` only actually uses `range.start.line`, but
-/// keeping the real, whole `Range` here (rather than pre-extracting one field) keeps this
-/// function's own real output self-describing.
+/// Picks the first usable `(Uri, Range)` out of an `lsp_types::GotoDefinitionResponse`, an
+/// untagged three-way union per the LSP spec (a single `Location`, a `Vec<Location>`, or a
+/// `Vec<LocationLink>`) - `lsp_core::client`'s end-to-end definition test observes rust-analyzer
+/// replying with the `Array` shape for a call-site query. Only the *first* location is used:
+/// `design_handoff_jerry_ade/README.md`'s `F12 definition` footer navigates to one place, not a
+/// disambiguation list. `Range` (not just a line number) is returned so the caller can navigate
+/// without a second lookup, even though `crate::root::AdeApp::trigger_goto_definition` only uses
+/// `range.start.line`.
 pub fn first_definition_location(
     response: &lsp_types::GotoDefinitionResponse,
 ) -> Option<(lsp_types::Uri, lsp_types::Range)> {
@@ -354,16 +295,11 @@ pub fn first_definition_location(
     }
 }
 
-/// Which real byte range of `line.text` a real hover-triggering click at `byte_range` (itself
-/// always exactly one already-rendered run's own real byte span - see
-/// `crate::root::render_file_view_line`'s own click handler) should be underlined with
-/// [`crate::theme::syntax::HOVER_UNDERLINE`] - real, run-level granularity (see this module's
-/// top-level docs on why that's not a meaningfully different precision from real per-character
-/// hit-testing for this purpose), not a re-derivation from `rust-analyzer`'s own returned
-/// `Hover::range` (which would require the reverse UTF-16-to-byte conversion
-/// `crate::diagnostics_view::index_diagnostics_by_line` already performs for diagnostics - real,
-/// but redundant here, since the clicked run's own byte range is already known exactly, having
-/// been computed to build the request in the first place).
+/// Which byte range of `line.text` a hover-triggering click (an already-rendered run's byte
+/// span - see `crate::root::render_file_view_line`'s click handler) should be underlined with
+/// [`crate::theme::syntax::HOVER_UNDERLINE`] - run-level granularity (see this module's
+/// top-level docs on position precision), not re-derived from rust-analyzer's returned
+/// `Hover::range`, since the clicked run's byte range is already known exactly.
 pub type HoverByteRange = Range<usize>;
 
 #[cfg(test)]

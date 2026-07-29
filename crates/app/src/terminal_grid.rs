@@ -1,75 +1,54 @@
-//! Real ANSI/VT100 terminal grid emulation via `alacritty_terminal::Term`.
+//! ANSI/VT100 terminal grid emulation via `alacritty_terminal::Term`.
 //!
 //! ## Why this replaced `ansi.rs`'s hand-rolled scanner
 //!
-//! Step 3's `ansi::TerminalBuffer` recognized and dropped CSI/OSC escape sequences rather
-//! than interpreting them, so it had no notion of cursor position: a full-screen,
-//! cursor-addressed program (`vim`, `htop`, and - the concrete motivating case for this
-//! step - an interactive agent CLI like `claude`, which redraws its UI in place using
-//! cursor positioning rather than only ever printing new lines) would render as a garbled
-//! stream of its raw draw commands instead of a clean, in-place-updating screen. That
-//! fidelity gap is exactly what a real terminal emulator's grid model exists to close, so
-//! this module drives `alacritty_terminal::Term` - the same crate/rev `vendor/zed`'s own
-//! `terminal` crate uses (`vendor/zed/Cargo.toml`: `alacritty_terminal = { git =
-//! "https://github.com/zed-industries/alacritty", rev =
-//! "4c129667ce56611becdc82de6e28218c80e2e88f" }`, pinned identically here) - instead of a
+//! Step 3's `ansi::TerminalBuffer` recognized and dropped CSI/OSC escape sequences rather than
+//! interpreting them, so it had no notion of cursor position: a full-screen, cursor-addressed
+//! program (`vim`, `htop`, or an interactive agent CLI that redraws its UI in place) would
+//! render as a garbled stream of raw draw commands instead of a clean, in-place-updating
+//! screen. This module drives `alacritty_terminal::Term` - the same crate/rev `vendor/zed`'s
+//! own `terminal` crate uses (`vendor/zed/Cargo.toml`, pinned identically here) - instead of a
 //! plain-text scan.
 //!
 //! ## API surface, verified against the pinned rev's real source
 //!
-//! Zed's own `vendor/zed/crates/terminal/src/alacritty.rs` wraps every one of these calls,
-//! but through Zed-specific types (its own `TerminalBounds`, a font-metrics-aware
-//! `Dimensions` impl; its own `Cell`/`Point` wrappers). Rather than guess whether that
-//! wrapping reflects the real underlying `alacritty_terminal` API or Zed-specific plumbing,
-//! every signature below was checked directly against the fetched dependency source at
-//! `~/.cargo/git/checkouts/alacritty-*/*/alacritty_terminal/src/`:
+//! Every signature below was checked against the fetched dependency source at
+//! `~/.cargo/git/checkouts/alacritty-*/*/alacritty_terminal/src/`, since Zed's own
+//! `vendor/zed/crates/terminal/src/alacritty.rs` wraps these through Zed-specific types:
 //! - `Term::new<D: Dimensions>(config: Config, dimensions: &D, event_proxy: T) -> Term<T>`
 //!   (`term/mod.rs:410`) and `Term::resize<S: Dimensions>(&mut self, size: S)`
-//!   (`term/mod.rs:655`). The `Dimensions` trait (`grid/mod.rs:486`) needs only
-//!   `total_lines`/`screen_lines`/`columns` - see [`GridSize`].
-//! - `Term<T>` only requires `T: EventListener` for `renderable_content`/the `Handler` impl
-//!   (`term/mod.rs:637`, `:1059`); `EventListener` itself needs just `fn send_event(&self,
-//!   event: Event)` (`event.rs`). This pane polls the grid directly every tick (see
-//!   `crate::terminal_pane`'s poll loop) rather than reacting to events (title changes,
-//!   bell, clipboard requests, etc. - none of those are surfaced by this step), so
+//!   (`term/mod.rs:655`). `Dimensions` (`grid/mod.rs:486`) needs only `total_lines`/
+//!   `screen_lines`/`columns` - see [`GridSize`].
+//! - `Term<T>` only requires `T: EventListener` for `renderable_content`/the `Handler` impl.
+//!   This pane polls the grid directly every tick (see `crate::terminal_pane`'s poll loop)
+//!   rather than reacting to events (title changes, bell, clipboard, ...), so
 //!   [`NoopEventListener`] just drops them.
-//! - Feeding bytes: `alacritty_terminal::vte::ansi::Processor::<StdSyncHandler>::advance(&mut
-//!   self, handler: &mut H, bytes: &[u8]) where H: Handler` (`vte-0.15.0/src/ansi.rs:298`);
-//!   `Term<T: EventListener>` implements `Handler` (`term/mod.rs:1059`). Note
-//!   `alacritty_terminal` re-exports its exact `vte` dependency as `alacritty_terminal::vte`
-//!   (`alacritty_terminal/src/lib.rs:20`, `pub use vte;`), so this crate depends on
-//!   `alacritty_terminal` alone rather than also pinning a separate top-level `vte`
-//!   dependency that could drift out of lockstep with it.
-//! - Reading the grid: `Term::renderable_content(&self) -> RenderableContent<'_>`
-//!   (`term/mod.rs:637`) whose `display_iter: GridIterator<'_, Cell>`
-//!   (`term/mod.rs:2393-2394`) yields `Indexed<&Cell> { point: Point, cell: &Cell }`
-//!   (`grid/mod.rs:554`, `:593`) for exactly the visible viewport (`grid/mod.rs:422`'s
-//!   `display_iter`, at the default `display_offset` of 0: `point.line` ranges `0..
-//!   screen_lines`, `point.column` ranges `0..columns`) - not the whole scrollback.
-//!   `Cell`'s real fields are `c: char, fg: Color, bg: Color, flags: Flags, extra: ...`
-//!   (`term/cell.rs:134`).
+//! - Feeding bytes: `Processor::<StdSyncHandler>::advance(&mut self, handler: &mut H, bytes:
+//!   &[u8]) where H: Handler` (`vte-0.15.0/src/ansi.rs:298`); `Term<T: EventListener>`
+//!   implements `Handler`. `alacritty_terminal` re-exports its exact `vte` dependency as
+//!   `alacritty_terminal::vte`, so this crate depends on `alacritty_terminal` alone rather than
+//!   also pinning a separate top-level `vte` that could drift out of lockstep with it.
+//! - Reading the grid: `Term::renderable_content(&self) -> RenderableContent<'_>` whose
+//!   `display_iter` yields `Indexed<&Cell> { point: Point, cell: &Cell }` for exactly the
+//!   visible viewport (at `display_offset == 0`: `point.line` ranges `0..screen_lines`,
+//!   `point.column` ranges `0..columns`) - not the whole scrollback. `Cell`'s real fields are
+//!   `c: char, fg: Color, bg: Color, flags: Flags, extra: ...` (`term/cell.rs:134`).
 //!
 //! ## Scope cut: no scrollback UI
 //!
-//! `Term` itself retains scrollback history (`Config::scrolling_history`, default 10000
-//! lines), but `display_iter` at `display_offset == 0` only ever exposes the live,
-//! on-screen viewport - `alacritty_terminal::Term::scroll_display` (mouse-wheel/PageUp
-//! scrolling into history) is not wired up by this step. This is an inherent trade-off of
-//! real cursor-addressed grid rendering (unlike step 3's plain-text buffer, whose "history"
-//! was just more `div` rows), not an oversight; scrollback UI would be a natural following
-//! step.
+//! `Term` retains scrollback history (`Config::scrolling_history`, default 10000 lines), but
+//! `display_iter` at `display_offset == 0` only ever exposes the live viewport -
+//! `Term::scroll_display` (mouse-wheel/PageUp scrolling into history) isn't wired up here. Not
+//! an oversight - a natural following step.
 //!
 //! ## Scope cut: fixed 16-color palette, no OSC 4/10/11 customization
 //!
-//! `Term::colors` (a `Colors` palette that OSC 4/10/11 sequences can override) starts out
-//! entirely `None` (`term/color.rs:24`) and this module never populates or consults it;
-//! instead, named/indexed colors are resolved against a fixed, hardcoded ANSI-16 palette
-//! (`NAMED_COLOR_PALETTE`) plus the standard xterm 256-color cube/grayscale-ramp formulas
-//! for `Color::Indexed` (matching `vendor/zed/crates/terminal/src/terminal.rs`'s
-//! `get_color_at_index`/`rgb_for_index`, since that arithmetic is a public, documented
-//! xterm convention, not something Zed-specific to guess at). A program that repalettes its
-//! own colors via OSC would render with the *default* palette instead, not its customized
-//! one - not attempted here.
+//! `Term::colors` (a palette OSC 4/10/11 sequences can override) starts out entirely `None` and
+//! this module never populates or consults it; named/indexed colors resolve against a fixed,
+//! hardcoded ANSI-16 palette plus the standard xterm 256-color cube/grayscale formulas for
+//! `Color::Indexed` (matching `vendor/zed/crates/terminal/src/terminal.rs`'s
+//! `get_color_at_index`/`rgb_for_index`, a public xterm convention). A program that repalettes
+//! its own colors via OSC renders with the default palette instead.
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::grid::Dimensions;
@@ -77,11 +56,9 @@ use alacritty_terminal::term::cell::{Cell as AlacCell, Flags};
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor, StdSyncHandler};
 
-/// A concrete [`Dimensions`] impl for a fixed rows/cols grid - see the module docs' API
-/// surface section for why `Dimensions` (not a raw `(u16, u16)`) is what `Term::new`/
-/// `Term::resize` require. Scrollback history is intentionally reported as equal to the
-/// visible screen (`total_lines == screen_lines`): this module doesn't expose scrollback
-/// UI (see the module docs), so there is no separate "history size" to report.
+/// A concrete [`Dimensions`] impl for a fixed rows/cols grid. Scrollback history is reported as
+/// equal to the visible screen (`total_lines == screen_lines`) since this module doesn't expose
+/// scrollback UI (see the module docs).
 #[derive(Debug, Clone, Copy)]
 struct GridSize {
     rows: usize,
@@ -102,8 +79,8 @@ impl Dimensions for GridSize {
     }
 }
 
-/// A no-op [`EventListener`] - see the module docs' API surface section for why dropping
-/// every event is a deliberate choice here, not a stub standing in for missing behavior.
+/// A no-op [`EventListener`] - see the module docs' API surface section for why dropping every
+/// event is deliberate here, not a stub for missing behavior.
 #[derive(Debug, Clone, Copy)]
 struct NoopEventListener;
 
@@ -111,10 +88,9 @@ impl EventListener for NoopEventListener {
     fn send_event(&self, _event: AlacEvent) {}
 }
 
-/// One rendered grid cell: a real character plus the styling attributes this pane's
-/// renderer draws (color, bold, italic, underline, strikethrough). Colors are already
-/// resolved to concrete RGB triples (see [`resolve_color`]) so the renderer never needs to
-/// touch `alacritty_terminal` types directly.
+/// One rendered grid cell: a character plus the styling attributes this pane's renderer draws.
+/// Colors are already resolved to concrete RGB triples (see [`resolve_color`]) so the renderer
+/// never touches `alacritty_terminal` types directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GridCell {
     pub c: char,
@@ -126,17 +102,14 @@ pub struct GridCell {
     pub strikethrough: bool,
 }
 
-/// Default foreground/background, used both for `NamedColor::Foreground`/`Background` and
-/// as this pane's own rendering background - matches step 3's `TerminalPane` colors
-/// (`rgb(0xd4d4d4)` on `rgb(0x1e1e1e)`) so switching to real grid rendering didn't also
-/// silently change the pane's look.
+/// Default foreground/background, used both for `NamedColor::Foreground`/`Background` and this
+/// pane's own rendering background - matches step 3's `TerminalPane` colors (`rgb(0xd4d4d4)` on
+/// `rgb(0x1e1e1e)`).
 pub const DEFAULT_FOREGROUND: (u8, u8, u8) = (0xd4, 0xd4, 0xd4);
 pub const DEFAULT_BACKGROUND: (u8, u8, u8) = (0x1e, 0x1e, 0x1e);
 
-/// The standard ANSI 16-color palette (VS Code's default terminal theme values - a common,
-/// well-tested set of 16 ANSI colors chosen for readability on a dark background, matching
-/// this pane's own `DEFAULT_BACKGROUND`). Indexed `0..=15` by `NamedColor`'s own
-/// discriminants / `Color::Indexed(0..=15)`.
+/// The standard ANSI 16-color palette (VS Code's default terminal theme values), indexed
+/// `0..=15` by `NamedColor`'s own discriminants / `Color::Indexed(0..=15)`.
 const NAMED_COLOR_PALETTE: [(u8, u8, u8); 16] = [
     (0x00, 0x00, 0x00), // 0 black
     (0xcd, 0x31, 0x31), // 1 red
@@ -156,8 +129,8 @@ const NAMED_COLOR_PALETTE: [(u8, u8, u8); 16] = [
     (0xff, 0xff, 0xff), // 15 bright white
 ];
 
-/// Halves each channel - used for `NamedColor`'s `Dim*` variants, which have no fixed
-/// standard RGB value the way the base 16 colors do.
+/// Halves each channel - used for `NamedColor`'s `Dim*` variants, which have no fixed standard
+/// RGB value the way the base 16 colors do.
 fn dim(color: (u8, u8, u8)) -> (u8, u8, u8) {
     (color.0 / 2, color.1 / 2, color.2 / 2)
 }
@@ -195,11 +168,9 @@ fn named_color_rgb(name: NamedColor) -> (u8, u8, u8) {
     }
 }
 
-/// The standard xterm 256-color cube (indices `16..=231`) and grayscale ramp
-/// (`232..=255`) formulas - matches `vendor/zed/crates/terminal/src/terminal.rs`'s
-/// `get_color_at_index`/`rgb_for_index` (a public xterm convention:
-/// https://github.com/xterm-x11/xterm-snapshots/blob/master/256colres.pl - Zed's own
-/// comment cites the same source).
+/// The standard xterm 256-color cube (indices `16..=231`) and grayscale ramp (`232..=255`)
+/// formulas - matches `vendor/zed/crates/terminal/src/terminal.rs`'s `get_color_at_index`/
+/// `rgb_for_index` (a public xterm convention, cited from the same source there).
 fn indexed_color_rgb(index: u8) -> (u8, u8, u8) {
     match index {
         0..=15 => NAMED_COLOR_PALETTE[index as usize],
@@ -236,10 +207,9 @@ fn grid_cell_from_alacritty(cell: &AlacCell, is_cursor: bool) -> GridCell {
         std::mem::swap(&mut fg, &mut bg);
     }
     GridCell {
-        // A real, uninitialized-by-any-write cell holds `'\0'` (see `Cell::default()` in
-        // `term/cell.rs`, `c: ' '` there is only the *constructed* default, not what a
-        // cleared cell necessarily holds after grid resizes/erases in practice) - render as
-        // a space either way.
+        // An uninitialized-by-any-write cell holds `'\0'` (`Cell::default()` in
+        // `term/cell.rs` uses `c: ' '` only as the *constructed* default) - render as a
+        // space either way.
         c: if cell.c == '\0' { ' ' } else { cell.c },
         fg,
         bg,
@@ -250,10 +220,9 @@ fn grid_cell_from_alacritty(cell: &AlacCell, is_cursor: bool) -> GridCell {
     }
 }
 
-/// A real `alacritty_terminal::Term`-backed grid: real bytes from a genuinely running child
-/// process (via `pty-core`, fed in through [`TerminalGrid::append_bytes`]) are parsed as
-/// real ANSI/VT100 and land in a real cursor-addressed grid - nothing here is a simulated
-/// or canned rendering.
+/// An `alacritty_terminal::Term`-backed grid: bytes from a running child process (via
+/// `pty-core`, fed in through [`TerminalGrid::append_bytes`]) are parsed as real ANSI/VT100 and
+/// land in a real cursor-addressed grid.
 pub struct TerminalGrid {
     term: Term<NoopEventListener>,
     processor: Processor<StdSyncHandler>,
@@ -278,19 +247,16 @@ impl TerminalGrid {
         }
     }
 
-    /// Feeds a chunk of raw bytes read from the pty into the real VT100 parser
-    /// (`Processor::advance`), which drives the real `Term` grid state (cursor movement,
-    /// SGR colors, screen clears, etc.) - see the module docs' API surface section.
+    /// Feeds a chunk of raw pty bytes into the VT100 parser (`Processor::advance`), which
+    /// drives the real `Term` grid state (cursor movement, SGR colors, screen clears, etc.).
     pub fn append_bytes(&mut self, bytes: &[u8]) {
         self.processor.advance(&mut self.term, bytes);
     }
 
-    /// Resizes the grid to match a new pty size. Must be called alongside
-    /// `PtySession::resize` (see `crate::terminal_pane::maybe_resize_pty`) - the two are
-    /// separate real resizes (one tells the child process's `ioctl(TIOCSWINSZ)`, this one
-    /// resizes the local grid this module renders from) that need to stay in sync, or the
-    /// rendered grid's geometry would silently diverge from what the child process believes
-    /// its terminal size is.
+    /// Resizes the grid to match a new pty size. Must be called alongside `PtySession::resize`
+    /// (see `crate::terminal_pane::maybe_resize_pty`) - the two are separate resizes that need
+    /// to stay in sync, or the rendered grid's geometry would diverge from what the child
+    /// process believes its terminal size is.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.size = GridSize {
             rows: rows.max(1) as usize,
@@ -303,34 +269,25 @@ impl TerminalGrid {
         self.ended = true;
     }
 
-    /// The real, current `(cols, rows)` this grid's `Term` is sized to - `crate::terminal_pane`'s
-    /// info footer's own `148×38`-style display (`design_handoff_jerry_ade/revision/
-    /// CHANGELOG.md`'s 2026-07-29 entry, change 5). Already a known, tracked fact
-    /// ([`Self::resize`] is the only place [`Self::size`] ever changes) - this just exposes it
-    /// rather than recomputing it from anything.
+    /// The current `(cols, rows)` this grid's `Term` is sized to - backs
+    /// `crate::terminal_pane`'s info footer `148×38`-style display.
     pub fn dimensions(&self) -> (u16, u16) {
         (self.size.cols as u16, self.size.rows as u16)
     }
 
-    /// A real terminal "clear" - erases the visible screen *and* the scrollback `Term` itself
-    /// retains internally (`ClearMode::Saved`, per the module docs' "Scope cut: no scrollback
-    /// UI" - this app never surfaces that scrollback as UI, but `Term` still holds it, and a
-    /// real clear should drop it too, the same as pressing `clear`/Ctrl-L would leave nothing
-    /// to scroll back into even if this app grew scrollback UI later), then homes the cursor.
-    /// Implemented as real ANSI bytes fed through the exact same [`Self::append_bytes`] path
-    /// every other byte this grid ever renders goes through (`\x1b[3J` erase saved lines,
-    /// `\x1b[2J` erase the visible screen, `\x1b[H` home the cursor - the same real sequence a
-    /// shell's own `clear`/`tput reset` emits) rather than reaching into `alacritty_terminal`'s
-    /// `Term`/`Handler` API directly: one real, already-tested code path, not a second one.
+    /// Erases the visible screen *and* the scrollback `Term` retains internally
+    /// (`ClearMode::Saved` - this app never surfaces that scrollback as UI, but `Term` still
+    /// holds it, and a real clear should drop it too), then homes the cursor. Implemented as
+    /// real ANSI bytes through the same [`Self::append_bytes`] path every other byte goes
+    /// through (`\x1b[3J` erase saved lines, `\x1b[2J` erase the visible screen, `\x1b[H` home
+    /// the cursor - the same sequence a shell's own `clear`/`tput reset` emits).
     pub fn clear(&mut self) {
         self.append_bytes(b"\x1b[3J\x1b[2J\x1b[H");
     }
 
-    /// A snapshot of the currently *visible* grid (`rows.len() == screen_lines`, each row
-    /// has exactly `columns` cells) - the real, cursor-addressed terminal state, not a
-    /// scrolling text log. The cell at the cursor's current position (if the cursor is
-    /// visible) has its fg/bg swapped, so the renderer doesn't need to separately overlay a
-    /// cursor glyph.
+    /// A snapshot of the currently visible grid (`rows.len() == screen_lines`, each row has
+    /// exactly `columns` cells). The cell at the cursor's current position (if visible) has its
+    /// fg/bg swapped, so the renderer doesn't need to separately overlay a cursor glyph.
     pub fn visible_rows(&self) -> Vec<Vec<GridCell>> {
         let content = self.term.renderable_content();
         let cursor_point =
@@ -342,8 +299,8 @@ impl TerminalGrid {
 
         for indexed in content.display_iter {
             if indexed.point.line.0 < 0 {
-                // Shouldn't happen at `display_offset == 0` (see the module docs), but
-                // guard defensively rather than panicking on an unexpected negative index.
+                // Shouldn't happen at `display_offset == 0` (see the module docs), but guard
+                // defensively rather than panicking on an unexpected negative index.
                 continue;
             }
             let Some(row) = rows.get_mut(indexed.point.line.0 as usize) else {
@@ -374,9 +331,9 @@ mod tests {
         assert!(row_text(&rows[0]).starts_with("hello"));
     }
 
-    /// The key proof that this is *real* cursor-addressed grid emulation rather than a
-    /// plain-text scan: a cursor-positioning CSI sequence (`ESC [ row ; col H`) must place
-    /// text at that exact cell, not just append it to a growing line.
+    /// The key proof that this is real cursor-addressed grid emulation rather than a plain-text
+    /// scan: a cursor-positioning CSI sequence (`ESC [ row ; col H`) must place text at that
+    /// exact cell, not just append it to a growing line.
     #[test]
     fn cursor_positioning_places_text_at_the_addressed_cell() {
         let mut grid = TerminalGrid::new(5, 20);
@@ -390,9 +347,8 @@ mod tests {
         assert_eq!(rows[2][3].c, ' ');
     }
 
-    /// A second CSI-positioned write to an *earlier* cell must overwrite in place, not
-    /// append after the first - this is exactly the "redraw in place" behavior a plain-text
-    /// scan (step 3's `ansi::TerminalBuffer`) could not represent at all.
+    /// A second CSI-positioned write to an earlier cell must overwrite in place, not append
+    /// after the first - "redraw in place" behavior step 3's plain-text scan couldn't represent.
     #[test]
     fn redrawing_at_an_earlier_position_overwrites_in_place() {
         let mut grid = TerminalGrid::new(5, 20);
@@ -475,8 +431,8 @@ mod tests {
     }
 
     /// End-to-end through a genuinely spawned process on a real pty (via `pty_core::spawn`)
-    /// using real cursor-positioning output (`tput cup`), the same spirit as `ansi.rs`'s own
-    /// end-to-end regression test but proving grid *addressing*, not just line commits.
+    /// using real cursor-positioning output (`tput cup`), proving grid *addressing*, not just
+    /// line commits.
     #[test]
     fn end_to_end_real_pty_cursor_positioning_lands_correctly() {
         // `printf` with a real CUP escape sequence: move to row 2 col 3, print "OK".

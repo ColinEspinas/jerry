@@ -9,11 +9,9 @@ use crate::root::widgets::{
 };
 
 impl AdeApp {
-    /// Loads (or reloads) the real diff of `root` against its detected base branch, per
-    /// `wt_core::diff`'s docs. Offloaded to `cx.background_executor()` for the same reason
-    /// `load_worktrees`/`load_file_tree` are: `diff_against_base` performs blocking I/O
-    /// (`gix` reads plus a spawned `git diff` child process) and must never run on the GPUI
-    /// foreground thread.
+    /// Loads (or reloads) the diff of `root` against its detected base branch. Runs on
+    /// `cx.background_executor()` since `diff_against_base` does blocking I/O (gix reads plus a
+    /// spawned `git diff` process) and must not run on the GPUI foreground thread.
     pub(super) fn load_diff(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.diff_root = root.clone();
         self.diff_state = DiffLoadState::Loading;
@@ -25,10 +23,8 @@ impl AdeApp {
                 .spawn({
                     let root = root.clone();
                     async move {
-                        // The `+n`/`-n` header totals (`Self::diff_totals`) are folded here,
-                        // off the UI thread, right alongside the diff itself becoming
-                        // available - not recomputed on every render (see `diff_totals`'s
-                        // docs for the real per-frame cost that used to be).
+                        // Fold the +n/-n totals here, off the UI thread, rather than
+                        // recomputing them on every render.
                         wt_core::diff::diff_against_base(&root).map(|base| {
                             let totals = match &base {
                                 DiffBase::Diff(diff) => Some(diff.files.iter().fold(
@@ -56,17 +52,10 @@ impl AdeApp {
                         this.diff_totals = None;
                     }
                 }
-                // A freshly (re)loaded diff may have changed - or stopped having - a real
-                // `DiffFile` for whichever path `open_change` currently names (e.g. an agent
-                // just touched the very file already open in Surface C). Refresh the cache
-                // `Self::render_center_pane` reads instead of leaving it pointed at the
-                // previous diff's now-stale entry until the next unrelated navigation event
-                // happens to refresh it.
+                // The reloaded diff may have changed whether `open_change`'s path has a
+                // `DiffFile`, so refresh the cache immediately rather than leaving it stale.
                 this.refresh_open_diff_file_cache();
-                // The palette's cached file-candidate list (`Self::palette_file_candidates`)
-                // carries each file's real add/del/changed marks from the current diff - refresh
-                // it here too, the other real point that input changes (see
-                // `Self::rebuild_palette_file_candidates`'s docs).
+                // The palette's file-candidate list also carries diff marks; rebuild it too.
                 this.rebuild_palette_file_candidates();
                 cx.notify();
             });
@@ -74,24 +63,16 @@ impl AdeApp {
         self._load_diff_task = Some(task);
     }
 
-    /// Pushes `path` onto [`Self::open_files`] (in "open order", at the end) if it isn't already
-    /// present - the one real place every source that can open a file tab
-    /// ([`Self::open_change_diff`], [`Self::open_file_view`]) records it in the tab list, so none
-    /// of them can independently forget to and let the tab strip silently disagree with which
-    /// files [`Self::open_change`] can actually point at. Reopening an already-open file (a
-    /// second click on the same Changes row, or a palette/go-to-definition hit on a file that
-    /// already has a tab) is a real no-op here - it doesn't duplicate the tab, only
-    /// [`Self::open_change`] itself moves.
+    /// Appends `path` to [`Self::open_files`] if not already present. The shared entry point for
+    /// every source that opens a file tab, so the tab list can't drift from what `open_change`
+    /// points at.
     fn push_open_file(&mut self, path: &Path) {
         if !self.open_files.iter().any(|open| open.as_path() == path) {
             self.open_files.push(path.to_path_buf());
         }
     }
 
-    /// Opens `path`'s real diff in the centre pane - the Changes row's own click handler
-    /// (`design_handoff_jerry_ade/README.md`: "clicking a change row sets ... open_change =
-    /// row"). See [`Self::open_change`]'s docs for what this actually swaps in, and
-    /// [`Self::push_open_file`]'s for the real tab-list bookkeeping this now also does.
+    /// Opens `path`'s diff in the centre pane (the Changes row click handler).
     pub(super) fn open_change_diff(
         &mut self,
         path: PathBuf,
@@ -104,19 +85,12 @@ impl AdeApp {
         self.code_view = code_view::CodeView::Diff;
         self.restore_zoom_for_open_change(&path);
         self.refresh_open_diff_file_cache();
-        // See `Self::select_worktree`'s identical reset for why: a Hover card is only ever real
-        // for the file it was requested against.
+        // A hover card is only valid for the file it was requested against.
         self.hover = None;
         cx.notify();
     }
 
-    /// Opens `path` (a real file on disk, from a real Files-tree row click) directly in Surface
-    /// C's real File view - `design_handoff_jerry_ade/README.md`'s Files tree never gave
-    /// individual file rows a click handler of their own before this phase (only directories, to
-    /// collapse/expand - see [`Self::toggle_dir_collapsed`]). This is this phase's own documented
-    /// trigger for reaching the File view from real navigation, alongside the Changes row's
-    /// (`[`Self::open_change_diff`]) `Diff | File` toggle for files that already have a diff -
-    /// see this crate's report for the judgment call.
+    /// Opens `path` directly in Surface C's File view (the Files-tree row click handler).
     pub(super) fn open_file_view(
         &mut self,
         path: PathBuf,
@@ -125,11 +99,8 @@ impl AdeApp {
     ) {
         self.prune_confirm_armed = false;
         self.focus_code_surface(window, cx);
-        // Every fresh File view open clears any stale `pending_cursor_line` left over from an
-        // abandoned navigation (see that field's own docs for the real cross-file leak this
-        // closes) - `Self::navigate_to_definition` re-sets a fresh, correct one right after this
-        // call returns when it actually has a target line to apply, so this can never fight a
-        // real, live navigation in progress.
+        // Clear any stale pending cursor line from an abandoned navigation;
+        // `navigate_to_definition` re-sets it right after this if it has a target line.
         self.pending_cursor_line = None;
         let relative = path
             .strip_prefix(&self.file_tree_root)
@@ -146,34 +117,19 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Activates a file tab (the unified tab strip's own click handler for a file tab's hit row -
-    /// `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change 4), as opposed
-    /// to [`Self::open_change_diff`]/[`Self::open_file_view`], which are for *opening* a file
-    /// that might not have a tab yet. Calls [`Self::push_open_file`] itself (idempotent, so a
-    /// caller that already pushed - the tab strip's own click handler - pays nothing extra) so
-    /// `Self::open_change` can never be pointed at a path `Self::open_files` doesn't actually
-    /// list, a structural invariant rather than one only the one real caller happens to uphold.
+    /// Activates a file tab (the tab strip's click handler), as opposed to
+    /// [`Self::open_change_diff`]/[`Self::open_file_view`], which open a file that may not have a
+    /// tab yet. Calls [`Self::push_open_file`] itself so `open_change` can never point at a path
+    /// missing from `open_files`.
     ///
-    /// ## Real per-tab view restore
+    /// Switching to a different tab with a diff resets [`Self::code_view`] to `Diff`, matching a
+    /// freshly opened changed file, rather than inheriting whatever `Diff`/`File` toggle state a
+    /// different file left `code_view` in (it's a single global field, not per-tab).
     ///
-    /// Switching to a *different* tab that has a real diff available sets [`Self::code_view`]
-    /// back to `Diff` - matching what a freshly opened changed file already gets via
-    /// [`Self::open_change_diff`] - rather than silently inheriting whatever `Diff`/`File` toggle
-    /// state a completely different file happened to leave [`Self::code_view`] in (a real, live
-    /// bug: `code_view` is one global field, not per-tab, so opening a plain file in `File` view
-    /// and then switching back to an already-diffed tab used to incorrectly keep showing `File`).
-    /// A file with no real diff has nothing to restore either way - [`Self::render_code_surface`]'s
-    /// own `effective_view` already forces `File` for it regardless of `code_view`.
-    ///
-    /// ## Re-activating an already-"active" tab is not always a real no-op
-    ///
-    /// A file tab can be "active" (`Self::open_change == Some(path)`) without actually being
-    /// *shown* - e.g. its diff disappeared after the underlying change was reverted, so
-    /// [`Self::render_center_pane`]'s own `has_diff_or_file_view` check falls back to rendering
-    /// the active session instead, while the tab strip still paints that file tab as active.
-    /// Re-clicking such a tab must still be a real action, not a dead no-op: this falls back to
-    /// `code_view = File`, which - per that same `has_diff_or_file_view` check - always has real
-    /// content to show.
+    /// Re-clicking the already-"active" tab is not always a no-op: the tab can be active without
+    /// being shown (e.g. its diff disappeared after a revert, so [`Self::render_center_pane`]
+    /// falls back to the active session while the tab strip still marks it active). That case
+    /// falls back to `code_view = File`, which always has content to show.
     pub(super) fn activate_file_tab(
         &mut self,
         path: PathBuf,
@@ -206,18 +162,10 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Closes file tab `path` for real - removes it from [`Self::open_files`], not just from
-    /// view (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change 4: each
-    /// file tab's own 15×15 `×` hit box). If `path` was the active tab, activates a sensible
-    /// neighbor: the tab that was immediately to its right, else the one to its left, else - no
-    /// tabs left at all - falls back to the active session's terminal, restoring real keyboard
-    /// focus the same way [`Self::close_settings`] does and for the same documented reason (see
-    /// [`Self::code_focus_handle`]'s own docs for the bug that fixes). Closing a tab that *isn't*
-    /// active is a real no-op beyond removing it from the list - whichever tab (or session) was
-    /// showing keeps showing, unchanged.
-    ///
-    /// A real no-op if `path` isn't actually an open tab (e.g. a stale/duplicate click) - nothing
-    /// here assumes the caller already checked membership.
+    /// Closes file tab `path`, removing it from [`Self::open_files`] (the tab's `×` hit box). If
+    /// `path` was the active tab, activates the neighbor to its right, else the one to its left,
+    /// else falls back to the active session's terminal (restoring focus like
+    /// [`Self::close_settings`] does). No-op if `path` isn't an open tab.
     pub(super) fn close_file_tab(
         &mut self,
         path: PathBuf,
@@ -228,24 +176,14 @@ impl AdeApp {
             return;
         };
         self.open_files.remove(index);
-        // A closed tab's own remembered per-tab zoom (`Self::file_zoom_percent`) must not
-        // outlive the tab itself - without this, reopening the exact same path later would
-        // resurrect whatever stale zoom this tab happened to be left at, silently violating
-        // `Self::restore_zoom_for_open_change`'s own documented "a never-zoomed tab starts at
-        // the real 100% default" contract (a *closed-then-reopened* path is, from the user's
-        // perspective, indistinguishable from one that was never zoomed - it has no open tab
-        // remembering anything about it anymore). Also bounds this map's real growth: without
-        // this, it would otherwise accumulate one entry per distinct path ever zoomed for the
-        // whole worktree session, only ever cleared on a full worktree switch
-        // (`reset_per_worktree_ui_state`).
+        // Drop the closed tab's remembered zoom too, so reopening the same path later starts
+        // fresh at the 100% default instead of resurrecting a stale value, and so this map
+        // doesn't grow unbounded for the life of the worktree session.
         self.file_zoom_percent.remove(&path);
         let was_active = self.open_change.as_deref() == Some(path.as_path());
         if was_active {
-            // After `Vec::remove`, whatever was immediately to the right of the closed tab (if
-            // any) has shifted down into this same index - checked first, per the design's own
-            // "prefer the tab to the right" rule; falling back to the one now at `index - 1` (the
-            // real left neighbor, untouched by the removal) only when there's nothing to the
-            // right.
+            // After removal, the tab that was to the right (if any) has shifted into `index`;
+            // fall back to `index - 1` only if there's nothing there.
             let neighbor = self.open_files.get(index).cloned().or_else(|| {
                 index
                     .checked_sub(1)
@@ -270,39 +208,28 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Closes the centre's currently *active* file tab (`Self::open_change`, if any) - the
-    /// diff/file surface's own real "× close" toolbar affordance
-    /// (`Self::render_code_surface`'s toolbar, kept as a real, still-distinct-from-the-tab-strip
-    /// affordance per `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change
-    /// 4). Delegates to [`Self::close_file_tab`] - the exact same real "remove from
-    /// `open_files`, activate a sensible neighbor or fall back to the active session" behavior a
-    /// click on the tab's own `×` performs, so this app never has two different, silently
-    /// diverging ideas of what "close" means for a file. A real no-op if nothing is active.
+    /// Closes the currently active file tab, if any (the code surface toolbar's own "× close",
+    /// distinct from the tab strip's). Delegates to [`Self::close_file_tab`] so both affordances
+    /// share the same close behavior.
     pub(super) fn close_change_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = self.open_change.clone() {
             self.close_file_tab(path, window, cx);
         }
     }
 
-    /// Real editor-zoom minimum/maximum/step (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s
-    /// 2026-07-29 entry, change 6: "Range 70-200 in steps of 10") and default (100%, the real
-    /// `Settings.appearance.editor_font_size` baseline unchanged).
+    /// Editor-zoom range (70-200%, in steps of 10) and default (100%).
     pub(super) const ZOOM_MIN_PERCENT: u16 = 70;
     pub(super) const ZOOM_MAX_PERCENT: u16 = 200;
     pub(super) const ZOOM_STEP_PERCENT: u16 = 10;
     pub(super) const ZOOM_DEFAULT_PERCENT: u16 = 100;
 
-    /// The real effective rem size (in pixels) the code surface's zoom-scoped subtree renders
-    /// its `rems()`-based text at - `Settings.appearance.editor_font_size` (the real, persisted
-    /// 100%-zoom baseline this phase unifies with, rather than a second, disconnected constant)
-    /// times [`Self::code_zoom_percent`] as a fraction. A cheap arithmetic read of two
-    /// already-loaded fields, not a recomputation from scratch - see the module-level
-    /// performance discipline this codebase's audits keep enforcing.
+    /// The effective rem size (px) the zoom-scoped code surface renders `rems()`-based text at:
+    /// `editor_font_size` times [`Self::code_zoom_percent`] as a fraction.
     pub(super) fn effective_code_rem_px(&self) -> f32 {
         self.settings.appearance.editor_font_size * (self.code_zoom_percent as f32 / 100.0)
     }
 
-    /// Zooms in one real step - the toolbar's `+` button.
+    /// Zooms in one step (the toolbar `+` button).
     pub(super) fn zoom_in(&mut self, cx: &mut Context<Self>) {
         self.set_code_zoom(
             clamp_zoom_percent(self.code_zoom_percent as i32 + Self::ZOOM_STEP_PERCENT as i32),
@@ -310,7 +237,7 @@ impl AdeApp {
         );
     }
 
-    /// Zooms out one real step - the toolbar's `−` button.
+    /// Zooms out one step (the toolbar `−` button).
     pub(super) fn zoom_out(&mut self, cx: &mut Context<Self>) {
         self.set_code_zoom(
             clamp_zoom_percent(self.code_zoom_percent as i32 - Self::ZOOM_STEP_PERCENT as i32),
@@ -318,20 +245,14 @@ impl AdeApp {
         );
     }
 
-    /// Resets zoom to 100% - the toolbar's real "click the value to reset" affordance
-    /// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 6: "the value is ... and
-    /// click resets to 100%").
+    /// Resets zoom to 100% (clicking the toolbar's zoom value).
     pub(super) fn reset_zoom(&mut self, cx: &mut Context<Self>) {
         self.set_code_zoom(Self::ZOOM_DEFAULT_PERCENT, cx);
     }
 
-    /// The one real place [`Self::code_zoom_percent`] is ever written to by a user action -
-    /// [`Self::zoom_in`]/[`Self::zoom_out`]/[`Self::reset_zoom`] all delegate here. When
-    /// `Settings.appearance.per_tab_zoom` is on, also remembers `percent` against whichever
-    /// file [`Self::open_change`] currently names in [`Self::file_zoom_percent`], so switching
-    /// away and back restores it (`Self::restore_zoom_for_open_change`); when it's off, this is
-    /// the one shared value every open file already reads, so there is nothing further to
-    /// remember per-file.
+    /// The single place [`Self::code_zoom_percent`] is written by a user action; `zoom_in`/
+    /// `zoom_out`/`reset_zoom` all delegate here. When `per_tab_zoom` is on, also remembers
+    /// `percent` per-file in [`Self::file_zoom_percent`] so switching tabs restores it.
     fn set_code_zoom(&mut self, percent: u16, cx: &mut Context<Self>) {
         self.code_zoom_percent = percent;
         if self.settings.appearance.per_tab_zoom {
@@ -342,16 +263,9 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Restores [`Self::code_zoom_percent`] for whichever file [`Self::open_change`] now names -
-    /// called at every real point that field is pointed at a (possibly different) file:
-    /// [`Self::open_change_diff`], [`Self::open_file_view`], [`Self::activate_file_tab`]'s
-    /// real tab-switch branch, and [`Self::close_file_tab`]'s neighbor-activation branch.
-    /// Mirrors [`Self::activate_file_tab`]'s own "switching tabs restores that tab's Diff/File
-    /// view state" real per-tab-state pattern (see that method's docs), applied to zoom instead
-    /// of the view toggle: when `Settings.appearance.per_tab_zoom` is on, looks up `path`'s own
-    /// remembered zoom in [`Self::file_zoom_percent`], defaulting a never-zoomed tab to 100%;
-    /// when it's off, leaves [`Self::code_zoom_percent`] exactly as it was, since every open
-    /// file is meant to share that one value uniformly in that mode.
+    /// Restores [`Self::code_zoom_percent`] for `path`, called wherever `open_change` is pointed
+    /// at a (possibly different) file. When `per_tab_zoom` is on, looks up `path`'s remembered
+    /// zoom, defaulting a never-zoomed tab to 100%; when off, leaves the shared value untouched.
     pub(super) fn restore_zoom_for_open_change(&mut self, path: &Path) {
         if self.settings.appearance.per_tab_zoom {
             self.code_zoom_percent = self
@@ -362,12 +276,9 @@ impl AdeApp {
         }
     }
 
-    /// Recomputes [`Self::open_diff_file_cache`] (and, since it depends only on the diff's own
-    /// hunks - never the file's own content - [`Self::file_view_changed_lines`] alongside it)
-    /// from [`Self::open_change`] and [`Self::current_diff`]. Called at every real point either
-    /// input can actually change (a different file opened or closed, or the diff itself
-    /// (re)loading) - never from a render method. See [`Self::open_diff_file_cache`]'s own docs
-    /// for the per-render `DiffFile` clone this exists to avoid.
+    /// Recomputes [`Self::open_diff_file_cache`] (and [`Self::file_view_changed_lines`] with it)
+    /// from [`Self::open_change`] and [`Self::current_diff`]. Called whenever either input
+    /// changes; never from a render method, to avoid a per-render `DiffFile` clone.
     pub(super) fn refresh_open_diff_file_cache(&mut self) {
         self.open_diff_file_cache = match (&self.open_change, self.current_diff()) {
             (Some(open_path), Some(diff)) => diff
@@ -384,14 +295,10 @@ impl AdeApp {
             .unwrap_or_default();
     }
 
-    /// Dispatches a real, off-foreground-thread `code_view::load_file` call for `path` - see
-    /// [`FileLoadState`]'s own docs for exactly why this must never run inline during `render()`.
-    /// Mirrors [`Self::load_diff`]'s exact shape: mark the state `Loading` and `cx.notify()`
-    /// immediately (so the very next render shows a real, honest loading state rather than
-    /// silently doing nothing until the background task resolves), hand the actual blocking work
-    /// to `cx.background_executor()`, then write the real outcome back into
-    /// [`Self::file_view_cache`]/[`Self::file_load_state`] from a `this.update(cx, ..)` callback
-    /// once it resolves, back on the foreground thread.
+    /// Dispatches a background `code_view::load_file` call for `path` (must never run inline
+    /// during `render()`; see [`FileLoadState`]'s docs). Mirrors [`Self::load_diff`]'s shape: mark
+    /// `Loading` and notify immediately, run the blocking work on `cx.background_executor()`, then
+    /// write the outcome back into [`Self::file_view_cache`]/[`Self::file_load_state`].
     pub(super) fn spawn_file_load(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.file_load_state = FileLoadState::Loading(path.clone());
         cx.notify();
@@ -407,15 +314,9 @@ impl AdeApp {
                 match result {
                     Ok(parsed) => {
                         this.file_view_cache = Some(parsed);
-                        // A real go-to-definition navigation (`Self::navigate_to_definition`) may
-                        // have left a real target line waiting specifically for *this* file's
-                        // load to finish - apply it instead of the ordinary "just-opened, start
-                        // at line 1" default, but only when it actually names the file that just
-                        // finished loading. See `Self::pending_cursor_line`'s own docs for the
-                        // real cross-file cursor leak this path check closes: without it, an
-                        // unrelated file's completed load could apply a stale target line left
-                        // behind by an earlier, since-abandoned navigation into a *different*
-                        // file.
+                        // A pending go-to-definition target line applies only if it names the
+                        // file that just finished loading, so an unrelated file's load can't
+                        // apply a stale target left over from an abandoned navigation.
                         let target_line = match &this.pending_cursor_line {
                             Some((pending_path, line)) if pending_path == &path => Some(*line),
                             _ => None,
@@ -431,9 +332,8 @@ impl AdeApp {
                     Err(error) => {
                         this.file_load_state =
                             FileLoadState::Error(path.clone(), error.to_string());
-                        // A real read failure must not leave a stale target line around to
-                        // misapply onto whatever unrelated file loads successfully next - see
-                        // `Self::pending_cursor_line`'s own docs.
+                        // Don't leave a stale target line to misapply onto the next file that
+                        // loads successfully.
                         this.pending_cursor_line = None;
                     }
                 }
@@ -443,40 +343,18 @@ impl AdeApp {
         self._file_load_task = Some(task);
     }
 
-    /// Real click-to-hover trigger for Surface C's File view (`design_handoff_jerry_ade/
-    /// README.md`'s Hover state) - `crate::root::render_file_view_line`'s own per-token click
-    /// handler calls this with `absolute_path` (the real, currently-open `.rs` file),
-    /// `line_number`/`byte_range` (the real, 1-based line and in-line byte span of whichever
-    /// already-highlighted token was clicked), and `position` (the same click's real LSP
-    /// `Position`, already computed by `hover_view::position_for_line_byte_offset` from that same
-    /// byte range - computed once at the render/click site rather than re-derived here).
+    /// Click-to-hover trigger for Surface C's File view. `absolute_path`/`line_number`/
+    /// `byte_range` identify the clicked token; `position` is the corresponding LSP `Position`,
+    /// already computed at the click site.
     ///
-    /// ## Judgment call: click, not mouse-hover
+    /// Triggered by click, not mouse-hover: this app has no per-pixel hover-position tracking,
+    /// and building it (a debounced `.on_mouse_move` translated back to a token/byte position)
+    /// would be substantial infrastructure out of proportion to what this read-only viewer needs.
     ///
-    /// The design's own Hover state is triggered by a real mouse-hover; this app has no
-    /// mouse-hover-position tracking against individual code tokens (only `on_click`, the same
-    /// interaction model `Self::render_file_view_line`'s existing line-level `code_cursor` click
-    /// already established, and the one `crate::diagnostics_view`'s own H2 report already used
-    /// for the equivalent judgment call on the Diagnostic state's card). Building real
-    /// per-pixel hover-tracking machinery (a `.on_mouse_move` handler translated back into a
-    /// token/byte position on every real mouse movement over the code view, debounced so it
-    /// doesn't flood `rust-analyzer` with a request per pixel) would be a substantial, novel
-    /// piece of infrastructure for this phase alone - out of proportion to what the rest of this
-    /// read-only viewer needs, and not otherwise motivated by anything else in this app. A click
-    /// is a real, deliberate, unambiguous "tell me about this symbol" action, consistent with
-    /// every other real interaction this viewer already has.
-    ///
-    /// ## Caching: never re-requests for the same real click
-    ///
-    /// A no-op (no new request dispatched, [`Self::hover`] left untouched) when
-    /// `(absolute_path, line_number, byte_range)` already matches [`Self::hover`]'s current entry,
-    /// the same "don't redo real work every frame/every re-click" discipline
-    /// [`Self::file_view_cache`]'s own docs establish for the parse cache, applied here to a real
-    /// network-equivalent (a real `rust-analyzer` round trip) request instead of a real parse.
-    /// Runs the real request on `cx.background_executor()`, never inline: `lsp_core::client`'s
-    /// own docs are explicit that [`lsp_core::LspClient::request`] blocks the calling thread for
-    /// a real response, which must never be the GPUI foreground thread (the exact rule this
-    /// project's own H1/H2 reports both had to fix a real violation of).
+    /// No-ops if `(absolute_path, line_number, byte_range)` already matches the current
+    /// [`Self::hover`] entry, so re-clicking the same token doesn't redo an `rust-analyzer` round
+    /// trip. Runs on `cx.background_executor()`, never inline: [`lsp_core::LspClient::request`]
+    /// blocks the calling thread and must not block the GPUI foreground thread.
     pub(super) fn request_hover(
         &mut self,
         absolute_path: PathBuf,
@@ -497,11 +375,7 @@ impl AdeApp {
         let Some(LspClientState::Ready(client)) =
             self.lsp_clients.get(&self.file_tree_root).cloned()
         else {
-            // No real, ready client for this file's root yet (still spawning, failed, or - in
-            // practice unreachable, since only a `.rs` file's click handler ever calls this -
-            // simply never started). There is no real client to ask, so there is honestly
-            // nothing to show; clearing any previous entry rather than leaving a stale one
-            // showing for a click that produced no real new attempt.
+            // No ready LSP client for this root yet; nothing to show, so clear any stale entry.
             self.hover = None;
             cx.notify();
             return;
@@ -540,9 +414,8 @@ impl AdeApp {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                // Only apply this real result if it's still the answer to the *current* real
-                // click - a slower, superseded request finishing after a newer click must never
-                // clobber the newer one's own (possibly still-loading) entry.
+                // Only apply if this is still the answer to the current click - a slower,
+                // superseded request must not clobber a newer one.
                 let still_current = this.hover.as_ref().is_some_and(|entry| {
                     entry.path == absolute_path
                         && entry.line_number == line_number
@@ -568,17 +441,13 @@ impl AdeApp {
                 cx.notify();
             });
         });
-        // A single slot, not an unbounded `Vec` - see `Self::_hover_request_task`'s own docs for
-        // why this is safe (hover has no notion of independent concurrent requests the way
-        // `Self::_goto_definition_tasks` does) and the real thread-starvation bug it closes.
-        // Assigning here drops (and so immediately cancels) any still-in-flight previous request.
+        // A single slot, not a Vec: assigning drops (cancelling) any in-flight previous request.
+        // Unlike `_goto_definition_tasks`, hover requests aren't independently concurrent.
         self._hover_request_task = Some(task);
     }
 
-    /// `F12`'s real handler (`design_handoff_jerry_ade/README.md`'s "`F12 definition` footer") -
-    /// see [`GotoDefinition`]'s own docs for why [`Self::hover`] itself is the real, honest
-    /// source of "which symbol" rather than a separately-tracked target. A real no-op when
-    /// nothing's been clicked yet ([`Self::hover`] is `None`).
+    /// `F12`'s handler. Uses [`Self::hover`] as the source of "which symbol" rather than a
+    /// separately-tracked target. No-op if nothing's been clicked yet.
     pub(super) fn trigger_goto_definition(&mut self, cx: &mut Context<Self>) {
         let Some(hover) = self.hover.as_ref() else {
             return;
@@ -614,8 +483,7 @@ impl AdeApp {
                 })
                 .await;
             let Ok(Some(response)) = result else {
-                // A real timeout/error, or a real "no definition here" (`Ok(None)`) - both
-                // honestly produce no navigation, never a fabricated one.
+                // Timeout, error, or no definition found - either way, no navigation.
                 return;
             };
             let Some((target_uri, target_range)) = hover_view::first_definition_location(&response)
@@ -623,19 +491,15 @@ impl AdeApp {
                 return;
             };
             let Ok(target_path) = lsp_core::LspClient::path_for_uri(&target_uri) else {
-                // A real non-`file://` target (e.g. a virtual macro-expansion buffer) - see
-                // `lsp_core::LspClient::path_for_uri`'s own docs for why this is a real,
-                // reachable "no real navigation possible" case, not an error.
+                // Non-`file://` target (e.g. a virtual macro-expansion buffer): nothing to
+                // navigate to.
                 return;
             };
             let target_line = target_range.start.line as usize + 1;
-            // `Self::navigate_to_definition` needs real `Window` access (to move focus onto
-            // `Self::code_focus_handle` - see that field's own docs) that this background
-            // completion doesn't have directly; `WeakEntity::update_in` gets it anyway, since
-            // `AsyncApp` implements the real `AppContext::with_window` by looking up the window
-            // this entity (a window's own root view) already belongs to - verified against
-            // `vendor/zed/crates/gpui/src/app/async_context.rs`'s own `AsyncApp::with_window` -
-            // rather than requiring the task to have been spawned via `cx.spawn_in` up front.
+            // `navigate_to_definition` needs `Window` access to move focus; `update_in` supplies
+            // it by looking up the window this entity belongs to (see
+            // vendor/zed/crates/gpui/src/app/async_context.rs `AsyncApp::with_window`), without
+            // requiring this task to have been spawned via `cx.spawn_in`.
             let _ = this.update_in(cx, |this, window, cx| {
                 this.navigate_to_definition(target_path, target_line, window, cx);
             });
@@ -643,27 +507,18 @@ impl AdeApp {
         self._goto_definition_tasks.push(task);
     }
 
-    /// Real navigation to a go-to-definition result - `crate::root::AdeApp::trigger_goto_definition`'s
-    /// own completion handler. `absolute_target_path` may name a real file under
-    /// [`Self::file_tree_root`] or a real file entirely outside it (e.g. another crate in a
-    /// workspace `rust-analyzer` can see but this app's own file tree doesn't include) - either
-    /// way, `Self::open_file_view`'s own `strip_prefix` already handles a path that isn't under
-    /// `file_tree_root` by falling back to the path as-is (`Self::render_file_view` resolves
-    /// `file_tree_root.join(relative_path)`, which - `PathBuf::join`'s own real, documented
-    /// behavior - simply becomes `relative_path` again when it's already absolute).
+    /// Navigates to a go-to-definition result. `absolute_target_path` may be under
+    /// [`Self::file_tree_root`] or entirely outside it (e.g. another crate `rust-analyzer` sees);
+    /// either way `Self::open_file_view`'s `strip_prefix` handles it, since `PathBuf::join` with
+    /// an already-absolute path just becomes that path.
     ///
-    /// ## The real cursor-line race this method exists to avoid
+    /// ## Avoiding a cursor-line race
     ///
-    /// [`Self::open_file_view`] alone would land the viewer on the right *file* but not
-    /// necessarily the right *line*: if the target file wasn't already open,
-    /// `Self::render_file_view` dispatches a real background `Self::spawn_file_load`, whose own
-    /// completion handler unconditionally sets `Self::code_cursor` to `1` (the right default for
-    /// every other real navigation into this view - a fresh file-tree/Changes-row click). Setting
-    /// [`Self::code_cursor`] directly here, before that background load has even started, would
-    /// just get silently overwritten back to `1` the instant it finishes. See
-    /// [`Self::pending_cursor_line`]'s own docs for the real one-shot instruction this method
-    /// sets up instead, and `Self::spawn_file_load`'s completion handler for the other half that
-    /// consumes it.
+    /// [`Self::open_file_view`] alone lands on the right file but not the right line: if the file
+    /// wasn't already open, its background load unconditionally sets [`Self::code_cursor`] to 1
+    /// once it completes, which would clobber a line set directly here before the load even
+    /// starts. [`Self::pending_cursor_line`] is the one-shot instruction that survives the load
+    /// instead; `Self::spawn_file_load`'s completion handler consumes it.
     pub(super) fn navigate_to_definition(
         &mut self,
         absolute_target_path: PathBuf,
@@ -672,12 +527,8 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         self.open_file_view(absolute_target_path.clone(), window, cx);
-        // Mirrors `Self::render_file_view`'s own real freshness check exactly (path *and*
-        // `mtime`/`len`, via the same real `code_view::cache_is_fresh`) rather than a plain path
-        // comparison - so this decision and the dispatch-or-not decision
-        // `Self::render_file_view` makes moments later on the very next render can never
-        // disagree (e.g. the target file's cached parse being present but stale because the file
-        // changed on disk since it was last loaded, which a plain path check would miss).
+        // Use the same freshness check (path, mtime, len via `code_view::cache_is_fresh`) that
+        // `render_file_view` uses, so the two decisions can't disagree.
         let metadata = std::fs::metadata(&absolute_target_path).ok();
         let mtime = metadata.as_ref().and_then(|meta| meta.modified().ok());
         let len = metadata.as_ref().map(|meta| meta.len()).unwrap_or(0);
@@ -685,10 +536,8 @@ impl AdeApp {
             code_view::cache_is_fresh(cached, &absolute_target_path, mtime, len)
         });
         if already_fresh {
-            // The target file's real parse is already cached (e.g. navigating to a definition
-            // inside the file already open) - `Self::render_file_view` won't dispatch a real
-            // reload, so its completion handler will never run to consume
-            // `Self::pending_cursor_line`. Apply the real target line directly instead.
+            // Already cached (e.g. navigating within the open file), so render_file_view won't
+            // reload and there's no completion handler to consume `pending_cursor_line`.
             self.code_cursor = Some(one_based_line);
             self.file_view_scroll_handle
                 .scroll_to_item(one_based_line.saturating_sub(1), ScrollStrategy::Center);
@@ -698,27 +547,15 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// The real handler for `crate::terminal_pane::TerminalPaneEvent::OpenPath` - a `mod`-held
-    /// click on a real, detected path/`path:line` link inside a session's terminal output
-    /// (`crate::sessions::Sessions::spawn`'s own real subscription is the one caller). `path`
-    /// is already resolved against the session's own real cwd (see
-    /// `crate::terminal_links::resolve`), never the app's own process cwd. Reuses the exact
-    /// same real navigation primitives go-to-definition already established rather than a
-    /// second, parallel way to open a file: [`Self::navigate_to_definition`] when the link
-    /// carried a real line number (the same one-shot `pending_cursor_line` race-avoidance that
-    /// method's own docs describe), or plain [`Self::open_file_view`] when it didn't.
+    /// Handles `TerminalPaneEvent::OpenPath` - a mod-held click on a detected path/`path:line`
+    /// link in a session's terminal output. `path` is already resolved against the session's cwd
+    /// (see `crate::terminal_links::resolve`). Reuses [`Self::navigate_to_definition`] when the
+    /// link carried a line number, else [`Self::open_file_view`].
     ///
-    /// ## Real existence check first
-    ///
-    /// Every other real caller of [`Self::open_file_view`] (the file tree, the palette, a
-    /// Changes row, LSP go-to-definition) only ever supplies a path it already knows is real -
-    /// a terminal link is the first source that can't guarantee that (`crate::terminal_links`'s
-    /// own regex is a heuristic over plain text, not a filesystem lookup, and can still land on
-    /// a plausible-looking path that simply doesn't exist, e.g. a typo'd path in a shell error
-    /// message). `Path::is_file()` here is a real, synchronous `stat()` - acceptable because
-    /// it's triggered by one real user click, not run on every render the way a per-row check
-    /// would be. Without this, every false positive the link-detection regex ever produces
-    /// becomes a permanent, un-closeable-by-itself junk tab.
+    /// Unlike every other caller of `open_file_view`, a terminal link's path isn't guaranteed to
+    /// exist: `terminal_links`'s regex is a heuristic over plain text, not a filesystem lookup.
+    /// The synchronous `Path::is_file()` check is affordable here since it runs once per click,
+    /// not per render; without it, a false-positive link would open a permanent junk tab.
     pub(crate) fn open_terminal_link(
         &mut self,
         path: PathBuf,
@@ -739,7 +576,7 @@ impl AdeApp {
         }
     }
 
-    /// [`GotoDefinition`]'s real, bound `F12` action handler.
+    /// [`GotoDefinition`]'s bound `F12` action handler.
     pub(super) fn handle_goto_definition_action(
         &mut self,
         _action: &GotoDefinition,
@@ -749,11 +586,9 @@ impl AdeApp {
         self.trigger_goto_definition(cx);
     }
 
-    /// The currently loaded real diff, if [`Self::diff_state`] has one - `None` while
-    /// loading/erroring, or when the worktree is on its default branch / has no detectable
-    /// base (see `wt_core::diff::DiffBase`'s docs for those two explanatory non-diff
-    /// outcomes). The one real source every Zone 3 view (file-tree change marks, the Changes
-    /// list, the centre's file-diff surface) reads, so they can never disagree.
+    /// The currently loaded diff, if any - `None` while loading/erroring, or when the worktree is
+    /// on its default branch / has no detectable base (see [`wt_core::diff::DiffBase`]). The
+    /// single source every view that shows diff state reads.
     pub(super) fn current_diff(&self) -> Option<&WorktreeDiff> {
         match &self.diff_state {
             DiffLoadState::Loaded(DiffBase::Diff(diff)) => Some(diff),
@@ -761,9 +596,7 @@ impl AdeApp {
         }
     }
 
-    /// A real, themed explanatory message for every [`DiffLoadState`] that isn't a loaded diff,
-    /// shared by the Changes list (no diff yet/loaded) and, defensively, anywhere else that
-    /// needs to explain why there's no diff content to show.
+    /// A themed explanatory message for every [`DiffLoadState`] that isn't a loaded diff.
     pub(super) fn render_diff_state_message(&self) -> gpui::AnyElement {
         let (text, color) = match &self.diff_state {
             DiffLoadState::Loading => ("computing diff...".to_string(), theme::text::FAINT),
@@ -783,28 +616,21 @@ impl AdeApp {
                 ),
                 theme::text::FAINT,
             ),
-            // Unreachable from every real call site (each checks `current_diff()` first), but
-            // matched explicitly rather than a wildcard so a future `DiffBase` variant can't
-            // silently fall through here without a compile error to catch it.
+            // Unreachable in practice (callers check `current_diff()` first); matched explicitly
+            // so a future `DiffBase` variant isn't silently swallowed by a wildcard.
             DiffLoadState::Loaded(DiffBase::Diff(_)) => (String::new(), theme::text::FAINT),
         };
         render_sidebar_message(text, color)
     }
 
-    /// The centre's real single-file Surface C, opened by a Changes-row click
-    /// (`Self::open_change_diff`, always with a real `diff_file`) or a Files-tree row click
-    /// (`Self::open_file_view`, `diff_file` may be `None`) - a toolbar (`dir`/`name`, an optional
-    /// tag pill, real `+n`/`−n` when `diff_file` is present, the real `Diff | File` segmented
-    /// toggle, the real editor-zoom group - see [`Self::render_zoom_control`]'s docs - an
-    /// always-dimmed `Accept file` - see [`render_accept_file_button`]'s docs - and a real
-    /// close/back action) over either [`Self::render_diff_file_detail`]'s real, folded hunk
-    /// content or [`Self::render_file_view`]'s real, syntax-highlighted file content, both real,
-    /// zoom-scoped through [`zoom_scoped`].
+    /// The centre's single-file Surface C, opened by a Changes-row click (`diff_file` always
+    /// `Some`) or a Files-tree row click (`diff_file` may be `None`): a toolbar (dir/name, tag
+    /// pill, +n/-n stats, the `Diff | File` toggle, the zoom group, `Accept file`, close) over
+    /// either [`Self::render_diff_file_detail`]'s folded hunk content or [`Self::render_file_view`]'s
+    /// syntax-highlighted content, both zoom-scoped through [`zoom_scoped`].
     ///
-    /// `effective_view` is `File` unconditionally when `diff_file` is `None` (there is no diff to
-    /// show - `design_handoff_jerry_ade/README.md`'s `code_view` state field: "forced to `File`
-    /// when the session has no changes", read here per-file rather than per-session), regardless
-    /// of whatever `self.code_view` was last left at by a *different* file.
+    /// `effective_view` forces `File` when `diff_file` is `None`, regardless of what
+    /// `self.code_view` was last left at by a different file.
     pub(super) fn render_code_surface(
         &mut self,
         relative_path: &Path,
@@ -866,10 +692,8 @@ impl AdeApp {
                         .child(format!("\u{2212}{del}")),
                 )
             })
-            // The toolbar's own real "renamed from" detail - the row's compact
-            // `render_moved_tag` has no room for the actual pre-rename path, but this toolbar
-            // does. `changes::rename_label` is `None` unless `old_path` is both present and
-            // really different from the current path.
+            // The row's compact `render_moved_tag` has no room for the pre-rename path; the
+            // toolbar does.
             .when_some(rename_label, |el, label| {
                 el.child(
                     div()
@@ -913,15 +737,12 @@ impl AdeApp {
 
         div()
             .id("code-surface")
-            // Real focus target for the whole Diff/File surface - see
-            // `Self::code_focus_handle`'s own docs for the dangling-`Window::focus` bug this
-            // fixes (the same real bug class `Self::render_settings`'s own identical
-            // `track_focus` already fixes for the Settings surface).
+            // Focus target for the whole Diff/File surface - see `code_focus_handle`'s docs for
+            // the dangling-`Window::focus` bug this fixes, the same class `render_settings`'s
+            // identical `track_focus` fixes for the Settings surface.
             .track_focus(&self.code_focus_handle)
-            // Scopes `]` (`NextChangedFile`, `crate::default_key_bindings`) to only fire while a
-            // real file tab has focus - see that binding's own docs for the real terminal-input-
-            // swallowing bug this exists to prevent, and the real, verified `Styled::key_context`
-            // API this uses.
+            // Scopes `]` (`NextChangedFile`) to only fire while a file tab has focus - see that
+            // binding's docs for the terminal-input-swallowing bug this prevents.
             .key_context("diff")
             .flex()
             .flex_col()
@@ -935,15 +756,9 @@ impl AdeApp {
             .into_any_element()
     }
 
-    /// The toolbar's real segmented `Diff | File` toggle (`design_handoff_jerry_ade/README.md`'s
-    /// Surface C toolbar spec) - the `Diff` segment is only real, clickable navigation when
-    /// `has_diff` is true (there's nothing to switch *to* otherwise, and clicking it would be a
-    /// dead affordance - [`ChoiceOption::enabled_if`] disables it, the real thing
-    /// [`Self::render_choice_control`] is generalized to support); `File` is always clickable,
-    /// since every real file on disk can always be shown as a File view. Shares
-    /// [`Self::render_choice_control`]'s implementation with [`Self::render_right_sidebar_toggle`]/
-    /// [`Self::render_palette_scope_control`]/the Settings config-format toggle - see that
-    /// method's own docs.
+    /// The toolbar's segmented `Diff | File` toggle. `Diff` is only clickable when `has_diff` is
+    /// true ([`ChoiceOption::enabled_if`] disables it otherwise); `File` is always clickable.
+    /// Shares [`Self::render_choice_control`] with the other segmented toggles in this file.
     pub(super) fn render_diff_file_toggle(
         &self,
         has_diff: bool,
@@ -963,9 +778,7 @@ impl AdeApp {
             selected.to_string(),
             cx,
             |this, index, cx| {
-                // Structural, not a label re-match: index 0 is `Diff`, index 1 is `File`, per
-                // the `options` array literal right above - see
-                // `Self::render_choice_control`'s own docs for why dispatch is index-based.
+                // Index 0 is `Diff`, index 1 is `File`, per the options array above.
                 this.code_view = match index {
                     0 => code_view::CodeView::Diff,
                     _ => code_view::CodeView::File,
@@ -975,23 +788,13 @@ impl AdeApp {
         )
     }
 
-    /// The toolbar's real editor-zoom control group (`design_handoff_jerry_ade/revision/
-    /// CHANGELOG.md`'s 2026-07-29 entry, change 6; `design_handoff_jerry_ade/revision/
-    /// Jerry.dc.html` lines 373-375 for the exact spec): `−` / value / `+`, each a real `19×19`
-    /// button with a real `1px` gap between them, the value itself in a real `36`-wide column
-    /// (a fixed width rather than the design's `min-width` - visually equivalent for this real
-    /// range: every real zoom percent from `Self::ZOOM_MIN_PERCENT`..=`Self::ZOOM_MAX_PERCENT`
-    /// is at most 3 digits, so it never clips) that resets zoom to 100% on click and brightens
-    /// to [`theme::text::SELECTED`] on real hover, matching the design's own `style-hover:
-    /// color:#dde2e7`. Reads/writes the real, live [`Self::code_zoom_percent`] via
-    /// [`Self::zoom_out`]/[`Self::zoom_in`]/[`Self::reset_zoom`] - never a display-only mockup
-    /// of a zoom value.
+    /// The toolbar's zoom control group: `-` / value / `+`, 19x19 buttons with a 1px gap, value
+    /// in a fixed 36px column (every value in `ZOOM_MIN_PERCENT..=ZOOM_MAX_PERCENT` is at most 3
+    /// digits). Clicking the value resets zoom to 100%.
     ///
-    /// The design specifies no disabled-color state for `−`/`+` at the range boundaries - this
-    /// real implementation adds one anyway (`enabled` dims to [`theme::text::DISABLED`] and
-    /// drops the click handler/hover/cursor entirely rather than leaving a dead-looking button
-    /// that still silently no-ops when clicked at 70%/200%), a deliberate, defensible real UX
-    /// improvement over the mockup, not a bug.
+    /// The design has no disabled-color state for `-`/`+` at the range boundaries; this adds one
+    /// (dims and drops the click handler/hover/cursor) rather than leaving a dead-looking button
+    /// that silently no-ops at 70%/200%.
     pub(super) fn render_zoom_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let button = |id: &'static str, label: &'static str, enabled: bool| {
             let mut el = div()
@@ -1061,20 +864,15 @@ impl AdeApp {
             )
     }
 
-    /// One changed file's real diff content: a "binary file" note, or its real hunks as
-    /// unified-diff-style themed lines, with a real `⋯ N unchanged lines` fold marker
-    /// (`design_handoff_jerry_ade/README.md`'s Diff view fold spec) for the real gap between
-    /// consecutive hunks (`crate::changes::fold_gap_between`, parsed from the hunks' own real
-    /// `@@ ... @@` headers - never a fabricated line count). `wt_core::diff` has no lazy
-    /// per-file hunk-loading state to build a "press ⏎ to load this hunk" treatment for (every
-    /// non-binary changed file's hunks are already eagerly loaded - see that module's docs), so
-    /// that part of the design's fold spec doesn't apply to this app's real data model; capped
-    /// by [`MAX_RENDERED_DIFF_LINES_PER_FILE`] independent of `wt_core::diff`'s own load-time
-    /// cap.
+    /// One changed file's diff content: a "binary file" note, or its hunks as unified-diff-style
+    /// themed lines, with a `⋯ N unchanged lines` fold marker for the gap between consecutive
+    /// hunks (`crate::changes::fold_gap_between`, parsed from the hunks' `@@ ... @@` headers).
+    /// `wt_core::diff` has no lazy per-file hunk-loading state, since every non-binary changed
+    /// file's hunks are already eagerly loaded, so the design's "press ⏎ to load this hunk"
+    /// treatment doesn't apply here; capped by [`MAX_RENDERED_DIFF_LINES_PER_FILE`] independent
+    /// of `wt_core::diff`'s own load-time cap.
     pub(super) fn render_diff_file_detail(&self, file: &DiffFile) -> gpui::AnyElement {
-        // The real, live effective zoom (`Self::effective_code_rem_px`), read once and passed
-        // down to `zoom_scoped` at every real return point below - a cheap read of two
-        // already-loaded fields, not something worth recomputing per branch.
+        // Read the effective zoom once and pass it to `zoom_scoped` at every return point below.
         let rem_px = self.effective_code_rem_px();
         let mut container = div()
             .id(format!("diff-detail-{}", file.path.display()))
@@ -1096,12 +894,10 @@ impl AdeApp {
             );
         }
 
-        // A rename-only file (renamed with no content change) produces zero real `@@` hunks -
-        // `git diff` has nothing to diff line-by-line - so falling through the loop below would
-        // otherwise leave `container` with no children at all: a blank centre pane on click that
-        // looks like a rendering bug rather than the real "nothing to show" state it actually
-        // is. `changes::empty_hunks_message` picks the honest wording (naming the rename
-        // specifically when that's the real cause, per `DiffFile::status`).
+        // A rename-only file produces zero `@@` hunks, so falling through the loop below would
+        // leave `container` with no children - a blank pane that looks like a rendering bug
+        // rather than "nothing to show". `changes::empty_hunks_message` picks honest wording,
+        // naming the rename specifically when that's the cause.
         if file.hunks.is_empty() {
             return zoom_scoped(
                 rem_px,
@@ -1154,45 +950,26 @@ impl AdeApp {
         zoom_scoped(rem_px, container)
     }
 
-    /// Surface C's real File view (`design_handoff_jerry_ade/README.md`'s File view subsection):
-    /// a real breadcrumb, real line-numbered/syntax-highlighted code (`crate::code_view`), and a
-    /// real status bar - for whichever real file `relative_path` (resolved against
-    /// [`Self::file_tree_root`]) names on disk.
+    /// Surface C's File view: a breadcrumb, line-numbered/syntax-highlighted code
+    /// (`crate::code_view`), and a status bar for whichever file `relative_path` (resolved
+    /// against [`Self::file_tree_root`]) names on disk.
     ///
     /// ## Caching, and staying off the foreground thread
     ///
-    /// [`code_view::load_file`] (which runs a real `tree-sitter` parse for a `.rs` file) is only
-    /// ever *dispatched* here (via [`Self::spawn_file_load`]), and only when
-    /// [`Self::file_view_cache`] is missing or [`code_view::cache_is_fresh`] says it's stale
-    /// against the file's real, freshly-read `mtime`/`len` (a real `std::fs::metadata` call - a
-    /// single, cheap stat syscall, kept synchronous here unlike `load_file` itself, which
-    /// additionally does a full `std::fs::read` plus, for a `.rs` file, a full `tree-sitter`
-    /// parse) - never unconditionally on every render, and never run *inline* on the GPUI
-    /// foreground thread: the actual read-and-parse work happens inside
-    /// `cx.background_executor()`, with the result written back into `file_view_cache` from a
-    /// `this.update(cx, ..)` callback once it resolves (see [`FileLoadState`]'s own docs for the
-    /// measured real cost - up to 190ms for a single file in a debug build - that makes this not
-    /// optional). This was verified directly, not just read over: `crate::code_view`'s own
-    /// `cache_is_fresh` unit tests cover the staleness check in isolation, and this module's own
-    /// `code_view_cache_tests` (below) open a real temp `.rs` file, force several real
-    /// re-renders of the same open file, and assert `file_view_cache` stays `Some` with an
-    /// unchanged `mtime`/`len` pair throughout - i.e. that a second, third, ... render of the
-    /// same unmodified file never re-triggers [`code_view::load_file`] - *and* assert
-    /// `file_view_cache` is still `None` immediately after the render that kicked off the very
-    /// first load, before `cx.run_until_parked()` drives the background task to completion,
-    /// proving the parse did not happen synchronously inline.
+    /// [`code_view::load_file`] runs a `tree-sitter` parse and is only dispatched (via
+    /// [`Self::spawn_file_load`]) when [`Self::file_view_cache`] is missing or
+    /// [`code_view::cache_is_fresh`] says it's stale - never unconditionally on every render, and
+    /// never run inline on the foreground thread (see [`FileLoadState`]'s docs for the measured
+    /// cost this avoids). Covered by this module's `code_view_cache_tests` below.
     ///
     /// ## Virtualization
     ///
-    /// Every real line of `parsed.lines` is reachable - there is no cap on how many of them can
-    /// ever become a rendered row, unlike (for example) [`MAX_RENDERED_DIFF_LINES_PER_FILE`]'s
-    /// hard cap on the Diff view. `gpui::uniform_list` (verified against
-    /// `vendor/zed/crates/gpui/examples/uniform_list.rs` and its own real, non-example callers,
-    /// e.g. `vendor/zed/crates/git_ui/src/git_panel.rs`'s `commit_history_list`) only ever
-    /// constructs [`render_file_view_line`] elements for whichever row range is actually
-    /// scrolled into view, so a file with (say) 8000 real lines - this repo's own `root.rs`, at
-    /// the time this doc comment was written - is genuinely scrollable end to end, not silently
-    /// capped at some fixed prefix the user can never reach past no matter how far they scroll.
+    /// Every line of `parsed.lines` is reachable - no cap like
+    /// [`MAX_RENDERED_DIFF_LINES_PER_FILE`] applies here. `gpui::uniform_list` (see
+    /// vendor/zed/crates/gpui/examples/uniform_list.rs and
+    /// vendor/zed/crates/git_ui/src/git_panel.rs's `commit_history_list`) only constructs
+    /// [`render_file_view_line`] elements for rows scrolled into view, so a large file stays
+    /// scrollable end to end.
     pub(super) fn render_file_view(
         &mut self,
         relative_path: &Path,
@@ -1200,10 +977,8 @@ impl AdeApp {
     ) -> gpui::AnyElement {
         let absolute_path = self.file_tree_root.join(relative_path);
 
-        // Throttled real freshness check - see `Self::file_view_last_freshness_check`'s docs for
-        // why this doesn't call `std::fs::metadata` unconditionally on every render. A path
-        // mismatch (a different file than whatever was last checked) always forces a real,
-        // immediate re-check regardless of how recently *some other* path was checked.
+        // Throttled freshness check (see `file_view_last_freshness_check`'s docs); a path
+        // mismatch always forces an immediate re-check regardless of the throttle window.
         let now = Instant::now();
         let should_check = match &self.file_view_last_freshness_check {
             Some((checked_path, checked_at)) => {
@@ -1222,28 +997,19 @@ impl AdeApp {
                 .as_ref()
                 .is_some_and(|cached| code_view::cache_is_fresh(cached, &absolute_path, mtime, len))
         } else {
-            // Within the throttle window for this exact path - the real mtime/len check already
-            // ran recently (at most `FILE_FRESHNESS_CHECK_INTERVAL` ago) and nothing in this app
-            // mutates `file_view_cache` for an already-fresh path outside of that check, so a
-            // matching cached path is sufficient evidence of freshness without paying for another
-            // `stat()` this render.
+            // Within the throttle window: nothing mutates `file_view_cache` for an already-fresh
+            // path outside of the check above, so a matching cached path is enough evidence.
             self.file_view_cache
                 .as_ref()
                 .is_some_and(|cached| cached.path == absolute_path)
         };
 
         if !cache_fresh {
-            // A real, already-observed outcome for this *exact* path - either a load already in
-            // flight, or a previous real read failure - must never respawn another load on every
-            // single render. Before this also checked `FileLoadState::Error` here, a real,
-            // permanently unreadable path (e.g. a permissions error, or a real go-to-definition
-            // target outside this app's own file tree that this process happens not to be able to
-            // read) respawned a doomed load on *every* repaint: each failure called `cx.notify()`
-            // (`Self::spawn_file_load`'s completion handler always does, to show the real error),
-            // which triggered the next render, which respawned the load again - an unbounded,
-            // permanent busy-loop with no real work left to do, pinning the foreground thread at
-            // however fast `uniform_list` could repaint (measured at ~60 loads/repaints per
-            // second) instead of settling into a real, stable error state.
+            // A load already in flight, or a previous read failure, for this exact path must not
+            // respawn another load on every render. Without also checking `FileLoadState::Error`
+            // here, a permanently unreadable path would respawn a doomed load each repaint: every
+            // failure calls `cx.notify()`, triggering another render - an unbounded busy-loop
+            // instead of a stable error state.
             let already_settled = matches!(
                 &self.file_load_state,
                 FileLoadState::Loading(loading_path) if loading_path == &absolute_path
@@ -1254,12 +1020,9 @@ impl AdeApp {
             if !already_settled {
                 self.spawn_file_load(absolute_path.clone(), cx);
             }
-            // The background load just dispatched (or already in flight from a previous render)
-            // hasn't written a fresh `file_view_cache` yet - show its real, honest current
-            // state instead of stale content from a *different* file, or nothing at all. The
-            // very next render after it resolves (`cx.notify()` in `Self::spawn_file_load`'s
-            // completion handler) will find `cache_fresh` true and fall through to real content
-            // below.
+            // The dispatched (or in-flight) load hasn't written a fresh cache yet; show its
+            // current state instead of stale content from a different file. The next render
+            // after it resolves will find `cache_fresh` true and fall through below.
             return match &self.file_load_state {
                 FileLoadState::Error(error_path, message) if error_path == &absolute_path => {
                     render_sidebar_message(
@@ -1274,11 +1037,8 @@ impl AdeApp {
             };
         }
 
-        // A real go-to-definition navigation may have left a real target line waiting
-        // specifically for this exact, already-fresh file - see `Self::pending_cursor_line`'s own
-        // docs, including the path check this mirrors (`Self::spawn_file_load`'s completion
-        // handler handles the other case: the target file's parse wasn't cached yet, so a real
-        // background load had to happen first).
+        // A pending go-to-definition target line for this already-fresh file; the other case
+        // (parse not yet cached) is handled by `spawn_file_load`'s completion handler.
         if self
             .file_view_cache
             .as_ref()
@@ -1296,13 +1056,9 @@ impl AdeApp {
             }
         }
 
-        // Surface C's real Diagnostic state (`design_handoff_jerry_ade/README.md`'s "Language
-        // server UI" subsection) - only ever engaged for a real `.rs` file. `ensure_lsp_client`/
-        // `dispatch_did_open` are real, idempotent, `&mut self` calls, so they must run (and
-        // finish mutating `self.lsp_clients`/`self.lsp_opened_files`) *before* the immutable
-        // `self.file_view_cache` borrow below is taken - see `AdeApp::file_view_diagnostics`'s
-        // own docs for why the diagnostics index itself is computed in its own short-lived
-        // borrow scope rather than interleaved with the `parsed` borrow that follows.
+        // Diagnostics only apply to `.rs` files. `ensure_lsp_client`/`dispatch_did_open` are
+        // idempotent `&mut self` calls that must finish before the immutable `file_view_cache`
+        // borrow below is taken.
         let is_rust = absolute_path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"));
@@ -1315,13 +1071,8 @@ impl AdeApp {
                 self.dispatch_did_open(client.clone(), absolute_path.clone(), cx);
             }
 
-            // Computed exactly once per `render_file_view` call and reused for every
-            // diagnostics lookup below, rather than letting each lookup independently re-derive
-            // it (`lsp_core::LspClient::uri_for_path`/`path_to_uri` performs a real, blocking
-            // `canonicalize()` syscall) - `uniform_list` means this method runs on every
-            // repaint, so re-deriving it up to three times per call, as this used to, was a
-            // real per-frame blocking-syscall cost, not a micro-optimization. See
-            // `LspClient::uri_for_path`'s own docs.
+            // Computed once and reused below, since `uri_for_path` does a blocking
+            // `canonicalize()` syscall and this method runs on every repaint.
             let file_uri = lsp_core::LspClient::uri_for_path(&absolute_path).ok();
 
             let diagnostics_map = match (&state, &file_uri) {
@@ -1353,11 +1104,8 @@ impl AdeApp {
         let truncated = parsed.truncated;
         let line_count = parsed.lines.len();
         let diagnostics_card = render_diagnostics_card(&self.file_view_diagnostics);
-        // Surface C's real Hover state (`design_handoff_jerry_ade/README.md`'s "Language server
-        // UI" subsection) - only ever a real, live target for a `.rs` file (see
-        // `Self::request_hover`'s own docs; every other extension has no real language server to
-        // ask). Cloned once here (not re-derived per row) for the same reason `file_uri` above
-        // is: this closure runs on every real repaint of whichever rows are scrolled into view.
+        // Hover only applies to `.rs` files; cloned once here and reused per row for the same
+        // reason as `file_uri` above.
         let hover_target = is_rust.then(|| absolute_path.clone());
         let hover_card = render_hover_card(self.hover.as_ref(), &absolute_path, cx);
 
@@ -1400,22 +1148,15 @@ impl AdeApp {
                 rows
             }),
         )
-        // Real go-to-definition viewport scrolling (`Self::navigate_to_definition`/
-        // `Self::spawn_file_load`'s completion handler/this method's own already-fresh-
-        // navigation branch, whichever actually lands a real target line, drives this handle's
-        // `scroll_to_item` - see `Self::file_view_scroll_handle`'s own docs) - without this, F12
-        // moved `Self::code_cursor` and the status bar's `ln N` but never the actual viewport.
+        // Without tracking this handle, F12 moved `code_cursor` and the status bar's `ln N` but
+        // never scrolled the viewport.
         .track_scroll(&self.file_view_scroll_handle)
         .flex_1()
         .min_h_0()
         .bg(theme::surface::PTY)
         .font(font(theme::font::MONO))
-        // `rems(1.0)`/`rems(1.6)`, not `px()` - real, scoped editor zoom
-        // (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change 6),
-        // resolved against `zoom_scoped`'s real `Window::with_rem_size` override just below,
-        // not the window's own unrelated (and, in this app, unused - see `rem_scope`'s module
-        // docs) default rem size. `Self::render_file_view_line`'s own rows inherit this via
-        // GPUI's ordinary cascading text style rather than setting it a second time per row.
+        // `rems()`, not `px()`, so this text scales with `zoom_scoped`'s rem-size override
+        // below rather than the window's own (unused) default rem size.
         .text_size(rems(1.0))
         .line_height(rems(1.6));
 
@@ -1444,15 +1185,11 @@ impl AdeApp {
     }
 }
 
-/// Rounds `percent` to the nearest real 10-point zoom step, then clamps it into
-/// [`AdeApp::ZOOM_MIN_PERCENT`]`..=`[`AdeApp::ZOOM_MAX_PERCENT`] - `design_handoff_jerry_ade/
-/// revision/CHANGELOG.md`'s 2026-07-29 entry, change 6: "Range 70-200 in steps of 10". Pulled
-/// out as a free, `gpui`-free function (rather than inlined into `AdeApp::zoom_in`/`zoom_out`)
-/// so it's directly unit-testable without a `Context<AdeApp>` - the same real pattern this
-/// module already follows for `reset_per_worktree_ui_state` and `crate::terminal_pane`'s own
-/// `size_to_grid`. Takes a signed `i32` (not `u16`) so a caller can hand it an already
-/// out-of-range or negative candidate (e.g. `AdeApp::zoom_out` stepping below zero from 70%)
-/// without underflowing before this ever gets a chance to clamp it.
+/// Rounds `percent` to the nearest 10-point step, then clamps into
+/// `AdeApp::ZOOM_MIN_PERCENT..=AdeApp::ZOOM_MAX_PERCENT`. A free function, not inlined into
+/// `zoom_in`/`zoom_out`, so it's unit-testable without a `Context<AdeApp>`. Takes `i32`, not
+/// `u16`, so an already out-of-range or negative candidate (e.g. stepping below zero from 70%)
+/// doesn't underflow before it's clamped.
 pub(super) fn clamp_zoom_percent(percent: i32) -> u16 {
     let step = AdeApp::ZOOM_STEP_PERCENT as i32;
     let stepped = (percent as f32 / step as f32).round() as i32 * step;
@@ -1462,18 +1199,10 @@ pub(super) fn clamp_zoom_percent(percent: i32) -> u16 {
     ) as u16
 }
 
-/// Real, scoped editor-zoom application (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s
-/// 2026-07-29 entry, change 6's own implementation note: "code rows are authored at `1em/1.6`
-/// and the scroll container owns the px size ... so diff and file views scale together") -
-/// wraps `content` in [`rem_scope::WithRemSize`], scoped to `rem_px` (`Self::
-/// effective_code_rem_px`'s real, live value). Every real code row inside `content` that uses
-/// `.text_size(rems(1.0))`/`.line_height(rems(1.6))` (rather than a `px()` literal) resolves
-/// against this scoped size - GPUI's own real `AbsoluteLength::to_pixels` split (see
-/// `rem_scope`'s module docs) leaves anything still expressed in `px()` inside the same subtree
-/// (the 52px line-number gutter, the 3px git-gutter column) completely unaffected, which is
-/// exactly the real "gutters keep their fixed widths" behavior the design's own note describes -
-/// verified, not just assumed, by this module's own `code_zoom_tests::zoom_scales_text_but_not_
-/// the_gutter_width` interaction test.
+/// Wraps `content` in [`rem_scope::WithRemSize`], scoped to `rem_px`. Rows using
+/// `.text_size(rems(1.0))`/`.line_height(rems(1.6))` scale with it; anything still in `px()`
+/// (the line-number gutter, the git-gutter column) is unaffected - covered by
+/// `code_zoom_tests::zoom_scales_text_but_not_the_gutter_width`.
 fn zoom_scoped(rem_px: f32, content: impl IntoElement) -> gpui::AnyElement {
     WithRemSize::new(px(rem_px))
         .flex_1()
@@ -1484,31 +1213,23 @@ fn zoom_scoped(rem_px: f32, content: impl IntoElement) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// The outcome of the most recent (or in-flight) `wt_core::diff::diff_against_base` call for
-/// [`AdeApp::diff_root`]. Kept separate from [`DiffBase`] (rather than wrapping it in an
-/// `Option`/`Result` at the call site) so "still computing" is a first-class, renderable
-/// state rather than reusing an empty/default value that could be mistaken for "no changes".
+/// The outcome of the most recent (or in-flight) `diff_against_base` call for
+/// [`AdeApp::diff_root`]. Kept separate from [`DiffBase`] so "still computing" is a first-class
+/// state, distinct from an empty/default value that could be mistaken for "no changes".
 pub(super) enum DiffLoadState {
     Loading,
     Loaded(DiffBase),
     Error(String),
 }
 
-/// The outcome of the most recent (or in-flight) `code_view::load_file` call for whichever real
-/// on-disk path [`AdeApp::render_file_view`] most recently asked to load - mirrors
-/// [`DiffLoadState`]'s own shape and reasoning for the exact same underlying cause:
-/// `code_view::load_file` performs the same class of blocking I/O `diff_against_base` does (a
-/// full `std::fs::read`, plus - for a `.rs` file - a full `tree-sitter` parse) and must never run
-/// on the GPUI foreground thread. Measured directly against this repo's own 370KB `root.rs` in a
-/// debug build: `code_view::highlight_rust` alone took 119-190ms, and the full `load_file` 124ms
-/// - each one of those milliseconds spent blocking `render()` is a dropped frame.
+/// The outcome of the most recent (or in-flight) `code_view::load_file` call for whichever path
+/// [`AdeApp::render_file_view`] most recently asked to load. Mirrors [`DiffLoadState`]'s shape:
+/// `load_file` does the same class of blocking I/O (`std::fs::read`, plus a `tree-sitter` parse
+/// for `.rs` files) and must never run on the GPUI foreground thread.
 ///
-/// Kept separate from [`AdeApp::file_view_cache`] (which holds the last real, *successfully*
-/// loaded/parsed file) rather than folded into an `Option<Result<ParsedFile, String>>` there, so
-/// a fresh load kicked off for a newly opened file doesn't have to overwrite (and thus briefly
-/// blank) whatever was last successfully shown while the new one is still in flight - the same
-/// "loading state is a first-class, renderable state of its own" reasoning `DiffLoadState`'s own
-/// docs give.
+/// Kept separate from [`AdeApp::file_view_cache`] rather than folded into an
+/// `Option<Result<ParsedFile, String>>` there, so a fresh load for a newly opened file doesn't
+/// overwrite (and blank) whatever was last successfully shown while it's still in flight.
 #[derive(Debug)]
 pub(super) enum FileLoadState {
     Idle,
@@ -1516,59 +1237,43 @@ pub(super) enum FileLoadState {
     Error(PathBuf, String),
 }
 
-/// The real state of one real, in-flight or completed click-triggered `textDocument/hover`
-/// request (`design_handoff_jerry_ade/README.md`'s Hover state) - see [`AdeApp::hover`]'s own
-/// docs for the caching discipline this backs.
+/// The state of one in-flight or completed click-triggered `textDocument/hover` request; see
+/// [`AdeApp::hover`]'s docs for the caching discipline this backs.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct HoverEntry {
-    /// The real, absolute path of the file the hovered symbol is in - `render_file_view` only
-    /// ever shows this entry's [`Self::status`] when it matches the file currently open, so a
-    /// hover card can never visually bleed onto a different file after navigation.
+    /// The absolute path of the file the hovered symbol is in; `render_file_view` only shows
+    /// [`Self::status`] when it matches the file currently open.
     path: PathBuf,
-    /// The real, 1-based line number (matching [`AdeApp::code_cursor`]'s own convention) the
-    /// hovered token is on - used both to find the right row to underline and, together with
-    /// [`Self::byte_range`], as half of this entry's own real cache key.
+    /// 1-based line number (matching [`AdeApp::code_cursor`]'s convention); half of this entry's
+    /// cache key along with [`Self::byte_range`].
     line_number: usize,
-    /// The real byte range, within that line's own text, of whichever already-rendered
-    /// token/run was clicked (`crate::root::render_file_view_line`'s own click handler) - the
-    /// span [`crate::root::render_file_view_line`] underlines with
-    /// `theme::syntax::HOVER_UNDERLINE`, and (together with [`Self::line_number`]) the other half
-    /// of this entry's real cache key ([`Self::request_hover`]... see [`AdeApp::request_hover`]'s
-    /// own docs for why re-deriving an LSP `character` offset isn't needed to detect "same click
-    /// again").
+    /// Byte range, within the line's text, of the clicked token - the span
+    /// [`crate::root::render_file_view_line`] underlines with `theme::syntax::HOVER_UNDERLINE`,
+    /// and the other half of the cache key.
     byte_range: Range<usize>,
-    /// The real LSP `Position` (UTF-16 `character` offset) this entry's request was/will be sent
-    /// with - kept alongside `byte_range` (rather than derived from it again) so
-    /// [`AdeApp::trigger_goto_definition`] can reuse it directly for a real
-    /// `textDocument/definition` request without recomputing it.
+    /// The LSP `Position` this request was/will be sent with, kept alongside `byte_range` so
+    /// [`AdeApp::trigger_goto_definition`] can reuse it without recomputing.
     position: lsp_core::lsp_types::Position,
     status: HoverStatus,
 }
 
-/// The real, distinguishable outcomes of one [`HoverEntry`]'s own request - mirrors
-/// [`LspClientState`]'s own three-state shape (`Spawning`/`Failed`/`Ready` there;
-/// `Loading`/`Failed`/`Ready` here), so `render_hover_card` can show an honest state for
-/// whichever one currently applies rather than a blank card while a request is in flight.
+/// The outcomes of one [`HoverEntry`]'s request, mirroring [`LspClientState`]'s three-state
+/// shape, so `render_hover_card` can show the right state instead of a blank card while loading.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum HoverStatus {
     Loading,
-    /// A real response arrived - `Some` for a real, non-empty
-    /// `hover_view::HoverRenderModel` (`crate::hover_view::build_hover_render_model` returned
-    /// one), `None` for a genuine "rust-analyzer answered, and there's real nothing to show here"
-    /// (e.g. hovering whitespace/punctuation) - never conflated with [`HoverStatus::Failed`],
-    /// which means the request itself didn't complete.
+    /// A response arrived - `Some` for a non-empty `HoverRenderModel`, `None` for "rust-analyzer
+    /// answered, nothing to show" (e.g. hovering whitespace) - never conflated with
+    /// [`HoverStatus::Failed`], which means the request itself didn't complete.
     Ready(Option<hover_view::HoverRenderModel>),
     Failed(String),
 }
 
-/// Surface C's real Diagnostic-state card (`design_handoff_jerry_ade/README.md`: "a card below:
-/// message `#e3908b`, note `#7d848b`, `rust-analyzer · E0277`") - one row per real diagnostic
-/// currently indexed anywhere in the open file, `None` when there are none (a real, correct,
-/// expected "clean file" state - see `crate::diagnostics_view`'s own docs - that renders no card
-/// at all, not an empty one). Listing every diagnostic in the file here (rather than only the
-/// one under the cursor) is a documented simplification: the design anchors this card under the
-/// caret line, but this app has no floating-popup infrastructure yet (`lsp_popup` is a later,
-/// H3 concern) - see the step report for this judgment call.
+/// Surface C's Diagnostic-state card: one row per diagnostic currently indexed anywhere in the
+/// open file, `None` when there are none (a clean file renders no card, not an empty one).
+/// Listing every diagnostic in the file (rather than only the one under the cursor) is a
+/// simplification: the design anchors this card under the caret line, but this app has no
+/// floating-popup infrastructure yet.
 pub(super) fn render_diagnostics_card(
     by_line: &HashMap<usize, Vec<diagnostics_view::LineDiagnostic>>,
 ) -> Option<gpui::AnyElement> {
@@ -1626,14 +1331,11 @@ pub(super) fn render_diagnostics_card(
     Some(card.into_any_element())
 }
 
-/// Surface C's real Hover-state card (`design_handoff_jerry_ade/README.md`: "card 430 wide:
-/// signature, doc prose, `core::convert` + `F12 definition` footer") - `None` when
-/// [`AdeApp::hover`] is `None`, or (defensively - should already be unreachable given every real
-/// file-switch point resets [`AdeApp::hover`]) belongs to a different file than
-/// `open_absolute_path` currently names. Same real, documented simplification
-/// [`render_diagnostics_card`]'s own docs already state for the Diagnostic state: the design
-/// anchors this under the caret line as a floating popup, but this app has no floating-popup
-/// infrastructure, so it renders as a card below the code the same way the diagnostics card does.
+/// Surface C's Hover-state card: signature, doc prose, module path, `F12 definition` footer.
+/// `None` when [`AdeApp::hover`] is `None`, or (defensively) belongs to a different file than
+/// `open_absolute_path`. The design anchors this under the caret as a floating popup, but this
+/// app has no floating-popup infrastructure, so - like [`render_diagnostics_card`] - it renders
+/// as a card below the code instead.
 pub(super) fn render_hover_card(
     hover: Option<&HoverEntry>,
     open_absolute_path: &Path,
@@ -1721,12 +1423,8 @@ pub(super) fn render_hover_card(
                     .items_center()
                     .gap(px(3.0))
                     .cursor_pointer()
-                    // `F12` is a real function key, not one of `crate::keymap`'s eight
-                    // mod/alt/ctrl/shift/enter/esc/tab/bksp tokens - `Jerry.dc.html`'s own
-                    // reference keymap resolver hardcodes it identically on both platforms
-                    // (`def: [plat === 'macos' ? 'F12' : 'F12']`), so this literal is exempt
-                    // from the "no literal glyph in calling code" rule (it names no modifier
-                    // glyph at all) and correctly bypasses `crate::keymap::resolve_combo`.
+                    // `F12` is a function key, not one of `crate::keymap`'s modifier tokens, and
+                    // is identical on both platforms, so it bypasses `keymap::resolve_combo`.
                     .child(render_keycap("F12"))
                     .child(
                         div()
@@ -1745,21 +1443,13 @@ pub(super) fn render_hover_card(
     Some(card.into_any_element())
 }
 
-/// The diff view's real `⋯ N unchanged lines` fold marker
-/// (`design_handoff_jerry_ade/README.md`'s Diff view fold spec) - `N` is always a real count
-/// derived from the hunks' own `@@ ... @@` headers (`crate::changes::fold_gap_between`), never
-/// an estimate.
+/// The diff view's `⋯ N unchanged lines` fold marker. `N` is derived from the hunks' `@@ ... @@`
+/// headers (`crate::changes::fold_gap_between`), never an estimate.
 ///
-/// Sized in `rems()`, not `px()` - unlike the File view's line-number gutter/git-gutter column
-/// (`render_file_view_line`'s own docs), this marker is neither a gutter nor a diff-sign column,
-/// the two things the design's "gutters keep their fixed widths" note actually exempts from
-/// zoom. It's called from inside [`AdeApp::render_diff_file_detail`]'s own `container`, which
-/// [`zoom_scoped`] wraps - so `rems(0.85)`/`rems(1.6)` here resolve against that same real,
-/// live-zoomed rem size every surrounding diff row's own `rems(1.0)`/`rems(1.6)` does (`0.85`
-/// keeps this marker's text proportionally smaller than a real diff line's own text at every
-/// zoom level, matching the `11px`-vs-`13px` ratio this marker and a diff row's text already had
-/// at the real 100%-zoom baseline), rather than staying a fixed-size sliver that visually
-/// desyncs from the now-larger rows around it once zoom moves off 100%.
+/// Sized in `rems()`, not `px()`: unlike the line-number gutter and git-gutter column, this
+/// marker isn't exempt from zoom, so it must scale with the surrounding diff rows rather than
+/// staying a fixed-size sliver once zoom moves off 100%. `0.85` keeps it proportionally smaller
+/// than a diff line's own text, matching the 11px-vs-13px ratio at the 100% baseline.
 pub(super) fn render_fold_marker(gap: usize) -> impl IntoElement {
     div()
         .flex()
@@ -1777,8 +1467,7 @@ pub(super) fn render_fold_marker(gap: usize) -> impl IntoElement {
         ))
 }
 
-/// One real diff line - added/removed/context, coloured per `design_handoff_jerry_ade/
-/// README.md`'s Diff view line-kind table.
+/// One diff line - added/removed/context, colored per kind.
 pub(super) fn render_diff_line(line: &wt_core::diff::DiffLine) -> impl IntoElement {
     let (prefix, fg, bg) = match line.kind {
         DiffLineKind::Added => ("+", theme::diff::ADD_FG, Some(theme::diff::ADD_BG)),
@@ -1798,22 +1487,12 @@ pub(super) fn render_diff_line(line: &wt_core::diff::DiffLine) -> impl IntoEleme
     element.child(format!("{prefix} {}", line.content))
 }
 
-/// The File view toolbar's always-rendered `Accept file` button - `design_handoff_jerry_ade/
-/// README.md`: "**Accept file is always rendered**, dimmed (`#454b51` / border `#1f2327`) when
-/// there is nothing to accept. It must never appear or disappear with the view." This app has no
-/// real "accept" backing logic yet (no per-file review-apply action exists anywhere in this
-/// crate), so it is *always* the dimmed, non-interactive state the spec describes for "nothing to
-/// accept" - deliberately given no `cursor_pointer()`/`on_click` at all, rather than a click
-/// handler that would silently do nothing (that would be exactly the kind of fake, bound-to-
-/// nothing affordance this project's conventions forbid).
+/// The File view toolbar's always-rendered `Accept file` button, always in its dimmed
+/// non-interactive state: this app has no per-file review-apply logic yet, so it's deliberately
+/// given no `cursor_pointer()`/`on_click` at all rather than a handler that would silently no-op.
 ///
-/// The trailing `⏎` used to be baked directly into this button's label string
-/// (`"Accept file \u{23ce}"`) - a literal glyph in calling code, exactly what
-/// `design_handoff_jerry_ade/CHANGELOG.md`'s 2026-07-29 entry (change 2) eliminates. It's now a
-/// real, separate `enter` keycap resolved through `crate::keymap::resolve_combo` (so it reads
-/// `Enter` on Windows/Linux instead of always showing the macOS `⏎` glyph), styled with the
-/// same dimmed `GHOSTER`/`BUTTON_DISABLED` tint the rest of this always-disabled button already
-/// uses.
+/// The trailing keycap is resolved through `crate::keymap::resolve_combo("enter", macos)` rather
+/// than a baked-in `⏎` glyph, so it reads `Enter` on Windows/Linux.
 pub(super) fn render_accept_file_button(macos: bool) -> impl IntoElement {
     let parts = keymap::resolve_combo("enter", macos);
     div()
@@ -1841,14 +1520,11 @@ pub(super) fn render_accept_file_button(macos: bool) -> impl IntoElement {
         ))
 }
 
-/// The File view's real breadcrumb (`design_handoff_jerry_ade/README.md`: "Breadcrumb 26 (`src ›
-/// db › query_builder.rs › impl QueryBuilder › build`, ..., separators `#3d4248`, active crumb
-/// `#a9b0b7`)") - built from `relative_path`'s own real path segments
+/// The File view's breadcrumb, built from `relative_path`'s segments
 /// (`code_view::breadcrumb_segments`). The design's deeper symbol-path suffix (`› impl
-/// QueryBuilder › build`) is a documented scope simplification: it needs real symbol/AST-position
-/// tracking (which function/impl block the cursor is currently inside) that this phase's read-only
-/// viewer doesn't build - see this crate's report for the judgment call. The last (file name)
-/// segment is the "active crumb"; every segment before it is a real ancestor directory, dimmer.
+/// QueryBuilder › build`) is out of scope: it needs symbol/AST-position tracking this read-only
+/// viewer doesn't build. The last (file name) segment is the active crumb; earlier segments are
+/// dimmer ancestor directories.
 pub(super) fn render_file_breadcrumb(relative_path: &Path) -> impl IntoElement {
     let segments = code_view::breadcrumb_segments(relative_path);
     let last_index = segments.len().saturating_sub(1);
@@ -1881,42 +1557,25 @@ pub(super) fn render_file_breadcrumb(relative_path: &Path) -> impl IntoElement {
     row
 }
 
-/// One real File view code row: a real 52px right-aligned line-number gutter
-/// (`design_handoff_jerry_ade/Jerry.dc.html`'s File view code template: `width:52px;text-
-/// align:right;padding-right:12px`), a real 3px git-gutter marker (tinted
-/// `theme::diff::GIT_GUTTER` for `is_changed`, transparent otherwise), and the real
-/// syntax-highlighted line content (`line.runs`, each run's own `code_view::color_for_kind`).
-/// `is_current` tints the whole row (`theme::surface::CURRENT_LINE`) and brightens the gutter
-/// number - `design_handoff_jerry_ade/Jerry.dc.html`'s own current-line row (`background:
-/// #181c20`, gutter `color:#8b9197` vs. the usual `#3a3f44`).
+/// One File view code row: a 52px right-aligned line-number gutter, a 3px git-gutter marker
+/// (tinted `theme::diff::GIT_GUTTER` for `is_changed`, transparent otherwise), and the
+/// syntax-highlighted line content (`line.runs`, via `code_view::color_for_kind`). `is_current`
+/// tints the whole row and brightens the gutter number.
 ///
-/// Clicking a row sets `AdeApp::code_cursor` to `line_number` - a real line number from a real
-/// click. There is no column here at all (not a fabricated `col 1`) - see `AdeApp::code_cursor`'s
-/// own docs and `render_file_status_bar`'s docs for why: real per-character column tracking is a
-/// documented scope simplification this phase, and showing a column that never actually reflects
-/// where the user clicked would be exactly the kind of fake UI this project's conventions forbid.
+/// Clicking a row sets `AdeApp::code_cursor` to `line_number`. There is no column tracking here
+/// (not a fabricated `col 1`) - see `AdeApp::code_cursor`'s docs: per-character column tracking
+/// is out of scope for this phase.
 ///
-/// `diagnostics` (a real, possibly-empty `Vec<diagnostics_view::LineDiagnostic>` for this exact
-/// line - see `AdeApp::file_view_diagnostics`'s docs) drives the Diagnostic state's three
-/// remaining real, per-row treatments (`design_handoff_jerry_ade/README.md`): a row tint
-/// (`theme::syntax::DIAGNOSTIC_ROW_BG`, applied whenever `is_current` isn't already tinting the
-/// row), a `.border_dashed()` bottom border under the real, byte-range-precise offending span
-/// (`crate::diagnostics_view::overlay_diagnostic_runs`; GPUI has no true "dotted" border style -
-/// see `vendor/zed/crates/gpui/src/styled.rs`'s own `border_dashed` - so this is the closest
-/// real primitive available, the same "drop it, keep the real one" precedent `theme::shadow`'s
-/// own docs already establish for the popover shadow), and a real, dim inline message from the
-/// first diagnostic on the line appended after the code (a full per-diagnostic breakdown is the
-/// separate card `render_diagnostics_card` renders below the code area, not repeated per-row).
-/// The File view row's real dotted-underline colour for a diagnostic of `severity`
-/// (`design_handoff_jerry_ade/README.md` only specifies a treatment for the error case -
-/// `#e0625c`/[`theme::syntax::ERROR_UNDERLINE`] - so the other three are a documented judgment
-/// call, not a spec value: `Warning` reuses [`theme::term::WARN`] (`#d8a94a`, this app's existing
-/// amber, already used for warning-adjacent UI elsewhere), and `Information`/`Hint` reuse the
-/// existing dim/faint neutral text tokens ([`theme::text::DIM`]/[`theme::text::FAINT`]) rather
-/// than any new hex value - `Hint` deliberately gets the *dimmer* of the two, since LSP hints are
-/// conventionally the least severe/most subtle real diagnostic kind (the same real-editor
-/// convention `VS Code`'s own hint rendering - a faint dotted underline, no row highlight -
-/// follows, referenced directly in this fix's own step report).
+/// `diagnostics` (possibly empty, for this line - see `AdeApp::file_view_diagnostics`) drives
+/// three per-row treatments: a row tint (`theme::syntax::DIAGNOSTIC_ROW_BG`, when `is_current`
+/// isn't already tinting the row), a `.border_dashed()` underline under the offending span
+/// (`crate::diagnostics_view::overlay_diagnostic_runs`; GPUI has no true dotted border, see
+/// vendor/zed/crates/gpui/src/styled.rs's `border_dashed`), and a dim inline message from the
+/// first diagnostic on the line (the full breakdown is `render_diagnostics_card`, below the code
+/// area, not repeated per-row). The design only specifies an underline color for the error case;
+/// `Warning` reuses [`theme::term::WARN`], `Information`/`Hint` reuse
+/// [`theme::text::DIM`]/[`theme::text::FAINT`] with `Hint` dimmer, matching the convention that
+/// LSP hints are the least severe/most subtle diagnostic kind.
 pub(super) fn diagnostic_underline_color(severity: diagnostics_view::Severity) -> gpui::Rgba {
     match severity {
         diagnostics_view::Severity::Error => theme::syntax::ERROR_UNDERLINE,
@@ -1926,14 +1585,10 @@ pub(super) fn diagnostic_underline_color(severity: diagnostics_view::Severity) -
     }
 }
 
-/// The File view row's real background tint for a diagnostic of `severity` - `None` means no
-/// tint at all. Only `Error` gets one (`design_handoff_jerry_ade/README.md`'s own `#191416` row
-/// tint, [`theme::syntax::DIAGNOSTIC_ROW_BG`]): the design spec never mandates one for the other
-/// three severities, and following the same real-editor convention
-/// [`diagnostic_underline_color`]'s own docs cite (hints/info render subtly, without a row-level
-/// highlight), a `Warning`/`Information`/`Hint`-only line is distinguished from a clean line by
-/// its dotted underline alone, not an additional tint - keeping every non-error severity visibly
-/// *less* alarming than an error, which is the whole point of having severities at all.
+/// The File view row's background tint for a diagnostic of `severity` - `None` means no tint.
+/// Only `Error` gets one ([`theme::syntax::DIAGNOSTIC_ROW_BG`]); the other three are
+/// distinguished from a clean line by their dotted underline alone, keeping every non-error
+/// severity visibly less alarming than an error.
 pub(super) fn diagnostic_row_bg(severity: diagnostics_view::Severity) -> Option<gpui::Rgba> {
     match severity {
         diagnostics_view::Severity::Error => Some(theme::syntax::DIAGNOSTIC_ROW_BG),
@@ -1941,12 +1596,9 @@ pub(super) fn diagnostic_row_bg(severity: diagnostics_view::Severity) -> Option<
     }
 }
 
-/// The File view row's real inline end-of-line message colour for a diagnostic of `severity` -
-/// `Error` keeps the design's own dim red ([`theme::syntax::DIAGNOSTIC_INLINE_MESSAGE`],
-/// `#6b4a48`); every other severity reuses [`theme::text::FAINT`] (no bespoke per-severity
-/// message colour is specified by the design, and a single dim neutral tone reads correctly
-/// alongside any of the three non-error underline colours [`diagnostic_underline_color`] can
-/// produce).
+/// The File view row's inline end-of-line message color for a diagnostic of `severity` - `Error`
+/// keeps [`theme::syntax::DIAGNOSTIC_INLINE_MESSAGE`]; every other severity reuses
+/// [`theme::text::FAINT`].
 pub(super) fn diagnostic_inline_message_color(severity: diagnostics_view::Severity) -> gpui::Rgba {
     match severity {
         diagnostics_view::Severity::Error => theme::syntax::DIAGNOSTIC_INLINE_MESSAGE,
@@ -1954,12 +1606,9 @@ pub(super) fn diagnostic_inline_message_color(severity: diagnostics_view::Severi
     }
 }
 
-/// Real, automated proof that the four severities produce visibly distinct rendered treatments -
-/// a literal screenshot isn't practical in this sandbox's test environment, so this asserts
-/// directly against the real colour-mapping functions [`render_file_view_line`] itself calls
-/// (not a reimplemented duplicate of their logic), which is what actually determines each row's
-/// real drawn appearance. The regression this guards: before this fix, every severity collapsed
-/// onto the same `ERROR_UNDERLINE`/`DIAGNOSTIC_ROW_BG` treatment regardless of its real severity.
+/// Asserts the four severities produce visibly distinct colors, against the same color-mapping
+/// functions [`render_file_view_line`] calls (not a reimplemented duplicate). Regression guard:
+/// every severity used to collapse onto the same underline/row-bg treatment.
 #[cfg(test)]
 mod diagnostic_severity_color_tests {
     use super::*;
@@ -1996,9 +1645,8 @@ mod diagnostic_severity_color_tests {
         assert!(diagnostic_row_bg(diagnostics_view::Severity::Hint).is_none());
     }
 
-    /// The exact regression this fix addresses, checked directly: a real Hint used to render
-    /// pixel-identical to a real Error (same underline colour, same row tint, same inline
-    /// message colour) - every one of those three dimensions must now differ.
+    /// Regression guard: a Hint used to render pixel-identical to an Error (same underline,
+    /// row tint, and inline message color) - all three dimensions must now differ.
     #[test]
     fn a_real_hint_is_visibly_distinct_from_a_real_error_on_every_dimension() {
         assert_ne!(
@@ -2019,15 +1667,12 @@ mod diagnostic_severity_color_tests {
     }
 }
 
-/// Bundles [`render_file_view_line`]'s two Hover-state parameters together purely to keep that
-/// function's own argument count under clippy's `too_many_arguments` limit - `target`/`entry` are
-/// otherwise unrelated to each other in meaning (see [`AdeApp::request_hover`]/[`HoverEntry`]'s
-/// own docs), so this is real grouping-for-arity, not a real conceptual unit.
+/// Bundles [`render_file_view_line`]'s two hover-state parameters to keep that function's
+/// argument count under clippy's `too_many_arguments` limit; not otherwise a conceptual unit.
 pub(super) struct HoverRenderContext<'a> {
-    /// The current file's own real, absolute path - `Some` only for a `.rs` file (see
-    /// [`AdeApp::request_hover`]'s own docs for why hover has no real target otherwise).
+    /// The current file's absolute path, `Some` only for a `.rs` file.
     target: Option<&'a Path>,
-    /// [`AdeApp::hover`]'s current real entry, if any.
+    /// [`AdeApp::hover`]'s current entry, if any.
     entry: Option<&'a HoverEntry>,
 }
 
@@ -2049,14 +1694,11 @@ pub(super) fn render_file_view_line(
     } else {
         theme::text::GUTTER
     };
-    // "Worst wins" - see `diagnostics_view::Severity::worst`'s own docs for why this (rather
-    // than "whichever diagnostic happens to be first in the Vec") is this app's documented,
-    // explicit tie-break for a line's single row-level treatment when it carries diagnostics of
-    // mixed severity.
+    // "Worst wins": the tie-break for a line's row-level treatment when it carries diagnostics
+    // of mixed severity (see `Severity::worst`), not whichever is first in the Vec.
     let worst_severity = diagnostics_view::Severity::worst(diagnostics);
-    // The real hovered span on *this* line, if any - see `HoverEntry::byte_range`'s own docs for
-    // why run-level equality (not a re-derived UTF-16/byte conversion of `rust-analyzer`'s own
-    // returned `Hover::range`) is exactly the right, real granularity here.
+    // The hovered span on this line, if any, compared by run-level byte range rather than a
+    // re-derived UTF-16 conversion of rust-analyzer's own `Hover::range`.
     let hovered_byte_range = hover_entry
         .and_then(|entry| (entry.line_number == line_number).then(|| entry.byte_range.clone()));
 
@@ -2069,21 +1711,16 @@ pub(super) fn render_file_view_line(
         let run_end = run_start + run_text.len();
         byte_cursor = run_end;
 
-        // A stable `.id()` is applied unconditionally (not only for a real, clickable token) so
-        // `run`'s own type stays exactly `Stateful<Div>` across every branch below - GPUI's
-        // `Div::id` and `Stateful<Div>`'s own subsequent `.cursor_pointer()`/`.on_click()` change
-        // the concrete type, and an `if`/`else` reassigning the same `let mut run` binding with
-        // two different concrete types on different branches doesn't compile.
+        // `.id()` is applied unconditionally so `run` stays `Stateful<Div>` across every branch
+        // below; a conditional `.cursor_pointer()`/`.on_click()` would change the concrete type,
+        // and this `let mut run` can't be reassigned two different types on different branches.
         let mut run = div()
             .id(("file-view-code-token", line_number * 1_000_000 + run_start))
             .text_color(code_view::color_for_kind(kind))
             .child(run_text.clone());
         if is_diagnostic {
-            // Every underlined run on this line shares the line's own worst-severity colour
-            // (see this function's own docs above) - `unwrap_or` a value that is never actually
-            // reached here (`is_diagnostic` is only ever `true` when `diagnostics` was non-empty,
-            // which is exactly when `worst_severity` is `Some`), kept as a real fallback rather
-            // than an `.unwrap()` per this crate's own no-`.unwrap()`-outside-tests convention.
+            // `is_diagnostic` is only true when `diagnostics` is non-empty, so `worst_severity`
+            // is always `Some` here; `unwrap_or` is a fallback, not a reachable default.
             let underline_color = worst_severity
                 .map(diagnostic_underline_color)
                 .unwrap_or(theme::syntax::ERROR_UNDERLINE);
@@ -2092,18 +1729,14 @@ pub(super) fn render_file_view_line(
                 .border_color(underline_color)
                 .border_dashed();
         } else if hovered_byte_range.as_ref() == Some(&(run_start..run_end)) {
-            // A real diagnostic (2px dotted, error-severity colour) always wins over the hover
-            // underline (1px solid `theme::syntax::HOVER_UNDERLINE`) when both would land on the
-            // exact same run - a deliberate priority (an active error is more urgent than a
-            // symbol the user merely clicked to inspect), not an accidental overwrite.
+            // A diagnostic underline always wins over the hover underline on the same run - an
+            // active error is more urgent than a symbol the user merely clicked to inspect.
             run = run
                 .border_b_1()
                 .border_color(theme::syntax::HOVER_UNDERLINE);
         }
-        // Only a real, non-whitespace token is a real hover/go-to-definition target - clicking
-        // whitespace/an empty gap run would just ask `rust-analyzer` about nothing, so it's left
-        // as a plain, non-interactive span (still real syntax-highlighted text, just not wrapped
-        // in a second, redundant `on_click`/`cursor_pointer` on top of the line's own).
+        // Only a non-whitespace token is a hover/go-to-definition target; clicking whitespace
+        // would just ask rust-analyzer about nothing.
         if let Some(path) = hover_target {
             if !run_text.trim().is_empty() {
                 let path = path.to_path_buf();
@@ -2131,18 +1764,10 @@ pub(super) fn render_file_view_line(
         text_row = text_row.child(run);
     }
     if let Some(first) = diagnostics.first() {
-        // Only the message's real *first* line is shown inline - `uniform_list` measures one
-        // row's height and applies it uniformly to every row (see
-        // `vendor/zed/crates/gpui/examples/uniform_list.rs`/that widget's own real callers, e.g.
-        // `vendor/zed/crates/git_ui/src/git_panel.rs`'s `commit_history_list`, for the fixed-
-        // row-height virtualized-list semantics this follows), so a real, genuinely multi-line
-        // rust-analyzer/rustc message (embedded `\n`s are routine - e.g. a real "mismatched
-        // types\nexpected `i32`, found `&str`") would otherwise clip or overlap the row below
-        // it. The full, unmodified multi-line message is still shown in
-        // `render_diagnostics_card` below, which isn't height-constrained the same way.
-        // `.lines().next()` returns `None` only for a genuinely empty message string, hence
-        // `unwrap_or_default()` rather than `.unwrap()` (forbidden outside `#[cfg(test)]` by
-        // this crate's own conventions).
+        // Only the message's first line is shown inline: `uniform_list` measures one row's
+        // height and applies it uniformly to every row, so a multi-line rustc message (embedded
+        // `\n`s are routine) would otherwise clip or overlap the row below. The full message is
+        // still shown in `render_diagnostics_card` below, which isn't height-constrained.
         let first_line = first.message.lines().next().unwrap_or_default();
         text_row = text_row.child(
             div()
@@ -2178,31 +1803,17 @@ pub(super) fn render_file_view_line(
                 .pr(px(12.0))
                 .text_right()
                 .text_color(gutter_color)
-                // Pinned to a real, fixed `px()` value - deliberately NOT `rems(1.0)` (which
-                // this row's ancestor `uniform_list` sets, and which every other real piece of
-                // text in this row inherits) - see this crate's report for the real, measured
-                // bug this closes: `uniform_list` (`vendor/zed/crates/gpui/src/elements/
-                // uniform_list.rs`) measures every row's real height from item index 0 alone (a
-                // single-digit "1", which never wraps) and applies that one measured height
-                // uniformly to every row slot. A 4-digit line number growing with zoom the same
-                // way the code text does would, past a real, measurable zoom threshold, no
-                // longer fit this column's real fixed 52px width (`design_handoff_jerry_ade/
-                // Jerry.dc.html`'s own `width:52px;text-align:right;padding-right:12px`) and
-                // wrap onto a real second line - taller than the slot `uniform_list` allocated
-                // for it, so it visually overlaps the row below. Pinning this `text_size` alone
-                // (not `line_height`, which stays the ambient, zoom-scoped `rems(1.6)` this row
-                // inherits) keeps the glyphs small enough to never wrap while still letting this
-                // div's own line-box height track the row's real, zoom-scaled height - so it
-                // never desyncs from the code text row's own real height either.
+                // Fixed `px()`, not `rems(1.0)` like the rest of this row's text: `uniform_list`
+                // measures every row's height from item index 0 alone (a single-digit "1", which
+                // never wraps) and applies that height to every row slot. A 4-digit line number
+                // growing with zoom could wrap past this column's fixed 52px width and overlap
+                // the row below. Pinning `text_size` alone (not `line_height`, which stays the
+                // ambient zoom-scoped `rems(1.6)`) keeps glyphs from wrapping while the line-box
+                // height still tracks the row's zoom-scaled height.
                 .text_size(px(11.0))
-                // Test-only-in-effect (`Styled::debug_selector` is a real no-op outside
-                // `#[cfg(any(test, feature = "test-support"))]` builds - `crate::root::
-                // settings_render`'s keybindings-filter test already establishes this exact
-                // unconditional-call pattern): lets `code_zoom_tests::zoom_scales_text_but_not_
-                // the_gutter_width` measure this real, fixed-`px()` gutter's real rendered
-                // width at two different zoom levels and assert it never changes - the other
-                // half of the design's "gutters ... keep their fixed widths" note that
-                // `zoom_scoped`'s own docs describe.
+                // `debug_selector` is a no-op outside test builds; lets
+                // `code_zoom_tests::zoom_scales_text_but_not_the_gutter_width` measure this
+                // gutter's rendered width at two zoom levels and assert it never changes.
                 .debug_selector(move || format!("file-view-gutter-{line_number}"))
                 .child(line_number.to_string()),
         )
@@ -2210,17 +1821,10 @@ pub(super) fn render_file_view_line(
             div()
                 .flex_none()
                 .w(px(3.0))
-                // `self_stretch()` (`align-self: stretch`, verified against `vendor/zed/crates/
-                // gpui/src/styled.rs`'s own `Styled::self_stretch`, the exact same real pattern
-                // `crate::root::title_bar`'s own caption buttons already use to fill their
-                // band's full height), not a stale `h(px(20.0))` - the old fixed `20px` matched
-                // this row's *old*, always-~20.8px real height, but at higher zoom this row's
-                // real height grows (this row's own `items_center()` sizes it from its tallest
-                // child, the zoom-scaled code text) while a fixed-`px()` bar would stay pinned
-                // at 20px, leaving a real visible gap between consecutive changed lines' bars
-                // instead of one continuous strip. Stretching to the row's own real cross-axis
-                // height (whatever it actually is at the current zoom) keeps this bar spanning
-                // the full row at every zoom level, not just the old fixed 100% baseline.
+                // `self_stretch()` (`align-self: stretch`), not a fixed `h(px(20.0))`: at higher
+                // zoom this row's height grows with the code text, and a fixed-height bar would
+                // leave a gap between consecutive changed lines' bars instead of one continuous
+                // strip.
                 .self_stretch()
                 .bg(if is_changed {
                     theme::diff::GIT_GUTTER
@@ -2233,26 +1837,19 @@ pub(super) fn render_file_view_line(
                 .flex_1()
                 .min_w_0()
                 .pl(px(12.0))
-                // See the gutter `debug_selector` above - this one measures the real,
-                // `rems()`-sized text row instead, so the same test can assert it *does*
-                // change with zoom.
+                // See the gutter `debug_selector` above; this one measures the `rems()`-sized
+                // text row instead, so the same test can assert it does change with zoom.
                 .debug_selector(move || format!("file-view-text-row-{line_number}"))
                 .child(text_row),
         )
         .into_any_element()
 }
 
-/// The File view's real status bar (`design_handoff_jerry_ade/README.md`: "Status bar 28: ...
-/// `Rust`, `ln 44, col 14`, `LF`") - real language, real last-click cursor *line* (`None` until
-/// the first click, per `AdeApp::code_cursor`'s docs), a real, byte-detected line-ending label,
-/// and - for a `.rs` file, once a real `lsp_core::LspClient` exists for its repo root - a real
-/// `rust-analyzer` status (`lsp_status`, `None` for every non-Rust file: there is genuinely no
-/// language server for e.g. `.toml`, so no status field is shown for one, rather than a
-/// fabricated placeholder). The design's own `col 14` remains deliberately omitted: there is
-/// still no real per-character column-hit-testing in this app (a documented scope
-/// simplification from an earlier phase), so showing a column next to a real `ln N` would look
-/// just as real while actually always reading `1` - exactly the kind of fake UI this project's
-/// conventions forbid.
+/// The File view's status bar: language, last-click cursor line (`None` until the first click,
+/// per `AdeApp::code_cursor`), a byte-detected line-ending label, and - for a `.rs` file with a
+/// live LSP client - a `rust-analyzer` status. The design's `col 14` is deliberately omitted:
+/// there's no per-character column tracking in this app, so showing a column would always read
+/// `1`.
 pub(super) fn render_file_status_bar(
     parsed: &code_view::ParsedFile,
     cursor: Option<usize>,
@@ -2319,27 +1916,19 @@ pub(super) fn render_file_status_bar(
         .child(parsed.line_ending.label())
 }
 
-/// Real, interactive regression coverage for `AdeApp::render_file_view`'s cache (the exact bug
-/// class - "re-running an expensive parse on every render" - this crate's own prior phases hit
-/// and fixed repeatedly; see `AdeApp::file_view_cache`'s and `AdeApp::render_file_view`'s docs).
+/// Regression coverage for `AdeApp::render_file_view`'s cache: re-running an expensive parse on
+/// every render.
 #[cfg(test)]
 mod code_view_cache_tests {
     use super::*;
     use gpui::TestAppContext;
 
-    /// A real, direct, wall-clock proof that opening a large real file no longer blocks
-    /// `render_center_pane` on the full `code_view::load_file` parse - not just a pointer-
-    /// identity/`None`-before-`run_until_parked` proxy (see this module's other two tests for
-    /// those), but an actual timing comparison against a real synchronous baseline, on the same
-    /// file, on the same machine, in the same test run (a ratio comparison, not an absolute
-    /// wall-clock threshold, so this isn't flaky under CI/machine load the way an absolute
-    /// millisecond budget would be).
+    /// A direct wall-clock proof that opening a large file no longer blocks `render_center_pane`
+    /// on the full `load_file` parse: a timing comparison against a synchronous baseline on the
+    /// same file, same machine, same test run (a ratio, not an absolute threshold, so it isn't
+    /// flaky under CI load).
     ///
-    /// Uses this crate's own `root/code_surface.rs` as the large real `.rs` fixture (originally
-    /// the pre-module-split `root.rs`, the same file a prior audit of this phase measured
-    /// `code_view::highlight_rust` alone taking 119-190ms and the full `code_view::load_file`
-    /// 124ms on, in a debug build, when it still ran inline - `root.rs` was later split into
-    /// `root/*.rs` submodules for maintainability, `code_surface.rs` being the largest of them).
+    /// Uses this crate's own `root/code_surface.rs` as the large `.rs` fixture.
     #[gpui::test]
     fn opening_a_large_real_file_does_not_block_render_on_the_full_parse(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2351,9 +1940,7 @@ mod code_view_cache_tests {
         .expect("read this crate's own root/code_surface.rs as a real, large .rs fixture");
         std::fs::write(&file_path, &source).expect("write large.rs");
 
-        // The real, direct, synchronous baseline: how long the actual blocking work (read +
-        // tree-sitter parse) takes for this exact file, on this exact machine, in this exact
-        // build - i.e. what used to run inline on the render thread.
+        // The synchronous baseline: how long the blocking read+parse takes on this machine.
         let baseline_start = std::time::Instant::now();
         code_view::load_file(&file_path).expect("load_file baseline");
         let baseline_duration = baseline_start.elapsed();
@@ -2381,8 +1968,7 @@ mod code_view_cache_tests {
              executor and returns immediately, it does not run the parse inline"
         );
 
-        // Drive the real background load to completion and confirm it really did load the
-        // whole large file (not a truncated/fabricated stand-in for it).
+        // Drive the background load to completion and confirm the whole file loaded.
         cx.run_until_parked();
         let cached_line_count = app.read_with(cx, |app, _| {
             app.file_view_cache
@@ -2398,21 +1984,11 @@ mod code_view_cache_tests {
         );
     }
 
-    /// Opens a real file and confirms two things in one pass:
-    ///
-    /// 1. The real parse genuinely happens off the GPUI foreground thread - `file_view_cache` is
-    ///    still `None` immediately after the render that kicks off the load, *before*
-    ///    `cx.run_until_parked()` drives `AdeApp::spawn_file_load`'s background task to
-    ///    completion. If `code_view::load_file` were ever called synchronously inline during
-    ///    `render_file_view` again (the exact bug this phase's fix addresses), this assertion
-    ///    would fail: `file_view_cache` would already be populated at this point, with no
-    ///    background task to wait for at all.
-    /// 2. Once the load has actually completed, several further real re-renders of the centre
-    ///    pane never rebuild the cached parse - proven by real pointer identity, not just equal
-    ///    *content*: a fresh `code_view::load_file` call allocates a brand new `Vec` for
-    ///    `ParsedFile::lines`, so if the render path were re-parsing on every frame, the buffer
-    ///    would get a freshly allocated address each time; a real cache hit leaves the existing
-    ///    `Some(ParsedFile)` completely untouched, so the address is trivially identical.
+    /// Confirms two things: (1) the parse happens off the foreground thread - `file_view_cache`
+    /// is still `None` right after the render that kicks off the load, before
+    /// `run_until_parked()` drives it to completion; (2) once loaded, further re-renders reuse
+    /// the cached parse - proven by pointer identity of `ParsedFile::lines`, since a fresh
+    /// `load_file` call would allocate a new `Vec`.
     #[gpui::test]
     fn repeated_renders_of_the_same_open_file_reuse_the_cached_parse(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2440,8 +2016,7 @@ mod code_view_cache_tests {
              during render() again"
         );
 
-        // Drives `AdeApp::spawn_file_load`'s background task (a real `cx.background_executor()`
-        // spawn) to completion, and its `this.update(cx, ..)` write-back along with it.
+        // Drives `spawn_file_load`'s background task, and its write-back, to completion.
         cx.run_until_parked();
 
         let first_render_ptr = app.update(cx, |app, cx| {
@@ -2471,17 +2046,10 @@ mod code_view_cache_tests {
         }
     }
 
-    /// The other half of the same behavior: a real, on-disk content change to the open file (a
-    /// different `mtime`/`len`) *must* invalidate the cache - confirms this isn't a cache that
-    /// never refreshes, just one that doesn't needlessly re-run on an unchanged file. Each real
-    /// load (the initial one and the one triggered by the on-disk change) is driven to
-    /// completion via `cx.run_until_parked()`, since both now run on the background executor
-    /// rather than inline. Sleeps past [`FILE_FRESHNESS_CHECK_INTERVAL`] before the renders that
-    /// must observe the change - see [`AdeApp::file_view_last_freshness_check`]'s docs: a real
-    /// `std::fs::metadata` re-check only happens at most that often now, so a change made (and
-    /// re-rendered against) within the same throttle window as the prior check would - correctly
-    /// - not be picked up yet; `renders_within_the_throttle_window_do_not_pick_up_a_fresh_on_disk_change`
-    /// below covers that half directly.
+    /// A content change (different mtime/len) must invalidate the cache - confirms this isn't a
+    /// cache that never refreshes. Sleeps past [`FILE_FRESHNESS_CHECK_INTERVAL`] first, since the
+    /// throttle window itself is covered separately by
+    /// `renders_within_the_throttle_window_do_not_pick_up_a_fresh_on_disk_change` below.
     #[gpui::test]
     fn a_real_on_disk_change_to_the_open_file_invalidates_the_cache(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2507,16 +2075,14 @@ mod code_view_cache_tests {
                 .len()
         });
 
-        // A real content change with more real lines than before - not a fabricated cache
-        // invalidation signal.
+        // A content change with more lines than before.
         std::fs::write(
             &file_path,
             "fn add() -> i32 {\n    1\n}\n\nfn subtract() -> i32 {\n    -1\n}\n",
         )
         .expect("rewrite sample.rs");
 
-        // Past the real throttle window, so the next render's freshness check is a real,
-        // unthrottled `std::fs::metadata` call again.
+        // Past the throttle window, so the next freshness check isn't skipped.
         std::thread::sleep(FILE_FRESHNESS_CHECK_INTERVAL + std::time::Duration::from_millis(50));
 
         app.update(cx, |app, cx| {
@@ -2541,11 +2107,9 @@ mod code_view_cache_tests {
         );
     }
 
-    /// Real proof of [`AdeApp::file_view_last_freshness_check`]'s own throttling: a real on-disk
-    /// change made *within* [`FILE_FRESHNESS_CHECK_INTERVAL`] of the last real freshness check
-    /// must not be picked up yet (no `std::fs::metadata` re-check has run), and the exact same
-    /// change must be picked up on the very next render once the window has passed - i.e. this
-    /// is a real, bounded staleness window, not a cache that simply never re-checks.
+    /// Proves [`AdeApp::file_view_last_freshness_check`]'s throttling: a change made within
+    /// [`FILE_FRESHNESS_CHECK_INTERVAL`] of the last check isn't picked up yet, but the same
+    /// change is picked up once the window passes.
     #[gpui::test]
     fn renders_within_the_throttle_window_do_not_pick_up_a_fresh_on_disk_change(
         cx: &mut TestAppContext,
@@ -2573,8 +2137,7 @@ mod code_view_cache_tests {
                 .len()
         });
 
-        // A real content change, made immediately - well within the throttle window of the
-        // freshness check the render above just performed.
+        // A content change made immediately, within the throttle window.
         std::fs::write(
             &file_path,
             "fn add() -> i32 {\n    1\n}\n\nfn subtract() -> i32 {\n    -1\n}\n",
@@ -2605,8 +2168,7 @@ mod code_view_cache_tests {
             "no reload should have been dispatched while the freshness check was throttled"
         );
 
-        // Past the real throttle window - the exact same on-disk change is now real, stale
-        // enough to actually be observed.
+        // Past the throttle window - the change is now observed.
         std::thread::sleep(FILE_FRESHNESS_CHECK_INTERVAL + std::time::Duration::from_millis(50));
         app.update(cx, |app, cx| {
             app.render_center_pane(cx);
@@ -2630,11 +2192,10 @@ mod code_view_cache_tests {
     }
 }
 
-/// Real, deterministic regression coverage for the cross-file cursor leak
-/// [`AdeApp::pending_cursor_line`]'s own docs describe: [`AdeApp::navigate_to_definition`] to a
-/// real file B that isn't cached yet leaves a one-shot target line waiting for B's own real
-/// background load to finish; opening a *different*, unrelated file C before that load resolves
-/// must never let C's own load misapply B's stale target line.
+/// Regression coverage for the cross-file cursor leak [`AdeApp::pending_cursor_line`] describes:
+/// [`AdeApp::navigate_to_definition`] to a file B that isn't cached yet leaves a one-shot target
+/// line waiting for B's background load; opening a different file C before that resolves must
+/// not let C's load misapply B's stale target line.
 #[cfg(test)]
 mod cross_file_navigation_tests {
     use super::*;
@@ -2652,9 +2213,8 @@ mod cross_file_navigation_tests {
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
-        // A real go-to-definition landing on B's real line 5 - B isn't cached yet, so this only
-        // sets a real, one-shot `pending_cursor_line` instruction rather than `code_cursor`
-        // directly (see `AdeApp::navigate_to_definition`'s own docs).
+        // Landing on B's line 5 - B isn't cached yet, so this sets `pending_cursor_line` rather
+        // than `code_cursor` directly.
         app.update_in(cx, |app, window, cx| {
             app.navigate_to_definition(file_b.clone(), 5, window, cx);
         });
@@ -2663,20 +2223,17 @@ mod cross_file_navigation_tests {
             Some((file_b.clone(), 5))
         );
         app.update(cx, |app, cx| {
-            // Dispatches B's real background load (`AdeApp::spawn_file_load`) - not yet driven
-            // to completion (`cx.run_until_parked()` hasn't run), matching the real race: the
-            // load is genuinely in flight.
+            // Dispatches B's background load; not yet driven to completion, so it's still
+            // in flight.
             app.render_center_pane(cx);
         });
 
-        // Before B's own real background load resolves, the user clicks a completely unrelated
-        // file C in the tree.
+        // Before B's load resolves, the user opens unrelated file C.
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_c.clone(), window, cx);
         });
         app.update(cx, |app, cx| {
-            // Dispatches C's own real background load, replacing (and so - dropping a `Task`
-            // cancels it immediately - cancelling) B's still in-flight one.
+            // Dispatches C's background load, dropping (and so cancelling) B's in-flight one.
             app.render_center_pane(cx);
         });
         cx.run_until_parked();
@@ -2709,9 +2266,8 @@ mod cross_file_navigation_tests {
     }
 }
 
-/// Real, deterministic regression coverage for the unbounded busy-loop
-/// [`FileLoadState::Error`]'s own docs describe: a real read failure for a path must settle into
-/// a stable error state, never respawn a doomed load again on every subsequent render.
+/// Regression coverage for the unbounded busy-loop [`FileLoadState::Error`] describes: a read
+/// failure must settle into a stable error state, never respawn a doomed load every render.
 #[cfg(test)]
 mod unreadable_file_tests {
     use super::*;
@@ -2722,9 +2278,8 @@ mod unreadable_file_tests {
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
-        // A real, deterministic, cross-platform read failure - no such path exists on disk, so
-        // `code_view::load_file`'s own `fs::metadata`/`fs::read` calls fail every single time,
-        // with no platform-specific permissions setup needed.
+        // A deterministic, cross-platform read failure: no such path exists, so `load_file`'s
+        // `fs::metadata`/`fs::read` fail every time, with no platform-specific setup needed.
         let missing_path = repo.path().join("does-not-exist.rs");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
@@ -2745,14 +2300,10 @@ mod unreadable_file_tests {
             other => panic!("expected a real Error state after the failed load, got {other:?}"),
         });
 
-        // The real regression this guards against: before the fix, this next render alone -
-        // called synchronously, with no further `run_until_parked()` first - would flip
-        // `file_load_state` straight back to `Loading` (`AdeApp::spawn_file_load` sets that
-        // synchronously, before any real background work even runs), because the respawn guard
-        // only ever checked `FileLoadState::Loading`, never `FileLoadState::Error`. Left
-        // unbounded, each real failed load called `cx.notify()`, which triggered the very next
-        // render, which respawned the doomed load again - a permanent busy-loop (measured at
-        // ~60 loads/repaints per second), not a real, stable error state.
+        // The regression this guards against: before the fix, this next render alone (no
+        // further `run_until_parked()`) would flip `file_load_state` back to `Loading`, because
+        // the respawn guard only checked `FileLoadState::Loading`, never `Error` - an unbounded
+        // busy-loop instead of a stable error state.
         app.update(cx, |app, cx| {
             app.render_center_pane(cx);
         });
@@ -2773,15 +2324,12 @@ mod unreadable_file_tests {
     }
 }
 
-/// The real, practical end-to-end proof H3's hover/go-to-definition feature exists to deliver -
-/// mirrors [`lsp_diagnostics_wiring_tests`]'s own real "spawn a real `rust-analyzer` through this
-/// app's own real code path, wait real wall-clock time for a real async result, assert on real
-/// content" shape, applied to `AdeApp::request_hover`/`AdeApp::trigger_goto_definition` instead of
-/// diagnostics. `AdeApp::request_hover` is called directly (the same real method
-/// `crate::root::render_file_view_line`'s own click handler calls) rather than synthesizing a
-/// real GPUI mouse click on a specific virtualized row's pixel position - consistent with
-/// `lsp_diagnostics_wiring_tests`'s own `AdeApp::open_file_view` call, which exercises the real
-/// production method a real Files-tree click would call, not a simulated click event.
+/// End-to-end proof of the hover/go-to-definition feature: mirrors
+/// [`lsp_diagnostics_wiring_tests`]'s shape (spawn a real `rust-analyzer` through this app's code
+/// path, wait for an async result, assert on real content), applied to `request_hover`/
+/// `trigger_goto_definition`. Calls `request_hover` directly - the same method
+/// `render_file_view_line`'s click handler calls - rather than synthesizing a mouse click on a
+/// virtualized row's pixel position.
 #[cfg(test)]
 mod lsp_hover_wiring_tests {
     use super::*;
@@ -2800,16 +2348,10 @@ mod lsp_hover_wiring_tests {
         dir
     }
 
-    /// Real, bounded wall-clock retry loop that keeps re-sending a real `AdeApp::request_hover`
-    /// call for the exact same real click until it resolves to a real, non-empty
-    /// `hover_view::HoverRenderModel`, or `deadline` passes. A single real request can honestly
-    /// come back `Ready(None)` while `rust-analyzer` is still mid-index for this specific
-    /// position (the exact same real "not resolved yet" behavior
-    /// `lsp_core::client::tests::rust_analyzer_returns_a_real_definition_location_for_a_call_site`
-    /// had to retry past for an empty `GotoDefinitionResponse::Array`) - `AdeApp::request_hover`'s
-    /// own real caching discipline (a no-op for a repeated identical click) means `app.hover` is
-    /// reset to `None` between real attempts here so each retry is a genuine new request, not a
-    /// cache hit against the previous empty answer.
+    /// A bounded retry loop that re-sends `request_hover` for the same click until it resolves
+    /// to a non-empty `HoverRenderModel`, or `deadline` passes. A single request can honestly
+    /// come back `Ready(None)` while rust-analyzer is still mid-index; `app.hover` is reset to
+    /// `None` between attempts so `request_hover`'s caching doesn't turn a retry into a no-op.
     fn request_hover_until_resolved(
         app: &Entity<AdeApp>,
         cx: &mut VisualTestContext,
@@ -2864,16 +2406,11 @@ mod lsp_hover_wiring_tests {
         }
     }
 
-    /// Real click position for `"    let result = add_one(41);"` (line index 8, 0-based - see
+    /// Click position for `"    let result = add_one(41);"` (line index 8, 0-based), reused from
     /// `lsp_core::client::tests::rust_analyzer_returns_a_real_hover_for_a_documented_function`'s
-    /// identical fixture/position, reused here verbatim since it's already verified against a
-    /// real `rust-analyzer` response) - the real `add_one` call-site identifier itself spans
-    /// bytes 17..24 of that line (`"    let result = "` is 17 real ASCII bytes, `"add_one"` is 7
-    /// more), matching exactly the real byte range a real tree-sitter identifier token/run for it
-    /// would carry (this test calls `AdeApp::request_hover` directly rather than going through a
-    /// real render/click, so this range is asserted by hand rather than read off a real
-    /// `code_view::RenderedLine` run - see this module's own top-level docs for why that's still
-    /// a real, honest exercise of the same method a real click would call).
+    /// fixture. The `add_one` call-site identifier spans bytes 17..24 of that line (`"    let
+    /// result = "` is 17 bytes, `"add_one"` is 7 more) - computed by hand since this test calls
+    /// `request_hover` directly rather than through a render/click.
     const FIXTURE_SOURCE: &str = "/// Adds one to the given number.\n\
          ///\n\
          /// Returns the incremented value.\n\
@@ -2886,11 +2423,9 @@ mod lsp_hover_wiring_tests {
         character: 20,
     };
 
-    /// The real hover flow: a real click-equivalent `AdeApp::request_hover` call against a real,
-    /// running `rust-analyzer` (spawned through `AdeApp::render_file_view`'s own real
-    /// `ensure_lsp_client` path, not `lsp_core` called directly) resolves to a real
-    /// `hover_view::HoverRenderModel` whose real signature and doc text match the fixture's own
-    /// real documented function - not placeholder or guessed content.
+    /// A click-equivalent `request_hover` call against a running rust-analyzer (spawned through
+    /// `render_file_view`'s `ensure_lsp_client` path) resolves to a `HoverRenderModel` whose
+    /// signature and doc text match the fixture's documented function.
     #[gpui::test]
     fn a_real_click_resolves_to_a_real_hover_render_model(cx: &mut TestAppContext) {
         let project = write_scratch_project(FIXTURE_SOURCE);
@@ -2902,19 +2437,16 @@ mod lsp_hover_wiring_tests {
             app.open_file_view(main_rs.clone(), window, cx);
         });
         cx.run_until_parked();
-        // `AdeApp::render_file_view` (the real method that spawns the real `LspClient`) only
-        // actually runs as part of a real render - `render_center_pane` drives it, mirroring
-        // `lsp_diagnostics_wiring_tests`'s own identical need to call it directly in a headless
-        // test (no real window compositor is driving repaints here).
+        // `render_file_view` spawns the LspClient but only runs as part of a render; there's no
+        // window compositor driving repaints in this headless test, so drive it directly.
         app.update(cx, |app, cx| {
             app.render_center_pane(cx);
         });
         cx.run_until_parked();
 
-        // Keeps re-rendering (the real trigger for `AdeApp::dispatch_did_open`, once the client
-        // is `Ready`) while waiting for the real client to finish its handshake - a plain "wait,
-        // then render once" would leave a real window where the client only just became `Ready`
-        // and `didOpen` was never sent for this render pass, exactly the gap this loop closes.
+        // Keeps re-rendering (the trigger for `dispatch_did_open` once the client is Ready)
+        // while waiting for the handshake - a single "wait, then render once" could leave
+        // `didOpen` never sent for a client that only just became Ready.
         let client_deadline = Instant::now() + Duration::from_secs(120);
         loop {
             app.update(cx, |app, cx| {
@@ -2961,41 +2493,24 @@ mod lsp_hover_wiring_tests {
         });
     }
 
-    /// Proves the real `F12` keybinding is genuinely wired end to end at the GPUI action-dispatch
-    /// layer: `crate::lib::run`'s real `cx.bind_keys([... KeyBinding::new("f12",
-    /// root::GotoDefinition, None) ...])` entry, `AdeApp::render`'s real
-    /// `.on_action(cx.listener(Self::handle_goto_definition_action))`, and
-    /// `handle_goto_definition_action` itself all genuinely connect a dispatched [`GotoDefinition`]
-    /// action to a real call into `AdeApp::trigger_goto_definition` - verified here by observing a
-    /// real, distinguishing side effect (`AdeApp::hover` being read, which only happens inside
-    /// `trigger_goto_definition`): with no file ever opened, `AdeApp::hover` is `None`, so
-    /// `trigger_goto_definition` returns immediately without spawning anything - a real, harmless,
-    /// deterministic no-op that this test can assert didn't panic and didn't spawn a stray
-    /// background task, which is exactly what "the action reached the handler and the handler's
-    /// real early-return path ran" looks like from the outside.
+    /// Proves the `F12` keybinding is wired end to end at the GPUI action-dispatch layer
+    /// (`cx.bind_keys`, `AdeApp::render`'s `.on_action`, `handle_goto_definition_action`) by
+    /// observing a distinguishing side effect: with no file open, `hover` is `None`, so
+    /// `trigger_goto_definition` returns immediately without spawning anything - a harmless,
+    /// deterministic no-op this test can assert didn't panic or spawn a stray background task.
     ///
-    /// ## Why the *full* navigation behavior below is proven a different way
+    /// ## Why full navigation is proven a different way
     ///
-    /// [`a_real_click_resolves_to_a_real_hover_render_model`]'s own File view (`open_change`
-    /// naming a real `.rs` file, `code_view = File`) mounted via `AdeApp::render_center_pane` was
-    /// found, while writing this phase's tests, to leave `TestAppContext::dispatch_action` unable
-    /// to reach *any* `on_action` handler at all - reproduced down to the minimal case of setting
-    /// `open_change`/`code_view` directly with no LSP/file content involved at all. This was a
-    /// real, genuine bug (`AdeApp::render_center_pane` stops rendering the active session's own
-    /// terminal pane - the previously-focused node - the instant a File view mounts, leaving
-    /// `Window::focus` dangling on a `FocusId` the last rendered frame no longer contains), the
-    /// same bug class [`palette_focus_tests`]/[`settings_focus_tests`]'s own docs describe, now
-    /// fixed for Surface C too by [`AdeApp::code_focus_handle`] - see that field's own docs, and
-    /// [`code_focus_tests`] for real, interactive coverage that `ToggleSettings`/`TogglePalette`/
-    /// `GotoDefinition` all genuinely reach their handlers with a File view open. This test itself
-    /// stays deliberately minimal (a fresh window, `hover == None`, no file ever opened) rather
-    /// than folding that File-view-open case in here too, so the real navigation behavior below
-    /// is still proven the way it originally was: [`f12_action_navigates_to_the_real_definition_
-    /// line`] calls `AdeApp::trigger_goto_definition` directly - the exact same method this real,
-    /// verified action handler calls - mirroring the exact "call the real production method the
-    /// real input event would call, rather than simulate the input event itself" pattern this
-    /// module's own [`a_real_click_resolves_to_a_real_hover_render_model`] and
-    /// `lsp_diagnostics_wiring_tests`'s `AdeApp::open_file_view` call both already establish.
+    /// Mounting a File view via `render_center_pane` was found, while writing this test, to leave
+    /// `TestAppContext::dispatch_action` unable to reach any `on_action` handler at all:
+    /// `render_center_pane` stops rendering the active session's terminal pane the instant a File
+    /// view mounts, leaving `Window::focus` dangling on a `FocusId` the last frame no longer
+    /// contains - the same bug class [`palette_focus_tests`]/[`settings_focus_tests`] describe,
+    /// fixed for Surface C by [`AdeApp::code_focus_handle`] (see [`code_focus_tests`] for
+    /// interactive coverage that `GotoDefinition` reaches its handler with a File view open).
+    /// This test stays minimal (fresh window, no file opened); full navigation is proven by
+    /// [`f12_action_navigates_to_the_real_definition_line`] calling `trigger_goto_definition`
+    /// directly instead.
     #[gpui::test]
     fn f12_action_reaches_the_real_handler_on_a_fresh_window(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3010,21 +2525,15 @@ mod lsp_hover_wiring_tests {
         cx.dispatch_action(GotoDefinition);
         cx.run_until_parked();
 
-        // `handle_goto_definition_action`'s only real effect with `hover == None` is a harmless
-        // early return inside `trigger_goto_definition` - confirming the app is still alive and
-        // in exactly the same real state is the honest, available proof that dispatch reached it
-        // without erroring, without this test needing to instrument production code with a debug
-        // hook just to observe it.
+        // `handle_goto_definition_action`'s only effect with `hover == None` is a harmless early
+        // return; confirming the app is unchanged is the available proof dispatch reached it.
         assert_eq!(app.read_with(cx, |app, _| app.hover.clone()), None);
     }
 
-    /// The real go-to-definition flow: `AdeApp::trigger_goto_definition` - the exact same real
-    /// method [`f12_action_reaches_the_real_handler_on_a_fresh_window`] just proved a real `F12`
-    /// keypress reaches - sends a real `textDocument/definition` request using `AdeApp::hover`'s
-    /// own real position, and a real response navigates the viewer's real `AdeApp::code_cursor`
-    /// to the function's own real definition line, not the call site the request was sent from.
-    /// See this module's own docs above for why this calls `trigger_goto_definition` directly
-    /// rather than `cx.dispatch_action(GotoDefinition)`.
+    /// `trigger_goto_definition` sends a `textDocument/definition` request using `hover`'s
+    /// position, and the response navigates `code_cursor` to the function's definition line, not
+    /// the call site the request was sent from. Calls `trigger_goto_definition` directly rather
+    /// than `cx.dispatch_action(GotoDefinition)` - see this module's docs above.
     #[gpui::test]
     fn f12_action_navigates_to_the_real_definition_line(cx: &mut TestAppContext) {
         let project = write_scratch_project(FIXTURE_SOURCE);
@@ -3037,7 +2546,7 @@ mod lsp_hover_wiring_tests {
         });
         cx.run_until_parked();
 
-        // See the hover test above's identical loop for why re-rendering here (not just waiting)
+        // See the hover test above's identical loop for why re-rendering, not just waiting,
         // matters.
         let client_deadline = Instant::now() + Duration::from_secs(120);
         loop {
@@ -3061,11 +2570,9 @@ mod lsp_hover_wiring_tests {
             std::thread::sleep(Duration::from_millis(200));
         }
 
-        // `AdeApp::trigger_goto_definition` reads `AdeApp::hover`'s own real `path`/`position`
-        // regardless of whether that entry's own hover *content* has resolved yet (see
-        // `GotoDefinition`'s own docs) - a real `Loading` entry already carries a real, valid
-        // request target, so this only needs `request_hover` to have been called once, not to
-        // have fully settled the way the hover test above needs a real render model back.
+        // `trigger_goto_definition` reads `hover`'s path/position regardless of whether the
+        // hover content itself has resolved - a `Loading` entry already carries a valid request
+        // target, so this only needs `request_hover` to have been called once.
         app.update(cx, |app, cx| {
             app.request_hover(
                 main_rs.clone(),
@@ -3077,31 +2584,23 @@ mod lsp_hover_wiring_tests {
         });
         cx.run_until_parked();
 
-        // Retried on a real timer rather than called exactly once: a real
-        // `textDocument/definition` response can honestly be empty while `rust-analyzer` is still
-        // mid-index for this exact position (the same real "not resolved yet" behavior
-        // `lsp_core::client`'s own end-to-end definition test had to retry past), and a real user
-        // would just press `F12` again - this test does exactly that instead of treating one
-        // empty answer as failure.
+        // Retried on a timer rather than called once: a `textDocument/definition` response can
+        // honestly be empty while rust-analyzer is still mid-index, and a real user would just
+        // press F12 again.
         let definition_deadline = Instant::now() + Duration::from_secs(120);
         loop {
             app.update(cx, |app, cx| {
                 app.trigger_goto_definition(cx);
             });
             cx.run_until_parked();
-            // The real `textDocument/definition` request runs on a real background OS thread
-            // (`cx.background_executor().spawn` in `AdeApp::trigger_goto_definition`) - GPUI's
-            // deterministic test executor's own `run_until_parked` only drains *its own*
-            // scheduled queue, which is empty again the instant that real background call is
-            // dispatched (the call itself blocks a genuine thread-pool thread, invisible to the
-            // deterministic scheduler until it finishes and schedules a real completion
-            // callback) - so a real wall-clock sleep has to happen here before a *second*
-            // `run_until_parked` can actually observe and run that completion callback.
+            // The definition request runs on a background OS thread; GPUI's deterministic test
+            // executor's `run_until_parked` only drains its own scheduled queue, which is empty
+            // again the instant that background call is dispatched, so a wall-clock sleep is
+            // needed before a second `run_until_parked` can observe the completion callback.
             std::thread::sleep(Duration::from_millis(300));
             cx.run_until_parked();
-            // `fn add_one` is on real line 4 (1-based - `AdeApp::code_cursor`'s own convention;
-            // 0-based line 3 in the fixture) - genuinely different from `CALL_SITE_LINE` (9),
-            // proving this is real navigation, not a no-op that left the cursor where it was.
+            // `fn add_one` is on line 4 (1-based), different from `CALL_SITE_LINE` (9), proving
+            // this is real navigation, not a no-op that left the cursor where it was.
             let navigated = app.read_with(cx, |app, _| app.code_cursor == Some(4));
             if navigated {
                 break;
@@ -3116,24 +2615,18 @@ mod lsp_hover_wiring_tests {
     }
 }
 
-/// Real, deterministic regression coverage for Revision R4a's multi-file tab-strip
-/// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change 4) - the real
-/// `Self::open_files` open/close/switch state transitions this phase introduced:
-/// [`AdeApp::open_change_diff`]/[`AdeApp::open_file_view`] no longer discard a file from
-/// existence when the user navigates elsewhere, [`AdeApp::activate_file_tab`] switches which one
-/// is showing without touching the list, and [`AdeApp::close_file_tab`] is the one real place a
-/// tab actually leaves the list.
+/// Regression coverage for the multi-file tab strip's `open_files` state transitions:
+/// [`AdeApp::open_change_diff`]/[`AdeApp::open_file_view`] no longer discard a file when the user
+/// navigates elsewhere, [`AdeApp::activate_file_tab`] switches which one is showing without
+/// touching the list, and [`AdeApp::close_file_tab`] is the only place a tab leaves the list.
 #[cfg(test)]
 mod multi_file_tab_tests {
     use super::*;
     use gpui::TestAppContext;
 
-    /// Writes three real files under `dir` and returns both their real absolute paths (what
-    /// `AdeApp::open_file_view` takes) and the real repo-relative paths `AdeApp::open_change`/
-    /// `AdeApp::open_files`/`AdeApp::activate_file_tab`/`AdeApp::close_file_tab` actually key by
-    /// (`AdeApp::open_file_view`'s own `strip_prefix` against `file_tree_root`) - every assertion
-    /// and every `activate_file_tab`/`close_file_tab` call below uses the relative form, the same
-    /// real coordinate space the tab strip itself operates in.
+    /// Writes three files under `dir` and returns both their absolute paths (what
+    /// `open_file_view` takes) and their repo-relative paths (what `open_change`/`open_files`/
+    /// `activate_file_tab`/`close_file_tab` key by, via `open_file_view`'s `strip_prefix`).
     fn write_three_files(
         dir: &std::path::Path,
     ) -> ((PathBuf, PathBuf, PathBuf), (PathBuf, PathBuf, PathBuf)) {
@@ -3328,9 +2821,9 @@ mod multi_file_tab_tests {
         });
     }
 
-    /// [`AdeApp::next_changed_file`]'s real "no active file -> first entry, otherwise advance,
-    /// wrapping around past the last entry" behavior, against a real `git`-backed diff (not a
-    /// fabricated `DiffFile` list) so this also exercises `Self::current_diff`'s real data.
+    /// [`AdeApp::next_changed_file`]'s "no active file -> first entry, otherwise advance,
+    /// wrapping past the last entry" behavior, against a real git-backed diff so this also
+    /// exercises `Self::current_diff`'s data.
     #[gpui::test]
     fn next_changed_file_advances_through_every_changed_file_and_wraps_around(
         cx: &mut TestAppContext,
@@ -3435,12 +2928,10 @@ mod multi_file_tab_tests {
         );
     }
 
-    /// Regression test for the "switching tabs shows the wrong Diff/File view" bug:
-    /// `Self::code_view` is a single global field, not per-tab, so switching from a tab left in
-    /// `File` view to a *different* tab that has a real diff used to incorrectly stay in `File`
-    /// view instead of forcing `Diff` back - `Self::activate_file_tab` never touched `code_view`
-    /// at all, and `Self::render_code_surface`'s own `effective_view` only ever *forces* `File`
-    /// when there's no diff, never forces `Diff` back when one exists.
+    /// Regression test for "switching tabs shows the wrong Diff/File view": `code_view` is a
+    /// single global field, not per-tab, so switching from a tab left in `File` view to a
+    /// different tab with a diff used to incorrectly stay in `File` view instead of forcing
+    /// `Diff` back.
     #[gpui::test]
     fn switching_to_a_tab_with_a_real_diff_shows_the_diff_not_the_last_view_mode(
         cx: &mut TestAppContext,
@@ -3463,8 +2954,7 @@ mod multi_file_tab_tests {
         let changed_rel = PathBuf::from("changed.txt");
         let plain_abs = repo.path().join("plain.txt");
 
-        // Open the real diff file first - lands in Diff view, matching `open_change_diff`'s own
-        // real default.
+        // Open the diff file first - lands in Diff view, matching `open_change_diff`'s default.
         app.update_in(cx, |app, window, cx| {
             app.open_change_diff(changed_rel.clone(), window, cx);
         });
@@ -3473,8 +2963,7 @@ mod multi_file_tab_tests {
             code_view::CodeView::Diff
         );
 
-        // Open a second, unrelated, unchanged file - forced into File view (it has no real
-        // diff).
+        // Open a second, unrelated, unchanged file - forced into File view (no diff).
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(plain_abs, window, cx);
         });
@@ -3484,8 +2973,8 @@ mod multi_file_tab_tests {
             code_view::CodeView::File
         );
 
-        // Switch back to the changed file's tab - it has a real diff, so it must show that diff
-        // again, not silently inherit the File view the plain file just left `code_view` in.
+        // Switch back to the changed file's tab - it has a diff, so it must show that again, not
+        // inherit the File view the plain file left `code_view` in.
         app.update_in(cx, |app, window, cx| {
             app.activate_file_tab(changed_rel.clone(), window, cx);
         });
@@ -3502,12 +2991,11 @@ mod multi_file_tab_tests {
     }
 
     /// Regression test for the "active but not actually showing" gap: a file tab can stay
-    /// `Self::open_change`-active even after its real diff disappears (e.g. the underlying
-    /// change was reverted), at which point `Self::render_center_pane`'s own
-    /// `has_diff_or_file_view` check falls back to rendering the active session instead - but the
-    /// tab strip still paints that file tab as active. Before the fix, `Self::activate_file_tab`
-    /// early-returned as a dead no-op whenever `path` already equalled `Self::open_change`,
-    /// regardless of whether anything was actually showing; re-clicking such a tab did nothing.
+    /// `open_change`-active even after its diff disappears (e.g. the underlying change was
+    /// reverted), so `render_center_pane`'s `has_diff_or_file_view` check falls back to the
+    /// active session while the tab strip still paints the file tab as active. Before the fix,
+    /// `activate_file_tab` early-returned as a dead no-op whenever `path` already equalled
+    /// `open_change`, so re-clicking such a tab did nothing.
     #[gpui::test]
     fn reactivating_a_tab_whose_diff_disappeared_shows_real_content_again(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3532,8 +3020,8 @@ mod multi_file_tab_tests {
             code_view::CodeView::Diff
         );
 
-        // Revert the change on disk and reload the diff - the file's real `DiffFile` disappears
-        // from the loaded diff, but `open_change` still names it (nothing closed the tab).
+        // Revert the change on disk and reload the diff - the file's `DiffFile` disappears from
+        // the loaded diff, but `open_change` still names it (nothing closed the tab).
         std::fs::write(repo.path().join("a.txt"), "1\n").expect("revert a.txt");
         app.update(cx, |app, cx| app.load_diff(repo.path().to_path_buf(), cx));
         cx.run_until_parked();
@@ -3551,8 +3039,7 @@ mod multi_file_tab_tests {
              show for it"
         );
 
-        // Re-click the same, now-content-less tab - before the fix, `activate_file_tab`'s early
-        // return (path already equals `open_change`) made this a dead no-op.
+        // Re-click the same, now-content-less tab - before the fix this was a dead no-op.
         app.update_in(cx, |app, window, cx| {
             app.activate_file_tab(rel, window, cx);
         });
@@ -3565,18 +3052,12 @@ mod multi_file_tab_tests {
     }
 }
 
-/// Real, end-to-end proof that the segmented `Diff | File` toggle's dispatch
-/// (`Self::render_diff_file_toggle`, via the shared `Self::render_choice_control`) is driven by
-/// each segment's real structural position, not by re-matching its current display label - the
-/// exact real correctness hazard an R5.5 senior-maintainer audit found in the label-string
-/// dispatch this replaced (see `Self::render_choice_control`'s own docs): renaming a segment's
-/// label with no matching update to its `on_select` handler used to be able to silently select
-/// the wrong value, with no compile error and no test failure unless someone thought to check
-/// it. This clicks each real, painted segment by its structural `debug_selector`
-/// (`"choice-diff-file-toggle-{index}"` - never derived from, or compared against, either
-/// segment's label text) and asserts the resulting `code_view` matches that segment's real
-/// position, proving dispatch would survive even a future label rename that a purely
-/// label-string-matching `on_select` would have silently gotten wrong.
+/// Proves the segmented `Diff | File` toggle's dispatch (`render_diff_file_toggle`, via the
+/// shared `render_choice_control`) is driven by each segment's structural position, not its
+/// display label - the R5.5 audit found the prior label-string dispatch could silently select
+/// the wrong value if a label was renamed without updating `on_select`, with no compile error or
+/// test failure. Clicks each segment by its structural `debug_selector` (never derived from the
+/// label text) and asserts `code_view` matches that segment's position.
 #[cfg(test)]
 mod choice_control_dispatch_tests {
     use super::*;
@@ -3625,8 +3106,8 @@ mod choice_control_dispatch_tests {
             "sanity: opening a changed file's diff lands in Diff view by default"
         );
 
-        // Segment at structural index 1 ("File") - clicked by its real, position-based
-        // selector, never by searching for its label text.
+        // Segment at structural index 1 ("File") - clicked by its position-based selector,
+        // never by searching for its label text.
         let file_bounds = cx
             .debug_bounds("choice-diff-file-toggle-1")
             .expect("the File segment must have painted at least once");
@@ -3635,7 +3116,7 @@ mod choice_control_dispatch_tests {
         assert_eq!(
             app.read_with(cx, |app, _| app.code_view),
             code_view::CodeView::File,
-            "clicking the segment at structural index 1 must select File - real position-based \
+            "clicking the segment at structural index 1 must select File - position-based \
              dispatch, not a re-match on whatever that segment's label currently says"
         );
 
@@ -3653,11 +3134,10 @@ mod choice_control_dispatch_tests {
     }
 }
 
-/// Real, end-to-end proof of Revision R4b's "terminal is interactive" link-click-opens-a-file
-/// path: a real `gpui::VisualTestContext::simulate_click` against the pane's own real, painted
-/// bounds - not a direct method call standing in for the click - drives `TerminalPane`'s real
-/// `on_click`/`cx.emit`, `Sessions::spawn`'s real `cx.subscribe_in`, and
-/// `AdeApp::open_terminal_link`, the same chain a real user's mouse click goes through.
+/// End-to-end proof of the "terminal is interactive" link-click-opens-a-file path:
+/// `simulate_click` against the pane's own painted bounds drives `TerminalPane`'s `on_click`/
+/// `cx.emit`, `Sessions::spawn`'s `cx.subscribe_in`, and `AdeApp::open_terminal_link` - the same
+/// chain a real mouse click goes through.
 #[cfg(test)]
 mod terminal_link_click_tests {
     use super::*;
@@ -3666,11 +3146,10 @@ mod terminal_link_click_tests {
         VisualTestContext,
     };
 
-    /// Injects a real row of terminal text containing a `path:line` link on the third visible
-    /// row (`"see src/main.rs:1 for it"`, 0-indexed row 2) into the active session's real pane,
-    /// and returns the real, painted geometry (`content_bounds`, cell size) an interaction test
-    /// needs to compute a real click position - factored out since both tests below need the
-    /// identical setup.
+    /// Injects a row of terminal text containing a `path:line` link on the third visible row
+    /// (`"see src/main.rs:1 for it"`, 0-indexed row 2) into the active session's pane, and
+    /// returns the painted geometry (`content_bounds`, cell size) needed to compute a click
+    /// position.
     fn inject_link_row_and_measure(
         app: &Entity<AdeApp>,
         cx: &mut VisualTestContext,
@@ -3685,12 +3164,10 @@ mod terminal_link_click_tests {
                 cx,
             );
         });
-        // Lets the injected `cx.notify()` actually drive a real paint (populating
-        // `content_bounds`) - see `TerminalPane::content_bounds_for_test`'s own docs. The
-        // initial session's real `$SHELL` spawn may also make background progress here, but
-        // only ever appends *after* the cursor position my own injected bytes left it at (the
-        // end of row 2's text) - it can't touch the already-written link characters at the
-        // start of that row, which is all this test's click-position math depends on.
+        // Lets the injected `cx.notify()` drive a real paint (populating `content_bounds`). The
+        // session's `$SHELL` spawn may also make background progress here, but only ever appends
+        // after the injected bytes, so it can't touch the link characters this test's
+        // click-position math depends on.
         cx.run_until_parked();
 
         let (bounds, cell_size) = pane.update_in(cx, |pane, window, _cx| {
@@ -3705,12 +3182,11 @@ mod terminal_link_click_tests {
         )
     }
 
-    /// The real pixel position of the middle of `"src/main.rs:1"` on row 2 of
-    /// [`inject_link_row_and_measure`]'s own injected text (`"see "` is a real 4-character
-    /// prefix) - real geometry math off the pane's own real, measured padding/line-height/cell
-    /// width constants, mirroring the exact same real approach
-    /// `vendor/zed/crates/editor/src/editor_tests.rs`'s own `simulate_click` call sites use
-    /// (`text_origin + em_width * column`, `line_height * row`) rather than a guessed literal.
+    /// The pixel position of the middle of `"src/main.rs:1"` on row 2 of
+    /// [`inject_link_row_and_measure`]'s injected text (`"see "` is a 4-character prefix) -
+    /// geometry math off the pane's measured padding/line-height/cell-width constants, mirroring
+    /// `vendor/zed/crates/editor/src/editor_tests.rs`'s `simulate_click` call sites
+    /// (`text_origin + em_width * column`, `line_height * row`).
     fn link_click_position(bounds: Bounds<Pixels>, cell_size: Size<Pixels>) -> gpui::Point<Pixels> {
         let link_text = "src/main.rs:1";
         let prefix_chars = 4.0; // "see "
@@ -3755,10 +3231,8 @@ mod terminal_link_click_tests {
         });
     }
 
-    /// The real gesture this app requires (`mod`-held click, per the header's own real hint)
-    /// matters: a bare click on the exact same link must not navigate anywhere, so an ordinary
-    /// click inside the terminal (real input focus today; real text selection eventually)
-    /// can never be silently hijacked into a file navigation.
+    /// The mod-held-click gesture matters: a bare click on the same link must not navigate, so
+    /// an ordinary click inside the terminal is never silently hijacked into a file navigation.
     #[gpui::test]
     fn a_bare_click_on_a_detected_link_does_not_open_anything(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3783,14 +3257,12 @@ mod terminal_link_click_tests {
         });
     }
 
-    /// The real, checker-reproduced bug `crate::terminal_pane::click_included_secondary_modifier`
-    /// fixes: `gpui::ClickEvent::modifiers()` only ever reports the modifiers held at mouse-*up*
-    /// (`vendor/zed/crates/gpui/src/interactive.rs:296-306`), so a completely ordinary click
-    /// sequence - hold the modifier, click, release the modifier a moment *before* releasing the
-    /// mouse button - used to silently do nothing. Drives the two halves of a real click
-    /// separately (`simulate_mouse_down`/`simulate_mouse_up`, not `simulate_click`, which always
-    /// holds the same modifiers for both) specifically so this test can hold the modifier only
-    /// at mouse-down and prove that still opens the link.
+    /// The bug `crate::terminal_pane::click_included_secondary_modifier` fixes:
+    /// `gpui::ClickEvent::modifiers()` only reports the modifiers held at mouse-up
+    /// (vendor/zed/crates/gpui/src/interactive.rs, `ClickEvent::modifiers`), so a click sequence
+    /// that releases the modifier just before releasing the mouse button used to silently do
+    /// nothing. Drives mouse-down/mouse-up separately (not `simulate_click`, which holds the
+    /// same modifiers for both) to hold the modifier only at mouse-down.
     #[gpui::test]
     fn mod_held_only_during_mouse_down_still_opens_the_real_file_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3816,13 +3288,9 @@ mod terminal_link_click_tests {
         });
     }
 
-    /// A real, checker-reproduced false-positive class this app has no way to fully rule out
-    /// at the regex level alone (see `crate::terminal_links`'s own docs): a plausible-looking
-    /// path that simply doesn't exist on disk. `AdeApp::open_terminal_link`'s own
-    /// `Path::is_file()` check must refuse it, not open a permanent junk tab for it - the exact
-    /// real end-to-end path (real click -> real `TerminalPaneEvent::OpenPath` -> real handler)
-    /// the two tests above already exercise, just with a detected link that resolves to a real,
-    /// nonexistent path instead of a real file.
+    /// A false-positive class `crate::terminal_links`'s regex can't rule out: a plausible-looking
+    /// path that doesn't exist on disk. `open_terminal_link`'s `Path::is_file()` check must
+    /// refuse it, not open a permanent junk tab.
     #[gpui::test]
     fn mod_click_on_a_link_to_a_nonexistent_path_does_not_open_a_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3852,11 +3320,10 @@ mod terminal_link_click_tests {
     }
 }
 
-/// Real coverage for `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry,
-/// change 6 ("Editor zoom") - pure clamping/rounding logic, real zoom-state mutation through
-/// [`AdeApp`], both real per-tab-zoom modes, and a real interaction test proving the scoped
-/// `rem_scope::WithRemSize` mechanism actually scales code text while leaving the fixed-`px()`
-/// gutter untouched.
+/// Coverage for the editor-zoom feature: clamping/rounding logic, zoom-state mutation through
+/// [`AdeApp`], both per-tab-zoom modes, and an interaction test proving the scoped
+/// `rem_scope::WithRemSize` mechanism scales code text while leaving the fixed-`px()` gutter
+/// untouched.
 #[cfg(test)]
 mod code_zoom_tests {
     use super::*;
@@ -3898,11 +3365,9 @@ mod code_zoom_tests {
         file_path
     }
 
-    /// A real, valid-Rust `.rs` file of exactly `lines` real lines (`// line N` comments, one
-    /// per line - tree-sitter parses a comment-only file just as validly as real code, and this
-    /// test module only ever needs a real, distinct line count/number per row, never real
-    /// syntax) - used by `zoom_scales_text_but_not_the_gutter_width` to reach a real 4-digit
-    /// line number, which `write_single_file`'s own 3-line file can never produce.
+    /// A valid `.rs` file of exactly `lines` lines (`// line N` comments) - used by
+    /// `zoom_scales_text_but_not_the_gutter_width` to reach a 4-digit line number, which
+    /// `write_single_file`'s 3-line file can't produce.
     fn write_many_line_file(repo: &std::path::Path, lines: usize) -> PathBuf {
         let file_path = repo.join("main.rs");
         let mut content = String::new();
@@ -3978,8 +3443,8 @@ mod code_zoom_tests {
         );
     }
 
-    /// `Settings.appearance.per_tab_zoom` on (the real default - `AppearanceSettings::default`)
-    /// - each open file tab must remember its own zoom independently.
+    /// `per_tab_zoom` on (the default) - each open file tab must remember its own zoom
+    /// independently.
     #[gpui::test]
     fn per_tab_zoom_on_remembers_each_tabs_own_zoom_independently(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4073,12 +3538,10 @@ mod code_zoom_tests {
         );
     }
 
-    /// The real regression the audit reproduced live: set a shared zoom, then turn per-tab zoom
-    /// *on* - every already-open tab must keep showing exactly the zoom it was already showing,
-    /// not silently reset to the real 100% default the instant the mode flips. See
-    /// `Self::toggle_per_tab_zoom`'s own docs for the root cause this closes: `file_zoom_percent`
-    /// used to only ever be written to while per-tab mode was already on, so turning it on left
-    /// the map empty for every currently-open tab.
+    /// Regression: set a shared zoom, then turn per-tab zoom on - every already-open tab must
+    /// keep showing the zoom it already had, not reset to 100%. Root cause: `file_zoom_percent`
+    /// used to only be written while per-tab mode was already on, so turning it on left the map
+    /// empty for every open tab.
     #[gpui::test]
     fn turning_per_tab_zoom_on_seeds_every_open_tab_with_the_current_shared_zoom(
         cx: &mut TestAppContext,
@@ -4090,9 +3553,8 @@ mod code_zoom_tests {
         std::fs::write(&b, "fn b() {}\n").expect("write b.rs");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
-        // Start in shared mode (per-tab off) - the real default is per-tab *on*
-        // (`AppearanceSettings::default`), so this test's own first toggle turns it off to set
-        // up the "currently shared" starting state the audit's own repro begins from.
+        // Start in shared mode (per-tab off) - the default is per-tab on, so this toggle sets up
+        // the starting state.
         app.update(cx, |app, cx| app.toggle_per_tab_zoom(cx));
         assert!(!app.read_with(cx, |app, _| app.settings.appearance.per_tab_zoom));
 
@@ -4120,12 +3582,9 @@ mod code_zoom_tests {
              showing"
         );
 
-        // b.rs is the currently active tab (opened last) - switching away and back to it must
-        // restore the same 150% it was already showing, not silently fall back to 100%.
-        // `activate_file_tab` (unlike `open_file_view`) takes the same worktree-relative path
-        // `Self::open_files`/`Self::file_zoom_percent` are actually keyed by, not an absolute
-        // one - `PathBuf::from("a.rs")`/`("b.rs")`, matching every other real caller of this
-        // method in this test module.
+        // b.rs is the active tab (opened last) - switching away and back must restore 150%.
+        // `activate_file_tab` (unlike `open_file_view`) takes the relative path `open_files`/
+        // `file_zoom_percent` are keyed by, not an absolute one.
         app.update_in(cx, |app, window, cx| {
             app.activate_file_tab(PathBuf::from("a.rs"), window, cx);
         });
@@ -4153,13 +3612,9 @@ mod code_zoom_tests {
         );
     }
 
-    /// The real regression the audit reproduced live: zoom a tab, close it, reopen the exact
-    /// same path - it must come back at the real 100% default (this codebase's own documented
-    /// contract for a "never-zoomed" tab -
-    /// `per_tab_zoom_on_remembers_each_tabs_own_zoom_independently`, above), not resurrect the
-    /// stale zoom the closed tab was left at. See `Self::close_file_tab`'s own docs for the real
-    /// fix: the closed path's entry in `Self::file_zoom_percent` is removed immediately, not
-    /// left to accumulate for the rest of the worktree session.
+    /// Regression: zoom a tab, close it, reopen the same path - it must come back at the 100%
+    /// default, not resurrect the stale zoom it was left at. See `close_file_tab`'s docs: the
+    /// closed path's `file_zoom_percent` entry is removed immediately.
     #[gpui::test]
     fn closing_a_tab_clears_its_remembered_zoom_so_reopening_it_starts_fresh(
         cx: &mut TestAppContext,
@@ -4202,30 +3657,25 @@ mod code_zoom_tests {
         );
     }
 
-    /// The real, verified proof that `zoom_scoped`'s `WithRemSize` mechanism actually works as
-    /// GPUI's type system promises: a real, live-rendered code row's text grows with zoom while
-    /// the fixed-`px()` line-number gutter measures identically at every zoom level.
+    /// Proves `zoom_scoped`'s `WithRemSize` mechanism works: a live-rendered code row's text
+    /// grows with zoom while the fixed-`px()` line-number gutter measures identically at every
+    /// zoom level.
     ///
-    /// ## Why this test's own width-only assertion used to be vacuous
+    /// ## Why a width-only assertion would be vacuous
     ///
-    /// A real audit finding: comparing only the gutter's `width` (below) can never actually
-    /// fail, since the gutter column is declared `w(px(52.0))` - a compile-time literal GPUI
-    /// resolves identically regardless of whether the gutter's zoom-scoping is even wired up
-    /// correctly. It proved the column's *width* never moves, which was never actually in
-    /// doubt; it proved nothing about the column's real *content* - specifically, whether the
-    /// line-number *text* inside it still (wrongly) grows with zoom the exact same way the code
-    /// text beside it does. This test's second half (below the 150%-zoom checks) closes that
-    /// gap for real: a real 4-digit line number, scrolled into view and measured at the real
-    /// 200% zoom maximum, where the original bug actually manifested (`uniform_list` sizes every
-    /// row's slot from item index 0 alone - a single-digit "1", which never wraps - so a
-    /// 4-digit gutter number wrapping onto a second line at higher zoom painted taller than the
-    /// slot `uniform_list` actually allocated for it, overlapping the row below).
+    /// Comparing only the gutter's `width` can never fail, since the column is declared
+    /// `w(px(52.0))` - a compile-time literal GPUI resolves identically regardless of whether
+    /// zoom-scoping is wired up correctly. It proves nothing about whether the line-number text
+    /// inside still (wrongly) grows with zoom. This test's second half closes that gap: a
+    /// 4-digit line number, scrolled into view at the 200% zoom maximum, where the original bug
+    /// manifested (`uniform_list` sizes every row's slot from item index 0 alone - a single-digit
+    /// "1", which never wraps - so a 4-digit gutter number wrapping at higher zoom painted taller
+    /// than its allocated slot, overlapping the row below).
     #[gpui::test]
     fn zoom_scales_text_but_not_the_gutter_width(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
-        // 1200 real lines - enough to reach a real 4-digit line number (`1000`), which this
-        // test's own second half needs; line 1 (used by the first half below) exists in a file
-        // of any size, so this doesn't disturb that half's own real coverage.
+        // 1200 lines - enough to reach a 4-digit line number (1000), which the second half
+        // needs; line 1 (used by the first half) exists regardless of file size.
         let file_path = write_many_line_file(repo.path(), 1200);
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
@@ -4268,14 +3718,9 @@ mod code_zoom_tests {
             text_at_150.size,
         );
 
-        // The real regression this second half closes: scroll a real 4-digit line number into
-        // view, push zoom to the real documented maximum (200%, the worst real case - the audit
-        // measured a wrapped-line-number row at 54px into a 27px slot at 130%, and 83px into
-        // 41.5px at 200%), and confirm the gutter never grew taller than its own row's real code
-        // text - i.e. it never wrapped, so it can never overlap the row below. Line `1000`
-        // (index `999`) is a real, literal `&'static str` target - `VisualTestContext::
-        // debug_bounds` requires one, and it's known up front here anyway (this test wrote the
-        // file being scrolled, above), so there's no real need to format/leak a dynamic one.
+        // Scroll a 4-digit line number into view, push zoom to the 200% maximum (the audit
+        // measured a wrapped-line-number row at 54px into a 27px slot at 130%, 83px into 41.5px
+        // at 200%), and confirm the gutter never grew taller than its row's code text.
         app.update(cx, |app, cx| {
             for _ in 0..5 {
                 app.zoom_in(cx); // 150% -> 200%

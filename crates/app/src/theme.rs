@@ -1,55 +1,26 @@
-//! Jerry's design tokens, ported from `design_handoff_jerry_ade/tokens.rs` (the
-//! design-review-approved colour/size constants transcribed from `Jerry.dc.html`, the
-//! authoritative mockup - see `design_handoff_jerry_ade/README.md`).
+//! Jerry's design tokens, ported from `design_handoff_jerry_ade/tokens.rs` (colour/size
+//! constants transcribed from the reviewed mockup `Jerry.dc.html`).
 //!
-//! ## Why `Rgba`, not `Hsla`, is the constant's type
+//! Tokens are typed as [`Rgba`], not [`gpui::Hsla`]: GPUI's `rgb()` and its `From<Rgba> for
+//! Hsla` impl are not `const fn` (`vendor/zed/crates/gpui/src/color.rs:14,677`), so a `const
+//! Hsla` token wouldn't compile. [`hex`] reimplements `rgb()`'s byte-extraction formula as a
+//! real `const fn` instead; GPUI's own `Into<Hsla>` conversions apply automatically wherever a
+//! token is used.
 //!
-//! GPUI's real color type for `.bg()`/`.text_color()`/`.border_color()` is `Hsla`
-//! (`vendor/zed/crates/gpui/src/color.rs:334`), and `gpui::rgb(u32) -> Rgba`
-//! (`color.rs:14`) is the real hex-to-color entry point, converted to `Hsla` via a real
-//! `impl From<Rgba> for Hsla` (`color.rs:677`). Neither `rgb()` nor that `From` impl is
-//! `const fn` (the former calls `u32::to_be_bytes`, the latter needs `f32::max`/`min`), so
-//! `pub const ASK: Hsla = gpui::rgb(0x...).into();` does not compile. [`hex`] below
-//! reimplements `rgb()`'s exact byte-extraction formula (no HSL math, so no `const`-unsafe
-//! float comparisons needed) as a real `const fn`, producing a real compile-time `Rgba`
-//! constant for every token; GPUI's own `Into<Hsla>`/`Into<Fill>` conversions (verified
-//! against `.bg()`'s `impl Styled` bound at `vendor/zed/crates/gpui/src/styled.rs` and
-//! `.text_color()`'s `impl Into<Hsla>` bound) then apply automatically, using GPUI's real
-//! conversion math, at whichever call site actually renders a token - not a reimplementation
-//! of RGB-to-HSL here.
+//! Module names (`surface`, `border`, `text`, `status`, `diff`, `syntax`, `term`, `agent`,
+//! `lang`, `button`, `toggle`, `tag`, `radius`, `band`, `zone`, `shadow`, ...) match `tokens.rs`
+//! so call sites can reference e.g. `theme::status::ASK` unchanged. `radius`/`band`/`zone` are
+//! [`gpui::Pixels`] (via `gpui::px`, `vendor/zed/crates/gpui/src/geometry.rs:3736`) since GPUI's
+//! sizing methods consume `Pixels` directly; `shadow` is `(Pixels, Pixels, Pixels)` for
+//! `(x-offset, y-offset, blur-radius)`.
 //!
-//! `Rgba` is `Copy` and has no `Drop`, so a struct literal of it is itself a valid `const`
-//! expression - no `unsafe`, no runtime initialization (`once_cell`/`lazy_static`) needed.
-//! This matches the shape `vendor/zed/crates/theme/src/styles/default_colors.rs` uses for
-//! its own color constants (plain `const` values built from literal fields), just with an
-//! `Rgba` byte triple standing in for that crate's direct `Hsla { h, s, l, a }` literals
-//! (which come pre-computed from a design tool; these came from the mockup as hex).
-//!
-//! ## Module grouping
-//!
-//! Grouping and names are unchanged from `tokens.rs` (`surface`, `border`, `text`,
-//! `status`, `diff`, `syntax`, `term`, `agent`, `lang`, `button`, `toggle`, `tag`,
-//! `radius`, `band`, `zone`, `shadow`) so later phases can reference e.g.
-//! `theme::status::ASK` exactly as `design_handoff_jerry_ade/README.md` does. Every
-//! numeric literal below is copied unchanged from `tokens.rs` - this module only adapts
-//! the *type*, never the *value*.
-//!
-//! `radius`/`band`/`zone` are typed as [`gpui::Pixels`] (via the real `const fn
-//! gpui::px` at `vendor/zed/crates/gpui/src/geometry.rs:3736`) rather than bare `f32`,
-//! since every one of their tokens is a pixel size GPUI's own sizing methods
-//! (`.w()`, `.h()`, `.rounded()`, ...) consume directly as `Pixels`. `shadow` is typed as
-//! `(Pixels, Pixels, Pixels)` for the same reason (`(x-offset, y-offset, blur-radius)`,
-//! matching the CSS `box-shadow: <x> <y> <blur>` order the original comments describe).
-//!
-//! An added `font` module (not present in `tokens.rs`, which only covers colour) carries
-//! the two bundled family names (see `crate::fonts`), so later phases have one place to
-//! reference them from, matching this module's own `theme::font::SANS` shape.
+//! `font` (not present in `tokens.rs`) carries the two bundled font family names - see
+//! `crate::fonts`.
 
 use gpui::{px, Pixels, Rgba};
 
-/// Reimplements `gpui::rgb`'s byte-extraction formula (see the module docs) as a real
-/// `const fn`, so every token below is a genuine compile-time constant rather than a
-/// runtime-initialized value.
+/// Reimplements `gpui::rgb`'s byte-extraction formula (see the module docs) as a real `const
+/// fn`, so every token below is a compile-time constant.
 const fn hex(v: u32) -> Rgba {
     Rgba {
         r: ((v >> 16) & 0xff) as f32 / 255.0,
@@ -81,25 +52,19 @@ pub mod surface {
     pub const SEGMENT_TRACK: Rgba = hex(0x171a1d);
     pub const SEGMENT_ACTIVE: Rgba = hex(0x242a2f);
     pub const KEYCAP: Rgba = hex(0x181c1f);
-    /// The hint-size keycap's own background - `design_handoff_jerry_ade/CHANGELOG.md`'s
-    /// 2026-07-29 entry, change 2: "hint size 14-high, padding 0 3.5, bg `#15181a`, border
-    /// `#23272b`" - confirmed against `Jerry.dc.html`'s own `takeLeftCaps`/etc. template
-    /// (`background:#15181a;border:1px solid #23272b`), a real, distinct token from
-    /// [`KEYCAP`]'s standard-size `#181c1f`.
+    /// The hint-size keycap's own background - distinct from [`KEYCAP`]'s standard-size
+    /// `#181c1f` (`Jerry.dc.html`: `background:#15181a;border:1px solid #23272b`).
     pub const KEYCAP_HINT: Rgba = hex(0x15181a);
     pub const CHIP_NEUTRAL: Rgba = hex(0x23272b);
     pub const CURRENT_LINE: Rgba = hex(0x181c20);
-    /// The Windows/Linux title bar's close caption button's real hover fill
-    /// (`design_handoff_jerry_ade/Jerry.dc.html`'s close caption button `style-hover="background:
-    /// #8c3a38"`, confirmed by `CHANGELOG.md`'s "close hover bg `#8c3a38`").
+    /// The Windows/Linux title bar's close caption button's hover fill (`Jerry.dc.html`:
+    /// `style-hover="background:#8c3a38"`).
     pub const TITLE_BAR_CLOSE_HOVER: Rgba = hex(0x8c3a38);
-    /// The tab strip's `+` menu popover row hover fill (`design_handoff_jerry_ade/revision/
-    /// Jerry.dc.html`'s plus-menu row template: `style-hover="background:#1d2226"`) - distinct
-    /// from [`ROW_HOVER`]/[`ROW_HOVER_ALT`], neither of which match this exact value.
+    /// The tab strip's `+` menu popover row hover fill - distinct from [`ROW_HOVER`]/
+    /// [`ROW_HOVER_ALT`].
     pub const PLUS_MENU_ROW_HOVER: Rgba = hex(0x1d2226);
-    /// A file tab's real close-affordance hover fill (`design_handoff_jerry_ade/revision/
-    /// CHANGELOG.md`'s change 4: "15×15 hit box, radius 3, hover `#23282c`") - one hex step off
-    /// [`CHIP_NEUTRAL`] (`#23272b`), so kept as its own token rather than reused.
+    /// A file tab's close-affordance hover fill - one hex step off [`CHIP_NEUTRAL`]
+    /// (`#23272b`), kept as its own token.
     pub const TAB_CLOSE_HOVER: Rgba = hex(0x23282c);
 }
 
@@ -118,8 +83,7 @@ pub mod border {
     pub const BUTTON: Rgba = hex(0x2a2f34); // outline button
     pub const BUTTON_DISABLED: Rgba = hex(0x1f2327);
     pub const KEYCAP: Rgba = hex(0x272c31);
-    /// The hint-size keycap's own border - see [`super::surface::KEYCAP_HINT`]'s docs for the
-    /// same real source (`Jerry.dc.html`'s `border:1px solid #23272b`).
+    /// The hint-size keycap's own border - see [`super::surface::KEYCAP_HINT`].
     pub const KEYCAP_HINT: Rgba = hex(0x23272b);
     pub const SELECTED_EDGE: Rgba = hex(0x3f5b74); // 2px left edge on a selected row
 }
@@ -143,19 +107,12 @@ pub mod text {
     pub const HINT: Rgba = hex(0x41464b);
     pub const GUTTER: Rgba = hex(0x3a3f44);
     pub const DISABLED: Rgba = hex(0x3d4248);
-    /// The context bar's worktree path text specifically - `design_handoff_jerry_ade/
-    /// README.md`'s "branch 11px mono `#8b9197` · worktree path 10.5px mono `#4a5057`" (its
-    /// own distinct value, one hex step off [`GHOST`]'s `#4e545a`) - `tokens.rs`'s `text`
-    /// module omits it (the same real gap [`super::button::GREEN_KEYCAP_FG`]'s docs describe
-    /// for a different module: present in the HTML/README, missing from the transcribed
-    /// token list), so it's added here directly rather than reusing the nearby-but-different
-    /// [`GHOST`] or an unrelated module's identically-valued constant (`diff::FOLD_FG`).
+    /// The context bar's worktree path text (`README.md`: "worktree path 10.5px mono
+    /// `#4a5057`") - one hex step off [`GHOST`]; not in `tokens.rs`'s `text` module, added
+    /// here directly.
     pub const PATH: Rgba = hex(0x4a5057);
-    /// The file tree row's `▾`/`▸` caret specifically - `design_handoff_jerry_ade/
-    /// Jerry.dc.html`'s tree row template (`n.caret`'s span, `color:#4a5057`). Same hex as
-    /// [`PATH`] but a distinct token for a distinct real UI element, per this module's own
-    /// stated policy above of not reusing an unrelated element's constant just because the
-    /// value happens to match.
+    /// The file tree row's `▾`/`▸` caret - same hex as [`PATH`] but a distinct token for a
+    /// distinct element.
     pub const TREE_CARET: Rgba = hex(0x4a5057);
 }
 
@@ -215,19 +172,14 @@ pub mod syntax {
     pub const ERROR_UNDERLINE: Rgba = hex(0xe0625c); // 2px dotted
     pub const HOVER_UNDERLINE: Rgba = hex(0x4d7ba8); // 1px solid
 
-    /// The File view's real Diagnostic-state row tint (`design_handoff_jerry_ade/README.md`:
-    /// "row tinted `#191416`") - a real, distinct-from-[`super::surface::CURRENT_LINE`] tint for
-    /// a code row that has at least one real diagnostic on it (`crate::diagnostics_view`).
+    /// The File view's Diagnostic-state row tint (`README.md`: "row tinted `#191416`") -
+    /// distinct from [`super::surface::CURRENT_LINE`].
     pub const DIAGNOSTIC_ROW_BG: Rgba = hex(0x191416);
-    /// The Diagnostic state's dim, end-of-line inline message text
-    /// (`design_handoff_jerry_ade/README.md`: "dim inline message at end of line (`#6b4a48`)").
+    /// The Diagnostic state's dim, end-of-line inline message text (`README.md`: `#6b4a48`).
     pub const DIAGNOSTIC_INLINE_MESSAGE: Rgba = hex(0x6b4a48);
-    /// The Diagnostic state's card message text (`design_handoff_jerry_ade/README.md`: "a card
-    /// below: message `#e3908b`"). Same hex as [`super::button::DANGER_FG_HOVER`], kept as its
-    /// own named token here (same reasoning as this crate's other same-hex-different-meaning
-    /// tokens, e.g. [`super::text::PATH`]'s own docs): a diagnostic card's message and a danger
-    /// button's hover state are unrelated real UI elements that merely happen to share a
-    /// designed red.
+    /// The Diagnostic state's card message text (`README.md`: `#e3908b`). Same hex as
+    /// [`super::button::DANGER_FG_HOVER`], kept as its own token - unrelated elements that
+    /// happen to share a designed red.
     pub const DIAGNOSTIC_CARD_MESSAGE: Rgba = hex(0xe3908b);
 }
 
@@ -245,41 +197,30 @@ pub mod term {
     pub const MENU_SEL_FG: Rgba = hex(0xe0b263);
     pub const MENU_SEL_BG: Rgba = hex(0x1f1a10);
     pub const CURSOR: Rgba = hex(0x5a9ad4);
-    /// A real, clickable path/`path:line` link inside terminal output
-    /// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change 5) -
-    /// `Jerry.dc.html`'s own link span template: `color:#7fb4e3;border-bottom:1px dotted
-    /// #3d6a91`.
+    /// A clickable path/`path:line` link inside terminal output (`Jerry.dc.html`:
+    /// `color:#7fb4e3;border-bottom:1px dotted #3d6a91`).
     pub const LINK: Rgba = hex(0x7fb4e3);
     pub const LINK_UNDERLINE: Rgba = hex(0x3d6a91);
-    /// The same link's real hover state (`Jerry.dc.html`: `style-hover="color:#a5cdf0;
-    /// border-bottom:1px solid #78a8d0"`). `LINK_HOVER` happens to be the exact same value as
-    /// [`super::button::BLUE_FG`] - kept as its own distinct token anyway, matching this
-    /// module's (and `super::text::PATH`'s) own established policy of one real UI element, one
-    /// named token, even when two unrelated elements happen to share a designed colour.
+    /// The link's hover state (`Jerry.dc.html`: `style-hover="color:#a5cdf0;border-bottom:1px
+    /// solid #78a8d0"`). Same value as [`super::button::BLUE_FG`], kept as its own token for a
+    /// distinct element.
     pub const LINK_HOVER: Rgba = hex(0xa5cdf0);
     pub const LINK_UNDERLINE_HOVER: Rgba = hex(0x78a8d0);
 }
 
-/// The environment (WSL) chip - `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29
-/// entry, change 8. One real, reusable set of tokens for the one real widget
-/// (`crate::root::widgets::render_env_chip`) shown in three places across this revision and the
-/// next: the terminal footer (Revision R4b, this phase), and the status bar chip plus the
-/// Settings `Default environment` row (both Revision R6).
+/// The environment (WSL) chip's tokens - shown in the terminal footer, and later the status bar
+/// chip and Settings `Default environment` row.
 pub mod env {
     use super::{hex, Rgba};
 
-    /// `Jerry.dc.html`: `footRemoteFg: plat === 'windows' ? '#8fbde6' : ...` - the exact same
-    /// value already ported as [`super::term::PROMPT`], reused directly per this crate's own
-    /// "no separate token for a value that's already the exact same real thing" precedent
-    /// (`super::button`'s own `BLUE_KEYCAP`/`term::PROMPT` note).
+    /// Same value as [`super::term::PROMPT`], reused directly (`Jerry.dc.html`'s
+    /// `footRemoteFg` for `plat === 'windows'`).
     pub const WSL_FG: Rgba = super::term::PROMPT;
     pub const WSL_BG: Rgba = hex(0x16222c);
     pub const WSL_BORDER: Rgba = hex(0x24384a);
-    /// `Jerry.dc.html`: `footRemoteFg: ... : '#6b7178'` - the exact same value already ported
-    /// as [`super::text::FAINT`].
+    /// Same value as [`super::text::FAINT`], reused directly.
     pub const LOCAL_FG: Rgba = super::text::FAINT;
-    /// `Jerry.dc.html`: `footRemoteBd: ... : '#22262a'` - the exact same value already ported
-    /// as [`super::border::DIVIDER`].
+    /// Same value as [`super::border::DIVIDER`], reused directly.
     pub const LOCAL_BORDER: Rgba = super::border::DIVIDER;
 }
 
@@ -312,12 +253,9 @@ pub mod button {
     pub const GREEN_BG_HOVER: Rgba = hex(0x2c6045);
     pub const GREEN_FG: Rgba = hex(0x9fdcb6);
     pub const GREEN_KEYCAP: Rgba = hex(0x376b4d);
-    /// The keycap *glyph* colour inside a green primary button - `design_handoff_jerry_ade/
-    /// README.md`'s "Keyboard affordances" section states this explicitly ("green
-    /// `#376b4d`/`#8ac9a4`") and `Jerry.dc.html`'s own `AB.primaryG.keyFg` inline literal
-    /// confirms it, but `design_handoff_jerry_ade/tokens.rs`'s `button` module omits it (only
-    /// [`GREEN_KEYCAP`], the keycap *border*, is transcribed there) - added here directly from
-    /// the HTML/README rather than left as an inline magic number at each Phase C call site.
+    /// The keycap glyph colour inside a green primary button (`README.md`/`Jerry.dc.html`:
+    /// `#8ac9a4`) - not in `tokens.rs`'s `button` module (only [`GREEN_KEYCAP`], the border, is
+    /// transcribed there), added here directly.
     pub const GREEN_KEYCAP_FG: Rgba = hex(0x8ac9a4);
     // The equivalent blue keycap glyph colour (`#8fbde6`) needs no separate constant here -
     // it's the exact same value already ported as `term::PROMPT`.
@@ -351,57 +289,41 @@ pub mod tag {
     pub const TREE_MODIFIED: Rgba = hex(0xa3873f); // "M" mark
 }
 
-/// Settings-surface-only colours read directly from `design_handoff_jerry_ade/Jerry.dc.html`'s
-/// own inline literals for the `settingsOpen` block - like [`palette`]'s tokens before them,
-/// real values present in the reviewed mockup but missing from `design_handoff_jerry_ade/
-/// tokens.rs`'s transcription (that file predates the Settings section being added to the
-/// README/HTML), so they're added here directly rather than approximated with a nearby-but-
-/// different existing token. Every other Settings colour (card borders, card row backgrounds,
-/// card footer backgrounds, most text colours, button/danger colours) is a genuine reuse of an
-/// existing token from another module - see `crate::root`'s Settings render methods for exactly
-/// which ones - since `design_handoff_jerry_ade/README.md`'s own Settings section literally
-/// says its cards use "the same 9.5px uppercase header as the rail" and its rows use the same
-/// card shape as the composer; this module holds only what's genuinely new.
+/// Settings-surface-only colours read directly from `Jerry.dc.html`'s inline literals for the
+/// `settingsOpen` block - real values present in the mockup but missing from `tokens.rs`'s
+/// transcription (predates the Settings section). Every other Settings colour reuses an
+/// existing token from another module - see `crate::root`'s Settings render methods.
 pub mod settings {
     use super::{hex, Rgba};
 
-    /// A nav row's real hover background (`Jerry.dc.html`'s settings nav row `style-hover`:
-    /// `background:#17191b`) - distinct from [`super::surface::ROW_HOVER`] (`#15181b`, the
-    /// palette's own unselected-row hover, which happens to be one hex step off).
+    /// A nav row's hover background (`Jerry.dc.html`: `style-hover="background:#17191b"`) -
+    /// distinct from [`super::surface::ROW_HOVER`] (`#15181b`).
     pub const NAV_ROW_HOVER: Rgba = hex(0x17191b);
-    /// The content column's page-subtitle text (`Jerry.dc.html`'s settings header block:
-    /// `color:#767d84`) - close to but distinct from [`super::text::DIM`] (`#8b9197`).
+    /// The content column's page-subtitle text (`Jerry.dc.html`: `color:#767d84`) - close to
+    /// but distinct from [`super::text::DIM`] (`#8b9197`).
     pub const SUBTITLE: Rgba = hex(0x767d84);
-    /// A card row's own bottom separator (`Jerry.dc.html`'s Agents/Worktrees card row:
-    /// `border-bottom:1px solid #1f2327`) - distinct from [`super::border::CARD_FIELD`]
-    /// (`#22272b`).
+    /// A card row's own bottom separator (`Jerry.dc.html`: `border-bottom:1px solid #1f2327`) -
+    /// distinct from [`super::border::CARD_FIELD`] (`#22272b`).
     pub const CARD_ROW_SEP: Rgba = hex(0x1f2327);
-    /// A real-binary-found status dot on the Agents page. Same hex as [`super::status::REVIEW`],
-    /// kept as its own token rather than a reuse of that one: `design_handoff_jerry_ade/
-    /// README.md`'s own "Status vocabulary — use nowhere else" rule reserves the session
-    /// `Status` palette for session urgency specifically, and "this binary resolved on `$PATH`"
-    /// is a different real fact that only visually happens to want the same green.
+    /// A binary-found status dot on the Agents page. Same hex as [`super::status::REVIEW`],
+    /// kept as its own token: the session `Status` palette is reserved for session urgency
+    /// (`README.md`'s "Status vocabulary — use nowhere else"), and "this binary resolved on
+    /// `$PATH`" is a different fact that just happens to want the same green.
     pub const AGENT_READY: Rgba = hex(0x5cb87f);
-    /// A real binary-not-found status dot on the Agents page - same reasoning as
-    /// [`AGENT_READY`], with the same hex as [`super::status::FAIL`].
+    /// A binary-not-found status dot on the Agents page - same reasoning as [`AGENT_READY`],
+    /// same hex as [`super::status::FAIL`].
     pub const AGENT_NOT_FOUND: Rgba = hex(0xe0625c);
-    /// The Worktrees page's real "merged and prunable" row dot (`Jerry.dc.html`'s `wtDefs`
-    /// sample: the one `note`-only row with no live session, `dot: '#3f454b'`) - distinct from
-    /// [`super::status::IDLE`] (`#565d64`, used here for the main checkout's own dot, matching
-    /// that same fixture's `{ path: 'jerry-core', ..., dot: '#565d64' }`).
+    /// The Worktrees page's "merged and prunable" row dot - distinct from
+    /// [`super::status::IDLE`] (`#565d64`, used for the main checkout's own dot).
     pub const WORKTREE_PRUNABLE_DOT: Rgba = hex(0x3f454b);
-    /// A selected Appearance-preview-card's / Theme-card's own real background
-    /// (`design_handoff_jerry_ade/revision/Jerry.dc.html`'s `scaleSamples`/`themeRows`
-    /// row-decoration: `bg: uiScale === s ? '#161b1f' : '#131619'`) - see
+    /// A selected Appearance-preview-card's / Theme-card's background - see
     /// [`CARD_UNSELECTED_BG`] for the unselected counterpart.
     pub const CARD_SELECTED_BG: Rgba = hex(0x161b1f);
     pub const CARD_UNSELECTED_BG: Rgba = hex(0x131619);
-    /// A Theme card's real hover border (`Jerry.dc.html`'s theme card template:
-    /// `style-hover="border-color:#3a4148"`).
+    /// A Theme card's hover border (`Jerry.dc.html`: `style-hover="border-color:#3a4148"`).
     pub const THEME_CARD_HOVER_BORDER: Rgba = hex(0x3a4148);
-    /// The config snippet block's real section-header line colour
-    /// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3: "section lines `#c294e0`" -
-    /// confirmed against `Jerry.dc.html`'s own `CSFG = { s: '#c294e0', ... }`).
+    /// The config snippet block's section-header line colour (`Jerry.dc.html`'s `CSFG.s`:
+    /// `#c294e0`).
     pub const SNIPPET_SECTION: Rgba = hex(0xc294e0);
 }
 
@@ -430,12 +352,9 @@ pub mod band {
     pub const FILTER_ROW: Pixels = px(30.0);
     pub const SURFACE_FOOTER: Pixels = px(28.0);
     pub const PTY_HEADER: Pixels = px(27.0);
-    /// The terminal pane's own new info footer (`design_handoff_jerry_ade/revision/
-    /// CHANGELOG.md`'s 2026-07-29 entry, change 5: "New footer band, 26 high") - `pid` · grid
-    /// dimensions · the environment chip · right-aligned static copy. Distinct from
-    /// [`SURFACE_FOOTER`] (the session-level Interrupt/Retry/Archive action footer, unchanged
-    /// and still rendered separately) - this new band sits between the terminal body and that
-    /// existing footer, additive per the changelog's own framing ("the pane has none today").
+    /// The terminal pane's info footer band (`pid` · grid dimensions · environment chip ·
+    /// right-aligned static copy) - distinct from [`SURFACE_FOOTER`] (the session-level
+    /// Interrupt/Retry/Archive action footer, rendered separately below it).
     pub const PTY_INFO_FOOTER: Pixels = px(26.0);
     pub const BREADCRUMB: Pixels = px(26.0);
     pub const STATUS_BAR: Pixels = px(26.0);
@@ -444,20 +363,14 @@ pub mod band {
     pub const CHANGE_ROW: Pixels = px(27.0);
     pub const TREE_ROW: Pixels = px(22.0);
     pub const KEYCAP: Pixels = px(15.0);
-    /// The hint-size keycap's height (`design_handoff_jerry_ade/CHANGELOG.md`'s 2026-07-29
-    /// entry, change 2: "hint size 14-high" - confirmed against `Jerry.dc.html`'s own
-    /// `height:14px;min-width:14px` template).
+    /// The hint-size keycap's height.
     pub const KEYCAP_HINT: Pixels = px(14.0);
-    /// The Windows/Linux title bar's menu row item height (`CHANGELOG.md`'s 2026-07-29 entry,
-    /// change 1: "22-high items" - confirmed against `Jerry.dc.html`'s `height:22px`).
+    /// The Windows/Linux title bar's menu row item height.
     pub const TITLE_BAR_MENU_ITEM: Pixels = px(22.0);
     /// One Windows/Linux caption button's width (minimise/maximise/close), pinned to the
-    /// title bar's right edge - `CHANGELOG.md`'s 2026-07-29 entry, change 1: "three caption
-    /// buttons pinned to the right edge, 44 wide × full band" - confirmed against
-    /// `Jerry.dc.html`'s `width:44px`.
+    /// title bar's right edge.
     pub const TITLE_BAR_CAPTION_BUTTON: Pixels = px(44.0);
-    /// The tab strip's `+` menu popover's real row height (`design_handoff_jerry_ade/revision/
-    /// CHANGELOG.md`'s change 4: "29-high rows").
+    /// The tab strip's `+` menu popover's row height.
     pub const PLUS_MENU_ROW: Pixels = px(29.0);
 }
 
@@ -468,16 +381,12 @@ pub mod zone {
     pub const PANEL_WIDTH: Pixels = px(320.0);
     pub const PANEL_WIDTH_EMPTY: Pixels = px(260.0);
     pub const SETTINGS_NAV_WIDTH: Pixels = px(212.0);
-    /// The Settings content column's real cap (`design_handoff_jerry_ade/revision/
-    /// CHANGELOG.md`'s change 3: "content column capped at 700px, left-aligned inside the
-    /// existing 26px padding") - both the header block and the scrollable body share this
-    /// `max_w`, matching `Jerry.dc.html`'s own `style="width:100%;max-width:700px"` wrapper on
-    /// each.
+    /// The Settings content column's cap - both the header block and the scrollable body share
+    /// this `max_w`.
     pub const SETTINGS_CONTENT_MAX_WIDTH: Pixels = px(700.0);
     pub const PALETTE_WIDTH: Pixels = px(684.0);
     pub const COMPOSER_WIDTH: Pixels = px(560.0);
-    /// The tab strip's `+` menu popover's real width (`design_handoff_jerry_ade/revision/
-    /// CHANGELOG.md`'s change 4: "a 326-wide popover").
+    /// The tab strip's `+` menu popover's width.
     pub const PLUS_MENU_WIDTH: Pixels = px(326.0);
 }
 
@@ -489,105 +398,73 @@ pub mod shadow {
     pub const POPOVER: (Pixels, Pixels, Pixels) = (px(0.0), px(8.0), px(20.0)); // rgba(0,0,0,0.50)
     pub const PALETTE: (Pixels, Pixels, Pixels) = (px(0.0), px(12.0), px(34.0));
     // rgba(0,0,0,0.55)
-    /// The tab strip's `+` menu popover's own shadow (`design_handoff_jerry_ade/revision/
-    /// CHANGELOG.md`'s change 4: "shadow `0 14 30 / .55`") - a real, distinct figure from
-    /// [`PALETTE`]'s `0 12 34`.
+    /// The `+` menu popover's own shadow - distinct from [`PALETTE`]'s `0 12 34`.
     pub const PLUS_MENU: (Pixels, Pixels, Pixels) = (px(0.0), px(14.0), px(30.0));
     // rgba(0,0,0,0.55)
 }
 
-/// Real, honestly-scoped application of `Settings.appearance.interface_scale_percent`
-/// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, "Sizing" section) -
-/// text-size scaling only, deliberately not padding/spacing/icon/fixed-chrome dimensions. See
-/// `crate::root::AdeApp::ui_text_size`'s own docs for exactly why: `crate::theme` is otherwise
-/// ~500 call sites of literal, compile-time `Pixels` constants (see this module's own docs), so
-/// retrofitting every single one of them to scale (not just text) is the large, invasive,
-/// out-of-scope rems-retrofit this phase's own brief explicitly declines to attempt - this
-/// module only offers the one, real, narrow multiplier a render call site can choose to apply to
-/// its own `.text_size(...)` call.
+/// Honestly-scoped application of `Settings.appearance.interface_scale_percent` - text-size
+/// scaling only, deliberately not padding/spacing/icon/fixed-chrome dimensions (retrofitting
+/// every literal `Pixels` constant in this module to scale is out of scope). See
+/// `crate::root::AdeApp::ui_text_size` for the render-side application, which chooses whether to
+/// call [`scaled_px`] at each call site.
 ///
-/// ## The honest, current list of which real surfaces read this
+/// ## Which real surfaces read this
 ///
-/// A real audit found an earlier version of this list overstated its own coverage (claiming
-/// "the Settings surface" scales, when only row *labels*/*hints* did, not the row *controls*
-/// right next to them - visibly obvious on the Appearance page itself, where dragging the scale
-/// control grew its own label while the `90% | 100% | 110% | 125%` segment labels beside it
-/// stayed fixed size). Rather than punt to a separate document that can drift out of sync with
-/// the code again, here is the real, current, specific list:
+/// Scaled: the session rail (`crate::root::rail_render`); the title bar/status bar
+/// (`crate::root::status_bar`); the command palette's row labels/hints
+/// (`crate::root::palette_render`); the Files/Changes sidebar's row labels, footer hint, and
+/// tree caret (`crate::root::sidebar_render`); the file/session tab strip's tab labels
+/// (`crate::root::work_surface_render`); and every Settings row's label/hint *and* control
+/// (stepper value, choice-segment labels, config banner text, snippet block text - all in
+/// `crate::root::settings_widgets`).
 ///
-/// Scaled: the session rail (`crate::root::rail_render`, every row/label); the title bar/status
-/// bar (`crate::root::status_bar`); the command palette's row labels/hints
-/// (`crate::root::palette_render`); the Files/Changes sidebar's row labels, footer hint, and tree
-/// caret (`crate::root::sidebar_render`); the file/session tab strip's tab labels
-/// (`crate::root::work_surface_render::render_file_tab`/`render_session_tab`); and, as of this
-/// fix, every real Settings row - both the label/hint (`crate::root::settings_widgets::
-/// render_settings_row`) *and* its control (the stepper value, the choice-segment labels, the
-/// config banner's path/chip/keys-line/`Open file`/`TOML|JSON` text, and the snippet block's
-/// title/body/caption - all in `crate::root::settings_widgets`).
-///
-/// Deliberately NOT scaled, each for its own real reason rather than an oversight: the code
-/// surface and terminal panes have their own separate, dedicated font-size mechanisms
-/// (`crate::root::AdeApp::effective_code_rem_px`/`Settings.appearance.terminal_font_size` - a
-/// second multiplier on top of those would compound in a way nothing in this app's settings
-/// model or design actually asks for); chips/badges/keycaps/close-tab icon glyphs app-wide
-/// (`crate::root::widgets::render_keycap`, the file/session tab strip's own language chip and
-/// `×` close glyph, the palette's session/file/command chips, the Files tree's own language
-/// chip/`moved` tag) and the Themes page's preview-card internals, which are all small,
-/// fixed-size glyphs/labels the design treats as part of a component's own fixed shape rather
-/// than running text; and the rest of `crate::root::work_surface_render`'s own chrome (the
-/// session context bar, toolbar buttons, the tab strip's own `+` menu, footer action buttons) -
-/// real, currently out of scope, left for a later pass rather than silently left unmentioned.
+/// Deliberately not scaled, each for its own reason: the code surface and terminal panes have
+/// their own dedicated font-size mechanisms (`AdeApp::effective_code_rem_px`,
+/// `Settings.appearance.terminal_font_size`) that a second multiplier would compound with;
+/// chips/badges/keycaps/close-tab glyphs app-wide are small, fixed-size shapes the design treats
+/// as part of a component rather than running text; and the rest of `work_surface_render`'s own
+/// chrome (session context bar, toolbar buttons, `+` menu, footer action buttons) is real,
+/// currently out of scope.
 pub mod ui_scale {
     use super::px;
     use gpui::Pixels;
 
-    /// Scales `base_px` by `scale_percent` (e.g. `100` = unchanged, `125` = 25% larger) - a
-    /// pure, `gpui::Context`-free function so it's directly unit-testable without a live
-    /// window, the same real pattern this codebase already applies to `crate::terminal_pane`'s
-    /// `size_to_grid`/`crate::root::code_surface`'s `clamp_zoom_percent`.
+    /// Scales `base_px` by `scale_percent` (`100` = unchanged, `125` = 25% larger). Pure and
+    /// `gpui::Context`-free so it's directly unit-testable without a live window.
     pub fn scaled_px(base_px: f32, scale_percent: u16) -> Pixels {
         px(base_px * (scale_percent as f32 / 100.0))
     }
 }
 
-/// The two bundled font families (see `crate::fonts`) - `design_handoff_jerry_ade/README.md`'s
-/// "Design tokens" section: "Fonts: IBM Plex Sans (UI ...) and IBM Plex Mono (branches,
-/// paths, diffs, terminal, code ...). Nothing else."
+/// The two bundled font families (see `crate::fonts`): IBM Plex Sans (UI) and IBM Plex Mono
+/// (branches, paths, diffs, terminal, code).
 pub mod font {
     pub const SANS: &str = "IBM Plex Sans";
     pub const MONO: &str = "IBM Plex Mono";
 }
 
-/// Palette-only (⌘K) colours read directly from `design_handoff_jerry_ade/Jerry.dc.html`'s own
-/// inline literals for the `paletteOpen` block - like [`text::PATH`]/[`button::GREEN_KEYCAP_FG`]
-/// before it, these are real values present in the reviewed mockup but missing from
-/// `design_handoff_jerry_ade/tokens.rs`'s transcription (that file predates the palette section
-/// being added to the README/HTML), so they're added here directly rather than reusing a
-/// nearby-but-different existing token or leaving them as inline magic numbers at each call site.
+/// Palette-only (⌘K) colours read directly from `Jerry.dc.html`'s inline literals for the
+/// `paletteOpen` block - real values missing from `tokens.rs`'s transcription (predates the
+/// palette section).
 pub mod palette {
     use super::{hex, Rgba};
 
-    /// The input row's scope-prefix glyph (`design_handoff_jerry_ade/Jerry.dc.html` line
-    /// ~748: `color:#5f7f9e`).
+    /// The input row's scope-prefix glyph (`Jerry.dc.html`: `color:#5f7f9e`).
     pub const PREFIX: Rgba = hex(0x5f7f9e);
-    /// A result group's uppercase header label (`Jerry.dc.html` line ~766: `color:#5b6167`) -
-    /// close to but distinct from [`super::text::FAINT`] (`#6b7178`), so kept as its own token
-    /// rather than reusing that nearby value for a different element.
+    /// A result group's uppercase header label (`Jerry.dc.html`: `color:#5b6167`) - close to
+    /// but distinct from [`super::text::FAINT`] (`#6b7178`).
     pub const GROUP_HEADER: Rgba = hex(0x5b6167);
-    /// An unselected result row's real hover background (`Jerry.dc.html`'s `style-hover`
-    /// attribute on the row template: `background:#191d20`) - distinct from
-    /// [`super::surface::ROW_HOVER`] (`#15181b`, which happens to equal the palette panel's own
-    /// background, [`super::surface::PALETTE`]).
+    /// An unselected result row's hover background (`Jerry.dc.html`: `style-hover`:
+    /// `background:#191d20`) - distinct from [`super::surface::ROW_HOVER`] (`#15181b`, which
+    /// happens to equal the palette panel's own background, [`super::surface::PALETTE`]).
     pub const ROW_HOVER: Rgba = hex(0x191d20);
-    /// The selected/first row's label colour (`Jerry.dc.html`'s row-decoration function:
-    /// `fg: first ? '#e3e8ed' : '#c2c7cc'`) - one hex step brighter than
-    /// [`super::text::SELECTED`] (`#dde2e7`, used elsewhere for a selected rail row's title), so
-    /// kept distinct rather than reused.
+    /// The selected/first row's label colour (`Jerry.dc.html`: `fg: first ? '#e3e8ed' :
+    /// '#c2c7cc'`) - one hex step brighter than [`super::text::SELECTED`] (`#dde2e7`).
     pub const LABEL_SELECTED: Rgba = hex(0xe3e8ed);
-    /// A command result's real, always-the-same kind chip `(fg, bg)` (`Jerry.dc.html` line
-    /// ~772: `background:#1d2532` / `color:#7f9ad4`) - the exact same hex pair as
-    /// [`super::lang::MD`], but kept as its own named token here since a command chip and a
-    /// Markdown-file chip are unrelated concepts that merely happen to share a designed colour.
+    /// A command result's kind chip `(fg, bg)` (`Jerry.dc.html`: `background:#1d2532` /
+    /// `color:#7f9ad4`) - the same hex pair as [`super::lang::MD`], kept as its own token since
+    /// a command chip and a Markdown-file chip are unrelated concepts.
     pub const COMMAND_CHIP: (Rgba, Rgba) = (hex(0x7f9ad4), hex(0x1d2532));
 }
 
@@ -604,8 +481,7 @@ mod ui_scale_tests {
     #[test]
     fn scales_up_and_down_proportionally() {
         // `125`/`50` (not e.g. `90`) so the expected value is exactly representable in `f32`
-        // and this stays a real, non-flaky exact-equality check rather than needing an epsilon
-        // comparison.
+        // and this stays an exact-equality check rather than needing an epsilon comparison.
         assert_eq!(scaled_px(12.0, 125), px(15.0));
         assert_eq!(scaled_px(12.0, 50), px(6.0));
     }

@@ -3,36 +3,25 @@ use super::*;
 use crate::root::focus::palette_focus_tests;
 
 impl AdeApp {
-    /// Tears down every real [`Self::lsp_clients`] entry whose key is not `active_root` - see
-    /// that field's own docs for why this exists and the kill-on-switch-not-LRU choice. Also
-    /// drops [`Self::lsp_opened_files`] entries for files under an evicted root: leaving them
-    /// stale would make a *future* `Self::dispatch_did_open` against a freshly-respawned client
-    /// for that same root (if the user switches back to it later) wrongly believe the file is
-    /// "already open" and skip sending a real `didOpen` to the new process, which would never
-    /// see that file at all.
+    /// Tears down every [`Self::lsp_clients`] entry whose key is not `active_root` - see that
+    /// field's own docs for the kill-on-switch-not-LRU choice. Also drops
+    /// [`Self::lsp_opened_files`] entries for files under an evicted root, so a future
+    /// [`Self::dispatch_did_open`] against a freshly-respawned client for that root won't
+    /// wrongly believe the file is already open and skip sending `didOpen`.
     ///
     /// ## Getting `&mut LspClient` out of a shared `Arc`
     ///
     /// [`LspClientState::Ready`] holds an `Arc<lsp_core::LspClient>`, cloned out to whichever
-    /// in-flight background task last needed it (`Self::dispatch_did_open`, and the single
-    /// long-lived [`Self::ensure_lsp_poll_task`] loop, which only ever reads through `&self`
-    /// methods and never outlives a single poll tick's borrow - see that method's own body). A
-    /// clone *could* still be alive at the exact moment of eviction (a `dispatch_did_open` task
-    /// dispatched moments earlier, not yet finished). [`LspClient::shutdown`] needs `&mut self`
-    /// and does real, potentially slow, blocking work (a `shutdown` request, an `exit`
-    /// notification, `SIGTERM`, a bounded grace period, `SIGKILL`, then joining the reader/
-    /// stderr threads) - unacceptable to run inline on this foreground/GPUI thread. So: the
-    /// `Arc` is moved into a `cx.background_executor()` task (fired here, not awaited - the
-    /// `Task` handle is kept alive in [`Self::_lsp_tasks`] the same way every other in-flight LSP
-    /// background task here is, per that field's own docs), and `Arc::try_unwrap` is attempted
-    /// *there*: if this was genuinely the last clone, it succeeds and a real, graceful
-    /// `shutdown()` runs off the foreground thread; if some other clone is still alive,
-    /// `try_unwrap` fails and returns the `Arc` back, which is then just `drop`-ped - not a
-    /// silent no-op: `LspClient`'s own `Drop` impl still does a real `SIGKILL`-based teardown of
-    /// the whole process tree (no orphan either way, see that impl's docs), just not the
-    /// graceful path. This only happens in the rare case a clone outlives the switch, and
-    /// "process gets `SIGKILL`ed instead of asked nicely to shut down" is a real, acceptable
-    /// trade-off for never blocking the UI on a worktree switch.
+    /// in-flight background task last needed it. A clone could still be alive at the exact
+    /// moment of eviction. [`LspClient::shutdown`] needs `&mut self` and does real, potentially
+    /// slow, blocking work (a `shutdown` request, `exit`, `SIGTERM`, a grace period, `SIGKILL`,
+    /// joining reader threads) - unacceptable to run inline on the GPUI thread. So the `Arc` is
+    /// moved into a `cx.background_executor()` task, and `Arc::try_unwrap` is attempted there:
+    /// if this was the last clone, a graceful `shutdown()` runs off-thread; if not,
+    /// `try_unwrap` returns the `Arc` back and it's just dropped - not a silent no-op, since
+    /// `LspClient`'s own `Drop` impl still does a `SIGKILL`-based teardown either way. This only
+    /// happens in the rare case a clone outlives the switch, and "process gets `SIGKILL`ed
+    /// instead of asked nicely" is an acceptable trade-off for never blocking the UI.
     pub(super) fn evict_stale_lsp_clients(&mut self, active_root: &Path, cx: &mut Context<Self>) {
         let stale_roots = stale_lsp_client_roots(
             &self.lsp_clients.keys().cloned().collect::<Vec<_>>(),
@@ -59,8 +48,7 @@ impl AdeApp {
                         }
                         Err(client) => {
                             // Some other clone is still alive - see this method's own docs.
-                            // Dropping it here is still real cleanup (a `SIGKILL`-based teardown
-                            // via `Drop`, guaranteed once the *last* clone drops), just not the
+                            // Dropping it here is still real cleanup via `Drop`, just not the
                             // graceful path.
                             drop(client);
                         }
@@ -68,25 +56,19 @@ impl AdeApp {
                 });
                 self._lsp_tasks.push(task);
             }
-            // `Spawning`/`Failed` states hold no real process to tear down. A `Spawning` one
-            // whose background task (`Self::ensure_lsp_client`'s own `cx.spawn`) is still
-            // in-flight will, once it resolves, re-insert a `Ready`/`Failed` entry back under
-            // `root` even though it's no longer active - a harmless, one-time re-insertion (no
-            // process leak: `Ready` just means a real client that the *next* eviction pass,
-            // triggered by the next worktree switch, will catch and tear down same as any other
-            // stale entry).
+            // `Spawning`/`Failed` states hold no process to tear down. A `Spawning` one whose
+            // background task is still in-flight will, once it resolves, re-insert an entry
+            // under `root` even though it's no longer active - harmless: the next eviction pass
+            // catches it same as any other stale entry.
         }
     }
 
-    /// Lazily spawns (or reuses) a real `lsp_core::LspClient` for `repo_root`
-    /// (`design_handoff_jerry_ade/README.md`'s Diagnostic state) - a no-op if a client for this
-    /// exact root already exists in any state (`Spawning`/`Ready`/`Failed`; a previous real
-    /// failure is not silently retried on every render - see this method's own call site,
-    /// which only calls this once per root per [`Self::render_file_view`] pass anyway). The
-    /// real `LspClient::spawn` call (process spawn plus the full `initialize`/`initialized`
+    /// Lazily spawns (or reuses) an `lsp_core::LspClient` for `repo_root` - a no-op if a client
+    /// for this exact root already exists in any state (a previous failure is not retried on
+    /// every render; this is only called once per root per [`Self::render_file_view`] pass). The
+    /// `LspClient::spawn` call (process spawn plus the full `initialize`/`initialized`
     /// handshake) runs on `cx.background_executor()`, mirroring [`Self::spawn_file_load`]'s
-    /// exact shape, since it is real, blocking I/O (and can take real, non-trivial time - see
-    /// `lsp_core::client`'s own docs) that must never run on the GPUI foreground thread.
+    /// shape, since it's blocking I/O that must never run on the GPUI foreground thread.
     pub(super) fn ensure_lsp_client(&mut self, repo_root: PathBuf, cx: &mut Context<Self>) {
         if self.lsp_clients.contains_key(&repo_root) {
             return;
@@ -123,28 +105,23 @@ impl AdeApp {
         self._lsp_tasks.push(task);
     }
 
-    /// Sends a real `textDocument/didOpen` for `path` on `client`, once per real path (see
-    /// [`Self::lsp_opened_files`]'s docs) - the real file content is read fresh here (a second,
-    /// small read separate from [`Self::file_view_cache`]'s own cached parse; this only happens
-    /// once per file open, not per render, so the duplication is cheap and keeps `code_view`
-    /// itself free of any LSP awareness). Runs on `cx.background_executor()` since both the real
-    /// file read and the real `write` syscall to rust-analyzer's stdin are blocking I/O.
+    /// Sends a `textDocument/didOpen` for `path`, once per real path (see
+    /// [`Self::lsp_opened_files`]'s docs). The file content is read fresh here (separate from
+    /// [`Self::file_view_cache`]'s own cached parse; this only happens once per file open, not
+    /// per render). Runs on `cx.background_executor()` since both the file read and the write to
+    /// rust-analyzer's stdin are blocking I/O.
     ///
     /// ## Judgment call: no `textDocument/didClose` is ever sent
     ///
-    /// A real editor sends `didClose` when a buffer stops being open so the server can free
-    /// per-document state and stop publishing diagnostics for it. This viewer is read-only and
-    /// has no real "close" event of its own - `Self::open_file_view` can be called again for the
-    /// same path at any later point (switching tabs back and forth, or re-selecting the same
-    /// file in the tree), and [`Self::lsp_opened_files`] intentionally treats that as "already
-    /// open," not "reopen." Sending `didClose` on every tab switch would mean re-sending
-    /// `didOpen` (and waiting through indexing/analysis again) every time the user switches back
-    /// to a file they were just looking at - real, user-visible latency for no real benefit,
-    /// since this app keeps at most a handful of files' worth of server-side state alive per
-    /// session, nowhere near enough to matter for `rust-analyzer`'s own memory use. The
-    /// `LspClient` (and every document it opened) is torn down for real when its owning root's
-    /// client is dropped (window close, or a future repo-root change - see [`Self::lsp_clients`]'s
-    /// own docs), which is this app's actual real document lifetime boundary.
+    /// A real editor sends `didClose` when a buffer stops being open. This viewer is read-only
+    /// and has no "close" event of its own - [`Self::open_file_view`] can be called again for
+    /// the same path later (switching tabs back and forth), and [`Self::lsp_opened_files`]
+    /// intentionally treats that as "already open," not "reopen." Sending `didClose` on every
+    /// tab switch would mean re-sending `didOpen` (and re-waiting through indexing) every time
+    /// the user switches back to a file - real latency for no benefit, since this app keeps at
+    /// most a handful of files' worth of server-side state alive per session. The `LspClient`
+    /// (and every document it opened) is torn down when its owning root's client is dropped -
+    /// this app's actual document lifetime boundary.
     pub(super) fn dispatch_did_open(
         &mut self,
         client: std::sync::Arc<lsp_core::LspClient>,
@@ -175,17 +152,15 @@ impl AdeApp {
         self._lsp_tasks.push(task);
     }
 
-    /// Starts (idempotently - see [`Self::_lsp_poll_task`]'s own docs on why this is a one-time,
-    /// not per-client, task) the single background loop that keeps this window's rendering aware
-    /// of real, asynchronously-arriving `publishDiagnostics` notifications from every
-    /// [`Self::lsp_clients`] entry. Mirrors `crate::terminal_pane::TerminalPane::spawn_process`'s
-    /// own established `cx.background_executor().timer(..)`-driven poll loop shape: real
-    /// diagnostics arrive on a background thread (`lsp_core`'s own reader thread - see that
-    /// crate's docs) with no way to directly notify a GPUI entity from outside the GPUI runtime,
-    /// so this loop periodically drains every ready client's real wake channel
-    /// (`lsp_core::LspClient::drain_updates`) and calls `cx.notify()` only when something real actually
-    /// changed - never an unconditional per-tick `cx.notify()`, which would repaint every ~250ms
-    /// regardless of whether there was ever anything new to show.
+    /// Starts (idempotently - see [`Self::_lsp_poll_task`]'s docs on why this is a one-time, not
+    /// per-client, task) the background loop that keeps rendering aware of asynchronously
+    /// arriving `publishDiagnostics` notifications from every [`Self::lsp_clients`] entry.
+    /// Mirrors `crate::terminal_pane::TerminalPane::spawn_process`'s own
+    /// `cx.background_executor().timer(..)`-driven poll loop shape: diagnostics arrive on
+    /// `lsp_core`'s own reader thread, outside the GPUI runtime, with no way to directly notify
+    /// a GPUI entity from there - so this loop periodically drains every ready client's wake
+    /// channel and calls `cx.notify()` only when something actually changed, never
+    /// unconditionally per tick.
     pub(super) fn ensure_lsp_poll_task(&mut self, cx: &mut Context<Self>) {
         if self._lsp_poll_task.is_some() {
             return;
@@ -215,32 +190,30 @@ impl AdeApp {
     }
 }
 
-/// The real state of one repository root's `lsp_core::LspClient`, across its own real,
-/// asynchronous spawn-then-initialize lifecycle (see `lsp_core::LspClient::spawn`'s own docs -
-/// it does not return until a real `initialize`/`initialized` handshake has completed, so
-/// `Ready` here always means a genuinely usable client, never one still mid-handshake).
+/// The state of one repository root's `lsp_core::LspClient` across its asynchronous
+/// spawn-then-initialize lifecycle (`lsp_core::LspClient::spawn` doesn't return until the
+/// `initialize`/`initialized` handshake completes, so `Ready` here always means a usable
+/// client).
 #[derive(Clone)]
 pub(super) enum LspClientState {
-    /// A real `cx.background_executor()` task is currently spawning `rust-analyzer` and running
-    /// its handshake for this root - `Self::render_file_view`'s status bar shows this honestly
-    /// (`"starting rust-analyzer..."`), never a fabricated "indexed" state.
+    /// A `cx.background_executor()` task is currently spawning `rust-analyzer` and running its
+    /// handshake for this root - the status bar shows this honestly (`"starting
+    /// rust-analyzer..."`), never a fabricated "indexed" state.
     Spawning,
-    /// A real, already-initialized client - `Arc`-shared so it can be handed into a background
-    /// task (`Self::dispatch_did_open`) and the poll loop (`Self::ensure_lsp_poll_task`) without
-    /// re-locking `AdeApp` itself from a foreground-only `Context<Self>` on every call.
+    /// An already-initialized client - `Arc`-shared so it can be handed into a background task
+    /// ([`AdeApp::dispatch_did_open`]) and the poll loop ([`AdeApp::ensure_lsp_poll_task`])
+    /// without re-locking `AdeApp` from a foreground-only `Context<Self>` on every call.
     Ready(std::sync::Arc<lsp_core::LspClient>),
-    /// A real spawn/handshake failure (e.g. `rust-analyzer` genuinely not on `PATH`) - carries
-    /// the real `lsp_core::LspError`'s own `Display` text, shown as-is rather than a generic
-    /// "language server unavailable" that would hide *why*.
+    /// A spawn/handshake failure (e.g. `rust-analyzer` not on `PATH`) - carries the
+    /// `lsp_core::LspError`'s own `Display` text, shown as-is rather than a generic message
+    /// that would hide *why*.
     Failed(String),
 }
 
 /// Which of `existing_roots` should be evicted once `active_root` becomes the newly active
-/// worktree root: every one of them that isn't `active_root` itself (see
-/// [`AdeApp::evict_stale_lsp_clients`]'s own docs for the real teardown side this feeds - kept
-/// gpui-free/pure, mirroring [`reset_per_worktree_ui_state`]'s own reasoning, so the actual
+/// worktree root: every one of them that isn't `active_root` itself. Kept gpui-free/pure so the
 /// "which keys get removed" bookkeeping is unit-testable without a real `lsp_core::LspClient`,
-/// which can only be constructed by genuinely spawning `rust-analyzer`).
+/// which can only be constructed by genuinely spawning `rust-analyzer`.
 pub(super) fn stale_lsp_client_roots(
     existing_roots: &[PathBuf],
     active_root: &Path,
@@ -252,20 +225,18 @@ pub(super) fn stale_lsp_client_roots(
         .collect()
 }
 
-/// The real, honest `rust-analyzer` status this window's status bar shows for a `.rs` file -
-/// `design_handoff_jerry_ade/README.md`'s "Status bar 28: `rust-analyzer` + green dot +
-/// `indexed 1,284 crates`". Every variant here corresponds to a real, distinguishable server
-/// state (see [`LspClientState`]'s own docs); there is no variant that fabricates progress this
-/// app can't actually observe (e.g. no invented crate-count - rust-analyzer's real `$/progress`
-/// payloads carry one, but this phase doesn't track `$/progress` at all - see the step report's
-/// "indexing state" section for why [`LspFileStatus::Indexing`]'s coarser "no publishDiagnostics
-/// yet" signal was chosen instead).
+/// The `rust-analyzer` status this window's status bar shows for a `.rs` file. Every variant
+/// corresponds to a real, distinguishable server state (see [`LspClientState`]'s own docs);
+/// there is no variant that fabricates progress this app can't actually observe (rust-analyzer's
+/// real `$/progress` payloads carry a crate count, but this phase doesn't track `$/progress` at
+/// all, so [`LspFileStatus::Indexing`]'s coarser "no publishDiagnostics yet" signal is used
+/// instead).
 pub(super) enum LspFileStatus {
     Spawning,
     Failed(String),
-    /// A real, ready client exists, but no real `publishDiagnostics` has arrived yet for this
-    /// specific file - genuinely distinct from `Analyzed { errors: 0, .. }` (see
-    /// `lsp_core::LspClient::has_diagnostics_result`'s own docs for the real signal this reads).
+    /// A ready client exists, but no `publishDiagnostics` has arrived yet for this specific file.
+    /// Distinct from `Analyzed { errors: 0, .. }` (see
+    /// `lsp_core::LspClient::has_diagnostics_result`'s own docs for the signal this reads).
     Indexing,
     Analyzed {
         errors: usize,
@@ -274,12 +245,10 @@ pub(super) enum LspFileStatus {
 }
 
 /// Takes an already-computed [`lsp_core::lsp_types::Uri`] (see [`AdeApp::render_file_view`]'s
-/// own docs for why it's computed once per render and passed in here, rather than this function
-/// re-deriving it from a path itself) - `None` only in the rare case that computing the real
-/// `file://` URI for the open file's own path failed (see [`lsp_core::LspClient::uri_for_path`]'s
-/// docs), in which case this honestly reports [`LspFileStatus::Indexing`] (there is no real way
-/// to answer "is there a result" without a real URI to look one up by) rather than fabricating
-/// any other status.
+/// own docs for why it's computed once per render and passed in rather than re-derived here).
+/// `None` only when computing the `file://` URI for the open file's path failed, in which case
+/// this reports [`LspFileStatus::Indexing`] (there's no way to answer "is there a result"
+/// without a URI to look one up by) rather than fabricating any other status.
 pub(super) fn lsp_file_status(
     state: &Option<LspClientState>,
     uri: Option<&lsp_core::lsp_types::Uri>,
@@ -314,18 +283,16 @@ pub(super) fn lsp_file_status(
     }
 }
 
-/// Real regression coverage for the LSP client-eviction fix (see [`AdeApp::lsp_clients`]'s own
-/// docs): before this fix, nothing ever removed an `lsp_clients` entry once its root stopped
-/// being the active worktree, so browsing N different worktrees (each with a Rust file opened)
-/// leaked N live `rust-analyzer` processes for the rest of the window's life. Exercises the real
-/// production code path (`AdeApp::select_worktree` -> [`AdeApp::evict_stale_lsp_clients`])
-/// through a real `AdeApp` in a real (test) GPUI window, but seeds `lsp_clients` with cheap
-/// `LspClientState::Spawning` entries rather than real `Arc<lsp_core::LspClient>`s (which can
-/// only be constructed by genuinely spawning `rust-analyzer`) - the real, full end-to-end
-/// process-lifecycle proof (a genuine spawn, genuine diagnostics, genuine teardown) lives in
-/// `lsp_diagnostics_wiring_tests` below, where spawning a real process is unavoidable anyway.
-/// This module's own tests instead prove the real *bookkeeping* - which keys survive a switch -
-/// runs in milliseconds, with no real process involved.
+/// Regression coverage for the LSP client-eviction fix (see [`AdeApp::lsp_clients`]'s own docs):
+/// before this fix, nothing ever removed an `lsp_clients` entry once its root stopped being the
+/// active worktree, so browsing N worktrees (each with a Rust file opened) leaked N live
+/// `rust-analyzer` processes for the window's life. Exercises the real production code path
+/// (`AdeApp::select_worktree` -> [`AdeApp::evict_stale_lsp_clients`]) through a real `AdeApp` in
+/// a test GPUI window, but seeds `lsp_clients` with cheap `LspClientState::Spawning` entries
+/// rather than real `Arc<lsp_core::LspClient>`s - the full end-to-end process-lifecycle proof
+/// lives in `lsp_diagnostics_wiring_tests` below, where spawning a real process is unavoidable
+/// anyway. This module's own tests prove the bookkeeping runs in milliseconds, with no real
+/// process involved.
 #[cfg(test)]
 mod lsp_client_eviction_tests {
     use super::*;
@@ -360,13 +327,11 @@ mod lsp_client_eviction_tests {
         assert!(stale.is_empty());
     }
 
-    /// The real end-to-end proof at the `AdeApp` level: browsing several different worktrees,
-    /// each with a real `lsp_clients` entry seeded for it (standing in for "a Rust file was
-    /// opened here" - see [`AdeApp::ensure_lsp_client`]'s own docs for the real trigger this
-    /// simulates), never lets more than one entry accumulate - [`AdeApp::select_worktree`]'s
-    /// real call into [`AdeApp::evict_stale_lsp_clients`] must fire on every real switch,
-    /// including a later revisit of an already-seen worktree (not just "never insert a second
-    /// one" on a monotonic walk).
+    /// The end-to-end proof at the `AdeApp` level: browsing several worktrees, each with an
+    /// `lsp_clients` entry seeded for it (standing in for "a Rust file was opened here"), never
+    /// lets more than one entry accumulate - [`AdeApp::select_worktree`]'s call into
+    /// [`AdeApp::evict_stale_lsp_clients`] must fire on every switch, including a later revisit
+    /// of an already-seen worktree.
     #[gpui::test]
     fn switching_between_several_worktrees_never_lets_lsp_clients_grow_past_one(
         cx: &mut TestAppContext,
@@ -389,9 +354,9 @@ mod lsp_client_eviction_tests {
         for index in 0..3 {
             app.update(cx, |app, cx| {
                 app.select_worktree(index, cx);
-                // Simulate `Self::ensure_lsp_client` having already been called for a Rust file
-                // opened under the newly active root - a cheap `Spawning` entry, no real process
-                // needed to prove the real eviction bookkeeping.
+                // Simulate `AdeApp::ensure_lsp_client` having already been called for a Rust
+                // file opened under the newly active root - a cheap `Spawning` entry, no real
+                // process needed to prove the eviction bookkeeping.
                 let root = app.file_tree_root.clone();
                 app.lsp_clients
                     .insert(root.clone(), LspClientState::Spawning);
@@ -438,37 +403,29 @@ mod lsp_client_eviction_tests {
     }
 }
 
-/// Real, slow, end-to-end coverage proving the actual async path from a real `rust-analyzer`
-/// `publishDiagnostics` response through to [`AdeApp::render_file_view`]'s own rendered output -
-/// before this test, every `lsp_core` test lived below the GPUI layer entirely, and every
-/// `diagnostics_view` test was pure byte-range/run-splitting logic with no real process involved
-/// at all, so nothing actually proved a real diagnostic ever reaches [`AdeApp::file_view_diagnostics`]
-/// (the data [`AdeApp::render_file_view`]'s row builder actually reads) through this crate's own
-/// real code path (`AdeApp::open_file_view` -> `AdeApp::ensure_lsp_client` ->
-/// `AdeApp::dispatch_did_open` -> `AdeApp::render_file_view`), rather than by reaching into
-/// `lsp_core` directly and bypassing `AdeApp` the way `lsp_core::client`'s own e2e test does.
+/// Slow, end-to-end coverage proving the real async path from a real `rust-analyzer`
+/// `publishDiagnostics` response through to [`AdeApp::render_file_view`]'s rendered output,
+/// through this crate's own real code path (`AdeApp::open_file_view` -> `ensure_lsp_client` ->
+/// `dispatch_did_open` -> `render_file_view`) rather than by calling `lsp_core` directly and
+/// bypassing `AdeApp`.
 ///
-/// This genuinely spawns a real `rust-analyzer` against a real, tiny, dependency-free scratch
-/// cargo project (mirroring `lsp_core::client`'s own `write_scratch_project` fixture, kept
-/// dependency-free for the same reason: `cargo metadata`/rust-analyzer's own workspace discovery
-/// must never need network access) with a genuine `let x: i32 = "not a number";` type mismatch,
-/// and polls real wall-clock time (up to a generous 180s bound, matching `lsp_core::client`'s own
-/// e2e test) for the real diagnostic to actually arrive - no artificial sleep stands in for that
-/// real wait, and no diagnostic is fabricated if the wait were to time out (the assertion would
-/// simply fail honestly). This is a genuinely slow test (real process spawn plus real sysroot
-/// indexing) kept in the normal, non-`#[ignore]` suite on purpose - this project has no separate
-/// "slow test" lane, and this is exactly the kind of test that proves the feature is real rather
-/// than merely compiling.
+/// This genuinely spawns a real `rust-analyzer` against a tiny, dependency-free scratch cargo
+/// project (kept dependency-free so `cargo metadata`/rust-analyzer's own workspace discovery
+/// never needs network access) with a genuine `let x: i32 = "not a number";` type mismatch, and
+/// polls real wall-clock time (up to 180s, matching `lsp_core::client`'s own e2e test) for the
+/// diagnostic to actually arrive - no sleep stands in for that wait, and nothing is fabricated
+/// if the wait times out (the assertion just fails). This is a genuinely slow test (real process
+/// spawn plus real sysroot indexing) kept in the normal, non-`#[ignore]` suite on purpose - this
+/// project has no separate "slow test" lane.
 #[cfg(test)]
 mod lsp_diagnostics_wiring_tests {
     use super::*;
     use gpui::{Entity, TestAppContext, VisualTestContext};
     use std::time::{Duration, Instant};
 
-    /// Same real, minimal, dependency-free scratch cargo project shape as
+    /// Same minimal, dependency-free scratch cargo project shape as
     /// `lsp_core::client::tests::write_scratch_project` - kept as its own small copy here
-    /// (rather than exporting that one across the crate boundary) since it's a handful of lines
-    /// and this is the only place the `app` crate's own tests need one.
+    /// rather than exporting that one across the crate boundary.
     fn write_scratch_project(main_rs: &str) -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().expect("tempdir");
         std::fs::write(
@@ -482,11 +439,10 @@ mod lsp_diagnostics_wiring_tests {
     }
 
     /// Repeatedly re-renders the centre pane and drains the deterministic test executor until
-    /// `AdeApp::file_view_diagnostics` holds at least one real diagnostic, or `deadline` passes.
-    /// A real, bounded, wall-clock retry loop - the real `publishDiagnostics` notification
-    /// arrives on `lsp_core`'s own raw OS reader thread (outside GPUI's scheduler entirely), so
-    /// this must genuinely keep re-checking over real time, exactly like
-    /// `lsp_core::client`'s own e2e test's `wait_for_update` polling loop does one layer down.
+    /// `AdeApp::file_view_diagnostics` holds at least one diagnostic, or `deadline` passes. The
+    /// real `publishDiagnostics` notification arrives on `lsp_core`'s own raw OS reader thread,
+    /// outside GPUI's scheduler entirely, so this must genuinely keep re-checking over real
+    /// time, like `lsp_core::client`'s own `wait_for_update` polling loop one layer down.
     fn wait_for_real_diagnostics(
         app: &Entity<AdeApp>,
         cx: &mut VisualTestContext,
@@ -511,10 +467,9 @@ mod lsp_diagnostics_wiring_tests {
         }
     }
 
-    /// The real, practical end-to-end proof this fix exists to deliver: a real `rust-analyzer`,
-    /// spawned via this app's own real `AdeApp::ensure_lsp_client`/`AdeApp::dispatch_did_open`
-    /// code path (not `lsp_core` called directly), genuinely publishes a diagnostic for a real
-    /// type mismatch, and that real diagnostic - real byte range, real error code, real message
+    /// The end-to-end proof this fix exists to deliver: a real `rust-analyzer`, spawned via this
+    /// app's own `AdeApp::ensure_lsp_client`/`AdeApp::dispatch_did_open` code path, publishes a
+    /// diagnostic for a real type mismatch, and that diagnostic - real byte range, real message
     /// - ends up in `AdeApp::file_view_diagnostics`, which is exactly what
     /// `AdeApp::render_file_view`'s row builder reads to draw the underline/card.
     #[gpui::test]
@@ -531,9 +486,9 @@ mod lsp_diagnostics_wiring_tests {
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(main_rs.clone(), window, cx);
         });
-        // Drives the real `code_view::load_file` background parse to completion - `render_file_view`
-        // does nothing LSP-related at all until `file_view_cache` is fresh (see that method's own
-        // docs), so this must happen before `ensure_lsp_client` ever gets a chance to run.
+        // Drives the real `code_view::load_file` background parse to completion -
+        // `render_file_view` does nothing LSP-related until `file_view_cache` is fresh, so this
+        // must happen before `ensure_lsp_client` ever gets a chance to run.
         cx.run_until_parked();
 
         let deadline = Instant::now() + Duration::from_secs(180);
@@ -574,8 +529,8 @@ mod lsp_diagnostics_wiring_tests {
             );
         });
 
-        // One real, `Ready` `lsp_clients` entry for this repo root - the real "one client per
-        // repo root, not per file" requirement.
+        // One real, `Ready` `lsp_clients` entry for this repo root - the "one client per repo
+        // root, not per file" requirement.
         app.read_with(cx, |app, _| {
             assert_eq!(
                 app.lsp_clients.len(),
@@ -593,8 +548,7 @@ mod lsp_diagnostics_wiring_tests {
         });
 
         // Opening a *second* Rust file under the same repo root must reuse the existing client,
-        // not spawn a second real `rust-analyzer` process - the "one client per repo root, not
-        // per file" requirement from this phase's own scope. Cheaply proven via `lsp_clients.len()`
+        // not spawn a second real `rust-analyzer` process. Cheaply proven via `lsp_clients.len()`
         // staying at 1 (no second real indexing wait needed).
         let second_file = project.path().join("src").join("lib.rs");
         std::fs::write(&second_file, "pub fn helper() -> i32 {\n    1\n}\n").expect("write lib.rs");

@@ -1,70 +1,57 @@
-//! Real session-status derivation - the "who needs me" mechanism
-//! `design_handoff_jerry_ade/README.md` calls the whole point of the session rail.
+//! Session-status derivation - the "who needs me" mechanism `design_handoff_jerry_ade/README.md`
+//! calls the whole point of the session rail.
 //!
-//! This module is deliberately GPUI-free and pty/process-free: it takes small, already-read
-//! signals ([`ProcessSignal`], a `has_reviewable_diff` bool, a [`crate::sessions::SessionKind`])
-//! and returns a [`Status`], so the interesting decision logic can be unit tested directly
-//! (see the tests below) without spinning up a real window or a real child process. The
-//! *gathering* of those signals from a real [`crate::terminal_pane::TerminalPane`] and a real
-//! `wt_core::diff::diff_against_base` call lives in `crate::rail`/`crate::root`.
+//! GPUI-free and pty/process-free: takes small, already-read signals ([`ProcessSignal`], a
+//! `has_reviewable_diff` bool, a [`crate::sessions::SessionKind`]) and returns a [`Status`], so
+//! the decision logic is unit testable without a window or a child process. Gathering those
+//! signals from a live [`crate::terminal_pane::TerminalPane`] and `wt_core::diff::diff_against_base`
+//! lives in `crate::rail`/`crate::root`.
 //!
 //! ## The heuristic, precisely
 //!
-//! Exit-based statuses ([`Status::Fail`], [`Status::Review`]) are exact, not heuristic: a
-//! process either exited with a non-zero code (or was killed by a signal - `pty-core`'s
-//! `ExitStatus::success()` is `false` for both) or it exited 0. Whether a "review ready" exit
-//! actually has anything to review is likewise exact - it's `wt_core::diff::diff_against_base`
-//! reporting at least one changed file, a real diff.
+//! Exit-based statuses ([`Status::Fail`], [`Status::Review`]) are exact: a process either exited
+//! non-zero/was killed by a signal, or exited 0. Whether a "review ready" exit has anything to
+//! review is likewise exact - `wt_core::diff::diff_against_base` reporting at least one changed
+//! file.
 //!
-//! The one genuinely fuzzy call is distinguishing [`Status::Run`] from [`Status::Ask`] for a
-//! still-*alive* process: there is no portable, reliable way to know a process is truly
-//! blocked reading its own stdin from outside it. The real, precise version of that signal
-//! exists only on Linux, only per-thread, and only by parsing `/proc/<pid>/wchan` (or
-//! `/proc/<pid>/status`'s `State: S (sleeping)` plus a stack-trace heuristic) - both
-//! kernel-version-dependent in exact format and not something a pty's *parent* process can
-//! cheaply and reliably attribute to "waiting on the pty's stdin specifically" versus "waiting
-//! on literally anything else" (a network read, a mutex, a timer). Real tools that solve this
-//! triage problem (tmux's `monitor-activity`, many CI dashboards) use the same pragmatic
-//! substitute this module uses instead: **idle time**. A process that was streaming output and
-//! has now gone quiet for longer than a threshold is treated as "probably waiting on input" -
-//! a genuine heuristic, not a certainty, and documented as one everywhere it's used.
+//! The one fuzzy call is distinguishing [`Status::Run`] from [`Status::Ask`] for a still-alive
+//! process: there's no portable, reliable way to know from outside a process that it's blocked
+//! reading its own stdin (the precise version of that signal exists only on Linux, only
+//! per-thread, via `/proc/<pid>/wchan`, and isn't cheap or reliable to attribute to "waiting on
+//! the pty's stdin" specifically). This module uses the same substitute tools like tmux's
+//! `monitor-activity` use: **idle time**. A process that was streaming output and has now gone
+//! quiet longer than a threshold is treated as "probably waiting on input" - a heuristic, not a
+//! certainty.
 //!
-//! Two thresholds, not one, because a plain shell and an interactive agent CLI mean something
-//! different by "gone quiet":
-//! - [`RUN_RECENT_OUTPUT_WINDOW`] (2s) is the boundary between "actively streaming" and
-//!   "merely paused" for *any* live process - this is the "produced output recently" signal
-//!   named in this feature's own spec.
-//! - [`AGENT_ASK_IDLE_THRESHOLD`] (15s) is the *second*, longer threshold that only matters
-//!   for [`crate::sessions::SessionKind::Claude`]/[`crate::sessions::SessionKind::Codex`]
-//!   sessions: an agent CLI commonly pauses for several seconds between a tool call and its
-//!   result, or while "thinking", so treating every pause past 2s as "needs input" would
-//!   flicker the rail constantly on completely normal agent latency. Only once a session has
-//!   been quiet for the *longer* window is it actually flagged [`Status::Ask`].
+//! Two thresholds, because a plain shell and an interactive agent CLI mean something different
+//! by "gone quiet":
+//! - [`RUN_RECENT_OUTPUT_WINDOW`] (2s) is the boundary between "actively streaming" and "merely
+//!   paused" for any live process.
+//! - [`AGENT_ASK_IDLE_THRESHOLD`] (15s) is a second, longer threshold that only matters for
+//!   [`crate::sessions::SessionKind::Claude`]/[`crate::sessions::SessionKind::Codex`] sessions:
+//!   an agent CLI commonly pauses for several seconds between a tool call and its result, so
+//!   treating every pause past 2s as "needs input" would flicker the rail on normal agent
+//!   latency. Only past the longer window is a session flagged [`Status::Ask`].
 //!
-//! A plain [`crate::sessions::SessionKind::Shell`] has no equivalent long grace window: a
-//! shell sitting at its prompt isn't "asking a question", it's just idle (per the design's own
-//! `Status::Idle` definition, "a shell tab that's just sitting there") - so a shell falls
-//! straight to [`Status::Idle`] once [`RUN_RECENT_OUTPUT_WINDOW`] has elapsed, never
-//! [`Status::Ask`].
+//! A plain [`crate::sessions::SessionKind::Shell`] has no such grace window: a shell sitting at
+//! its prompt isn't "asking a question", it's just idle - so it falls straight to
+//! [`Status::Idle`] once [`RUN_RECENT_OUTPUT_WINDOW`] elapses, never [`Status::Ask`].
 
 use std::time::Duration;
 
 use crate::sessions::SessionKind;
 
-/// How long a *live* process must have produced output within to count as "recently active"
-/// (the `Run` label's own condition, and the short end of the Run/Ask heuristic - see the
-/// module docs). Matches this feature's own spec ("within the last ~2s").
+/// How long a live process must have produced output within to count as "recently active" - the
+/// short end of the Run/Ask heuristic (see the module docs).
 pub const RUN_RECENT_OUTPUT_WINDOW: Duration = Duration::from_secs(2);
 
 /// How long an agent-CLI session ([`SessionKind::Claude`]/[`SessionKind::Codex`]) must have
-/// been quiet (no new pty output) before it's flagged [`Status::Ask`] - a real, but
-/// heuristic, "probably waiting on stdin" signal; see the module docs for why this exists and
-/// why it's longer than [`RUN_RECENT_OUTPUT_WINDOW`].
+/// been quiet before it's flagged [`Status::Ask`] - see the module docs for why this is longer
+/// than [`RUN_RECENT_OUTPUT_WINDOW`].
 pub const AGENT_ASK_IDLE_THRESHOLD: Duration = Duration::from_secs(15);
 
-/// The exact status vocabulary from `design_handoff_jerry_ade/README.md`'s "Status
-/// vocabulary" table - used nowhere else in the app (colour is reserved for status and
-/// diffs), backed one-to-one by `crate::theme::status::*`.
+/// The status vocabulary from `design_handoff_jerry_ade/README.md`'s "Status vocabulary" table,
+/// backed one-to-one by `crate::theme::status::*`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Status {
     /// Needs input.
@@ -117,8 +104,7 @@ impl Status {
     }
 
     /// The status pill's background colour (`design_handoff_jerry_ade/README.md`'s "Session
-    /// context bar" spec: "status pill (19 high, radius 3, 5px dot + ... label in the status
-    /// colour)" on this background) - `crate::theme::status::*_BG`, one per [`Status`].
+    /// context bar" spec) - `crate::theme::status::*_BG`, one per [`Status`].
     pub fn pill_bg(self) -> gpui::Rgba {
         match self {
             Status::Ask => crate::theme::status::ASK_BG,
@@ -130,8 +116,7 @@ impl Status {
     }
 
     /// Every status, already in the README's "by urgency" group order - `crate::rail`'s
-    /// urgency grouping iterates this rather than re-deriving the order from
-    /// [`Self::urgency_rank`] at each call site.
+    /// urgency grouping iterates this rather than re-deriving it from [`Self::urgency_rank`].
     pub const ORDER: [Status; 5] = [
         Status::Ask,
         Status::Fail,
@@ -141,24 +126,23 @@ impl Status {
     ];
 }
 
-/// The real, already-read signal this module derives a [`Status`] from - built by the caller
-/// (see `crate::rail`) from a live [`crate::terminal_pane::TerminalPane`], never fabricated.
+/// The already-read signal this module derives a [`Status`] from - built by the caller (see
+/// `crate::rail`) from a live [`crate::terminal_pane::TerminalPane`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessSignal {
-    /// The child process is alive; `idle` is how long it's been since its pty last produced
-    /// output (or since it started, if it never has yet).
+    /// The child process is alive; `idle` is how long since its pty last produced output (or
+    /// since it started, if never).
     Running { idle: Duration },
-    /// The child process has exited (or a spawn attempt failed outright, treated the same as
-    /// a non-zero exit - see `crate::rail`'s docs on why).
+    /// The child process has exited (or a spawn attempt failed outright, treated the same as a
+    /// non-zero exit - see `crate::rail`'s docs).
     Exited { success: bool },
-    /// No process has ever run in this session slot (or one is still in the middle of an
-    /// async spawn - see `crate::rail`'s docs).
+    /// No process has ever run in this session slot (or one is mid-async-spawn - see
+    /// `crate::rail`'s docs).
     NoProcess,
 }
 
-/// Derive the real [`Status`] for one session from its already-read process signal and
-/// whether it has a real, non-empty diff against its worktree's base - see the module docs
-/// for the full reasoning behind the Run/Ask split.
+/// Derives the [`Status`] for one session from its process signal and whether it has a
+/// non-empty diff against its worktree's base - see the module docs for the Run/Ask split.
 pub fn derive_status(
     kind: SessionKind,
     signal: ProcessSignal,
@@ -309,11 +293,10 @@ mod tests {
 
     #[test]
     fn pill_bg_is_distinct_per_status_and_matches_the_dot_colour_family() {
-        // Every status must have its own pill background (never accidentally sharing one
-        // with a different status) - a real regression a copy-pasted match arm could
-        // introduce silently, since two visually-similar dark ambers/reds would still
-        // "look plausible" without this check. `gpui::Rgba` has no `Debug` impl, so this
-        // compares raw channels rather than using `assert_ne!` directly on the colour.
+        // Every status must have its own pill background - a copy-pasted match arm could
+        // silently share one, and two similar dark ambers/reds would still "look plausible".
+        // `gpui::Rgba` has no `Debug` impl, so this compares raw channels instead of using
+        // `assert_ne!` directly.
         let bgs: Vec<gpui::Rgba> = Status::ORDER.iter().map(|s| s.pill_bg()).collect();
         for (i, a) in bgs.iter().enumerate() {
             for (j, b) in bgs.iter().enumerate() {

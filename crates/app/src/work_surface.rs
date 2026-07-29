@@ -1,12 +1,12 @@
-//! Pure logic for Zone 2's restyle (`design_handoff_jerry_ade/README.md`'s "Zone 2 — work
-//! surface": tab strip, session context bar, and the CLI/terminal pane header/footer).
+//! Pure logic for Zone 2 (work surface): tab strip, session context bar, and the
+//! CLI/terminal pane header/footer.
 //!
 //! Deliberately GPUI-free, mirroring `crate::status`'s own split: this module only maps
-//! already-known facts (a [`SessionKind`], a [`Status`], a `bool`) onto *which* colours/
-//! labels/actions a Zone 2 element should show, so that mapping is directly unit-testable
-//! without a live GPUI window. Turning these into actual `gpui::Div` trees (and wiring real
-//! click handlers - spawning/closing/interrupting a session) happens one layer up, in
-//! `crate::root`, which has the `Context<AdeApp>` these decisions need to act on.
+//! already-known facts (a [`SessionKind`], a [`Status`], a `bool`) onto *which*
+//! colours/labels/actions a Zone 2 element should show, so that mapping is directly
+//! unit-testable without a live GPUI window. Turning these into actual `gpui::Div` trees (and
+//! wiring click handlers) happens one layer up, in `crate::root`, which has the
+//! `Context<AdeApp>` these decisions need to act on.
 
 use gpui::Rgba;
 
@@ -15,11 +15,10 @@ use crate::sessions::SessionKind;
 use crate::status::Status;
 use crate::theme;
 
-/// Fully transparent - used where the design's own inline styles say `background:transparent`
-/// / no border (the "outline"/"ghost" button variants, an inactive tab's background), so every
-/// button/tab can always call `.bg()`/`.border_color()` uniformly rather than conditionally
-/// skipping the call (which would also shift the box model by the border's width - see
-/// `crate::root::render_session_tab`'s docs).
+/// Fully transparent - used for the "outline"/"ghost" button variants and an inactive tab's
+/// background, so every button/tab can always call `.bg()`/`.border_color()` uniformly rather
+/// than conditionally skipping the call (which would also shift the box model by the border's
+/// width).
 pub const TRANSPARENT: Rgba = Rgba {
     r: 0.0,
     g: 0.0,
@@ -27,12 +26,8 @@ pub const TRANSPARENT: Rgba = Rgba {
     a: 0.0,
 };
 
-/// The real agent tint `(fg, bg)` for a session's badge/chip - `design_handoff_jerry_ade/
-/// README.md`'s "Agent badge — 16×16, radius 3, agent tint background" and the tab strip's
-/// "chip tinted with **that agent's** colour" both read this. [`SessionKind::Shell`] isn't an
-/// "agent" in the design's sense (no agent tint is specified for a plain shell), so it gets a
-/// neutral chip instead, matching the tab strip's own "terminal" chip colours rather than
-/// inventing a tint the design never specified.
+/// The agent tint `(fg, bg)` for a session's badge/chip. [`SessionKind::Shell`] isn't an agent,
+/// so it gets a neutral chip instead of an invented tint.
 pub fn agent_tint(kind: SessionKind) -> (Rgba, Rgba) {
     match kind {
         SessionKind::Claude => theme::agent::SONNET,
@@ -50,12 +45,8 @@ pub fn agent_initial(kind: SessionKind) -> &'static str {
     }
 }
 
-/// Which of the tab strip's two chip shapes a session's tab draws
-/// (`design_handoff_jerry_ade/README.md`'s tab-strip spec: agent CLI gets a `❯` glyph,
-/// terminal gets the pane glyph - 14×4 bar + prompt mark). The design's third tab kind
-/// ("code", a file's language chip) has no equivalent in this app's session model - here
-/// every session *is* its own tab, not a per-session Cli/Terminal/Code view switcher - so it's
-/// never constructed by this app.
+/// Which of the tab strip's two chip shapes a session's tab draws: agent CLI gets a `❯` glyph,
+/// terminal gets the pane glyph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabChipKind {
     Cli,
@@ -69,10 +60,8 @@ pub fn tab_chip_kind(kind: SessionKind) -> TabChipKind {
     }
 }
 
-/// A tab chip's real `(bg, fg)`, active or dimmed - `Jerry.dc.html`'s own tab computation:
-/// `chipBg: on ? chip.bg : '#1e2225', chipFg: on ? chip.fg : '#5e646a'` (`#1e2225` ==
-/// `theme::border::ZONE`, `#5e646a` == `theme::text::FAINTER` - both already-ported tokens,
-/// just reused for a different element here).
+/// A tab chip's `(bg, fg)`, active or dimmed. Dimmed reuses [`theme::border::ZONE`] (the same
+/// token an inactive tab's own underline uses) for `bg`, and [`theme::text::FAINTER`] for `fg`.
 #[derive(Debug, Clone, Copy)]
 pub struct ChipColors {
     pub bg: Rgba,
@@ -91,11 +80,8 @@ pub fn tab_chip_colors(kind: SessionKind, active: bool) -> ChipColors {
     }
 }
 
-/// A file tab's real chip colours (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 4:
-/// "the file's language chip, same table as the file tree" for the active state, dimmed to the
-/// exact same `bg`/`fg` [`tab_chip_colors`] already dims a session tab's chip to when inactive -
-/// `Jerry.dc.html`'s own tab computation applies the identical `chipBg: on ? chip.bg : '#1e2225',
-/// chipFg: on ? chip.fg : '#5e646a'` rule regardless of whether the tab is a session or a file).
+/// A file tab's chip colours - the file's language chip when active, dimmed to the exact same
+/// `bg`/`fg` [`tab_chip_colors`] dims a session tab's chip to when inactive.
 pub fn file_tab_chip_colors(lang: LangChip, active: bool) -> ChipColors {
     if active {
         ChipColors {
@@ -110,14 +96,9 @@ pub fn file_tab_chip_colors(lang: LangChip, active: bool) -> ChipColors {
     }
 }
 
-/// A tab's own label/background/underline/foreground - `Jerry.dc.html`'s tab computation:
-/// `bg: on ? '#131518' : 'transparent', underline: on ? '#131518' : '#1e2225', fg: on ?
-/// '#d3d8dd' : '#767d84'`. `#131518` and `#d3d8dd` are exact `theme::surface::CENTER`/
-/// `theme::text::PRIMARY` matches; the inactive label colour `#767d84` has no exact token in
-/// `design_handoff_jerry_ade/tokens.rs` (the design-approved transcription this app's
-/// `theme.rs` mirrors field-for-field) - `theme::text::DIMMER` (`#7d848b`) is the closest
-/// ported token (differs by 7/7/7 per channel vs. `FAINT`'s 11/12/12), so that's what's used
-/// here rather than inventing a new, untracked colour constant for one pixel-level shade.
+/// A tab's own background/underline/label colour, active or inactive. The design's inactive
+/// label colour (`#767d84`) has no exact token in `theme.rs`; [`theme::text::DIMMER`]
+/// (`#7d848b`) is the closest ported token, used here rather than adding a new one-off constant.
 #[derive(Debug, Clone, Copy)]
 pub struct TabColors {
     pub bg: Rgba,
@@ -141,14 +122,12 @@ pub fn tab_colors(active: bool) -> TabColors {
     }
 }
 
-/// The CLI/terminal pane header's real pty-state text
-/// (`design_handoff_jerry_ade/README.md`'s Surface A spec: "attached · waiting on stdin" /
-/// "attached · streaming" / "exited 0" / "exited 101" / "detached · resumable"). This app has
-/// no detach/resume concept (`crate::sessions`: a session is exactly one live process for its
-/// whole lifetime, from `Sessions::spawn` to `Sessions::close`), so `detached · resumable` is
-/// never produced. Every other state is read from already-derived, real signals - the same
-/// `is_running`/exit-code facts `crate::status::derive_status` itself consumes - rather than a
-/// second, independent heuristic that could drift from the status pill shown right next to it.
+/// The CLI/terminal pane header's pty-state text (`attached · waiting on stdin` / `attached ·
+/// streaming` / `exited N` / `not started`). This app has no detach/resume concept (a session is
+/// exactly one live process for its whole lifetime - see `crate::sessions`), so a `detached ·
+/// resumable` state is never produced. Reads the same `is_running`/exit-code facts
+/// `crate::status::derive_status` consumes, rather than a second heuristic that could drift from
+/// the status pill shown right next to it.
 pub fn pty_state_label(is_running: bool, status: Status, exit_code: Option<u32>) -> String {
     if !is_running {
         return match exit_code {
@@ -159,18 +138,14 @@ pub fn pty_state_label(is_running: bool, status: Status, exit_code: Option<u32>)
     match status {
         Status::Ask => "attached \u{b7} waiting on stdin".to_string(),
         Status::Idle => "attached \u{b7} idle".to_string(),
-        // `Status::Fail`/`Status::Review` only ever arise from `ProcessSignal::Exited` (see
-        // `crate::status::derive_status`), which implies `is_running == false` - unreachable
-        // in practice while `is_running` is `true`, but matched explicitly (rather than a
-        // wildcard) so a future status added to the enum doesn't silently fall through here.
+        // Fail/Review only arise from `ProcessSignal::Exited`, which implies `is_running ==
+        // false` - unreachable here in practice, but matched explicitly so a future status
+        // variant doesn't silently fall through a wildcard arm.
         Status::Run | Status::Fail | Status::Review => "attached \u{b7} streaming".to_string(),
     }
 }
 
-/// A footer action button's colour treatment - `Jerry.dc.html`'s own `AB` (action-button)
-/// dictionary (`primaryG`/`primaryB`/`outline`/`ghost`), backed by `theme::button::*` (plus
-/// [`theme::button::GREEN_KEYCAP_FG`] - see its own docs for why that one constant was added
-/// directly from the HTML rather than already existing in `tokens.rs`).
+/// A footer action button's colour treatment, backed by `theme::button::*`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionStyle {
     PrimaryGreen,
@@ -201,8 +176,7 @@ pub fn action_button_colors(style: ActionStyle) -> ActionColors {
             bg: theme::button::BLUE_BG,
             border: theme::button::BLUE_BG,
             fg: theme::button::BLUE_FG,
-            // `Jerry.dc.html`'s blue keycap glyph colour (`#8fbde6`) is the exact same value
-            // already ported as `term::PROMPT` - see `theme::button::GREEN_KEYCAP_FG`'s docs.
+            // Same blue (`#8fbde6`) as `term::PROMPT`, reused rather than duplicated.
             keycap_fg: theme::term::PROMPT,
             keycap_border: theme::button::BLUE_KEYCAP,
         },
@@ -223,28 +197,25 @@ pub fn action_button_colors(style: ActionStyle) -> ActionColors {
     }
 }
 
-/// Which real operation a footer action button performs, if any - `crate::root::AdeApp`'s
-/// click handlers dispatch on this. Every variant either has real, minimal backing logic
-/// wired up this phase, or is rendered honestly disabled (see [`FooterAction::implemented`]'s
-/// docs) - never a button that looks clickable but silently does nothing.
+/// Which operation a footer action button performs, if any - `crate::root::AdeApp`'s click
+/// handlers dispatch on this. Every variant either has real backing logic wired up, or is
+/// rendered honestly disabled (see [`FooterAction::implemented`]) - never a button that looks
+/// clickable but silently does nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
-    /// Sends a real `Ctrl-C` to the session's pty (`TerminalPane::interrupt`).
+    /// Sends a `Ctrl-C` to the session's pty (`TerminalPane::interrupt`).
     Interrupt,
-    /// Finds-or-spawns a real `Shell` session in the same cwd and selects it.
+    /// Finds-or-spawns a `Shell` session in the same cwd and selects it.
     OpenTerminal,
-    /// Closes this tab and spawns a fresh session of the same kind/cwd - a real, if
-    /// approximate, stand-in for the design's `Retry`/`Resume` (this app has no saved-session
-    /// resumability to actually resume *from* - see `pty_state_label`'s docs on the same
-    /// gap).
+    /// Closes this tab and spawns a fresh session of the same kind/cwd - an approximate
+    /// stand-in for `Retry`/`Resume` (this app has no saved-session resumability to actually
+    /// resume *from* - see [`pty_state_label`] on the same gap).
     Respawn,
-    /// Closes this tab (`Sessions::close`) - the same real action as the context bar's own
-    /// `Archive` button.
+    /// Closes this tab (`Sessions::close`) - the same action as the context bar's own `Archive`
+    /// button.
     Archive,
-    /// No real backing logic exists yet this phase (git-level review/merge/editor-surface
-    /// workflows - out of scope here, see `crate::root`'s module docs) - always rendered
-    /// disabled regardless of [`FooterAction::implemented`] (which is always `false` for
-    /// these).
+    /// No backing logic exists yet (git-level review/merge/editor-surface workflows) - always
+    /// rendered disabled regardless of [`FooterAction::implemented`] (always `false` for these).
     Unimplemented,
 }
 
@@ -252,31 +223,22 @@ pub enum ActionKind {
 pub struct FooterAction {
     pub kind: ActionKind,
     pub label: &'static str,
-    /// A real keybinding **spec string** (`"mod+enter"`, `"ctrl+C"`), not an already-resolved
-    /// glyph - `crate::root::work_surface_render::render_footer_action_button` runs it through
-    /// `crate::keymap::resolve_combo` at render time, so the same spec renders `⌘⏎`/`⌃C` on
-    /// macOS and `Ctrl Enter`/`Ctrl C` on Windows/Linux, never a hardcoded platform-specific
-    /// literal (`design_handoff_jerry_ade/CHANGELOG.md`'s 2026-07-29 entry, change 2).
+    /// A keybinding **spec string** (`"mod+enter"`, `"ctrl+C"`), not an already-resolved glyph -
+    /// the render call site runs it through `crate::keymap::resolve_combo`, so the same spec
+    /// renders `⌘⏎`/`⌃C` on macOS and `Ctrl Enter`/`Ctrl C` on Windows/Linux.
     pub keycap: Option<&'static str>,
     pub style: ActionStyle,
-    /// Whether this action kind has real backing logic wired up in this phase at all (a
-    /// *static* fact about the action, independent of this particular session's current
-    /// state - `crate::root::AdeApp`'s render call site layers any further, state-dependent
-    /// enablement - e.g. `Resume` only while the process isn't already running - on top of
-    /// this). `false` here always means "rendered dimmed, non-interactive, real disabled
-    /// state" (matching the design's own "Accept file is always rendered, dimmed ... when
-    /// there is nothing to accept" precedent), never a clickable-looking no-op.
+    /// Whether this action kind has real backing logic wired up at all (a *static* fact,
+    /// independent of this session's current state - the render call site layers further,
+    /// state-dependent enablement on top of this). `false` always means rendered dimmed and
+    /// non-interactive, never a clickable-looking no-op.
     pub implemented: bool,
 }
 
-/// The footer action strip for one [`Status`] - `design_handoff_jerry_ade/README.md`'s
-/// Surface A footer spec, one list per status (keybinding spec strings shown resolved to
-/// their macOS glyphs here for readability - see [`FooterAction::keycap`]'s docs for why the
-/// stored value is the unresolved spec, not this literal glyph):
-/// review: `Keep all ⌘⏎` (green) · `Review diff` · `Open in editor` · `Discard worktree`;
-/// ask: `Open terminal` · `Interrupt ⌃C`; fail: `Retry ⌘R` · `Open terminal` ·
-/// `Discard worktree`; run: `Interrupt ⌃C` · `Open terminal`; idle: `Resume ⌘⏎` (blue) ·
-/// `Archive`.
+/// The footer action strip for one [`Status`]: review gets `Keep all ⌘⏎` (green) · `Review
+/// diff` · `Open in editor` · `Discard worktree`; ask gets `Open terminal` · `Interrupt ⌃C`;
+/// fail gets `Retry ⌘R` · `Open terminal` · `Discard worktree`; run gets `Interrupt ⌃C` ·
+/// `Open terminal`; idle gets `Resume ⌘⏎` (blue) · `Archive`.
 pub fn footer_actions(status: Status) -> Vec<FooterAction> {
     match status {
         Status::Review => vec![

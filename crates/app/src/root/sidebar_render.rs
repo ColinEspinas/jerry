@@ -3,12 +3,10 @@ use crate::root::settings_widgets::ChoiceOption;
 use crate::root::widgets::{render_sidebar_message, render_tag_pill};
 
 impl AdeApp {
-    /// Switches which real data source the right sidebar shows. Switching *to* the Changes
-    /// view always recomputes the diff (`load_diff`, not just `cx.notify()`) rather than
-    /// showing whatever was last loaded: the core workflow this feature exists for is "run an
-    /// agent in a terminal tab, then check what changed", and a stale snapshot captured back
-    /// when the worktree was first selected would silently hide exactly the changes just made -
-    /// worse than an obviously-loading state.
+    /// Switches which data source the right sidebar shows. Switching *to* the Changes view
+    /// always recomputes the diff (`load_diff`, not just `cx.notify()`) rather than showing
+    /// whatever was last loaded - a stale snapshot from when the worktree was first selected
+    /// would silently hide changes an agent just made.
     pub(super) fn set_right_sidebar_view(
         &mut self,
         view: RightSidebarView,
@@ -22,8 +20,8 @@ impl AdeApp {
         }
     }
 
-    /// Toggles a directory's collapsed/expanded state - the file tree row's real click handler
-    /// (`crate::file_tree::visible_entries` does the actual hiding at render time).
+    /// Toggles a directory's collapsed/expanded state - `crate::file_tree::visible_entries`
+    /// does the actual hiding at render time.
     pub(super) fn toggle_dir_collapsed(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if !self.collapsed_dirs.remove(&path) {
             self.collapsed_dirs.insert(path);
@@ -31,9 +29,9 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Toggles a file's real reviewed/not-reviewed state - the Changes row checkbox's click
-    /// handler. Deliberately stops propagation at the call site (see
-    /// `Self::render_change_row`) so checking a box never also opens that file's diff.
+    /// Toggles a file's reviewed state - the Changes row checkbox's click handler.
+    /// `Self::render_change_row` stops propagation at the call site so checking a box never
+    /// also opens that file's diff.
     pub(super) fn toggle_reviewed(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if !self.reviewed_files.remove(&path) {
             self.reviewed_files.insert(path);
@@ -41,19 +39,12 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// The real `A`/`M` change marks for every changed file in the currently loaded diff, keyed
-    /// by each file's absolute path (`design_handoff_jerry_ade/README.md`: "Changed files carry
-    /// an `A` ... or `M` ... mark at the right"). Built *once* per [`Self::render_file_tree`]
-    /// call and looked up per row from there, rather than the row itself re-scanning
-    /// `diff.files` (a `Vec`, so a linear scan) and re-joining a `PathBuf` for every rendered
-    /// row: with up to `file_tree::MAX_RENDERED_FILE_ENTRIES` (500) rows rendered against up to
-    /// 300 loaded diff files, doing that scan+allocation per row per frame was a real, measured
-    /// ~21ms foreground-executor cost against a ~33ms frame budget - exactly the kind of stall
-    /// `file_tree::MAX_RENDERED_FILE_ENTRIES`'s own doc comment already warned a prior phase
-    /// measured. A
-    /// deleted file never needs an entry here: `crate::file_tree::build_file_tree` only ever
-    /// lists real, currently-existing directory entries, so a deleted path simply never produces
-    /// a row to mark in the first place.
+    /// The `A`/`M` change marks for every changed file in the currently loaded diff, keyed by
+    /// each file's absolute path. Built *once* per [`Self::render_file_tree`] call rather than
+    /// the row itself re-scanning `diff.files` per row per frame - with up to 500 rendered
+    /// rows against up to 300 diff files, that scan was a measured ~21ms foreground stall
+    /// against a ~33ms frame budget. A deleted file never needs an entry here:
+    /// `crate::file_tree::build_file_tree` only lists currently-existing entries.
     pub(super) fn tree_change_marks(&self) -> HashMap<PathBuf, (&'static str, gpui::Rgba)> {
         let Some(diff) = self.current_diff() else {
             return HashMap::new();
@@ -73,19 +64,15 @@ impl AdeApp {
             .collect()
     }
 
-    /// The real file tree - `design_handoff_jerry_ade/README.md`'s Zone 3 "Files (tree)" spec:
-    /// real rect-composed folder/language-chip icons (see [`render_folder_icon`]/
-    /// [`render_lang_chip`], never emoji or an SVG pipeline), real collapse/expand (see
-    /// [`Self::toggle_dir_collapsed`]/`crate::file_tree::visible_entries`), and - critically for
-    /// scrolling to actually work - **no `size_full()`/fixed height on this list**: its caller
-    /// (`Self::render_right_sidebar`) puts it inside a `flex_1().min_h_0().overflow_y_scroll()`
-    /// wrapper, and a scrollable container's child must be free to grow to its own natural
-    /// content height (not clamped to `height: 100%` of the scroll viewport) for there to be
-    /// anything to scroll *to*. That `size_full()` on this method's own root div was exactly
-    /// the reported "file tree scroll doesn't work" bug: it pinned the list's height to the
-    /// visible viewport regardless of how many rows it held, so content past the bottom was
-    /// silently clipped instead of scrollable (verified against `Self::render_rail_list`, which
-    /// never had this bug - it was never given a `size_full()` in the first place).
+    /// The file tree - `design_handoff_jerry_ade/README.md`'s Zone 3 "Files (tree)" spec:
+    /// rect-composed folder/language-chip icons (see [`render_folder_icon`]/
+    /// [`render_lang_chip`], never emoji or an SVG pipeline), collapse/expand (see
+    /// [`Self::toggle_dir_collapsed`]/`crate::file_tree::visible_entries`) - and deliberately
+    /// **no `size_full()`/fixed height on this list**. The caller
+    /// (`Self::render_right_sidebar`) wraps it in `flex_1().min_h_0().overflow_y_scroll()`; a
+    /// scrollable container's child must be free to grow to its natural content height, not
+    /// clamped to the viewport, or content past the bottom is silently clipped instead of
+    /// scrollable - the exact "file tree scroll doesn't work" bug this once was.
     pub(super) fn render_file_tree(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         if let Some(error) = &self.file_tree_error {
             return render_sidebar_message(
@@ -99,18 +86,15 @@ impl AdeApp {
 
         let visible = file_tree::visible_entries(&self.file_tree, &self.collapsed_dirs);
 
-        // Only the first `file_tree::MAX_RENDERED_FILE_ENTRIES` *visible* rows are turned into
-        // actual elements - independent of `self.file_tree`'s own up-to-`file_tree::MAX_ENTRIES`
-        // (5000) loaded size. Laying out that many `div`s through GPUI's flexbox engine on
-        // *every* render (which happens as often as every ~33ms while a terminal pane is
-        // streaming output and calling `cx.notify()`) was a real, measured foreground-executor
-        // stall during an earlier step's own verification (see this constant's docs) - a real
-        // virtualized list (`uniform_list`, see `vendor/zed/crates/project_panel`) would be a
-        // further improvement for a tree of unbounded size, but is out of scope here.
+        // Only the first `file_tree::MAX_RENDERED_FILE_ENTRIES` *visible* rows become actual
+        // elements - laying out more `div`s than that through GPUI's flexbox engine on every
+        // render (as often as ~33ms while a terminal streams output) was a measured
+        // foreground stall. A virtualized list (`uniform_list`, see
+        // `vendor/zed/crates/gpui/src/elements/uniform_list.rs`) would scale further but is
+        // out of scope here.
         let rendered_count = visible.len().min(file_tree::MAX_RENDERED_FILE_ENTRIES);
 
-        // Built once per render, not once per row - see `Self::tree_change_marks`'s docs for
-        // the real per-frame cost this avoids.
+        // Built once per render, not once per row - see `Self::tree_change_marks`'s docs.
         let marks = self.tree_change_marks();
 
         let mut list = div().id("file-tree-list").flex().flex_col().py(px(4.0));
@@ -130,11 +114,9 @@ impl AdeApp {
         list.into_any_element()
     }
 
-    /// One file-tree row: real indent (13px/level, per the README), a real composed icon (a
-    /// folder's two-rect glyph or a file's language chip), the real name, and, for a directory,
-    /// a real click handler that toggles [`Self::collapsed_dirs`] (never an always-expanded
-    /// tree: this was the other half of the reported "collapse doesn't work" bug, since there
-    /// was previously no collapse *state* at all, so every directory rendered permanently open).
+    /// One file-tree row: indent (13px/level, per the README), a composed icon (a folder's
+    /// two-rect glyph or a file's language chip), the name, and, for a directory, a click
+    /// handler that toggles [`Self::collapsed_dirs`].
     pub(super) fn render_file_tree_row(
         &self,
         entry: &FileTreeEntry,
@@ -144,11 +126,9 @@ impl AdeApp {
         let indent = px(13.0 * entry.depth as f32);
         let is_open = entry.is_dir && !self.collapsed_dirs.contains(&entry.path);
         let mark = marks.get(&entry.path).copied();
-        // The Files tree's own real row-selection highlight (`design_handoff_jerry_ade/
-        // README.md`'s Zone 3 "Selected row bg `#1a1e21`") - only ever set by
-        // `Self::open_palette_file_result` for a file result with no diff to open in the centre
-        // (see that method's docs); Phase D never gave individual file rows a click handler of
-        // their own, so this was previously always `false`.
+        // The Files tree's row-selection highlight (README's Zone 3 "Selected row bg
+        // `#1a1e21`") - set by `Self::open_file_view` (this row's own click handler, below)
+        // and by `Self::open_palette_file_result` for a palette file result with no diff.
         let is_selected = self.selected_tree_path.as_deref() == Some(entry.path.as_path());
 
         let mut row = div()
@@ -172,9 +152,7 @@ impl AdeApp {
                     this.toggle_dir_collapsed(path.clone(), cx);
                 }));
         } else {
-            // A file row's own real click handler - opens it in Surface C's real File view
-            // (`Self::open_file_view`'s docs explain why this, rather than the diff surface, is
-            // this phase's chosen trigger for a plain Files-tree row).
+            // Opens the file in Surface C's File view - see `Self::open_file_view`'s docs.
             let path = entry.path.clone();
             row = row
                 .cursor_pointer()
@@ -331,11 +309,9 @@ impl AdeApp {
         }
     }
 
-    /// The Changes header: real file count, a real review-progress bar and `N reviewed` count
-    /// (`design_handoff_jerry_ade/README.md`: "file count, a 56×3 review progress bar, and
-    /// `3 reviewed`"), both computed directly from [`Self::reviewed_files`]'s real membership
-    /// against `diff`'s real file list, never an independently tracked counter that could drift
-    /// from what's actually checked.
+    /// The Changes header: file count, a review-progress bar, and `N reviewed` count, both
+    /// computed directly from [`Self::reviewed_files`]'s membership against `diff`'s file
+    /// list rather than an independently tracked counter that could drift.
     pub(super) fn render_changes_header(&self, diff: &WorktreeDiff) -> impl IntoElement {
         let total = diff.files.len();
         let reviewed = diff
@@ -392,10 +368,8 @@ impl AdeApp {
             )
     }
 
-    /// The Changes list's real, scrollable rows - falls back to [`Self::render_diff_state_message`]
-    /// if the diff isn't loaded (defensive: `Self::render_right_sidebar` already branches on
-    /// `current_diff()` before calling this, but this stays correct on its own regardless), or a
-    /// real "no changes" message for a genuinely clean worktree.
+    /// The Changes list's scrollable rows - falls back to [`Self::render_diff_state_message`]
+    /// if the diff isn't loaded, or a "no changes" message for a clean worktree.
     pub(super) fn render_changes_rows(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(diff) = self.current_diff() else {
             return self.render_diff_state_message();
@@ -407,13 +381,10 @@ impl AdeApp {
         let rendered_count = diff.files.len().min(MAX_RENDERED_DIFF_FILES);
         let mut list = div().id("changes-rows").flex().flex_col();
         // `diff.truncated` is `wt_core::diff`'s own load-time cap firing (2MB of raw `git diff`
-        // output, or more than 300 changed files - see `WorktreeDiff::truncated`'s docs) -
-        // distinct from both a single file's own `DiffFile::truncated` (a per-file hunk-line
-        // cap, surfaced separately in `Self::render_diff_file_detail`) and this list's own
-        // `MAX_RENDERED_DIFF_FILES` *render* cap (the "... and N more changed files not shown"
-        // message below, which only fires when there's real, fully-loaded data this view simply
-        // chose not to render). Without this, a diff that hit `wt_core::diff`'s own cap looked
-        // exactly like a complete one - a real regression from the pre-Phase-D Changes view.
+        // output, or more than 300 changed files) - distinct from a single file's own
+        // `DiffFile::truncated` (per-file hunk-line cap, surfaced in
+        // `Self::render_diff_file_detail`) and this list's own `MAX_RENDERED_DIFF_FILES`
+        // *render* cap below, which only ever omits already fully-loaded data.
         if diff.truncated {
             list = list.child(render_sidebar_message(
                 "diff truncated: this worktree's real changes exceeded wt_core::diff's own \
@@ -437,11 +408,10 @@ impl AdeApp {
         list.into_any_element()
     }
 
-    /// One Changes row: a real review checkbox, `dir`/`name`, an optional tag pill, real
-    /// `+n`/`−n`, and the real five-segment stat bar - `design_handoff_jerry_ade/README.md`'s
-    /// Changes row spec. Clicking anywhere on the row (other than the checkbox itself - see
-    /// [`Self::render_review_checkbox`]'s `stop_propagation`) opens this file's real diff in the
-    /// centre via [`Self::open_change_diff`].
+    /// One Changes row: a review checkbox, `dir`/`name`, an optional tag pill, `+n`/`−n`, and
+    /// the five-segment stat bar. Clicking anywhere on the row other than the checkbox itself
+    /// (see [`Self::render_review_checkbox`]'s `stop_propagation`) opens the file's diff via
+    /// [`Self::open_change_diff`].
     pub(super) fn render_change_row(
         &self,
         file: &DiffFile,
@@ -505,11 +475,9 @@ impl AdeApp {
                     .child(name),
             )
             .when_some(tag, |el, tag| el.child(render_tag_pill(tag)))
-            // A rename-only file gets no `tag` from `changes::change_tag` (a plain rename isn't
-            // `new`/`del`), so without this it rendered as a plain filename with `+0 -0` and an
-            // empty stat bar - visually identical to a file with no changes at all. Real
-            // signal, not decoration: `changes::is_real_rename` only fires when `old_path` is
-            // both present and actually different from the current path.
+            // A rename-only file gets no `tag` from `changes::change_tag` (a plain rename
+            // isn't `new`/`del`), so without this it looked identical to an unchanged file.
+            // `changes::is_real_rename` only fires when `old_path` differs from the current path.
             .when(changes::is_real_rename(file), |el| {
                 el.child(render_moved_tag())
             })
@@ -532,11 +500,9 @@ impl AdeApp {
             .child(render_stat_bar(segments))
     }
 
-    /// The Changes row's real 12×12 review checkbox (`design_handoff_jerry_ade/README.md`:
-    /// "a 12×12 review checkbox (checked border `#2f6d4b`, bg `#24503a`, `✓` `#9fdcb6`)") - real
-    /// interactive state via [`Self::toggle_reviewed`], not decoration. Stops propagation on
-    /// click so checking a box never also opens the row's diff, mirroring
-    /// `Self::render_session_tab`'s own nested-clickable-child pattern (its tab-close `×`).
+    /// The Changes row's 12×12 review checkbox - toggled via [`Self::toggle_reviewed`]. Stops
+    /// propagation on click so checking a box never also opens the row's diff, mirroring
+    /// `Self::render_session_tab`'s nested-clickable-child pattern (its tab-close `×`).
     pub(super) fn render_review_checkbox(
         &self,
         path: PathBuf,
@@ -570,26 +536,24 @@ impl AdeApp {
     }
 }
 
-/// Which real data source the right sidebar currently shows for the selected worktree -
-/// `design_handoff_jerry_ade/README.md`'s Zone 3 `right_pane` state (`Files | Changes`, `Files`
-/// default). The panel itself never shows diff *content* (see [`AdeApp::open_change`]'s docs) -
-/// `Changes` is the real per-file review list, not a diff view.
+/// Which data source the right sidebar currently shows for the selected worktree - Zone 3's
+/// `right_pane` state (`Files | Changes`, `Files` default). The panel never shows diff
+/// *content* (see [`AdeApp::open_change`]'s docs) - `Changes` is the per-file review list,
+/// not a diff view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RightSidebarView {
     Files,
     Changes,
 }
 
-/// The Changes list's real footer 29 (`design_handoff_jerry_ade/README.md`: "Footer 29: `click
-/// a file to open its diff in the centre · ] next file`"). The `] next file` portion of that
-/// spec text is deliberately dropped here: `]` isn't actually bound to anything (only
-/// `secondary-n` is a real, wired-up keybinding - see `crate::default_key_bindings`), and advertising a
-/// shortcut that silently does nothing if pressed is worse than a shorter, accurate footer.
+/// The Changes list's footer 29. The README's spec text also mentions `] next file`, dropped
+/// here since `]` isn't actually bound to anything (only `secondary-n` is - see
+/// `crate::default_key_bindings`); advertising a dead shortcut is worse than a shorter,
+/// accurate footer.
 ///
-/// `text_size` is the caller's already-scaled [`AdeApp::ui_text_size`] value, not a literal
-/// `px(10.0)` - this free function has no `&self` of its own to call that method through, so the
-/// one real caller ([`AdeApp::render_right_sidebar`]) computes it and passes it in, the same real
-/// interface-scale coverage every other Changes/Files sidebar row text already gets.
+/// `text_size` is the caller's already-scaled [`AdeApp::ui_text_size`] value - this free
+/// function has no `&self` to call that method through, so the one caller
+/// ([`AdeApp::render_right_sidebar`]) computes and passes it in.
 pub(super) fn render_changes_footer(text_size: Pixels) -> impl IntoElement {
     div()
         .flex_none()
@@ -606,14 +570,12 @@ pub(super) fn render_changes_footer(text_size: Pixels) -> impl IntoElement {
         .child("click a file to open its diff in the centre")
 }
 
-/// The file tree row's real `▾`/`▸` caret (`design_handoff_jerry_ade/Jerry.dc.html`'s tree row
-/// template: an 8px-wide `n.caret` span, `#4a5057`, before the folder/file icon) - the signal
-/// that a directory row is clickable/expandable, distinct from the folder icon itself. Blank
-/// (but still 8px wide, to keep every row's icon column aligned) for a file row, which the
-/// mockup's own data never gives a caret at all.
+/// The file tree row's `▾`/`▸` caret, signaling a directory row is clickable/expandable,
+/// distinct from the folder icon itself. Blank but still 8px wide for a file row, to keep
+/// every row's icon column aligned.
 ///
-/// `text_size` - see [`render_changes_footer`]'s own docs for why this free function takes an
-/// already-scaled [`AdeApp::ui_text_size`] value rather than computing it internally.
+/// `text_size` - see [`render_changes_footer`]'s docs for why this takes an already-scaled
+/// value rather than computing it internally.
 pub(super) fn render_tree_caret(is_dir: bool, open: bool, text_size: Pixels) -> impl IntoElement {
     let label = if !is_dir {
         ""
@@ -631,23 +593,16 @@ pub(super) fn render_tree_caret(is_dir: bool, open: bool, text_size: Pixels) -> 
         .child(label)
 }
 
-/// The file tree's real folder icon - `design_handoff_jerry_ade/README.md`: "Folder icon is two
-/// rects — a 5×3 tab at (0,1) and a 12×8 radius-2 body at (0,3) — outlined `#4e545a` when
-/// collapsed, filled `#23272b` with a `#6b7178` border when open." Composed entirely from
-/// nested `div()`s with real borders/backgrounds/rounded corners (per the design's own "Assets"
-/// section: "Every icon is composed from rects and text glyphs ... precisely so that nothing
-/// needs an SVG pipeline") - never an emoji glyph standing in for it, which is exactly what the
-/// reported "tofu box" bug was: `\u{1F4C1}` folder/`\u{1F4C4}` file emoji with no matching glyph
-/// installed on the machine that reported the bug.
+/// The file tree's folder icon - two rects, a 5×3 tab and a 12×8 radius-2 body, composed
+/// entirely from `div()`s (never an emoji glyph, which is what caused the "tofu box" bug:
+/// no matching glyph installed on the reporting machine).
 ///
-/// The two rects are *not* styled identically, verified against `design_handoff_jerry_ade/
-/// Jerry.dc.html`'s own real tree-row template (`n.folderBd`/`n.folderBg`, not this crate's own
-/// paraphrase above): the 12×8 body alternates between a filled `bg` (open) and a transparent
-/// one (collapsed), both with a real `border`, exactly as the doc comment above says - but the
-/// 5×3 tab is always solid-filled with the state's `border` colour and has no separate border of
-/// its own (`background:{{ n.folderBd }}` with nothing else). Rendering the tab with the same
-/// hollow-when-collapsed treatment as the body (an earlier version of this function did) was a
-/// real design-fidelity gap: the mockup's collapsed-folder tab is solid, not outlined.
+/// The two rects are *not* styled identically (verified against `design_handoff_jerry_ade/
+/// Jerry.dc.html`'s `n.folderBd`/`n.folderBg`): the body alternates between a filled `bg`
+/// (open) and transparent (collapsed), both with a `border` - but the tab is always
+/// solid-filled with the `border` colour and has no separate border of its own. An earlier
+/// version gave the tab the same hollow-when-collapsed treatment as the body; the mockup's
+/// collapsed-folder tab is solid, not outlined.
 pub(super) fn render_folder_icon(open: bool) -> impl IntoElement {
     let (fill, border) = if open {
         (theme::surface::CHIP_NEUTRAL, theme::text::FAINT)
@@ -683,11 +638,9 @@ pub(super) fn render_folder_icon(open: bool) -> impl IntoElement {
         )
 }
 
-/// The file tree's real 13×13 radius-2.5 language chip (`design_handoff_jerry_ade/README.md`'s
-/// Zone 3 chip table) - a real rect with a real text-glyph label, per
-/// `crate::file_tree::lang_chip_for_name`'s pure selection logic (never an emoji, never a
-/// second, independent extension-matching guess at the tab-strip's own `rs`/`to`/`md`/`sq`
-/// chips).
+/// The file tree's 13×13 radius-2.5 language chip - a rect with a text-glyph label, per
+/// `crate::file_tree::lang_chip_for_name`'s selection logic (never an emoji, never a second,
+/// independently maintained extension-matching guess).
 pub(super) fn render_lang_chip(chip: LangChip) -> impl IntoElement {
     div()
         .flex_none()
@@ -705,14 +658,10 @@ pub(super) fn render_lang_chip(chip: LangChip) -> impl IntoElement {
         .child(chip.label)
 }
 
-/// The Changes row's `moved` tag for a real rename with a different pre-rename path
-/// (`changes::is_real_rename`) - a plain rename has no `ChangeTag` of its own
-/// (`changes::change_tag` deliberately returns `None` for `Modified`/`Renamed` alike, since
-/// most renames also carry a content change and already show real `+n`/`−n`), so a rename-only
-/// file needs its own distinct visual signal instead of looking identical to "no changes at
-/// all". Deliberately its own muted style, not [`ChangeTag`]'s bg/fg pair (that enum only
-/// covers `new`/`del`, and reusing an unrelated colour for a third, semantically different
-/// meaning was judged worse than a plain, honestly-neutral tag here).
+/// The Changes row's `moved` tag for a real rename (`changes::is_real_rename`) - its own
+/// muted style rather than [`ChangeTag`]'s bg/fg pair, since that enum only covers
+/// `new`/`del` and reusing an unrelated colour for a third meaning seemed worse than a plain
+/// neutral tag.
 pub(super) fn render_moved_tag() -> impl IntoElement {
     div()
         .flex_none()

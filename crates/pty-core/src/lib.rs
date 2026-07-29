@@ -4,116 +4,105 @@
 //!
 //! ## Scope decision: no `alacritty_terminal` in this crate
 //!
-//! `vendor/zed/crates/terminal/` was read as the reference implementation for how a
-//! terminal widget composes process spawning with ANSI/grid parsing. It turns out Zed's
-//! terminal crate does **not** use `portable_pty` at all for spawning: it drives
+//! `vendor/zed/crates/terminal/` does not use `portable_pty` at all for spawning: it drives
 //! `alacritty_terminal::tty::Pty` directly and lets `alacritty_terminal::event_loop::EventLoop`
-//! own the reader thread that both pumps bytes and feeds them into the `Term` grid
-//! parser in one step. That composition is `alacritty_terminal`-owned end to end and
-//! isn't separable into a "spawn primitive" the way this crate needs to be.
+//! own the reader thread that both pumps bytes and feeds them into the `Term` grid parser in
+//! one step - a composition that's `alacritty_terminal`-owned end to end and isn't separable
+//! into a standalone "spawn primitive".
 //!
-//! Since this crate is deliberately named `pty-core` and sits before the `app` crate in
-//! the build order, the chosen split is: `pty-core` owns spawning via `portable-pty`, a
-//! raw-byte output stream, resize, and kill, with no knowledge of ANSI escapes or
-//! terminal grid state; `app` (a later step) owns `alacritty_terminal`'s `Term` grid,
-//! driven by the raw bytes this crate streams out.
+//! So the split here is: `pty-core` owns spawning via `portable-pty`, a raw-byte output
+//! stream, resize, and kill, with no knowledge of ANSI escapes or terminal grid state; `app`
+//! (a later step) owns `alacritty_terminal`'s `Term` grid, driven by the raw bytes this crate
+//! streams out.
 //!
 //! ## Platform scope: unix only, for now
 //!
-//! The reader-thread shutdown signaling (a self-pipe polled alongside the pty fd) and
-//! the process-tree kill (process-group signals plus a `/proc` descendant walk) are
-//! unix-specific. `portable-pty` itself is cross-platform, but replicating equivalent
-//! non-blocking-shutdown and tree-kill primitives on Windows (job objects, IOCP) is a
-//! distinct, unverified API surface this step didn't have a reference for - rather than
-//! guess, this is an explicit, documented scope cut. The dev machine and this repo's
-//! target (a Linux/WSL2 desktop tool) are unix, so this isn't a blocking gap for now.
+//! The reader-thread shutdown signaling (a self-pipe polled alongside the pty fd) and the
+//! process-tree kill (process-group signals plus a `/proc` descendant walk) are
+//! unix-specific. `portable-pty` itself is cross-platform, but equivalent non-blocking-
+//! shutdown and tree-kill primitives on Windows (job objects, IOCP) are a distinct API
+//! surface this crate has no reference implementation for - an explicit, documented scope
+//! cut rather than a guess. This repo's target (a Linux/WSL2 desktop tool) is unix, so it
+//! isn't a blocking gap for now.
 //!
 //! ## Output streaming
 //!
-//! Output is streamed via a background thread that `poll(2)`s the pty master's fd
-//! together with a self-pipe used only for shutdown signaling, and forwards raw byte
-//! chunks over a **bounded** `mpsc::sync_channel<Vec<u8>>` (see [`PtySession::output`]).
-//! Two things changed here after an audit caught real bugs in an earlier version of
-//! this crate, worth calling out explicitly:
+//! Output is streamed via a background thread that `poll(2)`s the pty master's fd together
+//! with a self-pipe used only for shutdown signaling, and forwards raw byte chunks over a
+//! **bounded** `mpsc::sync_channel<Vec<u8>>` (see [`PtySession::output`]):
 //!
 //! - **The channel is bounded, not unbounded.** An unbounded channel against a fast,
-//!   undrained producer (e.g. a stalled render loop, or an unfocused tab) is an
-//!   unbounded memory leak - measured empirically at ~40MB/s of RSS growth against a
-//!   `yes` pipe in an earlier version of this crate (see
-//!   `output_channel_backpressures_instead_of_growing_unboundedly` in the test module).
-//!   With a bounded `sync_channel`, a full channel blocks the reader thread's `send`,
-//!   which stops it from calling `read` again, which lets the kernel's pty input buffer
-//!   fill, which blocks the child's `write` - correct, standard terminal backpressure.
-//! - **Shutdown is a self-pipe, not "drop the master fd and hope the reader wakes
-//!   up."** `MasterPty::try_clone_reader()` returns an independently `dup`'d fd; the
-//!   reader thread's blocking read does **not** unblock just because `PtySession`'s
-//!   `master` handle gets dropped - that only closes *one* of the (at least) two open
-//!   references to the pty. An earlier version of this crate relied on that closing
-//!   coincidentally: the `take_writer()` handle's `Drop` impl in `portable-pty` writes a
-//!   trailing `\n` + EOT, and when local echo is on, that write gets echoed back to the
-//!   reader, incidentally waking its blocking read. With echo off (`stty -echo` -
-//!   exactly what most non-shell interactive programs do), that trick doesn't fire and
-//!   the reader thread (and its fd) leaks for the life of the process. The fix here is
-//!   a dedicated self-pipe (`filedescriptor::Pipe`): the reader thread `poll()`s
-//!   `[pty_master_fd, shutdown_pipe_read_fd]` and exits deterministically the moment a
-//!   byte is written to the pipe, independent of echo state or fd-closing races.
+//!   undrained producer (e.g. a stalled render loop, or an unfocused tab) is an unbounded
+//!   memory leak - measured at ~40MB/s of RSS growth against a `yes` pipe with an earlier,
+//!   unbounded version of this crate (see
+//!   `output_channel_backpressures_instead_of_growing_unboundedly` in the test module). With
+//!   a bounded `sync_channel`, a full channel blocks the reader thread's `send`, which stops
+//!   it from calling `read` again, which lets the kernel's pty input buffer fill, which
+//!   blocks the child's `write` - standard terminal backpressure.
+//! - **Shutdown is a self-pipe, not "drop the master fd and hope the reader wakes up."**
+//!   `MasterPty::try_clone_reader()` returns an independently `dup`'d fd, so the reader
+//!   thread's blocking read does **not** unblock just because `PtySession`'s `master` handle
+//!   gets dropped - that closes only one of the (at least) two open references to the pty.
+//!   An earlier version relied on that closing coincidentally via a side effect: the
+//!   `take_writer()` handle's `Drop` impl in `portable-pty` writes a trailing `\n` + EOT,
+//!   and with local echo on, that write gets echoed back to the reader, incidentally waking
+//!   its blocking read. With echo off (`stty -echo`, what most non-shell interactive
+//!   programs do), that trick doesn't fire and the reader thread leaks for the process's
+//!   life. The fix is a dedicated self-pipe (`filedescriptor::Pipe`): the reader thread
+//!   `poll()`s `[pty_master_fd, shutdown_pipe_read_fd]` and exits deterministically the
+//!   moment a byte is written to the pipe, independent of echo state or fd-closing races.
 //!
 //! ## Kill: `Drop` vs. `shutdown()`
 //!
-//! `Drop` must never block the calling thread for long - this crate exists to back a
-//! GPUI terminal widget, and a multi-hundred-millisecond (or, in an earlier version of
-//! this crate, ~2s) freeze on drop would freeze the UI thread. So `Drop` only sends
-//! signals (fast, non-blocking syscalls) and does a single non-blocking `try_wait`; if
-//! the child hasn't already been reaped by that point, it hands the child handle off to
-//! a short-lived **detached** background thread that finishes `wait()`-ing on it, so
-//! `Drop` itself never blocks but the child still doesn't linger as a zombie forever.
+//! `Drop` must never block the calling thread for long - this crate exists to back a GPUI
+//! terminal widget, and a multi-hundred-millisecond (or, in an earlier version, ~2s) freeze
+//! on drop would freeze the UI thread. So `Drop` only sends signals (fast, non-blocking
+//! syscalls) and does a single non-blocking `try_wait`; if the child hasn't already been
+//! reaped by that point, it hands the child handle off to a short-lived **detached**
+//! background thread that finishes `wait()`-ing on it, so `Drop` itself never blocks but the
+//! child still doesn't linger as a zombie.
 //!
-//! [`PtySession::shutdown`] is the deterministic counterpart: it blocks until the
-//! process (and everything in its tree) is confirmed dead and reaped, and the reader
-//! and writer threads have been joined. Call it from a background task when you need a
-//! guarantee that teardown fully completed before proceeding (e.g. before removing a
-//! tab's last reference); rely on `Drop` alone when you just want "don't leak" and are
-//! on a thread that can't block.
+//! [`PtySession::shutdown`] is the deterministic counterpart: it blocks until the process
+//! (and everything in its tree) is confirmed dead and reaped, and the reader/writer threads
+//! have been joined. Call it from a background task when teardown must fully complete before
+//! proceeding (e.g. before removing a tab's last reference); rely on `Drop` alone when you
+//! just want "don't leak" from a thread that can't block.
 //!
 //! ## Kill: process group *and* process tree
 //!
 //! The child is made a session/process-group leader by `portable-pty` itself (it calls
 //! `setsid()` in `pre_exec` on unix), so signaling its pgid with `killpg` reaches any
-//! ordinary descendant that stayed in that group (e.g. `some_cmd &` inside a
-//! non-interactive shell, which does not get its own process group without job
-//! control). That is *not* sufficient on its own: a descendant that calls `setsid()`
-//! itself (e.g. `setsid sleep 100 &`, or any daemonizing tool) deliberately detaches
-//! into its own session and process group and becomes unreachable via the parent's
-//! pgid. To handle that, [`kill`](PtySession::kill) / [`shutdown`](PtySession::shutdown)
-//! / `Drop` all first walk `/proc/<pid>/task/<pid>/children` (Linux-specific procfs;
-//! recursively, breadth-first, depth-capped) to snapshot the *entire* descendant set
+//! ordinary descendant that stayed in that group (e.g. `some_cmd &` inside a non-interactive
+//! shell). That's not sufficient alone: a descendant that calls `setsid()` itself (e.g.
+//! `setsid sleep 100 &`, or any daemonizing tool) detaches into its own session and process
+//! group, unreachable via the parent's pgid. To handle that, [`kill`](PtySession::kill) /
+//! [`shutdown`](PtySession::shutdown) / `Drop` all first walk `/proc/<pid>/task/<pid>/children`
+//! (Linux procfs; breadth-first, depth-capped) to snapshot the *entire* descendant set
 //! **before** sending any signal - reading it after the fact races against the kernel
-//! reparenting a dying process's children out from under that file - then signal both
-//! the process group and every discovered descendant individually. See
-//! `drop_terminates_entire_process_tree_including_escaped_grandchild` in the test
-//! module for the regression case this fixes.
+//! reparenting a dying process's children out from under that file - then signal both the
+//! process group and every discovered descendant individually. See
+//! `drop_terminates_entire_process_tree_including_escaped_grandchild` in the test module for
+//! the regression case this fixes.
 //!
 //! ## Input writing
 //!
 //! [`PtySession::write_input`] hands bytes to a background writer thread over an
-//! `mpsc::Sender` rather than writing directly (behind a lock) on the caller's thread.
-//! An earlier version of this crate did the latter, which meant a full pty write
-//! buffer (child not reading its input) would block whichever thread called
-//! `write_input` - plausibly a GPUI key-handler on the main thread - and serialize every
-//! other writer behind the same lock in the meantime. Enqueueing onto a channel is
-//! effectively non-blocking for realistic input volumes (keystrokes, small pastes);
-//! the actual (possibly blocking) `write` syscall only ever happens on the dedicated
-//! writer thread.
+//! `mpsc::Sender` rather than writing directly (behind a lock) on the caller's thread - a
+//! full pty write buffer (child not reading its input) would otherwise block whichever
+//! thread called `write_input`, plausibly a GPUI key-handler on the main thread, and
+//! serialize every other writer behind the same lock. Enqueueing onto a channel is
+//! effectively non-blocking for realistic input volumes; the actual (possibly blocking)
+//! `write` syscall only ever happens on the dedicated writer thread.
 //!
 //! ## Working directory
 //!
-//! `portable-pty`'s `CommandBuilder` silently falls back to the user's home directory
-//! both when no cwd is set *and* when a set cwd fails an `is_dir()` check - i.e. a
-//! caller passing a stale path (e.g. a deleted worktree) would silently get a process
-//! spawned in `$HOME` instead of an error. [`spawn`] avoids both silent fallbacks: it
-//! defaults to `std::env::current_dir()` when [`SpawnOptions::cwd`] is unset, and
-//! validates any caller-supplied cwd is an existing directory before ever handing it to
-//! `CommandBuilder`, returning [`PtyError::InvalidCwd`] otherwise.
+//! `portable-pty`'s `CommandBuilder` silently falls back to the user's home directory both
+//! when no cwd is set *and* when a set cwd fails an `is_dir()` check - a caller passing a
+//! stale path (e.g. a deleted worktree) would silently get a process spawned in `$HOME`
+//! instead of an error. [`spawn`] avoids both silent fallbacks: it defaults to
+//! `std::env::current_dir()` when [`SpawnOptions::cwd`] is unset, and validates any
+//! caller-supplied cwd is an existing directory before handing it to `CommandBuilder`,
+//! returning [`PtyError::InvalidCwd`] otherwise.
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashSet;
@@ -153,12 +142,11 @@ const TREE_WALK_MAX_DEPTH: usize = 8;
 /// Errors that can occur while spawning, driving, or tearing down a [`PtySession`].
 ///
 /// Deliberately carries no `anyhow::Error`: `anyhow::Error` does not implement
-/// `std::error::Error` (confirmed against `anyhow-1.0.104/src/error.rs`, which impls
-/// `Display`/`Debug`/`Deref<Target = dyn StdError>` but not `StdError` itself), so a
-/// `#[source] anyhow::Error` field would not compile with thiserror, and even if it
-/// did, it would leak an opaque dependency type into this crate's public API. Failures
-/// that originate from `portable-pty`'s own `anyhow::Result` returns are captured via
-/// their `Display` output as an owned `String` instead.
+/// `std::error::Error` (`anyhow-1.0.104/src/error.rs` impls `Display`/`Debug`/
+/// `Deref<Target = dyn StdError>` but not `StdError` itself), so a `#[source] anyhow::Error`
+/// field wouldn't compile with thiserror, and would leak an opaque dependency type into this
+/// crate's public API regardless. Failures from `portable-pty`'s own `anyhow::Result`
+/// returns are captured via their `Display` output as an owned `String` instead.
 #[derive(Debug, Error)]
 pub enum PtyError {
     #[error("failed to open pty: {0}")]
@@ -238,55 +226,47 @@ impl SpawnOptions {
     }
 }
 
-/// Resolves `program` (a bare command name, e.g. `"claude"`) against `$PATH`, real
-/// filesystem checks only - no fabricated result, no caching of a stale answer.
+/// Resolves `program` (a bare command name, e.g. `"claude"`) against `$PATH` via real
+/// filesystem checks.
 ///
-/// This exists so a caller that needs to know *whether a spawn would succeed* (e.g. the
-/// app crate's Settings › Agents page, showing a real "ready"/"not found" dot per agent
-/// binary) can ask honestly, without actually spawning anything. It deliberately mirrors
-/// `portable-pty-0.9.0`'s own real `CommandBuilder::search_path` (unix implementation,
-/// `~/.cargo/registry/src/index.crates.io-6f17d22bba15001f/portable-pty-0.9.0/src/
-/// cmdbuilder.rs:416-472`) - the exact, private (not `pub`, so it cannot be called
-/// directly) function [`spawn`] itself relies on via `CommandBuilder::spawn`'s internal
-/// `search_path` call for a bare (non-cwd-relative) program name: for each directory in
-/// `std::env::split_paths(&PATH)`, join it with `program` and check the candidate exists
-/// and is executable, returning the first hit.
+/// This exists so a caller that needs to know *whether a spawn would succeed* (e.g. the app
+/// crate's Settings › Agents page, showing a "ready"/"not found" dot per agent binary) can
+/// ask without actually spawning anything. It mirrors `portable-pty-0.9.0`'s own
+/// `CommandBuilder::search_path` (unix implementation, private, so not callable directly;
+/// `portable-pty-0.9.0/src/cmdbuilder.rs:416-472`), which [`spawn`] itself relies on via
+/// `CommandBuilder::spawn` for a bare (non-cwd-relative) program name: for each directory in
+/// `std::env::split_paths(&PATH)`, join it with `program` and check the candidate exists and
+/// is executable, returning the first hit.
 ///
-/// Two deliberate, documented departures from that exact algorithm:
-/// - `portable-pty` uses `nix::unistd::access(path, X_OK)`, a real `access(2)` syscall
-///   this crate's callers (the `app` crate) has no `nix` dependency of its own to call.
-///   [`is_executable`] instead checks the owner/group/other execute bits on
-///   `std::fs::Metadata::permissions().mode()` (`S_IXUSR | S_IXGRP | S_IXOTH`) - real
-///   file metadata, not a guess, though (unlike `access(2)`) it doesn't itself account for
-///   ACLs or a process's specific uid/gid. For a "is this binary on PATH at all" status
-///   dot, that gap was judged an acceptable, documented simplification over adding a new
-///   dependency.
+/// Two deliberate departures from that algorithm:
+/// - `portable-pty` uses `nix::unistd::access(path, X_OK)`, a real `access(2)` syscall this
+///   crate's callers have no `nix` dependency of their own to call. [`is_executable`]
+///   instead checks the owner/group/other execute bits on
+///   `std::fs::Metadata::permissions().mode()` (`S_IXUSR | S_IXGRP | S_IXOTH`) - real file
+///   metadata, though unlike `access(2)` it doesn't account for ACLs or a process's specific
+///   uid/gid. Judged an acceptable simplification for a status dot over adding a dependency.
 /// - This never checks a cwd-relative candidate (`portable-pty`'s `is_cwd_relative_path`
-///   branch, e.g. `./claude`) - every real caller here passes a bare name
-///   (`SessionKind::agent_binary_name` in the `app` crate only ever returns plain names
-///   like `"claude"`/`"codex"`, never a path), so that branch is dead code for this
-///   crate's actual callers and was left out rather than speculatively added.
+///   branch, e.g. `./claude`) - every caller here passes a bare name
+///   (`SessionKind::agent_binary_name` in the `app` crate only returns plain names like
+///   `"claude"`/`"codex"`), so that branch is dead code for this crate's actual callers.
 ///
-/// Because this is a second, independent implementation of the same *algorithm* rather
-/// than a call into `portable-pty`'s own (private) function, it is not literally
-/// guaranteed to agree with what [`spawn`] does in every exotic case (e.g. a `PATH` entry
-/// that is itself a symlink to a directory, or unusual permission-bit combinations) - but
-/// both walk the same `$PATH` list in the same order and apply the same "exists and is
-/// executable" test, so in every realistic case (the ones this app's Settings page is
-/// actually screenshotting: `claude` present, `codex` absent) they agree.
+/// Because this is a second, independent implementation of the same algorithm rather than a
+/// call into `portable-pty`'s own (private) function, it isn't literally guaranteed to agree
+/// with [`spawn`] in every exotic case (e.g. a `PATH` entry that's itself a symlink, or
+/// unusual permission-bit combinations) - but both walk the same `$PATH` in the same order
+/// with the same "exists and is executable" test, so they agree in every realistic case.
 pub fn resolve_on_path(program: &str) -> Option<PathBuf> {
     resolve_in_path_var(&std::env::var_os("PATH")?, program)
 }
 
-/// The real search loop [`resolve_on_path`] runs, factored out so it can take a `PATH` value
-/// as a plain argument instead of always reading the real process environment. This is what
-/// lets `resolve_on_path_skips_a_same_named_directory` (and any other test that needs a
-/// custom, isolated `PATH`) construct an `OsString` directly and pass it here, rather than
-/// mutating `std::env`'s real, process-global `PATH` var - which would need `unsafe` (`std::
-/// env::set_var` requires it as of this workspace's edition) and would be genuinely racy
-/// against any other test concurrently reading the environment (e.g. via `portable_pty`'s
-/// `get_base_env`, which sibling tests here exercise through real `spawn` calls) since
-/// `cargo test` runs this crate's tests concurrently by default.
+/// The search loop [`resolve_on_path`] runs, factored out so it can take a `PATH` value as a
+/// plain argument instead of always reading the process environment. This lets
+/// `resolve_on_path_skips_a_same_named_directory` (and any other test that needs a custom,
+/// isolated `PATH`) construct an `OsString` directly and pass it here, rather than mutating
+/// `std::env`'s process-global `PATH` var - which would need `unsafe` (`std::env::set_var`
+/// requires it as of this workspace's edition) and would be racy against any other test
+/// concurrently reading the environment (e.g. via `portable_pty`'s `get_base_env`, exercised
+/// by sibling tests through real `spawn` calls), since `cargo test` runs tests concurrently.
 fn resolve_in_path_var(path_var: &OsStr, program: &str) -> Option<PathBuf> {
     for dir in std::env::split_paths(path_var) {
         let candidate = dir.join(program);
@@ -324,21 +304,18 @@ pub struct PtySession {
 
 /// Spawns `options.program` on a freshly opened native PTY.
 ///
-/// Verified API surface (from `portable-pty-0.9.0` source at
-/// `~/.cargo/registry/src/index.crates.io-6f17d22bba15001f/portable-pty-0.9.0/src/lib.rs`
-/// and `src/unix.rs`): `native_pty_system()`, `PtySystem::openpty`, `PtyPair {
-/// slave, master }`, `SlavePty::spawn_command`, `MasterPty::{try_clone_reader,
-/// take_writer, resize, get_size, as_raw_fd}`, `Child`/`ChildKiller::{kill, wait,
-/// try_wait, process_id}`. `filedescriptor` (`Pipe`, `FileDescriptor`, `poll`,
-/// `pollfd`, `POLLIN`) and `nix::sys::signal::{kill, killpg}` /
-/// `nix::unistd::Pid` were verified against their own fetched sources at
-/// `~/.cargo/registry/src/index.crates.io-6f17d22bba15001f/{filedescriptor-0.8.3,nix-0.28.0}`.
+/// API surface: `native_pty_system()`, `PtySystem::openpty`, `PtyPair { slave, master }`,
+/// `SlavePty::spawn_command`, `MasterPty::{try_clone_reader, take_writer, resize, get_size,
+/// as_raw_fd}`, `Child`/`ChildKiller::{kill, wait, try_wait, process_id}` from
+/// `portable-pty-0.9.0`; `filedescriptor` (`Pipe`, `FileDescriptor`, `poll`, `pollfd`,
+/// `POLLIN`) and `nix::sys::signal::{kill, killpg}` / `nix::unistd::Pid` from
+/// `filedescriptor-0.8.3`/`nix-0.28.0`.
 ///
 /// The parent's copy of `pair.slave` is dropped immediately after spawning: on unix the
 /// spawned child inherits its own duplicate of the slave-side file descriptors, and the
 /// master's reader only observes EOF once *every* open reference to the slave side is
-/// closed, so keeping `pair.slave` alive here would prevent EOF from ever being
-/// observed after the child exits.
+/// closed, so keeping `pair.slave` alive here would prevent EOF from ever being observed
+/// after the child exits.
 pub fn spawn(options: SpawnOptions) -> Result<PtySession, PtyError> {
     let cwd = resolve_cwd(options.cwd)?;
 

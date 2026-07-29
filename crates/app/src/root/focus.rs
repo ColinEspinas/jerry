@@ -1,15 +1,19 @@
+//! Opens/closes Surface C (Diff/File), the command palette, and Settings. All three are
+//! overlay-shaped: each has its own `*_focus_handle` and `*_focus: OverlayFocus` pair, moves
+//! real focus onto its handle on open, and must restore focus through [`OverlayFocus`]/
+//! [`restore_focus`] on close - see those types' docs in `root::mod` for the dangling-focus
+//! invariant this file exists to satisfy. This project has hit "close forgot to restore" bugs
+//! repeatedly (BUILD-LOG.md); the fix each time was routing through that shared mechanism
+//! rather than hand-rolling capture/restore again, so any new overlay added here should do the
+//! same instead of re-deriving it.
+
 use super::*;
 
 impl AdeApp {
-    /// Captures the real, pre-open focus target into [`Self::code_focus`]
-    /// (`OverlayFocus::capture`) - but only the first time Surface C actually transitions from
-    /// closed to open (`Self::open_change` was `None`), mirroring [`Self::open_settings`]'s own
-    /// "capture once, not on every subsequent navigation" rule: a second file opened while one
-    /// is already showing must not overwrite the real original target with
-    /// `Self::code_focus_handle` itself (already focused at that point), which would make
-    /// [`Self::close_change_diff`] restore focus onto a surface that isn't even rendered anymore
-    /// instead of the real terminal pane it should return to. Always moves real focus onto
-    /// [`Self::code_focus_handle`] regardless - see that field's own docs for why.
+    /// Captures the pre-open focus target only on the closed-to-open transition
+    /// (`Self::open_change` was `None`) - a second file opened while one is already showing must
+    /// not overwrite the real original target with `Self::code_focus_handle` itself (already
+    /// focused by then). Always moves focus onto [`Self::code_focus_handle`] regardless.
     pub(super) fn focus_code_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.open_change.is_none() {
             self.code_focus.capture(window, &self.sessions, cx);
@@ -17,24 +21,15 @@ impl AdeApp {
         window.focus(&self.code_focus_handle, cx);
     }
 
-    /// Opens the command palette (⌘K) - `design_handoff_jerry_ade/README.md`'s "Command
-    /// palette" section: resets the query/scope/selection to a fresh "browse everything" state
-    /// (matching `Jerry.dc.html`'s own initial `state.scope === 'all'`, empty-query fixture)
-    /// and moves real keyboard focus onto it, so the very next keystroke reaches
-    /// [`Self::handle_palette_key_down`] rather than whatever had focus before. Captures
-    /// whatever real focus target and active session were in place beforehand into
-    /// [`Self::palette_focus`] (`OverlayFocus::capture`), so [`Self::close_palette`] can
-    /// restore focus correctly instead of leaving it dangling on
-    /// [`Self::palette_focus_handle`] once this element stops being rendered - see that field's
-    /// docs for the bug this fixes. Also disarms a pending rail prune confirmation
-    /// ([`Self::prune_confirm_armed`]'s docs): opening the palette is itself the kind of "did
-    /// something else" gesture that should require a fresh confirmation before a later "Prune
-    /// Worktrees" palette selection can execute.
+    /// Opens the command palette (⌘K): resets query/scope/selection to a fresh "browse
+    /// everything" state, captures the pre-open focus target into [`Self::palette_focus`], and
+    /// moves focus onto [`Self::palette_focus_handle`]. Also disarms a pending rail prune
+    /// confirmation ([`Self::prune_confirm_armed`]) - opening the palette counts as "did
+    /// something else".
     pub(super) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = true;
-        // See `Self::plus_menu_open`'s own docs: the tab strip's `+` menu is rendered as an
-        // unconditional sibling of the palette, so leaving it open here would paint it on top
-        // of (or under) a surface it no longer makes sense over.
+        // The tab strip's `+` menu is an unconditional sibling of the palette - see
+        // `Self::plus_menu_open`'s docs.
         self.plus_menu_open = false;
         self.palette_focus.capture(window, &self.sessions, cx);
         self.palette_scope = palette::PaletteScope::default();
@@ -45,37 +40,16 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Closes the palette overlay - the scrim click, `Esc`, and "run a result" real handlers.
-    /// Restores real keyboard focus rather than leaving `Window::focus` pointing at
-    /// [`Self::palette_focus_handle`], which stops being tracked by anything the moment this
-    /// panel stops rendering (see that field's docs, and [`restore_focus`]'s, for the bug this
-    /// fixes: without a restore, every action dispatch - including the very next ⌘K - falls
-    /// back to the root node instead of reaching [`Self::handle_toggle_palette_action`]).
-    ///
-    /// If the active session changed while the palette was open (e.g. a palette-run "New
-    /// Shell"/"New Claude Session"/"New Codex Session" swapped which session is active - see
-    /// [`Self::palette_focus`]'s docs), the captured pre-open handle is skipped in favor of the
-    /// *current* active session's terminal pane, since a captured handle from the session
-    /// that's no longer active would be exactly as untracked/stale as `palette_focus_handle`
-    /// itself. Otherwise, the captured handle is restored if there was one, falling back to the
-    /// active session's terminal pane if nothing was focused before (e.g. a completely fresh
-    /// window that had never been clicked into).
+    /// Closes the palette overlay (scrim click, Esc, or running a result) and restores focus via
+    /// [`restore_focus`].
     pub(super) fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = false;
         if self.settings_open {
-            // Settings is showing underneath the palette right now - either because
-            // `Self::execute_palette_command`'s `OpenSettings` branch just opened it
-            // (`Self::run_selected_palette_entry` always calls `close_palette` right after
-            // dispatching a command, regardless of which one), or because the palette (⌘K)
-            // happened to be opened *while Settings was already open* and is now just being
-            // dismissed back down to it. Either way the correct real focus target is
-            // [`Self::settings_focus_handle`] - the same handle `Self::open_settings` itself
-            // moves focus onto - never `Self::palette_focus`/the active session's terminal
-            // pane: restoring either of those would either fight `open_settings`'s own focus
-            // move (the first case) or move focus onto a surface that isn't even being rendered
-            // anymore, since the Settings surface still replaces the three zones (the second
-            // case) - both exactly the "`Window::focus` left pointing at an untracked handle"
-            // bug class `restore_focus`'s own docs describe.
+            // Settings is showing underneath (either `OpenSettings` just opened it, or the
+            // palette was opened while Settings was already open and is now dismissing back
+            // down to it) - focus belongs on `settings_focus_handle`, the same handle
+            // `open_settings` itself uses, not on `palette_focus`'s restore target or the
+            // active session's pane (neither is actually rendered right now).
             window.focus(&self.settings_focus_handle, cx);
             self.palette_focus.clear();
             cx.notify();
@@ -85,28 +59,15 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Opens the Settings surface (`design_handoff_jerry_ade/README.md`'s "Settings" section) -
-    /// mirrors [`Self::open_palette`]'s exact real-focus-capture shape: captures whatever real
-    /// focus target and active session were in place beforehand into [`Self::settings_focus`]
-    /// (`OverlayFocus::capture`), so [`Self::close_settings`] can restore correctly instead of
-    /// leaving `Window::focus` dangling on [`Self::settings_focus_handle`] once the surface
-    /// stops rendering - see [`Self::palette_focus`]'s docs for the exact bug this class of fix
-    /// addresses.
-    ///
-    /// Unlike [`Self::open_palette`], this does **not** reset [`Self::settings_page`] - which
-    /// page was showing persists across opens, matching ordinary settings-window UX (the
-    /// palette's query/scope reset because it's a transient search, not a navigation history).
-    /// Also disarms a pending rail prune confirmation, for the same reason `open_palette` does.
-    ///
-    /// If the palette happens to be open at the same time (e.g. the raw `secondary-,` keybinding
-    /// fired while `secondary-k` was still showing), it's closed first via [`Self::close_palette`] -
-    /// run while [`Self::settings_open`] is still `false`, so that call takes its own normal,
-    /// non-Settings-aware restore path - rather than leaving both overlays stacked at once.
+    /// Opens the Settings surface - same capture-and-focus shape as [`Self::open_palette`].
+    /// Unlike the palette, this does **not** reset [`Self::settings_page`]: which page was
+    /// showing persists across opens, matching ordinary settings-window UX. Closes the palette
+    /// first (via [`Self::close_palette`], run while `settings_open` is still `false` so that
+    /// call takes its normal, non-Settings-aware restore path) if it happened to be open too.
     pub(super) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette_open {
             self.close_palette(window, cx);
         }
-        // See `Self::open_palette`'s identical guard, and `Self::plus_menu_open`'s own docs.
         self.plus_menu_open = false;
         self.settings_open = true;
         self.settings_focus.capture(window, &self.sessions, cx);
@@ -117,10 +78,8 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Closes the Settings surface - the nav header's `esc` keycap, real `Esc` key handling
-    /// (`Self::handle_settings_key_down`), and (in the palette-focus test module, matching
-    /// `close_palette`'s own test coverage) direct calls. Restores real keyboard focus the same
-    /// way [`Self::close_palette`] does, and for the same documented reason.
+    /// Closes the Settings surface (the nav header's Esc keycap, or a real Esc keystroke via
+    /// [`Self::handle_settings_key_down`]) and restores focus via [`restore_focus`].
     pub(super) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = false;
         restore_focus(&self.sessions, &mut self.settings_focus, window, cx);
@@ -128,35 +87,20 @@ impl AdeApp {
     }
 }
 
-/// Real, interactive regression coverage for the palette's own ⌘K entry point, driven through
-/// GPUI's actual `TestAppContext`/`VisualTestContext` harness (a real window, real focus
-/// tracking, real action dispatch and keystroke simulation - not a mock of any of those). A
-/// plain unit test can't catch this bug class: the bug was `Window::focus` being left pointing
-/// at a `FocusHandle` no element tracks anymore, which only a real window with real GPUI
-/// dispatch can actually reproduce or verify fixed.
+/// Interactive regression coverage for the palette's ⌘K entry point, driven through GPUI's
+/// `TestAppContext`/`VisualTestContext` harness (a real window, focus tracking, action dispatch
+/// and keystroke simulation). A plain unit test can't catch this bug class: it requires a real
+/// window with real GPUI dispatch to reproduce a dangling `Window::focus`.
 #[cfg(test)]
 pub(in crate::root) mod palette_focus_tests {
     use super::*;
     use gpui::{Entity, TestAppContext};
 
-    /// Opens a real `AdeApp` in a real (test) GPUI window against a throwaway temp directory.
-    /// Not a real git repo, so `wt_core::list_worktrees`/`diff_against_base` genuinely fail and
-    /// leave `worktrees`/`diff_state` empty/errored - exactly like pointing the app at some
-    /// non-repo directory would in production, and irrelevant to what these tests check.
-    /// `AdeApp::new` still spawns one real shell session regardless (see that method's docs),
-    /// which is exactly the terminal pane these tests check ⌘K's focus-restore behavior
-    /// against.
-    ///
-    /// `pub(in crate::root)` rather than private: `settings_focus_tests` (a sibling test module,
-    /// not a child of this one) reuses this exact same real-window setup for its own Settings
-    /// lifecycle coverage, rather than maintaining a second, separately-written copy that could
-    /// drift - as do several test modules in other `crate::root` submodules (`code_surface`,
-    /// `lsp`, `merge_flow`) covering cross-cutting focus regressions in their own areas.
-    ///
-    /// Uses `AdeApp::new_with_settings` (real, in-memory-only `Settings::default()`, `None`
-    /// settings path), not `AdeApp::new` - see that method's own docs for why: `AdeApp::new`
-    /// really does read and write `~/.config/jerry/settings.toml` on whatever real machine
-    /// calls it, which must never be the machine running `cargo test`.
+    /// Opens an `AdeApp` in a test GPUI window against a throwaway temp directory (not a real
+    /// git repo, so `worktrees`/`diff_state` end up empty/errored - irrelevant to what these
+    /// tests check). `pub(in crate::root)` since `settings_focus_tests` and others reuse this
+    /// same setup. Uses `AdeApp::new_with_settings` (in-memory `Settings::default()`, `None`
+    /// path), not `AdeApp::new`, so tests never read or write a real `settings.toml`.
     pub(in crate::root) fn open_test_app(
         cx: &mut TestAppContext,
         repo_path: PathBuf,
@@ -172,12 +116,10 @@ pub(in crate::root) mod palette_focus_tests {
         })
     }
 
-    /// The bug this guards against, exactly as measured: closing the palette used to leave
-    /// `Window::focus` pointing at `palette_focus_handle`, which stops being tracked by
-    /// anything the instant the palette panel stops rendering. Every action dispatch after that
-    /// - including the very next ⌘K - fell back to the root node, which has no
-    /// `on_action(handle_toggle_palette_action)` of its own, so the palette could never be
-    /// reopened without the user manually clicking something first to re-establish real focus.
+    /// Without a focus restore in `close_palette`, `Window::focus` stayed on the untracked
+    /// `palette_focus_handle` and every action dispatch after that - including the next ⌘K -
+    /// fell back to the dispatch root, so the palette could never be reopened without a manual
+    /// click first.
     #[gpui::test]
     fn toggle_palette_reopens_after_being_closed(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -204,10 +146,8 @@ pub(in crate::root) mod palette_focus_tests {
         );
     }
 
-    /// The other half of the same bug: a completely fresh window starts with `Window::focus ==
-    /// None` (nothing focused until the user clicks something), so without `AdeApp::new` giving
-    /// the initial session's terminal pane real focus up front, the very first secondary-k - before
-    /// any click has ever happened - would also silently do nothing.
+    /// A fresh window starts with `Window::focus == None` - without `AdeApp::new` giving the
+    /// initial session's pane focus up front, the very first ⌘K would silently do nothing.
     #[gpui::test]
     fn toggle_palette_works_on_a_fresh_window_with_nothing_clicked_yet(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -222,13 +162,9 @@ pub(in crate::root) mod palette_focus_tests {
         );
     }
 
-    /// Spawning a session from the palette (e.g. "New Shell") swaps the active session, and the
-    /// centre pane only ever renders `sessions.active()` - so a captured pre-open focus handle
-    /// belonging to the *previous* active session's terminal pane would be exactly as
-    /// untracked/stale as `palette_focus_handle` itself once that swap happens. Verifies
-    /// `close_palette` correctly detects the active-session change and focuses the *new*
-    /// session's pane instead of the stale captured one, by confirming the keyboard is left
-    /// live enough for a subsequent secondary-k to still work.
+    /// Spawning a session from the palette swaps the active session; verifies `close_palette`
+    /// focuses the *new* session's pane instead of the stale captured handle (see
+    /// [`OverlayFocus`]'s `opened_session` field).
     #[gpui::test]
     fn toggle_palette_still_works_after_a_palette_spawned_new_shell(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -297,26 +233,15 @@ pub(in crate::root) mod palette_focus_tests {
         });
     }
 
-    /// The exact regression test gap the real, live-reproduced `"cmd-k"` bug slipped through:
-    /// every other test in this module (and `settings_focus_tests`/`code_focus_tests`) dispatches
-    /// [`TogglePalette`] directly via `cx.dispatch_action`, which exercises the action handler but
-    /// never the real keystroke-to-action resolution `crate::default_key_bindings`'s `KeyBinding`s
-    /// perform - so a wrong keystroke spec (`"cmd-k"`, which GPUI resolves to the Super/Windows
-    /// key on Linux, not Ctrl - verified against `vendor/zed/crates/gpui/src/platform/
-    /// keystroke.rs`'s own `Keystroke::parse`) could ship with every action-dispatch test green.
-    ///
-    /// This test instead does what a real user does: binds the crate's real, production
-    /// `default_key_bindings()` list (not a hand-picked subset) onto this real test window via
-    /// the real `App::bind_keys` (`vendor/zed/crates/gpui/src/app.rs:2130`), then simulates the
-    /// real keystroke via `VisualTestContext::simulate_keystrokes`
-    /// (`vendor/zed/crates/gpui/src/app/test_context.rs:794`, the same real API
-    /// `settings_focus_tests` already uses for `"escape"`) - never `dispatch_action`. The
-    /// simulated string tracks the real per-OS resolution of GPUI's `"secondary"` keystroke alias
-    /// (`cfg!(target_os = "macos")`, the same real compile-time fact
-    /// `crate::keymap::detected_platform_is_macos` resolves for rendering) rather than hardcoding
-    /// `"ctrl-k"`, so this test proves the real binding is correct on whatever OS actually runs
-    /// it - on this Linux dev sandbox that resolves to exactly `"ctrl-k"`, the literal keystroke
-    /// the audit reproduced failing (silently doing nothing) against the old `"cmd-k"` binding.
+    /// Unlike every other test in this module, which dispatches `TogglePalette` directly, this
+    /// binds `crate::default_key_bindings()` via `App::bind_keys`
+    /// (`vendor/zed/crates/gpui/src/app.rs:2130`) and simulates the real keystroke via
+    /// `VisualTestContext::simulate_keystrokes` (`vendor/zed/crates/gpui/src/app/
+    /// test_context.rs:794`) - so a wrong keystroke spec in `default_key_bindings` (e.g. `cmd-k`,
+    /// which GPUI resolves to Super/Windows on Linux, never Ctrl) fails this test even though a
+    /// direct `dispatch_action` test would stay green. `secondary_k` tracks the same
+    /// `cfg!(target_os = "macos")` resolution `default_key_bindings` itself uses, rather than
+    /// hardcoding `ctrl-k`.
     #[gpui::test]
     fn secondary_keystroke_opens_the_palette_through_the_real_key_bindings(
         cx: &mut TestAppContext,
@@ -342,15 +267,12 @@ pub(in crate::root) mod palette_focus_tests {
     }
 }
 
-/// Real, interactive regression coverage for Revision R4a's new global keybindings (`ctrl-shift-
-/// T`, `secondary-shift-n`, `secondary-p`, `]`, `secondary-1`..`secondary-8`) - the exact same
-/// real `cx.bind_keys(crate::default_key_bindings())` + `cx.simulate_keystrokes(..)` shape
-/// [`palette_focus_tests::secondary_keystroke_opens_the_palette_through_the_real_key_bindings`]
-/// established in Revision R2 for exactly this reason: a test that only calls
-/// `cx.dispatch_action(..)` directly proves the *handler* works, never that the real, literal
-/// keystroke string in `crate::default_key_bindings` actually resolves to that action - which is
-/// exactly the class of bug R2's own `"cmd-k"` incident shipped with a fully green, dispatch-only
-/// test suite.
+/// Regression coverage for the tab strip's global keybindings (`ctrl-shift-T`,
+/// `secondary-shift-n`, `]`, `secondary-1`..`secondary-8`), using the same
+/// `bind_keys`-plus-`simulate_keystrokes` shape as
+/// [`palette_focus_tests::secondary_keystroke_opens_the_palette_through_the_real_key_bindings`] -
+/// a test that only dispatches the action directly can't catch a wrong keystroke string in
+/// `crate::default_key_bindings`.
 #[cfg(test)]
 mod tab_strip_keybinding_tests {
     use super::*;
@@ -400,9 +322,9 @@ mod tab_strip_keybinding_tests {
         );
     }
 
-    /// `ctrl-shift-T` is a real, literal Ctrl combo on every OS (not `secondary`-aliased - see
-    /// `crate::default_key_bindings`'s own docs for why) - simulated literally here rather than
-    /// branching on `cfg!(target_os = "macos")` the way the `secondary-` bindings' own tests do.
+    /// `ctrl-shift-T` is a literal Ctrl combo on every OS, not `secondary`-aliased (see
+    /// `crate::default_key_bindings`), so it's simulated literally rather than branching on
+    /// `cfg!(target_os = "macos")`.
     #[gpui::test]
     fn ctrl_shift_t_spawns_a_real_shell_session_through_the_real_key_bindings(
         cx: &mut TestAppContext,
@@ -466,19 +388,11 @@ mod tab_strip_keybinding_tests {
         );
     }
 
-    /// The mirror-image regression the audit specifically called out as missing: the `+` menu's
-    /// "Open file…" row used to be backed by a real global `secondary-p` binding - removed (see
-    /// `crate::default_key_bindings`'s own docs) once audit found it silently ate a real,
-    /// standard readline control byte (Ctrl+P, `0x10`, "previous history") out of every focused
-    /// terminal session on Linux/Windows, since GPUI dispatches a matched, registered
-    /// `KeyBinding`'s action *before* a focused element's own `on_key_down`. With no real
-    /// binding registered for it anymore, a real, simulated `ctrl-p` keystroke - with the
-    /// window's real initial terminal pane focused, exactly like a completely ordinary "browsing
-    /// the terminal" moment - must not open the palette at all; it should be free to reach the
-    /// focused terminal as literal input instead. This test only proves the palette didn't open
-    /// (the state-level half of the same two-part proof `bracket_does_not_fire_globally_while_a_
-    /// terminal_is_focused` uses for `]`); `terminal_pane`'s own `keystroke_tests` module covers
-    /// the real pty-forwarding half (`ctrl-p` really does map to the real `0x10` control byte).
+    /// The `+` menu's "Open file…" row has no global `secondary-p` binding (see
+    /// `crate::default_key_bindings`'s docs: GPUI dispatches a matched `KeyBinding` before a
+    /// focused element's own `on_key_down`, so a global binding would swallow readline's Ctrl+P
+    /// out of every focused terminal). This only proves the palette didn't open;
+    /// `terminal_pane`'s `keystroke_tests` covers the pty-forwarding half.
     #[gpui::test]
     fn ctrl_p_does_not_open_the_palette_while_a_terminal_is_focused(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -514,14 +428,10 @@ mod tab_strip_keybinding_tests {
         }
     }
 
-    /// CRITICAL regression test, the exact sequence the audit reproduced live: open a file tab
-    /// (so `AdeApp::open_change` is `Some` and `Self::render_center_pane` is showing that file,
-    /// not any session's `TerminalPane`), press `ctrl-shift-t` (`NewTerminal`, which spawns a new
-    /// session), then confirm `ctrl-k` still opens the palette. Before the fix,
-    /// `Sessions::spawn` unconditionally moved `Window::focus` onto the freshly spawned
-    /// session's own pane even though it wasn't rendered anywhere that frame, leaving
-    /// `Window::focus` pointing at a node with no `on_action` handlers above it - silently
-    /// killing every bound shortcut, `ctrl-k` included, until the next click.
+    /// With a file tab active (so `render_center_pane` shows the file, not any session's pane),
+    /// spawning a new session via `ctrl-shift-t` must not leave `Window::focus` on a pane that
+    /// isn't rendered anywhere that frame - `Sessions::spawn` used to move focus there
+    /// unconditionally, silently killing every bound shortcut until the next click.
     #[gpui::test]
     fn ctrl_k_still_works_after_ctrl_shift_t_with_a_file_tab_active(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -556,11 +466,9 @@ mod tab_strip_keybinding_tests {
         );
     }
 
-    /// CRITICAL regression test for the identical gap in `Sessions::close`: closing the *active*
-    /// session's tab (the tab strip's own `×`, exercised here via `AdeApp::close_session`, its
-    /// real handler) picks a new active session but, before the fix, never moved real keyboard
-    /// focus onto it - leaving `ctrl-k` dead afterward exactly like the `Sessions::spawn` gap
-    /// above.
+    /// The identical gap in `Sessions::close`: closing the active session's tab picks a new
+    /// active session but must also move focus onto it, or every bound shortcut dies until the
+    /// next click.
     #[gpui::test]
     fn ctrl_k_still_works_after_closing_the_active_session_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -603,9 +511,8 @@ mod tab_strip_keybinding_tests {
         );
     }
 
-    /// The other real, live reproduction path the audit found for the same `Sessions::close`
-    /// gap: archiving the active session from the rail (`AdeApp::archive_session`, which
-    /// delegates to `Self::close_session`).
+    /// The other path to the same `Sessions::close` gap: archiving the active session from the
+    /// rail (`AdeApp::archive_session`, which delegates to `Self::close_session`).
     #[gpui::test]
     fn ctrl_k_still_works_after_archiving_the_active_session(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -668,15 +575,10 @@ mod tab_strip_keybinding_tests {
     fn bracket_advances_to_the_next_changed_file_through_the_real_key_bindings(
         cx: &mut TestAppContext,
     ) {
-        // `]` is deliberately scoped to `Some("diff")` (`crate::default_key_bindings`'s own
-        // docs), not global - real, live-verified against GPUI's own dispatch order: a *global*
-        // bare `]` binding would silently swallow a literal `]` typed into any focused terminal/
-        // agent session (closing a bracket, an array literal, ...) instead of forwarding it to
-        // the real pty, since GPUI dispatches a matched action *before* a focused element's own
-        // `on_key_down`. This test therefore first opens a real file (establishing real
-        // `"diff"`-context focus, via `AdeApp::open_change_diff`) before simulating the
-        // keystroke - proving the real, scoped binding still works from the surface it's meant
-        // to, not that it works from literally anywhere.
+        // `]` is scoped to `Some("diff")` (`crate::default_key_bindings`), not global - a global
+        // bare `]` would swallow a literal `]` typed into any focused terminal instead of
+        // forwarding it to the pty. This opens a file first (`AdeApp::open_change_diff`) to
+        // establish "diff"-context focus before simulating the keystroke.
         let repo = tempfile::tempdir().expect("tempdir");
         git(repo.path(), &["init", "-b", "main"]);
         git(repo.path(), &["config", "user.email", "test@example.com"]);
@@ -722,20 +624,11 @@ mod tab_strip_keybinding_tests {
         );
     }
 
-    /// The other real half of the scoping above: with *no* file tab focused (only the initial
-    /// session's terminal pane, as in a completely ordinary "browsing the terminal" moment), a
-    /// real `]` keystroke must **not** reach [`NextChangedFile`] at all - it should be a real
-    /// no-op at the dispatch level, leaving the keystroke free to reach the focused terminal
-    /// instead (this test only proves the state didn't change; `terminal_pane`'s own
-    /// `keystroke_tests` module covers the pty-forwarding half separately).
-    ///
-    /// Asserts a real diff with at least one file actually loaded before checking the negative
-    /// keystroke behavior - a hardening fix so this test can't silently go vacuous: without it,
-    /// a future change to the test fixture that stopped producing a real diff (e.g. a git config
-    /// or branch-detection regression) would leave `open_change` at `None` before *and* after the
-    /// `]` keystroke for a completely different, uninteresting reason - there being nothing to
-    /// navigate to at all - and this test would keep passing trivially forever without ever
-    /// exercising the real scoping it claims to.
+    /// The other half of the scoping above: with no file tab focused, `]` must not reach
+    /// [`NextChangedFile`] at all (`terminal_pane`'s `keystroke_tests` covers the pty-forwarding
+    /// half). Asserts a diff with at least one file actually loaded first, so this can't go
+    /// vacuous if the fixture ever stops producing a diff - `open_change` would stay `None`
+    /// before and after `]` for an uninteresting reason instead of proving the scoping works.
     #[gpui::test]
     fn bracket_does_not_fire_globally_while_a_terminal_is_focused(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -869,26 +762,20 @@ mod tab_strip_keybinding_tests {
     }
 }
 
-/// Real, interactive regression coverage for the Settings surface's own lifecycle - the same
-/// bug class `palette_focus_tests` exists to catch (a `Window::focus` handle left dangling
-/// after an element stops rendering), now exercised against the Settings surface instead of
-/// the palette overlay. Settings is a bigger risk for exactly this bug than the palette was:
-/// it *replaces* the whole three-zone body (see [`AdeApp::render_workspace_body`]'s docs)
-/// rather than drawing on top of it, so a broken focus restore here would leave every bound
-/// action (⌘N, ⌘K, ⌘,) unreachable, not just ⌘K.
+/// Regression coverage for the Settings surface's lifecycle - the same dangling-focus bug class
+/// `palette_focus_tests` covers, exercised against Settings instead. Settings is a bigger risk
+/// for it than the palette: it *replaces* the whole three-zone body
+/// ([`AdeApp::render_workspace_body`]) rather than drawing on top of it, so a broken restore
+/// here leaves every bound action unreachable, not just one.
 #[cfg(test)]
 mod settings_focus_tests {
     use super::*;
     use gpui::TestAppContext;
 
-    /// `secondary-,` opens Settings, real `Esc` (simulated as an actual keystroke via `VisualTestContext::
-    /// simulate_keystrokes` - `vendor/zed/crates/editor/src/edit_prediction_tests.rs`'s own
-    /// `cx.simulate_keystroke("escape")` on `TestAppContext` is the verified real precedent
-    /// that GPUI's keystroke parser accepts the lowercase string `"escape"` for this key)
-    /// closes it, and a subsequent `secondary-k` still reaches
-    /// [`AdeApp::handle_toggle_palette_action`] - which it only can if closing Settings left
-    /// real, live focus somewhere `dispatch_action` can find, not dangling on
-    /// [`AdeApp::settings_focus_handle`].
+    /// `secondary-,` opens Settings, a real Esc keystroke (`VisualTestContext::
+    /// simulate_keystrokes("escape")`, the same lowercase-string precedent
+    /// `vendor/zed/crates/editor/src/edit_prediction_tests.rs` uses) closes it, and a
+    /// subsequent `secondary-k` still reaches [`AdeApp::handle_toggle_palette_action`].
     #[gpui::test]
     fn toggle_settings_action_opens_then_real_escape_closes_it_and_focus_stays_live(
         cx: &mut TestAppContext,
@@ -919,11 +806,9 @@ mod settings_focus_tests {
         );
     }
 
-    /// `secondary-,` works from a completely fresh window (nothing manually clicked into yet) - the
-    /// same "no click has established real focus" case `palette_focus_tests::
-    /// toggle_palette_works_on_a_fresh_window_with_nothing_clicked_yet` covers for the palette,
-    /// here for Settings. Relies on the same real fix (`AdeApp::new` focusing the initial
-    /// session's terminal pane up front) that test's own docs describe.
+    /// `secondary-,` works from a fresh window with nothing clicked yet - same case as
+    /// `palette_focus_tests::toggle_palette_works_on_a_fresh_window_with_nothing_clicked_yet`,
+    /// here for Settings.
     #[gpui::test]
     fn toggle_settings_works_on_a_fresh_window_with_nothing_clicked_yet(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -937,20 +822,12 @@ mod settings_focus_tests {
         );
     }
 
-    /// The comma-leak half of the real, live-reproduced `"cmd-k"`-class bug (see
-    /// `crate::default_key_bindings`'s own docs): with the old `"cmd-,"` binding, `Ctrl+,` was
-    /// never recognized as a keystroke matching any real `KeyBinding` at all (`"cmd"`/`"super"`/
-    /// `"win"` only ever mean the platform/Super modifier, never Ctrl, on Linux), so the
-    /// keystroke fell all the way through GPUI's dispatch tree to whatever plain text input had
-    /// real keyboard focus - a live terminal session in this app's case - and got typed into it
-    /// as a literal `,` character instead of ever reaching [`AdeApp::handle_toggle_settings_action`].
-    ///
-    /// This test proves the fix the same real way `palette_focus_tests::
-    /// secondary_keystroke_opens_the_palette_through_the_real_key_bindings` proves ⌘K's: binds
-    /// the crate's real `default_key_bindings()` and simulates the real keystroke (never
-    /// `dispatch_action`), so it fails the same way the live bug did if the binding regresses -
-    /// unlike every other test in this module, which dispatches [`ToggleSettings`] directly and
-    /// so could never have caught this.
+    /// With the old `"cmd-,"` binding, `Ctrl+,` was never recognized as matching any
+    /// `KeyBinding` (`"cmd"`/`"super"`/`"win"` only ever mean the platform modifier, never Ctrl,
+    /// on Linux - `vendor/zed/crates/gpui/src/platform/keystroke.rs`), so the keystroke fell
+    /// through to whatever text input had focus and got typed as a literal `,`. This test binds
+    /// `default_key_bindings()` and simulates the real keystroke, unlike every other test in
+    /// this module which dispatches `ToggleSettings` directly and so couldn't catch this.
     #[gpui::test]
     fn secondary_comma_keystroke_opens_settings_through_the_real_key_bindings(
         cx: &mut TestAppContext,
@@ -976,12 +853,9 @@ mod settings_focus_tests {
         );
     }
 
-    /// The orchestrator-visible proof that closing Settings genuinely "returns to the
-    /// workspace" with real state intact, per `design_handoff_jerry_ade/README.md`'s "esc ...
-    /// returns to the workspace": a session tab opened *before* Settings was ever shown is
-    /// still there, and still the active tab, after a real open/close round-trip - Settings
-    /// swapping out `AdeApp::render_workspace_body` (see that method's docs) never tore down
-    /// or mutated `AdeApp::sessions` itself, only which body `Render::render` draws.
+    /// A session tab opened before Settings was shown is still there, and still active, after an
+    /// open/close round-trip - Settings swaps which body `Render::render` draws
+    /// ([`AdeApp::render_workspace_body`]) without touching `AdeApp::sessions` itself.
     #[gpui::test]
     fn closing_settings_leaves_open_session_tabs_intact(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1013,10 +887,8 @@ mod settings_focus_tests {
         );
     }
 
-    /// Selecting a nav page is real, live `AdeApp` state - covers the "nav-page-switching"
-    /// focus/lifecycle risk the orchestrator flagged alongside Esc-to-close, verifying a page
-    /// switch survives (and doesn't reset) across a Settings close/reopen, matching
-    /// `AdeApp::open_settings`'s own documented "does not reset settings_page" contract.
+    /// A page switch survives a Settings close/reopen, matching `AdeApp::open_settings`'s "does
+    /// not reset settings_page" contract.
     #[gpui::test]
     fn settings_page_selection_persists_across_a_close_and_reopen(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1044,10 +916,8 @@ mod settings_focus_tests {
         );
     }
 
-    /// The palette's real `Open Settings` command (`palette::PaletteCommand::OpenSettings`)
-    /// actually opens Settings and leaves real, live focus on it - not on a stale palette
-    /// handle - covers `AdeApp::close_palette`'s Settings-aware branch (see its docs) via the
-    /// exact real dispatch path a user typing "settings" into ⌘K and hitting `⏎` would take.
+    /// The palette's `Open Settings` command opens Settings and leaves focus on it, not a stale
+    /// palette handle - covers `AdeApp::close_palette`'s Settings-aware branch.
     #[gpui::test]
     fn open_settings_palette_command_leaves_real_focus_on_settings(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1057,11 +927,8 @@ mod settings_focus_tests {
         app.update_in(cx, |app, window, cx| {
             app.execute_palette_command(palette::PaletteCommand::OpenSettings, window, cx);
         });
-        // Mirrors `palette_focus_tests::
-        // toggle_palette_still_works_after_a_palette_spawned_new_shell`'s own comment:
-        // `execute_palette_command` alone doesn't close the palette - that's
-        // `run_selected_palette_entry`'s job - so close it the same way Escape does, to reach
-        // the exact real `close_palette` code path this test targets.
+        // `execute_palette_command` alone doesn't close the palette (`run_selected_palette_entry`
+        // does), so close it explicitly to reach the `close_palette` path under test.
         app.update_in(cx, |app, window, cx| {
             app.close_palette(window, cx);
         });
@@ -1084,14 +951,9 @@ mod settings_focus_tests {
         );
     }
 
-    /// The real regression this module exists to catch for [`AdeApp::load_agent_rows`]: opening
-    /// Settings must actually populate [`AdeApp::agent_rows`] from a real `$PATH` search, not
-    /// leave it permanently empty now that the search moved off the render path and onto
-    /// `cx.spawn`/`cx.background_executor()` (see that method's docs for why - a real ~30ms
-    /// `$PATH` walk for a not-found binary, previously paid inline in `render()` on every
-    /// frame). `cx.run_until_parked()` is what actually drives the spawned background task (and
-    /// its `this.update` write-back) to completion in this deterministic test executor - without
-    /// it, the assertion below would race the still-in-flight task and could flake.
+    /// Opening Settings must populate [`AdeApp::agent_rows`] from the background `$PATH` search
+    /// (see [`AdeApp::load_agent_rows`]) rather than leave it empty. `run_until_parked` drives
+    /// the spawned task to completion; without it this would race the still-in-flight search.
     #[gpui::test]
     fn opening_settings_populates_real_agent_rows_from_a_background_path_search(
         cx: &mut TestAppContext,
@@ -1124,8 +986,7 @@ mod settings_focus_tests {
         }
     }
 
-    /// Mirrors the Agents-page test above, for [`AdeApp::lsp_rows`]
-    /// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3 "Language servers" page).
+    /// Mirrors the Agents-page test above, for [`AdeApp::lsp_rows`] (the Language servers page).
     #[gpui::test]
     fn opening_settings_populates_real_lsp_rows_from_a_background_path_search(
         cx: &mut TestAppContext,
@@ -1145,8 +1006,6 @@ mod settings_focus_tests {
         }
     }
 
-    /// `design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3: "Default page is now
-    /// General (was Agents)."
     #[gpui::test]
     fn settings_opens_to_general_by_default_on_a_fresh_window(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1160,13 +1019,10 @@ mod settings_focus_tests {
         );
     }
 
-    /// A real, whole-surface render smoke test: every real page in `SettingsPage::ALL` -
-    /// General/Agents/Worktrees/Appearance/Theme/Keymap's real content and every nav-only
-    /// page's honest placeholder alike - must actually render without panicking. Selecting a
-    /// page and running the real GPUI test executor to a parked, fully-drawn state
-    /// (`cx.run_until_parked`) is what actually exercises `AdeApp::render_settings_content`'s
-    /// real per-page render call, not just the pure state transition `select_settings_page`
-    /// itself performs.
+    /// Every page in `SettingsPage::ALL` must render without panicking. Running the test
+    /// executor to a parked state (`cx.run_until_parked`) is what actually exercises
+    /// `AdeApp::render_settings_content`'s per-page render, not just the state transition
+    /// `select_settings_page` performs.
     #[gpui::test]
     fn every_settings_page_renders_without_panicking(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1189,13 +1045,11 @@ mod settings_focus_tests {
         }
     }
 
-    /// `design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3: `Window controls` on the
-    /// General page is "wired live to change 1" - the real title-bar/keycap override, not a
-    /// decorative row. `AdeApp::set_window_controls_style` is the exact method the General
-    /// page's real choice-row click handler calls (`crate::root::settings_render::
-    /// render_settings_general_page`) - the same real, single source of truth
-    /// `root::title_bar::caption_button_tests::clicking_the_close_caption_button_closes_the_real_window`
-    /// already proves actually changes which title-bar variant renders.
+    /// The General page's `Window controls` row is wired live, not decorative:
+    /// `AdeApp::set_window_controls_style` is the method its click handler
+    /// (`crate::root::settings_render::render_settings_general_page`) calls - the same accessor
+    /// `root::title_bar::caption_button_tests` proves actually changes which title-bar variant
+    /// renders.
     #[gpui::test]
     fn window_controls_style_change_updates_the_real_persisted_settings_field(
         cx: &mut TestAppContext,
@@ -1225,15 +1079,10 @@ mod settings_focus_tests {
     }
 }
 
-/// Real, interactive regression coverage for the third real occurrence of the exact bug class
-/// [`palette_focus_tests`]/[`settings_focus_tests`]'s own docs describe - `Window::focus` left
-/// dangling on a `FocusHandle` that stops being tracked once its own element stops rendering -
-/// this time for Surface C's Diff/File view (`AdeApp::code_focus_handle`'s own docs).
-/// `AdeApp::render_center_pane` early-returns before ever rendering the active session's own
-/// terminal pane (the previously-focused node in every one of these tests) once `AdeApp::
-/// open_change` becomes `Some` - reproduced here with a plain `.txt` file, deliberately no `.rs`/
-/// LSP content involved at all, matching exactly how this bug was actually found: it has nothing
-/// to do with hover/go-to-definition, only with a file view being mounted at all.
+/// The same dangling-focus bug class as `palette_focus_tests`/`settings_focus_tests`, this time
+/// for Surface C's Diff/File view (`AdeApp::code_focus_handle`). Uses a plain `.txt` file
+/// deliberately - the bug is about a file view being mounted at all, not about hover/
+/// go-to-definition/LSP content.
 #[cfg(test)]
 mod code_focus_tests {
     use super::*;
@@ -1309,20 +1158,14 @@ mod code_focus_tests {
         assert_eq!(app.read_with(cx, |app, _| app.hover.clone()), None);
         cx.dispatch_action(GotoDefinition);
         cx.run_until_parked();
-        // `handle_goto_definition_action`'s only real effect with `hover == None` (a plain .txt
-        // file has no real hover entry at all - it isn't even a `.rs` file) is a harmless early
-        // return inside `trigger_goto_definition`, the same real proof technique
-        // `lsp_hover_wiring_tests::f12_action_reaches_the_real_handler_on_a_fresh_window` already
-        // establishes - what's actually under test here is that dispatch reached the handler at
-        // all with a File view open, not the no-op it did once there.
+        // `handle_goto_definition_action` only has a harmless early return with `hover == None`
+        // (a .txt file has no hover entry) - what's under test is that dispatch reached the
+        // handler at all with a File view open, not what it did once there.
         assert_eq!(app.read_with(cx, |app, _| app.hover.clone()), None);
     }
 
-    /// Closing the File view (the surface's own real `× close` affordance,
-    /// [`AdeApp::close_change_diff`]) must restore real, live focus back onto the active
-    /// session's terminal pane - not leave it dangling on [`AdeApp::code_focus_handle`], which
-    /// stops being rendered the instant [`AdeApp::open_change`] goes back to `None` - so every
-    /// bound action keeps working afterward too.
+    /// Closing the File view ([`AdeApp::close_change_diff`]) must restore focus onto the active
+    /// session's pane, not leave it dangling on [`AdeApp::code_focus_handle`].
     #[gpui::test]
     fn closing_the_file_view_restores_real_focus_and_actions_keep_working(cx: &mut TestAppContext) {
         let (app, cx, file_path) = open_test_app_with_a_plain_text_file(cx);

@@ -1,26 +1,23 @@
 //! Maps `wt-core`'s [`wt_core::WorktreeResult`] list into a UI-friendly, GPUI-independent
 //! shape for the left sidebar. Kept separate from the rendering code so the mapping logic
-//! (label derivation, error surfacing) can be unit tested without a GPUI window.
+//! is unit-testable without a GPUI window.
 
 use std::path::{Path, PathBuf};
 
 /// One row in the worktree sidebar: either a successfully-read worktree, or a note that one
-/// entry couldn't be read (kept in the list, rather than silently dropped, so a single
-/// unreadable worktree doesn't make the others disappear along with it).
+/// entry couldn't be read (kept in the list rather than dropped, so one bad entry doesn't
+/// hide the others).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeItem {
-    /// Absolute path to the worktree, used both as the row's unique id and as the
-    /// directory a selected worktree's terminal/file tree operate on.
+    /// Also the directory a selected worktree's terminal/file tree operate on.
     pub path: PathBuf,
-    /// Short label shown in the sidebar: the branch name if known, otherwise the
-    /// worktree's directory name, otherwise the full path as a last resort.
+    /// The branch name if known, otherwise the directory name, otherwise the full path.
     pub label: String,
     pub branch: Option<String>,
     pub is_main: bool,
     pub is_locked: bool,
     /// `Some` if this entry could not be fully read (mirrors `wt_core::WorktreeResult`'s
-    /// per-entry `Err`); the row is still shown so the problem is visible rather than the
-    /// entry silently vanishing from the list.
+    /// per-entry `Err`).
     pub error: Option<String>,
 }
 
@@ -35,9 +32,8 @@ fn label_for(path: &Path, branch: &Option<String>) -> String {
 }
 
 /// Converts `wt-core`'s raw per-worktree results into display rows. A worktree whose
-/// metadata failed to read (`Err` in the source list) becomes a row with `error: Some(..)`
-/// and a best-effort label of "(unreadable worktree)", rather than being dropped: the
-/// sidebar should reflect exactly what `list_worktrees` returned, problems included.
+/// metadata failed to read becomes a row with `error: Some(..)` and label
+/// "(unreadable worktree)", rather than being dropped.
 pub fn build_worktree_items(results: Vec<wt_core::WorktreeResult>) -> Vec<WorktreeItem> {
     results
         .into_iter()
@@ -116,9 +112,8 @@ mod tests {
         assert_eq!(build_worktree_items(Vec::new()), Vec::new());
     }
 
-    /// `is_locked` must survive the `wt_core::Worktree` -> `WorktreeItem` mapping unchanged -
-    /// the rail's "by project" mode (`crate::rail::WorktreeNote::is_locked`) and its prune
-    /// safety check both depend on this real value reaching the UI layer, not a default.
+    /// `is_locked` must survive the mapping unchanged - the rail's prune safety check
+    /// (`crate::rail::WorktreeNote::is_locked`) depends on it.
     #[test]
     fn locked_state_is_preserved_from_the_real_worktree_result() {
         let mut locked = worktree("/repo-wt/locked", Some("locked-branch"), false);

@@ -8,14 +8,12 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Types (or backspaces/clears) into [`Self::filter_query`] - a small, deliberately
-    /// minimal hand-rolled text field (append/backspace only, no cursor positioning or
-    /// selection), mirroring `crate::terminal_pane::keystroke_to_bytes`'s own "small,
-    /// deliberate subset" scope cut rather than porting `vendor/zed/crates/gpui/examples/
-    /// input.rs`'s full `EntityInputHandler` (IME marked-text, mouse selection, clipboard) -
-    /// judged out of scope for a single filter row. Modified keystrokes (⌘, ⌃, ⌥) are left
-    /// unhandled and keep propagating, so app-level shortcuts (e.g. ⌘N) still reach their
-    /// bindings while this field has focus.
+    /// Types (or backspaces/clears) into [`Self::filter_query`] - a small, hand-rolled text
+    /// field (append/backspace only, no cursor positioning or selection) rather than
+    /// `vendor/zed/crates/gpui/examples/input.rs`'s full `EntityInputHandler`, judged out of
+    /// scope for a single filter row. Modified keystrokes (⌘, ⌃, ⌥) are left unhandled and
+    /// keep propagating, so app-level shortcuts (e.g. ⌘N) still reach their bindings while
+    /// this field has focus.
     pub(super) fn handle_filter_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -48,13 +46,11 @@ impl AdeApp {
         }
     }
 
-    /// Builds the rail's real per-session rows from live state: each session's
-    /// `TerminalPane` (process signal, question preview - see `crate::terminal_pane`'s new
-    /// `is_running`/`idle_duration`/`exit_status`/`spawn_error`/`visible_text_lines`
-    /// getters), the matching worktree's real branch name, and the real diff summary from
-    /// [`Self::diff_cache`] (refreshed by the periodic task started in `Self::new`). No
-    /// field here is fabricated or hardcoded - a session with no diff data yet simply shows
-    /// `0`/`0` until the next status-poll tick fills it in.
+    /// Builds the rail's per-session rows from live state: each session's `TerminalPane`
+    /// (process signal, question preview), the matching worktree's branch name, and the diff
+    /// summary from [`Self::diff_cache`] (refreshed by the periodic task started in
+    /// `Self::new`). A session with no diff data yet simply shows `0`/`0` until the next
+    /// status-poll tick fills it in.
     pub(super) fn build_session_rows(&self, cx: &App) -> Vec<SessionRow> {
         self.sessions
             .iter()
@@ -99,20 +95,15 @@ impl AdeApp {
             .collect()
     }
 
-    /// Builds the real "by project" worktree list: **every** worktree `wt_core::
-    /// list_worktrees` reported, including ones that failed to read - `crate::worktrees::
-    /// WorktreeItem`'s own docs say a per-entry error is kept in the list "so the problem is
-    /// visible rather than the entry silently vanishing", and filtering them out here would
-    /// defeat that intent (a real Phase-A behavior this rewrite must not regress). An
-    /// errored item gets a [`WorktreeEntry`] with `error: Some(..)` and an empty note
-    /// (nothing real to compute a clean/merged state from); `crate::root::AdeApp::
-    /// render_worktree_note_row` renders that as a visible, non-interactive error row rather
-    /// than a normal clickable one.
+    /// Builds the "by project" worktree list: every worktree `wt_core::list_worktrees`
+    /// reported, including ones that failed to read - `crate::worktrees::WorktreeItem`'s docs
+    /// say a per-entry error is kept in the list rather than filtered out, and
+    /// `Self::render_worktree_note_row` renders an errored entry as a visible,
+    /// non-interactive row.
     ///
-    /// Readable entries get their real clean/merged note from [`Self::worktree_notes`]
-    /// (refreshed by the same periodic task as [`Self::diff_cache`]) - defaulting to an
-    /// "unknown yet" note (`clean: None, merge: None`) for one the background snapshot
-    /// hasn't reached yet, rather than guessing.
+    /// Readable entries get their clean/merged note from [`Self::worktree_notes`] (refreshed
+    /// by the same periodic task as [`Self::diff_cache`]), defaulting to "unknown yet"
+    /// (`clean: None, merge: None`) for one the background snapshot hasn't reached yet.
     pub(super) fn build_worktree_entries(&self) -> Vec<WorktreeEntry> {
         self.worktrees
             .iter()
@@ -153,14 +144,12 @@ impl AdeApp {
             .collect()
     }
 
-    /// Starts the rail's periodic real-status background refresh (see
-    /// [`STATUS_POLL_INTERVAL`]'s docs). Every tick: snapshots the current worktree paths and
-    /// open sessions' cwds on the foreground thread (cheap, no I/O), computes a real
-    /// [`rail::StatusSnapshot`] on the background executor (real `git`/`gix` calls - see
-    /// `rail::compute_status_snapshot`'s docs), then writes the result back into
-    /// [`Self::diff_cache`]/[`Self::worktree_notes`] on the foreground thread. Mirrors the
-    /// same "gather on foreground, compute on background, write back on foreground" shape
-    /// [`Self::load_worktrees`]/[`Self::load_diff`] already use.
+    /// Starts the rail's periodic status background refresh (see [`STATUS_POLL_INTERVAL`]'s
+    /// docs). Every tick: snapshots the current worktree paths and open sessions' cwds on the
+    /// foreground thread (cheap, no I/O), computes a [`rail::StatusSnapshot`] on the
+    /// background executor, then writes the result back into
+    /// [`Self::diff_cache`]/[`Self::worktree_notes`] on the foreground thread - the same
+    /// "gather/compute/write back" shape [`Self::load_worktrees`]/[`Self::load_diff`] use.
     pub(super) fn start_status_polling(&mut self, cx: &mut Context<Self>) {
         let task = cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(STATUS_POLL_INTERVAL).await;
@@ -203,18 +192,11 @@ impl AdeApp {
         self._status_poll_task = Some(task);
     }
 
-    /// The rail footer's real `prune` action: removes every currently-known real prune
-    /// candidate (not the main checkout, clean, merged - see [`rail::WorktreeNote::
-    /// is_prunable`]) via the real, already-tested `wt_core::remove_worktree` (with
-    /// `force: false`, so its own dirty-tree refusal still guards against a race between the
-    /// last status snapshot and this click), then reloads the real worktree list. Real
-    /// functionality, not a decorative label: this can and does delete real directories on
-    /// disk.
-    /// The real prune candidate list: every worktree that is a prune candidate on its own
-    /// merits ([`rail::is_prunable`]) **and** has no live session currently running with its
-    /// cwd inside it - see [`rail::prunable_worktree_paths`]'s docs for why that second
-    /// condition is not optional. Shared by the footer's displayed count and the actual
-    /// removal, so what's shown always matches what a click will really do.
+    /// The prune candidate list: every worktree that is a prune candidate on its own merits
+    /// ([`rail::is_prunable`]) **and** has no live session running with its cwd inside it -
+    /// see [`rail::prunable_worktree_paths`]'s docs for why that second condition matters.
+    /// Shared by the footer's displayed count and [`Self::execute_prune`], so what's shown
+    /// always matches what a click will do.
     pub(super) fn prunable_worktree_paths(&self) -> Vec<PathBuf> {
         let worktree_paths: Vec<PathBuf> = self
             .worktrees
@@ -231,15 +213,11 @@ impl AdeApp {
     }
 
     /// The footer `prune` button's click handler. Destructive, so this is deliberately a
-    /// two-click confirmation, not a single unconfirmed click: the first click only arms
-    /// [`Self::prune_confirm_armed`] and changes the button's own label (real, visible
-    /// feedback - see `Self::render_rail_footer`), and does not touch the filesystem at all.
-    /// Only a *second* click while already armed calls [`Self::execute_prune`]. This matters
-    /// beyond the design's own footer-label spec: `wt_core::is_dirty` correctly follows
-    /// git's own ignored-file semantics, so a "clean" worktree can still hold real,
-    /// gitignored state (secrets, build artifacts, uncommitted-but-ignored work) that a
-    /// single misclick would otherwise destroy silently, for potentially several worktrees
-    /// at once.
+    /// two-click confirmation: the first click only arms [`Self::prune_confirm_armed`] and
+    /// changes the button's label, without touching the filesystem. Only a *second* click
+    /// while already armed calls [`Self::execute_prune`] - worth the extra click since
+    /// `wt_core::is_dirty` follows git's ignored-file semantics, so a "clean" worktree can
+    /// still hold gitignored state a misclick would destroy.
     pub(super) fn request_prune(&mut self, cx: &mut Context<Self>) {
         let candidates = self.prunable_worktree_paths();
 
@@ -264,25 +242,18 @@ impl AdeApp {
         self.execute_prune(candidates, cx);
     }
 
-    /// Actually removes `candidates` via the real, already-tested `wt_core::remove_worktree`.
-    /// Only ever called once [`Self::request_prune`]'s confirmation step has been satisfied,
-    /// and only with paths [`Self::prunable_worktree_paths`] itself produced (never the main
-    /// checkout, never a locked worktree, never one with a live session).
+    /// Removes `candidates` via `wt_core::remove_worktree`. Only called once
+    /// [`Self::request_prune`]'s confirmation step is satisfied, with paths
+    /// [`Self::prunable_worktree_paths`] itself produced.
     ///
-    /// Guarded by [`Self::prune_in_flight`] - a real no-op while a previous prune batch is
-    /// still running, exactly mirroring `Self::complete_merge_flow`/`Self::abort_merge_flow`'s
-    /// own `merge_op_in_flight` guard (see that field's docs for the identical real race this
-    /// closes: without it, a second confirming click could spawn a second batch into the same
-    /// [`Self::_prune_task`] slot, dropping the first batch's `Task` handle and either
-    /// silently cancelling it outright (if it hadn't started yet) or letting it complete for
-    /// real without its own completion handler ever running (if it had) - either way leaving
-    /// [`Self::prune_status`]/the worktree list stuck stale).
+    /// Guarded by [`Self::prune_in_flight`], mirroring `Self::complete_merge_flow`/
+    /// `Self::abort_merge_flow`'s `merge_op_in_flight` guard (see that field's docs for the
+    /// race this closes - a second confirming click spawning a second batch into the same
+    /// [`Self::_prune_task`] slot, dropping/cancelling the first).
     pub(super) fn execute_prune(&mut self, candidates: Vec<PathBuf>, cx: &mut Context<Self>) {
         if self.prune_in_flight {
             // Defense in depth alongside `Self::render_rail_footer`'s own gating of the prune
-            // button itself (which is what actually stops a real user from reaching this while
-            // a batch is running): an honest, visible status rather than silent nothing, for
-            // any caller that reaches here anyway.
+            // button while a batch is running.
             self.prune_status = Some("prune already running\u{2026}".to_string());
             cx.notify();
             return;
@@ -356,12 +327,10 @@ impl AdeApp {
             .child(self.render_rail_footer(cx))
     }
 
-    /// A real, visible error banner for [`Self::worktrees_error`] - a real Phase-A behavior
-    /// (`wt_core::list_worktrees` failing outright, e.g. a corrupt repository) this rewrite
-    /// must not silently drop: the old sidebar returned early with exactly this message; the
-    /// rail shows it as a standing banner instead (rather than replacing the whole session
-    /// list) so real, already-open sessions stay visible and usable even when the worktree
-    /// listing itself is broken.
+    /// A visible error banner for [`Self::worktrees_error`] (`wt_core::list_worktrees`
+    /// failing outright, e.g. a corrupt repository) - shown as a standing banner rather than
+    /// replacing the whole session list, so already-open sessions stay usable even when the
+    /// worktree listing itself is broken.
     pub(super) fn render_worktrees_error_banner(&self) -> Option<impl IntoElement> {
         let error = self.worktrees_error.as_ref()?;
         Some(
@@ -661,16 +630,9 @@ impl AdeApp {
                 })
                 .child(div().flex_1())
                 .child(
-                    // A real, aggregate "which statuses does this project contain" summary
-                    // (`rail::status_dot_cluster`) - the design mockup's own project-row
-                    // `p.dots` fixture is a 5×5 circle per distinct status
-                    // (`design_handoff_jerry_ade/revision/Jerry.dc.html`'s `railProject`
-                    // section), the same real 5×5 size [`Self::render_status_group`]'s own
-                    // header marker uses for the same "summary, not an individual row" reason -
-                    // deliberately larger than an individual session row's own 4×4 dot (see
-                    // [`Self::render_session_row`]'s own `.w(px(4.0)).h(px(4.0))` - one real
-                    // call site shared by both rail modes, matching the same mockup's `s.dot`
-                    // and `r.dot` fixtures, which both specify 4×4 too).
+                    // Aggregate status summary (`rail::status_dot_cluster`): 5×5 dots, same
+                    // size as `Self::render_status_group`'s header marker - deliberately
+                    // larger than an individual session row's 4×4 dot.
                     div().flex().items_center().gap(px(3.0)).children(
                         dots.into_iter()
                             .map(|status| div().w(px(5.0)).h(px(5.0)).bg(status.color())),
@@ -898,13 +860,8 @@ impl AdeApp {
                     .items_center()
                     .gap(px(5.0))
                     .pt(px(2.0))
-                    // Real, deliberately smaller than the group-header/project-summary dots
-                    // above (5×5 - see `Self::render_status_group`'s and the project dots
-                    // cluster's own docs): this is one individual session row's own status dot,
-                    // matching the design mockup's `s.dot` (`railUrgency` section) and `r.dot`
-                    // (`railProject` section) fixtures, both `width:4px;height:4px` in
-                    // `design_handoff_jerry_ade/revision/Jerry.dc.html` - this one function
-                    // renders both modes' rows, so one real 4×4 call site covers both fixtures.
+                    // 4×4, smaller than the group-header/project-summary dots (5×5) - matches
+                    // the mockup's `s.dot`/`r.dot` fixtures.
                     .child(div().w(px(4.0)).h(px(4.0)).bg(row.status.color()))
                     .child(
                         div()
@@ -956,9 +913,8 @@ impl AdeApp {
     /// Footer 28: real aggregate stats (`N worktrees · disk usage`) plus the real `prune`
     /// action.
     pub(super) fn render_rail_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Includes error'd entries: `crate::worktrees::WorktreeItem`'s own docs say a real
-        // count of what `wt_core::list_worktrees` reported should stay visible problems and
-        // all, not silently shrink because some entries failed to read.
+        // Includes error'd entries - the count should match what `wt_core::list_worktrees`
+        // reported, problems included, not silently shrink.
         let worktree_count = self.worktrees.len();
         let disk_label = match self.disk_usage {
             Some((bytes, truncated)) => {
@@ -987,12 +943,10 @@ impl AdeApp {
             .rounded(theme::radius::CHIP)
             .font(font(theme::font::MONO))
             .text_size(self.ui_text_size(10.0));
-        // Mirrors `Self::render_merge_flow_footer`'s own `in_flight` gating of its
-        // Complete/Abort buttons: while a real prune batch is genuinely running
-        // (`Self::prune_in_flight`), this button stops looking or acting clickable at all -
-        // no `cursor_pointer`, no hover affordance, no `on_click` - rather than staying
-        // enabled-looking and inviting a click that `Self::execute_prune`'s guard would
-        // silently swallow. See that field's docs for the exact confusing no-op this closes.
+        // Mirrors `Self::render_merge_flow_footer`'s `in_flight` gating: while a prune batch
+        // is running, this button drops `cursor_pointer`/hover/`on_click` entirely rather
+        // than staying enabled-looking and inviting a click `Self::execute_prune`'s guard
+        // would silently swallow.
         let prune_button = if self.prune_in_flight {
             prune_button
                 .cursor_default()
@@ -1038,14 +992,12 @@ impl AdeApp {
     }
 }
 
-/// Real regression coverage for [`AdeApp::prune_in_flight`] - mirrors
-/// `root::merge_flow::merge_regression_tests`'s own real-git-repo, deterministic-executor
-/// idiom (`init_repo`/`add_worktree`, `cx.run_until_parked()` called only where the test
-/// deliberately wants a pending background task to actually finish) applied to the identical
-/// bug class for pruning: arm, execute (spawns a real prune batch), arm again, execute again,
-/// with all four `Self::request_prune` calls landing before the first batch's real
-/// `wt_core::remove_worktree` has run - must leave exactly one real prune batch in flight,
-/// never two racing ones sharing `Self::_prune_task`.
+/// Regression coverage for [`AdeApp::prune_in_flight`] - mirrors
+/// `root::merge_flow::merge_regression_tests`'s real-git-repo, deterministic-executor idiom,
+/// applied to the same bug class for pruning: arm, execute, arm again, execute again, with
+/// all four `Self::request_prune` calls landing before the first batch's
+/// `wt_core::remove_worktree` has run - must leave exactly one batch in flight, never two
+/// racing ones sharing `Self::_prune_task`.
 #[cfg(test)]
 mod prune_regression_tests {
     use super::*;
@@ -1082,9 +1034,9 @@ mod prune_regression_tests {
         dir
     }
 
-    /// Same real-linked-worktree idiom `root::merge_flow`'s own test module uses. Created with
-    /// no new commits of its own, so its branch tip trivially equals `main`'s - a real,
-    /// genuinely-merged, clean worktree without needing a second real merge to produce one.
+    /// Same linked-worktree idiom `root::merge_flow`'s test module uses. Created with no new
+    /// commits, so its branch tip trivially equals `main`'s - a genuinely-merged, clean
+    /// worktree without needing a second real merge to produce one.
     fn add_worktree(repo_path: &Path, branch: &str, name: &str) -> PathBuf {
         let container = TempDir::new().expect("tempdir");
         let path = container.path().join(name);
@@ -1102,10 +1054,9 @@ mod prune_regression_tests {
         path
     }
 
-    /// Wires up `app.worktrees`/`app.worktree_notes` directly with one real, prunable
-    /// worktree, bypassing the periodic status-poll computation this test doesn't need to
-    /// exercise - `Self::prunable_worktree_paths` only ever reads these two fields plus
-    /// `self.sessions`, so this is a real, direct exercise of the same code
+    /// Wires up `app.worktrees`/`app.worktree_notes` directly with one prunable worktree,
+    /// bypassing the periodic status-poll computation - `Self::prunable_worktree_paths` only
+    /// reads these two fields plus `self.sessions`, so this exercises the same code
     /// `Self::request_prune`/`Self::execute_prune` run in production.
     fn seed_one_prunable_worktree(app: &mut AdeApp, path: PathBuf, branch: &str) {
         app.worktrees.push(WorktreeItem {
@@ -1131,20 +1082,12 @@ mod prune_regression_tests {
         );
     }
 
-    /// The exact race from the bug report, made *discriminating* rather than merely
-    /// end-state-checking: a naive version of this test that arms/confirms twice against the
-    /// same single candidate passes identically whether or not `Self::prune_in_flight` exists
-    /// at all, because a double-spawned batch removing the same one worktree twice (the second
-    /// attempt just failing harmlessly, since the path is already gone) looks the same as a
-    /// single batch removing it once. This version instead seeds a *second*, independent
-    /// prunable worktree only *after* the first batch is already in flight (before
-    /// `run_until_parked` lets any real background work happen), so the second `request_prune`
-    /// cycle's candidate list is genuinely disjoint from the first's: `second` can only ever be
-    /// removed by a *second* batch actually spawning. If `Self::prune_in_flight`'s guard is
-    /// working, the second arm/confirm is a real no-op and `second` survives; if the guard were
-    /// missing or broken, a second batch would spawn (dropping - cancelling - the first batch's
-    /// still-not-yet-run `Task` in the process, via the same "dropping a `Task` cancels it
-    /// immediately" mechanism `Self::_merge_cleanup_task`'s docs describe) and remove both.
+    /// Deliberately discriminating, not just end-state-checking: arming/confirming twice
+    /// against the *same* candidate would pass whether or not `Self::prune_in_flight` exists
+    /// (a double-spawned batch removing one worktree twice just fails harmlessly the second
+    /// time). Instead this seeds a *second*, independent prunable worktree only after the
+    /// first batch is already in flight, so it can only be removed by a genuine second batch
+    /// spawning - if the guard is broken, `second` gets removed too.
     #[gpui::test]
     fn a_second_confirm_while_first_batch_is_in_flight_does_not_prune_a_worktree_seeded_after_it(
         cx: &mut TestAppContext,

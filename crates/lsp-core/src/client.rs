@@ -1,14 +1,12 @@
-//! A real LSP client: spawns a language server as a plain child process (`std::process::
-//! Command` + `Stdio::piped()`, deliberately **not** `pty-core` - see this crate's top-level
-//! docs for why a pty's line discipline would corrupt JSON-RPC framing), drives a real
-//! `initialize`/`initialized` handshake, and exposes real request/response correlation plus a
-//! real `textDocument/publishDiagnostics` notification sink.
+//! An LSP client: spawns a language server as a plain child process (`std::process::Command`
+//! with `Stdio::piped()`), deliberately not `pty-core` - see this crate's top-level docs for
+//! why a pty's line discipline would corrupt JSON-RPC framing. Drives an
+//! `initialize`/`initialized` handshake, and exposes request/response correlation plus a
+//! `textDocument/publishDiagnostics` notification sink.
 //!
 //! ## Handshake order - verified against the LSP spec and `vendor/zed/crates/lsp/src/lsp.rs`
 //!
-//! The LSP spec (and `vendor/zed`'s own client, read here only as a reference for real-world
-//! sequencing gotchas - see this crate's own module docs / the step report for the licensing
-//! boundary) are unambiguous on two points this implementation follows exactly:
+//! The LSP spec is unambiguous on two points this implementation follows exactly:
 //!
 //! 1. `initialize` must be the **first** request sent, and the client must wait for its
 //!    response before sending anything else except a reply to a server-initiated request the
@@ -16,41 +14,36 @@
 //! 2. The `initialized` notification must be sent **after** the `initialize` response arrives,
 //!    and every other request/notification (`textDocument/didOpen` included) must wait until
 //!    *after* `initialized` has been sent - `vendor/zed/crates/lsp/src/lsp.rs`'s own
-//!    `LanguageServer::initialize` sends them in exactly this order (request, await response,
-//!    then a separate `initialized` notification) before returning a ready server handle to its
-//!    own callers, matching [`LspClient::spawn`]'s own shape below: `spawn` does not return a
-//!    usable [`LspClient`] until both steps have completed, so no caller of this crate can
-//!    accidentally send `didOpen` (or anything else) before `initialized` - the type system
-//!    only ever hands out an already-initialized client.
+//!    `LanguageServer::initialize` sends them in exactly this order before returning a ready
+//!    server handle, matching [`LspClient::spawn`]'s shape below: `spawn` does not return a
+//!    usable [`LspClient`] until both steps have completed, so the type system only ever hands
+//!    out an already-initialized client.
 //!
-//! Getting this order wrong is silent, not a hard error: a server that receives requests before
-//! `initialized` (or before `initialize`'s response) is permitted by the spec to just ignore
-//! them, which is exactly the "nothing happens and there's no error to debug" failure mode this
-//! ordering guarantee exists to prevent.
+//! Getting this order wrong is silent, not a hard error: a server that receives requests
+//! before `initialized` (or before `initialize`'s response) is permitted by the spec to just
+//! ignore them - "nothing happens and there's no error to debug," exactly the failure mode
+//! this ordering guarantee prevents.
 //!
 //! ## Why a plain `Mutex`-guarded writer, not a dedicated writer thread
 //!
-//! `pty-core::PtySession::write_input` hands bytes to a dedicated writer thread specifically
-//! because its callers can be the GPUI foreground thread (a key-handler), where blocking on a
-//! full pty write buffer would freeze the UI. Every real write this crate performs
-//! ([`LspClient::request`], [`LspClient::notify`]) is only ever called from inside
-//! `cx.background_executor().spawn(..)` by this workspace's own established convention (see
-//! `crate::terminal_pane`'s and `crate::root::spawn_file_load`'s docs in the `app` crate) - so
-//! blocking the *calling* background thread for the duration of a `write_all` to a child's
-//! stdin pipe (a small, fast syscall in the overwhelmingly common case) is an acceptable,
-//! simpler alternative to a second thread and channel here.
+//! `pty-core::PtySession::write_input` hands bytes to a dedicated writer thread because its
+//! callers can be the GPUI foreground thread (a key-handler), where blocking on a full pty
+//! write buffer would freeze the UI. Every write this crate performs ([`LspClient::request`],
+//! [`LspClient::notify`]) is only ever called from inside `cx.background_executor().spawn(..)`
+//! by this workspace's convention, so blocking the *calling* background thread for the
+//! duration of a `write_all` to a child's stdin pipe (a small, fast syscall in the common
+//! case) is an acceptable, simpler alternative to a second thread and channel here.
 //!
 //! ## Why no self-pipe for reader-thread shutdown, unlike `pty-core`
 //!
 //! `pty-core`'s reader thread needs a self-pipe because a pty master fd can have multiple
-//! independent `dup`'d references alive at once, so dropping any *one* of them does not
+//! independent `dup`'d references alive at once, so dropping any *one* of them doesn't
 //! guarantee the reader's blocking read unblocks. A `std::process::Child`'s `ChildStdout` has
-//! no such multi-reference ambiguity: once the child process has actually terminated, the
-//! kernel closes every fd it held (including the write end of the stdout pipe this reader is
-//! blocked reading from) as part of process termination, not merely once it's been `wait()`-ed
-//! on - so the reader thread's blocking `read` reliably returns `Ok(0)` (EOF) shortly after the
-//! child dies, with no extra signaling mechanism required. See [`LspClient::shutdown`]/`Drop`'s
-//! own docs for how process termination is guaranteed before those code paths return/finish.
+//! no such ambiguity: once the child process terminates, the kernel closes every fd it held
+//! (including the stdout pipe's write end) as part of termination, not merely once it's been
+//! `wait()`-ed on - so the reader thread's blocking `read` reliably returns `Ok(0)` shortly
+//! after the child dies, with no extra signaling needed. See [`LspClient::shutdown`]/`Drop`'s
+//! docs for how process termination is guaranteed before those code paths return.
 
 use std::collections::HashMap;
 use std::io::BufReader;
@@ -91,12 +84,11 @@ const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(800);
 /// never loses a real diagnostic, only a redundant "something changed" nudge).
 const WAKE_CHANNEL_CAPACITY: usize = 64;
 
-/// Locks a `Mutex`, recovering from poisoning rather than propagating a panic across it - this
-/// crate has no `.unwrap()`/`.expect()` outside tests, and a poisoned lock here (meaning some
-/// *other* thread already panicked while holding it) shouldn't cascade into every subsequent
-/// caller panicking too; the recovered guard's data is used as-is; the state it protects
+/// Locks a `Mutex`, recovering from poisoning rather than propagating a panic across it - a
+/// poisoned lock here (some *other* thread already panicked while holding it) shouldn't
+/// cascade into every subsequent caller panicking too. The state it protects
 /// (pending-request bookkeeping, the diagnostics map) has no invariant that a mid-operation
-/// panic could leave "corrupt" in a way that would make continuing unsafe.
+/// panic could leave corrupt in a way that would make continuing unsafe.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -104,9 +96,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Everything that can go wrong spawning, driving, or tearing down an [`LspClient`]. Mirrors
-/// `pty_core::PtyError`'s shape (a `thiserror` enum, no `anyhow::Error` - see that type's own
-/// docs for why: `anyhow::Error` doesn't implement `std::error::Error`, so it can't be a
-/// `#[source]` field, and it would leak an opaque dependency type into this crate's public API).
+/// `pty_core::PtyError`'s shape (a `thiserror` enum, no `anyhow::Error` - see that type's docs
+/// for why: `anyhow::Error` doesn't implement `std::error::Error`, so it can't be a `#[source]`
+/// field, and would leak an opaque dependency type into this crate's public API).
 #[derive(Debug, thiserror::Error)]
 pub enum LspError {
     #[error("failed to spawn `rust-analyzer` (is it installed and on PATH?): {0}")]
@@ -153,8 +145,8 @@ pub enum ClientUpdate {
     Closed,
 }
 
-/// A real, running `rust-analyzer` process for one repository root, already past a real
-/// `initialize`/`initialized` handshake (see this module's own docs for why that ordering
+/// A running `rust-analyzer` process for one repository root, already past an
+/// `initialize`/`initialized` handshake (see this module's docs for why that ordering
 /// guarantee is baked into [`LspClient::spawn`] rather than left to callers). Cloneable via
 /// `Arc<LspClient>` at the call site (every method here takes `&self`, guarded internally by
 /// `Mutex`es) - the `app` crate keeps one `Arc<LspClient>` per repository root, shared across
@@ -168,32 +160,30 @@ pub struct LspClient {
     pending: Arc<Mutex<HashMap<i64, SyncSender<PendingResponse>>>>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<lsp_types::Diagnostic>>>>,
     /// Guarded by a `Mutex` (rather than a bare `Receiver<()>`) purely so `LspClient` itself is
-    /// `Sync` - `std::sync::mpsc::Receiver` is `Send` but deliberately not `Sync` (it's a
-    /// single-consumer channel), and this crate's callers (the `app` crate) share one
-    /// `Arc<LspClient>` across a GPUI background task and a poll loop, both of which require
-    /// `Arc<LspClient>: Send`, which in turn requires `LspClient: Sync`. There is still only
-    /// ever one real logical consumer in practice (see [`LspClient::drain_updates`]'s docs), so
-    /// the lock is uncontended in the overwhelmingly common case.
+    /// `Sync` - `std::sync::mpsc::Receiver` is `Send` but deliberately not `Sync`, and this
+    /// crate's callers (the `app` crate) share one `Arc<LspClient>` across a GPUI background
+    /// task and a poll loop, both of which require `Arc<LspClient>: Send` and thus
+    /// `LspClient: Sync`. There is still only one logical consumer in practice (see
+    /// [`LspClient::drain_updates`]'s docs), so the lock is uncontended in the common case.
     wake_rx: Mutex<Receiver<()>>,
     reader_thread: Option<JoinHandle<()>>,
     stderr_thread: Option<JoinHandle<()>>,
 }
 
 impl LspClient {
-    /// Spawns `rust-analyzer` for the repository rooted at `repo_root`, performs a real
-    /// `initialize` request (awaiting its response) followed by a real `initialized`
-    /// notification - in that order, per this module's own docs - and returns a client that is
-    /// genuinely ready for `didOpen`/other calls. `repo_root` must be an absolute, existing
-    /// directory (relative paths cannot be turned into a well-formed `file://` URI - see
-    /// [`path_to_uri`]).
+    /// Spawns `rust-analyzer` for the repository rooted at `repo_root`, performs an
+    /// `initialize` request (awaiting its response) followed by an `initialized` notification -
+    /// in that order, per this module's docs - and returns a client that's ready for
+    /// `didOpen`/other calls. `repo_root` must be an absolute, existing directory (relative
+    /// paths cannot be turned into a well-formed `file://` URI - see [`path_to_uri`]).
     pub fn spawn(repo_root: &Path) -> Result<Self, LspError> {
         if !repo_root.is_dir() {
             return Err(LspError::InvalidRoot(repo_root.to_path_buf()));
         }
         // Canonicalized so the `file://` URI sent as this workspace folder's root is the same
-        // real, symlink-resolved path every other `path_to_uri` call (e.g. from `did_open`)
-        // will independently arrive at for a file underneath it - real consistency, not an
-        // assumption that the caller already passed a canonical path.
+        // symlink-resolved path every other `path_to_uri` call (e.g. from `did_open`) will
+        // independently arrive at for a file underneath it, rather than assuming the caller
+        // already passed a canonical path.
         let repo_root = repo_root
             .canonicalize()
             .map_err(|_| LspError::InvalidRoot(repo_root.to_path_buf()))?;
@@ -224,12 +214,10 @@ impl LspClient {
             let stdin_for_replies = Arc::clone(&stdin);
             move || run_reader_loop(stdout, pending, diagnostics, wake_tx, stdin_for_replies)
         });
-        // rust-analyzer's own stderr is real diagnostic/log output (not part of the LSP
-        // protocol) - drained on its own thread purely so a full OS pipe buffer on stderr can
-        // never backpressure rust-analyzer's stdout writes (a real, if obscure, way an
-        // undrained stderr pipe can wedge a child process). Logged at debug level rather than
-        // discarded outright, so a real startup failure (e.g. a version mismatch panic) is
-        // still observable.
+        // rust-analyzer's stderr is diagnostic/log output (not part of the LSP protocol) -
+        // drained on its own thread so a full OS pipe buffer on stderr can never backpressure
+        // rust-analyzer's stdout writes. Logged at debug level rather than discarded, so a
+        // startup failure (e.g. a version mismatch panic) is still observable.
         let stderr_thread = std::thread::spawn(move || run_stderr_drain_loop(stderr));
 
         let client = LspClient {
@@ -249,8 +237,8 @@ impl LspClient {
         Ok(client)
     }
 
-    /// The real, verified handshake body: see this module's top-level docs for why the request
-    /// and notification are sent in exactly this order and why no other call can happen first.
+    /// The handshake body: see this module's top-level docs for why the request and
+    /// notification are sent in exactly this order and why no other call can happen first.
     fn initialize(&self, repo_root: &Path) -> Result<(), LspError> {
         let uri = path_to_uri(repo_root)?;
         let folder_name = repo_root
@@ -278,9 +266,9 @@ impl LspClient {
         Ok(())
     }
 
-    /// Sends a real `textDocument/didOpen` notification for `path` with `text` as its real,
-    /// current content. Never called before `initialized` (see this module's docs) since a
-    /// caller can only ever hold an already-initialized `LspClient`.
+    /// Sends a `textDocument/didOpen` notification for `path` with `text` as its current
+    /// content. Never called before `initialized` (see this module's docs) since a caller can
+    /// only ever hold an already-initialized `LspClient`.
     pub fn did_open(&self, path: &Path, text: String, version: i32) -> Result<(), LspError> {
         let uri = path_to_uri(path)?;
         let params = DidOpenTextDocumentParams {
@@ -294,22 +282,21 @@ impl LspClient {
         self.notify::<lsp_types::notification::DidOpenTextDocument>(params)
     }
 
-    /// The most recent real `textDocument/publishDiagnostics` payload rust-analyzer has sent
-    /// for `path`, if any has arrived yet. `None` means "no publishDiagnostics notification for
-    /// this file has been received yet" - genuinely distinct from `Some(vec![])` ("rust-analyzer
-    /// has analyzed this file and found zero diagnostics") - see [`Self::has_diagnostics_result`]
-    /// for the same distinction under a name that makes the "haven't heard back yet" case (the
-    /// real, honest "still indexing" interim state) explicit at call sites.
+    /// The most recent `textDocument/publishDiagnostics` payload rust-analyzer has sent for
+    /// `path`, if any has arrived yet. `None` means "no publishDiagnostics notification for
+    /// this file has been received yet" - distinct from `Some(vec![])` ("rust-analyzer has
+    /// analyzed this file and found zero diagnostics") - see [`Self::has_diagnostics_result`]
+    /// for the same distinction under a name that makes the "haven't heard back yet" case
+    /// explicit at call sites.
     pub fn diagnostics_for(&self, path: &Path) -> Option<Vec<lsp_types::Diagnostic>> {
         let uri = path_to_uri(path).ok()?;
         self.diagnostics_for_uri(&uri)
     }
 
-    /// `true` once at least one real `publishDiagnostics` notification has been received for
-    /// `path` (even if it carried zero diagnostics - a real, clean-file result) - the signal the
-    /// `app` crate uses to distinguish "rust-analyzer is still indexing/hasn't analyzed this
-    /// file yet" from "rust-analyzer analyzed it and found nothing to report", per this phase's
-    /// documented indexing-state requirement.
+    /// `true` once at least one `publishDiagnostics` notification has been received for `path`
+    /// (even if it carried zero diagnostics - a clean-file result) - the signal the `app` crate
+    /// uses to distinguish "rust-analyzer is still indexing/hasn't analyzed this file yet" from
+    /// "rust-analyzer analyzed it and found nothing to report".
     pub fn has_diagnostics_result(&self, path: &Path) -> bool {
         match path_to_uri(path) {
             Ok(uri) => self.has_diagnostics_result_uri(&uri),
@@ -317,57 +304,54 @@ impl LspClient {
         }
     }
 
-    /// Computes the same real `file://` [`Uri`] [`Self::diagnostics_for`]/
-    /// [`Self::has_diagnostics_result`] each derive internally from a path - exposed so a caller
-    /// that needs more than one diagnostic lookup for the *same* path in one pass (e.g.
+    /// Computes the same `file://` [`Uri`] [`Self::diagnostics_for`]/
+    /// [`Self::has_diagnostics_result`] each derive internally from a path - exposed so a
+    /// caller that needs more than one diagnostic lookup for the *same* path in one pass (e.g.
     /// `crate::root::AdeApp::render_file_view`, which calls into this client up to three times
-    /// per render for one open file) can compute the [`Uri`] exactly once and reuse it via
+    /// per render for one open file) can compute the [`Uri`] once and reuse it via
     /// [`Self::diagnostics_for_uri`]/[`Self::has_diagnostics_result_uri`], rather than paying
-    /// [`path_to_uri`]'s real blocking `canonicalize()` syscall repeatedly for the same render
-    /// pass - a real, measured per-repaint cost on `uniform_list`'s virtualized rows, not a
-    /// micro-optimization. An associated function (not a method) since it needs no `&self`.
+    /// [`path_to_uri`]'s blocking `canonicalize()` syscall repeatedly for the same render pass -
+    /// a measured per-repaint cost on `uniform_list`'s virtualized rows. An associated function
+    /// (not a method) since it needs no `&self`.
     pub fn uri_for_path(path: &Path) -> Result<Uri, LspError> {
         path_to_uri(path)
     }
 
-    /// The real inverse of [`Self::uri_for_path`]: converts a real `file://` [`Uri`] (as returned
-    /// in a real `textDocument/definition` response's `Location`/`LocationLink` - H3's
-    /// go-to-definition flow, `crate::root::AdeApp::trigger_goto_definition` in the `app` crate)
-    /// back into a real, absolute filesystem [`PathBuf`] so the File view can actually load and
-    /// display it.
+    /// The inverse of [`Self::uri_for_path`]: converts a `file://` [`Uri`] (as returned in a
+    /// `textDocument/definition` response's `Location`/`LocationLink` - H3's go-to-definition
+    /// flow, `crate::root::AdeApp::trigger_goto_definition` in the `app` crate) back into an
+    /// absolute filesystem [`PathBuf`] so the File view can load and display it.
     ///
     /// `rust-analyzer` can (and does, for e.g. a virtual macro-expansion buffer or a library
     /// without downloaded sources) return a non-`file://` URI scheme; this honestly fails with
     /// [`LspError::InvalidUri`] rather than guessing at a path for one, which
     /// `crate::root::AdeApp::trigger_goto_definition` treats as "no real navigation possible for
     /// this result" rather than crashing or fabricating a path. An associated function (not a
-    /// method), mirroring [`Self::uri_for_path`] - real conversion between an LSP protocol shape
-    /// and a filesystem path, not something that touches any live `LspClient` state.
+    /// method), mirroring [`Self::uri_for_path`] - conversion between an LSP protocol shape and
+    /// a filesystem path, not something that touches any live `LspClient` state.
     pub fn path_for_uri(uri: &Uri) -> Result<PathBuf, LspError> {
         uri_to_path(uri)
     }
 
-    /// Real diagnostics lookup keyed by an already-computed [`Uri`] (see [`Self::uri_for_path`]'s
-    /// own docs for why this exists) - identical real semantics to [`Self::diagnostics_for`],
-    /// just without re-deriving the `Uri` from a path internally.
+    /// Diagnostics lookup keyed by an already-computed [`Uri`] (see [`Self::uri_for_path`]'s
+    /// docs for why this exists) - identical semantics to [`Self::diagnostics_for`], just
+    /// without re-deriving the `Uri` from a path internally.
     pub fn diagnostics_for_uri(&self, uri: &Uri) -> Option<Vec<lsp_types::Diagnostic>> {
         lock(&self.diagnostics).get(uri.as_str()).cloned()
     }
 
-    /// Real "has a result arrived yet" check keyed by an already-computed [`Uri`] - identical
-    /// real semantics to [`Self::has_diagnostics_result`]; see [`Self::uri_for_path`]'s docs.
+    /// "Has a result arrived yet" check keyed by an already-computed [`Uri`] - identical
+    /// semantics to [`Self::has_diagnostics_result`]; see [`Self::uri_for_path`]'s docs.
     pub fn has_diagnostics_result_uri(&self, uri: &Uri) -> bool {
         lock(&self.diagnostics).contains_key(uri.as_str())
     }
 
-    /// Non-blocking: drains every real "diagnostics changed" wake signal currently buffered
-    /// (the reader thread sends one every time it records a fresh `publishDiagnostics`
-    /// notification for *any* file, not just one specific path), returning `true` iff at least
-    /// one was found. A caller polling this (see `crate::root`'s established
-    /// `cx.background_executor().timer(..)` poll pattern, e.g.
-    /// `terminal_pane::TerminalPane::spawn_process`'s own loop) knows to re-check
-    /// [`Self::diagnostics_for`]/[`Self::has_diagnostics_result`] for whichever file it cares
-    /// about and re-render if the real answer changed.
+    /// Non-blocking: drains every "diagnostics changed" wake signal currently buffered (the
+    /// reader thread sends one every time it records a fresh `publishDiagnostics` notification
+    /// for *any* file, not just one specific path), returning `true` iff at least one was
+    /// found. A caller polling this (see `crate::root`'s `cx.background_executor().timer(..)`
+    /// poll pattern) knows to re-check [`Self::diagnostics_for`]/[`Self::has_diagnostics_result`]
+    /// for whichever file it cares about and re-render if the answer changed.
     pub fn drain_updates(&self) -> bool {
         let receiver = lock(&self.wake_rx);
         let mut any = false;
@@ -377,11 +361,10 @@ impl LspClient {
         any
     }
 
-    /// Blocking, bounded wait for the next real wake signal - see [`Self::drain_updates`]'s docs
-    /// for what it means. Exists for real, deterministic test/tooling waits (this crate's own
-    /// end-to-end test); `crate::root`'s actual GPUI polling always uses the non-blocking
-    /// [`Self::drain_updates`] instead, since blocking is never acceptable on a GPUI-managed
-    /// task.
+    /// Blocking, bounded wait for the next wake signal - see [`Self::drain_updates`]'s docs for
+    /// what it means. Exists for deterministic test/tooling waits; `crate::root`'s actual GPUI
+    /// polling always uses the non-blocking [`Self::drain_updates`] instead, since blocking is
+    /// never acceptable on a GPUI-managed task.
     pub fn wait_for_update(&self, timeout: Duration) -> ClientUpdate {
         let receiver = lock(&self.wake_rx);
         match receiver.recv_timeout(timeout) {
@@ -391,8 +374,8 @@ impl LspClient {
         }
     }
 
-    /// Sends a real, framed LSP request and blocks (the calling thread - see this module's docs
-    /// on why that's acceptable here) for a real response, up to `timeout`.
+    /// Sends a framed LSP request and blocks the calling thread (see this module's docs on why
+    /// that's acceptable here) for a response, up to `timeout`.
     pub fn request<R: LspRequest>(
         &self,
         params: R::Params,
@@ -403,7 +386,7 @@ impl LspClient {
         serde_json::from_value(result_value).map_err(LspError::Deserialize)
     }
 
-    /// Sends a real, framed LSP notification (no response expected or awaited).
+    /// Sends a framed LSP notification (no response expected or awaited).
     pub fn notify<N: LspNotification>(&self, params: N::Params) -> Result<(), LspError> {
         let params_value = serde_json::to_value(params).map_err(LspError::Serialize)?;
         self.send_notification_raw(N::METHOD, params_value)
@@ -462,14 +445,14 @@ impl LspClient {
         transport::write_message(&mut *stdin, &message).map_err(LspError::Io)
     }
 
-    /// Deterministically tears the session down: a real, best-effort `shutdown` request
+    /// Deterministically tears the session down: a best-effort `shutdown` request
     /// (rust-analyzer may already be unresponsive, which is not itself an error for teardown
-    /// purposes), a real `exit` notification, then `SIGTERM` to the real process (and any real
-    /// descendants it spawned, see `crate::proc`'s docs), a bounded grace period, `SIGKILL` if
-    /// still alive, a blocking reap, and finally joining the reader/stderr threads (which exit
-    /// on their own once the process is confirmed dead, see this module's top-level docs on why
-    /// no explicit shutdown signal is needed for them, unlike `pty-core`'s pty case). Safe to
-    /// call more than once.
+    /// purposes), an `exit` notification, then `SIGTERM` to the process (and any descendants it
+    /// spawned, see `crate::proc`'s docs), a bounded grace period, `SIGKILL` if still alive, a
+    /// blocking reap, and finally joining the reader/stderr threads (which exit on their own
+    /// once the process is confirmed dead, see this module's top-level docs on why no explicit
+    /// shutdown signal is needed for them, unlike `pty-core`'s pty case). Safe to call more
+    /// than once.
     pub fn shutdown(&mut self) -> Result<(), LspError> {
         if !self.exited {
             let _ = self.request::<lsp_types::request::Shutdown>((), SHUTDOWN_REQUEST_TIMEOUT);
@@ -528,17 +511,15 @@ impl Drop for LspClient {
     }
 }
 
-/// Converts a real, absolute filesystem path to a real, percent-encoded `file://` URI via the
-/// `url` crate (`Url::from_file_path`) - deliberately not hand-rolled, since correct percent-
-/// encoding of arbitrary path bytes (spaces, non-ASCII, ...) is exactly the kind of "looks right
-/// for the happy path, silently wrong on real-world paths" trap this project's own conventions
-/// warn against re-implementing without a real reason to.
+/// Converts an absolute filesystem path to a percent-encoded `file://` URI via the `url`
+/// crate (`Url::from_file_path`) - deliberately not hand-rolled, since correct
+/// percent-encoding of arbitrary path bytes (spaces, non-ASCII, ...) is exactly the kind of
+/// "looks right for the happy path, silently wrong on real-world paths" trap not worth
+/// reimplementing.
 fn path_to_uri(path: &Path) -> Result<Uri, LspError> {
     // Best-effort canonicalization for consistency with `LspClient::spawn`'s own root-URI
-    // canonicalization (see its docs) - falls back to the given path as-is if canonicalization
-    // fails (e.g. a caller checking a path that doesn't exist on disk), rather than turning a
-    // real, working `path_to_uri` call into a hard error over a real convenience it doesn't
-    // strictly need.
+    // canonicalization; falls back to the given path as-is if canonicalization fails (e.g. a
+    // caller checking a path that doesn't exist on disk).
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let url = url::Url::from_file_path(&canonical)
         .map_err(|_| LspError::InvalidPath(path.to_path_buf()))?;
@@ -547,11 +528,10 @@ fn path_to_uri(path: &Path) -> Result<Uri, LspError> {
         .map_err(|_| LspError::InvalidPath(path.to_path_buf()))
 }
 
-/// The real inverse of [`path_to_uri`] - see [`LspClient::path_for_uri`]'s own docs for why this
-/// exists and how a real, non-`file://` result (a genuine, reachable case - see that method's
-/// docs) is handled by its own caller. Parses `uri`'s own real string form with the `url` crate
-/// (the same real dependency [`path_to_uri`] already uses for the opposite direction) rather than
-/// hand-rolling percent-decoding, for the identical reason `path_to_uri`'s own docs give.
+/// The inverse of [`path_to_uri`] - see [`LspClient::path_for_uri`]'s docs for why this
+/// exists and how a non-`file://` result is handled by its caller. Parses `uri`'s string
+/// form with the `url` crate (the same dependency [`path_to_uri`] uses for the opposite
+/// direction) rather than hand-rolling percent-decoding.
 fn uri_to_path(uri: &Uri) -> Result<PathBuf, LspError> {
     let url = url::Url::parse(uri.as_str())
         .map_err(|_| LspError::InvalidUri(uri.as_str().to_string()))?;
@@ -562,11 +542,11 @@ fn uri_to_path(uri: &Uri) -> Result<PathBuf, LspError> {
         .map_err(|_| LspError::InvalidUri(uri.as_str().to_string()))
 }
 
-/// Body of the background reader thread: reads real, framed messages from rust-analyzer's real
-/// stdout in a loop, dispatching each one as a response (has `id`, no `method`), a
-/// server-initiated request (has both `id` and `method` - auto-replied to with a `null` result;
-/// see the doc comment inline below for why), or a notification (`method`, no `id`) - exits
-/// cleanly on a real EOF (the process died) or a real I/O error.
+/// Body of the background reader thread: reads framed messages from rust-analyzer's stdout in
+/// a loop, dispatching each one as a response (has `id`, no `method`), a server-initiated
+/// request (has both `id` and `method` - auto-replied to with a `null` result; see the inline
+/// comment below for why), or a notification (`method`, no `id`) - exits cleanly on EOF (the
+/// process died) or an I/O error.
 fn run_reader_loop(
     stdout: std::process::ChildStdout,
     pending: Arc<Mutex<HashMap<i64, SyncSender<PendingResponse>>>>,
@@ -597,40 +577,26 @@ fn handle_incoming(
 
     if let Some(id) = object.get("id") {
         if object.contains_key("method") {
-            // A real, server-initiated request (e.g. `workspace/configuration`,
+            // A server-initiated request (e.g. `workspace/configuration`,
             // `client/registerCapability`, `window/workDoneProgress/create`) - this phase's
             // scope is diagnostics only, so every such request is answered generically with a
-            // `null` result rather than left unanswered (an unanswered server request is not a
-            // protocol deadlock - JSON-RPC is full-duplex - but leaving it hanging forever is
-            // needless server-side resource retention, and some servers' own request timeouts
-            // would otherwise eventually surface as a real error), except `workspace/
-            // configuration` - see [`server_request_reply`]'s own docs for why that one gets a
-            // real, spec-shaped array reply instead. A later phase (H3) that needs a *real*
-            // answer to some other specific server request can special-case it there without
-            // touching the generic fallback for everything else.
+            // `null` result rather than left unanswered, except `workspace/configuration` -
+            // see [`server_request_reply`]'s docs for why that one gets a spec-shaped array
+            // reply instead.
             let method = object.get("method").and_then(|m| m.as_str()).unwrap_or("");
             let reply = server_request_reply(id, method, object.get("params"));
 
-            // Written from a short-lived, detached thread - deliberately never inline from this
-            // reader thread. See this function's module-level docs for the real deadlock this
-            // avoids: `transport::write_message` is a blocking `write_all` to the child's stdin
-            // pipe; if that pipe's OS write buffer happens to be full at this exact moment (a
-            // real, reachable precondition - e.g. another thread is concurrently mid-write of a
-            // large `textDocument/didOpen` for a large real file, since this client sends full
-            // file text un-chunked, and this repo's own larger source files exceed a pipe's
-            // typical 64KiB buffer), writing here would block *this* reader thread, which stops
-            // it draining the child's stdout; if the child is itself single-threaded and blocked
-            // writing to its own (now-undrained) stdout waiting for *its* stdin to be read
-            // further, neither side can make progress - a classic bidirectional pipe deadlock.
-            // A dedicated persistent writer thread + queue would also fix this, but server-
-            // initiated requests needing a reply are rare (at most a handful over a whole
-            // session, not a hot path), so the per-call thread-spawn cost here is real but
-            // negligible, and it avoids adding a new persistent thread/channel/shutdown-drain
-            // lifecycle for an infrequent case. `stdin`'s `Arc` clone is cheap; the spawned
-            // thread reuses the exact same lock-then-`write_message` path every other outbound
-            // message goes through (`LspClient::send_request_raw`/`send_notification_raw`), so
-            // there is only ever one real writer path into this child's stdin, just not always
-            // invoked from the same OS thread.
+            // Written from a short-lived, detached thread rather than inline from this reader
+            // thread: `transport::write_message` is a blocking `write_all` to the child's
+            // stdin pipe, and if that pipe's OS write buffer is full at this moment (e.g.
+            // another thread is mid-write of a large un-chunked `textDocument/didOpen`),
+            // writing here would block this reader thread from draining the child's stdout -
+            // if the child is itself blocked writing to its own undrained stdout waiting for
+            // more stdin, neither side can make progress. Server-initiated requests needing a
+            // reply are rare (a handful per session, not a hot path), so the per-call
+            // thread-spawn cost is negligible; the spawned thread reuses the same
+            // lock-then-`write_message` path every other outbound message goes through
+            // (`LspClient::send_request_raw`/`send_notification_raw`).
             let stdin = Arc::clone(stdin);
             std::thread::spawn(move || {
                 let mut guard = lock(&stdin);
@@ -639,7 +605,7 @@ fn handle_incoming(
             return;
         }
 
-        // A real response to one of our own requests.
+        // A response to one of our own requests.
         let Some(id) = id.as_i64() else { return };
         let sender = lock(pending).remove(&id);
         let Some(sender) = sender else { return };
@@ -661,10 +627,9 @@ fn handle_incoming(
         return;
     }
 
-    // A real notification - the only one this phase cares about is `publishDiagnostics`;
-    // everything else (`$/progress`, `window/logMessage`, ...) is real server traffic that is
-    // deliberately ignored here rather than half-handled, per this phase's documented scope cut
-    // (see the step report for the indexing-state design this implies).
+    // A notification - the only one this crate cares about is `publishDiagnostics`;
+    // everything else (`$/progress`, `window/logMessage`, ...) is deliberately ignored here
+    // rather than half-handled.
     let Some(method) = object.get("method").and_then(|m| m.as_str()) else {
         return;
     };
@@ -682,24 +647,19 @@ fn handle_incoming(
     }
 }
 
-/// Builds a real, protocol-shaped reply to one real, server-initiated request (`id` + `method`
-/// both present on the incoming message - see [`handle_incoming`]'s own docs for the reader-
-/// thread-side handling this feeds). `workspace/configuration`
-/// (`lsp_types::request::WorkspaceConfiguration`) is special-cased: its real spec'd `Result`
-/// type is `Vec<serde_json::Value>`, one entry per requested `ConfigurationItem` (`lsp_types`'s
-/// own doc comment on that request: "if a scope contains no unique value the corresponding value
-/// can be null") - a bare top-level `null` is not a legal reply shape for it, even though
-/// rust-analyzer (this crate's only real server today) tolerates one in practice. This client's
-/// own `ClientCapabilities::default()` (see [`LspClient::initialize`]) leaves
-/// `workspace.configuration` unset (`None`), meaning this client does not advertise support for
-/// `workspace/configuration` at all - per the LSP spec's own capability gate on that request
-/// ("@since 3.6.0 ... The client supports `workspace/configuration` requests"), a strictly
-/// spec-compliant server should never send it here. Real-world `rust-analyzer` has been observed
-/// sending it anyway (it wants its own configuration sections regardless of what the client
-/// advertised), so this special case is real, exercised behavior against this crate's actual
-/// server, not speculative over-building for a request that can't occur. Every other server-
-/// initiated request method keeps the generic `null`-result fallback, which remains legal per
-/// spec for methods whose real result types vary/are optional.
+/// Builds a protocol-shaped reply to one server-initiated request (`id` + `method` both
+/// present on the incoming message - see [`handle_incoming`]'s docs for the reader-thread-side
+/// handling this feeds). `workspace/configuration`
+/// (`lsp_types::request::WorkspaceConfiguration`) is special-cased: its spec'd `Result` type
+/// is `Vec<serde_json::Value>`, one entry per requested `ConfigurationItem`, so a bare
+/// top-level `null` is not a legal reply shape for it, even though rust-analyzer tolerates one
+/// in practice. This client's `ClientCapabilities::default()` (see [`LspClient::initialize`])
+/// leaves `workspace.configuration` unset, so per spec a strictly compliant server should
+/// never send this request here - but rust-analyzer has been observed sending it anyway
+/// (wanting its own configuration sections regardless of advertised capabilities), so this
+/// special case is exercised behavior, not speculative. Every other server-initiated request
+/// method keeps the generic `null`-result fallback, which remains legal for methods whose
+/// result types vary/are optional.
 fn server_request_reply(
     id: &serde_json::Value,
     method: &str,
@@ -727,10 +687,10 @@ fn server_request_reply(
     })
 }
 
-/// Body of the stderr-draining background thread - see [`LspClient::spawn`]'s docs for why this
-/// exists at all (preventing a full stderr pipe from backpressuring the process). Each line is
-/// logged at `debug` level with a `rust-analyzer:` prefix rather than silently discarded, so a
-/// real startup failure is still observable in this app's own logs.
+/// Body of the stderr-draining background thread - see [`LspClient::spawn`]'s docs for why
+/// this exists (preventing a full stderr pipe from backpressuring the process). Each line is
+/// logged at `debug` level with a `rust-analyzer:` prefix rather than discarded, so a startup
+/// failure is still observable in this app's own logs.
 fn run_stderr_drain_loop(stderr: std::process::ChildStderr) {
     use std::io::BufRead;
     let reader = BufReader::new(stderr);
@@ -747,12 +707,9 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    /// Writes a real, minimal, valid cargo project to a fresh tempdir: a `Cargo.toml` and a
-    /// `src/main.rs`. No external crates.io dependencies (so `cargo metadata`/rust-analyzer's
-    /// own workspace discovery never needs network access), which is also exactly why this real
-    /// scratch project indexes far faster than this repo's own (`vendor/zed`-path-dependent)
-    /// workspace does - see this crate's step report for the timing this was actually observed
-    /// to take.
+    /// Writes a minimal, valid cargo project to a fresh tempdir: a `Cargo.toml` and a
+    /// `src/main.rs`. No external crates.io dependencies, so `cargo metadata`/rust-analyzer's
+    /// workspace discovery never needs network access and indexes fast.
     fn write_scratch_project(main_rs: &str) -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().expect("tempdir");
         std::fs::write(
@@ -765,12 +722,11 @@ mod tests {
         dir
     }
 
-    /// Whether a real `GotoDefinitionResponse` carries zero real locations - a real, distinct
-    /// "not resolved (yet)" case for the `Array`/`Link` shapes (an empty `Vec` is a real, legal
-    /// value for either, spec-wise), used by
-    /// [`rust_analyzer_returns_a_real_definition_location_for_a_call_site`] to keep polling
-    /// rather than mistake it for a genuine zero-results answer against a fixture known to always
-    /// have one. `Scalar` has no empty state at all (a single, always-present `Location`).
+    /// Whether a `GotoDefinitionResponse` carries zero locations - a distinct "not resolved
+    /// yet" case for the `Array`/`Link` shapes (an empty `Vec` is legal for either, spec-wise),
+    /// used by [`rust_analyzer_returns_a_real_definition_location_for_a_call_site`] to keep
+    /// polling rather than mistake it for a genuine zero-results answer. `Scalar` has no empty
+    /// state (a single, always-present `Location`).
     fn goto_definition_response_is_empty(response: &lsp_types::GotoDefinitionResponse) -> bool {
         match response {
             lsp_types::GotoDefinitionResponse::Scalar(_) => false,
@@ -779,9 +735,8 @@ mod tests {
         }
     }
 
-    /// Real, direct `/proc/<pid>` existence check, reused by every lifecycle test below - the
-    /// same real technique `pty_core`'s own tests use (see `crates/pty-core/src/lib.rs`'s
-    /// `pid_exists`) to prove a process is genuinely gone, not just "not tracked by us anymore".
+    /// Direct `/proc/<pid>` existence check, reused by every lifecycle test below - the same
+    /// technique `pty-core`'s own tests use to prove a process is genuinely gone.
     fn pid_exists(pid: u32) -> bool {
         proc::pid_exists(pid)
     }
@@ -852,19 +807,13 @@ mod tests {
             pid_exists(pid),
             "rust-analyzer's real pid {pid} should be alive right after a successful spawn"
         );
-        // Captured *before* `shutdown()` - `proc::collect_descendant_pids`'s own docs require
-        // this ordering (reading it after teardown starts races the kernel reparenting children
-        // out from under `/proc/<pid>/task/<pid>/children`). Honest caveat: this scratch
-        // fixture (`fn main() {}`, no dependencies - see `write_scratch_project`'s own docs for
-        // why it's kept dependency-free) may well not cause rust-analyzer to spawn any real
-        // descendant (a proc-macro server process, or a `cargo check`/`rustc` invocation) within
-        // this test's short runtime, in which case the assertion below is real but trivially
-        // passes over an empty list - it is kept anyway (rather than skipped) because it costs
-        // nothing extra to check and directly exercises the exact real code path
-        // (`proc::collect_descendant_pids`, already unit-tested standalone in `proc.rs` against
-        // a real, guaranteed-to-have-a-child `sh -c 'sleep 30'` fixture there) that a genuinely
-        // dependency-heavy project (this repo's own workspace, for instance) would actually
-        // exercise for real.
+        // Captured *before* `shutdown()` - `proc::collect_descendant_pids`'s docs require this
+        // ordering, since reading it after teardown starts races the kernel reparenting
+        // children out from under `/proc/<pid>/task/<pid>/children`. Honest caveat: this
+        // dependency-free scratch fixture may not cause rust-analyzer to spawn any descendant
+        // within this test's short runtime, in which case the assertion below trivially passes
+        // over an empty list - kept anyway since it costs nothing and exercises the same code
+        // path a dependency-heavy project would.
         let descendants_before_shutdown = proc::collect_descendant_pids(pid);
 
         client.shutdown().expect("shutdown should succeed");

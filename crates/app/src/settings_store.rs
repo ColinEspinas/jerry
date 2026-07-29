@@ -1,59 +1,48 @@
-//! Real, config-file-backed settings (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s
-//! 2026-07-29 entry, change 3: "Settings — narrower, config-file-first, five new pages"). This
-//! module owns [`Settings`] - the one struct that is genuinely loaded from, and saved back to,
-//! a real `~/.config/jerry/settings.toml` on this machine - plus the pure TOML/JSON snippet
-//! rendering the config banner/snippet-block widgets (`crate::root::settings_widgets`) show.
-//! Deliberately separate from `crate::settings` (which stays the live-app-state pure data
-//! module it already was for the Agents/Worktrees pages): this module is specifically about a
-//! real file on disk, not about deriving rows from already-live in-memory state.
+//! Config-file-backed settings (`CHANGELOG.md`'s 2026-07-29 entry, change 3: "Settings —
+//! narrower, config-file-first, five new pages"). Owns [`Settings`] - the struct loaded from,
+//! and saved back to, `~/.config/jerry/settings.toml` - plus the TOML/JSON snippet rendering the
+//! config banner/snippet-block widgets (`crate::root::settings_widgets`) show. Deliberately
+//! separate from `crate::settings`, which stays about already-live in-memory app state rather
+//! than a file on disk.
 //!
 //! ## Scope: every field here is loaded, saved, and read back by something real
 //!
-//! [`Settings`] only has a field for a value this phase actually wires end-to-end: written to
-//! the real file, read back at startup, and consumed by at least one real render call site (see
-//! `crate::root::settings_render`'s per-page docs for exactly which). This mirrors
-//! `crate::settings`'s own documented refusal to render an Agents/Worktrees toggle with nothing
-//! real behind it - the same discipline applied to the config-file surface: no field exists
-//! here "for completeness" or because the mockup shows a row for it.
+//! [`Settings`] only has a field for a value this phase wires end-to-end: written to the file,
+//! read back at startup, and consumed by at least one render call site (see
+//! `crate::root::settings_render`'s per-page docs for which) - no field exists here "for
+//! completeness" just because the mockup shows a row for it.
 //!
 //! ## TOML is the real file; JSON is a read-only alternate view
 //!
 //! The config banner's `TOML | JSON` segment (`crate::root::settings_widgets::render_config_banner`)
-//! is real, but deliberately scoped: **TOML is the one real on-disk source of truth.** Picking
-//! "JSON" re-renders the exact same already-loaded [`Settings`] value through
-//! [`Settings::to_json_string`] for the snippet-block preview, and swaps the displayed path
-//! string to `~/.config/jerry/settings.json` for information purposes only - it does not create,
-//! write, or keep in sync a second physical file. This is a deliberate design decision, not a
-//! missing feature: maintaining two real, independently-editable config files that must always
-//! agree (what happens if a user hand-edits both, differently, while the app isn't running?)
-//! is a materially larger feature than "preview this file's contents in another syntax," and
-//! nothing in `design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3 asks for real JSON
-//! persistence - its own spec text says only that the segment "switches the path and the
-//! snippet below," which is exactly what [`CfgFormat`] does.
+//! is real, but **TOML is the one on-disk source of truth.** Picking "JSON" re-renders the same
+//! already-loaded [`Settings`] value through [`Settings::to_json_string`] for the snippet-block
+//! preview and swaps the displayed path to `~/.config/jerry/settings.json` for information
+//! purposes only - no second physical file is ever created or kept in sync. Maintaining two
+//! independently-editable config files that must always agree is a materially larger feature
+//! than previewing one file's contents in another syntax, and `CHANGELOG.md`'s change 3 only
+//! asks for the path/snippet to switch, which is what [`CfgFormat`] does.
 //!
 //! ## What's persisted-only vs. persisted-and-applied
 //!
-//! [`WindowSettings::controls`] is real, persisted **and** applied -
-//! `crate::root::AdeApp::window_controls_style` reads/writes it directly, so it's the real,
-//! single source of truth for both the title-bar variant and the keycap glyph table (see
-//! `crate::keymap::WindowControlsStyle`'s own docs).
+//! [`WindowSettings::controls`] is persisted **and** applied -
+//! `crate::root::AdeApp::window_controls_style` reads/writes it directly as the single source of
+//! truth for both the title-bar variant and the keycap glyph table.
 //!
-//! [`AppearanceSettings`]'s scaling fields are now also real and applied, each through its own
-//! real, narrow mechanism - see each field's own doc comment for which:
-//! `interface_scale_percent` scales text size only, at a real, growing (but deliberately not
-//! exhaustive) list of render call sites via `crate::root::AdeApp::ui_text_size`;
-//! `editor_font_size` is Surface C's real editor-zoom baseline
-//! (`crate::root::AdeApp::effective_code_rem_px`); `terminal_font_size` really
-//! resizes `crate::terminal_pane::TerminalPane`'s live cells, grid, and pty. `per_tab_zoom`
-//! really governs which of two real zoom-persistence modes Surface C's zoom is in.
-//! `follow_system_text_size` stays real-but-persisted-only, investigated and found to have no
-//! real backing signal available (see `crate::root::settings_render`'s
-//! `toggle_follow_system_text_size` docs for the specific, real Linux GPUI APIs checked).
+//! [`AppearanceSettings`]'s scaling fields are each applied through their own narrow mechanism -
+//! see each field's own doc comment: `interface_scale_percent` scales text size at a growing
+//! (not exhaustive) list of render call sites via `crate::root::AdeApp::ui_text_size`;
+//! `editor_font_size` is Surface C's editor-zoom baseline
+//! (`crate::root::AdeApp::effective_code_rem_px`); `terminal_font_size` resizes
+//! `crate::terminal_pane::TerminalPane`'s live cells, grid, and pty; `per_tab_zoom` governs
+//! which of two zoom-persistence modes Surface C's zoom is in. `follow_system_text_size` stays
+//! persisted-only - investigated and found to have no real backing signal available (see
+//! `crate::root::settings_render`'s `toggle_follow_system_text_size` docs for the specific Linux
+//! GPUI APIs checked).
 //!
-//! [`ThemeSettings`] round-trips correctly (set it, close and reopen the app, it's still set)
-//! but nothing in the render pipeline reads it yet to re-skin colours - `crate::theme` is a set
-//! of compile-time `const` colour tokens, not yet a runtime-swappable resource; a real
-//! theme-swap engine is separately tracked, substantial follow-up work, not a small gap.
+//! [`ThemeSettings`] round-trips correctly but nothing in the render pipeline reads it yet to
+//! re-skin colours - `crate::theme` is a set of compile-time `const` colour tokens, not yet a
+//! runtime-swappable resource; a theme-swap engine is separately tracked follow-up work.
 
 use std::path::{Path, PathBuf};
 
@@ -63,11 +52,9 @@ use crate::keymap::WindowControlsStyle;
 
 /// The real, on-disk (`window`) / (`appearance`) / (`theme`) shape of
 /// `~/.config/jerry/settings.toml` - see the module docs for exactly which of these fields are
-/// merely persisted vs. also applied. `#[serde(default)]` on the struct (and on every nested
-/// struct below) means a hand-edited file missing any key - or an entire missing section -
-/// parses successfully and falls back to that key's real default, rather than failing to load
-/// at all: the whole point of "settings live in a file you can just edit" is defeated if a
-/// small hand-edit mistake bricks the app's settings.
+/// merely persisted vs. also applied. `#[serde(default)]` on the struct (and every nested struct
+/// below) means a hand-edited file missing a key, or an entire section, parses successfully and
+/// falls back to that key's default rather than failing to load at all.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -76,7 +63,7 @@ pub struct Settings {
     pub theme: ThemeSettings,
 }
 
-/// `crate::root::AdeApp::window_controls_style`'s real, persisted backing - see
+/// `crate::root::AdeApp::window_controls_style`'s persisted backing - see
 /// [`crate::keymap::WindowControlsStyle`]'s own "Now persisted (R3)" docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -84,10 +71,9 @@ pub struct WindowSettings {
     pub controls: WindowControlsStyle,
 }
 
-/// The Appearance & scaling settings page's real, persisted fields - see the module docs'
-/// "What's persisted-only vs. persisted-and-applied" section for exactly which of these are
-/// now also real, applied inputs to rendering (most of them) and which is still honestly
-/// persisted-only (`follow_system_text_size`).
+/// The Appearance & scaling settings page's persisted fields - see the module docs'
+/// "What's persisted-only vs. persisted-and-applied" section for which are also applied inputs
+/// to rendering (most of them) and which is persisted-only (`follow_system_text_size`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppearanceSettings {
@@ -110,38 +96,25 @@ impl Default for AppearanceSettings {
     }
 }
 
-/// The real, shared bounds for [`AppearanceSettings::editor_font_size`]/
-/// [`AppearanceSettings::terminal_font_size`] - the same range `crate::root::settings_render`'s
-/// `adjust_editor_font_size`/`adjust_terminal_font_size` steppers already clamp every UI-driven
-/// edit to (`.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX)` there, not a second, independently-chosen
-/// pair of magic numbers), and the same range [`AppearanceSettings::sanitize`] clamps a freshly
-/// *loaded* value to - see that method's own docs for why the load path needs this too, not
-/// just the stepper.
+/// Shared bounds for [`AppearanceSettings::editor_font_size`]/
+/// [`AppearanceSettings::terminal_font_size`] - the same range the Appearance page's steppers
+/// clamp UI edits to, and [`AppearanceSettings::sanitize`] clamps freshly loaded values to.
 pub const FONT_SIZE_MIN: f32 = 9.0;
 pub const FONT_SIZE_MAX: f32 = 32.0;
 
-/// The real, shared bounds for [`AppearanceSettings::interface_scale_percent`] - generous
-/// headroom around the Appearance page's own four selectable presets (90/100/110/125%), not a
-/// tight match to just those four: a hand-edited file choosing some other in-between or
-/// slightly-outside percentage (say `140`) is still a real, plausible, non-corrupt value worth
-/// keeping, unlike an obviously-wrong one (`5000`) a typo or a bad hand-edit could produce.
+/// Shared bounds for [`AppearanceSettings::interface_scale_percent`] - generous headroom around
+/// the Appearance page's four selectable presets (90/100/110/125%), not a tight match to just
+/// those four: a hand-edited file choosing some other in-between or slightly-outside percentage
+/// is still plausible and worth keeping, unlike an obviously-wrong one a bad hand-edit produces.
 pub const INTERFACE_SCALE_PERCENT_MIN: u16 = 50;
 pub const INTERFACE_SCALE_PERCENT_MAX: u16 = 300;
 
 impl AppearanceSettings {
-    /// Clamps every real, numeric field here into its documented real range - see
-    /// [`FONT_SIZE_MIN`]/[`FONT_SIZE_MAX`]/[`INTERFACE_SCALE_PERCENT_MIN`]/
-    /// [`INTERFACE_SCALE_PERCENT_MAX`]'s own docs. Ranges are only ever enforced by the
-    /// stepper/choice-control mutators that drive a *UI* edit (`crate::root::settings_render`),
-    /// never by [`Settings::load_or_init_at`] itself - so a hand-edited `settings.toml` (this
-    /// phase's headline feature: the file is real and genuinely meant to be hand-editable) with
-    /// an out-of-range value (`editor_font_size = 900.0`, `interface_scale_percent = 5000`)
-    /// used to load completely verbatim, with nothing to stop a stepper/segmented-choice control
-    /// from rendering with no valid-looking selection at all. Called once, right after a real
-    /// file successfully deserializes (see [`Settings::load_or_init_at`]) - never silently, and
-    /// never for a value that only ever came from this app's own already-range-checked UI
-    /// mutators in the first place, so this is a real, additional safety net for hand edits
-    /// specifically, not duplicate work.
+    /// Clamps every numeric field into its documented range. UI mutators
+    /// (`crate::root::settings_render`) already clamp their own edits; this exists so a
+    /// hand-edited `settings.toml` with an out-of-range value (`editor_font_size = 900.0`)
+    /// can't reach the render pipeline verbatim. Called once, right after a file successfully
+    /// deserializes (see [`Settings::load_or_init_at`]).
     pub fn sanitize(&mut self) {
         self.interface_scale_percent = self
             .interface_scale_percent
@@ -151,10 +124,9 @@ impl AppearanceSettings {
     }
 }
 
-/// The Themes settings page's real, persisted fields - `name` is the currently-selected real
-/// [`crate::settings::THEME_DEFS`] entry's name (`"Jerry Dark"` by default, matching that
-/// fixture's own `on: true` row). See the module docs for why selecting anything else here
-/// persists correctly without yet re-skinning the running app.
+/// The Themes settings page's persisted fields - `name` is the currently-selected
+/// [`crate::settings::THEME_DEFS`] entry's name (`"Jerry Dark"` by default). See the module
+/// docs for why selecting anything else persists correctly without yet re-skinning the app.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeSettings {
@@ -173,9 +145,8 @@ impl Default for ThemeSettings {
     }
 }
 
-/// The config banner's real `TOML | JSON` segment state
-/// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3) - a display-only choice, not a
-/// [`Settings`] field itself (switching it never touches the real file) - see the module docs'
+/// The config banner's `TOML | JSON` segment state (`CHANGELOG.md`'s change 3) - a display-only
+/// choice, not a [`Settings`] field (switching it never touches the file) - see the module docs'
 /// "TOML is the real file; JSON is a read-only alternate view" section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CfgFormat {
@@ -193,14 +164,10 @@ impl CfgFormat {
     }
 }
 
-/// Real `$HOME`-relative settings path resolution - Unix-only for now
-/// (`std::env::var_os("HOME")`, no `dirs` crate dependency, matching the codebase-wide
-/// convention of not adding a small-utility crate for something `std` already does directly).
-/// Returns `None` on the real (if rare) case `$HOME` isn't set - callers fall back to an
+/// `$HOME`-relative settings path resolution - Unix-only for now (`std::env::var_os("HOME")`,
+/// no `dirs` crate dependency). Returns `None` if `$HOME` isn't set - callers fall back to an
 /// unpersisted, in-memory [`Settings::default`] rather than panicking or guessing a path.
-/// Windows/macOS home-directory resolution is explicitly out of scope for this phase -
-/// `design_handoff_jerry_ade/revision/CHANGELOG.md`'s "Not design changes" note assigns
-/// cross-platform work to Revision R11.
+/// Windows/macOS home-directory resolution is out of scope for now (see `BUILD-LOG.md`).
 pub fn settings_toml_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(
@@ -227,20 +194,11 @@ impl Settings {
         serde_json::to_string_pretty(self).unwrap_or_default()
     }
 
-    /// Real load from `path`. A file that fails to parse outright (not just "missing some
-    /// keys" - `#[serde(default)]` already handles that case by itself, see the struct's own
-    /// docs) falls back to [`Settings::default`] rather than crashing the app over a hand-edit
-    /// mistake - logged via `log::warn!` so the failure is real and visible, never silently
-    /// swallowed. If `path` doesn't exist yet, writes a real default file there (via
-    /// [`Settings::save_at`]) so "the config file exists on first run" is genuinely true, not
-    /// just "would be created eventually" - a save failure (e.g. an unwritable `$HOME`) is also
-    /// logged rather than propagated, since falling back to real in-memory defaults is still a
-    /// working app.
-    ///
-    /// A file that *does* parse still gets one more real pass: [`AppearanceSettings::sanitize`]
-    /// clamps every numeric field into its documented real range, so a hand-edited, structurally
-    /// valid but out-of-range value (`editor_font_size = 900.0`) can never reach the render
-    /// pipeline verbatim - see that method's own docs.
+    /// Loads from `path`. A file that fails to parse outright falls back to [`Settings::default`]
+    /// rather than crashing the app over a hand-edit mistake, logged via `log::warn!`. If `path`
+    /// doesn't exist yet, writes a default file there (via [`Settings::save_at`]) so the config
+    /// file exists on first run; a save failure there is also logged rather than propagated. A
+    /// file that does parse still gets [`AppearanceSettings::sanitize`] applied.
     pub fn load_or_init_at(path: &Path) -> Settings {
         match std::fs::read_to_string(path) {
             Ok(contents) => match toml::from_str::<Settings>(&contents) {
@@ -269,16 +227,11 @@ impl Settings {
         }
     }
 
-    /// Real save to `path` - `toml::to_string_pretty`, creating the parent directory
-    /// (`~/.config/jerry/`) first if it doesn't exist yet.
-    ///
-    /// A plain, non-atomic `std::fs::write` (truncate-then-write), not a write-to-temp-then-
-    /// rename. `crate::root::AdeApp`'s serial settings-save writer loop (see that struct's
-    /// `_settings_save_task` field docs) only ever claims to fix *this process's own* writes
-    /// racing each other - never more than one `save_at` call in flight at a time - not full
-    /// crash- or external-reader-safety: a process crash (or another process reading the file)
-    /// mid-write could still observe a partially-written file, exactly as any other plain
-    /// `fs::write` could.
+    /// Saves to `path`, creating the parent directory first if needed. A plain, non-atomic
+    /// `std::fs::write` (truncate-then-write), not write-to-temp-then-rename -
+    /// `crate::root::AdeApp`'s serial settings-save writer loop (see its `_settings_save_task`
+    /// field docs) only ever guarantees at most one `save_at` call in flight at a time, not
+    /// crash- or external-reader-safety.
     pub fn save_at(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -286,9 +239,8 @@ impl Settings {
         std::fs::write(path, self.to_toml_string())
     }
 
-    /// The real, production entry point - [`settings_toml_path`]'s real `$HOME`-resolved path,
-    /// or an unpersisted in-memory default if that couldn't be resolved (see that function's
-    /// own docs).
+    /// The production entry point - [`settings_toml_path`]'s `$HOME`-resolved path, or an
+    /// unpersisted in-memory default if that couldn't be resolved.
     pub fn load_or_init() -> Settings {
         match settings_toml_path() {
             Some(path) => Settings::load_or_init_at(&path),
@@ -296,9 +248,8 @@ impl Settings {
         }
     }
 
-    /// The real, production save entry point - a no-op `Ok(())` (not an error) when
-    /// [`settings_toml_path`] can't be resolved, matching [`Settings::load_or_init`]'s own
-    /// honest fallback: nothing to save to, but that's not this call's failure to report.
+    /// The production save entry point - a no-op `Ok(())`, not an error, when
+    /// [`settings_toml_path`] can't be resolved, matching [`Settings::load_or_init`]'s fallback.
     pub fn save(&self) -> std::io::Result<()> {
         match settings_toml_path() {
             Some(path) => self.save_at(&path),
@@ -307,13 +258,10 @@ impl Settings {
     }
 }
 
-/// Which real settings page a [`snippet_lines`]/[`config_keys_line`] call is for - deliberately
-/// only the three pages `crate::root::settings_render` actually shows a config banner/snippet
-/// block on (see that module's docs for why Agents/Worktrees/Keybindings/Language servers -
-/// every other page `design_handoff_jerry_ade/revision/Jerry.dc.html`'s own `cfgKeys` fixture
-/// lists - don't get one here: none of them are backed by a [`Settings`] field, so a banner
-/// claiming a `settings.toml` key namespace for them would be describing a file section that
-/// doesn't actually exist).
+/// Which settings page a [`snippet_lines`]/[`config_keys_line`] call is for - only the three
+/// pages `crate::root::settings_render` shows a config banner/snippet block on. Every other page
+/// `Jerry.dc.html`'s own `cfgKeys` fixture lists isn't backed by a [`Settings`] field, so a
+/// banner for it would describe a file section that doesn't exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigPage {
     General,
@@ -321,12 +269,9 @@ pub enum ConfigPage {
     Theme,
 }
 
-/// The config banner's real, dot-joined key list for `page` - `design_handoff_jerry_ade/
-/// revision/CHANGELOG.md`'s change 3 spec ("the page's key list in 9.5px mono ... ellipsised"),
-/// rewritten from `Jerry.dc.html`'s own `cfgKeys` fixture to list only the real
-/// [`Settings`] field paths this phase actually persists (that fixture's `window.
-/// restore_sessions`/`environment.default`, for example, name settings this app doesn't
-/// implement yet - see `crate::root::settings_render`'s General page docs).
+/// The config banner's dot-joined key list for `page` - rewritten from `Jerry.dc.html`'s own
+/// `cfgKeys` fixture to list only the [`Settings`] field paths this app actually persists (that
+/// fixture also names settings this app doesn't implement, e.g. `window.restore_sessions`).
 pub fn config_keys_line(page: ConfigPage) -> &'static str {
     match page {
         ConfigPage::General => "window.controls",
@@ -341,10 +286,9 @@ pub fn config_keys_line(page: ConfigPage) -> &'static str {
     }
 }
 
-/// One line of a real config snippet, tagged for part of the design's syntax tint
-/// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3 names three colors: "section
-/// lines `#c294e0`, key lines `#a9b0b7`, comments `#4e545a`") -
-/// `crate::root::settings_widgets::render_snippet_block` is the only real consumer.
+/// One line of a config snippet, tagged for the design's syntax tint (`CHANGELOG.md`'s change 3
+/// names three colours: section, key, comment) - `crate::root::settings_widgets::render_snippet_block`
+/// is the only consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnippetLine {
     pub text: String,
@@ -352,12 +296,9 @@ pub struct SnippetLine {
 }
 
 /// Only the two kinds [`snippet_lines`] can actually produce - there is no `Comment` variant,
-/// even though the design's own 3-colour scheme (above) names one. [`snippet_lines`] is always a
-/// direct, live re-serialization of the real, already-loaded [`Settings`] value via
-/// `toml::to_string_pretty`/`serde_json::to_string_pretty` (see that function's own docs for why
-/// the snippet can never drift from what the real file actually contains), and neither serializer
-/// ever emits a comment: there is nowhere a real inline comment could honestly come from here
-/// without hand-authoring commentary text this app never actually wrote into the file.
+/// even though the design's own colour scheme names one: [`snippet_lines`] always re-serializes
+/// the live [`Settings`] value via `toml`/`serde_json`, and neither serializer ever emits a
+/// comment, so there's nowhere one could honestly come from here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnippetLineKind {
     Section,
@@ -379,15 +320,11 @@ struct ThemeSnippetDoc<'a> {
     theme: &'a ThemeSettings,
 }
 
-/// Renders `page`'s real slice of `settings` (the actual, currently-loaded struct - never
-/// mockup fixture text) as real TOML or JSON via [`toml::to_string_pretty`]/
-/// [`serde_json::to_string_pretty`], the exact same serializers [`Settings::save_at`]/
-/// [`Settings::to_json_string`] use - so this snippet is never a second, independently-
-/// formatted representation that could drift from what the real file (or its JSON preview)
-/// actually contains. Each field-scoped `*SnippetDoc` wrapper exists only so the real section
-/// header (`[window]`, `[appearance]`, `[theme]`) appears in the output - serializing
-/// `settings.window` directly would produce the same real key/value pairs but with no section
-/// header, since a bare struct at the TOML document root has no name to put in brackets.
+/// Renders `page`'s slice of `settings` (the currently-loaded struct, never mockup fixture text)
+/// as TOML or JSON via the same serializers [`Settings::save_at`]/[`Settings::to_json_string`]
+/// use, so this can't drift from what the file (or its JSON preview) actually contains. Each
+/// field-scoped `*SnippetDoc` wrapper exists only so a section header (`[window]`, etc.) appears
+/// in the output - a bare struct at the TOML document root has no name to put in brackets.
 pub fn snippet_lines(settings: &Settings, page: ConfigPage, format: CfgFormat) -> Vec<SnippetLine> {
     let text = match (page, format) {
         (ConfigPage::General, CfgFormat::Toml) => toml::to_string_pretty(&WindowSnippetDoc {

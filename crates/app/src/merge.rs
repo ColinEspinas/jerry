@@ -1,9 +1,8 @@
-//! Pure (GPUI-free) state for the context bar's real `Merge` action and Surface D's real
+//! Pure (GPUI-free) state for the context bar's `Merge` action and Surface D's
 //! conflict-resolution flow - mirrors `crate::rail`/`crate::status`'s own split: this module
-//! only holds already-computed facts (from real `wt_core::merge` calls made in `crate::root`,
-//! which has the `Context<AdeApp>` background-thread access those calls need) and pure
-//! transitions over them, so the flow logic is directly unit-testable without a live GPUI
-//! window.
+//! only holds already-computed facts (from `wt_core::merge` calls made in `crate::root`, which
+//! has the `Context<AdeApp>` background-thread access those calls need) and pure transitions
+//! over them, so the flow logic is directly unit-testable without a live GPUI window.
 
 use std::path::{Path, PathBuf};
 
@@ -11,23 +10,22 @@ use wt_core::merge::{ConflictSegment, ConflictedFile, ConflictedPath, Unmergeabl
 
 use crate::sessions::SessionId;
 
-/// The real, live state of one merge attempt/resolution, scoped to the session whose `Merge`
-/// button started it.
+/// The live state of one merge attempt/resolution, scoped to the session whose `Merge` button
+/// started it.
 pub struct MergeFlow {
     pub session_id: SessionId,
     pub state: MergeFlowState,
 }
 
-/// The real state of a [`MergeFlow`] - every variant here corresponds to a real,
-/// already-happened `wt_core::merge` outcome (or a real error from one), never a simulated
-/// intermediate state.
+/// The state of a [`MergeFlow`] - every variant corresponds to an already-happened
+/// `wt_core::merge` outcome (or an error from one), never a simulated intermediate state.
 pub enum MergeFlowState {
-    /// The real `git merge` child process is still running on a background thread.
+    /// The `git merge` child process is still running on a background thread.
     Running,
     /// The session branch already contributes nothing new to the base branch - `git merge`
-    /// exited successfully but there was really nothing to merge.
+    /// exited successfully but there was nothing to merge.
     AlreadyUpToDate { base_branch: String },
-    /// The merge completed with no real conflicts and is staged, uncommitted - waiting for an
+    /// The merge completed with no conflicts and is staged, uncommitted - waiting for an
     /// explicit `complete_merge` click (see `wt_core::merge::complete_merge`'s docs for why
     /// this is never auto-committed).
     Clean {
@@ -35,13 +33,13 @@ pub enum MergeFlowState {
         base_worktree_path: PathBuf,
         files: Vec<PathBuf>,
     },
-    /// The merge produced one or more real conflicted files, each classified from git's own
-    /// real ground truth (`wt_core::merge::classify_conflicted_file`) into either a real,
-    /// resolvable text conflict or one this app has no text-hunk resolution for at all (a
-    /// modify/delete or binary conflict - see [`ConflictedPath`]'s docs). `files` holds their
-    /// live, possibly-partially-resolved state; `active_file`/`active_hunk` index into it for
-    /// whichever real text hunk Surface D currently shows (meaningless, and never read, while
-    /// [`first_unresolved`] returns `None`).
+    /// The merge produced one or more conflicted files, each classified from git's own ground
+    /// truth (`wt_core::merge::classify_conflicted_file`) into either a resolvable text
+    /// conflict or one this app has no text-hunk resolution for (a modify/delete or binary
+    /// conflict - see [`ConflictedPath`]'s docs). `files` holds their live, possibly
+    /// partially-resolved state; `active_file`/`active_hunk` index into it for whichever hunk
+    /// Surface D currently shows (meaningless, and never read, while [`first_unresolved`]
+    /// returns `None`).
     Conflicted {
         base_branch: String,
         base_worktree_path: PathBuf,
@@ -52,32 +50,31 @@ pub enum MergeFlowState {
         active_file: usize,
         active_hunk: usize,
     },
-    /// A real error from `wt_core::merge` (a refused dirty base worktree, no detectable base
-    /// branch, the base branch not checked out anywhere, a real git failure, ...) or from
-    /// resolving/writing a conflicted file. The real repository state is left exactly as
-    /// `wt_core::merge` (or git itself) left it - never silently discarded.
+    /// An error from `wt_core::merge` (a refused dirty base worktree, no detectable base
+    /// branch, the base branch not checked out anywhere, a git failure, ...) or from
+    /// resolving/writing a conflicted file. Repository state is left exactly as `wt_core::merge`
+    /// (or git itself) left it - never silently discarded.
     Error {
         message: String,
-        /// The real base worktree to offer a real `Abort merge` action against, if
-        /// `wt_core::merge::find_in_progress_merge`/`merge_head_exists` actually found
-        /// `MERGE_HEAD` present there at the moment this error state was constructed - `None`
-        /// when no merge is genuinely in progress (so there is nothing real to abort). Without
-        /// this, an error part-way through a real merge attempt (e.g. a read failure after
-        /// `git merge` already ran) would leave the UI with only a `Dismiss` action that makes
-        /// zero git calls - dismissing would silently abandon the real worktree mid-merge
-        /// (`MERGE_HEAD` still present), permanently refusing every future merge attempt
-        /// against that base worktree (`Error::MergeTargetDirty`/"you have not concluded your
-        /// merge") until someone runs a real `git merge --abort` by hand in a terminal.
+        /// The base worktree to offer an `Abort merge` action against, if
+        /// `wt_core::merge::find_in_progress_merge`/`merge_head_exists` found `MERGE_HEAD`
+        /// present there when this error state was constructed - `None` when no merge is
+        /// actually in progress. Without this, an error part-way through a merge attempt (e.g.
+        /// a read failure after `git merge` already ran) would leave the UI with only a
+        /// `Dismiss` action that makes no git calls - dismissing would silently abandon the
+        /// worktree mid-merge (`MERGE_HEAD` still present), permanently refusing every future
+        /// merge attempt against that base worktree until someone runs `git merge --abort` by
+        /// hand.
         abortable_worktree: Option<PathBuf>,
     },
 }
 
-/// Find the first (file, hunk) index, in order, that's still a real, resolvable unresolved
+/// Finds the first (file, hunk) index, in order, that's still an unresolved
 /// [`ConflictSegment::Conflict`] within a [`ConflictedPath::Text`] entry - `None` once every
 /// such hunk is resolved, *or* if every remaining unresolved entry is
-/// [`ConflictedPath::Unmergeable`] (which has no hunk for Surface D's two-column editor to
-/// show at all - see [`unmergeable_paths`] for that case). Used both to pick which hunk
-/// Surface D shows first, and to advance to the next one after a resolve.
+/// [`ConflictedPath::Unmergeable`] (which has no hunk for Surface D's two-column editor to show,
+/// see [`unmergeable_paths`]). Used both to pick which hunk Surface D shows first, and to
+/// advance to the next one after a resolve.
 pub fn first_unresolved(files: &[ConflictedPath]) -> Option<(usize, usize)> {
     for (file_index, entry) in files.iter().enumerate() {
         let ConflictedPath::Text(file) = entry else {
@@ -94,14 +91,12 @@ pub fn first_unresolved(files: &[ConflictedPath]) -> Option<(usize, usize)> {
     None
 }
 
-/// Whether every conflicted path is genuinely, fully resolved - the real, computed condition
-/// that unlocks Surface D's `Complete merge` action for a conflicted flow. An
-/// [`ConflictedPath::Unmergeable`] entry is *never* resolved by this check (there is
-/// deliberately no automatic path from "unmergeable" to "resolved" - see that variant's own
-/// docs): this app has no text-hunk resolution action for a modify/delete or binary conflict,
-/// so one remaining in `files` must keep blocking `Complete merge` exactly like a real
-/// unresolved text hunk would, never silently count as done just because the conflict-marker
-/// parser found nothing to parse.
+/// Whether every conflicted path is fully resolved - the condition that unlocks Surface D's
+/// `Complete merge` action. An [`ConflictedPath::Unmergeable`] entry is *never* resolved by this
+/// check (there is deliberately no automatic path from "unmergeable" to "resolved"): this app
+/// has no text-hunk resolution action for a modify/delete or binary conflict, so one remaining
+/// in `files` must keep blocking `Complete merge` like an unresolved text hunk would - never
+/// silently count as done just because the conflict-marker parser found nothing to parse.
 pub fn all_resolved(files: &[ConflictedPath]) -> bool {
     files.iter().all(|entry| match entry {
         ConflictedPath::Text(file) => file.is_resolved(),
@@ -109,11 +104,10 @@ pub fn all_resolved(files: &[ConflictedPath]) -> bool {
     })
 }
 
-/// The real conflicted paths this app has no text-hunk resolution for at all - modify/delete
-/// or binary conflicts (see [`ConflictedPath::Unmergeable`]'s docs). Surface D shows these in
-/// their own distinct panel (real paths, real reasons) rather than silently treating a merge
-/// as "resolved" once every *text* conflict is handled while one of these still blocks
-/// `Complete merge`.
+/// The conflicted paths this app has no text-hunk resolution for at all - modify/delete or
+/// binary conflicts (see [`ConflictedPath::Unmergeable`]'s docs). Surface D shows these in their
+/// own panel rather than silently treating a merge as "resolved" once every *text* conflict is
+/// handled while one of these still blocks `Complete merge`.
 pub fn unmergeable_paths(files: &[ConflictedPath]) -> Vec<(&Path, UnmergeableReason)> {
     files
         .iter()
@@ -127,10 +121,10 @@ pub fn unmergeable_paths(files: &[ConflictedPath]) -> Vec<(&Path, UnmergeableRea
         .collect()
 }
 
-/// How many real conflict hunks remain, total, across every file - the pre-flight strip's
-/// "only N files need you" count is `files.len() - clean_files.len()`, but this is the raw
-/// hunk-level count Surface D's header (`hunk X of Y`) needs within the active file
-/// specifically; see [`hunk_position_in_file`].
+/// How many conflict hunks remain, total, in `file` - the pre-flight strip's "only N files need
+/// you" count is `files.len() - clean_files.len()`, but this is the raw hunk-level count
+/// Surface D's header (`hunk X of Y`) needs within the active file; see
+/// [`hunk_position_in_file`].
 pub fn hunk_count(file: &ConflictedFile) -> usize {
     file.segments
         .iter()

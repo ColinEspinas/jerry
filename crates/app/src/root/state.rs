@@ -3,28 +3,22 @@ use crate::root::code_surface::{DiffLoadState, FileLoadState};
 use crate::root::sidebar_render::RightSidebarView;
 
 impl AdeApp {
-    /// Real, production entry point - loads `~/.config/jerry/settings.toml` for real
-    /// (`Settings::load_or_init`, see that method's own docs for why this is one of the rare
-    /// deliberate exceptions to this codebase's "never block the foreground thread" rule: it's
-    /// a single, tiny file read that must complete before the very first frame renders anyway -
-    /// unlike every other blocking-I/O call this project's audits have repeatedly caught, this
-    /// one is not a per-render or per-poll cost, it runs exactly once, before a window even
-    /// exists) and delegates to [`Self::new_with_settings`].
+    /// Production entry point - loads `~/.config/jerry/settings.toml` (`Settings::load_or_init`)
+    /// and delegates to [`Self::new_with_settings`]. Blocking the foreground thread here is a
+    /// deliberate exception to this codebase's usual rule: it's a single tiny file read that
+    /// runs exactly once, before a window even exists, not a per-render or per-poll cost.
     pub fn new(repo_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings_path = settings_store::settings_toml_path();
         let settings = settings_store::Settings::load_or_init();
         Self::new_with_settings(repo_path, settings, settings_path, window, cx)
     }
 
-    /// The real constructor - takes an already-resolved [`Settings`] value and its real
-    /// (optional) source path rather than resolving them itself, so [`Self::new`] (the real
-    /// `~/.config/jerry/settings.toml`-backed production path) and
-    /// `root::focus::palette_focus_tests::open_test_app` (every GPUI regression test in this
-    /// crate's shared entry point) can each supply their own - test app instances get real,
-    /// in-memory-only defaults and a `None` path, so [`Self::persist_settings`] is a genuine,
-    /// honest no-op for them (the same real code path a genuinely `$HOME`-less production
-    /// environment already exercises - see [`settings_store::settings_toml_path`]'s own docs),
-    /// never a write to whatever real machine happens to run `cargo test`.
+    /// The real constructor - takes an already-resolved [`Settings`] and its optional source
+    /// path rather than resolving them itself, so [`Self::new`] (production) and
+    /// `root::focus::palette_focus_tests::open_test_app` (every GPUI test's shared entry point)
+    /// can each supply their own. Test instances get in-memory-only defaults and a `None` path,
+    /// so [`Self::persist_settings`] is a genuine no-op for them, never a write to whatever
+    /// machine happens to run `cargo test`.
     pub(super) fn new_with_settings(
         repo_path: PathBuf,
         settings: settings_store::Settings,
@@ -126,17 +120,10 @@ impl AdeApp {
             plus_button_bounds: gpui::Bounds::default(),
             _new_agent_pane_task: TaskPool::new(),
         };
-        // A fresh window shouldn't open with zero tabs and no way to see anything running -
-        // start with one real shell in the repo root, exactly like step 3's single terminal
-        // did, except now it's a tab like any other rather than the only pane that can
-        // exist. `open_change` is always `None` this early (it's initialized a few fields up,
-        // above), so this always moves real keyboard focus onto the fresh session's own pane
-        // (see `Sessions::focus_active`'s own docs for the real bug this fixes) - a freshly
-        // opened window would otherwise start with `Window::focus == None`, and every bound
-        // action (⌘K/⌘N) would fall back to dispatch against the root node, which has no
-        // `on_action` handler of its own registered (see `Self::render`'s docs on why those
-        // handlers live where they do), until the user manually clicked into the terminal
-        // first.
+        // A fresh window starts with one shell in the repo root, as a tab like any other.
+        // `focus_active` below moves real keyboard focus onto it - see `Sessions::focus_active`'s
+        // docs and this crate's `OverlayFocus`/`restore_focus` docs for why a fresh window must
+        // never start with `Window::focus == None`.
         this.sessions.spawn(
             SessionKind::Shell,
             repo_path.clone(),
@@ -177,17 +164,13 @@ impl AdeApp {
         self._load_worktrees_task = Some(task);
     }
 
-    /// Recomputes [`Self::disk_usage`] *and* [`Self::worktree_disk_usage`] from the current
-    /// real worktree list, offloaded to the background executor - see
-    /// `crate::rail::disk_usage_bytes`'s docs for the real, bounded `std::fs` walk this runs
-    /// once per readable worktree. Run once per worktree-list load (not on the 3s status-poll
-    /// cadence - a `std::fs` walk is real per-file I/O, and re-walking every worktree's entire
-    /// tree every 3s would be needless cost for numbers that only meaningfully change when a
-    /// worktree is added, removed, or its files change).
+    /// Recomputes [`Self::disk_usage`] and [`Self::worktree_disk_usage`] from the current
+    /// worktree list, offloaded to the background executor (`crate::rail::disk_usage_bytes`).
+    /// Run once per worktree-list load, not on the 3s status-poll cadence - a `std::fs` walk per
+    /// worktree every 3s would be needless cost for numbers that rarely change.
     ///
     /// [`Self::disk_usage`] (the rail footer's aggregate) is always derived from the same
-    /// per-path map the Settings › Worktrees page reads - one real computation, two real
-    /// consumers, never two separately-run walks that could disagree.
+    /// per-path map the Settings › Worktrees page reads - one computation, two consumers.
     pub(super) fn load_disk_usage(&mut self, cx: &mut Context<Self>) {
         let paths: Vec<PathBuf> = self
             .worktrees
@@ -272,15 +255,12 @@ impl AdeApp {
         }
         let path = item.path.clone();
         self.selected = Some(index);
-        // Any other rail interaction disarms a pending prune confirmation - see
-        // `Self::request_prune`'s docs. Browsing to a different worktree is exactly the kind
-        // of "I did something else" that must not let a stale armed click land later.
+        // Browsing to a different worktree disarms a pending prune confirmation - see
+        // `Self::request_prune`'s docs.
         self.prune_confirm_armed = false;
-        // Review/collapse state is per-worktree in spirit but keyed only by repo-relative (or,
-        // for `collapsed_dirs`, absolute-but-never-pruned) path (see
-        // `reset_per_worktree_ui_state`'s docs) - reset it here so switching worktrees never
-        // leaks a "reviewed" checkbox or an open diff from the worktree just left, and never
-        // lets `collapsed_dirs` grow forever across however many worktrees get browsed.
+        // Reset per-worktree UI state (see `reset_per_worktree_ui_state`'s docs) so switching
+        // worktrees never leaks a "reviewed" checkbox, open diff, or collapsed-dir entry from
+        // the worktree just left.
         reset_per_worktree_ui_state(
             &mut self.reviewed_files,
             &mut self.open_files,
@@ -289,13 +269,9 @@ impl AdeApp {
             &mut self.selected_tree_path,
             &mut self.file_zoom_percent,
         );
-        // `code_view`/`file_view_cache`/`file_load_state`/`file_view_changed_lines`/
-        // `code_cursor`/`open_diff_file_cache` are the File view's own equivalent per-worktree
-        // UI state (a cached parse of a file, and a cached diff lookup, that are both about to
-        // belong to a whole different worktree's `file_tree_root`) - reset for exactly the same
-        // reason `reset_per_worktree_ui_state`'s own docs give for `open_change`/
-        // `reviewed_files`. Dropping `_file_load_task` (rather than leaving it to finish)
-        // cancels any real, in-flight load for the worktree just left - see that field's docs.
+        // The File view's own per-worktree state (a cached parse and diff lookup that are about
+        // to belong to a different `file_tree_root`) - reset for the same reason as above.
+        // Dropping `_file_load_task` cancels any in-flight load for the worktree just left.
         self.code_view = code_view::CodeView::Diff;
         self.file_view_cache = None;
         self.file_load_state = FileLoadState::Idle;
@@ -303,21 +279,14 @@ impl AdeApp {
         self.code_cursor = None;
         self.open_diff_file_cache = None;
         self._file_load_task = None;
-        // `file_zoom_percent` (cleared above, alongside `open_files`) is per-worktree; the
-        // single shared `code_zoom_percent` value also has to reset back to the real 100%
-        // default here, for the same reason `code_view` resets to `Diff` above rather than
-        // silently carrying over whatever the worktree just left happened to be zoomed to.
         self.code_zoom_percent = AdeApp::ZOOM_DEFAULT_PERCENT;
-        // The Hover-state cache is per-file (see `Self::hover`'s own docs) - clear it here too,
-        // for the same real reason: without this, a hover card from the worktree just left could
-        // render again the instant a same-named file happened to be opened in the new one.
+        // The hover cache is per-file - clear it too, or a hover card from the worktree just
+        // left could reappear the instant a same-named file opens in the new one.
         self.hover = None;
         self.pending_cursor_line = None;
         self.load_file_tree(path.clone(), cx);
-        // `load_file_tree` (just called, above) synchronously sets `self.file_tree_root = path`
-        // before its own background task even starts (see that method's own docs) - so `path`
-        // is already the real, active root by the time eviction runs; nothing here races the
-        // still-in-flight file-tree load itself.
+        // `load_file_tree` above already set `self.file_tree_root = path` synchronously, so
+        // `path` is the active root by the time eviction runs.
         self.evict_stale_lsp_clients(&path, cx);
         self.load_diff(path, cx);
         cx.notify();
@@ -338,19 +307,14 @@ impl AdeApp {
     }
 }
 
-/// Clears every piece of per-worktree UI state that would otherwise survive a worktree switch
-/// ([`AdeApp::reviewed_files`], [`AdeApp::open_files`], [`AdeApp::open_change`],
-/// [`AdeApp::collapsed_dirs`]) - called from [`AdeApp::select_worktree`] on every switch.
-/// `reviewed_files`/`open_files`/`open_change` are keyed by repo-relative paths, so without this
-/// reset a file reviewed (or opened) in worktree A would silently read as already-reviewed - or
-/// reopen a same-named file, or leave a stale tab in the strip - in worktree B just because it
-/// happens to share the same relative path; none of the three has any per-worktree scoping of
-/// its own. `collapsed_dirs` is keyed by absolute path (so it never visually bleeds the same way,
-/// since two worktrees are different directories on disk), but nothing ever removed a past
-/// worktree's entries either, so it grew unboundedly across however many worktrees got browsed
-/// in a session; clearing it here on every switch is the same fix applied for the same reason.
-/// Pulled out as a free, `gpui`-free function (rather than an `AdeApp` method) so this behavior
-/// is directly unit-testable without needing a `Context<AdeApp>` to construct an `AdeApp` first.
+/// Clears every piece of per-worktree UI state that would otherwise survive a worktree switch -
+/// called from [`AdeApp::select_worktree`] on every switch. `reviewed_files`/`open_files`/
+/// `open_change` are keyed by repo-relative paths with no per-worktree scoping of their own, so
+/// without this reset a file reviewed or opened in worktree A would read as already-reviewed (or
+/// reopen) in worktree B if it shares the same relative path. `collapsed_dirs` is keyed by
+/// absolute path, so it doesn't bleed the same way, but nothing else ever pruned its entries
+/// either. A free, `gpui`-free function so this is unit-testable without constructing an
+/// `AdeApp`.
 pub(super) fn reset_per_worktree_ui_state(
     reviewed_files: &mut HashSet<PathBuf>,
     open_files: &mut Vec<PathBuf>,
@@ -371,11 +335,6 @@ pub(super) fn reset_per_worktree_ui_state(
 mod tests {
     use super::*;
 
-    /// Regression test for the cross-worktree state-bleed bug: `reviewed_files`/`open_change`
-    /// are keyed only by repo-relative path, so without `reset_per_worktree_ui_state`'s call in
-    /// `AdeApp::select_worktree`, a file reviewed (or opened) in one worktree would silently
-    /// read as already-reviewed - or reopen a same-named file - in a different worktree that
-    /// happens to share the same relative path.
     #[test]
     fn reset_per_worktree_ui_state_clears_reviewed_files_and_open_change() {
         let mut reviewed_files = HashSet::new();
@@ -400,11 +359,7 @@ mod tests {
         assert_eq!(open_change, None);
     }
 
-    /// The same worktree-relative-path bleed [`reset_per_worktree_ui_state_clears_reviewed_files_and_open_change`]
-    /// covers for `open_change`, extended to the new `open_files` tab list: every open tab from
-    /// the worktree just left must be gone, not just deactivated - otherwise a stale tab in the
-    /// strip would keep pointing at a repo-relative path that means something else (or nothing at
-    /// all) in the newly selected worktree.
+    /// Every open tab from the worktree just left must be gone, not just deactivated.
     #[test]
     fn reset_per_worktree_ui_state_clears_every_open_file_tab() {
         let mut reviewed_files = HashSet::new();
@@ -457,10 +412,6 @@ mod tests {
         assert!(collapsed_dirs.is_empty());
     }
 
-    /// Regression test for the "never pruned" half of the same bug (item f): `collapsed_dirs`
-    /// is keyed by absolute path, so it doesn't visually bleed between worktrees the way
-    /// `reviewed_files` does, but nothing removed a past worktree's entries either, so it grew
-    /// unboundedly across however many worktrees got browsed in a session.
     #[test]
     fn reset_per_worktree_ui_state_clears_collapsed_dirs_too() {
         let mut reviewed_files = HashSet::new();
@@ -505,11 +456,9 @@ mod tests {
         assert_eq!(selected_tree_path, None);
     }
 
-    /// Regression test for the same real per-worktree bleed the rest of this module already
-    /// covers, extended to editor zoom (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s
-    /// 2026-07-29 entry, change 6): `file_zoom_percent` is keyed by the same worktree-relative
-    /// paths as `open_files`, so without this a zoom level remembered for `src/main.rs` in one
-    /// worktree would silently apply to a same-named file in a completely different one.
+    /// `file_zoom_percent` is keyed the same way as `open_files`; without this reset a zoom
+    /// level remembered for `src/main.rs` in one worktree would apply to a same-named file in a
+    /// different one.
     #[test]
     fn reset_per_worktree_ui_state_clears_file_zoom_percent() {
         let mut reviewed_files = HashSet::new();

@@ -1,16 +1,10 @@
-//! Builds a flattened, indented file tree for the right sidebar by walking a real
-//! directory with `std::fs::read_dir`. Pure and GPUI-independent so it's unit testable
-//! without a window.
+//! Builds a flattened, indented file tree for the right sidebar by walking a directory with
+//! `std::fs::read_dir`. Pure and GPUI-independent so it's unit testable without a window.
 //!
-//! Scope decisions (documented per the step-3 brief):
-//! - Dotfiles/dot-directories (names starting with `.`) are skipped, matching most file
-//!   explorers' defaults and, more importantly, keeping this fast: the main worktree's
-//!   `.git` directory can contain many thousands of loose objects, and walking it would
-//!   make this feature slow to the point of being unusable for its actual purpose (letting
-//!   someone browse their project's files).
-//! - The walk is capped at [`MAX_ENTRIES`] total entries as a defensive bound against
-//!   pathological trees (this is a UI sidebar, not a full indexer); once the cap is hit,
-//!   remaining entries are simply omitted rather than erroring.
+//! Dotfiles/dot-directories are skipped, matching most file explorers' defaults and, more
+//! importantly, keeping this fast: `.git` can contain many thousands of loose objects, and
+//! walking it would make browsing unusably slow. The walk is capped at [`MAX_ENTRIES`] total
+//! entries as a defensive bound; once hit, remaining entries are simply omitted.
 
 use std::collections::HashSet;
 use std::fs;
@@ -26,13 +20,10 @@ use crate::theme;
 const MAX_ENTRIES: usize = 5000;
 
 /// Cap on how many *visible* file-tree rows `crate::root::AdeApp::render_file_tree` turns into
-/// actual GPUI elements, independent of [`MAX_ENTRIES`]'s much larger loaded-tree size. Laying
-/// out that many `div`s through GPUI's flexbox engine on *every* render (which happens as
-/// often as every ~33ms while a terminal pane is streaming output and calling `cx.notify()`)
-/// was a real, measured foreground-executor stall during an earlier step's own verification. A
-/// real virtualized list (`uniform_list`, see `vendor/zed/crates/project_panel`) would be a
-/// further improvement for a tree of unbounded size, but is out of scope here. Also used by
-/// [`visible_entries`] to bound its own allocation - see that function's docs.
+/// GPUI elements, independent of [`MAX_ENTRIES`]'s much larger loaded-tree size. Laying out that
+/// many `div`s on every render caused a measured foreground-executor stall while a terminal pane
+/// streams output. A virtualized list (`uniform_list`, see `vendor/zed/crates/project_panel`)
+/// would scale further but is out of scope here. Also bounds [`visible_entries`]'s allocation.
 pub const MAX_RENDERED_FILE_ENTRIES: usize = 500;
 
 /// One row in the flattened file tree: a real filesystem entry, its path, and its depth
@@ -131,27 +122,19 @@ pub fn lang_chip_for_name(name: &str) -> LangChip {
 }
 
 /// Filters a flattened, depth-annotated [`build_file_tree`] listing down to the rows that
-/// should actually be rendered given which directories are collapsed - the real backing logic
-/// for the file tree's collapse/expand feature (a collapsed directory's own row still shows,
-/// but every row nested underneath it is hidden until it's expanded again).
+/// should be rendered given which directories are collapsed (a collapsed directory's own row
+/// still shows, but everything nested underneath it is hidden until re-expanded).
 ///
-/// Relies on `entries` being in the same pre-order depth-first shape `build_file_tree` produces
-/// (a directory immediately followed by its own descendants, deeper `depth` first): once a
-/// collapsed directory at depth `d` is seen, every following entry with `depth > d` is skipped,
-/// and skipping stops as soon as an entry with `depth <= d` is reached (i.e. a sibling or an
-/// ancestor's next sibling - past the collapsed subtree). Nested collapsed directories inside an
-/// already-hidden subtree need no special case: they're already skipped along with the rest of
-/// their (also hidden) parent.
+/// Relies on `entries` being in `build_file_tree`'s pre-order depth-first shape: once a
+/// collapsed directory at depth `d` is seen, every following entry with `depth > d` is skipped
+/// until one with `depth <= d` is reached. Nested collapsed directories inside an already-hidden
+/// subtree need no special case - they're skipped along with the rest of their parent.
 ///
-/// The returned `Vec`'s full length still matters to the caller (`crate::root::AdeApp::
-/// render_file_tree`'s "... and N more entries not shown" count), so every visible entry really
-/// is collected here rather than stopping early at [`MAX_RENDERED_FILE_ENTRIES`] - but the
-/// initial allocation is capped at that same bound rather than `entries.len()` (which can be up
-/// to [`MAX_ENTRIES`], 5000): most real trees have far fewer entries collapsed away than that,
-/// and reserving capacity for a full 5000-entry tree on every render when at most
-/// `MAX_RENDERED_FILE_ENTRIES` (500) of them will ever be rendered wastes an allocation for no
-/// benefit - `Vec` still grows geometrically past this initial reservation if the real visible
-/// count exceeds it.
+/// The full result length still matters to the caller (`crate::root::AdeApp::render_file_tree`'s
+/// "... and N more entries not shown" count), so every visible entry is collected rather than
+/// stopping early at [`MAX_RENDERED_FILE_ENTRIES`] - only the initial allocation is capped at
+/// that bound instead of `entries.len()` (up to [`MAX_ENTRIES`], 5000), since most trees have far
+/// fewer than 500 visible entries.
 pub fn visible_entries<'a>(
     entries: &'a [FileTreeEntry],
     collapsed: &HashSet<PathBuf>,

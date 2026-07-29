@@ -2,17 +2,12 @@ use super::*;
 use crate::root::widgets::{render_keycap_row, KeycapSize};
 
 impl AdeApp {
-    /// The 26px status bar (`design_handoff_jerry_ade/README.md`'s Layout table: height 26,
-    /// bg `#101214`, top border `#1e2225`). The mockup's own `↑2 ↓0` ahead/behind counts and
-    /// `{{ statusLine }}` template placeholder still need git plumbing this phase doesn't build,
-    /// so they're left out (rendering those would be exactly the "component bound to nothing"
-    /// this project's constraints forbid) - but the `⌘K commands` hint is now real: the command
-    /// palette exists as of this phase, so clicking it (or pressing the real `secondary-k`
-    /// binding - see [`TogglePalette`]) really opens it, the same as `Jerry.dc.html`'s own
-    /// `onClick={{onOpenPalette}}`. The mockup's second `⌘⇧K sessions` hint is deliberately
-    /// omitted: that binding was never wired up in this phase (see the "Command palette" task
-    /// docs' own scope), so showing a keycap for it would advertise a shortcut that silently
-    /// does nothing if pressed.
+    /// The 26px status bar. The mockup's `↑2 ↓0` ahead/behind counts and `{{ statusLine }}`
+    /// template placeholder need git plumbing this app doesn't build, so they're left out rather
+    /// than bound to nothing. The `⌘K commands` hint is real: clicking it (or pressing the bound
+    /// `secondary-k` - see [`TogglePalette`]) opens the command palette. The mockup's second
+    /// `⌘⇧K sessions` hint is omitted since that binding is never wired up - showing a keycap for
+    /// it would advertise a shortcut that silently does nothing.
     pub(super) fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let worktree_count = self.worktrees.len();
         let label = match worktree_count {

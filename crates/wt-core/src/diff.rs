@@ -4,10 +4,10 @@
 //! ## What "base" means
 //!
 //! A git worktree has no notion of an explicit "base branch": it just has a branch (or a
-//! detached commit) checked out. For an agent-development-environment reviewing what an
-//! agent changed before merging, the useful comparison is against the point where the
-//! worktree's branch diverged from the repository's default branch - i.e. the merge-base
-//! between the worktree's `HEAD` and the default branch's tip.
+//! detached commit) checked out. The useful comparison for reviewing what changed before
+//! merging is against the point where the worktree's branch diverged from the repository's
+//! default branch - i.e. the merge-base between the worktree's `HEAD` and the default
+//! branch's tip.
 //!
 //! The default branch itself is detected, in order:
 //! 1. `refs/remotes/origin/HEAD`, if it exists and is a symbolic ref (mirrors
@@ -15,13 +15,13 @@
 //! 2. A local `main` branch, if one exists.
 //! 3. A local `master` branch, if one exists.
 //! 4. The main worktree's own currently checked-out branch, as a last resort (so a
-//!    repository with neither an `origin` remote nor a `main`/`master` branch - e.g. one
-//!    initialized locally on some other default branch name - still gets a sensible base).
+//!    repository with neither an `origin` remote nor a `main`/`master` branch still gets a
+//!    sensible base).
 //!
 //! If none of these yield a branch, or the selected worktree's branch *is* the detected
-//! default branch, or no merge-base exists between the two histories (e.g. genuinely
-//! unrelated histories), there is no sensible base: [`diff_against_base`] returns
-//! [`DiffBase::NoBaseFound`] or [`DiffBase::OnDefaultBranch`] rather than fabricating one.
+//! default branch, or no merge-base exists between the two histories, [`diff_against_base`]
+//! returns [`DiffBase::NoBaseFound`] or [`DiffBase::OnDefaultBranch`] rather than fabricating
+//! a base.
 //!
 //! ## What the diff includes
 //!
@@ -29,46 +29,38 @@
 //! itself as the current directory. `git diff <commit>` compares `<commit>`'s tree against
 //! the *working tree* (index and unstaged changes included), which is deliberate: an agent
 //! working in this worktree may not have committed anything yet, so limiting the diff to
-//! committed history (`<merge-base>..HEAD`) would hide exactly the changes a reviewer most
-//! wants to see. This one command covers both committed-since-branch-point changes and any
-//! uncommitted working-tree changes on top of them - with one real gap: `git diff <commit>`
-//! (with no `--cached`) only ever considers paths already present in `<commit>`'s tree or in
-//! the index, so a genuinely untracked file (created but never `git add`ed) is invisible to
-//! it no matter what. Since a new, unstaged file is exactly the single most common thing an
-//! agent produces, [`diff_against_base`] works around this with [`prepare_shadow_index`]: a
-//! throwaway, `--intent-to-add`-augmented copy of the real index, passed to `git diff` via a
-//! `GIT_INDEX_FILE` override so untracked files show up as real additions too, without ever
-//! touching the real index. See that function's docs for the mechanics and why it's safe.
+//! committed history would hide exactly the changes a reviewer most wants to see. One gap:
+//! `git diff <commit>` (with no `--cached`) only ever considers paths already present in
+//! `<commit>`'s tree or in the index, so a genuinely untracked file is invisible to it.
+//! [`diff_against_base`] works around this with [`prepare_shadow_index`]: a throwaway,
+//! `--intent-to-add`-augmented copy of the index, passed to `git diff` via a
+//! `GIT_INDEX_FILE` override so untracked files show up as additions too, without ever
+//! touching the real index. See that function's docs for the mechanics.
 //!
 //! ## Explicit git config, not caller defaults
 //!
 //! The `git diff` invocation pins `diff.mnemonicPrefix=false`, `diff.noprefix=false`, and
 //! `core.quotePath=false` via `-c` (before the `diff` subcommand, where git requires global
 //! config overrides to appear). Without this, the path-prefix parsing below
-//! ([`strip_diff_prefix`]) would silently mislabel every file under a caller's repo/global
+//! ([`strip_diff_prefix`]) would silently mislabel every file under a caller's
 //! `diff.mnemonicPrefix=true` config (prefixes become `i/`/`w/`/`c/` instead of `a/`/`b/`),
-//! and non-ASCII filenames would render octal-escaped under `core.quotePath`'s *default*
-//! (on) setting. Pinning these explicitly makes this module's parsing assumptions true by
-//! construction rather than by hoping the caller's git config happens to match them.
+//! and non-ASCII filenames would render octal-escaped under `core.quotePath`'s default (on)
+//! setting.
 //!
 //! ## gix vs. the `git` CLI
 //!
-//! Per this crate's convention (see the crate-level docs), reads go through `gix` where
-//! practical. Base-branch detection and merge-base computation are done via `gix`
-//! ([`gix::Repository::find_reference`], [`gix::Repository::merge_base`]) - both real reads
-//! with a direct, stable `gix` API.
+//! Per this crate's convention, reads go through `gix` where practical: base-branch
+//! detection and merge-base computation use [`gix::Repository::find_reference`] and
+//! [`gix::Repository::merge_base`].
 //!
-//! Producing the actual diff *text* is different: `gix-diff` operates at the level of tree
-//! and blob objects, not the working tree, and has no built-in formatter that reproduces
-//! `git diff`'s unified-diff text (hunk headers, context lines, rename detection, binary
-//! detection, and - critically - blending in uncommitted working-tree state). Reimplementing
-//! that formatting (and a working-tree-aware diff at that) on top of `gix-diff`'s lower-level
-//! primitives would mean re-deriving `git diff`'s own output format from scratch, which is a
-//! lot of surface area to get byte-for-byte right without a real risk of subtly-wrong
-//! (effectively fake) hunks. `git diff` itself is definitionally correct and already handles
-//! all of this, so this module shells out to it for the diff text specifically, the same way
-//! [`super::remove_worktree`]'s dirty-check shells out to `git status` for a read that's
-//! easier to get right via the CLI than via a from-scratch reimplementation.
+//! Producing the diff *text* is different: `gix-diff` operates at the level of tree and blob
+//! objects, not the working tree, and has no built-in formatter that reproduces `git diff`'s
+//! unified-diff text (hunk headers, context lines, rename/binary detection, and blending in
+//! uncommitted working-tree state). Reimplementing that on top of `gix-diff`'s lower-level
+//! primitives would mean re-deriving `git diff`'s own output format from scratch. `git diff`
+//! already handles all of this correctly, so this module shells out to it for the diff text
+//! specifically, the same way [`super::remove_worktree`]'s dirty-check shells out to `git
+//! status`.
 //!
 //! Performs blocking I/O; see the crate-level docs.
 
@@ -257,35 +249,32 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
     }))
 }
 
-/// Real merge-state of a worktree's `HEAD` against the repository's detected default base
-/// branch (see the module docs' "What 'base' means" section for the detection order) -
-/// powers the session rail's "by project" worktree rows
+/// Merge-state of a worktree's `HEAD` against the repository's detected default base branch
+/// (see the module docs' "What 'base' means" section for the detection order) - powers the
+/// session rail's "by project" worktree rows
 /// (`design_handoff_jerry_ade/README.md`: a worktree whose branch is fully merged into the
 /// default branch, with no running session, is offered as `merged HH:MM · prunable`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeMergeStatus {
     /// The short name of the detected default branch this was checked against.
     pub base_branch: String,
-    /// `true` if the worktree's `HEAD` is a real ancestor of (or equal to) the base
-    /// branch's tip - i.e. every commit reachable from `HEAD` is already reachable from the
-    /// base branch, the same condition `git branch --merged <base>` reports. Computed via
+    /// `true` if the worktree's `HEAD` is an ancestor of (or equal to) the base branch's
+    /// tip - i.e. every commit reachable from `HEAD` is already reachable from the base
+    /// branch, the same condition `git branch --merged <base>` reports. Computed via
     /// `gix::Repository::merge_base`: `HEAD` is merged iff its own id *is* the merge-base of
-    /// (`HEAD`, base tip) - equivalently, fast-forwarding the base branch to `HEAD` would be
-    /// a no-op.
+    /// (`HEAD`, base tip).
     pub merged: bool,
-    /// The worktree `HEAD` commit's real committer timestamp, as seconds since the Unix
-    /// epoch (UTC) - read via `gix`'s `Commit::time()`. `None` only if the commit object
-    /// itself could not be decoded (unexpected for any object `HEAD` successfully resolved
-    /// to; treated as "unknown" rather than a hard error, since it only affects a display
-    /// label, not the `merged` verdict itself).
+    /// The worktree `HEAD` commit's committer timestamp, as seconds since the Unix epoch
+    /// (UTC) - read via `gix`'s `Commit::time()`. `None` only if the commit object itself
+    /// could not be decoded; treated as "unknown" rather than a hard error, since it only
+    /// affects a display label, not the `merged` verdict itself.
     pub head_committer_unix_seconds: Option<i64>,
 }
 
 /// Compute [`WorktreeMergeStatus`] for the worktree at `worktree_path`: whether its `HEAD`
 /// has already been fully merged into the repository's detected default branch, per this
 /// module's own base-detection order. Returns `Ok(None)` if no sensible base could be
-/// detected or `HEAD` is unborn - the same "no fabricated answer" contract
-/// [`diff_against_base`] uses for [`DiffBase::NoBaseFound`], rather than guessing.
+/// detected or `HEAD` is unborn, rather than guessing.
 ///
 /// Performs blocking I/O (`gix` reads only - no `git` child process is spawned here, unlike
 /// [`diff_against_base`]).
@@ -368,15 +357,13 @@ pub(crate) fn detect_default_base(
     }
 
     // Last resort: the main worktree's own currently checked-out branch. `main_repo()`
-    // itself succeeds even when the main repository is bare - per gix's own docs ("the main
-    // repo might be bare"), it just opens the common dir, bare or not, rather than erroring
-    // on one. The real "nothing to fall back to" cases are handled explicitly below: the
-    // main repo's `HEAD` being unborn (a bare or fresh repository with no commits reachable
-    // from `HEAD` yet - `try_peel_to_id_in_place` returns `None`) or detached
-    // (`referent_name` returns `None`). `main_repo()` can still fail for other reasons
-    // (e.g. a corrupt or inaccessible common dir), which is treated the same as "nothing
-    // found" here rather than a hard failure, consistent with this function's overall
-    // contract of returning `Ok(None)` for "no base detectable" rather than `Err`.
+    // succeeds even when the main repository is bare (per gix's own docs, "the main repo
+    // might be bare") - it just opens the common dir either way. The "nothing to fall back
+    // to" cases are handled explicitly below: the main repo's `HEAD` being unborn
+    // (`try_peel_to_id_in_place` returns `None`) or detached (`referent_name` returns
+    // `None`). `main_repo()` can still fail for other reasons (e.g. a corrupt common dir),
+    // treated the same as "nothing found" here, consistent with this function's `Ok(None)`
+    // contract.
     let Ok(main_repo) = repo.main_repo() else {
         return Ok(None);
     };
@@ -402,7 +389,7 @@ const MAX_STDERR_BYTES: usize = 64 * 1024;
 /// is `Some`, the child runs with `GIT_INDEX_FILE` pointed at that path instead of the
 /// worktree's real index - see [`prepare_shadow_index`]. If more stdout is available than
 /// `max_bytes`, the child is killed (rather than waited on to completion) and the second
-/// element of the returned tuple is `true`: mirrors [`super::is_dirty`]'s reasoning for not
+/// element of the returned tuple is `true` - mirrors [`super::is_dirty`]'s reasoning for not
 /// risking a blocked read against a pipe the child may still be filling.
 fn capture_git_stdout(
     dir: &Path,
@@ -454,14 +441,12 @@ fn capture_git_stdout(
 /// thread drains stdout - rather than reading one pipe to completion before starting on the
 /// other.
 ///
-/// Reading them sequentially (stdout to EOF, only then stderr - what an earlier version of
-/// this code did) has a real deadlock: each pipe has a bounded OS buffer (64KB on Linux),
-/// and if the child writes enough to stderr before finishing stdout - plausible for `git
-/// diff` (e.g. one CRLF/smudge-filter warning line per changed file, across up to
-/// `MAX_FILES` files) - the child blocks writing stderr while this process is blocked
-/// reading stdout: neither side can make progress, hanging this thread forever with a live,
-/// un-reapable `git` child. Draining both concurrently means neither pipe can ever back up
-/// far enough to block the child's writes.
+/// Reading them sequentially (stdout to EOF, only then stderr) can deadlock: each pipe has a
+/// bounded OS buffer (64KB on Linux), and if the child writes enough to stderr before
+/// finishing stdout - plausible for `git diff` (e.g. one CRLF/smudge-filter warning line per
+/// changed file, across up to `MAX_FILES` files) - the child blocks writing stderr while
+/// this process is blocked reading stdout, and neither side can make progress. Draining both
+/// concurrently means neither pipe can ever back up far enough to block the child's writes.
 ///
 /// Returns `(stdout, stdout_truncated, stderr_text)`; does not wait on `child` - the caller
 /// is responsible for that (and for killing it first if truncated).
@@ -532,25 +517,22 @@ fn read_streams_concurrently(
     Ok((buf, truncated, stderr_text))
 }
 
-/// Builds a temporary, throwaway copy of the worktree's real index with untracked files
-/// added as "intent to add" stubs (`git add --intent-to-add`), so `git diff <merge-base>` -
-/// which only ever considers paths already present in the index or in `<merge-base>`'s tree
-/// (see the module docs' "What the diff includes" section) - picks up genuinely new,
-/// unstaged files as real additions instead of silently omitting them.
+/// Builds a temporary, throwaway copy of the worktree's index with untracked files added as
+/// "intent to add" stubs (`git add --intent-to-add`), so `git diff <merge-base>` - which
+/// only ever considers paths already present in the index or in `<merge-base>`'s tree (see
+/// the module docs' "What the diff includes" section) - picks up new, unstaged files as
+/// additions instead of silently omitting them.
 ///
-/// The real index is only ever *read* (to seed the copy); every mutation happens on the
-/// temp file via a `GIT_INDEX_FILE` override in the caller, so this can never perturb the
-/// real repository state. Empirically verified during this fix: modifying a tracked file
-/// and creating an untracked file, then diffing through a shadow index built this way,
-/// includes both changes; a plain `git status` immediately afterward still reports the
-/// untracked file as untracked (`??`), never staged - confirming the real index was
-/// untouched.
+/// The real index is only ever *read* (to seed the copy); every mutation happens on the temp
+/// file via a `GIT_INDEX_FILE` override in the caller, so this can never perturb the real
+/// repository state - verified by checking that `git status` still reports the untracked
+/// file as untracked (`??`), never staged, immediately after diffing through a shadow index.
 ///
 /// `--intent-to-add` (rather than a full `git add -A`) is deliberate: it records just enough
-/// (an empty-blob stub entry) for `git diff` to treat the path as present, without actually
-/// staging real file content into the temp index - unnecessary work, since `git diff
-/// <commit>` (no `--cached`) always compares against the real working-tree file content
-/// directly regardless of what's staged.
+/// (an empty-blob stub entry) for `git diff` to treat the path as present, without staging
+/// actual file content into the temp index - unnecessary, since `git diff <commit>` (no
+/// `--cached`) always compares against the real working-tree file content directly
+/// regardless of what's staged.
 fn prepare_shadow_index(worktree_path: &Path) -> Result<tempfile::NamedTempFile, Error> {
     let index_path_args: Vec<OsString> =
         vec!["rev-parse".into(), "--git-path".into(), "index".into()];
@@ -604,8 +586,8 @@ fn prepare_shadow_index(worktree_path: &Path) -> Result<tempfile::NamedTempFile,
 /// here are always exactly `a/`/`b/` *by construction*, not by assumption: `diff_against_base`
 /// always invokes `git diff` with `-c diff.mnemonicPrefix=false -c diff.noprefix=false` (see
 /// the module docs' "Explicit git config" section), which pins this regardless of the
-/// caller's own git config - `diff.mnemonicPrefix=true` (a real, fairly common user setting)
-/// would otherwise change these to `i/`/`w/`/`c/` and silently mislabel every file.
+/// caller's own git config - `diff.mnemonicPrefix=true` (a fairly common user setting) would
+/// otherwise change these to `i/`/`w/`/`c/` and silently mislabel every file.
 fn strip_diff_prefix(path: &str) -> Option<PathBuf> {
     if path == "/dev/null" {
         return None;
@@ -618,14 +600,13 @@ fn strip_diff_prefix(path: &str) -> Option<PathBuf> {
 /// prefix, or the `and `/` differ` markers of a `Binary files ...` line): unquoted in the
 /// common case. `diff_against_base` pins `-c core.quotePath=false` (see the module docs),
 /// which stops git from C-style-quoting paths just for containing non-ASCII characters -
-/// `core.quotePath`'s *default* (on) would otherwise render e.g. `café.txt` as the quoted,
+/// `core.quotePath`'s default (on) would otherwise render e.g. `café.txt` as the quoted,
 /// octal-escaped `"caf\303\251.txt"`. That pin doesn't cover every case though: git still
 /// quotes paths containing literal quote/backslash/control characters regardless of
-/// `core.quotePath`, in double quotes with backslash escapes. Only the surrounding quotes
+/// `core.quotePath`, with backslash escapes inside the quotes. Only the surrounding quotes
 /// are stripped here, not those inner escape sequences - a fully general C-style unquoter is
-/// out of scope for a read-only diff *viewer* (git itself remains the source of truth for
-/// the underlying files), so a quoted path with escapes shows its escaped form rather than
-/// being misrendered as something that isn't a valid path at all.
+/// out of scope for a read-only diff *viewer*, so a quoted path with escapes shows its
+/// escaped form rather than being misrendered as an invalid path.
 fn unquote_path(raw: &str) -> &str {
     if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
         &raw[1..raw.len() - 1]
@@ -694,25 +675,21 @@ impl FileBuilder {
 ///
 /// Header-line detection (`rename from `/`rename to `/`new file mode`/`deleted file
 /// mode`/`Binary files `/`--- `/`+++ `/`@@ `) only ever runs *outside* a hunk body
-/// (`!in_hunk`). This matters because a hunk's body lines are real file content with a
-/// single `+`/`-`/` ` marker prepended, not escaped in any way - a removed line whose own
-/// text happens to start with `-- ` (a SQL-style comment, say) is rendered by `git diff` as
-/// `--- <that text>`, textually indistinguishable from a `--- <path>` old-file header line;
-/// likewise an added line starting with `++ ` renders as `+++ <that text>`, indistinguishable
-/// from a `+++ <path>` new-file header. Naively checking these prefixes unconditionally (an
-/// earlier version of this function did) both truncates the rest of that file's hunk *and*
-/// can misattribute the change to whatever bogus "path" the content happened to parse as -
-/// for a tool whose purpose is reviewing real changes before merge, silently mislabeling a
-/// change under the wrong filename is a serious correctness bug, not a cosmetic one.
+/// (`!in_hunk`). This matters because a hunk's body lines are file content with a single
+/// `+`/`-`/` ` marker prepended, not escaped at all - a removed line whose own text happens
+/// to start with `-- ` (a SQL-style comment, say) renders as `--- <that text>`, textually
+/// indistinguishable from a `--- <path>` old-file header line (and likewise for `++
+/// `/`+++ `). Naively checking these prefixes unconditionally (an earlier version of this
+/// function did) both truncates the rest of that file's hunk and can misattribute the
+/// change to a bogus "path" - silently mislabeling a change under the wrong filename, a
+/// serious correctness bug for a tool whose purpose is reviewing changes before merge.
 ///
-/// Knowing precisely when a hunk body ends therefore can't rely on line-prefix heuristics
-/// either; it comes from the hunk header itself. A `@@ -<old_start>[,<old_count>]
-/// +<new_start>[,<new_count>] @@` header declares exactly how many old-side and new-side
-/// body lines follow ([`parse_hunk_counts`]); this function tracks both counts down as body
-/// lines are consumed (a context line decrements both, a removed line decrements only the
-/// old count, an added line only the new count) and only leaves "in a hunk body" once both
-/// hit zero - i.e. once the hunk has consumed exactly as many lines as it declared, not
-/// once a line merely *looks* like the next header.
+/// Knowing when a hunk body ends therefore can't rely on line-prefix heuristics; it comes
+/// from the hunk header itself. A `@@ -<old_start>[,<old_count>] +<new_start>[,<new_count>]
+/// @@` header declares exactly how many old-side and new-side body lines follow
+/// ([`parse_hunk_counts`]); this function counts both down as body lines are consumed (a
+/// context line decrements both, a removed line only the old count, an added line only the
+/// new count) and only leaves "in a hunk body" once both hit zero.
 fn parse_git_diff(text: &str) -> (Vec<DiffFile>, bool) {
     let mut files = Vec::new();
     let mut files_truncated = false;
@@ -843,9 +820,8 @@ fn parse_git_diff(text: &str) -> (Vec<DiffFile>, bool) {
 /// hunk header after the opening `"@@ "` (i.e. `header` starts with `-`) into
 /// `(old_count, new_count)`: how many old-side and new-side body lines this hunk declares,
 /// per the unified diff format. A range without an explicit `,<count>` means a count of
-/// exactly 1 (the unified diff spec's shorthand for a single-line range) - not "unknown" or
-/// "the start line number", which is why [`parse_range_count`] discards the start-line value
-/// entirely and only ever returns a real, meaningful count.
+/// exactly 1 (the unified diff spec's shorthand for a single-line range), which is why
+/// [`parse_range_count`] discards the start-line value and only returns the count.
 fn parse_hunk_counts(header: &str) -> Option<(usize, usize)> {
     let mut parts = header.split_whitespace();
     let old_part = parts.next()?.strip_prefix('-')?;
@@ -869,13 +845,10 @@ fn strip_diff_prefix_or_raw(raw: &str) -> Option<PathBuf> {
 /// Best-effort fallback path extraction from a `diff --git a/<path> b/<path>` header line
 /// (`rest` is everything after `"diff --git "`), used only when a file has no hunks, no
 /// rename, and no binary marker to derive a path from otherwise (e.g. a pure file-mode
-/// change). When the two sides are identical (the overwhelmingly common case for this
-/// fallback, since a real rename always emits `rename from`/`rename to` lines), splitting on
-/// the last `" b/"` yields the correct path regardless of where a space inside the path
-/// might also match; when the two sides genuinely differ *and* this fallback is the only
-/// source of the path (no rename lines emitted, which git always does for detected renames),
-/// there is a real but narrow ambiguity for paths containing the literal substring `" b/"` -
-/// documented rather than silently mishandled.
+/// change). When the two sides are identical (the common case here, since a rename always
+/// emits `rename from`/`rename to` lines instead), splitting on the last `" b/"` yields the
+/// correct path regardless of any space elsewhere in it; there's a narrow, documented
+/// ambiguity if the two sides genuinely differ *and* the path itself contains `" b/"`.
 fn parse_diff_git_header(rest: &str) -> Option<PathBuf> {
     let idx = rest.rfind(" b/")?;
     let b_path = &rest[idx + 3..];
