@@ -13,6 +13,7 @@ pub mod code_view;
 pub mod diagnostics_view;
 pub mod file_tree;
 pub mod fonts;
+pub mod hover_view;
 pub mod layout;
 pub mod merge;
 pub mod palette;
@@ -63,11 +64,18 @@ pub fn run(repo_path: PathBuf) {
             // `crate::root::TogglePalette`'s docs). `cmd-,` follows it again for the
             // Settings surface (see `crate::root::ToggleSettings`'s docs for the real
             // `vendor/zed/assets/keymaps/default-macos.json` precedent this literal
-            // keystroke string was verified against).
+            // keystroke string was verified against). `f12` follows the exact same real
+            // `actions!`/`KeyBinding` pattern for the File view's go-to-definition (see
+            // `crate::root::GotoDefinition`'s own docs) - the literal keystroke string `"f12"`
+            // was verified against `vendor/zed/assets/keymaps/default-linux.json`'s own real
+            // `"f12": "editor::GoToDefinition"` binding, and `vendor/zed/crates/gpui/src/
+            // platform/keystroke.rs` lists `"f12"` among the keystroke parser's own recognized
+            // function-key names.
             cx.bind_keys([
                 gpui::KeyBinding::new("cmd-n", root::NewSession, None),
                 gpui::KeyBinding::new("cmd-k", root::TogglePalette, None),
                 gpui::KeyBinding::new("cmd-,", root::ToggleSettings, None),
+                gpui::KeyBinding::new("f12", root::GotoDefinition, None),
             ]);
 
             let bounds = Bounds::centered(None, size(px(1440.0), px(928.0)), cx);
