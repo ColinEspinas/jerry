@@ -944,3 +944,48 @@ diff was showing the previous tab's Diff/File toggle state instead of the diff; 
 double-invocation of "new agent pane" silently produced one session instead of two (a
 single task slot dropping the older request); a tab whose diff disappeared out from under
 it (change reverted) could go permanently inert despite showing as active in the strip.
+
+## Revision R4b — make the terminal interactive
+
+Applied the second half of changelog entry 4/5: real, clickable path/`file:line` links
+inside terminal output (new `terminal_links.rs`), a WSL-aware terminal header, a new 26px
+terminal info footer (pid, live `cols×rows`, a real reusable environment chip), and a real
+`clear` action. A link is a span inside a line, not a whole-line style, matching the design
+spec exactly; clicking one resolves against the real session's worktree (not the app's own
+process cwd) and opens it through Revision R4a's real tab-opening path — no second, parallel
+way to open a file. `clear` writes the real VT100 clear sequence to the grid *and* a real
+Ctrl-L to the live pty, so a shell reprints its prompt and a TUI actually redraws instead of
+being left blank; deliberately click-only with no keybinding, since every plausible letter
+binding for it collides with a real readline shortcut on Linux/Windows — the exact bug class
+the two previous revisions each had to fix after shipping it. "Split" has no real backing
+anywhere in this codebase and was left out entirely rather than faked.
+
+The audit round constructed real terminal output and drove real clicks against the live app
+rather than only reasoning about the regex on paper, and found it was matching things that
+aren't paths: a URL in ordinary `cargo` output was detected as a link and opened a bogus
+absolute-path tab; `git@github.com:foo/bar.git`-style SSH remotes falsely linked `github.c`
+(a real, known bare extension) and `foo/bar.git`; plain decimal numbers and a URL's own
+port/path segment falsely matched the slash-shaped pattern. Fixed by having the regex
+consume and discard whole URLs before either path alternative can match a substring of one,
+and by requiring the slash-containing alternative's final segment to end in a real known
+extension the same way the bare-word alternative already required. Since no regex can be
+perfectly precise against arbitrary shell output, also added a real existence check before a
+click opens anything (so a false positive that slips through becomes a silently-dropped
+click instead of a permanent junk tab) and normalized `..` segments in the resolved path with
+a documented, deliberate decision to allow — not silently ignore — a worktree-external
+target, since this is a read-only viewer and the existence check is the real safety gate, not
+path containment.
+
+Also fixed: the modifier-gated click only checked the mouse-*up* event's modifiers, so the
+ordinary human sequence of releasing Ctrl a moment before releasing the mouse button silently
+dropped the click with no feedback — now checks both mouse-down and mouse-up. pid was briefly
+shown twice for agent sessions (once in the pre-existing header, once in this phase's new
+footer); the link-click hint and the clear control had been built inside the shell-only
+render branch despite both genuinely working for Claude/Codex sessions too, since their real
+output flows through the identical rendering path — hoisted out so the UI doesn't undersell
+what already works. WSL detection re-derived its result from the environment on every render;
+cached it once per process, and added a second real signal for launch paths where the primary
+environment-variable signal isn't reliably inherited.
+
+This closes Revision R4 (both halves — R4a's unified tab strip and R4b's interactive
+terminal — are now complete and committed).
