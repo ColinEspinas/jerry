@@ -1,4 +1,5 @@
 use super::*;
+use crate::root::settings_widgets::ChoiceOption;
 use crate::root::widgets::{render_keycap_row, KeycapSize};
 
 impl AdeApp {
@@ -834,13 +835,20 @@ impl AdeApp {
         let selected = self.window_controls_style().label().to_string();
         let choice = self.render_choice_control(
             "settings-window-controls",
-            &["System", "macOS", "Windows/Linux"],
+            &[
+                ChoiceOption::new("System"),
+                ChoiceOption::new("macOS"),
+                ChoiceOption::new("Windows/Linux"),
+            ],
             selected,
             cx,
-            |this, label, cx| {
-                let style = match label {
-                    "macOS" => WindowControlsStyle::MacosStyle,
-                    "Windows/Linux" => WindowControlsStyle::WindowsLinuxStyle,
+            |this, index, cx| {
+                // Structural, not a label re-match: index 0 is `System`, index 1 is `macOS`,
+                // index 2 is `Windows/Linux`, per the `options` array literal right above - see
+                // `Self::render_choice_control`'s own docs for why dispatch is index-based.
+                let style = match index {
+                    1 => WindowControlsStyle::MacosStyle,
+                    2 => WindowControlsStyle::WindowsLinuxStyle,
                     _ => WindowControlsStyle::System,
                 };
                 this.set_window_controls_style(style, cx);
@@ -910,11 +918,20 @@ impl AdeApp {
 
         let scale_choice = self.render_choice_control(
             "settings-interface-scale",
-            &["90%", "100%", "110%", "125%"],
+            &[
+                ChoiceOption::new("90%"),
+                ChoiceOption::new("100%"),
+                ChoiceOption::new("110%"),
+                ChoiceOption::new("125%"),
+            ],
             format!("{selected_percent}%"),
             cx,
-            |this, label, cx| {
-                if let Ok(percent) = label.trim_end_matches('%').parse::<u16>() {
+            |this, index, cx| {
+                // Structural, not a label re-match/parse: each index maps to a real percent,
+                // per the `options` array literal right above - see
+                // `Self::render_choice_control`'s own docs for why dispatch is index-based.
+                const PERCENTS: [u16; 4] = [90, 100, 110, 125];
+                if let Some(percent) = PERCENTS.get(index).copied() {
                     this.set_interface_scale_percent(percent, cx);
                 }
             },

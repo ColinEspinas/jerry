@@ -53,7 +53,9 @@ impl AdeApp {
                 let task = cx.background_executor().spawn(async move {
                     match std::sync::Arc::try_unwrap(client) {
                         Ok(mut client) => {
-                            let _ = client.shutdown();
+                            if let Err(err) = client.shutdown() {
+                                log::warn!("failed to shut down rust-analyzer: {err}");
+                            }
                         }
                         Err(client) => {
                             // Some other clone is still alive - see this method's own docs.
@@ -64,7 +66,6 @@ impl AdeApp {
                         }
                     }
                 });
-                self._lsp_tasks.retain(|task| !task.is_ready());
                 self._lsp_tasks.push(task);
             }
             // `Spawning`/`Failed` states hold no real process to tear down. A `Spawning` one
@@ -119,7 +120,6 @@ impl AdeApp {
                 cx.notify();
             });
         });
-        self._lsp_tasks.retain(|task| !task.is_ready());
         self._lsp_tasks.push(task);
     }
 
@@ -159,13 +159,19 @@ impl AdeApp {
         let task = cx.spawn(async move |_this, cx| {
             cx.background_executor()
                 .spawn(async move {
-                    if let Ok(text) = std::fs::read_to_string(&path) {
-                        let _ = client.did_open(&path, text, 1);
+                    match std::fs::read_to_string(&path) {
+                        Ok(text) => {
+                            if let Err(err) = client.did_open(&path, text, 1) {
+                                log::warn!("failed to send didOpen for {}: {err}", path.display());
+                            }
+                        }
+                        Err(err) => {
+                            log::warn!("failed to read {} for didOpen: {err}", path.display());
+                        }
                     }
                 })
                 .await;
         });
-        self._lsp_tasks.retain(|task| !task.is_ready());
         self._lsp_tasks.push(task);
     }
 

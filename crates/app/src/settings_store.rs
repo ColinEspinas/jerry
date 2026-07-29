@@ -271,6 +271,14 @@ impl Settings {
 
     /// Real save to `path` - `toml::to_string_pretty`, creating the parent directory
     /// (`~/.config/jerry/`) first if it doesn't exist yet.
+    ///
+    /// A plain, non-atomic `std::fs::write` (truncate-then-write), not a write-to-temp-then-
+    /// rename. `crate::root::AdeApp`'s serial settings-save writer loop (see that struct's
+    /// `_settings_save_task` field docs) only ever claims to fix *this process's own* writes
+    /// racing each other - never more than one `save_at` call in flight at a time - not full
+    /// crash- or external-reader-safety: a process crash (or another process reading the file)
+    /// mid-write could still observe a partially-written file, exactly as any other plain
+    /// `fs::write` could.
     pub fn save_at(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;

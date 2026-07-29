@@ -101,13 +101,7 @@ impl AdeApp {
             self.open_change = None;
             self.refresh_open_diff_file_cache();
             self.hover = None;
-            restore_focus(
-                &self.sessions,
-                &mut self.code_return_focus,
-                &mut self.code_opened_session,
-                window,
-                cx,
-            );
+            restore_focus(&self.sessions, &mut self.code_focus, window, cx);
         }
         let cwd = self
             .sessions
@@ -772,15 +766,14 @@ impl AdeApp {
                 cx.notify();
             });
         });
-        // A `Vec`, not a single `Option` slot - see `Self::_new_agent_pane_task`'s own docs for
-        // the real, live bug a single slot had: two rapid "New agent pane" clicks before the
+        // A `TaskPool`, not a single `Option` slot - see `Self::_new_agent_pane_task`'s own docs
+        // for the real, live bug a single slot had: two rapid "New agent pane" clicks before the
         // first click's background `$PATH` search resolved used to drop (and so immediately
         // cancel, per GPUI's real "dropping a `Task` cancels it immediately" semantics) the
         // first click's task the instant the second one was assigned here, silently spawning
         // only one session for two real clicks. Mirrors `Self::_lsp_tasks`/
         // `Self::_goto_definition_tasks`'s own "independent operations, dropping an unrelated
-        // one would cancel it" shape - pruned of already-finished entries before each push.
-        self._new_agent_pane_task.retain(|task| !task.is_ready());
+        // one would cancel it" shape.
         self._new_agent_pane_task.push(task);
     }
 

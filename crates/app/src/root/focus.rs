@@ -1,19 +1,18 @@
 use super::*;
 
 impl AdeApp {
-    /// Captures the real, pre-open focus target into [`Self::code_return_focus`]/
-    /// [`Self::code_opened_session`] - but only the first time Surface C actually transitions
-    /// from closed to open (`Self::open_change` was `None`), mirroring [`Self::open_settings`]'s
-    /// own "capture once, not on every subsequent navigation" rule: a second file opened while
-    /// one is already showing must not overwrite the real original target with
+    /// Captures the real, pre-open focus target into [`Self::code_focus`]
+    /// (`OverlayFocus::capture`) - but only the first time Surface C actually transitions from
+    /// closed to open (`Self::open_change` was `None`), mirroring [`Self::open_settings`]'s own
+    /// "capture once, not on every subsequent navigation" rule: a second file opened while one
+    /// is already showing must not overwrite the real original target with
     /// `Self::code_focus_handle` itself (already focused at that point), which would make
     /// [`Self::close_change_diff`] restore focus onto a surface that isn't even rendered anymore
     /// instead of the real terminal pane it should return to. Always moves real focus onto
     /// [`Self::code_focus_handle`] regardless - see that field's own docs for why.
     pub(super) fn focus_code_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.open_change.is_none() {
-            self.code_return_focus = window.focused(cx);
-            self.code_opened_session = self.sessions.active_id();
+            self.code_focus.capture(window, &self.sessions, cx);
         }
         window.focus(&self.code_focus_handle, cx);
     }
@@ -23,23 +22,21 @@ impl AdeApp {
     /// (matching `Jerry.dc.html`'s own initial `state.scope === 'all'`, empty-query fixture)
     /// and moves real keyboard focus onto it, so the very next keystroke reaches
     /// [`Self::handle_palette_key_down`] rather than whatever had focus before. Captures
-    /// whatever real focus target was in place beforehand (`window.focused(cx)`, `None` on a
-    /// completely fresh window) into [`Self::palette_return_focus`], plus which session was
-    /// active into [`Self::palette_opened_session`], so [`Self::close_palette`] can restore
-    /// focus correctly instead of leaving it dangling on [`Self::palette_focus_handle`] once
-    /// this element stops being rendered - see that field's docs for the bug this fixes.
-    /// Also disarms a pending rail prune confirmation ([`Self::prune_confirm_armed`]'s docs):
-    /// opening the palette is itself the kind of "did something else" gesture that should
-    /// require a fresh confirmation before a later "Prune Worktrees" palette selection can
-    /// execute.
+    /// whatever real focus target and active session were in place beforehand into
+    /// [`Self::palette_focus`] (`OverlayFocus::capture`), so [`Self::close_palette`] can
+    /// restore focus correctly instead of leaving it dangling on
+    /// [`Self::palette_focus_handle`] once this element stops being rendered - see that field's
+    /// docs for the bug this fixes. Also disarms a pending rail prune confirmation
+    /// ([`Self::prune_confirm_armed`]'s docs): opening the palette is itself the kind of "did
+    /// something else" gesture that should require a fresh confirmation before a later "Prune
+    /// Worktrees" palette selection can execute.
     pub(super) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = true;
         // See `Self::plus_menu_open`'s own docs: the tab strip's `+` menu is rendered as an
         // unconditional sibling of the palette, so leaving it open here would paint it on top
         // of (or under) a surface it no longer makes sense over.
         self.plus_menu_open = false;
-        self.palette_return_focus = window.focused(cx);
-        self.palette_opened_session = self.sessions.active_id();
+        self.palette_focus.capture(window, &self.sessions, cx);
         self.palette_scope = palette::PaletteScope::default();
         self.palette_query.clear();
         self.palette_selected = 0;
@@ -51,19 +48,18 @@ impl AdeApp {
     /// Closes the palette overlay - the scrim click, `Esc`, and "run a result" real handlers.
     /// Restores real keyboard focus rather than leaving `Window::focus` pointing at
     /// [`Self::palette_focus_handle`], which stops being tracked by anything the moment this
-    /// panel stops rendering (see that field's docs, and [`Self::palette_return_focus`]'s, for
-    /// the bug this fixes: without a restore, every action dispatch - including the very next
-    /// ⌘K - falls back to the root node instead of reaching
-    /// [`Self::handle_toggle_palette_action`]).
+    /// panel stops rendering (see that field's docs, and [`restore_focus`]'s, for the bug this
+    /// fixes: without a restore, every action dispatch - including the very next ⌘K - falls
+    /// back to the root node instead of reaching [`Self::handle_toggle_palette_action`]).
     ///
     /// If the active session changed while the palette was open (e.g. a palette-run "New
     /// Shell"/"New Claude Session"/"New Codex Session" swapped which session is active - see
-    /// [`Self::palette_opened_session`]'s docs), the captured pre-open handle is skipped in
-    /// favor of the *current* active session's terminal pane, since a captured handle from the
-    /// session that's no longer active would be exactly as untracked/stale as
-    /// `palette_focus_handle` itself. Otherwise, the captured handle is restored if there was
-    /// one, falling back to the active session's terminal pane if nothing was focused before
-    /// (e.g. a completely fresh window that had never been clicked into).
+    /// [`Self::palette_focus`]'s docs), the captured pre-open handle is skipped in favor of the
+    /// *current* active session's terminal pane, since a captured handle from the session
+    /// that's no longer active would be exactly as untracked/stale as `palette_focus_handle`
+    /// itself. Otherwise, the captured handle is restored if there was one, falling back to the
+    /// active session's terminal pane if nothing was focused before (e.g. a completely fresh
+    /// window that had never been clicked into).
     pub(super) fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = false;
         if self.settings_open {
@@ -74,35 +70,28 @@ impl AdeApp {
             // happened to be opened *while Settings was already open* and is now just being
             // dismissed back down to it. Either way the correct real focus target is
             // [`Self::settings_focus_handle`] - the same handle `Self::open_settings` itself
-            // moves focus onto - never [`Self::palette_return_focus`]/the active session's
-            // terminal pane: restoring either of those would either fight `open_settings`'s own
-            // focus move (the first case) or move focus onto a surface that isn't even being
-            // rendered anymore, since the Settings surface still replaces the three zones (the
-            // second case) - both exactly the "`Window::focus` left pointing at an untracked
-            // handle" bug class [`Self::palette_return_focus`]'s own docs describe.
+            // moves focus onto - never `Self::palette_focus`/the active session's terminal
+            // pane: restoring either of those would either fight `open_settings`'s own focus
+            // move (the first case) or move focus onto a surface that isn't even being rendered
+            // anymore, since the Settings surface still replaces the three zones (the second
+            // case) - both exactly the "`Window::focus` left pointing at an untracked handle"
+            // bug class `restore_focus`'s own docs describe.
             window.focus(&self.settings_focus_handle, cx);
-            self.palette_return_focus = None;
-            self.palette_opened_session = None;
+            self.palette_focus.clear();
             cx.notify();
             return;
         }
-        restore_focus(
-            &self.sessions,
-            &mut self.palette_return_focus,
-            &mut self.palette_opened_session,
-            window,
-            cx,
-        );
+        restore_focus(&self.sessions, &mut self.palette_focus, window, cx);
         cx.notify();
     }
 
     /// Opens the Settings surface (`design_handoff_jerry_ade/README.md`'s "Settings" section) -
-    /// mirrors [`Self::open_palette`]'s exact real-focus-capture shape: captures whatever was
-    /// really focused beforehand (`None` if nothing was) into [`Self::settings_return_focus`],
-    /// plus which session was active into [`Self::settings_opened_session`], so
-    /// [`Self::close_settings`] can restore correctly instead of leaving `Window::focus`
-    /// dangling on [`Self::settings_focus_handle`] once the surface stops rendering - see
-    /// [`Self::palette_return_focus`]'s docs for the exact bug this class of fix addresses.
+    /// mirrors [`Self::open_palette`]'s exact real-focus-capture shape: captures whatever real
+    /// focus target and active session were in place beforehand into [`Self::settings_focus`]
+    /// (`OverlayFocus::capture`), so [`Self::close_settings`] can restore correctly instead of
+    /// leaving `Window::focus` dangling on [`Self::settings_focus_handle`] once the surface
+    /// stops rendering - see [`Self::palette_focus`]'s docs for the exact bug this class of fix
+    /// addresses.
     ///
     /// Unlike [`Self::open_palette`], this does **not** reset [`Self::settings_page`] - which
     /// page was showing persists across opens, matching ordinary settings-window UX (the
@@ -120,8 +109,7 @@ impl AdeApp {
         // See `Self::open_palette`'s identical guard, and `Self::plus_menu_open`'s own docs.
         self.plus_menu_open = false;
         self.settings_open = true;
-        self.settings_return_focus = window.focused(cx);
-        self.settings_opened_session = self.sessions.active_id();
+        self.settings_focus.capture(window, &self.sessions, cx);
         self.prune_confirm_armed = false;
         window.focus(&self.settings_focus_handle, cx);
         self.load_agent_rows(cx);
@@ -135,13 +123,7 @@ impl AdeApp {
     /// way [`Self::close_palette`] does, and for the same documented reason.
     pub(super) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = false;
-        restore_focus(
-            &self.sessions,
-            &mut self.settings_return_focus,
-            &mut self.settings_opened_session,
-            window,
-            cx,
-        );
+        restore_focus(&self.sessions, &mut self.settings_focus, window, cx);
         cx.notify();
     }
 }

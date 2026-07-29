@@ -1,4 +1,5 @@
 use super::*;
+use crate::root::settings_widgets::ChoiceOption;
 use crate::root::sidebar_render::RightSidebarView;
 use crate::root::widgets::{render_hint_pair, render_hint_row, render_keycap_row, KeycapSize};
 
@@ -542,59 +543,37 @@ impl AdeApp {
     /// or by typing a scope's prefix character (`crate::palette::typed_scope_prefix`, handled
     /// in [`Self::handle_palette_key_down`]).
     pub(super) fn render_palette_scope_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let segment = |scope: palette::PaletteScope, cx: &mut Context<Self>| {
-            let active = self.palette_scope == scope;
-            div()
-                .id(format!("palette-scope-{}", scope.label()))
-                .cursor_pointer()
-                .h(px(19.0))
-                .px(px(9.0))
-                .rounded(theme::radius::BUTTON)
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .when(active, |el| el.bg(theme::surface::SEGMENT_ACTIVE))
-                .child(
-                    div()
-                        .font(font(theme::font::SANS))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_size(self.ui_text_size(10.5))
-                        .text_color(if active {
-                            theme::text::PRIMARY
-                        } else {
-                            theme::text::DIMMER
-                        })
-                        .child(scope.label()),
-                )
-                .child(
-                    div()
-                        .font(font(theme::font::MONO))
-                        .text_size(self.ui_text_size(9.5))
-                        .text_color(if active {
-                            theme::text::DIMMER
-                        } else {
-                            theme::text::GHOSTER
-                        })
-                        .child(scope.segment_key()),
-                )
-                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                    this.palette_scope = scope;
-                    this.palette_selected = 0;
-                    cx.notify();
-                }))
-        };
-
-        div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(2.0))
-            .p(px(2.0))
-            .rounded(theme::radius::BUTTON)
-            .bg(theme::surface::SEGMENT_TRACK)
-            .child(segment(palette::PaletteScope::All, cx))
-            .child(segment(palette::PaletteScope::Commands, cx))
-            .child(segment(palette::PaletteScope::Files, cx))
+        self.render_choice_control(
+            "palette-scope",
+            &[
+                ChoiceOption::with_hint(
+                    palette::PaletteScope::All.label(),
+                    palette::PaletteScope::All.segment_key(),
+                ),
+                ChoiceOption::with_hint(
+                    palette::PaletteScope::Commands.label(),
+                    palette::PaletteScope::Commands.segment_key(),
+                ),
+                ChoiceOption::with_hint(
+                    palette::PaletteScope::Files.label(),
+                    palette::PaletteScope::Files.segment_key(),
+                ),
+            ],
+            self.palette_scope.label().to_string(),
+            cx,
+            |this, index, cx| {
+                // Structural, not a label re-match: index 0 is `All`, index 1 is `Commands`,
+                // index 2 is `Files`, per the `options` array literal right above - see
+                // `Self::render_choice_control`'s own docs for why dispatch is index-based.
+                this.palette_scope = match index {
+                    1 => palette::PaletteScope::Commands,
+                    2 => palette::PaletteScope::Files,
+                    _ => palette::PaletteScope::All,
+                };
+                this.palette_selected = 0;
+                cx.notify();
+            },
+        )
     }
 
     /// The real, grouped, scrollable result list - `crate::palette::build_groups`'s output,

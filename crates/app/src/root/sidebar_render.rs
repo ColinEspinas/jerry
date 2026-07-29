@@ -1,4 +1,5 @@
 use super::*;
+use crate::root::settings_widgets::ChoiceOption;
 use crate::root::widgets::{render_sidebar_message, render_tag_pill};
 
 impl AdeApp {
@@ -226,28 +227,26 @@ impl AdeApp {
     /// loaded diff, summed from the same real per-file stats
     /// (`crate::changes::diff_file_stats`) the Changes rows themselves show.
     pub(super) fn render_right_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let segment = |label: &'static str, view: RightSidebarView| {
-            let is_active = self.right_sidebar_view == view;
-            div()
-                .id(label)
-                .cursor_pointer()
-                .px(px(8.0))
-                .py(px(3.0))
-                .rounded(theme::radius::CHIP)
-                .when(is_active, |el| el.bg(theme::surface::SEGMENT_ACTIVE))
-                .font(font(theme::font::SANS))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_size(self.ui_text_size(10.5))
-                .text_color(if is_active {
-                    theme::text::PRIMARY
-                } else {
-                    theme::text::DIMMER
-                })
-                .child(label)
-                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                    this.set_right_sidebar_view(view, cx);
-                }))
+        let selected = match self.right_sidebar_view {
+            RightSidebarView::Files => "Files",
+            RightSidebarView::Changes => "Changes",
         };
+        let toggle = self.render_choice_control(
+            "right-sidebar-toggle",
+            &[ChoiceOption::new("Files"), ChoiceOption::new("Changes")],
+            selected.to_string(),
+            cx,
+            |this, index, cx| {
+                // Structural, not a label re-match: index 0 is `Files`, index 1 is `Changes`,
+                // per the `options` array literal right above - see
+                // `Self::render_choice_control`'s own docs for why dispatch is index-based.
+                let view = match index {
+                    1 => RightSidebarView::Changes,
+                    _ => RightSidebarView::Files,
+                };
+                this.set_right_sidebar_view(view, cx);
+            },
+        );
 
         let totals = self.diff_totals;
 
@@ -260,17 +259,7 @@ impl AdeApp {
             .px(px(10.0))
             .border_b_1()
             .border_color(theme::border::INNER)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(2.0))
-                    .p(px(2.0))
-                    .rounded(theme::radius::CHIP)
-                    .bg(theme::surface::SEGMENT_TRACK)
-                    .child(segment("Files", RightSidebarView::Files))
-                    .child(segment("Changes", RightSidebarView::Changes)),
-            )
+            .child(toggle)
             .when_some(totals, |el, (add, del)| {
                 el.child(
                     div()

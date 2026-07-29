@@ -76,9 +76,10 @@ impl AdeApp {
     /// path and the snippet below)"). But there is no real `settings.json` file to open - the
     /// JSON view is a read-only re-serialization of the same loaded [`Settings`] value (see
     /// `crate::settings_store`'s own "TOML is the real file" docs) - so `Open file` is disabled
-    /// (`Self::render_cfg_format_segment`'s sibling below) whenever `JSON` is selected, rather
-    /// than silently opening the real `.toml` path next to a displayed `.json` one that button
-    /// doesn't actually target.
+    /// (this method's own `Open file` button, right below its [`Self::render_choice_control`]
+    /// call for the `TOML | JSON` segment) whenever `JSON` is selected, rather than silently
+    /// opening the real `.toml` path next to a displayed `.json` one that button doesn't
+    /// actually target.
     pub(super) fn render_config_banner(
         &self,
         page: ConfigPage,
@@ -146,16 +147,22 @@ impl AdeApp {
                     .text_color(theme::text::GHOSTER)
                     .child(keys_line),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .p(px(2.0))
-                    .rounded(theme::radius::BUTTON)
-                    .bg(theme::surface::SEGMENT_TRACK)
-                    .child(self.render_cfg_format_segment(CfgFormat::Toml, cx))
-                    .child(self.render_cfg_format_segment(CfgFormat::Json, cx)),
-            )
+            .child(self.render_choice_control(
+                "settings-cfg-fmt",
+                &[ChoiceOption::new("TOML"), ChoiceOption::new("JSON")],
+                self.settings_cfg_format.label().to_string(),
+                cx,
+                |this, index, cx| {
+                    // Structural, not a label re-match: index 0 is `TOML`, index 1 is `JSON`,
+                    // per the `options` array literal right above - see
+                    // `Self::render_choice_control`'s own docs for why dispatch is index-based.
+                    this.settings_cfg_format = match index {
+                        1 => CfgFormat::Json,
+                        _ => CfgFormat::Toml,
+                    };
+                    cx.notify();
+                },
+            ))
             .child(
                 div()
                     .id("settings-open-file")
@@ -189,36 +196,6 @@ impl AdeApp {
                             }))
                     }),
             )
-    }
-
-    fn render_cfg_format_segment(
-        &self,
-        format: CfgFormat,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let is_active = self.settings_cfg_format == format;
-        div()
-            .id(format!("settings-cfg-fmt-{}", format.label()))
-            .cursor_pointer()
-            .h(px(18.0))
-            .px(px(8.0))
-            .rounded(theme::radius::CHIP)
-            .flex()
-            .items_center()
-            .when(is_active, |el| el.bg(theme::surface::SEGMENT_ACTIVE))
-            .font(font(theme::font::MONO))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_size(self.ui_text_size(10.0))
-            .text_color(if is_active {
-                theme::text::PRIMARY
-            } else {
-                theme::settings::SUBTITLE
-            })
-            .child(format.label())
-            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                this.settings_cfg_format = format;
-                cx.notify();
-            }))
     }
 
     /// The snippet block (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3): "In
@@ -435,53 +412,155 @@ impl AdeApp {
     }
 
     /// The real segmented `choice` control (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s
-    /// change 3: "a segmented control matching the Diff/File toggle" -
-    /// `Self::render_diff_file_toggle`'s exact same track/active visual, generalized to an
-    /// arbitrary option list). `options` are the real display labels; `selected` is compared by
-    /// value (`==`) against each, so callers pass whatever already-real string they derive
-    /// `selected` from.
+    /// change 3: "a segmented control matching the Diff/File toggle"), and - since this codebase's
+    /// own R5.5 senior-maintainer audit - the one real shared implementation behind every
+    /// segmented-control-shaped widget in this app: `Self::render_diff_file_toggle`,
+    /// `Self::render_right_sidebar_toggle`, `Self::render_palette_scope_control`, and this page's
+    /// own TOML/JSON config-format toggle all used to hand-roll the identical visual shape
+    /// independently (one of them, `render_diff_file_toggle`, even said so explicitly in its own
+    /// doc comment: "mirrors `render_right_sidebar_toggle`'s own segmented-control shape
+    /// verbatim") - now all four route through here. `selected` is compared by value (`==`)
+    /// against each [`ChoiceOption::label`], so callers pass whatever already-real string they
+    /// derive `selected` from.
+    ///
+    /// Consolidating four independently-evolved implementations into one surfaced a handful of
+    /// real, tiny visual disagreements between them that had never been reconciled (some used
+    /// `theme::text::DIMMER` for an inactive-but-enabled segment where this control's own
+    /// pre-existing shape used the near-identical `theme::settings::SUBTITLE`; the Diff/File
+    /// toggle's text didn't respond to `Self::ui_text_size` the way every other segmented control
+    /// already did; the TOML/JSON toggle used `theme::font::MONO`/`10.0px`/an `18px` row height
+    /// where every other one uses `theme::font::SANS`/`10.5px`/`19px`; and the track had no real
+    /// `.gap(px(2.0))` at all, losing the small visible gap between the active pill and its
+    /// neighboring segment that three of the four call sites' own pre-consolidation tracks had) -
+    /// resolved by keeping this control's own pre-existing, already-in-production (two real
+    /// Settings pages) shape as the one real source of truth, rather than picking a shape per
+    /// call site.
+    ///
+    /// `on_select` receives the clicked segment's real **index** into `options`, not its display
+    /// `label` - every one of the four real call sites (`Self::render_diff_file_toggle`,
+    /// `Self::render_right_sidebar_toggle`, `Self::render_palette_scope_control`, this page's own
+    /// TOML/JSON toggle) needs to turn a click back into one of its own real enum variants, and
+    /// dispatching that by re-matching on the display string used to be a real, silent
+    /// correctness hazard: renaming a segment's label (e.g. changing what `PaletteScope::Files`'s
+    /// `label()` returns) with no matching update to the `on_select` match arm would silently
+    /// dispatch to the wrong variant - no compile error, no test failure unless someone thought
+    /// to check it. An index is structural, not display text, so a label rename alone can't
+    /// change what a click dispatches - only actually reordering `options` (a far rarer, more
+    /// visible edit, and not the bug class this closes) can.
     pub(super) fn render_choice_control(
         &self,
         id_prefix: &'static str,
-        options: &'static [&'static str],
+        options: &[ChoiceOption],
         selected: String,
         cx: &mut Context<Self>,
-        on_select: impl Fn(&mut Self, &'static str, &mut Context<Self>) + Clone + 'static,
+        on_select: impl Fn(&mut Self, usize, &mut Context<Self>) + Clone + 'static,
     ) -> impl IntoElement {
         let mut track = div()
             .flex_none()
             .flex()
+            .gap(px(2.0))
             .p(px(2.0))
             .rounded(theme::radius::BUTTON)
             .bg(theme::surface::SEGMENT_TRACK);
 
-        for option in options {
-            let is_active = *option == selected;
+        for (index, option) in options.iter().enumerate() {
+            let label = option.label;
+            let is_active = label == selected;
             let on_select = on_select.clone();
-            track = track.child(
-                div()
-                    .id(gpui::ElementId::from(format!("{id_prefix}-{option}")))
-                    .cursor_pointer()
-                    .h(px(19.0))
-                    .px(px(9.0))
-                    .rounded(theme::radius::CHIP)
-                    .flex()
-                    .items_center()
-                    .when(is_active, |el| el.bg(theme::surface::SEGMENT_ACTIVE))
-                    .font(font(theme::font::SANS))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_size(self.ui_text_size(10.5))
-                    .text_color(if is_active {
-                        theme::text::PRIMARY
-                    } else {
-                        theme::settings::SUBTITLE
-                    })
-                    .child(*option)
-                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                        on_select(this, option, cx);
-                    })),
-            );
+            let mut segment = div()
+                .id(gpui::ElementId::from(format!("{id_prefix}-{label}")))
+                // A real, structural (index-based, not label-text-based) lookup key for
+                // `gpui::VisualTestContext::debug_bounds` - lets a real interaction test click
+                // "the segment at this position" without depending on its current display text,
+                // the same real position-not-text distinction [`Self::render_choice_control`]'s
+                // own `on_select` dispatch now makes. A no-op in a real production build (see
+                // `InteractiveElement::debug_selector`'s own docs).
+                .debug_selector(move || format!("choice-{id_prefix}-{index}"))
+                .h(px(19.0))
+                .px(px(9.0))
+                .rounded(theme::radius::CHIP)
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .when(is_active, |el| el.bg(theme::surface::SEGMENT_ACTIVE))
+                .child(
+                    div()
+                        .font(font(theme::font::SANS))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_size(self.ui_text_size(10.5))
+                        .text_color(if is_active {
+                            theme::text::PRIMARY
+                        } else if option.enabled {
+                            theme::settings::SUBTITLE
+                        } else {
+                            theme::text::DISABLED
+                        })
+                        .child(label),
+                )
+                .when_some(option.hint, |el, hint| {
+                    // A real, horizontal sibling of the label (a flex row with a small gap),
+                    // not text stacked underneath it - matching the original palette scope
+                    // control's own real layout, the only pre-consolidation call site that used
+                    // this hint slot.
+                    el.child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(self.ui_text_size(9.5))
+                            .text_color(if is_active {
+                                theme::text::DIMMER
+                            } else {
+                                theme::text::GHOSTER
+                            })
+                            .child(hint),
+                    )
+                });
+            if option.enabled {
+                segment = segment.cursor_pointer().on_click(cx.listener(
+                    move |this, _event: &ClickEvent, _window, cx| {
+                        on_select(this, index, cx);
+                    },
+                ));
+            }
+            track = track.child(segment);
         }
         track
+    }
+}
+
+/// One real segment of [`AdeApp::render_choice_control`]. The common case is just a label
+/// ([`Self::new`]) - real disabled state and/or a secondary hint rendered as a horizontal
+/// sibling of the label (not stacked underneath it) are opt-in for the two real call sites
+/// that need them (the Diff/File toggle's `Diff` segment when there's no diff to show; the
+/// palette scope control's per-segment keybinding hint).
+#[derive(Clone, Copy)]
+pub(super) struct ChoiceOption {
+    pub(super) label: &'static str,
+    pub(super) enabled: bool,
+    pub(super) hint: Option<&'static str>,
+}
+
+impl ChoiceOption {
+    pub(super) fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            enabled: true,
+            hint: None,
+        }
+    }
+
+    pub(super) fn enabled_if(label: &'static str, enabled: bool) -> Self {
+        Self {
+            label,
+            enabled,
+            hint: None,
+        }
+    }
+
+    pub(super) fn with_hint(label: &'static str, hint: &'static str) -> Self {
+        Self {
+            label,
+            enabled: true,
+            hint: Some(hint),
+        }
     }
 }

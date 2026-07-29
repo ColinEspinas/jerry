@@ -67,6 +67,7 @@ use crate::root::code_surface::{DiffLoadState, FileLoadState, HoverEntry};
 use crate::root::lsp::LspClientState;
 use crate::root::resize::{PaneResizeDrag, ResizeTarget};
 use crate::root::sidebar_render::RightSidebarView;
+use crate::root::task_pool::TaskPool;
 
 // The rail header's `+` / ⌘N control spawns a new session. Bound as a real GPUI action/
 // keybinding (see `crate::run`'s `cx.bind_keys` call, and `Self::render` registering
@@ -292,25 +293,19 @@ pub struct AdeApp {
     /// node - which sits above every one of `Self::render`'s own `on_action` handlers - when that
     /// `FocusId` isn't found there. A dangling handle silently breaks every action (⌘K, ⌘,, F12)
     /// until the user manually clicks something to re-establish real focus - the exact same bug
-    /// class [`Self::palette_return_focus`]/[`Self::settings_return_focus`]'s own docs describe,
-    /// now fixed here the same way: [`Self::open_change_diff`]/[`Self::open_file_view`] move
-    /// focus onto this handle, and [`Self::close_change_diff`] restores whatever
-    /// [`Self::code_return_focus`] captured.
+    /// class [`Self::palette_focus`]/[`Self::settings_focus`]'s own docs describe, now fixed
+    /// here the same way: [`Self::open_change_diff`]/[`Self::open_file_view`] move focus onto
+    /// this handle, and [`Self::close_change_diff`] restores whatever [`Self::code_focus`]
+    /// captured.
     code_focus_handle: FocusHandle,
     /// See [`Self::code_focus_handle`]'s own docs - the real, pre-open focus target
-    /// [`Self::open_change_diff`]/[`Self::open_file_view`] found via `window.focused(cx)`,
-    /// captured only the first time either transitions [`Self::open_change`] from `None` to
-    /// `Some` (never overwritten by a *different* file opening while one is already showing, the
-    /// same "only capture on a real open, not on every navigation" rule
-    /// [`Self::palette_return_focus`]'s own docs establish). `None` if nothing was focused yet
-    /// (a completely fresh window). Restored (and cleared) by [`Self::close_change_diff`].
-    code_return_focus: Option<FocusHandle>,
-    /// See [`Self::palette_opened_session`]'s own docs for the exact real bug this mirrors and
-    /// fixes, applied to the code/file Surface C instead of the palette overlay: which session
-    /// was active when [`Self::code_return_focus`] was captured, so [`Self::close_change_diff`]
-    /// can tell whether restoring it is still safe (the active session may have changed while the
-    /// surface was open).
-    code_opened_session: Option<SessionId>,
+    /// ([`OverlayFocus::capture`]) [`Self::open_change_diff`]/[`Self::open_file_view`] (via
+    /// [`Self::focus_code_surface`]) find via `window.focused(cx)`, captured only the first
+    /// time either transitions [`Self::open_change`] from `None` to `Some` (never overwritten
+    /// by a *different* file opening while one is already showing - see
+    /// [`Self::focus_code_surface`]'s own docs). Restored (and cleared) by
+    /// [`Self::close_change_diff`].
+    code_focus: OverlayFocus,
     /// The File view's real `gpui::uniform_list` scroll handle (`vendor/zed/crates/gpui/src/
     /// elements/uniform_list.rs`'s own `UniformListScrollHandle`, verified against
     /// `vendor/zed/crates/git_ui/src/git_panel.rs`'s real `commit_history_scroll_handle` use of
@@ -399,25 +394,20 @@ pub struct AdeApp {
     /// recently produced, moved by `↑`/`↓` and run by `⏎` (`Self::handle_palette_key_down`).
     palette_selected: usize,
     palette_focus_handle: FocusHandle,
-    /// Whatever real focus target [`Self::open_palette`] found via `window.focused(cx)` right
-    /// before it moved focus onto [`Self::palette_focus_handle`] - `None` if nothing was
-    /// focused yet (a completely fresh window). [`Self::close_palette`] restores this on close
-    /// so ⌘K's own focus target isn't left dangling on a node that stops being rendered the
-    /// moment the palette closes (see that method's docs for the bug this fixes: without a
+    /// The real, pre-open focus target and active session ([`OverlayFocus::capture`])
+    /// [`Self::open_palette`] found right before it moved focus onto
+    /// [`Self::palette_focus_handle`]. [`Self::close_palette`] restores this on close so ⌘K's
+    /// own focus target isn't left dangling on a node that stops being rendered the moment the
+    /// palette closes (see [`restore_focus`]'s own docs for the bug this fixes: without a
     /// restore, `Window::focus` keeps pointing at the untracked `palette_focus_handle`, and
     /// every subsequent action dispatch - including the very next ⌘K - falls back to the root
-    /// node instead of reaching `Self::handle_toggle_palette_action`).
-    palette_return_focus: Option<FocusHandle>,
-    /// Which session was active when [`Self::open_palette`] most recently ran - compared
-    /// against the active session at close time so [`Self::close_palette`] can tell whether
-    /// [`Self::palette_return_focus`] is still safe to restore. A palette-spawned "New Shell"
-    /// (or any other command that calls [`Self::new_session`]) swaps which session is active,
-    /// and the centre pane only ever renders `sessions.active()` (see the module docs) - so a
-    /// captured pre-open handle belonging to the *previous* active session's terminal pane
+    /// node instead of reaching `Self::handle_toggle_palette_action`). A palette-spawned "New
+    /// Shell" (or any other command that calls [`Self::new_session`]) swaps which session is
+    /// active, and the centre pane only ever renders `sessions.active()` (see the module docs) -
+    /// so a captured pre-open handle belonging to the *previous* active session's terminal pane
     /// would be exactly as untracked/stale as `palette_focus_handle` itself once that swap
-    /// happens. When the active session changed while the palette was open, `close_palette`
-    /// ignores the captured handle and focuses the *current* active session's pane instead.
-    palette_opened_session: Option<SessionId>,
+    /// happens; [`restore_focus`] accounts for this via the captured `opened_session`.
+    palette_focus: OverlayFocus,
     /// The palette's real file-candidate list (`crate::palette::FileCandidate`, one per
     /// non-directory [`Self::file_tree`] entry, up to `file_tree::MAX_ENTRIES` = 5000) - built
     /// once by [`Self::rebuild_palette_file_candidates`] at the two real points its inputs
@@ -501,6 +491,21 @@ pub struct AdeApp {
     /// see each of those handlers) - see `Self::request_prune`'s docs for why prune is a
     /// real two-click confirmation rather than a single unconfirmed destructive click.
     prune_confirm_armed: bool,
+    /// `true` for the duration of a real, in-flight [`Self::execute_prune`] background
+    /// `wt_core::remove_worktree` batch - guards against a second confirming click spawning a
+    /// second, racing prune batch while the first is still running and overwriting
+    /// [`Self::_prune_task`], the same real bug class [`Self::merge_op_in_flight`] already
+    /// guards the merge Complete/Abort actions against (see that field's own docs). Without
+    /// this: if the first batch hadn't started running yet, dropping its `Task` handle
+    /// silently cancels the whole batch and leaves [`Self::prune_status`] stuck reading
+    /// "pruning N worktree(s)..." forever, since the only code that would correct that text is
+    /// the cancelled batch's own completion handler; if the first batch had already started,
+    /// it completes for real but its completion handler (which refreshes the worktree list)
+    /// never runs, leaving the rail showing a stale list. Set `true` synchronously by
+    /// [`Self::execute_prune`] before spawning, reset `false` in that same task's completion
+    /// handler - never anywhere else, so this can't be left stranded by a superseding call
+    /// (there is none: [`Self::execute_prune`] is a real no-op while this is already `true`).
+    prune_in_flight: bool,
     /// Whether the Settings surface (`design_handoff_jerry_ade/README.md`'s "Settings"
     /// section) is currently replacing the three-zone body - see [`Self::open_settings`]/
     /// [`Self::close_settings`], which follow the exact same real-focus-capture-and-restore
@@ -512,11 +517,9 @@ pub struct AdeApp {
     /// Settings later doesn't lose your place.
     settings_page: settings::SettingsPage,
     settings_focus_handle: FocusHandle,
-    /// See [`Self::palette_return_focus`]'s docs for the exact bug this mirrors and fixes -
-    /// same mechanism, applied to the Settings surface instead of the palette overlay.
-    settings_return_focus: Option<FocusHandle>,
-    /// See [`Self::palette_opened_session`]'s docs - same mechanism, applied to Settings.
-    settings_opened_session: Option<SessionId>,
+    /// See [`Self::palette_focus`]'s docs for the exact bug this mirrors and fixes - same
+    /// mechanism, applied to the Settings surface instead of the palette overlay.
+    settings_focus: OverlayFocus,
     /// The Settings › Agents page's real rows - `crate::settings::detect_agent_rows`, resolved
     /// via `pty_core::resolve_on_path`, but computed off the foreground thread and cached here
     /// (see [`Self::load_agent_rows`]) rather than recomputed inline on every render.
@@ -569,16 +572,16 @@ pub struct AdeApp {
     /// commit`, discarding already-resolved conflict work.
     _merge_cleanup_task: Option<Task<()>>,
     /// Every real, in-flight [`Self::resolve_active_hunk`] background write
-    /// (`wt_core::merge::write_resolved_file`), keyed by nothing (a `Vec`, not a single slot) -
-    /// see that method's docs for why a single `Option<Task<()>>` here was a verified real bug:
-    /// resolving one file's last hunk while a *different* file's write was still in flight
-    /// would drop (cancel) the earlier write via the same "dropping a `Task` cancels it
+    /// (`wt_core::merge::write_resolved_file`), keyed by nothing (a [`TaskPool`], not a single
+    /// slot) - see that method's docs for why a single `Option<Task<()>>` here was a verified
+    /// real bug: resolving one file's last hunk while a *different* file's write was still in
+    /// flight would drop (cancel) the earlier write via the same "dropping a `Task` cancels it
     /// immediately" mechanism described on [`Self::_merge_cleanup_task`], leaving real conflict
     /// markers on disk while the in-memory model already reported that file as resolved. Writes
     /// to distinct files are independent, so keeping every in-flight one alive here is safe;
-    /// [`Self::resolve_active_hunk`] prunes already-finished entries (`Task::is_ready`) before
-    /// pushing a new one so this never grows unboundedly.
-    _merge_write_tasks: Vec<Task<()>>,
+    /// [`TaskPool::push`] prunes already-finished entries before adding a new one so this never
+    /// grows unboundedly.
+    _merge_write_tasks: TaskPool,
     /// A real `lsp_core::LspClient` per repository root (`design_handoff_jerry_ade/README.md`'s
     /// "Language server UI" Diagnostic state) - keyed by [`Self::file_tree_root`] at the time a
     /// Rust file was first opened under it, since a session's worktree (not necessarily
@@ -623,12 +626,12 @@ pub struct AdeApp {
     /// constructs. Cleared (not just stale) whenever a non-Rust file or no file is showing, so a
     /// diagnostic from a previously open file can never bleed into a different file's rows.
     file_view_diagnostics: HashMap<usize, Vec<diagnostics_view::LineDiagnostic>>,
-    /// Every real, in-flight `lsp_core::LspClient::spawn`/`did_open` background task - a `Vec`
-    /// for the same reason [`Self::_merge_write_tasks`] is one (independent real operations
-    /// against potentially-different repo roots/files; dropping an unrelated in-flight one would
-    /// cancel it via the same real GPUI `Task`-drop-cancels semantics documented there), pruned
-    /// of already-finished entries (`Task::is_ready`) before each push.
-    _lsp_tasks: Vec<Task<()>>,
+    /// Every real, in-flight `lsp_core::LspClient::spawn`/`did_open` background task - a
+    /// [`TaskPool`] for the same reason [`Self::_merge_write_tasks`] is one (independent real
+    /// operations against potentially-different repo roots/files; dropping an unrelated
+    /// in-flight one would cancel it via the same real GPUI `Task`-drop-cancels semantics
+    /// documented there).
+    _lsp_tasks: TaskPool,
     /// The single, long-lived background poll loop that watches every ready
     /// [`Self::lsp_clients`] entry's `lsp_core::LspClient::drain_updates()` wake channel and calls
     /// `cx.notify()` when a real `publishDiagnostics` notification has arrived - started lazily
@@ -650,7 +653,7 @@ pub struct AdeApp {
     /// [`GotoDefinition`]'s own docs for why that's an honest choice, not a shortcut.
     hover: Option<HoverEntry>,
     /// The single real, in-flight [`Self::request_hover`] background task, if any - a single
-    /// `Option` slot (not an unbounded `Vec`, unlike [`Self::_lsp_tasks`]/
+    /// `Option` slot (not a [`TaskPool`], unlike [`Self::_lsp_tasks`]/
     /// [`Self::_goto_definition_tasks`]'s own "independent operations" reasoning) *because* hover
     /// requests are never independent of each other: [`Self::hover`] only ever shows one entry at
     /// a time, so a real click while a previous request is still in flight always supersedes it -
@@ -663,13 +666,12 @@ pub struct AdeApp {
     /// requests accumulate, pinning that many pool threads and starving other real background work
     /// (file loads, git status refresh) that share the same executor.
     _hover_request_task: Option<Task<()>>,
-    /// Every real, in-flight [`Self::trigger_goto_definition`] background task - a `Vec`, unlike
-    /// [`Self::_hover_request_task`]'s single slot, for the same real "independent operations,
-    /// dropping an unrelated one would cancel it" reasoning [`Self::_lsp_tasks`]'s own docs give:
-    /// a real `F12` press has no analogous `still_current` short-circuit tying it to a single
-    /// live UI slot the way hover's own single `Self::hover` field does. Pruned of already-
-    /// finished entries (`Task::is_ready`) before each push.
-    _goto_definition_tasks: Vec<Task<()>>,
+    /// Every real, in-flight [`Self::trigger_goto_definition`] background task - a [`TaskPool`],
+    /// unlike [`Self::_hover_request_task`]'s single slot, for the same real "independent
+    /// operations, dropping an unrelated one would cancel it" reasoning [`Self::_lsp_tasks`]'s
+    /// own docs give: a real `F12` press has no analogous `still_current` short-circuit tying it
+    /// to a single live UI slot the way hover's own single `Self::hover` field does.
+    _goto_definition_tasks: TaskPool,
     /// A real, one-shot "the next completed load of *this exact file* should land the cursor on
     /// this line, not line 1" instruction for [`Self::spawn_file_load`]'s completion handler - set
     /// by [`Self::navigate_to_definition`] when a real go-to-definition result named a file that
@@ -712,7 +714,7 @@ pub struct AdeApp {
     /// honest no-op rather than a special-cased test skip.
     settings_path: Option<PathBuf>,
     /// The single, real, in-flight [`Self::persist_settings`] background save, if any - unlike
-    /// [`Self::_lsp_tasks`]'s own "independent operations" `Vec`, settings saves are never
+    /// [`Self::_lsp_tasks`]'s own "independent operations" [`TaskPool`], settings saves are never
     /// independent of each other: there is only ever one real `settings.toml` to write, so a
     /// fast second settings change must *supersede* an earlier still-mid-write save, not race
     /// it. This used to be a `Vec`, with each save capturing its own `Settings` snapshot at
@@ -732,7 +734,57 @@ pub struct AdeApp {
     /// [`Self::_hover_request_task`]'s own docs describe for a superseded hover request), it was
     /// still writing *some* real, live snapshot of the settings at the time it ran, never a
     /// stale one captured before a later edit happened.
+    ///
+    /// ## Residual race this alone did not close, and why this is now a serial writer loop
+    ///
+    /// Per GPUI's real `Task` semantics (`vendor/zed/crates/scheduler/src/executor.rs`'s own
+    /// docs: dropping a `Task` only cancels it if its closure hasn't started running yet on a
+    /// worker thread - once started, it runs to completion), assigning a fresh `Task` here on
+    /// every edit could still let an *older* save's real `settings.save_at(&path)` disk write,
+    /// already dispatched to a background-executor worker by the time a newer edit superseded
+    /// it, physically complete *after* the newer edit's own write, since dropping the old
+    /// `Task` handle cannot stop a write that already started. Two real, concurrent
+    /// `std::fs::write`s to the same path with no ordering guarantee between them could still
+    /// leave the file holding stale data, just in a narrower window than the original bug this
+    /// field's docs above describe.
+    ///
+    /// This field is now the real, single, long-lived serial-writer loop task, spawned by
+    /// [`Self::persist_settings`] and kept alive by [`Self::settings_save_running`] (not
+    /// re-spawned per edit) - see that method's own docs. Its `loop` body always fully awaits
+    /// one `save_at` call before checking [`Self::settings_save_pending`] again, so two
+    /// physical writes to the same path are now structurally never concurrent, not just
+    /// usually-fast-enough-not-to-race.
     _settings_save_task: Option<Task<()>>,
+    /// `true` whenever there is a real settings edit newer than the last write the serial
+    /// writer loop (`Self::persist_settings`) started - a single flag, not a queue or a `Vec`
+    /// of pending snapshots, since there is only ever one real file to write and only the
+    /// *latest* value at write time ever matters. Set by every real call to
+    /// [`Self::persist_settings`]; cleared only by the loop itself, in the same synchronous
+    /// step that reads [`Self::settings`] fresh to write it.
+    settings_save_pending: bool,
+    /// `true` for as long as [`Self::persist_settings`]'s serial writer loop
+    /// (`Self::_settings_save_task`) is alive - guards `persist_settings` against spawning a
+    /// second, independent loop while one is already draining `settings_save_pending`, which
+    /// is exactly what would let two real `std::fs::write` calls to `settings.toml` run
+    /// concurrently again (see `_settings_save_task`'s own docs). Cleared by the loop itself,
+    /// inside the same synchronous step that finds nothing left pending and decides to stop -
+    /// never from outside the loop, so a `persist_settings` call can never race the loop's own
+    /// decision to keep running vs. exit.
+    settings_save_running: bool,
+    /// Test-only seam: an artificial delay the serial writer loop awaits (via GPUI's own
+    /// deterministic test clock - `cx.background_executor().timer`, per this project's
+    /// `vendor/zed` coding guidelines on preferring the GPUI executor's timer over
+    /// `smol::Timer` in tests) immediately before each real `Settings::save_at` call. Lets a
+    /// real regression test deterministically hold one edit's write pending (parked at this
+    /// delay, nothing dispatched to the background executor yet) while a later edit is queued
+    /// behind it, rather than relying on real wall-clock timing. `#[cfg(test)]`-gated on both
+    /// this field and the loop body's branch that reads it (see [`Self::persist_settings`]),
+    /// so - matching the real `TerminalPane::inject_bytes_for_test`-and-friends precedent in
+    /// `terminal_pane.rs` this follows - no test-only state or logic exists in a production
+    /// build at all, not merely a field that happens to always be `None` there. Only ever set
+    /// via [`Self::set_settings_save_test_delay`].
+    #[cfg(test)]
+    settings_save_test_delay: Option<Duration>,
     /// The config banner's real `TOML | JSON` segment (`design_handoff_jerry_ade/revision/
     /// CHANGELOG.md`'s change 3) - a display-only choice, not itself a [`Settings`] field, see
     /// `crate::settings_store`'s "TOML is the real file; JSON is a read-only alternate view"
@@ -769,15 +821,14 @@ pub struct AdeApp {
     /// `gpui::Bounds::default()` (zero origin/size) until the first paint; harmless, since
     /// nothing reads it before the popover can ever be opened.
     plus_button_bounds: gpui::Bounds<Pixels>,
-    /// Every real, in-flight [`Self::new_agent_pane`] background `$PATH` detection - a `Vec`,
-    /// mirroring [`Self::_lsp_tasks`]/[`Self::_goto_definition_tasks`]'s own "independent
-    /// operations, dropping an unrelated one would cancel it" shape, pruned of already-finished
-    /// entries before each push. This used to be a single `Option` slot - a real, live bug:
-    /// two rapid "New agent pane" clicks before the first click's background `$PATH` search had
-    /// resolved silently produced only one new session instead of two, since assigning the
-    /// second click's task into the same slot dropped (and so immediately cancelled) the
-    /// first's.
-    _new_agent_pane_task: Vec<Task<()>>,
+    /// Every real, in-flight [`Self::new_agent_pane`] background `$PATH` detection - a
+    /// [`TaskPool`], mirroring [`Self::_lsp_tasks`]/[`Self::_goto_definition_tasks`]'s own
+    /// "independent operations, dropping an unrelated one would cancel it" shape. This used to
+    /// be a single `Option` slot - a real, live bug: two rapid "New agent pane" clicks before
+    /// the first click's background `$PATH` search had resolved silently produced only one new
+    /// session instead of two, since assigning the second click's task into the same slot
+    /// dropped (and so immediately cancelled) the first's.
+    _new_agent_pane_task: TaskPool,
 }
 
 impl AdeApp {
@@ -826,37 +877,77 @@ impl AdeApp {
     /// [`Self::settings_path`]'s own docs) makes this a genuine no-op, not a special test case;
     /// a real save failure against a real, resolved path is logged, not surfaced to the UI.
     ///
-    /// Deliberately re-reads [`Self::settings`] via `this.update` *inside* the spawned task,
-    /// rather than cloning it into the closure up front - see [`Self::_settings_save_task`]'s own
-    /// docs for the real out-of-order-write bug this fixes, and why a single superseding task
-    /// slot alone isn't quite enough on its own to close it. Mirrors the real "gather on
-    /// foreground, do blocking work on background" shape `Self::start_status_polling`/
-    /// `Self::load_worktrees` already use, just with the "gather" step being a single field
-    /// clone rather than a real `git`/`gix` call.
+    /// Marks [`Self::settings_save_pending`] and, if the real serial writer loop
+    /// (`Self::_settings_save_task`) isn't already running, starts it - it stays alive for as
+    /// long as there is real pending work, always fully awaiting one `Settings::save_at` call
+    /// before checking for a newer edit, so two physical writes to the same `settings.toml`
+    /// path can never be in flight at once (see [`Self::_settings_save_task`]'s own docs for
+    /// the exact real out-of-order-write race this closes, which re-reading `self.settings`
+    /// fresh per write alone did not). A `None` [`Self::settings_path`] (every GPUI test - see
+    /// that field's own docs) makes this a genuine no-op, not a special test case; a real save
+    /// failure against a real, resolved path is logged, not surfaced to the UI.
     pub(super) fn persist_settings(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.settings_path.clone() else {
             return;
         };
+        self.settings_save_pending = true;
+        if self.settings_save_running {
+            // The loop below is already alive and always re-checks `settings_save_pending`
+            // before writing or stopping (see its own body) - it will pick this edit up on
+            // its own next iteration. Spawning a second loop here is exactly the shape that
+            // would let two real `save_at` calls overlap again.
+            return;
+        }
+        self.settings_save_running = true;
         let task = cx.spawn(async move |this, cx| {
-            let Ok(settings) = this.update(cx, |this, _cx| this.settings.clone()) else {
-                // The entity is already gone (e.g. the window closed while this task was still
-                // queued) - nothing real left to save.
-                return;
-            };
-            let result = cx
-                .background_executor()
-                .spawn({
-                    let path = path.clone();
-                    async move { settings.save_at(&path) }
-                })
-                .await;
-            if let Err(err) = result {
-                log::warn!("failed to save {}: {err}", path.display());
+            loop {
+                // Atomically (within this one synchronous foreground step) either take the
+                // pending edit to write, or - if there is none - clear `settings_save_running`
+                // in the very same step that decides to stop, so a `persist_settings` call
+                // can never land in the gap between "loop decided to stop" and "loop actually
+                // stopped" and be silently missed.
+                let step = this.update(cx, |this, _cx| {
+                    if this.settings_save_pending {
+                        this.settings_save_pending = false;
+                        Some(this.settings.clone())
+                    } else {
+                        this.settings_save_running = false;
+                        None
+                    }
+                });
+                let Ok(Some(settings)) = step else {
+                    // Either the entity is gone (window closed while this loop was still
+                    // running) or there is genuinely nothing left pending - either way, stop.
+                    break;
+                };
+                // Test-only seam - see [`Self::settings_save_test_delay`]'s own docs. This
+                // whole block (field read included) does not exist in a production build.
+                #[cfg(test)]
+                {
+                    let delay = this.update(cx, |this, _cx| this.settings_save_test_delay);
+                    if let Ok(Some(delay)) = delay {
+                        cx.background_executor().timer(delay).await;
+                    }
+                }
+                let result = cx
+                    .background_executor()
+                    .spawn({
+                        let path = path.clone();
+                        async move { settings.save_at(&path) }
+                    })
+                    .await;
+                if let Err(err) = result {
+                    log::warn!("failed to save {}: {err}", path.display());
+                }
             }
         });
-        // A single slot, not an unbounded `Vec` - see `Self::_settings_save_task`'s own docs.
-        // Assigning here drops (and so immediately cancels) any still-in-flight previous save.
         self._settings_save_task = Some(task);
+    }
+
+    /// Test-only seam - see [`Self::settings_save_test_delay`]'s own docs.
+    #[cfg(test)]
+    pub(crate) fn set_settings_save_test_delay(&mut self, delay: Option<Duration>) {
+        self.settings_save_test_delay = delay;
     }
 }
 
@@ -990,19 +1081,63 @@ impl AdeApp {
     }
 }
 
-/// The shared real focus-save-on-open/restore-on-close tail for every overlay/surface that
-/// captures a pre-open focus target and must restore it on close: [`AdeApp::close_palette`],
-/// [`AdeApp::close_settings`], and [`AdeApp::close_change_diff`] all had this exact same block
-/// (verified, not just skimmed, to be identical in logic - not merely superficially similar -
-/// before extracting it: same `session_changed` comparison, same "skip the captured handle in
-/// favor of the active session's pane" fallback order, same unconditional clear of both fields
-/// at the end), parameterized only by which pair of fields (a surface's own
-/// `*_return_focus`/`*_opened_session`) each caller passes in - `AdeApp::palette_return_focus`'s
-/// own docs describe the real dangling-focus bug this whole pattern exists to fix, found and
-/// fixed three separate times (Phases E, F, H3) against three hand-copied blocks before this
-/// extraction.
+/// The real "where to restore keyboard focus to once this overlay closes, and whether that
+/// target is still safe to use" state each of this app's three focus-capturing overlays - the
+/// code/file Surface C ([`AdeApp::code_focus`]), the command palette
+/// ([`AdeApp::palette_focus`]), and Settings ([`AdeApp::settings_focus`]) - needs.
 ///
-/// If the active session changed while the surface was open (`*opened_session` no longer matches
+/// Consolidates what, before this type existed, was three real, independently hand-copied
+/// pairs of fields (`*_return_focus`/`*_opened_session`) plus three hand-copied *capture*
+/// blocks (`window.focused(cx)` into the first field, `sessions.active_id()` into the second) -
+/// one in each of [`AdeApp::focus_code_surface`], [`AdeApp::open_palette`],
+/// [`AdeApp::open_settings`]. [`restore_focus`]'s own docs describe the real dangling-focus bug
+/// this whole mechanism exists to fix (found and fixed three separate times - Phases E, F,
+/// H3 - against three hand-copied *restore* blocks before that function was extracted); this
+/// type closes the matching *capture* half of the same duplication, which had stayed
+/// triplicated even after the restore half was consolidated.
+#[derive(Default)]
+pub(super) struct OverlayFocus {
+    /// Whatever real focus target was in place immediately before this overlay opened
+    /// (`window.focused(cx)`, `None` on a completely fresh window) - restored by
+    /// [`restore_focus`] when the overlay closes, rather than leaving `Window::focus` pointing
+    /// at a handle that stops being tracked by anything the moment the overlay stops rendering.
+    return_focus: Option<FocusHandle>,
+    /// Which session was active at the moment [`Self::capture`] ran - compared against the
+    /// active session at restore time so [`restore_focus`] can tell whether `return_focus` is
+    /// still safe to restore (the active session may have changed while the overlay was open).
+    opened_session: Option<SessionId>,
+}
+
+impl OverlayFocus {
+    /// Records the real, current focus target and active session - the one real capture step
+    /// every overlay's own open method used to hand-roll independently. Callers that must only
+    /// capture on a genuine closed-to-open transition (not on every subsequent navigation while
+    /// already open - see [`AdeApp::focus_code_surface`]'s own docs) guard the call themselves;
+    /// this always captures unconditionally when called.
+    pub(super) fn capture(&mut self, window: &Window, sessions: &Sessions, cx: &App) {
+        self.return_focus = window.focused(cx);
+        self.opened_session = sessions.active_id();
+    }
+
+    /// Discards any captured state without restoring it - used only by
+    /// [`AdeApp::close_palette`]'s Settings-showing-underneath branch, which moves focus onto
+    /// `settings_focus_handle` directly rather than through the normal [`restore_focus`] path
+    /// (see that call site's own docs for why).
+    pub(super) fn clear(&mut self) {
+        self.return_focus = None;
+        self.opened_session = None;
+    }
+}
+
+/// The shared real focus-restore-on-close tail for every overlay/surface that captures a
+/// pre-open focus target (via [`OverlayFocus::capture`]) and must restore it on close:
+/// [`AdeApp::close_palette`], [`AdeApp::close_settings`], and [`AdeApp::close_change_diff`] all
+/// had this exact same block (verified, not just skimmed, to be identical in logic - not merely
+/// superficially similar - before extracting it: same `session_changed` comparison, same "skip
+/// the captured handle in favor of the active session's pane" fallback order, same unconditional
+/// clear at the end), parameterized only by which [`OverlayFocus`] each caller passes in.
+///
+/// If the active session changed while the surface was open (`opened_session` no longer matches
 /// the real current active session), any captured pre-open handle is skipped in favor of the
 /// *current* active session's terminal pane - a captured handle from a session that's no longer
 /// active would be exactly as untracked/stale as the surface's own focus handle once that swap
@@ -1018,16 +1153,15 @@ impl AdeApp {
 /// included) is done.
 fn restore_focus(
     sessions: &Sessions,
-    return_focus: &mut Option<FocusHandle>,
-    opened_session: &mut Option<SessionId>,
+    overlay_focus: &mut OverlayFocus,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let session_changed = sessions.active_id() != *opened_session;
+    let session_changed = sessions.active_id() != overlay_focus.opened_session;
     let restore_target = if session_changed {
         None
     } else {
-        return_focus.take()
+        overlay_focus.return_focus.take()
     };
     let focus_target = restore_target.or_else(|| {
         sessions
@@ -1037,14 +1171,209 @@ fn restore_focus(
     if let Some(handle) = focus_target {
         window.focus(&handle, cx);
     }
-    *return_focus = None;
-    *opened_session = None;
+    overlay_focus.clear();
+}
+
+/// Real regression coverage for the residual settings-save race described on
+/// [`AdeApp::_settings_save_task`]'s own docs: even after `settings.clone()` was moved inside
+/// the spawned closure (reading it fresh rather than a spawn-time snapshot), two independent
+/// per-edit tasks sharing one superseding `Option<Task<()>>` slot could still let an *older*
+/// edit's real `std::fs::write` physically complete *after* a newer edit's, since dropping a
+/// GPUI `Task` cannot stop a write that had already started on a background-executor worker.
+/// [`AdeApp::persist_settings`]'s serial writer loop closes this structurally (never more than
+/// one `save_at` call in flight at a time) rather than just narrowing the window.
+///
+/// ## What these tests can and can't actually prove
+///
+/// Under GPUI's deterministic test executor every background-spawned closure here (including
+/// `Settings::save_at` itself, a plain synchronous `std::fs::write` with no internal `.await`
+/// points) either hasn't been polled at all yet, or - once polled - runs to completion in that
+/// one synchronous step (`vendor/zed/crates/scheduler/src/test_scheduler.rs`'s `step_filtered`
+/// polls one runnable to completion at a time, on the single thread driving the test). There is
+/// no wall-clock thread pool making independent progress between test statements. That means
+/// two real physical writes genuinely cannot be caught *interleaved mid-write* by any
+/// `#[gpui::test]` - "prove real write overlap" is not an achievable test goal here, and a test
+/// that merely checks the final on-disk value after two edits with the *same* injected delay
+/// (the original shape of these tests) can pass identically whether or not writes are actually
+/// serialized, since same-delay timers expire in the same tick and get drained in queuing
+/// order regardless of the implementation underneath.
+///
+/// What *is* real and testable is *ordering*: the tests below give an earlier edit a *longer*
+/// injected delay than a later edit queued behind it, so that a real (not serialized)
+/// implementation - one where each edit's write runs as its own independent, never-cancelled
+/// background operation - would let the later edit's shorter-delayed write land first and the
+/// earlier edit's longer-delayed, now-stale write land *after* it, corrupting the file. Against
+/// the real serial writer loop, no second write can even begin until the first's full delay-then-
+/// write has completed, so this specific inversion is structurally impossible. Verified (per this
+/// revision's build log) to actually fail this way against a genuine per-edit-independent-task
+/// reconstruction of the pre-fix shape, and to pass against the real code as written.
+#[cfg(test)]
+mod settings_persist_tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use std::time::Duration;
+
+    fn open_test_app_with_real_settings_path(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        settings_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                repo_path,
+                settings_store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        })
+    }
+
+    /// The two-edit version of the real ordering property: edit 1 is given a long delay and is
+    /// still genuinely pending (parked at its own timer - see the corrected note below on what
+    /// `run_until_parked` actually guarantees at that point) when edit 2 is queued behind it
+    /// with a *shorter* delay. A real per-edit-independent-task implementation would let edit
+    /// 2's write finish first and edit 1's stale write land on top of it afterward; the real
+    /// serial writer loop cannot even start edit 2's own delay until edit 1's entire
+    /// delay-then-write has completed, so that inversion can't happen.
+    #[gpui::test]
+    fn a_later_edit_queued_while_an_earlier_one_is_delayed_is_never_overwritten_by_it(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_path.clone(),
+        );
+
+        // Edit 1: a long delay, so its write is still genuinely pending when edit 2 is queued
+        // below.
+        let long_delay = Duration::from_millis(100);
+        app.update(cx, |app, cx| {
+            app.set_settings_save_test_delay(Some(long_delay));
+            app.settings.appearance.editor_font_size = 11.0;
+            app.persist_settings(cx);
+        });
+        assert!(app.read_with(cx, |app, _| app.settings_save_running));
+
+        // Parks at the loop's delay timer for edit 1 - nothing has been dispatched to the
+        // background executor yet at this point (the delay is awaited *before* `save_at` is
+        // ever called - see `Self::persist_settings`'s loop body), it cannot resume without the
+        // clock actually reaching the injected delay's expiration (`advance_clock` below is the
+        // only thing that does that here) - mirrors `terminal_pane.rs`'s own
+        // `advance_clock`/`run_until_parked` idiom for driving a real
+        // `cx.background_executor().timer(..)`-gated background loop deterministically in
+        // tests.
+        cx.run_until_parked();
+
+        // Edit 2, queued while edit 1's write is still pending, with a *shorter* delay - the
+        // exact shape needed to expose a real out-of-order write, since edit 1's write would
+        // otherwise complete first anyway regardless of serialization.
+        let short_delay = Duration::from_millis(5);
+        app.update(cx, |app, cx| {
+            app.set_settings_save_test_delay(Some(short_delay));
+            app.settings.appearance.editor_font_size = 22.0;
+            app.persist_settings(cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.settings_save_pending),
+            "the second edit should be recorded as pending, not dropped"
+        );
+
+        // Drain both delays, in whatever order the implementation actually resolves them.
+        let mut settled = false;
+        for _ in 0..40 {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(5));
+            cx.run_until_parked();
+            if !app.read_with(cx, |app, _| app.settings_save_running) {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the serial writer loop never settled back to idle");
+        assert!(!app.read_with(cx, |app, _| app.settings_save_pending));
+
+        let on_disk = settings_store::Settings::load_or_init_at(&settings_path);
+        assert_eq!(
+            on_disk.appearance.editor_font_size, 22.0,
+            "the file must hold edit 2's value - a real bug in the class this loop fixes would \
+             let edit 1's own, longer-delayed write land on disk *after* edit 2's \
+             shorter-delayed one, silently reverting it"
+        );
+    }
+
+    /// A rapid burst of edits (far more than two), each given a *shorter* delay than the one
+    /// before it and all queued before the loop has been driven forward even once, must still
+    /// converge on exactly the final edit's value - not, as a genuinely non-serialized
+    /// per-edit-independent-task implementation would produce, whichever edit happened to carry
+    /// the *longest* delay (here, deliberately the very first, stalest one) winning by finishing
+    /// last. See [`a_later_edit_queued_while_an_earlier_one_is_delayed_is_never_overwritten_by_it`]
+    /// for the two-edit version of the same real ordering property, with more detail on why this
+    /// (and not a same-delay convergence check) is what actually discriminates the two shapes.
+    #[gpui::test]
+    fn a_burst_of_edits_with_decreasing_delays_converges_on_the_final_value(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_path.clone(),
+        );
+
+        app.update(cx, |app, cx| {
+            // Deliberately decreasing delays: if each edit's write ran as its own independent
+            // operation, the *first* (here longest-delayed, most stale) edit would be the last
+            // to actually finish writing, landing its stale value on disk after every other one.
+            for (size, delay_ms) in [
+                (10.0, 60u64),
+                (12.0, 50),
+                (14.0, 40),
+                (16.0, 30),
+                (18.0, 20),
+                (20.0, 10),
+            ] {
+                app.set_settings_save_test_delay(Some(Duration::from_millis(delay_ms)));
+                app.settings.appearance.editor_font_size = size;
+                app.persist_settings(cx);
+            }
+        });
+
+        let mut settled = false;
+        for _ in 0..40 {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(10));
+            cx.run_until_parked();
+            if !app.read_with(cx, |app, _| app.settings_save_running) {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the serial writer loop never settled back to idle");
+        assert!(!app.read_with(cx, |app, _| app.settings_save_pending));
+
+        let on_disk = settings_store::Settings::load_or_init_at(&settings_path);
+        assert_eq!(
+            on_disk.appearance.editor_font_size, 20.0,
+            "the file must hold the LAST edit's value, never an earlier, longer-delayed edit's \
+             stale one landing on top of it afterward"
+        );
+    }
 }
 
 mod code_surface;
 mod focus;
 mod lsp;
 mod merge_flow;
+mod merge_flow_render;
 mod palette_render;
 mod rail_render;
 mod rem_scope;
@@ -1054,6 +1383,7 @@ mod settings_widgets;
 mod sidebar_render;
 mod state;
 mod status_bar;
+mod task_pool;
 mod title_bar;
 mod widgets;
 mod work_surface_render;

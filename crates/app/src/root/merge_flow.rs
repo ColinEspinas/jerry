@@ -208,7 +208,6 @@ impl AdeApp {
         // flight would cancel it, leaving real conflict markers on disk while the in-memory
         // model already reported that file resolved. Writes to distinct files are independent,
         // so nothing in-flight is ever dropped here, only tasks that have already completed.
-        self._merge_write_tasks.retain(|task| !task.is_ready());
         self._merge_write_tasks.push(task);
     }
 

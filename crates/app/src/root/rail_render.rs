@@ -268,8 +268,27 @@ impl AdeApp {
     /// Only ever called once [`Self::request_prune`]'s confirmation step has been satisfied,
     /// and only with paths [`Self::prunable_worktree_paths`] itself produced (never the main
     /// checkout, never a locked worktree, never one with a live session).
+    ///
+    /// Guarded by [`Self::prune_in_flight`] - a real no-op while a previous prune batch is
+    /// still running, exactly mirroring `Self::complete_merge_flow`/`Self::abort_merge_flow`'s
+    /// own `merge_op_in_flight` guard (see that field's docs for the identical real race this
+    /// closes: without it, a second confirming click could spawn a second batch into the same
+    /// [`Self::_prune_task`] slot, dropping the first batch's `Task` handle and either
+    /// silently cancelling it outright (if it hadn't started yet) or letting it complete for
+    /// real without its own completion handler ever running (if it had) - either way leaving
+    /// [`Self::prune_status`]/the worktree list stuck stale).
     pub(super) fn execute_prune(&mut self, candidates: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if self.prune_in_flight {
+            // Defense in depth alongside `Self::render_rail_footer`'s own gating of the prune
+            // button itself (which is what actually stops a real user from reaching this while
+            // a batch is running): an honest, visible status rather than silent nothing, for
+            // any caller that reaches here anyway.
+            self.prune_status = Some("prune already running\u{2026}".to_string());
+            cx.notify();
+            return;
+        }
         let repo_path = self.repo_path.clone();
+        self.prune_in_flight = true;
         self.prune_status = Some(format!("pruning {} worktree(s)...", candidates.len()));
         cx.notify();
 
@@ -293,6 +312,7 @@ impl AdeApp {
                 .await;
 
             let _ = this.update(cx, |this, cx| {
+                this.prune_in_flight = false;
                 let (removed, errors) = outcome;
                 this.prune_status = Some(if errors.is_empty() {
                     format!("pruned {removed} worktree(s)")
@@ -641,6 +661,16 @@ impl AdeApp {
                 })
                 .child(div().flex_1())
                 .child(
+                    // A real, aggregate "which statuses does this project contain" summary
+                    // (`rail::status_dot_cluster`) - the design mockup's own project-row
+                    // `p.dots` fixture is a 5×5 circle per distinct status
+                    // (`design_handoff_jerry_ade/revision/Jerry.dc.html`'s `railProject`
+                    // section), the same real 5×5 size [`Self::render_status_group`]'s own
+                    // header marker uses for the same "summary, not an individual row" reason -
+                    // deliberately larger than an individual session row's own 4×4 dot (see
+                    // [`Self::render_session_row`]'s own `.w(px(4.0)).h(px(4.0))` - one real
+                    // call site shared by both rail modes, matching the same mockup's `s.dot`
+                    // and `r.dot` fixtures, which both specify 4×4 too).
                     div().flex().items_center().gap(px(3.0)).children(
                         dots.into_iter()
                             .map(|status| div().w(px(5.0)).h(px(5.0)).bg(status.color())),
@@ -868,6 +898,13 @@ impl AdeApp {
                     .items_center()
                     .gap(px(5.0))
                     .pt(px(2.0))
+                    // Real, deliberately smaller than the group-header/project-summary dots
+                    // above (5×5 - see `Self::render_status_group`'s and the project dots
+                    // cluster's own docs): this is one individual session row's own status dot,
+                    // matching the design mockup's `s.dot` (`railUrgency` section) and `r.dot`
+                    // (`railProject` section) fixtures, both `width:4px;height:4px` in
+                    // `design_handoff_jerry_ade/revision/Jerry.dc.html` - this one function
+                    // renders both modes' rows, so one real 4×4 call site covers both fixtures.
                     .child(div().w(px(4.0)).h(px(4.0)).bg(row.status.color()))
                     .child(
                         div()
@@ -935,10 +972,45 @@ impl AdeApp {
             None => "...".to_string(),
         };
         let prunable_count = self.prunable_worktree_paths().len();
-        let prune_label = if self.prune_confirm_armed {
+        let prune_label = if self.prune_in_flight {
+            "pruning\u{2026}".to_string()
+        } else if self.prune_confirm_armed {
             format!("confirm prune ({prunable_count})?")
         } else {
             format!("prune ({prunable_count})")
+        };
+
+        let prune_button = div()
+            .id("rail-prune")
+            .px(px(6.0))
+            .py(px(2.0))
+            .rounded(theme::radius::CHIP)
+            .font(font(theme::font::MONO))
+            .text_size(self.ui_text_size(10.0));
+        // Mirrors `Self::render_merge_flow_footer`'s own `in_flight` gating of its
+        // Complete/Abort buttons: while a real prune batch is genuinely running
+        // (`Self::prune_in_flight`), this button stops looking or acting clickable at all -
+        // no `cursor_pointer`, no hover affordance, no `on_click` - rather than staying
+        // enabled-looking and inviting a click that `Self::execute_prune`'s guard would
+        // silently swallow. See that field's docs for the exact confusing no-op this closes.
+        let prune_button = if self.prune_in_flight {
+            prune_button
+                .cursor_default()
+                .text_color(theme::text::DISABLED)
+                .child(prune_label)
+        } else {
+            prune_button
+                .cursor_pointer()
+                .text_color(if prunable_count > 0 {
+                    theme::button::DANGER_FG
+                } else {
+                    theme::text::DISABLED
+                })
+                .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                .child(prune_label)
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.request_prune(cx);
+                }))
         };
 
         div()
@@ -962,25 +1034,184 @@ impl AdeApp {
                         format!("{worktree_count} worktrees \u{b7} {disk_label}")
                     }),
             )
-            .child(
-                div()
-                    .id("rail-prune")
-                    .cursor_pointer()
-                    .px(px(6.0))
-                    .py(px(2.0))
-                    .rounded(theme::radius::CHIP)
-                    .font(font(theme::font::MONO))
-                    .text_size(self.ui_text_size(10.0))
-                    .text_color(if prunable_count > 0 {
-                        theme::button::DANGER_FG
-                    } else {
-                        theme::text::DISABLED
-                    })
-                    .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
-                    .child(prune_label)
-                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                        this.request_prune(cx);
-                    })),
-            )
+            .child(prune_button)
+    }
+}
+
+/// Real regression coverage for [`AdeApp::prune_in_flight`] - mirrors
+/// `root::merge_flow::merge_regression_tests`'s own real-git-repo, deterministic-executor
+/// idiom (`init_repo`/`add_worktree`, `cx.run_until_parked()` called only where the test
+/// deliberately wants a pending background task to actually finish) applied to the identical
+/// bug class for pruning: arm, execute (spawns a real prune batch), arm again, execute again,
+/// with all four `Self::request_prune` calls landing before the first batch's real
+/// `wt_core::remove_worktree` has run - must leave exactly one real prune batch in flight,
+/// never two racing ones sharing `Self::_prune_task`.
+#[cfg(test)]
+mod prune_regression_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+    use std::fs;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "user.name", "Test User"]);
+        fs::write(dir.path().join("base.txt"), "base\n").expect("write");
+        git(dir.path(), &["add", "base.txt"]);
+        git(dir.path(), &["commit", "-m", "initial"]);
+        dir
+    }
+
+    /// Same real-linked-worktree idiom `root::merge_flow`'s own test module uses. Created with
+    /// no new commits of its own, so its branch tip trivially equals `main`'s - a real,
+    /// genuinely-merged, clean worktree without needing a second real merge to produce one.
+    fn add_worktree(repo_path: &Path, branch: &str, name: &str) -> PathBuf {
+        let container = TempDir::new().expect("tempdir");
+        let path = container.path().join(name);
+        drop(container);
+        git(
+            repo_path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                path.to_str().expect("utf8 path"),
+            ],
+        );
+        path
+    }
+
+    /// Wires up `app.worktrees`/`app.worktree_notes` directly with one real, prunable
+    /// worktree, bypassing the periodic status-poll computation this test doesn't need to
+    /// exercise - `Self::prunable_worktree_paths` only ever reads these two fields plus
+    /// `self.sessions`, so this is a real, direct exercise of the same code
+    /// `Self::request_prune`/`Self::execute_prune` run in production.
+    fn seed_one_prunable_worktree(app: &mut AdeApp, path: PathBuf, branch: &str) {
+        app.worktrees.push(WorktreeItem {
+            path: path.clone(),
+            label: branch.to_string(),
+            branch: Some(branch.to_string()),
+            is_main: false,
+            is_locked: false,
+            error: None,
+        });
+        app.worktree_notes.insert(
+            path,
+            WorktreeNote {
+                is_main: false,
+                clean: Some(true),
+                merge: Some(wt_core::diff::WorktreeMergeStatus {
+                    base_branch: "main".to_string(),
+                    merged: true,
+                    head_committer_unix_seconds: None,
+                }),
+                is_locked: false,
+            },
+        );
+    }
+
+    /// The exact race from the bug report, made *discriminating* rather than merely
+    /// end-state-checking: a naive version of this test that arms/confirms twice against the
+    /// same single candidate passes identically whether or not `Self::prune_in_flight` exists
+    /// at all, because a double-spawned batch removing the same one worktree twice (the second
+    /// attempt just failing harmlessly, since the path is already gone) looks the same as a
+    /// single batch removing it once. This version instead seeds a *second*, independent
+    /// prunable worktree only *after* the first batch is already in flight (before
+    /// `run_until_parked` lets any real background work happen), so the second `request_prune`
+    /// cycle's candidate list is genuinely disjoint from the first's: `second` can only ever be
+    /// removed by a *second* batch actually spawning. If `Self::prune_in_flight`'s guard is
+    /// working, the second arm/confirm is a real no-op and `second` survives; if the guard were
+    /// missing or broken, a second batch would spawn (dropping - cancelling - the first batch's
+    /// still-not-yet-run `Task` in the process, via the same "dropping a `Task` cancels it
+    /// immediately" mechanism `Self::_merge_cleanup_task`'s docs describe) and remove both.
+    #[gpui::test]
+    fn a_second_confirm_while_first_batch_is_in_flight_does_not_prune_a_worktree_seeded_after_it(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let first = add_worktree(repo.path(), "first-feature", "first-feature-wt");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            seed_one_prunable_worktree(app, first.clone(), "first-feature");
+        });
+
+        // Click 1: arm.
+        app.update(cx, |app, cx| app.request_prune(cx));
+        assert!(app.read_with(cx, |app, _| app.prune_confirm_armed));
+
+        // Click 2: confirm - spawns the real first prune batch, whose candidate list is
+        // captured as exactly `[first]` right now. `prune_in_flight` is set synchronously,
+        // before the background executor has run at all - the batch's own
+        // `wt_core::remove_worktree` has not executed yet.
+        app.update(cx, |app, cx| app.request_prune(cx));
+        assert!(
+            app.read_with(cx, |app, _| app.prune_in_flight),
+            "prune_in_flight should be set synchronously by execute_prune"
+        );
+        assert!(!app.read_with(cx, |app, _| app.prune_confirm_armed));
+        assert!(
+            first.exists(),
+            "the first batch's real background work must not have run yet - nothing has \
+             parked the executor since it was spawned"
+        );
+
+        // Seed a second, independent prunable worktree *now*, while the first batch is still
+        // genuinely in flight and before any executor progress has happened. The first
+        // batch's candidate list was already captured above and cannot include this path.
+        let second = add_worktree(repo.path(), "second-feature", "second-feature-wt");
+        app.update(cx, |app, _cx| {
+            seed_one_prunable_worktree(app, second.clone(), "second-feature");
+        });
+
+        // Click 3: re-arm - `second` is now a real prune candidate too.
+        app.update(cx, |app, cx| app.request_prune(cx));
+        assert!(app.read_with(cx, |app, _| app.prune_confirm_armed));
+
+        // Click 4: confirm again, while the first batch is still genuinely in flight. If the
+        // guard works, `execute_prune` returns having done nothing - no second batch, no
+        // second candidate list, `second` is never touched.
+        app.update(cx, |app, cx| app.request_prune(cx));
+
+        // Now let whichever batch(es) actually got spawned run to completion.
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app.prune_in_flight),
+            "prune_in_flight must not be stranded at true - the real batch's own completion \
+             handler must still run to reset it"
+        );
+        assert!(
+            !first.exists(),
+            "the first, genuinely in-flight batch must still have completed for real"
+        );
+        assert!(
+            second.exists(),
+            "a worktree seeded after the first batch was already in flight must survive a \
+             second confirm click made before the first batch settled - if this fails, \
+             `Self::prune_in_flight` did not actually prevent a second prune batch from \
+             spawning and racing the first"
+        );
     }
 }
