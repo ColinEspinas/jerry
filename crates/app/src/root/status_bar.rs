@@ -35,7 +35,7 @@ impl AdeApp {
             .child(
                 div()
                     .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
+                    .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::GHOST)
                     .child(self.repo_path.display().to_string()),
             )
@@ -43,7 +43,7 @@ impl AdeApp {
             .child(
                 div()
                     .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
+                    .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::GHOST)
                     .child(label),
             )
@@ -62,7 +62,7 @@ impl AdeApp {
                         div()
                             .font(font(theme::font::SANS))
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(px(10.5))
+                            .text_size(self.ui_text_size(10.5))
                             .text_color(theme::text::FAINT)
                             .child("commands"),
                     )

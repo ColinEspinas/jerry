@@ -159,7 +159,7 @@ impl AdeApp {
             .pl(px(8.0) + indent)
             .pr(px(8.0))
             .font(font(theme::font::MONO))
-            .text_size(px(11.5))
+            .text_size(self.ui_text_size(11.5))
             .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED));
 
         if entry.is_dir {
@@ -184,7 +184,11 @@ impl AdeApp {
         }
 
         row = row
-            .child(render_tree_caret(entry.is_dir, is_open))
+            .child(render_tree_caret(
+                entry.is_dir,
+                is_open,
+                self.ui_text_size(9.0),
+            ))
             .child(if entry.is_dir {
                 render_folder_icon(is_open).into_any_element()
             } else {
@@ -233,7 +237,7 @@ impl AdeApp {
                 .when(is_active, |el| el.bg(theme::surface::SEGMENT_ACTIVE))
                 .font(font(theme::font::SANS))
                 .font_weight(gpui::FontWeight::MEDIUM)
-                .text_size(px(10.5))
+                .text_size(self.ui_text_size(10.5))
                 .text_color(if is_active {
                     theme::text::PRIMARY
                 } else {
@@ -274,7 +278,7 @@ impl AdeApp {
                         .items_center()
                         .gap(px(6.0))
                         .font(font(theme::font::MONO))
-                        .text_size(px(10.0))
+                        .text_size(self.ui_text_size(10.0))
                         .child(
                             div()
                                 .text_color(theme::diff::STAT_ADD)
@@ -324,7 +328,7 @@ impl AdeApp {
                                 .overflow_y_scroll()
                                 .child(self.render_changes_rows(cx)),
                         )
-                        .child(render_changes_footer())
+                        .child(render_changes_footer(self.ui_text_size(10.0)))
                 }
                 None => container.child(
                     div()
@@ -367,7 +371,7 @@ impl AdeApp {
             .child(
                 div()
                     .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
+                    .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::DIM)
                     .child(format!("{total} file{}", if total == 1 { "" } else { "s" })),
             )
@@ -393,7 +397,7 @@ impl AdeApp {
             .child(
                 div()
                     .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
+                    .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::DIM)
                     .child(format!("{reviewed} reviewed")),
             )
@@ -491,7 +495,7 @@ impl AdeApp {
                     div()
                         .flex_none()
                         .font(font(theme::font::MONO))
-                        .text_size(px(10.5))
+                        .text_size(self.ui_text_size(10.5))
                         .text_color(theme::text::GHOST)
                         .child(format!("{dir}/")),
                 )
@@ -503,7 +507,7 @@ impl AdeApp {
                     .overflow_hidden()
                     .font(font(theme::font::MONO))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_size(px(11.5))
+                    .text_size(self.ui_text_size(11.5))
                     .text_color(if reviewed {
                         theme::text::DIMMER
                     } else {
@@ -524,7 +528,7 @@ impl AdeApp {
                 div()
                     .flex_none()
                     .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
+                    .text_size(self.ui_text_size(10.0))
                     .text_color(theme::diff::STAT_ADD)
                     .child(format!("+{add}")),
             )
@@ -532,7 +536,7 @@ impl AdeApp {
                 div()
                     .flex_none()
                     .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
+                    .text_size(self.ui_text_size(10.0))
                     .text_color(theme::diff::STAT_DEL)
                     .child(format!("\u{2212}{del}")),
             )
@@ -567,7 +571,7 @@ impl AdeApp {
             })
             .when(!checked, |el| el.border_color(theme::border::BUTTON))
             .font(font(theme::font::MONO))
-            .text_size(px(9.0))
+            .text_size(self.ui_text_size(9.0))
             .text_color(theme::button::GREEN_FG)
             .when(checked, |el| el.child("\u{2713}"))
             .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
@@ -592,7 +596,12 @@ pub(super) enum RightSidebarView {
 /// spec text is deliberately dropped here: `]` isn't actually bound to anything (only
 /// `secondary-n` is a real, wired-up keybinding - see `crate::default_key_bindings`), and advertising a
 /// shortcut that silently does nothing if pressed is worse than a shorter, accurate footer.
-pub(super) fn render_changes_footer() -> impl IntoElement {
+///
+/// `text_size` is the caller's already-scaled [`AdeApp::ui_text_size`] value, not a literal
+/// `px(10.0)` - this free function has no `&self` of its own to call that method through, so the
+/// one real caller ([`AdeApp::render_right_sidebar`]) computes it and passes it in, the same real
+/// interface-scale coverage every other Changes/Files sidebar row text already gets.
+pub(super) fn render_changes_footer(text_size: Pixels) -> impl IntoElement {
     div()
         .flex_none()
         .h(theme::band::SURFACE_FOOTER)
@@ -603,7 +612,7 @@ pub(super) fn render_changes_footer() -> impl IntoElement {
         .border_color(theme::border::INNER)
         .bg(theme::surface::FOOTER)
         .font(font(theme::font::MONO))
-        .text_size(px(10.0))
+        .text_size(text_size)
         .text_color(theme::text::HINT)
         .child("click a file to open its diff in the centre")
 }
@@ -613,7 +622,10 @@ pub(super) fn render_changes_footer() -> impl IntoElement {
 /// that a directory row is clickable/expandable, distinct from the folder icon itself. Blank
 /// (but still 8px wide, to keep every row's icon column aligned) for a file row, which the
 /// mockup's own data never gives a caret at all.
-pub(super) fn render_tree_caret(is_dir: bool, open: bool) -> impl IntoElement {
+///
+/// `text_size` - see [`render_changes_footer`]'s own docs for why this free function takes an
+/// already-scaled [`AdeApp::ui_text_size`] value rather than computing it internally.
+pub(super) fn render_tree_caret(is_dir: bool, open: bool, text_size: Pixels) -> impl IntoElement {
     let label = if !is_dir {
         ""
     } else if open {
@@ -625,7 +637,7 @@ pub(super) fn render_tree_caret(is_dir: bool, open: bool) -> impl IntoElement {
         .flex_none()
         .w(px(8.0))
         .font(font(theme::font::MONO))
-        .text_size(px(9.0))
+        .text_size(text_size)
         .text_color(theme::text::TREE_CARET)
         .child(label)
 }

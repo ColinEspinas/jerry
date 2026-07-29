@@ -496,6 +496,60 @@ pub mod shadow {
     // rgba(0,0,0,0.55)
 }
 
+/// Real, honestly-scoped application of `Settings.appearance.interface_scale_percent`
+/// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, "Sizing" section) -
+/// text-size scaling only, deliberately not padding/spacing/icon/fixed-chrome dimensions. See
+/// `crate::root::AdeApp::ui_text_size`'s own docs for exactly why: `crate::theme` is otherwise
+/// ~500 call sites of literal, compile-time `Pixels` constants (see this module's own docs), so
+/// retrofitting every single one of them to scale (not just text) is the large, invasive,
+/// out-of-scope rems-retrofit this phase's own brief explicitly declines to attempt - this
+/// module only offers the one, real, narrow multiplier a render call site can choose to apply to
+/// its own `.text_size(...)` call.
+///
+/// ## The honest, current list of which real surfaces read this
+///
+/// A real audit found an earlier version of this list overstated its own coverage (claiming
+/// "the Settings surface" scales, when only row *labels*/*hints* did, not the row *controls*
+/// right next to them - visibly obvious on the Appearance page itself, where dragging the scale
+/// control grew its own label while the `90% | 100% | 110% | 125%` segment labels beside it
+/// stayed fixed size). Rather than punt to a separate document that can drift out of sync with
+/// the code again, here is the real, current, specific list:
+///
+/// Scaled: the session rail (`crate::root::rail_render`, every row/label); the title bar/status
+/// bar (`crate::root::status_bar`); the command palette's row labels/hints
+/// (`crate::root::palette_render`); the Files/Changes sidebar's row labels, footer hint, and tree
+/// caret (`crate::root::sidebar_render`); the file/session tab strip's tab labels
+/// (`crate::root::work_surface_render::render_file_tab`/`render_session_tab`); and, as of this
+/// fix, every real Settings row - both the label/hint (`crate::root::settings_widgets::
+/// render_settings_row`) *and* its control (the stepper value, the choice-segment labels, the
+/// config banner's path/chip/keys-line/`Open file`/`TOML|JSON` text, and the snippet block's
+/// title/body/caption - all in `crate::root::settings_widgets`).
+///
+/// Deliberately NOT scaled, each for its own real reason rather than an oversight: the code
+/// surface and terminal panes have their own separate, dedicated font-size mechanisms
+/// (`crate::root::AdeApp::effective_code_rem_px`/`Settings.appearance.terminal_font_size` - a
+/// second multiplier on top of those would compound in a way nothing in this app's settings
+/// model or design actually asks for); chips/badges/keycaps/close-tab icon glyphs app-wide
+/// (`crate::root::widgets::render_keycap`, the file/session tab strip's own language chip and
+/// `×` close glyph, the palette's session/file/command chips, the Files tree's own language
+/// chip/`moved` tag) and the Themes page's preview-card internals, which are all small,
+/// fixed-size glyphs/labels the design treats as part of a component's own fixed shape rather
+/// than running text; and the rest of `crate::root::work_surface_render`'s own chrome (the
+/// session context bar, toolbar buttons, the tab strip's own `+` menu, footer action buttons) -
+/// real, currently out of scope, left for a later pass rather than silently left unmentioned.
+pub mod ui_scale {
+    use super::px;
+    use gpui::Pixels;
+
+    /// Scales `base_px` by `scale_percent` (e.g. `100` = unchanged, `125` = 25% larger) - a
+    /// pure, `gpui::Context`-free function so it's directly unit-testable without a live
+    /// window, the same real pattern this codebase already applies to `crate::terminal_pane`'s
+    /// `size_to_grid`/`crate::root::code_surface`'s `clamp_zoom_percent`.
+    pub fn scaled_px(base_px: f32, scale_percent: u16) -> Pixels {
+        px(base_px * (scale_percent as f32 / 100.0))
+    }
+}
+
 /// The two bundled font families (see `crate::fonts`) - `design_handoff_jerry_ade/README.md`'s
 /// "Design tokens" section: "Fonts: IBM Plex Sans (UI ...) and IBM Plex Mono (branches,
 /// paths, diffs, terminal, code ...). Nothing else."
@@ -535,4 +589,24 @@ pub mod palette {
     /// [`super::lang::MD`], but kept as its own named token here since a command chip and a
     /// Markdown-file chip are unrelated concepts that merely happen to share a designed colour.
     pub const COMMAND_CHIP: (Rgba, Rgba) = (hex(0x7f9ad4), hex(0x1d2532));
+}
+
+#[cfg(test)]
+mod ui_scale_tests {
+    use super::px;
+    use super::ui_scale::scaled_px;
+
+    #[test]
+    fn one_hundred_percent_is_a_real_no_op() {
+        assert_eq!(scaled_px(12.0, 100), px(12.0));
+    }
+
+    #[test]
+    fn scales_up_and_down_proportionally() {
+        // `125`/`50` (not e.g. `90`) so the expected value is exactly representable in `f32`
+        // and this stays a real, non-flaky exact-equality check rather than needing an epsilon
+        // comparison.
+        assert_eq!(scaled_px(12.0, 125), px(15.0));
+        assert_eq!(scaled_px(12.0, 50), px(6.0));
+    }
 }

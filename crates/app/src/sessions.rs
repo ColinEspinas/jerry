@@ -166,10 +166,16 @@ impl Sessions {
     /// is a real, new parameter this method needs specifically for `Context::subscribe_in`
     /// (which resolves the subscribing window at subscribe time, per its own real signature) -
     /// every one of this method's real call sites already had one available.
+    /// `terminal_font_size_px` is the real, live `settings_store::AppearanceSettings::
+    /// terminal_font_size` at spawn time (every real call site reads it fresh from
+    /// `AdeApp::settings` rather than a hardcoded literal) - see [`TerminalPane::new`]'s own
+    /// docs for why a freshly spawned pane must never start out silently mismatched from what
+    /// Settings › Appearance already shows.
     pub fn spawn(
         &mut self,
         kind: SessionKind,
         cwd: PathBuf,
+        terminal_font_size_px: f32,
         window: &mut Window,
         cx: &mut Context<AdeApp>,
     ) -> SessionId {
@@ -177,7 +183,7 @@ impl Sessions {
         self.next_id += 1;
 
         let spec = kind.spec(cwd.clone());
-        let pane = cx.new(|cx| TerminalPane::new(spec, cx));
+        let pane = cx.new(|cx| TerminalPane::new(spec, terminal_font_size_px, cx));
         let link_subscription =
             cx.subscribe_in(&pane, window, move |app, _pane, event, window, cx| {
                 let TerminalPaneEvent::OpenPath { path, line } = event;
@@ -193,6 +199,20 @@ impl Sessions {
         });
         self.active = Some(id);
         id
+    }
+
+    /// Real, live application of a Settings › Appearance "Terminal font size" edit
+    /// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, "Sizing" section)
+    /// to *every* currently open session's pane, not just newly spawned ones -
+    /// `crate::terminal_pane::TerminalPane::set_font_size` is itself a real no-op for a pane
+    /// already at that size, so calling this for every session on every edit is cheap even
+    /// when most panes don't actually change.
+    pub fn set_terminal_font_size(&mut self, font_size_px: f32, cx: &mut Context<AdeApp>) {
+        for session in &self.sessions {
+            session
+                .pane
+                .update(cx, |pane, cx| pane.set_font_size(font_size_px, cx));
+        }
     }
 
     pub fn set_active(&mut self, id: SessionId) {

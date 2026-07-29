@@ -138,6 +138,14 @@ fn eof_poll_decision(
 /// font's real metrics). This closes the vertical half of a real, measured "scales weirdly"
 /// bug - see [`TerminalPane::cell_size`]'s docs for the horizontal half and the fuller
 /// before/after story.
+///
+/// These are now only the *default/fallback* values - `design_handoff_jerry_ade/revision/
+/// CHANGELOG.md`'s 2026-07-29 entry, "Sizing" section makes `terminal_font_size` a real,
+/// persisted, user-editable setting (`settings_store::AppearanceSettings::terminal_font_size`,
+/// default `12.5`), so every real production [`TerminalPane`] is constructed with an explicit
+/// font size from that setting (see [`TerminalPane::new`]) rather than this constant - this
+/// stays only as the ratio [`TerminalPane::line_height_px`] scales from, and as the fixture
+/// value this module's own resize tests use.
 const ROW_FONT_SIZE_PX: f32 = 12.0;
 const ROW_LINE_HEIGHT_PX: f32 = 19.0;
 
@@ -257,10 +265,19 @@ pub struct TerminalPane {
     /// measuring `canvas()` child in `render` (see that method's docs for why this exists
     /// instead of `window.viewport_size()`). `None` only before the very first paint.
     content_bounds: Option<Bounds<Pixels>>,
+    /// This pane's real, current font size in pixels - `design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s 2026-07-29 entry: the persisted `appearance.terminal_font_size` setting,
+    /// pushed in at construction ([`Self::new`]) and again on every real edit
+    /// (`crate::root::AdeApp`'s Settings › Appearance page, via [`Self::set_font_size`]).
+    /// [`Self::line_height_px`] is always derived from this, keeping the design's `12px/19`
+    /// ratio rather than drifting independently.
+    font_size_px: f32,
     /// The real, measured advance width of this pane's monospace font at
-    /// [`ROW_FONT_SIZE_PX`] - see [`Self::cell_size`]'s docs. `None` until the first
-    /// successful measurement (the loaded font/size never changes at runtime once it does,
-    /// so this is cached rather than re-measured every render).
+    /// [`Self::font_size_px`] - see [`Self::cell_size`]'s docs. `None` until the first
+    /// successful measurement for the *current* [`Self::font_size_px`] - [`Self::set_font_size`]
+    /// resets this back to `None` on a real change, since a cached width measured at the old
+    /// size would otherwise silently keep being used for grid/pty sizing after the font size
+    /// setting changed.
     cell_width_px: Option<Pixels>,
     /// Tracks which `(rows, cols)` the grid and the real child pty are each actually in
     /// sync with - see [`ResizeLatch`]'s docs for the real bug this decomposition exists
@@ -273,7 +290,15 @@ pub struct TerminalPane {
 }
 
 impl TerminalPane {
-    pub fn new(spec: TerminalSpec, cx: &mut Context<Self>) -> Self {
+    /// `font_size_px` is the real, caller-supplied starting font size - every real production
+    /// caller (`crate::sessions::Sessions::spawn`) passes the live
+    /// `settings_store::AppearanceSettings::terminal_font_size`, never a hardcoded literal, so
+    /// a pane never starts out silently mismatched from what Settings › Appearance already
+    /// shows. Clamped via [`sanitized_font_size_px`] the same way [`Self::set_font_size`]
+    /// clamps a later edit, so an already out-of-range persisted value (see
+    /// `settings_store::AppearanceSettings::sanitize`'s own docs on why a hand-edited file can
+    /// still carry one transiently) can never reach real font-metrics measurement.
+    pub fn new(spec: TerminalSpec, font_size_px: f32, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             spec,
             grid: TerminalGrid::new(TERMINAL_ROWS, TERMINAL_COLS),
@@ -285,12 +310,44 @@ impl TerminalPane {
             eof_poll_ticks: 0,
             focus_handle: cx.focus_handle(),
             content_bounds: None,
+            font_size_px: sanitized_font_size_px(font_size_px),
             cell_width_px: None,
             resize_latch: ResizeLatch::default(),
             _task: None,
         };
         this.spawn_process(cx);
         this
+    }
+
+    /// Real, live application of a Settings › Appearance "Terminal font size" edit
+    /// (`crate::root::AdeApp`'s `adjust_terminal_font_size`, via
+    /// `crate::sessions::Sessions::set_terminal_font_size`) to this one already-live pane - a
+    /// real no-op if the sanitized value is unchanged (e.g. a stepper click already at a clamp
+    /// boundary), so it never pays for an unnecessary remeasure/resize/render.
+    ///
+    /// Invalidates [`Self::cell_width_px`] (the cached, size-specific font-metrics
+    /// measurement) and `cx.notify()`s - the next render's [`Self::maybe_resize_pty`] call (it
+    /// runs unconditionally at the top of `render`, see that method's docs) then does the real
+    /// work: [`Self::cell_size`] remeasures at the new size, [`size_to_grid`] recomputes
+    /// `(rows, cols)` from it, and [`Self::resize_to`] applies that to both
+    /// [`Self::grid`] and, if a session is live, a real `PtySession::resize` call - the exact
+    /// same resize path an actual window resize already drives, not a second one built just
+    /// for this.
+    pub fn set_font_size(&mut self, font_size_px: f32, cx: &mut Context<Self>) {
+        let font_size_px = sanitized_font_size_px(font_size_px);
+        if font_size_px == self.font_size_px {
+            return;
+        }
+        self.font_size_px = font_size_px;
+        self.cell_width_px = None;
+        cx.notify();
+    }
+
+    /// The real line height for [`Self::font_size_px`] - keeps the design's `12px/19` ratio
+    /// (`design_handoff_jerry_ade/README.md`'s "lines at 12px/19 mono") rather than a second,
+    /// independently-chosen line-height setting this app doesn't have.
+    fn line_height_px(&self) -> f32 {
+        self.font_size_px * (ROW_LINE_HEIGHT_PX / ROW_FONT_SIZE_PX)
     }
 
     /// Deterministically tears down the current child process, if any, via the real
@@ -461,6 +518,25 @@ impl TerminalPane {
     #[cfg(test)]
     pub(crate) fn cell_size_for_test(&mut self, window: &Window) -> Size<Pixels> {
         self.cell_size(window)
+    }
+
+    /// Test-only seam: `(Self::resize_latch.grid, Self::resize_latch.session)` - the real,
+    /// separately-tracked "what has the grid been resized to" / "what has a live pty actually
+    /// been resized to" pair (see [`ResizeLatch`]'s own docs). A real terminal font-size-change
+    /// test reads `.1` (the session half) to prove the real child pty was actually informed of
+    /// a new size, not just that [`Self::grid`] repainted at a new size while the real process
+    /// underneath it kept believing the old one.
+    #[cfg(test)]
+    pub(crate) fn resize_sync_state_for_test(&self) -> (Option<GridDims>, Option<GridDims>) {
+        (self.resize_latch.grid, self.resize_latch.session)
+    }
+
+    /// Test-only seam: this pane's own real, current font size in pixels - lets a real test
+    /// assert [`Self::set_font_size`] actually changed it (or didn't, for an out-of-range or
+    /// unchanged edit).
+    #[cfg(test)]
+    pub(crate) fn font_size_px_for_test(&self) -> f32 {
+        self.font_size_px
     }
 
     /// The currently visible grid, as plain trimmed-right text lines (right-trimmed only -
@@ -679,24 +755,31 @@ impl TerminalPane {
                     .resolve_font(&font(crate::theme::font::MONO));
                 let measured = window
                     .text_system()
-                    .advance(font_id, px(ROW_FONT_SIZE_PX), 'm')
+                    .advance(font_id, px(self.font_size_px), 'm')
                     .map(|advance| advance.width)
                     .ok()
                     .filter(|width| *width > px(0.0));
-                let width = measured.unwrap_or(px(APPROX_CELL_WIDTH_PX));
+                // The fallback scales with the real font size too - `APPROX_CELL_WIDTH_PX` is
+                // only ever a guess for the *default* 12px size; using it verbatim at some
+                // other real, user-chosen font size would silently under/over-estimate the
+                // real cell width by however far that size differs from 12px.
+                let width = measured.unwrap_or_else(|| {
+                    px(APPROX_CELL_WIDTH_PX * self.font_size_px / ROW_FONT_SIZE_PX)
+                });
                 // `debug!`, not `info!` - useful when actually diagnosing a sizing bug (see
                 // this method's own docs for the real one this replaced), silent by default
                 // (`main.rs`'s `env_logger` filter defaults to `info`).
                 log::debug!(
-                    "terminal_pane: measured real cell width = {width:?} (font-metrics lookup \
-                     succeeded: {}; {APPROX_CELL_WIDTH_PX}px fallback used otherwise)",
+                    "terminal_pane: measured real cell width = {width:?} at font size \
+                     {}px (font-metrics lookup succeeded: {})",
+                    self.font_size_px,
                     measured.is_some()
                 );
                 self.cell_width_px = Some(width);
                 width
             }
         };
-        gpui::size(width, px(ROW_LINE_HEIGHT_PX))
+        gpui::size(width, px(self.line_height_px()))
     }
 
     /// Recomputes a real `(rows, cols)` from this pane's own real content-area bounds (see
@@ -814,6 +897,20 @@ fn content_size_from_padding_box(padding_box: Size<Pixels>) -> Size<Pixels> {
     gpui::size(padding_box.width - padding, padding_box.height - padding)
 }
 
+/// Clamps a real, caller-supplied terminal font size into
+/// `settings_store`'s shared `FONT_SIZE_MIN`/`FONT_SIZE_MAX` bounds - the exact same real range
+/// `settings_store::AppearanceSettings::sanitize` clamps a freshly loaded `settings.toml` value
+/// to, and `crate::root::AdeApp`'s own stepper already clamps every UI-driven edit to. A pane
+/// has no settings file of its own to defend against a hand-edit, but a font size of `0.0` (or
+/// less) would divide-by-zero-shaped a real `size_to_grid` call, so this is a real, defensive
+/// second application of the same bound, not a fresh, independently-chosen one.
+fn sanitized_font_size_px(font_size_px: f32) -> f32 {
+    font_size_px.clamp(
+        crate::settings_store::FONT_SIZE_MIN,
+        crate::settings_store::FONT_SIZE_MAX,
+    )
+}
+
 /// What [`ResizeLatch::apply`] says the caller should actually do for a target size.
 #[derive(Debug, PartialEq, Eq)]
 struct ResizeActions {
@@ -845,13 +942,17 @@ struct ResizeActions {
 /// `TerminalPane::spawn_process`'s success callback re-running `resize_to` at that same
 /// cached target size (see its own doc comment) genuinely reaches the pty instead of being
 /// skipped.
+/// A real `(rows, cols)` pair - named so [`TerminalPane::resize_sync_state_for_test`]'s return
+/// type doesn't trip clippy's `type_complexity` lint on a bare nested tuple-of-tuples.
+type GridDims = (u16, u16);
+
 #[derive(Debug, Default)]
 struct ResizeLatch {
     /// The `(rows, cols)` `TerminalGrid` currently reflects.
-    grid: Option<(u16, u16)>,
+    grid: Option<GridDims>,
     /// The `(rows, cols)` last successfully sent to a *live* session's real pty resize -
     /// `None` until a session exists and a resize has actually reached it.
-    session: Option<(u16, u16)>,
+    session: Option<GridDims>,
 }
 
 impl ResizeLatch {
@@ -1275,8 +1376,8 @@ impl Render for TerminalPane {
             // measurement/`size_to_grid`'s real row math are built on. See `ROW_FONT_SIZE_PX`/
             // `ROW_LINE_HEIGHT_PX`'s docs for why leaving either of these implicit was a real,
             // measured bug.
-            .text_size(px(ROW_FONT_SIZE_PX))
-            .line_height(px(ROW_LINE_HEIGHT_PX))
+            .text_size(px(self.font_size_px))
+            .line_height(px(self.line_height_px()))
             .text_color(rgb(pack_rgb(DEFAULT_FOREGROUND)))
             .child(measure_bounds);
 
@@ -1808,6 +1909,7 @@ mod clear_pty_signal_tests {
         let pane = cx.new(|cx| {
             TerminalPane::new(
                 TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
+                ROW_FONT_SIZE_PX,
                 cx,
             )
         });

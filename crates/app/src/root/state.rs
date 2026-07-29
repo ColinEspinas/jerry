@@ -61,6 +61,8 @@ impl AdeApp {
             file_load_state: FileLoadState::Idle,
             file_view_changed_lines: HashSet::new(),
             code_cursor: None,
+            code_zoom_percent: AdeApp::ZOOM_DEFAULT_PERCENT,
+            file_zoom_percent: HashMap::new(),
             palette_open: false,
             palette_scope: palette::PaletteScope::default(),
             palette_query: String::new(),
@@ -133,8 +135,13 @@ impl AdeApp {
         // `on_action` handler of its own registered (see `Self::render`'s docs on why those
         // handlers live where they do), until the user manually clicked into the terminal
         // first.
-        this.sessions
-            .spawn(SessionKind::Shell, repo_path.clone(), window, cx);
+        this.sessions.spawn(
+            SessionKind::Shell,
+            repo_path.clone(),
+            this.settings.appearance.terminal_font_size,
+            window,
+            cx,
+        );
         this.sessions.focus_active(window, cx);
         this.load_worktrees(cx);
         this.load_file_tree(repo_path.clone(), cx);
@@ -278,6 +285,7 @@ impl AdeApp {
             &mut self.open_change,
             &mut self.collapsed_dirs,
             &mut self.selected_tree_path,
+            &mut self.file_zoom_percent,
         );
         // `code_view`/`file_view_cache`/`file_load_state`/`file_view_changed_lines`/
         // `code_cursor`/`open_diff_file_cache` are the File view's own equivalent per-worktree
@@ -293,6 +301,11 @@ impl AdeApp {
         self.code_cursor = None;
         self.open_diff_file_cache = None;
         self._file_load_task = None;
+        // `file_zoom_percent` (cleared above, alongside `open_files`) is per-worktree; the
+        // single shared `code_zoom_percent` value also has to reset back to the real 100%
+        // default here, for the same reason `code_view` resets to `Diff` above rather than
+        // silently carrying over whatever the worktree just left happened to be zoomed to.
+        self.code_zoom_percent = AdeApp::ZOOM_DEFAULT_PERCENT;
         // The Hover-state cache is per-file (see `Self::hover`'s own docs) - clear it here too,
         // for the same real reason: without this, a hover card from the worktree just left could
         // render again the instant a same-named file happened to be opened in the new one.
@@ -342,12 +355,14 @@ pub(super) fn reset_per_worktree_ui_state(
     open_change: &mut Option<PathBuf>,
     collapsed_dirs: &mut HashSet<PathBuf>,
     selected_tree_path: &mut Option<PathBuf>,
+    file_zoom_percent: &mut HashMap<PathBuf, u16>,
 ) {
     reviewed_files.clear();
     open_files.clear();
     *open_change = None;
     collapsed_dirs.clear();
     *selected_tree_path = None;
+    file_zoom_percent.clear();
 }
 
 #[cfg(test)]
@@ -368,6 +383,7 @@ mod tests {
         let mut open_change = Some(PathBuf::from("src/main.rs"));
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
+        let mut file_zoom_percent = HashMap::new();
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
@@ -375,6 +391,7 @@ mod tests {
             &mut open_change,
             &mut collapsed_dirs,
             &mut selected_tree_path,
+            &mut file_zoom_percent,
         );
 
         assert!(reviewed_files.is_empty());
@@ -397,6 +414,7 @@ mod tests {
         let mut open_change = Some(PathBuf::from("Cargo.toml"));
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
+        let mut file_zoom_percent = HashMap::new();
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
@@ -404,6 +422,7 @@ mod tests {
             &mut open_change,
             &mut collapsed_dirs,
             &mut selected_tree_path,
+            &mut file_zoom_percent,
         );
 
         assert!(
@@ -420,6 +439,7 @@ mod tests {
         let mut open_change = None;
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
+        let mut file_zoom_percent = HashMap::new();
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
@@ -427,6 +447,7 @@ mod tests {
             &mut open_change,
             &mut collapsed_dirs,
             &mut selected_tree_path,
+            &mut file_zoom_percent,
         );
 
         assert!(reviewed_files.is_empty());
@@ -445,6 +466,7 @@ mod tests {
         let mut open_change = None;
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
+        let mut file_zoom_percent = HashMap::new();
         collapsed_dirs.insert(PathBuf::from("/repo/worktree-a/src"));
         collapsed_dirs.insert(PathBuf::from("/repo/worktree-a/tests"));
 
@@ -454,6 +476,7 @@ mod tests {
             &mut open_change,
             &mut collapsed_dirs,
             &mut selected_tree_path,
+            &mut file_zoom_percent,
         );
 
         assert!(collapsed_dirs.is_empty());
@@ -466,6 +489,7 @@ mod tests {
         let mut open_change = None;
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = Some(PathBuf::from("/repo/worktree-a/src/main.rs"));
+        let mut file_zoom_percent = HashMap::new();
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
@@ -473,8 +497,37 @@ mod tests {
             &mut open_change,
             &mut collapsed_dirs,
             &mut selected_tree_path,
+            &mut file_zoom_percent,
         );
 
         assert_eq!(selected_tree_path, None);
+    }
+
+    /// Regression test for the same real per-worktree bleed the rest of this module already
+    /// covers, extended to editor zoom (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s
+    /// 2026-07-29 entry, change 6): `file_zoom_percent` is keyed by the same worktree-relative
+    /// paths as `open_files`, so without this a zoom level remembered for `src/main.rs` in one
+    /// worktree would silently apply to a same-named file in a completely different one.
+    #[test]
+    fn reset_per_worktree_ui_state_clears_file_zoom_percent() {
+        let mut reviewed_files = HashSet::new();
+        let mut open_files = Vec::new();
+        let mut open_change = None;
+        let mut collapsed_dirs = HashSet::new();
+        let mut selected_tree_path = None;
+        let mut file_zoom_percent = HashMap::new();
+        file_zoom_percent.insert(PathBuf::from("src/main.rs"), 150u16);
+        file_zoom_percent.insert(PathBuf::from("Cargo.toml"), 80u16);
+
+        reset_per_worktree_ui_state(
+            &mut reviewed_files,
+            &mut open_files,
+            &mut open_change,
+            &mut collapsed_dirs,
+            &mut selected_tree_path,
+            &mut file_zoom_percent,
+        );
+
+        assert!(file_zoom_percent.is_empty());
     }
 }

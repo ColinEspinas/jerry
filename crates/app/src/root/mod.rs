@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    actions, div, font, prelude::*, px, uniform_list, App, BoxShadow, ClickEvent, Context,
+    actions, div, font, prelude::*, px, rems, uniform_list, App, BoxShadow, ClickEvent, Context,
     DragMoveEvent, Empty, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent,
     Pixels, ScrollStrategy, Task, UniformListScrollHandle, Window, WindowControlArea,
 };
@@ -365,6 +365,24 @@ pub struct AdeApp {
     /// `rust-analyzer` status field - no column is shown at all rather than a fabricated `col 1`
     /// that never actually reflects where the user clicked.
     code_cursor: Option<usize>,
+    /// Surface C's real, current editor zoom for whichever file [`Self::open_change`] currently
+    /// names (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change 6) -
+    /// a percentage of `Settings.appearance.editor_font_size`'s real 100%-zoom baseline, clamped
+    /// to `code_surface::ZOOM_MIN_PERCENT..=code_surface::ZOOM_MAX_PERCENT` in steps of
+    /// `code_surface::ZOOM_STEP_PERCENT` by [`code_surface::clamp_zoom_percent`] - never written
+    /// directly, only through [`Self::zoom_in`]/[`Self::zoom_out`]/[`Self::reset_zoom`]. Restored
+    /// from [`Self::file_zoom_percent`] (when `Settings.appearance.per_tab_zoom` is on) or left
+    /// as this one shared value (when it's off) at every real point [`Self::open_change`] points
+    /// at a different file - see `code_surface::restore_zoom_for_open_change`'s docs.
+    code_zoom_percent: u16,
+    /// Each open file tab's own real, independently-remembered zoom - only consulted (and only
+    /// ever written to) while `Settings.appearance.per_tab_zoom` is on; while it's off, every
+    /// open file shares [`Self::code_zoom_percent`] uniformly and this map is neither read nor
+    /// updated. Keyed by the same worktree-relative paths [`Self::open_files`] uses, so it gets
+    /// the exact same real per-worktree reset `Self::select_worktree` already applies to that
+    /// field (see `reset_per_worktree_ui_state`'s docs) - without that, a zoom level remembered
+    /// for `src/main.rs` in one worktree would silently leak onto a same-named file in another.
+    file_zoom_percent: HashMap<PathBuf, u16>,
     /// Whether the command palette (⌘K) overlay is open - `design_handoff_jerry_ade/README.md`'s
     /// "Added state: palette_open".
     palette_open: bool,
@@ -774,6 +792,19 @@ impl AdeApp {
         self.settings.window.controls
     }
 
+    /// The one real, shared entry point every text-scaling render call site in this app should
+    /// route through for `Settings.appearance.interface_scale_percent`
+    /// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, "Sizing" section) -
+    /// a cheap read of an already-loaded settings field plus one multiply
+    /// (`theme::ui_scale::scaled_px`), never a per-frame recomputation from scratch. Deliberately
+    /// narrow: this scales the *text size* passed to `.text_size(...)`, nothing else - see that
+    /// function's own module docs, and this crate's report, for exactly why (padding/spacing/
+    /// icon/fixed-chrome dimensions are out of scope for this phase) and which real surfaces
+    /// call this today.
+    pub(super) fn ui_text_size(&self, base_px: f32) -> Pixels {
+        theme::ui_scale::scaled_px(base_px, self.settings.appearance.interface_scale_percent)
+    }
+
     /// Sets [`Self::window_controls_style`] and persists it for real (`Self::persist_settings`).
     /// The one real write path both the General settings page and the command palette's three
     /// `Window controls: …` entries call, so the two can never silently disagree about which
@@ -1016,6 +1047,7 @@ mod lsp;
 mod merge_flow;
 mod palette_render;
 mod rail_render;
+mod rem_scope;
 mod resize;
 mod settings_render;
 mod settings_widgets;

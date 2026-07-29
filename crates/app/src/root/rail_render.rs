@@ -354,7 +354,7 @@ impl AdeApp {
                 .border_b_1()
                 .border_color(theme::border::RAIL_INNER)
                 .font(font(theme::font::MONO))
-                .text_size(px(10.0))
+                .text_size(self.ui_text_size(10.0))
                 .text_color(theme::status::FAIL)
                 .child(format!("failed to list worktrees: {error}")),
         )
@@ -376,7 +376,7 @@ impl AdeApp {
                 div()
                     .font(font(theme::font::SANS))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_size(px(10.0))
+                    .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::FAINT)
                     .child("SESSIONS"),
             )
@@ -399,7 +399,7 @@ impl AdeApp {
             .py(px(2.0))
             .rounded(theme::radius::CHIP)
             .font(font(theme::font::MONO))
-            .text_size(px(10.0))
+            .text_size(self.ui_text_size(10.0))
             .text_color(theme::text::DIM)
             .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
             .child(format!("{} \u{25be}", self.rail_mode.label()))
@@ -426,7 +426,7 @@ impl AdeApp {
             .child(
                 div()
                     .text_color(theme::text::DIM)
-                    .text_size(px(11.0))
+                    .text_size(self.ui_text_size(11.0))
                     .child("+"),
             )
             .child(render_keycap_row(
@@ -461,7 +461,7 @@ impl AdeApp {
             .child(
                 div()
                     .font(font(theme::font::MONO))
-                    .text_size(px(10.5))
+                    .text_size(self.ui_text_size(10.5))
                     .text_color(theme::text::GHOST)
                     .child("/"),
             )
@@ -469,7 +469,7 @@ impl AdeApp {
                 div()
                     .flex_1()
                     .font(font(theme::font::MONO))
-                    .text_size(px(10.5))
+                    .text_size(self.ui_text_size(10.5))
                     .text_color(if has_query {
                         theme::text::DIM
                     } else {
@@ -529,7 +529,7 @@ impl AdeApp {
             .child(
                 div()
                     .font(font(theme::font::MONO))
-                    .text_size(px(10.5))
+                    .text_size(self.ui_text_size(10.5))
                     .text_color(theme::text::GHOST)
                     .child(message),
             )
@@ -559,14 +559,14 @@ impl AdeApp {
                         div()
                             .font(font(theme::font::SANS))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_size(px(9.5))
+                            .text_size(self.ui_text_size(9.5))
                             .text_color(theme::text::FAINT)
                             .child(group.status.label().to_uppercase()),
                     )
                     .child(
                         div()
                             .font(font(theme::font::MONO))
-                            .text_size(px(9.5))
+                            .text_size(self.ui_text_size(9.5))
                             .text_color(theme::text::GHOST)
                             .child(group.rows.len().to_string()),
                     ),
@@ -625,7 +625,7 @@ impl AdeApp {
                 .child(
                     div()
                         .font(font(theme::font::MONO))
-                        .text_size(px(11.0))
+                        .text_size(self.ui_text_size(11.0))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme::text::STRONG)
                         .child(project_name),
@@ -634,7 +634,7 @@ impl AdeApp {
                     el.child(
                         div()
                             .font(font(theme::font::MONO))
-                            .text_size(px(10.0))
+                            .text_size(self.ui_text_size(10.0))
                             .text_color(theme::text::GHOST)
                             .child(branch),
                     )
@@ -649,7 +649,7 @@ impl AdeApp {
                 .child(
                     div()
                         .font(font(theme::font::MONO))
-                        .text_size(px(9.5))
+                        .text_size(self.ui_text_size(9.5))
                         .text_color(theme::text::GHOST)
                         .child(format!("{worktree_count} wt")),
                 ),
@@ -715,14 +715,14 @@ impl AdeApp {
                 .child(
                     div()
                         .font(font(theme::font::SANS))
-                        .text_size(px(12.0))
+                        .text_size(self.ui_text_size(12.0))
                         .text_color(theme::status::FAIL)
                         .child(entry.label.clone()),
                 )
                 .child(
                     div()
                         .font(font(theme::font::MONO))
-                        .text_size(px(10.0))
+                        .text_size(self.ui_text_size(10.0))
                         .text_color(theme::status::FAIL)
                         .child(error.clone()),
                 );
@@ -745,14 +745,14 @@ impl AdeApp {
             .child(
                 div()
                     .font(font(theme::font::SANS))
-                    .text_size(px(12.0))
+                    .text_size(self.ui_text_size(12.0))
                     .text_color(theme::text::BODY)
                     .child(entry.label.clone()),
             )
             .child(
                 div()
                     .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
+                    .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::GHOST)
                     .child(entry.note.label()),
             )
@@ -840,7 +840,7 @@ impl AdeApp {
                             .bg(badge_bg)
                             .font(font(theme::font::MONO))
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(px(9.0))
+                            .text_size(self.ui_text_size(9.0))
                             .text_color(badge_fg)
                             .child(work_surface::agent_initial(row.kind)),
                     )
@@ -850,14 +850,14 @@ impl AdeApp {
                             .min_w_0()
                             .overflow_hidden()
                             .font(font(theme::font::SANS))
-                            .text_size(px(12.0))
+                            .text_size(self.ui_text_size(12.0))
                             .text_color(title_color)
                             .child(row.title.clone()),
                     )
                     .child(
                         div()
                             .font(font(theme::font::MONO))
-                            .text_size(px(9.5))
+                            .text_size(self.ui_text_size(9.5))
                             .text_color(meta_color)
                             .child(meta_text),
                     ),
@@ -875,7 +875,7 @@ impl AdeApp {
                             .min_w_0()
                             .overflow_hidden()
                             .font(font(theme::font::MONO))
-                            .text_size(px(10.5))
+                            .text_size(self.ui_text_size(10.5))
                             .text_color(if is_selected {
                                 theme::text::DIM
                             } else {
@@ -890,7 +890,7 @@ impl AdeApp {
                     .child(
                         div()
                             .font(font(theme::font::MONO))
-                            .text_size(px(10.0))
+                            .text_size(self.ui_text_size(10.0))
                             .text_color(stat_color)
                             .child(stat_text),
                     ),
@@ -907,7 +907,7 @@ impl AdeApp {
                     .border_l(px(2.0))
                     .border_color(theme::status::ASK_CARD_EDGE)
                     .font(font(theme::font::SANS))
-                    .text_size(px(10.5))
+                    .text_size(self.ui_text_size(10.5))
                     .text_color(theme::status::ASK_CARD_FG)
                     .child(preview.clone()),
             );
@@ -954,7 +954,7 @@ impl AdeApp {
             .child(
                 div()
                     .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
+                    .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::GHOST)
                     .child(if let Some(status) = &self.prune_status {
                         status.clone()
@@ -970,7 +970,7 @@ impl AdeApp {
                     .py(px(2.0))
                     .rounded(theme::radius::CHIP)
                     .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
+                    .text_size(self.ui_text_size(10.0))
                     .text_color(if prunable_count > 0 {
                         theme::button::DANGER_FG
                     } else {

@@ -589,8 +589,13 @@ mod tab_strip_keybinding_tests {
             app.sessions.active_id().expect("the initial shell session")
         });
         app.update_in(cx, |app, window, cx| {
-            app.sessions
-                .spawn(SessionKind::Shell, repo.path().to_path_buf(), window, cx)
+            app.sessions.spawn(
+                SessionKind::Shell,
+                repo.path().to_path_buf(),
+                app.settings.appearance.terminal_font_size,
+                window,
+                cx,
+            )
         });
         app.update_in(cx, |app, window, cx| {
             app.select_session(first_id, window, cx);
@@ -629,8 +634,13 @@ mod tab_strip_keybinding_tests {
             app.sessions.active_id().expect("the initial shell session")
         });
         app.update_in(cx, |app, window, cx| {
-            app.sessions
-                .spawn(SessionKind::Shell, repo.path().to_path_buf(), window, cx)
+            app.sessions.spawn(
+                SessionKind::Shell,
+                repo.path().to_path_buf(),
+                app.settings.appearance.terminal_font_size,
+                window,
+                cx,
+            )
         });
         app.update_in(cx, |app, window, cx| {
             app.select_session(first_id, window, cx);
@@ -840,8 +850,13 @@ mod tab_strip_keybinding_tests {
         })];
         for _ in 0..3 {
             let id = app.update_in(cx, |app, window, cx| {
-                app.sessions
-                    .spawn(SessionKind::Shell, repo.path().to_path_buf(), window, cx)
+                app.sessions.spawn(
+                    SessionKind::Shell,
+                    repo.path().to_path_buf(),
+                    app.settings.appearance.terminal_font_size,
+                    window,
+                    cx,
+                )
             });
             ids.push(id);
         }

@@ -501,7 +501,7 @@ impl AdeApp {
                     .flex_none()
                     .font(font(theme::font::MONO))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_size(px(12.0))
+                    .text_size(self.ui_text_size(12.0))
                     .text_color(theme::palette::PREFIX)
                     .child(self.palette_scope.prefix_glyph()),
             )
@@ -514,7 +514,7 @@ impl AdeApp {
                     .child(
                         div()
                             .font(font(theme::font::SANS))
-                            .text_size(px(13.0))
+                            .text_size(self.ui_text_size(13.0))
                             .text_color(if has_query {
                                 theme::text::SELECTED
                             } else {
@@ -558,7 +558,7 @@ impl AdeApp {
                     div()
                         .font(font(theme::font::SANS))
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_size(px(10.5))
+                        .text_size(self.ui_text_size(10.5))
                         .text_color(if active {
                             theme::text::PRIMARY
                         } else {
@@ -569,7 +569,7 @@ impl AdeApp {
                 .child(
                     div()
                         .font(font(theme::font::MONO))
-                        .text_size(px(9.5))
+                        .text_size(self.ui_text_size(9.5))
                         .text_color(if active {
                             theme::text::DIMMER
                         } else {
@@ -614,7 +614,7 @@ impl AdeApp {
                 .justify_center()
                 .py(px(24.0))
                 .font(font(theme::font::MONO))
-                .text_size(px(10.5))
+                .text_size(self.ui_text_size(10.5))
                 .text_color(theme::text::FAINT)
                 .child("no results")
                 .into_any_element();
@@ -658,14 +658,14 @@ impl AdeApp {
                         div()
                             .font(font(theme::font::SANS))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_size(px(9.5))
+                            .text_size(self.ui_text_size(9.5))
                             .text_color(theme::palette::GROUP_HEADER)
                             .child(group.label.to_uppercase()),
                     )
                     .child(
                         div()
                             .font(font(theme::font::MONO))
-                            .text_size(px(9.5))
+                            .text_size(self.ui_text_size(9.5))
                             .text_color(theme::text::GHOSTER)
                             .child(group.entries.len().to_string()),
                     ),
@@ -740,7 +740,7 @@ impl AdeApp {
                     .min_w_0()
                     .truncate()
                     .font(font(theme::font::MONO))
-                    .text_size(px(10.5))
+                    .text_size(self.ui_text_size(10.5))
                     .text_color(theme::text::FAINTER)
                     .child(entry.secondary.clone()),
             );
@@ -823,7 +823,7 @@ impl AdeApp {
                 div()
                     .flex_none()
                     .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
+                    .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::HINT)
                     .child(format!(
                         "{total} result{}",

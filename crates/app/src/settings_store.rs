@@ -33,16 +33,27 @@
 //!
 //! ## What's persisted-only vs. persisted-and-applied
 //!
-//! [`WindowSettings::controls`] is the one field this phase both persists **and** applies -
+//! [`WindowSettings::controls`] is real, persisted **and** applied -
 //! `crate::root::AdeApp::window_controls_style` reads/writes it directly, so it's the real,
 //! single source of truth for both the title-bar variant and the keycap glyph table (see
-//! `crate::keymap::WindowControlsStyle`'s own docs). Every [`AppearanceSettings`]/
-//! [`ThemeSettings`] field round-trips correctly (set it, close and reopen the app, it's still
-//! set) but nothing in the render pipeline reads it yet to actually resize UI or re-skin
-//! colours - see `crate::root::settings_render`'s Appearance/Themes page docs for the two,
-//! separately tracked, real follow-up items this defers (interface scaling is Revision R5's
-//! job; a runtime theme-swap engine is a named, substantial follow-up of its own, not a small
-//! gap).
+//! `crate::keymap::WindowControlsStyle`'s own docs).
+//!
+//! [`AppearanceSettings`]'s scaling fields are now also real and applied, each through its own
+//! real, narrow mechanism - see each field's own doc comment for which:
+//! `interface_scale_percent` scales text size only, at a real, growing (but deliberately not
+//! exhaustive) list of render call sites via `crate::root::AdeApp::ui_text_size`;
+//! `editor_font_size` is Surface C's real editor-zoom baseline
+//! (`crate::root::AdeApp::effective_code_rem_px`); `terminal_font_size` really
+//! resizes `crate::terminal_pane::TerminalPane`'s live cells, grid, and pty. `per_tab_zoom`
+//! really governs which of two real zoom-persistence modes Surface C's zoom is in.
+//! `follow_system_text_size` stays real-but-persisted-only, investigated and found to have no
+//! real backing signal available (see `crate::root::settings_render`'s
+//! `toggle_follow_system_text_size` docs for the specific, real Linux GPUI APIs checked).
+//!
+//! [`ThemeSettings`] round-trips correctly (set it, close and reopen the app, it's still set)
+//! but nothing in the render pipeline reads it yet to re-skin colours - `crate::theme` is a set
+//! of compile-time `const` colour tokens, not yet a runtime-swappable resource; a real
+//! theme-swap engine is separately tracked, substantial follow-up work, not a small gap.
 
 use std::path::{Path, PathBuf};
 
@@ -74,10 +85,9 @@ pub struct WindowSettings {
 }
 
 /// The Appearance & scaling settings page's real, persisted fields - see the module docs'
-/// "What's persisted-only vs. persisted-and-applied" section: every field here round-trips
-/// through a real file, but only `crate::root::settings_render`'s Appearance page itself reads
-/// these back today (Revision R5 is where interface scaling gets actually applied to rendered
-/// UI).
+/// "What's persisted-only vs. persisted-and-applied" section for exactly which of these are
+/// now also real, applied inputs to rendering (most of them) and which is still honestly
+/// persisted-only (`follow_system_text_size`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppearanceSettings {

@@ -33,7 +33,13 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let cwd = self.active_session_cwd();
-        self.sessions.spawn(kind, cwd, window, cx);
+        self.sessions.spawn(
+            kind,
+            cwd,
+            self.settings.appearance.terminal_font_size,
+            window,
+            cx,
+        );
         self.focus_newly_spawned_session(window, cx);
         self.prune_confirm_armed = false;
         cx.notify();
@@ -231,7 +237,13 @@ impl AdeApp {
         let kind = session.kind;
         let cwd = session.cwd.clone();
         self.close_session(id, window, cx);
-        self.sessions.spawn(kind, cwd, window, cx);
+        self.sessions.spawn(
+            kind,
+            cwd,
+            self.settings.appearance.terminal_font_size,
+            window,
+            cx,
+        );
         self.focus_newly_spawned_session(window, cx);
         self.prune_confirm_armed = false;
         cx.notify();
@@ -257,7 +269,13 @@ impl AdeApp {
         match existing {
             Some(id) => self.select_session(id, window, cx),
             None => {
-                self.sessions.spawn(SessionKind::Shell, cwd, window, cx);
+                self.sessions.spawn(
+                    SessionKind::Shell,
+                    cwd,
+                    self.settings.appearance.terminal_font_size,
+                    window,
+                    cx,
+                );
                 self.focus_newly_spawned_session(window, cx);
                 self.prune_confirm_armed = false;
                 cx.notify();
@@ -447,7 +465,7 @@ impl AdeApp {
                         div()
                             .font(font(theme::font::MONO))
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(px(11.0))
+                            .text_size(self.ui_text_size(11.0))
                             .text_color(colors.label)
                             .child(file_name),
                     )
@@ -742,7 +760,13 @@ impl AdeApp {
             // the same reason.
             let _ = this.update_in(cx, |this, window, cx| {
                 let kind = installed.unwrap_or(settings::AGENT_KINDS[0]);
-                this.sessions.spawn(kind, cwd, window, cx);
+                this.sessions.spawn(
+                    kind,
+                    cwd,
+                    this.settings.appearance.terminal_font_size,
+                    window,
+                    cx,
+                );
                 this.focus_newly_spawned_session(window, cx);
                 this.prune_confirm_armed = false;
                 cx.notify();
@@ -913,7 +937,7 @@ impl AdeApp {
                                 theme::font::SANS
                             }))
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(if is_mono { px(11.0) } else { px(11.5) })
+                            .text_size(self.ui_text_size(if is_mono { 11.0 } else { 11.5 }))
                             .text_color(colors.label)
                             .child(label),
                     )

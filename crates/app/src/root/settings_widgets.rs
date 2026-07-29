@@ -9,6 +9,15 @@
 //! this phase wires a real click handler to a `Change…` action, so it isn't built here; see
 //! `crate::root::settings_render`'s General page docs for why `Default environment`, the one
 //! row it was designed for, isn't built this phase either.)
+//!
+//! Every row-control text size in this module - the stepper value, the choice-segment labels,
+//! the config banner's path/chip/keys-line/`Open file`/`TOML|JSON` text, and the snippet
+//! block's title/body/caption - now routes through `Self::ui_text_size`
+//! (`crate::theme::ui_scale`), closing a real audit finding: an earlier pass only scaled each
+//! row's own *label*/*hint* (`Self::render_settings_row`) and left every row's *control* fixed,
+//! visibly obvious on the Appearance page's own "Interface scale" row, where dragging the
+//! control grew its own label while the `90% | 100% | 110% | 125%` segment labels right next to
+//! it stayed fixed size.
 
 use super::*;
 use crate::settings_store::{CfgFormat, ConfigPage, SnippetLineKind};
@@ -114,7 +123,7 @@ impl AdeApp {
                     .justify_center()
                     .font(font(theme::font::MONO))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_size(px(7.0))
+                    .text_size(self.ui_text_size(7.0))
                     .text_color(theme::text::DIM)
                     .child("to"),
             )
@@ -123,7 +132,7 @@ impl AdeApp {
                     .flex_none()
                     .font(font(theme::font::MONO))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_size(px(10.5))
+                    .text_size(self.ui_text_size(10.5))
                     .text_color(theme::text::SECONDARY)
                     .child(display_path),
             )
@@ -133,7 +142,7 @@ impl AdeApp {
                     .min_w_0()
                     .overflow_hidden()
                     .font(font(theme::font::MONO))
-                    .text_size(px(9.5))
+                    .text_size(self.ui_text_size(9.5))
                     .text_color(theme::text::GHOSTER)
                     .child(keys_line),
             )
@@ -159,7 +168,7 @@ impl AdeApp {
                     .items_center()
                     .font(font(theme::font::SANS))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_size(px(10.5))
+                    .text_size(self.ui_text_size(10.5))
                     .child("Open file")
                     .when(is_json, |el| {
                         // No real `settings.json` file exists to open (see this method's own
@@ -199,7 +208,7 @@ impl AdeApp {
             .when(is_active, |el| el.bg(theme::surface::SEGMENT_ACTIVE))
             .font(font(theme::font::MONO))
             .font_weight(gpui::FontWeight::MEDIUM)
-            .text_size(px(10.0))
+            .text_size(self.ui_text_size(10.0))
             .text_color(if is_active {
                 theme::text::PRIMARY
             } else {
@@ -236,7 +245,7 @@ impl AdeApp {
                     .pb(px(6.0))
                     .font(font(theme::font::SANS))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_size(px(9.5))
+                    .text_size(self.ui_text_size(9.5))
                     .text_color(theme::palette::GROUP_HEADER)
                     .child(title),
             )
@@ -257,7 +266,7 @@ impl AdeApp {
                         };
                         div()
                             .font(font(theme::font::MONO))
-                            .text_size(px(11.0))
+                            .text_size(self.ui_text_size(11.0))
                             .line_height(px(18.0))
                             .text_color(color)
                             .child(if line.text.is_empty() {
@@ -271,7 +280,7 @@ impl AdeApp {
                 div()
                     .mt(px(7.0))
                     .font(font(theme::font::SANS))
-                    .text_size(px(11.0))
+                    .text_size(self.ui_text_size(11.0))
                     .line_height(px(16.0))
                     .text_color(theme::text::FAINTER)
                     .child(
@@ -307,7 +316,7 @@ impl AdeApp {
                     .child(
                         div()
                             .font(font(theme::font::SANS))
-                            .text_size(px(12.0))
+                            .text_size(self.ui_text_size(12.0))
                             .text_color(theme::text::HEADING)
                             .child(label),
                     )
@@ -316,7 +325,7 @@ impl AdeApp {
                             div()
                                 .mt(px(2.0))
                                 .font(font(theme::font::SANS))
-                                .text_size(px(11.0))
+                                .text_size(self.ui_text_size(11.0))
                                 .line_height(px(16.0))
                                 .text_color(theme::text::FAINT)
                                 .child(hint),
@@ -388,7 +397,7 @@ impl AdeApp {
                     .justify_center()
                     .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
                     .font(font(theme::font::MONO))
-                    .text_size(px(11.0))
+                    .text_size(self.ui_text_size(11.0))
                     .text_color(theme::text::DIM)
                     .child(label)
                     .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
@@ -413,7 +422,7 @@ impl AdeApp {
                     .text_center()
                     .font(font(theme::font::MONO))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_size(px(11.5))
+                    .text_size(self.ui_text_size(11.5))
                     .text_color(theme::text::HEADING)
                     .child(value),
             )
@@ -461,7 +470,7 @@ impl AdeApp {
                     .when(is_active, |el| el.bg(theme::surface::SEGMENT_ACTIVE))
                     .font(font(theme::font::SANS))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_size(px(10.5))
+                    .text_size(self.ui_text_size(10.5))
                     .text_color(if is_active {
                         theme::text::PRIMARY
                     } else {

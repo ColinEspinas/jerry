@@ -283,7 +283,11 @@ impl AdeApp {
                     .min_w_0()
                     .overflow_hidden()
                     .font(font(theme::font::SANS))
-                    .text_size(px(11.5))
+                    // `Self::ui_text_size`, not a literal `px(11.5)` - the Settings surface is
+                    // the first real, live-scaling surface for `Settings.appearance.
+                    // interface_scale_percent` (`design_handoff_jerry_ade/revision/CHANGELOG.
+                    // md`'s 2026-07-29 entry, "Sizing" section) - see that method's own docs.
+                    .text_size(self.ui_text_size(11.5))
                     .text_color(if active {
                         theme::text::SELECTED
                     } else {
@@ -338,7 +342,7 @@ impl AdeApp {
                                 div()
                                     .font(font(theme::font::SANS))
                                     .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_size(px(15.0))
+                                    .text_size(self.ui_text_size(15.0))
                                     .text_color(theme::text::SELECTED)
                                     .child(page.label()),
                             )
@@ -346,7 +350,7 @@ impl AdeApp {
                                 div()
                                     .mt(px(4.0))
                                     .font(font(theme::font::SANS))
-                                    .text_size(px(11.5))
+                                    .text_size(self.ui_text_size(11.5))
                                     .text_color(theme::settings::SUBTITLE)
                                     .child(page.subtitle()),
                             ),
@@ -868,14 +872,30 @@ impl AdeApp {
     }
 
     /// *Appearance & scaling* - every row here is real, persisted, and round-trips through
-    /// [`Self::settings`] (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3). What's
-    /// **not** real yet: nothing in the render pipeline actually reads these values back to
-    /// resize the running UI - `crate::theme`'s tokens are compile-time `const`s read directly
-    /// by roughly 500 render call sites across this codebase, not a runtime-scaled resource.
-    /// Turning that into a real, applied interface scale is Revision R5's own, separately
-    /// tracked job; this phase's job is only the settings surface. The four preview cards are a
-    /// real, static approximation (scaled font sizes on fixed sample text) of what a scale
-    /// *would* look like, not a live re-render of any actual pane.
+    /// [`Self::settings`] (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3), and
+    /// this page is now itself one of the real, live consumers of `interface_scale_percent`
+    /// (`Self::ui_text_size`, applied to this page's own nav row/header/row labels and hints,
+    /// *and* - closing a real audit finding, see `crate::root::settings_widgets`'s module docs -
+    /// every row's own control: the stepper value, the choice-segment labels (including this
+    /// very page's own "Interface scale" segment control, which used to visibly fail to scale
+    /// itself while its label grew beside it), and the config banner/snippet block - see that
+    /// method's own docs) - editing the choice control below visibly rescales this very page's
+    /// text, not just this page's four preview cards.
+    ///
+    /// What's still real-but-partial, by deliberate scope (see `theme::ui_scale`'s module
+    /// docs, which carries the real, current, specific list of exactly which surfaces read this
+    /// setting and which don't yet - kept there, not duplicated here, so there is exactly one
+    /// place to keep it honest as coverage changes): only *text* sizes respond -
+    /// `crate::theme`'s other ~500 call sites (padding, icon/chip dimensions, fixed chrome) are
+    /// compile-time `const`s this phase does not attempt to make scale, and several of the
+    /// app's other surfaces (chips/badges/keycaps, the terminal, Surface C's own code text, most
+    /// of `crate::root::work_surface_render`'s chrome) don't read this setting either - each for
+    /// its own real, documented reason. `editor_font_size`/`terminal_font_size` are real,
+    /// separately-applied baselines for Surface C's zoom (`Self::effective_code_rem_px`) and
+    /// `crate::terminal_pane` respectively, not this same interface-scale multiplier - the
+    /// design's own copy already distinguishes "Interface scale" from the two font-size rows
+    /// beneath it, and this implementation keeps that same real separation rather than
+    /// conflating three different real numbers into one.
     pub(super) fn render_settings_appearance_page(
         &self,
         cx: &mut Context<Self>,
@@ -991,7 +1011,6 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_selected = percent == selected_percent;
-        let ratio = percent as f32 / 100.0;
         let macos = self.window_controls_style().is_macos();
 
         div()
@@ -1034,7 +1053,7 @@ impl AdeApp {
                     .child(
                         div()
                             .font(font(theme::font::SANS))
-                            .text_size(px(11.5 * ratio))
+                            .text_size(theme::ui_scale::scaled_px(11.5, percent))
                             .text_color(theme::text::HEADING)
                             .child("Needs input"),
                     )
@@ -1042,7 +1061,7 @@ impl AdeApp {
                         div()
                             .mt(px(2.0))
                             .font(font(theme::font::MONO))
-                            .text_size(px(10.5 * ratio))
+                            .text_size(theme::ui_scale::scaled_px(10.5, percent))
                             .text_color(theme::text::FAINT)
                             .child("fix/auth-token-race"),
                     )
@@ -1543,14 +1562,40 @@ impl AdeApp {
         cx.notify();
     }
 
-    fn adjust_terminal_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+    /// `pub(super)`, not private: `crate::root::work_surface_render`'s own real end-to-end test
+    /// (`changing_terminal_font_size_recomputes_grid_dimensions_and_resizes_the_real_pty`)
+    /// drives this directly, the same real edit path the Appearance page's stepper click
+    /// itself invokes, rather than a second, test-only setter.
+    ///
+    /// Real, live application (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29
+    /// entry, "Sizing" section): the new value isn't only persisted, it's also pushed into
+    /// every currently open session's [`crate::terminal_pane::TerminalPane`] via
+    /// [`crate::sessions::Sessions::set_terminal_font_size`] - see that method's own docs for
+    /// why every open pane, not just newly spawned ones, has to hear about this.
+    pub(super) fn adjust_terminal_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.settings.appearance.terminal_font_size = (self.settings.appearance.terminal_font_size
             + delta)
             .clamp(settings_store::FONT_SIZE_MIN, settings_store::FONT_SIZE_MAX);
+        self.sessions
+            .set_terminal_font_size(self.settings.appearance.terminal_font_size, cx);
         self.persist_settings(cx);
         cx.notify();
     }
 
+    /// Real toggle, still real-but-persisted-only per R3's own honest disclosure -
+    /// investigated for real as part of wiring `interface_scale_percent`
+    /// (`Self::ui_text_size`) and `terminal_font_size`/`editor_font_size` to real rendering:
+    /// this vendored GPUI checkout genuinely has no Linux API for a system text-scale
+    /// accessibility preference to follow. `vendor/zed/crates/gpui/src/platform.rs`'s
+    /// `PlatformWindow::appearance`/`on_appearance_changed` only carry light/dark mode: no
+    /// text-scale variant. `vendor/zed/crates/gpui_linux/src/linux/xdg_desktop_portal.rs`'s
+    /// real XDG Desktop Portal integration reads `org.gnome.desktop.interface` for
+    /// `cursor-theme`/`cursor-size`/`color-scheme` only - `text-scaling-factor` is never read,
+    /// and the client's own `Xft.dpi` handling (`.../x11/client.rs`) is pixel-density DPI, a
+    /// different, unrelated concept from a text-size accessibility preference. Wiring a fake
+    /// signal (e.g. silently treating DPI as if it were text scale) would be exactly the kind
+    /// of invented functionality this project's conventions forbid, so this stays exactly what
+    /// R3 already documented: real, persisted, not yet applied.
     fn toggle_follow_system_text_size(&mut self, cx: &mut Context<Self>) {
         self.settings.appearance.follow_system_text_size =
             !self.settings.appearance.follow_system_text_size;
@@ -1558,8 +1603,35 @@ impl AdeApp {
         cx.notify();
     }
 
-    fn toggle_per_tab_zoom(&mut self, cx: &mut Context<Self>) {
-        self.settings.appearance.per_tab_zoom = !self.settings.appearance.per_tab_zoom;
+    /// `pub(super)`, not private - `crate::root::code_surface`'s own real per-tab-zoom tests
+    /// (`code_zoom_tests::per_tab_zoom_on_remembers_.../per_tab_zoom_off_shares_.../
+    /// turning_per_tab_zoom_on_seeds_every_open_tab_with_the_current_shared_zoom`) drive this
+    /// directly, the same real edit path the Appearance page's toggle click itself invokes.
+    ///
+    /// ## Real bug this closes: turning per-tab zoom on used to silently discard the live shared
+    /// zoom
+    ///
+    /// `Self::file_zoom_percent` (the per-tab map `Self::restore_zoom_for_open_change` reads
+    /// once per-tab mode is on) is only ever *written* to while per-tab mode is already on
+    /// (`Self::set_code_zoom`'s own real write path) - so flipping `false -> true` with a live,
+    /// non-default shared `Self::code_zoom_percent` used to leave the map completely empty for
+    /// every already-open tab. The very next tab switch/reopen then fell through
+    /// `Self::restore_zoom_for_open_change`'s own "never-zoomed tab" branch straight to
+    /// `Self::ZOOM_DEFAULT_PERCENT`, silently resetting a real, user-set zoom the moment the
+    /// user turned per-tab zoom *on* - the opposite of what "remember each tab's own zoom"
+    /// should do to zoom nobody has touched yet. Seeding every currently-open tab
+    /// (`Self::open_files`) with the shared value *before* the mode flips means every tab keeps
+    /// showing exactly the zoom it was already showing; only a *later* zoom change on one tab
+    /// makes it actually diverge from the others, which is the real, intended per-tab behavior.
+    pub(super) fn toggle_per_tab_zoom(&mut self, cx: &mut Context<Self>) {
+        let turning_on = !self.settings.appearance.per_tab_zoom;
+        if turning_on {
+            let shared_zoom = self.code_zoom_percent;
+            for path in &self.open_files {
+                self.file_zoom_percent.insert(path.clone(), shared_zoom);
+            }
+        }
+        self.settings.appearance.per_tab_zoom = turning_on;
         self.persist_settings(cx);
         cx.notify();
     }
@@ -1661,5 +1733,114 @@ mod settings_keymap_filter_tests {
             cx.debug_bounds("keybinding-row-Command palette").is_some(),
             "clearing the real filter should render every row again"
         );
+    }
+}
+
+/// Real, end-to-end coverage for `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29
+/// entry, "Sizing" section - `appearance.terminal_font_size` isn't just a persisted number, it
+/// actually changes how `crate::terminal_pane::TerminalPane` measures cells and, through that,
+/// what real `(rows, cols)` its grid *and* its live child pty are resized to.
+#[cfg(test)]
+mod terminal_font_size_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn changing_terminal_font_size_recomputes_grid_dimensions_and_resizes_the_real_pty(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let pane = app
+            .read_with(cx, |app, _| app.sessions.active().map(|s| s.pane.clone()))
+            .expect("a fresh test window has one real, active shell session");
+
+        // `TerminalPane::grid_dimensions` (`TerminalGrid::dimensions`'s own docs) reports a
+        // real `(cols, rows)` pair - the info footer's `148×38` display order - while
+        // `resize_sync_state_for_test`'s `ResizeLatch` fields are real `(rows, cols)` (the
+        // order `TerminalPane::resize_to`'s own real parameters use). Both are internally
+        // consistent (and already real/tested) on their own; this test just has to respect the
+        // one place they meet, rather than assuming they share a convention.
+        let before_dims = pane.read_with(cx, |pane, _| pane.grid_dimensions());
+        let before_dims_rows_cols = (before_dims.1, before_dims.0);
+        let (_, before_session_sync) =
+            pane.read_with(cx, |pane, _| pane.resize_sync_state_for_test());
+        assert_eq!(
+            before_session_sync,
+            Some(before_dims_rows_cols),
+            "the initial spawn's own resize must have already reached the real live pty"
+        );
+
+        // A large jump (default is 12.5px) so the resulting cell size - and so the resulting
+        // grid dimensions - can't coincidentally land back on the same real integer (rows,
+        // cols) the smaller font size already produced.
+        app.update(cx, |app, cx| {
+            app.adjust_terminal_font_size(18.0 - app.settings.appearance.terminal_font_size, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.font_size_px_for_test()),
+            18.0,
+            "the real pane must actually receive the new setting value, not just settings.toml"
+        );
+
+        let after_dims = pane.read_with(cx, |pane, _| pane.grid_dimensions());
+        let after_dims_rows_cols = (after_dims.1, after_dims.0);
+        assert_ne!(
+            before_dims, after_dims,
+            "a real font-size change must actually recompute the grid's real (cols, rows)"
+        );
+
+        let (after_grid_sync, after_session_sync) =
+            pane.read_with(cx, |pane, _| pane.resize_sync_state_for_test());
+        assert_eq!(
+            after_grid_sync,
+            Some(after_dims_rows_cols),
+            "the grid itself must be resized to the new dimensions"
+        );
+        assert_eq!(
+            after_session_sync,
+            Some(after_dims_rows_cols),
+            "the real, live child pty must also have been informed of the new size - not just \
+             the local grid repainting at a size the process underneath it doesn't know about"
+        );
+    }
+
+    #[gpui::test]
+    fn a_terminal_font_size_edit_reaches_every_open_session_not_just_new_ones(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        // A second real session, spawned at whatever the default font size already was.
+        app.update_in(cx, |app, window, cx| {
+            app.new_session(SessionKind::Shell, window, cx);
+        });
+        cx.run_until_parked();
+
+        let panes: Vec<_> = app.read_with(cx, |app, _| {
+            app.sessions.iter().map(|s| s.pane.clone()).collect()
+        });
+        assert_eq!(panes.len(), 2, "expected two real open sessions");
+
+        app.update(cx, |app, cx| {
+            app.adjust_terminal_font_size(20.0 - app.settings.appearance.terminal_font_size, cx);
+        });
+        cx.run_until_parked();
+
+        for pane in panes {
+            assert_eq!(
+                pane.read_with(cx, |pane, _| pane.font_size_px_for_test()),
+                20.0,
+                "every already-open session's pane must pick up the new font size, not just \
+                 whichever one happens to be active"
+            );
+        }
     }
 }

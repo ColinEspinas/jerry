@@ -2,6 +2,7 @@ use super::*;
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
 use crate::root::lsp::{lsp_file_status, LspClientState, LspFileStatus};
+use crate::root::rem_scope::WithRemSize;
 use crate::root::widgets::{
     render_action_keycap_row, render_keycap, render_sidebar_message, render_tag_pill,
 };
@@ -98,8 +99,9 @@ impl AdeApp {
     ) {
         self.focus_code_surface(window, cx);
         self.push_open_file(&path);
-        self.open_change = Some(path);
+        self.open_change = Some(path.clone());
         self.code_view = code_view::CodeView::Diff;
+        self.restore_zoom_for_open_change(&path);
         self.refresh_open_diff_file_cache();
         // See `Self::select_worktree`'s identical reset for why: a Hover card is only ever real
         // for the file it was requested against.
@@ -133,8 +135,9 @@ impl AdeApp {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|_| path.clone());
         self.push_open_file(&relative);
-        self.open_change = Some(relative);
+        self.open_change = Some(relative.clone());
         self.code_view = code_view::CodeView::File;
+        self.restore_zoom_for_open_change(&relative);
         self.selected_tree_path = Some(path);
         self.refresh_open_diff_file_cache();
         // See `Self::select_worktree`'s identical reset for why.
@@ -188,12 +191,13 @@ impl AdeApp {
         let has_diff = self
             .current_diff()
             .is_some_and(|diff| diff.files.iter().any(|file| file.path == path));
-        self.open_change = Some(path);
+        self.open_change = Some(path.clone());
         self.code_view = if has_diff {
             code_view::CodeView::Diff
         } else {
             code_view::CodeView::File
         };
+        self.restore_zoom_for_open_change(&path);
         self.refresh_open_diff_file_cache();
         self.hover = None;
         self.code_cursor = None;
@@ -223,6 +227,17 @@ impl AdeApp {
             return;
         };
         self.open_files.remove(index);
+        // A closed tab's own remembered per-tab zoom (`Self::file_zoom_percent`) must not
+        // outlive the tab itself - without this, reopening the exact same path later would
+        // resurrect whatever stale zoom this tab happened to be left at, silently violating
+        // `Self::restore_zoom_for_open_change`'s own documented "a never-zoomed tab starts at
+        // the real 100% default" contract (a *closed-then-reopened* path is, from the user's
+        // perspective, indistinguishable from one that was never zoomed - it has no open tab
+        // remembering anything about it anymore). Also bounds this map's real growth: without
+        // this, it would otherwise accumulate one entry per distinct path ever zoomed for the
+        // whole worktree session, only ever cleared on a full worktree switch
+        // (`reset_per_worktree_ui_state`).
+        self.file_zoom_percent.remove(&path);
         let was_active = self.open_change.as_deref() == Some(path.as_path());
         if was_active {
             // After `Vec::remove`, whatever was immediately to the right of the closed tab (if
@@ -237,7 +252,8 @@ impl AdeApp {
             });
             match neighbor {
                 Some(next_path) => {
-                    self.open_change = Some(next_path);
+                    self.open_change = Some(next_path.clone());
+                    self.restore_zoom_for_open_change(&next_path);
                     self.refresh_open_diff_file_cache();
                     self.hover = None;
                 }
@@ -270,6 +286,84 @@ impl AdeApp {
     pub(super) fn close_change_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = self.open_change.clone() {
             self.close_file_tab(path, window, cx);
+        }
+    }
+
+    /// Real editor-zoom minimum/maximum/step (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s
+    /// 2026-07-29 entry, change 6: "Range 70-200 in steps of 10") and default (100%, the real
+    /// `Settings.appearance.editor_font_size` baseline unchanged).
+    pub(super) const ZOOM_MIN_PERCENT: u16 = 70;
+    pub(super) const ZOOM_MAX_PERCENT: u16 = 200;
+    pub(super) const ZOOM_STEP_PERCENT: u16 = 10;
+    pub(super) const ZOOM_DEFAULT_PERCENT: u16 = 100;
+
+    /// The real effective rem size (in pixels) the code surface's zoom-scoped subtree renders
+    /// its `rems()`-based text at - `Settings.appearance.editor_font_size` (the real, persisted
+    /// 100%-zoom baseline this phase unifies with, rather than a second, disconnected constant)
+    /// times [`Self::code_zoom_percent`] as a fraction. A cheap arithmetic read of two
+    /// already-loaded fields, not a recomputation from scratch - see the module-level
+    /// performance discipline this codebase's audits keep enforcing.
+    pub(super) fn effective_code_rem_px(&self) -> f32 {
+        self.settings.appearance.editor_font_size * (self.code_zoom_percent as f32 / 100.0)
+    }
+
+    /// Zooms in one real step - the toolbar's `+` button.
+    pub(super) fn zoom_in(&mut self, cx: &mut Context<Self>) {
+        self.set_code_zoom(
+            clamp_zoom_percent(self.code_zoom_percent as i32 + Self::ZOOM_STEP_PERCENT as i32),
+            cx,
+        );
+    }
+
+    /// Zooms out one real step - the toolbar's `−` button.
+    pub(super) fn zoom_out(&mut self, cx: &mut Context<Self>) {
+        self.set_code_zoom(
+            clamp_zoom_percent(self.code_zoom_percent as i32 - Self::ZOOM_STEP_PERCENT as i32),
+            cx,
+        );
+    }
+
+    /// Resets zoom to 100% - the toolbar's real "click the value to reset" affordance
+    /// (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 6: "the value is ... and
+    /// click resets to 100%").
+    pub(super) fn reset_zoom(&mut self, cx: &mut Context<Self>) {
+        self.set_code_zoom(Self::ZOOM_DEFAULT_PERCENT, cx);
+    }
+
+    /// The one real place [`Self::code_zoom_percent`] is ever written to by a user action -
+    /// [`Self::zoom_in`]/[`Self::zoom_out`]/[`Self::reset_zoom`] all delegate here. When
+    /// `Settings.appearance.per_tab_zoom` is on, also remembers `percent` against whichever
+    /// file [`Self::open_change`] currently names in [`Self::file_zoom_percent`], so switching
+    /// away and back restores it (`Self::restore_zoom_for_open_change`); when it's off, this is
+    /// the one shared value every open file already reads, so there is nothing further to
+    /// remember per-file.
+    fn set_code_zoom(&mut self, percent: u16, cx: &mut Context<Self>) {
+        self.code_zoom_percent = percent;
+        if self.settings.appearance.per_tab_zoom {
+            if let Some(path) = self.open_change.clone() {
+                self.file_zoom_percent.insert(path, percent);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Restores [`Self::code_zoom_percent`] for whichever file [`Self::open_change`] now names -
+    /// called at every real point that field is pointed at a (possibly different) file:
+    /// [`Self::open_change_diff`], [`Self::open_file_view`], [`Self::activate_file_tab`]'s
+    /// real tab-switch branch, and [`Self::close_file_tab`]'s neighbor-activation branch.
+    /// Mirrors [`Self::activate_file_tab`]'s own "switching tabs restores that tab's Diff/File
+    /// view state" real per-tab-state pattern (see that method's docs), applied to zoom instead
+    /// of the view toggle: when `Settings.appearance.per_tab_zoom` is on, looks up `path`'s own
+    /// remembered zoom in [`Self::file_zoom_percent`], defaulting a never-zoomed tab to 100%;
+    /// when it's off, leaves [`Self::code_zoom_percent`] exactly as it was, since every open
+    /// file is meant to share that one value uniformly in that mode.
+    pub(super) fn restore_zoom_for_open_change(&mut self, path: &Path) {
+        if self.settings.appearance.per_tab_zoom {
+            self.code_zoom_percent = self
+                .file_zoom_percent
+                .get(path)
+                .copied()
+                .unwrap_or(Self::ZOOM_DEFAULT_PERCENT);
         }
     }
 
@@ -1387,9 +1481,11 @@ impl AdeApp {
     /// (`Self::open_change_diff`, always with a real `diff_file`) or a Files-tree row click
     /// (`Self::open_file_view`, `diff_file` may be `None`) - a toolbar (`dir`/`name`, an optional
     /// tag pill, real `+n`/`−n` when `diff_file` is present, the real `Diff | File` segmented
-    /// toggle, an always-dimmed `Accept file` - see [`render_accept_file_button`]'s docs - and a
-    /// real close/back action) over either [`Self::render_diff_file_detail`]'s real, folded hunk
-    /// content or [`Self::render_file_view`]'s real, syntax-highlighted file content.
+    /// toggle, the real editor-zoom group - see [`Self::render_zoom_control`]'s docs - an
+    /// always-dimmed `Accept file` - see [`render_accept_file_button`]'s docs - and a real
+    /// close/back action) over either [`Self::render_diff_file_detail`]'s real, folded hunk
+    /// content or [`Self::render_file_view`]'s real, syntax-highlighted file content, both real,
+    /// zoom-scoped through [`zoom_scoped`].
     ///
     /// `effective_view` is `File` unconditionally when `diff_file` is `None` (there is no diff to
     /// show - `design_handoff_jerry_ade/README.md`'s `code_view` state field: "forced to `File`
@@ -1471,6 +1567,7 @@ impl AdeApp {
             })
             .child(div().flex_1())
             .child(self.render_diff_file_toggle(has_diff, effective_view, cx))
+            .child(self.render_zoom_control(cx))
             .child(
                 div()
                     .flex_none()
@@ -1578,6 +1675,92 @@ impl AdeApp {
             .child(segment("File", code_view::CodeView::File, true))
     }
 
+    /// The toolbar's real editor-zoom control group (`design_handoff_jerry_ade/revision/
+    /// CHANGELOG.md`'s 2026-07-29 entry, change 6; `design_handoff_jerry_ade/revision/
+    /// Jerry.dc.html` lines 373-375 for the exact spec): `−` / value / `+`, each a real `19×19`
+    /// button with a real `1px` gap between them, the value itself in a real `36`-wide column
+    /// (a fixed width rather than the design's `min-width` - visually equivalent for this real
+    /// range: every real zoom percent from `Self::ZOOM_MIN_PERCENT`..=`Self::ZOOM_MAX_PERCENT`
+    /// is at most 3 digits, so it never clips) that resets zoom to 100% on click and brightens
+    /// to [`theme::text::SELECTED`] on real hover, matching the design's own `style-hover:
+    /// color:#dde2e7`. Reads/writes the real, live [`Self::code_zoom_percent`] via
+    /// [`Self::zoom_out`]/[`Self::zoom_in`]/[`Self::reset_zoom`] - never a display-only mockup
+    /// of a zoom value.
+    ///
+    /// The design specifies no disabled-color state for `−`/`+` at the range boundaries - this
+    /// real implementation adds one anyway (`enabled` dims to [`theme::text::DISABLED`] and
+    /// drops the click handler/hover/cursor entirely rather than leaving a dead-looking button
+    /// that still silently no-ops when clicked at 70%/200%), a deliberate, defensible real UX
+    /// improvement over the mockup, not a bug.
+    pub(super) fn render_zoom_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let button = |id: &'static str, label: &'static str, enabled: bool| {
+            let mut el = div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(19.0))
+                .h(px(19.0))
+                .rounded(theme::radius::CHIP)
+                .font(font(theme::font::MONO))
+                .text_size(px(11.0))
+                .text_color(if enabled {
+                    theme::text::DIM
+                } else {
+                    theme::text::DISABLED
+                })
+                .child(label);
+            if enabled {
+                el = el
+                    .cursor_pointer()
+                    .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT));
+            }
+            el
+        };
+
+        let can_zoom_out = self.code_zoom_percent > AdeApp::ZOOM_MIN_PERCENT;
+        let can_zoom_in = self.code_zoom_percent < AdeApp::ZOOM_MAX_PERCENT;
+
+        div()
+            .id("code-zoom-control")
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(1.0))
+            .child(
+                button("code-zoom-out", "\u{2212}", can_zoom_out).when(can_zoom_out, |el| {
+                    el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.zoom_out(cx);
+                    }))
+                }),
+            )
+            .child(
+                div()
+                    .id("code-zoom-value")
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(36.0))
+                    .font(font(theme::font::MONO))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(10.0))
+                    .text_color(theme::text::DIM)
+                    .hover(|el| el.text_color(theme::text::SELECTED))
+                    .child(format!("{}%", self.code_zoom_percent))
+                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.reset_zoom(cx);
+                    })),
+            )
+            .child(
+                button("code-zoom-in", "+", can_zoom_in).when(can_zoom_in, |el| {
+                    el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.zoom_in(cx);
+                    }))
+                }),
+            )
+    }
+
     /// One changed file's real diff content: a "binary file" note, or its real hunks as
     /// unified-diff-style themed lines, with a real `⋯ N unchanged lines` fold marker
     /// (`design_handoff_jerry_ade/README.md`'s Diff view fold spec) for the real gap between
@@ -1589,6 +1772,10 @@ impl AdeApp {
     /// by [`MAX_RENDERED_DIFF_LINES_PER_FILE`] independent of `wt_core::diff`'s own load-time
     /// cap.
     pub(super) fn render_diff_file_detail(&self, file: &DiffFile) -> gpui::AnyElement {
+        // The real, live effective zoom (`Self::effective_code_rem_px`), read once and passed
+        // down to `zoom_scoped` at every real return point below - a cheap read of two
+        // already-loaded fields, not something worth recomputing per branch.
+        let rem_px = self.effective_code_rem_px();
         let mut container = div()
             .id(format!("diff-detail-{}", file.path.display()))
             .flex()
@@ -1600,12 +1787,13 @@ impl AdeApp {
             .py(px(4.0));
 
         if file.is_binary {
-            return container
-                .child(render_sidebar_message(
+            return zoom_scoped(
+                rem_px,
+                container.child(render_sidebar_message(
                     "binary file (contents not diffed)".to_string(),
                     theme::text::FAINT,
-                ))
-                .into_any_element();
+                )),
+            );
         }
 
         // A rename-only file (renamed with no content change) produces zero real `@@` hunks -
@@ -1615,12 +1803,13 @@ impl AdeApp {
         // is. `changes::empty_hunks_message` picks the honest wording (naming the rename
         // specifically when that's the real cause, per `DiffFile::status`).
         if file.hunks.is_empty() {
-            return container
-                .child(render_sidebar_message(
+            return zoom_scoped(
+                rem_px,
+                container.child(render_sidebar_message(
                     changes::empty_hunks_message(file.status).to_string(),
                     theme::text::FAINT,
-                ))
-                .into_any_element();
+                )),
+            );
         }
 
         let mut rendered_lines = 0usize;
@@ -1637,7 +1826,8 @@ impl AdeApp {
             container = container.child(
                 div()
                     .font(font(theme::font::MONO))
-                    .text_size(px(11.0))
+                    .text_size(rems(1.0))
+                    .line_height(rems(1.6))
                     .px(px(8.0))
                     .bg(theme::diff::HUNK_BG)
                     .text_color(theme::diff::HUNK_FG)
@@ -1661,7 +1851,7 @@ impl AdeApp {
             ));
         }
 
-        container.into_any_element()
+        zoom_scoped(rem_px, container)
     }
 
     /// Surface C's real File view (`design_handoff_jerry_ade/README.md`'s File view subsection):
@@ -1920,7 +2110,14 @@ impl AdeApp {
         .min_h_0()
         .bg(theme::surface::PTY)
         .font(font(theme::font::MONO))
-        .text_size(px(12.5));
+        // `rems(1.0)`/`rems(1.6)`, not `px()` - real, scoped editor zoom
+        // (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change 6),
+        // resolved against `zoom_scoped`'s real `Window::with_rem_size` override just below,
+        // not the window's own unrelated (and, in this app, unused - see `rem_scope`'s module
+        // docs) default rem size. `Self::render_file_view_line`'s own rows inherit this via
+        // GPUI's ordinary cascading text style rather than setting it a second time per row.
+        .text_size(rems(1.0))
+        .line_height(rems(1.6));
 
         let mut body = div()
             .flex()
@@ -1928,7 +2125,7 @@ impl AdeApp {
             .flex_1()
             .min_h_0()
             .child(render_file_breadcrumb(relative_path))
-            .child(code);
+            .child(zoom_scoped(self.effective_code_rem_px(), code));
 
         if truncated {
             body = body.child(render_sidebar_message(
@@ -1945,6 +2142,46 @@ impl AdeApp {
 
         body.child(status_bar).into_any_element()
     }
+}
+
+/// Rounds `percent` to the nearest real 10-point zoom step, then clamps it into
+/// [`AdeApp::ZOOM_MIN_PERCENT`]`..=`[`AdeApp::ZOOM_MAX_PERCENT`] - `design_handoff_jerry_ade/
+/// revision/CHANGELOG.md`'s 2026-07-29 entry, change 6: "Range 70-200 in steps of 10". Pulled
+/// out as a free, `gpui`-free function (rather than inlined into `AdeApp::zoom_in`/`zoom_out`)
+/// so it's directly unit-testable without a `Context<AdeApp>` - the same real pattern this
+/// module already follows for `reset_per_worktree_ui_state` and `crate::terminal_pane`'s own
+/// `size_to_grid`. Takes a signed `i32` (not `u16`) so a caller can hand it an already
+/// out-of-range or negative candidate (e.g. `AdeApp::zoom_out` stepping below zero from 70%)
+/// without underflowing before this ever gets a chance to clamp it.
+pub(super) fn clamp_zoom_percent(percent: i32) -> u16 {
+    let step = AdeApp::ZOOM_STEP_PERCENT as i32;
+    let stepped = (percent as f32 / step as f32).round() as i32 * step;
+    stepped.clamp(
+        AdeApp::ZOOM_MIN_PERCENT as i32,
+        AdeApp::ZOOM_MAX_PERCENT as i32,
+    ) as u16
+}
+
+/// Real, scoped editor-zoom application (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s
+/// 2026-07-29 entry, change 6's own implementation note: "code rows are authored at `1em/1.6`
+/// and the scroll container owns the px size ... so diff and file views scale together") -
+/// wraps `content` in [`rem_scope::WithRemSize`], scoped to `rem_px` (`Self::
+/// effective_code_rem_px`'s real, live value). Every real code row inside `content` that uses
+/// `.text_size(rems(1.0))`/`.line_height(rems(1.6))` (rather than a `px()` literal) resolves
+/// against this scoped size - GPUI's own real `AbsoluteLength::to_pixels` split (see
+/// `rem_scope`'s module docs) leaves anything still expressed in `px()` inside the same subtree
+/// (the 52px line-number gutter, the 3px git-gutter column) completely unaffected, which is
+/// exactly the real "gutters keep their fixed widths" behavior the design's own note describes -
+/// verified, not just assumed, by this module's own `code_zoom_tests::zoom_scales_text_but_not_
+/// the_gutter_width` interaction test.
+fn zoom_scoped(rem_px: f32, content: impl IntoElement) -> gpui::AnyElement {
+    WithRemSize::new(px(rem_px))
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .child(content)
+        .into_any_element()
 }
 
 /// The outcome of the most recent (or in-flight) `wt_core::diff::diff_against_base` call for
@@ -2212,16 +2449,27 @@ pub(super) fn render_hover_card(
 /// (`design_handoff_jerry_ade/README.md`'s Diff view fold spec) - `N` is always a real count
 /// derived from the hunks' own `@@ ... @@` headers (`crate::changes::fold_gap_between`), never
 /// an estimate.
+///
+/// Sized in `rems()`, not `px()` - unlike the File view's line-number gutter/git-gutter column
+/// (`render_file_view_line`'s own docs), this marker is neither a gutter nor a diff-sign column,
+/// the two things the design's "gutters keep their fixed widths" note actually exempts from
+/// zoom. It's called from inside [`AdeApp::render_diff_file_detail`]'s own `container`, which
+/// [`zoom_scoped`] wraps - so `rems(0.85)`/`rems(1.6)` here resolve against that same real,
+/// live-zoomed rem size every surrounding diff row's own `rems(1.0)`/`rems(1.6)` does (`0.85`
+/// keeps this marker's text proportionally smaller than a real diff line's own text at every
+/// zoom level, matching the `11px`-vs-`13px` ratio this marker and a diff row's text already had
+/// at the real 100%-zoom baseline), rather than staying a fixed-size sliver that visually
+/// desyncs from the now-larger rows around it once zoom moves off 100%.
 pub(super) fn render_fold_marker(gap: usize) -> impl IntoElement {
     div()
         .flex()
         .items_center()
         .gap(px(4.0))
         .px(px(8.0))
-        .h(px(20.0))
+        .h(rems(1.6))
         .bg(theme::diff::FOLD_BG)
         .font(font(theme::font::MONO))
-        .text_size(px(11.0))
+        .text_size(rems(0.85))
         .text_color(theme::diff::FOLD_FG)
         .child(format!(
             "\u{22ef} {gap} unchanged line{}",
@@ -2240,7 +2488,8 @@ pub(super) fn render_diff_line(line: &wt_core::diff::DiffLine) -> impl IntoEleme
     let mut element = div()
         .flex()
         .font(font(theme::font::MONO))
-        .text_size(px(11.5))
+        .text_size(rems(1.0))
+        .line_height(rems(1.6))
         .px(px(8.0))
         .text_color(fg);
     if let Some(bg) = bg {
@@ -2629,14 +2878,67 @@ pub(super) fn render_file_view_line(
                 .pr(px(12.0))
                 .text_right()
                 .text_color(gutter_color)
+                // Pinned to a real, fixed `px()` value - deliberately NOT `rems(1.0)` (which
+                // this row's ancestor `uniform_list` sets, and which every other real piece of
+                // text in this row inherits) - see this crate's report for the real, measured
+                // bug this closes: `uniform_list` (`vendor/zed/crates/gpui/src/elements/
+                // uniform_list.rs`) measures every row's real height from item index 0 alone (a
+                // single-digit "1", which never wraps) and applies that one measured height
+                // uniformly to every row slot. A 4-digit line number growing with zoom the same
+                // way the code text does would, past a real, measurable zoom threshold, no
+                // longer fit this column's real fixed 52px width (`design_handoff_jerry_ade/
+                // Jerry.dc.html`'s own `width:52px;text-align:right;padding-right:12px`) and
+                // wrap onto a real second line - taller than the slot `uniform_list` allocated
+                // for it, so it visually overlaps the row below. Pinning this `text_size` alone
+                // (not `line_height`, which stays the ambient, zoom-scoped `rems(1.6)` this row
+                // inherits) keeps the glyphs small enough to never wrap while still letting this
+                // div's own line-box height track the row's real, zoom-scaled height - so it
+                // never desyncs from the code text row's own real height either.
+                .text_size(px(11.0))
+                // Test-only-in-effect (`Styled::debug_selector` is a real no-op outside
+                // `#[cfg(any(test, feature = "test-support"))]` builds - `crate::root::
+                // settings_render`'s keybindings-filter test already establishes this exact
+                // unconditional-call pattern): lets `code_zoom_tests::zoom_scales_text_but_not_
+                // the_gutter_width` measure this real, fixed-`px()` gutter's real rendered
+                // width at two different zoom levels and assert it never changes - the other
+                // half of the design's "gutters ... keep their fixed widths" note that
+                // `zoom_scoped`'s own docs describe.
+                .debug_selector(move || format!("file-view-gutter-{line_number}"))
                 .child(line_number.to_string()),
         )
-        .child(div().flex_none().w(px(3.0)).h(px(20.0)).bg(if is_changed {
-            theme::diff::GIT_GUTTER
-        } else {
-            work_surface::TRANSPARENT
-        }))
-        .child(div().flex_1().min_w_0().pl(px(12.0)).child(text_row))
+        .child(
+            div()
+                .flex_none()
+                .w(px(3.0))
+                // `self_stretch()` (`align-self: stretch`, verified against `vendor/zed/crates/
+                // gpui/src/styled.rs`'s own `Styled::self_stretch`, the exact same real pattern
+                // `crate::root::title_bar`'s own caption buttons already use to fill their
+                // band's full height), not a stale `h(px(20.0))` - the old fixed `20px` matched
+                // this row's *old*, always-~20.8px real height, but at higher zoom this row's
+                // real height grows (this row's own `items_center()` sizes it from its tallest
+                // child, the zoom-scaled code text) while a fixed-`px()` bar would stay pinned
+                // at 20px, leaving a real visible gap between consecutive changed lines' bars
+                // instead of one continuous strip. Stretching to the row's own real cross-axis
+                // height (whatever it actually is at the current zoom) keeps this bar spanning
+                // the full row at every zoom level, not just the old fixed 100% baseline.
+                .self_stretch()
+                .bg(if is_changed {
+                    theme::diff::GIT_GUTTER
+                } else {
+                    work_surface::TRANSPARENT
+                }),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .pl(px(12.0))
+                // See the gutter `debug_selector` above - this one measures the real,
+                // `rems()`-sized text row instead, so the same test can assert it *does*
+                // change with zoom.
+                .debug_selector(move || format!("file-view-text-row-{line_number}"))
+                .child(text_row),
+        )
         .into_any_element()
 }
 
@@ -4159,5 +4461,459 @@ mod terminal_link_click_tests {
                 "a link to a nonexistent path must not add a real tab either"
             );
         });
+    }
+}
+
+/// Real coverage for `design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry,
+/// change 6 ("Editor zoom") - pure clamping/rounding logic, real zoom-state mutation through
+/// [`AdeApp`], both real per-tab-zoom modes, and a real interaction test proving the scoped
+/// `rem_scope::WithRemSize` mechanism actually scales code text while leaving the fixed-`px()`
+/// gutter untouched.
+#[cfg(test)]
+mod code_zoom_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[test]
+    fn clamp_zoom_percent_stays_put_at_the_documented_boundaries() {
+        assert_eq!(clamp_zoom_percent(70), 70);
+        assert_eq!(clamp_zoom_percent(200), 200);
+        assert_eq!(clamp_zoom_percent(100), 100);
+    }
+
+    #[test]
+    fn clamp_zoom_percent_clamps_out_of_range_candidates_into_bounds() {
+        assert_eq!(
+            clamp_zoom_percent(-40),
+            70,
+            "a negative candidate must clamp to the real minimum, not underflow/wrap"
+        );
+        assert_eq!(clamp_zoom_percent(5000), 200);
+        assert_eq!(clamp_zoom_percent(0), 70);
+    }
+
+    #[test]
+    fn clamp_zoom_percent_rounds_to_the_nearest_real_ten_point_step() {
+        // 53 -> 5.3 -> rounds to 5 steps -> 50 -> clamped up to the real 70 minimum.
+        assert_eq!(clamp_zoom_percent(53), 70);
+        // 75 -> 7.5 -> rounds away from zero to 8 steps -> 80.
+        assert_eq!(clamp_zoom_percent(75), 80);
+        // 84 -> 8.4 -> rounds down to 8 steps -> 80.
+        assert_eq!(clamp_zoom_percent(84), 80);
+        // 205 -> 20.5 -> rounds up to 21 steps -> 210 -> clamped down to the real 200 maximum.
+        assert_eq!(clamp_zoom_percent(205), 200);
+    }
+
+    fn write_single_file(repo: &std::path::Path) -> PathBuf {
+        let file_path = repo.join("main.rs");
+        std::fs::write(&file_path, "fn main() {\n    let x = 1;\n}\n").expect("write main.rs");
+        file_path
+    }
+
+    /// A real, valid-Rust `.rs` file of exactly `lines` real lines (`// line N` comments, one
+    /// per line - tree-sitter parses a comment-only file just as validly as real code, and this
+    /// test module only ever needs a real, distinct line count/number per row, never real
+    /// syntax) - used by `zoom_scales_text_but_not_the_gutter_width` to reach a real 4-digit
+    /// line number, which `write_single_file`'s own 3-line file can never produce.
+    fn write_many_line_file(repo: &std::path::Path, lines: usize) -> PathBuf {
+        let file_path = repo.join("main.rs");
+        let mut content = String::new();
+        for line in 1..=lines {
+            content.push_str(&format!("// line {line}\n"));
+        }
+        std::fs::write(&file_path, content).expect("write main.rs");
+        file_path
+    }
+
+    #[gpui::test]
+    fn zoom_in_and_out_clamp_at_the_documented_boundaries_through_the_real_app(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_single_file(repo.path());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path, window, cx);
+        });
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_zoom_percent),
+            AdeApp::ZOOM_DEFAULT_PERCENT,
+            "a freshly opened file starts at the real 100% default"
+        );
+
+        app.update(cx, |app, cx| {
+            for _ in 0..20 {
+                app.zoom_out(cx);
+            }
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_zoom_percent),
+            AdeApp::ZOOM_MIN_PERCENT,
+            "zooming out far past the real minimum must clamp at 70%, never go lower"
+        );
+
+        app.update(cx, |app, cx| {
+            for _ in 0..30 {
+                app.zoom_in(cx);
+            }
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_zoom_percent),
+            AdeApp::ZOOM_MAX_PERCENT,
+            "zooming in far past the real maximum must clamp at 200%, never wrap"
+        );
+    }
+
+    #[gpui::test]
+    fn resetting_zoom_returns_to_100_percent(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_single_file(repo.path());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path, window, cx);
+        });
+
+        app.update(cx, |app, cx| {
+            app.zoom_in(cx);
+            app.zoom_in(cx);
+            app.zoom_in(cx);
+        });
+        assert_eq!(app.read_with(cx, |app, _| app.code_zoom_percent), 130);
+
+        app.update(cx, |app, cx| app.reset_zoom(cx));
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_zoom_percent),
+            AdeApp::ZOOM_DEFAULT_PERCENT,
+            "resetting zoom - the toolbar value's own click affordance - must land exactly on \
+             100%, matching design_handoff_jerry_ade/revision/CHANGELOG.md's change 6"
+        );
+    }
+
+    /// `Settings.appearance.per_tab_zoom` on (the real default - `AppearanceSettings::default`)
+    /// - each open file tab must remember its own zoom independently.
+    #[gpui::test]
+    fn per_tab_zoom_on_remembers_each_tabs_own_zoom_independently(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let a = repo.path().join("a.rs");
+        let b = repo.path().join("b.rs");
+        std::fs::write(&a, "fn a() {}\n").expect("write a.rs");
+        std::fs::write(&b, "fn b() {}\n").expect("write b.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        assert!(
+            app.read_with(cx, |app, _| app.settings.appearance.per_tab_zoom),
+            "per_tab_zoom should default to true - see AppearanceSettings::default"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(a.clone(), window, cx);
+        });
+        app.update(cx, |app, cx| app.zoom_in(cx)); // a.rs -> 110%
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(b.clone(), window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_zoom_percent),
+            AdeApp::ZOOM_DEFAULT_PERCENT,
+            "a tab that has never been zoomed must start at the real 100% default, not inherit \
+             the previously active tab's zoom"
+        );
+        app.update(cx, |app, cx| {
+            app.zoom_in(cx);
+            app.zoom_in(cx);
+        }); // b.rs -> 120%
+
+        app.update_in(cx, |app, window, cx| {
+            app.activate_file_tab(PathBuf::from("a.rs"), window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_zoom_percent),
+            110,
+            "switching back to a.rs must restore its own real, previously set zoom"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.activate_file_tab(PathBuf::from("b.rs"), window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_zoom_percent),
+            120,
+            "switching back to b.rs must restore its own, independently remembered zoom"
+        );
+    }
+
+    /// `Settings.appearance.per_tab_zoom` off - one shared zoom value must apply uniformly to
+    /// every open file, and switching tabs must never silently revert it.
+    #[gpui::test]
+    fn per_tab_zoom_off_shares_one_zoom_value_across_every_open_file(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let a = repo.path().join("a.rs");
+        let b = repo.path().join("b.rs");
+        std::fs::write(&a, "fn a() {}\n").expect("write a.rs");
+        std::fs::write(&b, "fn b() {}\n").expect("write b.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, cx| app.toggle_per_tab_zoom(cx));
+        assert!(!app.read_with(cx, |app, _| app.settings.appearance.per_tab_zoom));
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(a.clone(), window, cx);
+        });
+        app.update(cx, |app, cx| app.zoom_in(cx)); // 110%, shared
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(b.clone(), window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_zoom_percent),
+            110,
+            "with per-tab zoom off, opening a different file must keep the one shared zoom \
+             value, not reset to 100%"
+        );
+
+        app.update(cx, |app, cx| app.zoom_in(cx)); // 120%, shared
+
+        app.update_in(cx, |app, window, cx| {
+            app.activate_file_tab(PathBuf::from("a.rs"), window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_zoom_percent),
+            120,
+            "with per-tab zoom off, switching back to a.rs must show the same shared 120% - not \
+             the 110% it happened to be at when it was left, which would mean the value was \
+             secretly still being tracked per-tab"
+        );
+    }
+
+    /// The real regression the audit reproduced live: set a shared zoom, then turn per-tab zoom
+    /// *on* - every already-open tab must keep showing exactly the zoom it was already showing,
+    /// not silently reset to the real 100% default the instant the mode flips. See
+    /// `Self::toggle_per_tab_zoom`'s own docs for the root cause this closes: `file_zoom_percent`
+    /// used to only ever be written to while per-tab mode was already on, so turning it on left
+    /// the map empty for every currently-open tab.
+    #[gpui::test]
+    fn turning_per_tab_zoom_on_seeds_every_open_tab_with_the_current_shared_zoom(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let a = repo.path().join("a.rs");
+        let b = repo.path().join("b.rs");
+        std::fs::write(&a, "fn a() {}\n").expect("write a.rs");
+        std::fs::write(&b, "fn b() {}\n").expect("write b.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        // Start in shared mode (per-tab off) - the real default is per-tab *on*
+        // (`AppearanceSettings::default`), so this test's own first toggle turns it off to set
+        // up the "currently shared" starting state the audit's own repro begins from.
+        app.update(cx, |app, cx| app.toggle_per_tab_zoom(cx));
+        assert!(!app.read_with(cx, |app, _| app.settings.appearance.per_tab_zoom));
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(a.clone(), window, cx);
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(b.clone(), window, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.zoom_in(cx);
+            app.zoom_in(cx);
+            app.zoom_in(cx);
+            app.zoom_in(cx);
+            app.zoom_in(cx);
+        }); // 150%, shared - both a.rs and b.rs are showing this right now
+        assert_eq!(app.read_with(cx, |app, _| app.code_zoom_percent), 150);
+
+        app.update(cx, |app, cx| app.toggle_per_tab_zoom(cx));
+        assert!(app.read_with(cx, |app, _| app.settings.appearance.per_tab_zoom));
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_zoom_percent),
+            150,
+            "turning per-tab zoom on must never itself change what the currently active tab is \
+             showing"
+        );
+
+        // b.rs is the currently active tab (opened last) - switching away and back to it must
+        // restore the same 150% it was already showing, not silently fall back to 100%.
+        // `activate_file_tab` (unlike `open_file_view`) takes the same worktree-relative path
+        // `Self::open_files`/`Self::file_zoom_percent` are actually keyed by, not an absolute
+        // one - `PathBuf::from("a.rs")`/`("b.rs")`, matching every other real caller of this
+        // method in this test module.
+        app.update_in(cx, |app, window, cx| {
+            app.activate_file_tab(PathBuf::from("a.rs"), window, cx);
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.activate_file_tab(PathBuf::from("b.rs"), window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_zoom_percent),
+            150,
+            "b.rs was showing 150% the instant per-tab zoom was turned on - switching away and \
+             back must not have silently discarded that and reset it to the real 100% default"
+        );
+
+        // a.rs never got its own explicit zoom action, but it was also visibly at 150% (the
+        // shared value) the instant the mode flipped - it must have been seeded too.
+        app.update_in(cx, |app, window, cx| {
+            app.activate_file_tab(PathBuf::from("a.rs"), window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_zoom_percent),
+            150,
+            "a.rs was also showing the shared 150% at the moment per-tab zoom turned on - it \
+             must have been seeded with that value too, not just whichever tab happened to be \
+             active"
+        );
+    }
+
+    /// The real regression the audit reproduced live: zoom a tab, close it, reopen the exact
+    /// same path - it must come back at the real 100% default (this codebase's own documented
+    /// contract for a "never-zoomed" tab -
+    /// `per_tab_zoom_on_remembers_each_tabs_own_zoom_independently`, above), not resurrect the
+    /// stale zoom the closed tab was left at. See `Self::close_file_tab`'s own docs for the real
+    /// fix: the closed path's entry in `Self::file_zoom_percent` is removed immediately, not
+    /// left to accumulate for the rest of the worktree session.
+    #[gpui::test]
+    fn closing_a_tab_clears_its_remembered_zoom_so_reopening_it_starts_fresh(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let a = repo.path().join("a.rs");
+        std::fs::write(&a, "fn a() {}\n").expect("write a.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        assert!(
+            app.read_with(cx, |app, _| app.settings.appearance.per_tab_zoom),
+            "per_tab_zoom should default to true - see AppearanceSettings::default"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(a.clone(), window, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.zoom_in(cx);
+            app.zoom_in(cx);
+            app.zoom_in(cx);
+        }); // a.rs -> 130%
+        assert_eq!(app.read_with(cx, |app, _| app.code_zoom_percent), 130);
+
+        app.update_in(cx, |app, window, cx| {
+            app.close_file_tab(PathBuf::from("a.rs"), window, cx);
+        });
+        assert!(
+            !app.read_with(cx, |app, _| app.open_files.contains(&PathBuf::from("a.rs"))),
+            "closing the tab must really remove it from open_files"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(a.clone(), window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_zoom_percent),
+            AdeApp::ZOOM_DEFAULT_PERCENT,
+            "reopening a.rs after closing it must start at the real 100% default, not resurrect \
+             the 130% it was left at before it was closed"
+        );
+    }
+
+    /// The real, verified proof that `zoom_scoped`'s `WithRemSize` mechanism actually works as
+    /// GPUI's type system promises: a real, live-rendered code row's text grows with zoom while
+    /// the fixed-`px()` line-number gutter measures identically at every zoom level.
+    ///
+    /// ## Why this test's own width-only assertion used to be vacuous
+    ///
+    /// A real audit finding: comparing only the gutter's `width` (below) can never actually
+    /// fail, since the gutter column is declared `w(px(52.0))` - a compile-time literal GPUI
+    /// resolves identically regardless of whether the gutter's zoom-scoping is even wired up
+    /// correctly. It proved the column's *width* never moves, which was never actually in
+    /// doubt; it proved nothing about the column's real *content* - specifically, whether the
+    /// line-number *text* inside it still (wrongly) grows with zoom the exact same way the code
+    /// text beside it does. This test's second half (below the 150%-zoom checks) closes that
+    /// gap for real: a real 4-digit line number, scrolled into view and measured at the real
+    /// 200% zoom maximum, where the original bug actually manifested (`uniform_list` sizes every
+    /// row's slot from item index 0 alone - a single-digit "1", which never wraps - so a
+    /// 4-digit gutter number wrapping onto a second line at higher zoom painted taller than the
+    /// slot `uniform_list` actually allocated for it, overlapping the row below).
+    #[gpui::test]
+    fn zoom_scales_text_but_not_the_gutter_width(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        // 1200 real lines - enough to reach a real 4-digit line number (`1000`), which this
+        // test's own second half needs; line 1 (used by the first half below) exists in a file
+        // of any size, so this doesn't disturb that half's own real coverage.
+        let file_path = write_many_line_file(repo.path(), 1200);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path, window, cx);
+        });
+        cx.run_until_parked();
+
+        let gutter_at_100 = cx
+            .debug_bounds("file-view-gutter-1")
+            .expect("line 1's gutter should have really painted at the default 100% zoom");
+        let text_at_100 = cx
+            .debug_bounds("file-view-text-row-1")
+            .expect("line 1's text row should have really painted at the default 100% zoom");
+
+        app.update(cx, |app, cx| {
+            for _ in 0..5 {
+                app.zoom_in(cx); // 100% -> 150%
+            }
+        });
+        cx.run_until_parked();
+
+        let gutter_at_150 = cx
+            .debug_bounds("file-view-gutter-1")
+            .expect("line 1's gutter should have really painted at 150% zoom");
+        let text_at_150 = cx
+            .debug_bounds("file-view-text-row-1")
+            .expect("line 1's text row should have really painted at 150% zoom");
+
+        assert_eq!(
+            gutter_at_100.size.width, gutter_at_150.size.width,
+            "the real, fixed-px() line-number gutter must measure identically at every zoom \
+             level - it must never respond to the scoped rem-size override"
+        );
+        assert!(
+            text_at_150.size.height > text_at_100.size.height,
+            "the real, rems()-sized text row must actually grow taller at 150% zoom \
+             (line-height is rems(1.6), scoped to the real effective zoom rem size) - got \
+             {:?} at 100% vs {:?} at 150%",
+            text_at_100.size,
+            text_at_150.size,
+        );
+
+        // The real regression this second half closes: scroll a real 4-digit line number into
+        // view, push zoom to the real documented maximum (200%, the worst real case - the audit
+        // measured a wrapped-line-number row at 54px into a 27px slot at 130%, and 83px into
+        // 41.5px at 200%), and confirm the gutter never grew taller than its own row's real code
+        // text - i.e. it never wrapped, so it can never overlap the row below. Line `1000`
+        // (index `999`) is a real, literal `&'static str` target - `VisualTestContext::
+        // debug_bounds` requires one, and it's known up front here anyway (this test wrote the
+        // file being scrolled, above), so there's no real need to format/leak a dynamic one.
+        app.update(cx, |app, cx| {
+            for _ in 0..5 {
+                app.zoom_in(cx); // 150% -> 200%
+            }
+            app.file_view_scroll_handle
+                .scroll_to_item(999, ScrollStrategy::Center);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let gutter_at_200 = cx.debug_bounds("file-view-gutter-1000").expect(
+            "scrolling to line 1000 (index 999) at 200% zoom should have really painted its \
+             gutter",
+        );
+        let text_at_200 = cx.debug_bounds("file-view-text-row-1000").expect(
+            "scrolling to line 1000 (index 999) at 200% zoom should have really painted its \
+             text row",
+        );
+
+        assert_eq!(
+            gutter_at_200.size.height, text_at_200.size.height,
+            "line 1000's real, 4-digit gutter must measure exactly as tall as its own code \
+             text row at 200% zoom - a taller gutter means its line number wrapped onto a \
+             second real line inside the still-fixed-52px column, which uniform_list's own \
+             single-row-height measurement (taken from line 1 alone) would paint straight into \
+             the row below's slot, exactly the real overlap the audit measured live"
+        );
     }
 }
