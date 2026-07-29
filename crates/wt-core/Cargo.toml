@@ -3,6 +3,8 @@ name = "wt-core"
 version = "0.1.0"
 edition = { workspace = true }
 publish = { workspace = true }
+license = { workspace = true }
+description = "Git worktree management (enumerate/create/remove) for the ade agent development environment"
 
 [dependencies]
 gix = { version = "0.68" }

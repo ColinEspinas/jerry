@@ -3,6 +3,8 @@ name = "pty-core"
 version = "0.1.0"
 edition = { workspace = true }
 publish = { workspace = true }
+license = { workspace = true }
+description = "Real PTY process spawning, I/O streaming, resizing, and process-tree teardown for the ade agent development environment"
 
 [dependencies]
 portable-pty = "0.9.0"

@@ -3,6 +3,8 @@ name = "app"
 version = "0.1.0"
 edition = { workspace = true }
 publish = { workspace = true }
+license = { workspace = true }
+description = "ade (\"Jerry\"): a GPUI desktop app for supervising coding agents across parallel git worktrees"
 
 [[bin]]
 name = "app"

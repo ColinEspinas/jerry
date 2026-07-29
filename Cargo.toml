@@ -17,6 +17,7 @@ exclude = ["vendor/zed"]
 [workspace.package]
 edition = "2021"
 publish = false
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 gpui = { path = "vendor/zed/crates/gpui" }

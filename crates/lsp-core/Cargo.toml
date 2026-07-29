@@ -3,6 +3,8 @@ name = "lsp-core"
 version = "0.1.0"
 edition = { workspace = true }
 publish = { workspace = true }
+license = { workspace = true }
+description = "Real LSP client (spawns and speaks the Language Server Protocol to rust-analyzer) for the ade agent development environment"
 
 [dependencies]
 # Real, correct LSP protocol type definitions (InitializeParams, PublishDiagnosticsParams,

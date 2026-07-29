@@ -1,4 +1,14 @@
+# Vendored, gitignored-not-submodule checkout of zed-industries/zed - see README.md
+# and .github/workflows/ci.yml for how to fetch it.
 vendor/
 target/
 .claude/scratch/
+# Windows/WSL alternate-data-stream marker files left behind by files downloaded/copied
+# from a Windows filesystem.
 *:Zone.Identifier
+
+# Editor / OS artifacts
+.vscode/
+.idea/
+.DS_Store
+*.swp

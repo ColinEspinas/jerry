@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # The exact zed-industries/zed commit this workspace's GPUI path dependencies
+  # (crates/app/Cargo.toml -> gpui_platform, and the workspace-level `gpui` dependency
+  # in the root Cargo.toml) were built and verified against. `vendor/zed` is
+  # intentionally NOT committed to this repository and is not a git submodule either
+  # (see .gitignore, which ignores `vendor/` outright, and BUILD-LOG.md's "Environment
+  # / setup decisions" section) — it's a full upstream checkout of a separate, very
+  # large Cargo workspace (excluded from this one via `[workspace] exclude` in the
+  # root Cargo.toml), so every job below fetches this exact commit fresh instead.
+  #
+  # Bump this only deliberately, together with re-checking out that commit locally
+  # and re-running the full test/build/clippy suite against it (see CONTRIBUTING.md)
+  # - never as a side effect of an unrelated change, since GPUI's API surface is not
+  # stable across arbitrary upstream commits.
+  ZED_VENDOR_COMMIT: 7b030b500810b04cf5fb4aa5973be99a502d9f36
+
+jobs:
+  # Full verification on Linux: this is the platform this project is actually
+  # developed on (see BUILD-LOG.md), and the one GitHub's own hosted runners can
+  # exercise completely, including running the real test suite (GPUI's `test-support`
+  # harness does not require a display server - see crates/app/Cargo.toml's
+  # `gpui`/test-support comment; Zed's own CI runs `cargo test`/`cargo nextest` the
+  # same way on plain Ubuntu runners, with no Xvfb or similar).
+  linux:
+    name: Linux (build, test, clippy, fmt)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Fetch vendor/zed (pinned commit)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init vendor/zed
+          git -C vendor/zed remote add origin https://github.com/zed-industries/zed
+          git -C vendor/zed fetch --depth 1 origin "$ZED_VENDOR_COMMIT"
+          git -C vendor/zed checkout FETCH_HEAD
+
+      # System libraries GPUI's default Linux backend (the `wayland` gpui_platform
+      # feature crates/app/Cargo.toml enables - see that file's comment on why `x11`
+      # isn't enabled here) needs to *compile*: Wayland client headers, xkbcommon
+      # (keyboard handling), Vulkan (gpui_wgpu's renderer), and fontconfig (cosmic-text's
+      # font matching). Trimmed down from the authoritative full list at
+      # `vendor/zed/script/linux`'s Ubuntu/Debian branch, which also installs several
+      # packages this project's own dependency set never touches (libgit2 - wt-core
+      # uses `gix`, a pure-Rust reimplementation, never libgit2; musl-tools/musl-dev -
+      # no musl target is built here; pipewire/xdg-desktop-portal/libva-dev - GPUI's
+      # optional `screen-capture` feature, which nothing in this workspace enables).
+      # ALSA, OpenSSL, sqlite3, and zstd dev packages were dropped from this list after
+      # checking `Cargo.lock` directly: no `alsa`/`alsa-sys`, `openssl-sys`,
+      # `libsqlite3-sys`/`rusqlite`, or `zstd-sys`/`libz-sys` appears anywhere in this
+      # workspace's resolved dependency tree, so none of those four are actually needed
+      # to build it, despite being genuinely required by `vendor/zed`'s own, larger
+      # workspace. This trimmed list has not been verified against a real GitHub Actions
+      # runner from this sandbox (no way to run one here) - if a future CI run fails
+      # with an unresolved system library at link time, the fix is almost certainly to
+      # restore the missing package from `vendor/zed/script/linux`'s full list.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            pkg-config \
+            libfontconfig-dev \
+            libvulkan1 \
+            mesa-vulkan-drivers \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libx11-xcb-dev
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+  # Build-only signal on macOS and Windows. This project's own dev environment is
+  # Linux/WSL2-only (see BUILD-LOG.md and README.md), so these jobs are the actual,
+  # only real verification that the workspace even compiles on those platforms going
+  # forward - nobody working on this repo can check that locally today. GPUI's
+  # macOS/Windows backends (gpui_macos, gpui_windows) are selected automatically by
+  # `gpui_platform`'s own `cfg(target_os = ...)` dependency gating (see
+  # vendor/zed/crates/gpui_platform/Cargo.toml); crates/app/Cargo.toml's `wayland`
+  # feature request on `gpui_platform` is a no-op on these platforms (it only turns on
+  # a feature of `gpui_linux`, which isn't pulled in as a dependency at all outside
+  # `cfg(any(target_os = "linux", target_os = "freebsd"))`), so no per-OS Cargo.toml
+  # changes are needed for the build to be attempted here.
+  cross-build:
+    name: Build only (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Fetch vendor/zed (pinned commit)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init vendor/zed
+          git -C vendor/zed remote add origin https://github.com/zed-industries/zed
+          git -C vendor/zed fetch --depth 1 origin "$ZED_VENDOR_COMMIT"
+          git -C vendor/zed checkout FETCH_HEAD
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
