@@ -1187,3 +1187,55 @@ only of careful cross-target type-checking (rustup-added Windows/FreeBSD targets
 against each) and close reading of the real vendored dependencies' own source, honestly
 distinguished throughout from what remains genuinely unverified until this runs on real
 hardware or a real CI pipeline.
+
+## Revision R6 — status bar rebuild + environment/WSL chip
+
+Real status bar rebuild: height 26→28, gap 12→9, all values 10px mono. Left side: branch
+name, a real ahead/behind indicator, five real per-status urgency-counter squares reusing
+the exact same status classification the rail already computes, real agent CPU/memory
+totals (new `process_stats.rs`, reading `/proc` directly on Linux, no new dependency, riding
+the existing 3s status-poll loop rather than a second one), and real worktree count/disk
+usage reusing the rail's own existing computation. Right side: the environment/WSL chip R4b
+already built for real, now also reused here and as a new live "Default environment" row on
+the Settings General page (R3 had explicitly left that row for this phase); real LSP
+server/error counts; real cursor line, indent width, line ending and encoding for the active
+file view; the real editor-zoom and interface-scale values from Revisions R3/R5, clickable
+to reset; and real palette/session-jump keycap hints. The old single "8 sessions · 2
+waiting · …" summary string is gone entirely.
+
+The audit ran real processes and real git repos against this rather than only reading the
+diff, and found the new `/proc`-based sampling — this project's first subsystem parsing live
+external OS data — had a routine, not edge-case, failure mode: `aggregate_process_stats`
+discarded the entire CPU/memory total the moment a single pid couldn't be fully read, which
+a real zombie process (a pty child kept alive for up to ten seconds after exit specifically
+so its own exit can be observed) hits on every ordinary agent-session close. Fixed to sum
+whatever is genuinely known and skip only the pid that can't be read, reserving "unknown"
+for when nothing at all has been sampled yet. The same audit found the new ahead/behind
+indicator was handing git a short branch name instead of the specific commit the app had
+already resolved as the real base, so a worktree whose local branch name happened to also
+exist as a stale local ref could silently read "up to date" when it measurably wasn't —
+fixed to pass the real resolved commit id, matching how this app's own existing diff
+computation already does it. A third real bug: the new server-error count was built by
+summing a per-line diagnostic index that fans one real error out across every line it
+touches, so a single three-line error rendered as "3 errors" in the status bar while the
+file view's own footer, correctly, showed "1" for the identical diagnostic on the same frame
+— fixed by having both read the one real count.
+
+Smaller real fixes from the same audit: unparsable git output was defaulting to a fabricated
+"up to date" rather than reporting unknown; the status bar kept showing a frozen file's
+line/indent/encoding while Settings covered the entire workspace; "UTF-8" was a hardcoded
+label shown even for a file that had actually been lossily decoded from something else; CPU
+percentages were unnormalized against real system core count and undocumented as excluding
+an agent's own child processes; a naive indent-width heuristic misread a block comment
+header and a hanging-indent continuation line; and two render functions were literal copies
+of existing rail/tab-strip code instead of sharing it, reintroducing exactly the class of
+duplication Revision R5.5 had just finished consolidating elsewhere.
+
+This closes the parallel-dispatch batch (R6, R7, R11) discussed with the user as a process
+change — three independent, low-file-overlap revisions run as simultaneous worktree-isolated
+builders instead of strictly sequentially. One real process lesson from running it: the
+Agent tool's `isolation: "worktree"` parameter creates a fresh worktree per call, which is
+correct for a phase's first build pass but wrong for a fix round that needs to continue work
+already sitting in an existing worktree — two fix-round dispatches had to be corrected
+mid-flight to operate on the right directory directly instead. R8, R9, and R10 return to
+strictly sequential dispatch, since all three converge heavily on the same core files.
