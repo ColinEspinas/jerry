@@ -750,3 +750,50 @@ beyond rust-analyzer, unifying diff/merge review with the code editor plus AI-as
 conflict resolution, an undo/redo command pattern, and cross-platform (Windows/macOS) plus
 native-WSL support with CI as the real verification path for platforms this sandbox can't
 build on directly. That work is tracked as revision phases R1 through R12 and picks up next.
+
+## Revision R1 — repo cleanup, open-source readiness, module split
+
+Two independent, non-overlapping pieces dispatched in parallel (license/docs/CI touches
+only top-level repo files; the module split touches only `crates/app/src/`).
+
+`crates/app/src/root.rs` had grown to 10,872 lines — one `impl AdeApp` block alone spanned
+over 5,500 lines. Split into 15 files under `crates/app/src/root/` by real concern (state,
+focus, resize, LSP client lifecycle, rail/work-surface/sidebar/code-surface/settings/
+palette rendering, title bar, status bar). Verified as genuinely behavior-preserving via a
+token-level comparison against the original file (236 items identical, 0 missing, the only
+real differences were rustfmt line-wraps from added `pub(super)` and one forced test-fixture
+path update) rather than trusting "same test count" alone.
+
+Dual MIT/Apache-2.0 license (matching the permissive-licensing choice already made for
+GPUI/lsp-types back in the original build and Phase H2), a real top-level README and
+CONTRIBUTING.md (there wasn't one before), and real GitHub Actions CI — Linux gates plus a
+build-only macOS/Windows matrix, which becomes the actual verification path for R11's
+cross-platform work since this sandbox can't build those locally. `vendor/zed` has no
+submodule to anchor a CI checkout to (it's a plain gitignored git checkout), so CI fetches
+it fresh, pinned to the exact commit this repo was built against rather than floating `main`
+— the project's own "verified against vendor/zed" methodology only holds for that specific
+commit.
+
+Audit found the module split genuinely sound but caught one real loss (a doc comment on the
+resize handle's vendor/zed verification provenance, deleted rather than moved — restored)
+and, more valuably, used the moment to fix something the split made newly visible: three
+verbatim-identical copies of the same focus-save/restore block, which is *why* the same
+focus-dangling bug had been independently found and fixed three separate times across
+Phases E, F, and H3 — each fix landing on one copy-pasted instance rather than a shared
+implementation. Consolidated into one function after confirming line-by-line the three
+blocks were truly identical logic, re-running all 14 existing focus-regression tests
+unchanged to confirm nothing shifted. Also caught two real per-render performance bugs
+while reading the newly-legible code — the command palette rebuilding its entire
+file-candidate list (up to 5000 `PathBuf` clones plus 10000 `String` allocations) on every
+render while open and on every keystroke instead of caching it, and an unthrottled blocking
+`stat()` on every render of an open file — both the same "recompute expensive work every
+frame" class found and fixed repeatedly since Phase H1, now fixed here too. Also caught and
+fixed a real inaccuracy in the CI/README system-dependency list: four packages (ALSA,
+OpenSSL, sqlite3, zstd) were listed as required without ever checking whether they were
+actually in the resolved dependency tree — they weren't.
+
+Flagged but deliberately deferred: roughly 20 near-identical background-task-dispatch call
+sites across 6 modules, sharing the same `cx.spawn(...)` + single-task-slot shape — exactly
+the pattern Phase G's second audit round found a real bug in (two operations sharing one
+cancellable slot). Consolidating this is a real opportunity, but bigger and riskier than
+this round's other fixes; left as a named follow-up rather than rushed.
