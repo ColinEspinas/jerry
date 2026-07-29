@@ -15,52 +15,85 @@
 
 use super::*;
 use crate::settings_store::{CfgFormat, ConfigPage, SnippetLineKind};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 
-/// Which program + args hand `path` to `target_os`'s default file-open handler - `target_os`
-/// is an injected `std::env::consts::OS`-shaped string (`"linux"`/`"macos"`/`"windows"`/...)
-/// so this pure decision is directly unit-testable without actually spawning a process, same
-/// "pure decision function + thin real-execution wrapper" shape as `crate::keymap`'s
+/// Which program + args hand `target` to `target_os`'s default open handler - `target_os` is an
+/// injected `std::env::consts::OS`-shaped string (`"linux"`/`"macos"`/`"windows"`/...) so this
+/// pure decision is directly unit-testable without actually spawning a process, same "pure
+/// decision function + thin real-execution wrapper" shape as `crate::keymap`'s
 /// `detected_platform_is_macos`/`resolve_keystroke` and `crate::env_info`'s `is_wsl_from`.
 ///
-/// - macOS: real `open <path>` (`man 1 open`).
-/// - Windows: real `cmd /c start "" <path>`, not just `start <path>` - `start`'s first
+/// `target` is deliberately an [`OsStr`], not a [`Path`] - the two real callers
+/// ([`AdeApp::open_settings_file`], a real local file path, and [`AdeApp::open_install_url`], a
+/// real `https://` URL) hand the OS default-open handler the same kind of "open this for me"
+/// string either way; a URL is not a filesystem path, so forcing it through `PathBuf` would be
+/// dishonest about what it is, and every platform's real handler below (`xdg-open`/`open`/
+/// `cmd /c start`) already accepts a URL exactly as it accepts a file path.
+///
+/// - macOS: real `open <target>` (`man 1 open`).
+/// - Windows: real `cmd /c start "" <target>`, not just `start <target>` - `start`'s first
 ///   argument is a required (but empty is fine) window *title*, and skipping it makes `start`
-///   treat `path` itself as the title instead of the target the moment `path` needs quoting
-///   (any path containing a space) - a well-known real `cmd.exe` `start` gotcha, verified
-///   against Microsoft's own guidance, not assumed from memory. `start` is a `cmd.exe`
+///   treat `target` itself as the title instead of the real target the moment `target` needs
+///   quoting (any path or URL containing a space) - a well-known real `cmd.exe` `start` gotcha,
+///   verified against Microsoft's own guidance, not assumed from memory. `start` is a `cmd.exe`
 ///   built-in, not a standalone executable, hence the `cmd /c` wrapper. This is invoked via
 ///   `std::process::Command`, one argument per `Vec` element - not through a shell that would
 ///   need to re-parse quoting - so it does not matter that a user's actual default shell might
 ///   be PowerShell, where `start` means something else entirely (`Start-Process`); this always
 ///   runs `cmd.exe` explicitly and directly.
-/// - Linux (and anything else, as a reasonable fallback): real `xdg-open <path>`, unchanged
+/// - Linux (and anything else, as a reasonable fallback): real `xdg-open <target>`, unchanged
 ///   from before this platform split existed.
-fn open_command_for(target_os: &str, path: &Path) -> (&'static str, Vec<OsString>) {
+fn open_command_for(target_os: &str, target: &OsStr) -> (&'static str, Vec<OsString>) {
     match target_os {
-        "macos" => ("open", vec![path.as_os_str().to_os_string()]),
+        "macos" => ("open", vec![target.to_os_string()]),
         "windows" => (
             "cmd",
             vec![
                 "/c".into(),
                 "start".into(),
                 "".into(),
-                path.as_os_str().to_os_string(),
+                target.to_os_string(),
             ],
         ),
-        _ => ("xdg-open", vec![path.as_os_str().to_os_string()]),
+        _ => ("xdg-open", vec![target.to_os_string()]),
     }
 }
 
 impl AdeApp {
-    /// Spawns a subprocess against the settings file path - the config banner's `Open file`
-    /// button - via [`open_command_for`], real per-platform: `xdg-open` on Linux, `open` on
-    /// macOS, `cmd /c start` on Windows (see that function's docs for why each is correct).
-    /// Uses `Command::status` - blocking, but only on the background-executor thread, never
-    /// the GPUI foreground thread - so the child is always reaped, matching every other
-    /// subprocess spawn in this codebase (`lsp_core::proc`'s `child.wait()`;
-    /// `pty_core::PtySession`'s `try_wait`/`wait`). A failure to launch, or a non-zero exit
-    /// status, is logged rather than silently swallowed.
+    /// Spawns `program args` on the background executor - never the GPUI foreground thread - and
+    /// logs a failed launch or a non-zero exit rather than silently swallowing it. Shared by
+    /// every real "open something via the OS default handler" call site
+    /// ([`Self::open_settings_file`], [`Self::open_install_url`]) so this real
+    /// spawn-and-reap-safely logic lives in exactly one place, not duplicated per call site.
+    /// Uses `Command::status` - blocking, but only on the background-executor thread - so the
+    /// child is always reaped, matching every other subprocess spawn in this codebase
+    /// (`lsp_core::proc`'s `child.wait()`; `pty_core::PtySession`'s `try_wait`/`wait`).
+    /// `target_label` is only ever used for the log message, never passed to the child process.
+    fn spawn_open_command(
+        &mut self,
+        program: &'static str,
+        args: Vec<OsString>,
+        target_label: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.background_executor()
+            .spawn(async move {
+                match std::process::Command::new(program).args(&args).status() {
+                    Ok(status) if !status.success() => {
+                        log::warn!("{program} exited with {status} while opening {target_label}");
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        log::warn!("failed to open {target_label} via {program}: {err}");
+                    }
+                }
+            })
+            .detach();
+    }
+
+    /// Opens the settings file - the config banner's `Open file` button - via
+    /// [`open_command_for`], real per-platform: `xdg-open` on Linux, `open` on macOS,
+    /// `cmd /c start` on Windows (see that function's docs for why each is correct).
     ///
     /// Only the Linux path (`xdg-open`) has actually been run - this app has only ever
     /// executed on Linux/WSL2. The macOS/Windows commands are real, verified-correct shell
@@ -70,23 +103,22 @@ impl AdeApp {
             log::warn!("cannot open settings file: $HOME is not set");
             return;
         };
-        let (program, args) = open_command_for(std::env::consts::OS, &path);
-        cx.background_executor()
-            .spawn(async move {
-                match std::process::Command::new(program).args(&args).status() {
-                    Ok(status) if !status.success() => {
-                        log::warn!(
-                            "{program} exited with {status} while opening {}",
-                            path.display()
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        log::warn!("failed to open {} via {program}: {err}", path.display());
-                    }
-                }
-            })
-            .detach();
+        let (program, args) = open_command_for(std::env::consts::OS, path.as_os_str());
+        self.spawn_open_command(program, args, path.display().to_string(), cx);
+    }
+
+    /// Opens a language server's real install/docs `url` (`crate::language::SettingsLspRow::
+    /// install_url`) in the user's default browser - the Language servers settings page's
+    /// `Install` action on a genuinely `not installed` row (see
+    /// `crate::settings::LspRow::is_ready`). Reuses [`open_command_for`]/
+    /// [`Self::spawn_open_command`] exactly as [`Self::open_settings_file`] does - this is the
+    /// same real "hand a target to the OS default-open handler" mechanism pointed at a URL
+    /// instead of a local file path, not a second, independent implementation of it. This app
+    /// never runs an install command on the user's behalf; the user follows the real, official
+    /// instructions on the page this opens.
+    pub(super) fn open_install_url(&mut self, url: &'static str, cx: &mut Context<Self>) {
+        let (program, args) = open_command_for(std::env::consts::OS, OsStr::new(url));
+        self.spawn_open_command(program, args, url.to_string(), cx);
     }
 
     /// The config banner (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3): a
@@ -558,14 +590,18 @@ mod open_command_tests {
 
     #[test]
     fn macos_uses_the_real_open_command() {
-        let (program, args) = open_command_for("macos", Path::new("/home/x/settings.toml"));
+        let (program, args) =
+            open_command_for("macos", Path::new("/home/x/settings.toml").as_os_str());
         assert_eq!(program, "open");
         assert_eq!(args, os_strings(&["/home/x/settings.toml"]));
     }
 
     #[test]
     fn windows_uses_cmd_start_with_a_required_empty_title_argument() {
-        let (program, args) = open_command_for("windows", Path::new(r"C:\Users\x\settings.toml"));
+        let (program, args) = open_command_for(
+            "windows",
+            Path::new(r"C:\Users\x\settings.toml").as_os_str(),
+        );
         assert_eq!(program, "cmd");
         // The empty string is load-bearing, not incidental - see `open_command_for`'s docs:
         // without it, `start` would treat the path itself as its window-title argument.
@@ -577,14 +613,52 @@ mod open_command_tests {
 
     #[test]
     fn linux_uses_the_real_xdg_open_command() {
-        let (program, args) = open_command_for("linux", Path::new("/home/x/settings.toml"));
+        let (program, args) =
+            open_command_for("linux", Path::new("/home/x/settings.toml").as_os_str());
         assert_eq!(program, "xdg-open");
         assert_eq!(args, os_strings(&["/home/x/settings.toml"]));
     }
 
     #[test]
     fn an_unrecognized_target_os_falls_back_to_xdg_open() {
-        let (program, _) = open_command_for("freebsd", Path::new("/x"));
+        let (program, _) = open_command_for("freebsd", Path::new("/x").as_os_str());
         assert_eq!(program, "xdg-open");
+    }
+
+    /// [`open_command_for`] is genuinely reused for a URL target too (the Language servers
+    /// page's `Install` action, `AdeApp::open_install_url`), not just a local file path - proves
+    /// the same three real per-platform commands work unchanged for an `https://` target on
+    /// every platform R11 already verified, matching this test module's own established
+    /// pattern.
+    #[test]
+    fn every_platform_command_works_unchanged_for_a_real_url_target() {
+        let url =
+            std::ffi::OsStr::new("https://rust-analyzer.github.io/book/rust_analyzer_binary.html");
+
+        let (program, args) = open_command_for("macos", url);
+        assert_eq!(program, "open");
+        assert_eq!(
+            args,
+            os_strings(&["https://rust-analyzer.github.io/book/rust_analyzer_binary.html"])
+        );
+
+        let (program, args) = open_command_for("windows", url);
+        assert_eq!(program, "cmd");
+        assert_eq!(
+            args,
+            os_strings(&[
+                "/c",
+                "start",
+                "",
+                "https://rust-analyzer.github.io/book/rust_analyzer_binary.html"
+            ])
+        );
+
+        let (program, args) = open_command_for("linux", url);
+        assert_eq!(program, "xdg-open");
+        assert_eq!(
+            args,
+            os_strings(&["https://rust-analyzer.github.io/book/rust_analyzer_binary.html"])
+        );
     }
 }

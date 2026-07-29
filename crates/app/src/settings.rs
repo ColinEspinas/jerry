@@ -360,6 +360,9 @@ pub struct LspLanguage {
     /// session summary to back (`crate::root::lsp`'s server clients are keyed by worktree, not
     /// surfaced here). Every note here is deliberately the descriptive kind only.
     pub note: &'static str,
+    /// This server's real official install/docs page - see
+    /// `crate::language::SettingsLspRow::install_url`'s own docs for how each was verified.
+    pub install_url: &'static str,
 }
 
 /// The real, generic shape [`lsp_languages`] applies to whatever `entries` iterator it's given -
@@ -381,6 +384,7 @@ fn build_lsp_languages<'a>(
                 ext: entry.extension,
                 binary: row.binary,
                 note: row.note,
+                install_url: row.install_url,
             })
         })
         .collect()
@@ -402,6 +406,10 @@ pub struct LspRow {
     pub ext: &'static str,
     pub binary: &'static str,
     pub note: &'static str,
+    /// This server's real official install/docs page - see
+    /// [`LspLanguage::install_url`]'s own docs. Carried straight through from [`lsp_languages`],
+    /// not recomputed, so there is exactly one real source for it.
+    pub install_url: &'static str,
     /// Same search contract as [`AgentRow::resolved_path`] - see that field's docs for the one
     /// disclosed gap.
     pub resolved_path: Option<PathBuf>,
@@ -434,6 +442,7 @@ pub fn detect_lsp_rows(resolve: impl Fn(&str) -> Option<PathBuf>) -> Vec<LspRow>
             ext: def.ext,
             binary: def.binary,
             note: def.note,
+            install_url: def.install_url,
             resolved_path: resolve(def.binary),
         })
         .collect()
@@ -500,6 +509,10 @@ fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::EditorPaste" => Some("Editor: paste"),
         "app::EditorSave" => Some("Editor: save file"),
         "app::EditorSaveAnyway" => Some("Editor: save file (overwrite external change)"),
+        "app::CompletionsUp" => Some("Completions: select previous"),
+        "app::CompletionsDown" => Some("Completions: select next"),
+        "app::CompletionsAccept" => Some("Completions: accept selected"),
+        "app::CompletionsDismiss" => Some("Completions: dismiss"),
         _ => None,
     }
 }
@@ -855,6 +868,7 @@ mod tests {
                 settings_row: has_row.then_some(SettingsLspRow {
                     binary: "synthetic-binary",
                     note: "synthetic",
+                    install_url: "https://example.invalid/synthetic",
                 }),
                 highlighter: None,
             }
@@ -895,6 +909,29 @@ mod tests {
         let rows = detect_lsp_rows(|_| None);
         assert!(rows.iter().all(|row| !row.is_ready()));
         assert!(rows.iter().all(|row| row.status_label() == "not installed"));
+    }
+
+    /// Proves [`detect_lsp_rows`] carries the real install URL straight through from
+    /// `crate::language`'s registry - not a second, independently-authored copy that could drift.
+    #[test]
+    fn detect_lsp_rows_carries_the_real_install_url_from_the_language_registry() {
+        let rows = detect_lsp_rows(|_| None);
+        for row in &rows {
+            assert!(
+                row.install_url.starts_with("https://"),
+                "{}'s install_url should be a real https:// URL, got {:?}",
+                row.binary,
+                row.install_url
+            );
+        }
+        let rust = rows
+            .iter()
+            .find(|row| row.language == "Rust")
+            .expect("a Rust row should exist");
+        assert_eq!(
+            rust.install_url,
+            "https://rust-analyzer.github.io/book/rust_analyzer_binary.html"
+        );
     }
 
     #[test]
@@ -978,6 +1015,11 @@ mod tests {
                 "Editor: paste",
                 "Editor: save file",
                 "Editor: save file (overwrite external change)",
+                "Completions: select previous",
+                "Completions: select next",
+                "Completions: accept selected",
+                "Completions: accept selected",
+                "Completions: dismiss",
             ]
         );
     }
@@ -1000,7 +1042,9 @@ mod tests {
         // while a file was actively being edited) - `KeybindingRow::context` only ever reports
         // the coarse `"global"`/`"scoped"` distinction (see its own docs), so that predicate
         // change doesn't move this test's own counts, but `]` is still exactly as "scoped" as
-        // before.
+        // before. Revision R8.5b added 5 more real scoped bindings for the Completions popup
+        // (`CompletionsUp`/`CompletionsDown`/`CompletionsDismiss`, plus `CompletionsAccept`
+        // bound twice - `tab` and `enter`), each `Some("file-editor && completions")`.
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings);
         assert!(!rows.is_empty());
@@ -1008,9 +1052,9 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            20,
-            "expected exactly `] -> NextChangedFile` (1) plus every real Editor* binding (19) \
-             to be scoped, not global"
+            25,
+            "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
+             every real Completions* binding (5) to be scoped, not global"
         );
         assert!(
             scoped.iter().any(|row| row.command == "Next changed file"),

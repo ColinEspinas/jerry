@@ -1402,7 +1402,7 @@ impl AdeApp {
     /// Agents/Worktrees toggle sections (see `crate::settings`'s module docs). No config
     /// banner/snippet either: these rows are live-detected `$PATH` state, not `settings.toml`
     /// keys.
-    pub(super) fn render_settings_lsp_page(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_settings_lsp_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = &self.lsp_rows;
         let last_index = rows.len().saturating_sub(1);
 
@@ -1426,12 +1426,24 @@ impl AdeApp {
                     .border_color(theme::border::CARD)
                     .overflow_hidden()
                     .children(rows.iter().enumerate().map(|(index, row)| {
-                        self.render_settings_lsp_row(row, index == last_index)
+                        self.render_settings_lsp_row(row, index == last_index, cx)
                     })),
             )
     }
 
-    fn render_settings_lsp_row(&self, row: &settings::LspRow, is_last: bool) -> impl IntoElement {
+    /// `install_url`'s `Install` action (see this method's own docs for the fuller shape) only
+    /// ever appears for a genuinely `not installed` row (`!row.is_ready()`) - a `ready` row has
+    /// live-found the binary already, so there is nothing real for the action to do. Styled to
+    /// match this same page's own established clickable-row-action pattern
+    /// ([`Self::render_settings_worktree_row`]'s `Open`/`Prune` links: a right-aligned,
+    /// `cursor_pointer`, medium-weight sans link that only darkens on hover), not a new visual
+    /// pattern invented for this one row.
+    fn render_settings_lsp_row(
+        &self,
+        row: &settings::LspRow,
+        is_last: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let chip = file_tree::lang_chip_for_name(&format!("x.{}", row.ext));
         let path_text = match &row.resolved_path {
             Some(path) => path.display().to_string(),
@@ -1518,6 +1530,29 @@ impl AdeApp {
                             .child(row.status_label()),
                     ),
             )
+            .when(!row.is_ready(), |el| {
+                let install_url = row.install_url;
+                el.child(
+                    div()
+                        .id(format!("settings-lsp-install-{}", row.binary))
+                        // Test-only, no-op in release builds - lets `VisualTestContext::
+                        // debug_bounds` (keyed by this, not `.id`) confirm the Install action
+                        // only actually renders for a genuinely not-installed row.
+                        .debug_selector(move || format!("settings-lsp-install-{}", row.binary))
+                        .cursor_pointer()
+                        .flex_none()
+                        .ml(px(10.0))
+                        .font(font(theme::font::SANS))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_size(px(10.5))
+                        .text_color(theme::text::FAINT)
+                        .hover(|el| el.text_color(theme::text::SECONDARY))
+                        .child("Install")
+                        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                            this.open_install_url(install_url, cx);
+                        })),
+                )
+            })
     }
 
     fn set_interface_scale_percent(&mut self, percent: u16, cx: &mut Context<Self>) {
@@ -1783,5 +1818,57 @@ mod terminal_font_size_tests {
                  whichever one happens to be active"
             );
         }
+    }
+}
+
+/// Coverage for the Language servers page's `Install` action (task #33): it must only ever
+/// render for a genuinely `not installed` row, never a `ready` one. Uses synthetic
+/// [`settings::LspRow`] values (not real live `$PATH` state, which would make the ready/
+/// not-ready split nondeterministic across machines) written straight into
+/// [`AdeApp::lsp_rows`] - the same cache `Self::load_lsp_rows` populates in production, just
+/// seeded directly here for a deterministic test.
+#[cfg(test)]
+mod settings_lsp_install_action_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    fn synthetic_row(binary: &'static str, ready: bool) -> settings::LspRow {
+        settings::LspRow {
+            language: "Synthetic",
+            ext: "sy",
+            binary,
+            note: "synthetic row for a deterministic test",
+            install_url: "https://example.invalid/synthetic",
+            resolved_path: ready.then(|| PathBuf::from(format!("/usr/bin/{binary}"))),
+        }
+    }
+
+    #[gpui::test]
+    fn install_action_renders_only_for_a_genuinely_not_installed_row(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        cx.dispatch_action(ToggleSettings);
+        app.update(cx, |app, cx| {
+            app.lsp_rows = vec![
+                synthetic_row("ready-binary", true),
+                synthetic_row("missing-binary", false),
+            ];
+            app.select_settings_page(SettingsPage::LanguageServers, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("settings-lsp-install-missing-binary")
+                .is_some(),
+            "a genuinely not-installed row should show a real Install action"
+        );
+        assert!(
+            cx.debug_bounds("settings-lsp-install-ready-binary")
+                .is_none(),
+            "a ready row has already live-found its binary and should show no Install action"
+        );
     }
 }

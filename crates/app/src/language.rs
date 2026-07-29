@@ -124,6 +124,17 @@ pub struct SettingsLspRow {
     /// Generic descriptive copy, not a live count - see `crate::settings::LspLanguage::note`'s
     /// own docs (this struct is `crate::settings::LSP_LANGUAGES`' one real source now).
     pub note: &'static str,
+    /// The real, official install/docs page for this server - what the Settings -> Language
+    /// servers page's "Install" action (a genuinely `not installed` row only, see
+    /// `crate::settings::LspRow::is_ready`) opens in the user's default browser via
+    /// `crate::root::settings_widgets::open_command_for`. Deliberately the server's own official
+    /// repo/README or docs site, not a third-party aggregator - each one was checked against the
+    /// real, current page before being added here (see this app's task tracker for the real
+    /// per-server verification: `rust-analyzer`'s own manual's binary-install chapter,
+    /// `typescript-language-server`'s own GitHub README, the Vue core team's own
+    /// `vuejs/language-tools` README, Pyright's own `docs/installation.md`, and `gopls`'s own
+    /// `go.dev/gopls` documentation).
+    pub install_url: &'static str,
 }
 
 fn no_initialization_options() -> Option<serde_json::Value> {
@@ -240,6 +251,7 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
         settings_row: Some(SettingsLspRow {
             binary: "rust-analyzer",
             note: "starts when a .rs file opens",
+            install_url: "https://rust-analyzer.github.io/book/rust_analyzer_binary.html",
         }),
         highlighter: Some(crate::code_view::highlight_rust),
     },
@@ -283,6 +295,7 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
         settings_row: Some(SettingsLspRow {
             binary: "typescript-language-server",
             note: "starts when a .ts file opens",
+            install_url: "https://github.com/typescript-language-server/typescript-language-server",
         }),
         highlighter: Some(crate::code_view::highlight_ts),
     },
@@ -334,6 +347,7 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
             // isn't wired for `.vue` at all (see this module's top-level docs for the real,
             // reproduced crash that's why), so the note must not promise it does.
             note: "detected on PATH; live analysis not wired this phase (see docs)",
+            install_url: "https://github.com/vuejs/language-tools",
         }),
         // No `.vue` `tree-sitter` grammar dependency exists in this workspace - unrelated to,
         // and independent of, why `lsp` above is also `None`.
@@ -349,6 +363,7 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
         settings_row: Some(SettingsLspRow {
             binary: "pyright-langserver",
             note: "starts when a .py file opens",
+            install_url: "https://github.com/microsoft/pyright/blob/main/docs/installation.md",
         }),
         highlighter: Some(crate::code_view::highlight_python),
     },
@@ -364,6 +379,7 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
         settings_row: Some(SettingsLspRow {
             binary: "gopls",
             note: "installs when the first .go file opens",
+            install_url: "https://go.dev/gopls/",
         }),
         // No real Go `tree-sitter` grammar dependency in this workspace.
         highlighter: None,
@@ -632,6 +648,49 @@ mod tests {
                 entry.highlighter.is_none(),
                 "{ext} has no real tree-sitter grammar dependency and should not carry a \
                  fabricated highlighter"
+            );
+        }
+    }
+
+    /// Every real Settings-page row must carry a real, non-empty `https://` install URL - not a
+    /// placeholder, and not a bare label that would fail to open anything real via
+    /// `crate::root::settings_widgets::open_command_for`. Pins the exact real, current five URLs
+    /// (each individually verified against its own official source - see [`SettingsLspRow::
+    /// install_url`]'s own docs) so a future edit that swaps one out is a deliberate, visible test
+    /// diff rather than a silent drift to something unverified.
+    #[test]
+    fn every_settings_row_has_a_real_verified_https_install_url() {
+        let mut urls: Vec<(&str, &str)> = EXTENSIONS
+            .iter()
+            .filter_map(|entry| entry.settings_row.map(|row| (row.binary, row.install_url)))
+            .collect();
+        urls.sort_unstable();
+        assert_eq!(
+            urls,
+            vec![
+                ("gopls", "https://go.dev/gopls/"),
+                (
+                    "pyright-langserver",
+                    "https://github.com/microsoft/pyright/blob/main/docs/installation.md"
+                ),
+                (
+                    "rust-analyzer",
+                    "https://rust-analyzer.github.io/book/rust_analyzer_binary.html"
+                ),
+                (
+                    "typescript-language-server",
+                    "https://github.com/typescript-language-server/typescript-language-server"
+                ),
+                (
+                    "vue-language-server",
+                    "https://github.com/vuejs/language-tools"
+                ),
+            ]
+        );
+        for (binary, url) in &urls {
+            assert!(
+                url.starts_with("https://"),
+                "{binary}'s install_url {url:?} should be a real https:// URL"
             );
         }
     }
