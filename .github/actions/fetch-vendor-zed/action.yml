@@ -1,0 +1,25 @@
+name: Fetch vendor/zed
+description: >-
+  Fetches the pinned zed-industries/zed commit into vendor/zed via a real, shallow
+  (--depth 1) git checkout - the same real fetch every CI job needs, defined once here
+  instead of copy-pasted into each job's own steps. Deliberately not a Cargo git
+  dependency: a plain `git = "...", rev = "..."` dependency on gpui was measured (by hand,
+  outside this repo) to pull down a ~450MB checkout via Cargo's own git-fetch machinery,
+  versus ~114MB for this same real commit fetched with an explicit --depth 1 - Cargo's
+  built-in git-dependency support does not do a comparably shallow fetch. This script
+  keeps the real, smaller fetch while removing the duplication across jobs.
+inputs:
+  commit:
+    description: The real zed-industries/zed commit sha to check out
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Fetch vendor/zed (pinned commit)
+      shell: bash
+      run: |
+        set -euo pipefail
+        git init vendor/zed
+        git -C vendor/zed remote add origin https://github.com/zed-industries/zed
+        git -C vendor/zed fetch --depth 1 origin "${{ inputs.commit }}"
+        git -C vendor/zed checkout FETCH_HEAD
