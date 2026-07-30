@@ -1435,3 +1435,52 @@ that's genuinely not installed, using the same live `$PATH` detection the rest o
 already relies on. All five URLs (rust-analyzer, typescript-language-server, vue-language-
 server, pyright, gopls) were checked against each project's own real, current official
 source, not guessed.
+
+## Revision R8.5b — live LSP sync and a real Completions popup
+
+Real `textDocument/didChange` sync on every edit (debounced 50ms, full-document sync so a
+rapid burst of edits before the debounce fires just means the later snapshot wins — no
+delta-ordering to get wrong), and a real Completions popup — real cursor-anchored
+positioning reusing R8.5a's own painted caret position, real trigger characters read from
+each server's own advertised capability rather than guessed, real keyboard navigation.
+Diagnostics and hover now track live, unsaved content instead of R8.5a's honest
+last-saved-only scoping.
+
+Building this surfaced a genuinely surprising real protocol behavior, found by live-probing
+the real installed servers rather than assuming: rust-analyzer pushes a diagnostic update
+exactly once, at open, and never again after a real `didChange` — real, live diagnostics
+require actively pulling via `textDocument/diagnostic` instead, which typescript-language-
+server and pyright don't need (they keep pushing normally). The client now detects which
+real mode each server actually wants from its own `initialize` response rather than
+assuming one protocol style fits all three.
+
+The audit found the two riskiest areas were, in fact, where the real bugs were. The exact
+"a keystroke gets swallowed" class this project has now shipped six times: the new
+completions keybindings claimed a key the instant a request was merely dispatched, not once
+something was actually ready to act on — so pressing Enter while a completion was still
+loading silently ate the keystroke instead of inserting a newline, live-reproduced with a
+real rust-analyzer. Made worse by a second, compounding bug found in the same pass: on any
+file with no errors, the new completions request was needlessly gated behind a 21-attempt,
+~8-second retry loop for an unrelated diagnostics pull, because an empty result was always
+treated as suspicious staleness rather than just nothing wrong. Together, editing a clean
+file could swallow Enter and the arrow keys for a real 8-second window on every keystroke.
+Fixed by scoping the keybindings to a genuinely ready popup with an honest fallback to
+ordinary typing when there's nothing to accept, and by only retrying an empty diagnostics
+result when the previous real result actually had something in it.
+
+The same audit found a real data-corruption bug: nothing dismissed an open completions
+popup when its file tab was backgrounded, so switching away and back could resurrect a
+stale popup and, if accepted, silently insert leftover text from a different edit into
+whatever file happened to be open now — the exact class of "confident, plausible-looking
+wrong output" this project's discipline exists to catch, now closed by dismissing
+completions everywhere hover state already gets cleared, plus on tab close. Also found and
+fixed: a retry-timeout calculation that multiplied instead of budgeted, with a real worst
+case around 70 minutes instead of the ten seconds the code itself claimed; a slow, stale
+diagnostics response with no version check that could land after and silently overwrite a
+fresher one; and a "the server has this content now" flag that was set at the moment a sync
+was merely dispatched rather than once it actually succeeded, reopening — in a new form —
+the exact stale-diagnostics-on-shifted-lines problem Revision R8.5a's own dirty-buffer
+banner already existed to prevent.
+
+This closes Revision R8.5b. Next: R8.5c (real editing in the Diff and Merge views, plus
+`wt-core`'s first real arbitrary-content file-write path), then R10 (undo/redo).
