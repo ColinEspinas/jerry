@@ -1528,3 +1528,71 @@ green at 592 app tests (up from 588 before this revision), with the one known pr
 This closes Revision R8.5 overall: R8.5a (real File-view editing), R8.5b (live LSP sync and
 the Completions popup), R8.5c (this — real Merge-view hand-editing). Next: R10 (undo/redo
 command pattern).
+
+## Revision R10 — real command-pattern undo/redo
+
+Real command-pattern undo/redo for "keep all changes" and "discard worktree" — until now,
+both of the footer buttons for these were dimmed, no-op placeholders, since neither action
+had any real backing at all. Listable in Keybindings settings
+(`secondary-z`/`secondary-shift-z`) and a new command-palette "History" group.
+
+Building "discard worktree" as a genuinely undoable action meant making it real first: the
+only existing worktree-deletion primitive permanently destroys uncommitted/untracked content
+with no recovery path at all, so an "Undo" button next to it would have been a lie. It now
+takes a real `git stash push --include-untracked` snapshot before force-removing the
+worktree; undo recreates the worktree and applies the stash back (`apply`, never `pop`, so
+the stash survives as a fallback even on a conflicting apply). Refuses upfront on the
+repository's main worktree (git can never force-remove it, so proceeding would stash real
+content nobody could ever get back to) and honestly reports real gitignored content a stash
+can't capture, rather than claiming full safety it doesn't have. "Keep all changes" commits
+everything in a session's worktree; undo is a real `git reset --soft` to the pre-commit
+state, redo moves `HEAD` forward again, both directions guarded so a commit made on top in
+the meantime is never silently discarded.
+
+An adversarial checker audit — after the builder's own internal self-review already found
+and fixed a real bug — found two further, live, empirically-reproduced CRITICAL bugs.
+`git stash push` can exit `0` and print "No local changes to save" without pushing anything
+at all (a dirty submodule pointer is real dirty state `is_dirty` correctly flags but `stash
+push` categorically cannot capture); the earlier code trusted `refs/stash` unconditionally
+afterward, which could silently hand back a completely unrelated pre-existing stash from a
+different operation and then force-remove the real worktree believing its content was
+captured — a real, reachable path to restoring the wrong content while claiming success.
+Fixed by reading `refs/stash` before and after the push and only trusting the result if it's
+both present and genuinely new. Separately, `commit_all_changes` recorded its undo-target
+`parent` from a pre-commit read taken before `add`/`commit` ran — anything else committing
+in that worktree in that window (this app's whole domain is running agent CLIs inside these
+exact worktrees) would pass the undo's `HEAD`-identity guard correctly, since `HEAD` genuinely
+was the recorded commit, and then reset `--soft` straight past the interleaved commit,
+silently discarding it. Fixed by deriving `parent` from the real commit's own parent after it
+exists, never a stale pre-commit snapshot.
+
+Also fixed: worktree-history status was sharing one render slot with an always-set,
+never-cleared prune status, permanently hiding every future status — including the only
+pointer to a stash left behind by a failed post-snapshot removal — after a single unrelated
+prune click, and was invisible entirely while Settings was open; given its own slot in the
+status bar, which renders unconditionally. Long status text had no truncation or tooltip.
+Redo of a discard silently dropped the gitignored-content warning the first discard
+surfaced. Redo's identity guard didn't canonicalize paths (silently dead on symlinked
+setups) or check the recorded commit for a detached-`HEAD` snapshot. A keybinding-triggered
+undo/redo silently no-op'd while an op was already in flight, unlike the palette (hides busy
+rows) and footer (disables buttons) — the exact "looks actionable, silently does nothing"
+pattern this project's discipline exists to catch. History palette rows were rendering their
+own description twice on one line; several unused struct fields were removed after
+confirming zero real consumers.
+
+Wiring up the new keybindings also surfaced a genuine GPUI bug, independent of anything
+specific to undo/redo: `KeyBindingContextPredicate::eval_inner` short-circuits to `false`
+whenever the dispatch path's context stack is completely empty, before evaluating any
+predicate at all — so a negated context like `!terminal` never matched anywhere a view had
+no `.key_context(..)` on its own ancestor chain (Settings focused, for instance), regardless
+of whether a terminal was even in sight. Fixed by giving the root render div a baseline
+`.key_context("app")`, guaranteeing the dispatch stack always has at least one frame —
+verified directly against `vendor/zed`'s own `eval_inner` rather than assumed, and covered
+by a real `simulate_keystrokes` regression test.
+
+Independently re-verified directly, twice — once before the checker round, once after the
+fix round: all four gates clean both times, both CRITICAL fixes spot-checked directly in the
+source and confirmed to match what was reported, full workspace test suite green at 620 app
+tests (up from 592) plus 98 `wt-core` tests (up from 72).
+
+This closes the active "first pass" roadmap.
