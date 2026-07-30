@@ -204,7 +204,23 @@ impl AdeApp {
                     // `merge::first_unresolved` only ever points at a `ConflictedPath::Text`
                     // entry with a remaining `Conflict` segment, so both always match.
                     if let Some(ConflictedPath::Text(file)) = files.get(target_file) {
-                        if let Some(ConflictSegment::Conflict(hunk)) =
+                        // Real hand-edit mode (Revision R8.5c): whenever `Self::merge_edit`
+                        // matches the active file (by path), the whole-file editable view
+                        // (`crate::root::merge_editing::AdeApp::render_merge_edit_view`) replaces
+                        // the read-only two-column quick-pick view *and its Take-left/Take-right/
+                        // Take-both buttons* entirely - not merely visually stacked alongside
+                        // them. This structural exclusivity, not a shared-visibility toggle, is
+                        // what rules out a quick-pick click racing an in-flight, unsaved hand-edit
+                        // of the very same file/hunk: while hand-edit mode is on for this file,
+                        // `Self::resolve_active_hunk`'s own button handlers simply have no button
+                        // in the render tree to be clicked from at all.
+                        let hand_editing = self
+                            .merge_edit
+                            .as_ref()
+                            .is_some_and(|edit| edit.relative_path == file.relative_path);
+                        if hand_editing {
+                            body = body.child(self.render_merge_edit_view(cx));
+                        } else if let Some(ConflictSegment::Conflict(hunk)) =
                             file.segments.get(target_hunk)
                         {
                             body = body
@@ -215,7 +231,8 @@ impl AdeApp {
                                     hunk,
                                     cx,
                                 ))
-                                .child(self.render_take_both_row(cx));
+                                .child(self.render_take_both_row(cx))
+                                .child(self.render_hand_edit_toggle_row(cx));
                         } else {
                             body = body.child(div().flex_1());
                         }
@@ -628,6 +645,33 @@ impl AdeApp {
                     .child("Take both")
                     .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                         this.resolve_active_hunk(wt_core::merge::ConflictChoice::Both, cx);
+                    })),
+            )
+    }
+
+    /// The real, discoverable toggle (Revision R8.5c) into the merge hand-edit whole-file editor
+    /// (`crate::root::merge_editing::AdeApp::render_merge_edit_view`) for the currently active
+    /// conflicted file - see `Self::render_merge_flow_surface`'s own docs for why this row is
+    /// structurally absent (not merely disabled) once hand-edit mode is actually on.
+    pub(super) fn render_hand_edit_toggle_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .py(px(6.0))
+            .bg(theme::surface::FOOTER)
+            .child(
+                div()
+                    .id("merge-hand-edit-toggle")
+                    .cursor_pointer()
+                    .font(font(theme::font::SANS))
+                    .text_size(px(10.5))
+                    .text_color(theme::text::FAINT)
+                    .hover(|el| el.text_color(theme::text::SECONDARY))
+                    .child("Edit conflict markers by hand")
+                    .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                        this.start_merge_hand_edit(window, cx);
                     })),
             )
     }

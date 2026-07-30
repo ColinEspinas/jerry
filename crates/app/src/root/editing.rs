@@ -70,11 +70,37 @@ use crate::{code_view, hover_view, theme};
 /// it even starts.
 const REHIGHLIGHT_DEBOUNCE: Duration = Duration::from_millis(150);
 
+/// Which real, live buffer is the current `EntityInputHandler`/`Editor*` action target - the File
+/// view's [`AdeApp::edit_buffers`] entry, or Surface D's merge hand-edit
+/// [`AdeApp::merge_edit`] - generalized (Revision R8.5c) from the File-view-only routing
+/// [`AdeApp::active_editable_path`] originally provided. Never both at once:
+/// `crate::root::work_surface_render::AdeApp::render_center_pane`'s own real visibility rule is
+/// `open_change.is_some() && (open_diff_file_cache.is_some() || code_view ==
+/// CodeView::File)` - Surface C (File/Diff) only actually renders when *that* holds. A real,
+/// reachable state this must account for (documented at
+/// `crate::root::code_surface::AdeApp::activate_file_tab`'s own doc comment): `open_change` can
+/// be `Some` while Surface C is *not* shown at all - a tab can be "active" (its path still in
+/// `open_change`) without a diff to show it (`open_diff_file_cache` is `None`) and `code_view`
+/// left on `Diff`, in which case `render_center_pane` falls through to the session/merge surface
+/// with `open_change` still `Some` the whole time. [`AdeApp::active_edit_target`] mirrors this
+/// exact predicate (not the weaker "`open_change.is_some()`" a first version of this method used,
+/// which incorrectly treated that real, reachable state as "Surface C is showing" and silently
+/// swallowed every keystroke meant for a genuinely on-screen merge hand-edit buffer) so it never
+/// has to arbitrate between the two surfaces - at most one is ever genuinely on screen, and this
+/// always agrees with `render_center_pane` about which one that is.
+enum EditTarget {
+    File(PathBuf),
+    Merge,
+}
+
 impl AdeApp {
     /// The worktree-relative path an editing action should target - `Some` only while the File
-    /// view (not the Diff view) is showing for an open tab. Every `EntityInputHandler` method and
-    /// `Editor*` action handler resolves its buffer through this, so a stray keystroke/IME event
-    /// arriving while the Diff view or a terminal has focus is a safe, honest no-op.
+    /// view (not the Diff view) is showing for an open tab. Deliberately File-view-only (unlike
+    /// [`Self::active_edit_target`]): every call site of this specific method is a File-view-only
+    /// concern that must never apply to the merge hand-edit surface at all - LSP diagnostics/
+    /// completions/hover (`crate::root::completions`, `crate::root::lsp`) - see
+    /// `crate::root::merge_editing`'s own top docs for why no language-server relationship is
+    /// ever established for a merge conflict buffer.
     pub(super) fn active_editable_path(&self) -> Option<PathBuf> {
         if self.code_view == code_view::CodeView::File {
             self.open_change.clone()
@@ -83,32 +109,73 @@ impl AdeApp {
         }
     }
 
+    /// The generalized real edit target (Revision R8.5c) - see [`EditTarget`]'s own docs for the
+    /// mutual-exclusivity guarantee this relies on. `Merge` only while the merge hand-edit slot
+    /// exists *and* actually belongs to the currently active session tab (a merge for a
+    /// background session tab the user has since switched away from is real, live state, but
+    /// genuinely not on screen right now, so it must not receive keystrokes meant for whatever
+    /// *is* focused).
+    fn active_edit_target(&self) -> Option<EditTarget> {
+        if let Some(path) = self.active_editable_path() {
+            return Some(EditTarget::File(path));
+        }
+        if self.open_change.is_some()
+            && (self.open_diff_file_cache.is_some() || self.code_view == code_view::CodeView::File)
+        {
+            // Surface C (File/Diff) is genuinely showing - see this method's own docs (and
+            // `crate::root::work_surface_render::AdeApp::render_center_pane`'s real predicate,
+            // which this mirrors exactly) for why `open_change.is_some()` alone is not enough to
+            // conclude that.
+            return None;
+        }
+        let edit = self.merge_edit.as_ref()?;
+        let active_session_id = self.sessions.active().map(|session| session.id)?;
+        if edit.session_id != active_session_id {
+            return None;
+        }
+        Some(EditTarget::Merge)
+    }
+
     pub(super) fn active_edit_buffer(&self) -> Option<&EditBuffer> {
-        let path = self.active_editable_path()?;
-        self.edit_buffers.get(&path)
+        match self.active_edit_target()? {
+            EditTarget::File(path) => self.edit_buffers.get(&path),
+            EditTarget::Merge => self.merge_edit.as_ref().map(|edit| &edit.buffer),
+        }
     }
 
     fn active_edit_buffer_mut(&mut self) -> Option<&mut EditBuffer> {
-        let path = self.active_editable_path()?;
-        self.edit_buffers.get_mut(&path)
+        match self.active_edit_target()? {
+            EditTarget::File(path) => self.edit_buffers.get_mut(&path),
+            EditTarget::Merge => self.merge_edit.as_mut().map(|edit| &mut edit.buffer),
+        }
     }
 
-    /// Syncs [`AdeApp::code_cursor`] (the status bar's `ln N` and the File view's own real
-    /// current-line row highlight - both read this field, not the buffer's own `selected_range`
-    /// directly, matching the read-only File view's pre-existing convention) to wherever the real
-    /// caret now is, and scrolls [`AdeApp::file_view_scroll_handle`] so that line is in view - real
-    /// non-strict scrolling (a no-op if it's already visible), reusing the exact same scroll
-    /// handle go-to-definition already drives (see that field's own docs) rather than a second
-    /// mechanism. Called after every real cursor-moving action and every real edit - both change
-    /// where the caret is.
+    /// Syncs the caret-line indicator and scrolls the owning list so the real caret stays in
+    /// view - [`AdeApp::code_cursor`]/[`AdeApp::file_view_scroll_handle`] for the File view,
+    /// [`AdeApp::merge_edit_scroll_handle`] (no cursor-line indicator - not read by anything) for
+    /// the merge hand-edit view (Revision R8.5c generalization). Called after every real
+    /// cursor-moving action and every real edit - both change where the caret is.
     pub(super) fn sync_cursor_and_scroll(&mut self) {
-        let Some(buffer) = self.active_edit_buffer() else {
-            return;
-        };
-        let (line, _) = buffer.line_col_for_offset(buffer.cursor_offset());
-        self.code_cursor = Some(line + 1);
-        self.file_view_scroll_handle
-            .scroll_to_item(line, gpui::ScrollStrategy::Nearest);
+        match self.active_edit_target() {
+            Some(EditTarget::File(path)) => {
+                let Some(buffer) = self.edit_buffers.get(&path) else {
+                    return;
+                };
+                let (line, _) = buffer.line_col_for_offset(buffer.cursor_offset());
+                self.code_cursor = Some(line + 1);
+                self.file_view_scroll_handle
+                    .scroll_to_item(line, gpui::ScrollStrategy::Nearest);
+            }
+            Some(EditTarget::Merge) => {
+                let Some(edit) = self.merge_edit.as_ref() else {
+                    return;
+                };
+                let (line, _) = edit.buffer.line_col_for_offset(edit.buffer.cursor_offset());
+                self.merge_edit_scroll_handle
+                    .scroll_to_item(line, gpui::ScrollStrategy::Nearest);
+            }
+            None => {}
+        }
     }
 
     /// Debounces a real `tree-sitter` re-highlight for `path`'s buffer - see this module's own
@@ -167,21 +234,29 @@ impl AdeApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(path) = self.active_editable_path() else {
-            return;
-        };
-        let Some(buffer) = self.edit_buffers.get_mut(&path) else {
-            return;
-        };
         // Delegates to `EditBuffer::backspace` itself (the exact same real no-op-at-start-of-
         // buffer/select-then-replace logic this handler used to reimplement inline) rather than
         // duplicating it - a real fix: the two copies had already drifted apart from
         // `EditBuffer::backspace`'s own dedicated unit tests, which is exactly the kind of
         // silent duplication this project's history (Revision R5.5) has already flagged once
         // for a different bug class.
-        buffer.backspace();
-        self.schedule_rehighlight(path.clone(), cx);
-        self.schedule_lsp_sync(path, cx);
+        match self.active_edit_target() {
+            Some(EditTarget::File(path)) => {
+                let Some(buffer) = self.edit_buffers.get_mut(&path) else {
+                    return;
+                };
+                buffer.backspace();
+                self.schedule_rehighlight(path.clone(), cx);
+                self.schedule_lsp_sync(path, cx);
+            }
+            Some(EditTarget::Merge) => {
+                let Some(edit) = self.merge_edit.as_mut() else {
+                    return;
+                };
+                edit.buffer.backspace();
+            }
+            None => return,
+        }
         self.sync_cursor_and_scroll();
         cx.notify();
     }
@@ -192,17 +267,25 @@ impl AdeApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(path) = self.active_editable_path() else {
-            return;
-        };
-        let Some(buffer) = self.edit_buffers.get_mut(&path) else {
-            return;
-        };
         // See `Self::handle_editor_backspace_action`'s own docs - delegates to
         // `EditBuffer::delete_forward` for the same real reason.
-        buffer.delete_forward();
-        self.schedule_rehighlight(path.clone(), cx);
-        self.schedule_lsp_sync(path, cx);
+        match self.active_edit_target() {
+            Some(EditTarget::File(path)) => {
+                let Some(buffer) = self.edit_buffers.get_mut(&path) else {
+                    return;
+                };
+                buffer.delete_forward();
+                self.schedule_rehighlight(path.clone(), cx);
+                self.schedule_lsp_sync(path, cx);
+            }
+            Some(EditTarget::Merge) => {
+                let Some(edit) = self.merge_edit.as_mut() else {
+                    return;
+                };
+                edit.buffer.delete_forward();
+            }
+            None => return,
+        }
         self.sync_cursor_and_scroll();
         cx.notify();
     }
@@ -416,13 +499,24 @@ impl AdeApp {
         self.sync_cursor_and_scroll();
     }
 
+    /// Generalized (Revision R8.5c): routes to [`Self::save_active_file`] (the File view's own
+    /// freshness-checked save) or [`Self::save_merge_edit`] (the merge hand-edit editor's own
+    /// pipeline - `crate::root::merge_flow`'s own docs), whichever [`Self::active_edit_target`]
+    /// names. `"merge-editor"`'s own key bindings (`crate::default_key_bindings`) never bind
+    /// [`EditorSaveAnyway`] at all - there is no external-change-conflict concept for a merge
+    /// hand-edit buffer (see [`Self::save_merge_edit`]'s own docs), so
+    /// [`Self::handle_editor_save_anyway_action`] deliberately stays File-view-only, unchanged.
     pub(super) fn handle_editor_save_action(
         &mut self,
         _: &EditorSave,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.save_active_file(cx);
+        match self.active_edit_target() {
+            Some(EditTarget::File(_)) => self.save_active_file(cx),
+            Some(EditTarget::Merge) => self.save_merge_edit(cx),
+            None => {}
+        }
     }
 
     pub(super) fn handle_editor_save_anyway_action(
@@ -669,16 +763,26 @@ impl EntityInputHandler for AdeApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(path) = self.active_editable_path() else {
-            return;
-        };
-        let Some(buffer) = self.edit_buffers.get_mut(&path) else {
-            return;
-        };
-        let range = range_utf16.map(|range_utf16| buffer.range_from_utf16(&range_utf16));
-        buffer.replace_range(range, text);
-        self.schedule_rehighlight(path.clone(), cx);
-        self.schedule_lsp_sync(path, cx);
+        match self.active_edit_target() {
+            Some(EditTarget::File(path)) => {
+                let Some(buffer) = self.edit_buffers.get_mut(&path) else {
+                    return;
+                };
+                let range = range_utf16.map(|range_utf16| buffer.range_from_utf16(&range_utf16));
+                buffer.replace_range(range, text);
+                self.schedule_rehighlight(path.clone(), cx);
+                self.schedule_lsp_sync(path, cx);
+            }
+            Some(EditTarget::Merge) => {
+                let Some(edit) = self.merge_edit.as_mut() else {
+                    return;
+                };
+                let range =
+                    range_utf16.map(|range_utf16| edit.buffer.range_from_utf16(&range_utf16));
+                edit.buffer.replace_range(range, text);
+            }
+            None => return,
+        }
         self.sync_cursor_and_scroll();
         cx.notify();
     }
@@ -691,16 +795,27 @@ impl EntityInputHandler for AdeApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(path) = self.active_editable_path() else {
-            return;
-        };
-        let Some(buffer) = self.edit_buffers.get_mut(&path) else {
-            return;
-        };
-        let range = range_utf16.map(|range_utf16| buffer.range_from_utf16(&range_utf16));
-        buffer.replace_and_mark_range(range, new_text, new_selected_range_utf16);
-        self.schedule_rehighlight(path.clone(), cx);
-        self.schedule_lsp_sync(path, cx);
+        match self.active_edit_target() {
+            Some(EditTarget::File(path)) => {
+                let Some(buffer) = self.edit_buffers.get_mut(&path) else {
+                    return;
+                };
+                let range = range_utf16.map(|range_utf16| buffer.range_from_utf16(&range_utf16));
+                buffer.replace_and_mark_range(range, new_text, new_selected_range_utf16);
+                self.schedule_rehighlight(path.clone(), cx);
+                self.schedule_lsp_sync(path, cx);
+            }
+            Some(EditTarget::Merge) => {
+                let Some(edit) = self.merge_edit.as_mut() else {
+                    return;
+                };
+                let range =
+                    range_utf16.map(|range_utf16| edit.buffer.range_from_utf16(&range_utf16));
+                edit.buffer
+                    .replace_and_mark_range(range, new_text, new_selected_range_utf16);
+            }
+            None => return,
+        }
         self.sync_cursor_and_scroll();
         cx.notify();
     }
@@ -712,27 +827,32 @@ impl EntityInputHandler for AdeApp {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let path = self.active_editable_path()?;
-        let buffer = self.edit_buffers.get(&path)?;
-        let (last_path, last_line) = self.file_view_last_layout_for.clone()?;
-        if last_path != path {
-            return None;
+        match self.active_edit_target()? {
+            EditTarget::File(path) => {
+                let buffer = self.edit_buffers.get(&path)?;
+                let (last_path, last_line) = self.file_view_last_layout_for.clone()?;
+                if last_path != path {
+                    return None;
+                }
+                let last_layout = self.file_view_last_layout.as_ref()?;
+                bounds_for_line_range(buffer, last_layout, last_line, element_bounds, range_utf16)
+            }
+            EditTarget::Merge => {
+                let edit = self.merge_edit.as_ref()?;
+                let (last_path, last_line) = self.merge_edit_last_layout_for.clone()?;
+                if last_path != edit.relative_path {
+                    return None;
+                }
+                let last_layout = self.merge_edit_last_layout.as_ref()?;
+                bounds_for_line_range(
+                    &edit.buffer,
+                    last_layout,
+                    last_line,
+                    element_bounds,
+                    range_utf16,
+                )
+            }
         }
-        let last_layout = self.file_view_last_layout.as_ref()?;
-        let line_range = buffer.line_ranges.get(last_line)?;
-        let range = buffer.range_from_utf16(&range_utf16);
-        let local_start = range.start.checked_sub(line_range.start)?;
-        let local_end = range.end.checked_sub(line_range.start)?;
-        Some(Bounds::from_corners(
-            point(
-                element_bounds.left() + last_layout.x_for_index(local_start),
-                element_bounds.top(),
-            ),
-            point(
-                element_bounds.left() + last_layout.x_for_index(local_end),
-                element_bounds.bottom(),
-            ),
-        ))
     }
 
     fn character_index_for_point(
@@ -741,32 +861,88 @@ impl EntityInputHandler for AdeApp {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        let path = self.active_editable_path()?;
-        let buffer = self.edit_buffers.get(&path)?;
-        let (last_path, last_line) = self.file_view_last_layout_for.clone()?;
-        if last_path != path {
-            return None;
+        match self.active_edit_target()? {
+            EditTarget::File(path) => {
+                let buffer = self.edit_buffers.get(&path)?;
+                let (last_path, last_line) = self.file_view_last_layout_for.clone()?;
+                if last_path != path {
+                    return None;
+                }
+                let last_bounds = self.file_view_last_bounds?;
+                let last_layout = self.file_view_last_layout.as_ref()?;
+                character_index_for_line_point(buffer, last_bounds, last_layout, last_line, point)
+            }
+            EditTarget::Merge => {
+                let edit = self.merge_edit.as_ref()?;
+                let (last_path, last_line) = self.merge_edit_last_layout_for.clone()?;
+                if last_path != edit.relative_path {
+                    return None;
+                }
+                let last_bounds = self.merge_edit_last_bounds?;
+                let last_layout = self.merge_edit_last_layout.as_ref()?;
+                character_index_for_line_point(
+                    &edit.buffer,
+                    last_bounds,
+                    last_layout,
+                    last_line,
+                    point,
+                )
+            }
         }
-        let last_bounds = self.file_view_last_bounds?;
-        let last_layout = self.file_view_last_layout.as_ref()?;
-        let line_text = buffer.lines.get(last_line)?.text.as_str();
-        // Honest degrade: if the row that was actually painted last frame no longer matches this
-        // buffer's current text at that line (e.g. an edit landed between the paint and this
-        // query), there's no real answer to give - mirrors `vendor/zed/crates/gpui/examples/
-        // input.rs`'s own `assert_eq!` intent without panicking (this project's hard "no panics
-        // outside tests" rule rules out porting that assertion verbatim).
-        if last_layout.text.as_ref() != line_text {
-            return None;
-        }
-        let line_point = last_bounds.localize(&point)?;
-        let local_index = last_layout.index_for_x(line_point.x)?;
-        let line_range = buffer.line_ranges.get(last_line)?;
-        Some(buffer.offset_to_utf16(line_range.start + local_index))
     }
 
     fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
         self.active_edit_buffer().is_some()
     }
+}
+
+/// The shared real bounds-for-range math [`EntityInputHandler::bounds_for_range`] needs for
+/// whichever buffer/last-painted-layout pair is the current edit target - factored out (Revision
+/// R8.5c) so the File view and merge hand-edit view (each with their own dedicated "last painted
+/// caret row" cache fields) can't drift into two independently-maintained copies of this real
+/// pixel math.
+fn bounds_for_line_range(
+    buffer: &EditBuffer,
+    last_layout: &gpui::ShapedLine,
+    last_line: usize,
+    element_bounds: Bounds<Pixels>,
+    range_utf16: Range<usize>,
+) -> Option<Bounds<Pixels>> {
+    let line_range = buffer.line_ranges.get(last_line)?;
+    let range = buffer.range_from_utf16(&range_utf16);
+    let local_start = range.start.checked_sub(line_range.start)?;
+    let local_end = range.end.checked_sub(line_range.start)?;
+    Some(Bounds::from_corners(
+        point(
+            element_bounds.left() + last_layout.x_for_index(local_start),
+            element_bounds.top(),
+        ),
+        point(
+            element_bounds.left() + last_layout.x_for_index(local_end),
+            element_bounds.bottom(),
+        ),
+    ))
+}
+
+/// The mirror of [`bounds_for_line_range`] for
+/// [`EntityInputHandler::character_index_for_point`] - see that function's own docs for the real
+/// "honest degrade if the painted row no longer matches the buffer's current text" check this
+/// preserves.
+fn character_index_for_line_point(
+    buffer: &EditBuffer,
+    last_bounds: Bounds<Pixels>,
+    last_layout: &gpui::ShapedLine,
+    last_line: usize,
+    point_on_screen: Point<Pixels>,
+) -> Option<usize> {
+    let line_text = buffer.lines.get(last_line)?.text.as_str();
+    if last_layout.text.as_ref() != line_text {
+        return None;
+    }
+    let line_point = last_bounds.localize(&point_on_screen)?;
+    let local_index = last_layout.index_for_x(line_point.x)?;
+    let line_range = buffer.line_ranges.get(last_line)?;
+    Some(buffer.offset_to_utf16(line_range.start + local_index))
 }
 
 /// Every visible row's real per-row painting context the File view's `uniform_list` row builder
@@ -1258,7 +1434,13 @@ fn text_run_div(
 
 /// Overlays a real IME-composition underline onto `runs`, splitting any run(s) `marked` crosses -
 /// composition must stay visible regardless of whatever syntax/diagnostic coloring sits under it.
-fn split_runs_for_marked_range(runs: Vec<TextRun>, marked: &Range<usize>) -> Vec<TextRun> {
+/// `pub(super)` (Revision R8.5c) - `crate::root::merge_editing`'s own simplified row painter
+/// reuses this for the merge hand-edit view's real IME-composition-range underline, rather than a
+/// second, duplicate implementation.
+pub(super) fn split_runs_for_marked_range(
+    runs: Vec<TextRun>,
+    marked: &Range<usize>,
+) -> Vec<TextRun> {
     if marked.start >= marked.end {
         return runs;
     }

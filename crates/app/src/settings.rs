@@ -457,7 +457,18 @@ pub fn detect_lsp_rows(resolve: impl Fn(&str) -> Option<PathBuf>) -> Vec<LspRow>
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeybindingRow {
     pub command: &'static str,
-    pub context: &'static str,
+    /// The binding's real, registered context predicate, via `gpui::KeyBinding::predicate`'s own
+    /// `Display` impl (`vendor/zed/crates/gpui/src/keymap/context.rs`) - `"global"` only when
+    /// there is genuinely no predicate at all. A real, live-reproduced bug an audit caught fixed
+    /// this from an earlier version that collapsed every non-global predicate down to the single
+    /// literal `"scoped"`: once more than one real scoped context existed (`"diff"`,
+    /// `"file-editor"`, `"file-editor && completions"`, `"merge-editor"`, ...), two bindings that
+    /// share a command label and keystroke but are scoped to *different*, mutually-exclusive
+    /// contexts (e.g. `EditorCopy` bound once under `"file-editor"` and once under
+    /// `"merge-editor"`) rendered as literally indistinguishable rows on the real Keybindings
+    /// page, and the filter field couldn't tell them apart either (both matched the same
+    /// `"scoped"` substring). Showing the real predicate string fixes both.
+    pub context: String,
     /// The registered keystroke(s) for this binding (almost always exactly one), resolved to
     /// per-platform keycaps via `crate::keymap::resolve_keystroke` at the render call site.
     pub keystrokes: Vec<gpui::Keystroke>,
@@ -519,18 +530,19 @@ fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
 
 /// Builds the Keybindings page's rows straight from `bindings` (in production,
 /// `crate::default_key_bindings()`) - row order is registration order, so there is no separate
-/// order to drift. `context` is `"global"` when the `KeyBinding` has no context predicate and
-/// `"scoped"` otherwise. A binding whose action has no [`action_label`] entry is skipped rather
-/// than shown with a blank label - see that function's docs for the test guarding against that.
+/// order to drift. `context` is `"global"` when the `KeyBinding` has no context predicate, else
+/// the real predicate's own `Display` string (see [`KeybindingRow::context`]'s own docs for why
+/// this - not a constant `"scoped"` - is load-bearing). A binding whose action has no
+/// [`action_label`] entry is skipped rather than shown with a blank label - see that function's
+/// docs for the test guarding against that.
 pub fn keybinding_rows(bindings: &[gpui::KeyBinding]) -> Vec<KeybindingRow> {
     bindings
         .iter()
         .filter_map(|binding| {
             let command = action_label(binding.action())?;
-            let context = if binding.predicate().is_none() {
-                "global"
-            } else {
-                "scoped"
+            let context = match binding.predicate() {
+                Some(predicate) => predicate.to_string(),
+                None => "global".to_string(),
             };
             let keystrokes = binding
                 .keystrokes()
@@ -973,6 +985,34 @@ mod tests {
         );
     }
 
+    /// The real drift guard for the exact bug an audit caught: `KeybindingRow::context` used to
+    /// collapse every scoped predicate down to the single literal `"scoped"`, so two bindings
+    /// that share a command label and keystroke but are scoped to different, mutually-exclusive
+    /// contexts (real, live example: `EditorCopy` bound once under `"file-editor"` and once
+    /// under `"merge-editor"`) rendered as literally indistinguishable rows. Asserts every real
+    /// `(command, context, keystrokes)` triple is unique - this is the actual, real property the
+    /// Keybindings page needs (never two rows a user genuinely cannot tell apart), not just a
+    /// row *count*, which the collision this guards against would not have changed at all.
+    #[test]
+    fn every_keybinding_row_is_genuinely_distinguishable_from_every_other() {
+        let bindings = crate::default_key_bindings();
+        let rows = keybinding_rows(&bindings);
+        let mut seen: Vec<(&str, &str, Vec<gpui::Keystroke>)> = Vec::new();
+        for row in &rows {
+            let identity = (row.command, row.context.as_str(), row.keystrokes.clone());
+            assert!(
+                !seen.contains(&identity),
+                "two Keybindings-page rows are genuinely indistinguishable - command {:?}, \
+                 context {:?}, keystrokes {:?} - a real user has no way to tell them apart: \
+                 {rows:#?}",
+                identity.0,
+                identity.1,
+                identity.2
+            );
+            seen.push(identity);
+        }
+    }
+
     #[test]
     fn keybinding_rows_are_derived_in_real_registration_order() {
         let bindings = crate::default_key_bindings();
@@ -1020,6 +1060,32 @@ mod tests {
                 "Completions: accept selected",
                 "Completions: accept selected",
                 "Completions: dismiss",
+                // Revision R8.5c's `"merge-editor"`-scoped bindings for Surface D's merge
+                // hand-edit whole-file editor - the same real `Editor*` action *types*/labels as
+                // the `"file-editor"` set above (reused, not duplicated - see
+                // `crate::root::editing::AdeApp::active_edit_target`'s own docs), minus
+                // `EditorSaveAnyway` (deliberately never bound here - there is no
+                // external-change-conflict concept for a merge hand-edit buffer) and minus every
+                // `Completions*` binding (no completions popup is ever wired up for this
+                // surface).
+                "Editor: delete backward",
+                "Editor: delete forward",
+                "Editor: insert newline",
+                "Editor: move left",
+                "Editor: move right",
+                "Editor: move up",
+                "Editor: move down",
+                "Editor: extend selection left",
+                "Editor: extend selection right",
+                "Editor: extend selection up",
+                "Editor: extend selection down",
+                "Editor: go to line start",
+                "Editor: go to line end",
+                "Editor: select all",
+                "Editor: copy",
+                "Editor: cut",
+                "Editor: paste",
+                "Editor: save file",
             ]
         );
     }
@@ -1045,6 +1111,11 @@ mod tests {
         // before. Revision R8.5b added 5 more real scoped bindings for the Completions popup
         // (`CompletionsUp`/`CompletionsDown`/`CompletionsDismiss`, plus `CompletionsAccept`
         // bound twice - `tab` and `enter`), each `Some("file-editor && completions")`.
+        // Revision R8.5c added 18 more real scoped bindings for Surface D's merge hand-edit
+        // whole-file editor, each `Some("merge-editor")` - the same 18 `Editor*` actions as the
+        // `"file-editor"` set minus `EditorSaveAnyway` (see
+        // `keybinding_rows_are_derived_in_real_registration_order`'s own updated expectations
+        // for exactly which).
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings);
         assert!(!rows.is_empty());
@@ -1052,9 +1123,10 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            25,
+            43,
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
-             every real Completions* binding (5) to be scoped, not global"
+             every real Completions* binding (5) plus every real merge-editor binding (18) to \
+             be scoped, not global"
         );
         assert!(
             scoped.iter().any(|row| row.command == "Next changed file"),

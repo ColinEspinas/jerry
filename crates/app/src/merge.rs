@@ -8,13 +8,67 @@ use std::path::{Path, PathBuf};
 
 use wt_core::merge::{ConflictSegment, ConflictedFile, ConflictedPath, UnmergeableReason};
 
+use crate::edit_buffer::EditBuffer;
 use crate::sessions::SessionId;
 
 /// The live state of one merge attempt/resolution, scoped to the session whose `Merge` button
 /// started it.
 pub struct MergeFlow {
     pub session_id: SessionId,
+    /// Bumped by [`crate::root::AdeApp::start_merge`] every time a fresh attempt is started -
+    /// including a fresh attempt for the *same* `session_id` (aborting a merge and immediately
+    /// re-clicking `Merge` on the same session tab reuses the same `session_id`). Real callers
+    /// that stamp a background operation with `(session_id, generation)` at dispatch time (see
+    /// [`MergeEditState::generation`]'s own docs) use this to tell "a result for the attempt
+    /// still in progress" apart from "a stale result for an attempt that has since been
+    /// superseded" - a bare `session_id` match alone cannot distinguish those two cases from each
+    /// other.
+    pub generation: u64,
     pub state: MergeFlowState,
+}
+
+/// Real, dedicated hand-edit state for Surface D's conflict-resolution flow (Revision R8.5c) -
+/// see `crate::root::AdeApp::merge_edit`'s own docs for why this is a single, dedicated slot on
+/// `AdeApp` rather than folded into `crate::root::AdeApp::edit_buffers` (a different,
+/// sidebar-worktree-selection-scoped map with its own wholesale-reset discipline this state must
+/// never share - a hand-edit here must survive a sidebar worktree switch untouched, since
+/// browsing a different worktree in the sidebar is a completely independent axis from which
+/// session/merge flow is on screen).
+pub struct MergeEditState {
+    /// Which [`MergeFlow`] (by session) this hand-edit belongs to.
+    pub session_id: SessionId,
+    /// [`MergeFlow::generation`] at the moment this hand-edit was started - see that field's own
+    /// docs for the real, narrow race this closes: a stale in-flight background save from an
+    /// aborted merge attempt landing *after* a fresh `start_merge` reused the very same
+    /// `session_id` must never be silently applied to the new attempt's unrelated conflict
+    /// state.
+    pub generation: u64,
+    /// A real, monotonic per-buffer identity stamp - bumped by
+    /// `crate::root::merge_flow::AdeApp::start_merge_hand_edit` every time a *fresh*
+    /// `EditBuffer` is actually seeded (not on a re-click that reuses an already-open one - see
+    /// that method's own docs). Closes a real, narrow race an audit found by reading (not
+    /// live-reproduced under the test executor, since it requires a real yield point mid-save
+    /// that this app's synchronous UI-event dispatch doesn't offer without one): `session_id`/
+    /// `generation`/`relative_path` alone are *not* enough to identify a specific *buffer*, only
+    /// a specific merge attempt's specific file - if a hand-edit save is dispatched, the user
+    /// then discards it and immediately re-opens hand-edit mode for the *same* file (same
+    /// session/generation/relative_path, but a brand-new `EditBuffer`) before that earlier save's
+    /// background write actually lands, the earlier save's completion would otherwise call
+    /// `EditBuffer::mark_saved` on the *new* buffer, stamping the old buffer's own written
+    /// content as the new buffer's `saved_content` - silently corrupting the new buffer's dirty-
+    /// state bookkeeping against content it never actually held. Every place a background save
+    /// result gets applied checks this alongside `session_id`/`generation`/`relative_path`.
+    pub buffer_id: u64,
+    pub base_worktree_path: PathBuf,
+    /// The conflicted file this hand-edit is for - matched by path (never a captured index) at
+    /// every real re-derivation point, since `files[]`'s own entries can be replaced in place by
+    /// either resolution path (quick-pick buttons or this one) without changing index.
+    pub relative_path: PathBuf,
+    /// The real editing engine - seeded from [`ConflictedFile::render`]'s current in-memory
+    /// content (which may already reflect quick-pick-resolved hunks not yet written to disk),
+    /// never from raw disk bytes - see `crate::root::merge_flow::AdeApp::start_merge_hand_edit`'s
+    /// own docs for why.
+    pub buffer: EditBuffer,
 }
 
 /// The state of a [`MergeFlow`] - every variant corresponds to an already-happened
@@ -119,6 +173,32 @@ pub fn unmergeable_paths(files: &[ConflictedPath]) -> Vec<(&Path, UnmergeableRea
             } => Some((relative_path.as_path(), *reason)),
         })
         .collect()
+}
+
+/// Replaces whichever `files` entry matches `relative_path` with a freshly re-derived
+/// `ConflictedPath::Text(fresh)` - matched by *path*, never a captured index, since another
+/// file's hunk can resolve via the ordinary take-left/take-right/take-both path (which never
+/// reorders `files`, only mutates in place) while a hand-edit save for *this* path is still in
+/// flight; index-based replacement would risk landing on the wrong entry if `files` were ever
+/// reordered, and path-matching costs nothing extra here since the identity being updated is
+/// always already known by path. Used by `crate::root::merge_flow::AdeApp::
+/// apply_merge_edit_save_result` after a real hand-edit save re-parses the just-written file's
+/// conflict markers (`wt_core::merge::load_conflicted_file`). Returns `false` (a no-op) if no
+/// entry matches `relative_path` at all - a stale save whose target path is no longer part of
+/// `files` (e.g. a fresh merge attempt replaced the whole list while the save was in flight).
+pub fn replace_conflicted_file(
+    files: &mut [ConflictedPath],
+    relative_path: &Path,
+    fresh: ConflictedFile,
+) -> bool {
+    let Some(entry) = files
+        .iter_mut()
+        .find(|entry| entry.relative_path() == relative_path)
+    else {
+        return false;
+    };
+    *entry = ConflictedPath::Text(fresh);
+    true
 }
 
 /// How many conflict hunks remain, total, in `file` - the pre-flight strip's "only N files need
@@ -309,5 +389,29 @@ mod tests {
     fn hunk_count_matches_the_number_of_conflict_segments() {
         assert_eq!(hunk_count(&conflicted_file("a.txt", 3)), 3);
         assert_eq!(hunk_count(&conflicted_file("a.txt", 0)), 0);
+    }
+
+    #[test]
+    fn replace_conflicted_file_updates_the_entry_matched_by_path_not_by_index() {
+        let mut files = vec![text("a.txt", 1), text("b.txt", 2)];
+        let mut resolved_b = conflicted_file("b.txt", 2);
+        resolve_all(&mut resolved_b);
+        let replaced = replace_conflicted_file(&mut files, Path::new("b.txt"), resolved_b.clone());
+        assert!(replaced);
+        assert_eq!(
+            files[0],
+            text("a.txt", 1),
+            "a.txt's own entry must be untouched"
+        );
+        assert_eq!(files[1], ConflictedPath::Text(resolved_b));
+    }
+
+    #[test]
+    fn replace_conflicted_file_is_a_no_op_when_the_path_is_no_longer_present() {
+        let mut files = vec![text("a.txt", 1)];
+        let stale = conflicted_file("gone.txt", 1);
+        let replaced = replace_conflicted_file(&mut files, Path::new("gone.txt"), stale);
+        assert!(!replaced);
+        assert_eq!(files, vec![text("a.txt", 1)]);
     }
 }

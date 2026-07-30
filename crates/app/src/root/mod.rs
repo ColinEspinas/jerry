@@ -510,6 +510,71 @@ pub struct AdeApp {
         Vec<code_view::RenderedLine>,
         Vec<code_view::RenderedLine>,
     )>,
+    /// Real, dedicated hand-edit state for Surface D's conflict-resolution flow (Revision
+    /// R8.5c) - see [`merge::MergeEditState`]'s own docs for why this is separate from
+    /// [`Self::edit_buffers`]. `None` whenever no hand-edit is in progress, including while a
+    /// merge conflict is showing but the user hasn't toggled hand-edit mode on for the active
+    /// file. Torn down (`crate::root::merge_flow::AdeApp::clear_merge_edit_state`) at every real
+    /// merge-flow-ending point (abort/complete/dismiss/session-close) and by a fresh
+    /// [`Self::start_merge`], and whenever the flow's own active file (matched by path) advances
+    /// past whatever file this hand-edit is for.
+    merge_edit: Option<merge::MergeEditState>,
+    /// Focus target for the merge hand-edit whole-file editor's outer container
+    /// (`crate::root::merge_editing::render_merge_edit_view`) - `track_focus`'d there, the same
+    /// "must be the exact focused node the real key-context/`on_action` dispatch walks up from"
+    /// discipline [`Self::code_focus_handle`] already establishes (see
+    /// `crate::root::code_surface::AdeApp::render_code_surface`'s own docs for the real,
+    /// live-reproduced bug getting that wrong once already caused).
+    merge_edit_focus_handle: FocusHandle,
+    merge_edit_scroll_handle: UniformListScrollHandle,
+    /// The merge hand-edit whole-file view's own, dedicated equivalent of
+    /// [`Self::file_view_row_layout`] - deliberately never shared with the File view's own map,
+    /// so the two virtualized lists' click/cursor hit-testing caches can never cross-contaminate
+    /// (the exact class of bug this project's own audits - e.g. BUILD-LOG's Revision R9a
+    /// diff-highlight-cache finding - keep finding when two independent surfaces share one
+    /// cache).
+    merge_edit_row_layout: HashMap<usize, (gpui::Bounds<Pixels>, gpui::ShapedLine)>,
+    /// See [`Self::file_view_last_layout`]/[`Self::file_view_last_bounds`]/
+    /// [`Self::file_view_last_layout_for`]'s own docs - the merge hand-edit view's own dedicated
+    /// equivalents, read by the generalized `EntityInputHandler::bounds_for_range`/
+    /// `character_index_for_point` impls when the merge buffer (not the File view's) is the
+    /// active edit target.
+    merge_edit_last_layout: Option<gpui::ShapedLine>,
+    merge_edit_last_bounds: Option<gpui::Bounds<Pixels>>,
+    merge_edit_last_layout_for: Option<(PathBuf, usize)>,
+    /// Mirrors [`Self::file_save_pending`]/[`Self::file_save_running`]'s serial-writer-loop
+    /// discipline (see `crate::root::merge_flow::AdeApp::save_merge_edit`'s own docs), scoped to
+    /// the single [`Self::merge_edit`] slot rather than per-path - only one hand-edit buffer can
+    /// ever exist at once.
+    merge_edit_save_pending: bool,
+    merge_edit_save_running: bool,
+    /// The most recent hand-edit save's real failure, if any - surfaced next to the hand-edit
+    /// editor's own Save button, mirroring [`Self::file_save_error`]'s convention. Cleared by
+    /// the next successful save, or by leaving hand-edit mode
+    /// (`crate::root::merge_flow::AdeApp::clear_merge_edit_state`).
+    merge_edit_save_error: Option<String>,
+    _merge_edit_save_task: Option<Task<()>>,
+    /// A real, monotonically-increasing counter bumped by every [`Self::start_merge`] call - the
+    /// source of [`merge::MergeFlow::generation`], mirroring [`Self::completions_generation`]'s
+    /// own "stamp a background operation at dispatch time, compare it at completion time before
+    /// applying a result" convention.
+    merge_generation: u64,
+    /// A real, monotonic counter bumped by every `crate::root::merge_flow::AdeApp::
+    /// start_merge_hand_edit` call that actually seeds a *fresh* `EditBuffer` - the source of
+    /// [`merge::MergeEditState::buffer_id`], mirroring [`Self::merge_generation`]'s own "stamp a
+    /// background operation at dispatch time, compare it at completion time" convention, but at
+    /// per-*buffer* granularity rather than per-merge-*attempt* granularity - see that field's
+    /// own docs for the real race this closes that `merge_generation` alone cannot.
+    merge_edit_buffer_id: u64,
+    /// Test-only seam: an artificial delay [`crate::root::merge_flow::AdeApp::
+    /// spawn_merge_edit_save_loop`] awaits (via the GPUI test clock) before each real write -
+    /// mirrors [`Self::settings_save_test_delay`]'s own identical, established pattern for the
+    /// same real reason: letting a test deterministically hold one save pending while it
+    /// mutates [`Self::merge_edit`] underneath it, to really exercise the buffer-identity guard
+    /// [`merge::MergeEditState::buffer_id`]'s own docs describe. `#[cfg(test)]`-gated end to
+    /// end, so no test-only state exists in a production build.
+    #[cfg(test)]
+    merge_edit_save_test_delay: Option<Duration>,
     _load_worktrees_task: Option<Task<()>>,
     _load_file_tree_task: Option<Task<()>>,
     _load_diff_task: Option<Task<()>>,
@@ -1242,6 +1307,7 @@ mod completions;
 mod editing;
 mod focus;
 mod lsp;
+mod merge_editing;
 mod merge_flow;
 mod merge_flow_render;
 mod palette_render;

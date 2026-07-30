@@ -224,6 +224,35 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
             root::CompletionsDismiss,
             Some("file-editor && completions"),
         ),
+        // Surface D's merge hand-edit whole-file editor (Revision R8.5c,
+        // `crate::root::merge_editing`) - a distinct `"merge-editor"` context, deliberately never
+        // `"file-editor"` itself: the same real `Editor*` action *types*/handler bodies are
+        // reused (see `crate::root::editing::AdeApp::active_edit_target`'s own docs for how a
+        // handler routes to whichever buffer is actually the current target), but reusing
+        // `"file-editor"` verbatim would also pull in the `"... && completions"`/
+        // `"... && !completions"` narrowing above, which makes no sense for a merge buffer - no
+        // completions popup is ever wired up for it (see `crate::root::merge_editing`'s own top
+        // docs). `EditorSaveAnyway` (`secondary-shift-s`) is deliberately *not* bound here either:
+        // there is no external-change-conflict concept for a merge hand-edit buffer (see
+        // `crate::root::merge_flow::AdeApp::save_merge_edit`'s own docs).
+        gpui::KeyBinding::new("backspace", root::EditorBackspace, Some("merge-editor")),
+        gpui::KeyBinding::new("delete", root::EditorDelete, Some("merge-editor")),
+        gpui::KeyBinding::new("enter", root::EditorEnter, Some("merge-editor")),
+        gpui::KeyBinding::new("left", root::EditorLeft, Some("merge-editor")),
+        gpui::KeyBinding::new("right", root::EditorRight, Some("merge-editor")),
+        gpui::KeyBinding::new("up", root::EditorUp, Some("merge-editor")),
+        gpui::KeyBinding::new("down", root::EditorDown, Some("merge-editor")),
+        gpui::KeyBinding::new("shift-left", root::EditorSelectLeft, Some("merge-editor")),
+        gpui::KeyBinding::new("shift-right", root::EditorSelectRight, Some("merge-editor")),
+        gpui::KeyBinding::new("shift-up", root::EditorSelectUp, Some("merge-editor")),
+        gpui::KeyBinding::new("shift-down", root::EditorSelectDown, Some("merge-editor")),
+        gpui::KeyBinding::new("home", root::EditorHome, Some("merge-editor")),
+        gpui::KeyBinding::new("end", root::EditorEnd, Some("merge-editor")),
+        gpui::KeyBinding::new("secondary-a", root::EditorSelectAll, Some("merge-editor")),
+        gpui::KeyBinding::new("secondary-c", root::EditorCopy, Some("merge-editor")),
+        gpui::KeyBinding::new("secondary-x", root::EditorCut, Some("merge-editor")),
+        gpui::KeyBinding::new("secondary-v", root::EditorPaste, Some("merge-editor")),
+        gpui::KeyBinding::new("secondary-s", root::EditorSave, Some("merge-editor")),
     ]
 }
 

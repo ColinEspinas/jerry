@@ -1369,11 +1369,20 @@ impl AdeApp {
             .child(
                 div()
                     .flex_none()
-                    .w(px(64.0))
+                    // Widened from an earlier px(64.0), plus a real whitespace/overflow backstop
+                    // - `KeybindingRow::context` now shows the real predicate string (see that
+                    // field's own docs for the real row-collision bug fixed by showing it), which
+                    // can be considerably longer than the old constant `"scoped"` (e.g.
+                    // `"file-editor && completions"`) - the same real gutter-overflow fix class
+                    // `code_surface::render_diff_gutter_number`'s own docs describe for a
+                    // different column.
+                    .w(px(190.0))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
                     .font(font(theme::font::MONO))
                     .text_size(px(10.0))
                     .text_color(theme::text::FAINTER)
-                    .child(row.context),
+                    .child(row.context.clone()),
             )
             .child(
                 div()
