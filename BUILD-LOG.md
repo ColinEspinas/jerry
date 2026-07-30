@@ -2195,3 +2195,122 @@ All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`,
 removed) + 42 lsp-core + 14 pty-core + 98 wt-core. One full run hit the project's known
 diff-rendering flake (`opening_a_real_diff_renders_real_syntax_highlighted_rows`); it passed alone,
 passed with its whole module, and the next full run was green with no other change.
+
+## File tree: right-click context menu and file operations (GitHub issue #19)
+
+The Files tree is writable now: right-click menus on a file row, a folder row and the empty area
+below the tree; inline New File / New Folder / Rename editors; a real cut/copy/paste buffer with
+`Ctrl+C`/`X`/`V`; and a confirmed delete that prefers the OS trash. Three new modules, split the
+way every feature folder in this crate is: `sidebar::context_menu` (which rows a target offers,
+plus the edge-aware popover geometry), `sidebar::file_ops` (name validation, collision-free
+naming, recursive copy/move/delete, the trash decision) - both pure and GPUI-free - and
+`sidebar::tree_ops`, the `impl AdeApp` glue that sequences them and repairs the app's own state
+afterwards.
+
+**Trash is real and named honestly.** On Linux/FreeBSD a confirmed delete shells out to
+`gio trash -- <path>`, GLib's own CLI wrapper around `g_file_trash`, which implements the
+freedesktop.org trash spec for local files in-process (no session bus, no gvfs daemon). Verified by
+running it in this environment rather than assumed: a file and a non-empty directory both really
+landed in `~/.local/share/Trash/files`, and the `--` terminator really does protect a leading-dash
+filename. No new dependency was added for it. macOS and Windows deliberately get **no** trash
+command: macOS's usual answer is an `osascript` snippet whose only interface is an AppleScript
+string literal (every quote and backslash in a filename hand-escaped, and a wrong escape acts on a
+different path than the one confirmed), and Windows has no built-in recycle-bin CLI at all. Those
+platforms take a real, permanent delete whose confirmation button reads "Delete permanently" and
+whose sentence says so, rather than a "moved to trash" claim for something that was destroyed. The
+mechanism is resolved once - against a real `$PATH` probe (`pty_core::resolve_on_path`, the same
+walk this workspace already uses for agent CLIs) - *before* the confirmation is shown, so the words
+the user agrees to and the command that runs come from the same value; a failed trash command is
+reported and never silently escalated into a permanent delete.
+
+**The empty area's "Collapse All" is issue #18's own reset**, `AdeApp::collapse_all_dirs` - the
+same method the Files header's `▾` button calls - not a parallel mechanism. That is asserted where
+the two would actually differ: the test writes a real fold-state file, expands a folder, confirms
+the expansion is genuinely on disk, runs the menu action, and asserts the entry is gone from the
+*file*. An implementation that only emptied `expanded_dirs` would pass every in-memory assertion
+and fail that one.
+
+**Watcher/refresh consistency.** The honest answer to §4's "do these just touch the filesystem, or
+do they need to trigger a refresh?" is: they are plain filesystem changes, so `git` sees them with
+no help - but nothing in this app polls the working tree for the sidebar. There is no filesystem
+watcher at all; the file tree is only ever re-walked by an explicit `load_file_tree`, and the diff
+view only by an explicit `load_diff` (the rail's 3-second status poll refreshes the *rail's*
+per-worktree summary, not `diff_state`). So every operation ends in `refresh_after_file_op`, which
+does both. The in-progress inline editor lives on `AdeApp`, never inside `AdeApp::file_tree` -
+that vector is *replaced wholesale* by each completed walk, which is exactly what an agent creating
+a file mid-session triggers - and the renderer re-finds the editor's anchor row by *path* each
+frame, falling back to the top of the list when the anchor has genuinely gone. Same discipline
+issue #18 applied to fold state. The regression test drives the real race (agent writes a file,
+real re-walk, run to parked) and was confirmed to fail against a completion handler that cleared
+the editor.
+
+**Keybinding scoping**, this project's most-repeated bug class, got two independent mechanisms and
+one corrected claim. The five new bindings are scoped to
+`"file-tree && !tree-editing && !tree-delete-confirm"`, and their `.on_action` handlers live only
+on the tree's own container. An earlier draft of the module docs asserted that handler placement
+was the *only* real protection for a focused terminal and that the `file-tree` half "isn't doing
+that work" - that was wrong, and revert-verification caught it: `dispatch_key` resolves bindings
+against the focused node's own dispatch-path context stack *before* any listener is consulted, so
+either mechanism alone suffices. Both are documented as independent now. The `!tree-editing` half
+has no redundant partner and is the one directly reproducible: with a bare `Some("file-tree")` the
+`shift_f10_while_an_inline_editor_is_open…` test fails, because while an editor is open the tree
+*is* the focused node, the listener runs, and GPUI stops propagation by default in the bubble
+phase - swallowing the keystroke being typed into the name field.
+
+An **adversarial review sub-agent was genuinely dispatched and its report genuinely received**
+(not the builder's own reasoning - said explicitly because a sibling agent misreported this
+earlier the same day). It found nothing fake or unwired, and eleven real problems, all fixed with
+tests:
+
+1. **`reviewed_files` was remapped in the wrong key space** - it is keyed by
+   `wt_core::diff::DiffFile::path` (worktree-relative) and was being remapped with the absolute
+   pair, making it a guaranteed silent no-op. A file's reviewed checkbox reset on every rename.
+2. **A cut+paste back into the source folder silently renamed the file** to `util copy.rs`: an
+   unconditional `unique_destination` for `Cut` as well as `Copy`. It is a no-op now.
+3. **The LSP's per-document bookkeeping survived a rename or delete.** `didOpen` early-returns for
+   a path already in `lsp_opened_files`, and that set is documented as never cleared on close - so
+   recreating a file at a renamed-away path silently got no diagnostics or completions for the
+   rest of the session. Six maps, in *two* key spaces; the reviewer's own split of which was which
+   was itself slightly wrong, and each field's docs were re-read one by one to get it right
+   (`lsp_synced_version`/`lsp_diagnostics_confirmed_version` are relative, not absolute).
+4. **Switching to the Changes tab left focus dangling** on `tree_focus_handle`, whose node stops
+   being rendered - the exact `OverlayFocus` invariant this project keeps re-finding, killing every
+   keybinding until the next click. `set_right_sidebar_view` now routes through `restore_focus`.
+5. **The tree's overlays floated over the Settings surface**, scrim and all, swallowing clicks.
+   Gated, and cleared in `open_settings` alongside the three overlays already cleared there.
+6. **Blocking recursive tree copy on the foreground thread** in a click listener - contradicting
+   the sibling `confirm_tree_delete`, whose own docs insist on "never the foreground thread".
+   Duplicate and paste-a-copy now run on the background executor.
+7. **A half-copied tree survived a failed copy**, then got repainted looking complete. Cleaned up.
+8. **A symlink to a directory aborted the copy** (`EISDIR`), and a symlinked subdirectory aborted
+   the recursion mid-tree - the dir/file decision used the non-following `symlink_metadata`. Now
+   follows, with a real depth bound for the symlink cycle that makes possible.
+9. **`forget_deleted_paths` was not the mirror of `rename_open_paths`** it claimed to be, leaving
+   eight fields pointing at a deleted path. Both now share one relative/absolute helper pair.
+10. **`menu_height` was 2px short** of the panel's real painted height (its own border), so the
+    edge-flip was computed against a size the menu isn't painted at. The height test asserted only
+    the *growth rate*, which is blind to a missing constant - it asserts the absolute value now.
+11. **Escape didn't dismiss the delete confirmation, and the tree's bindings fired behind its
+    scrim.** Hence the third context term.
+
+Two doc claims the review found false were corrected rather than deleted: the "atomic re-check"
+claim for `copy_path` (`fs::copy` opens `O_TRUNC`; it is a second real TOCTOU, now documented on
+the function like `move_path`'s already was), and the dispatch-causality claim above. One test was
+found passing for the wrong reason (`switching_worktrees_clears_every_tree_operation_in_flight`
+opened the context menu *after* the rename editor, and opening a menu cancels the editor - so its
+key assertion was already true before the switch); the builder had already found and documented
+one of the same class itself, on `ctrl_c_with_a_focused_terminal…`, which proves handler placement
+rather than the context predicate and now says so.
+
+Two limitations are stated rather than papered over: `F2`/`Shift+F10` on a *file* need a
+right-click (or a folder click) first, because a left-click on a file row opens it and moves focus
+to the code surface - stealing focus back would break typing in the editor just opened - and there
+are no up/down bindings to move the selection within the tree, which is where the issue's own
+keyboard requirement stops.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace --lib -- --test-threads=1` - 847 app (up from 795: 52 new tests, none
+removed) + 42 lsp-core + 14 pty-core + 98 wt-core. One full run hit the project's known
+diff-rendering flake (`switching_the_open_diff_to_a_different_file_recomputes_the_highlight_cache`);
+it passed alone with its whole module, and the next full run was green with no other change.

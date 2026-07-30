@@ -1,5 +1,8 @@
 use super::*;
-use crate::root::widgets::{render_sidebar_message, render_tag_pill, text_tooltip};
+use crate::keymap;
+use crate::root::widgets::{
+    render_keycap_row, render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
+};
 use crate::settings::widgets::ChoiceOption;
 
 impl AdeApp {
@@ -10,8 +13,35 @@ impl AdeApp {
     pub(crate) fn set_right_sidebar_view(
         &mut self,
         view: RightSidebarView,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if view != RightSidebarView::Files {
+            // Leaving the Files tab unrenders `Self::file_tree_shell` entirely - and with it the
+            // node `AdeApp::tree_focus_handle` is `track_focus`'d on, plus every control the
+            // tree's own overlays act through. Three real problems, all closed here (GitHub issue
+            // #19, found in this change's own review):
+            //
+            // 1. **Dangling focus.** A right-click focuses the tree. Switching to Changes with
+            //    focus still on `tree_focus_handle` leaves `Window::focus` pointing at a
+            //    `FocusId` that `focus_node_id_in_rendered_frame` can no longer find, so GPUI
+            //    falls back to the dispatch root - silently killing every context-scoped binding
+            //    *and* the focused terminal's own key handling until the next click. This is the
+            //    exact invariant `crate::root::OverlayFocus`' docs describe, applied to a tab
+            //    switch rather than an overlay.
+            // 2. A context menu targeting a row that is no longer on screen.
+            // 3. A half-typed inline name for a row that is no longer on screen.
+            //
+            // The armed delete confirmation deliberately survives: it is a window-level modal
+            // with its own scrim and buttons, not a tree affordance, and silently disarming a
+            // destructive confirmation the user is mid-way through answering would be its own
+            // small dishonesty.
+            self.tree_context_menu = None;
+            self.tree_inline_edit = None;
+            if self.tree_focus_handle.is_focused(window) {
+                restore_focus(&self.sessions, &mut self.code_focus, window, cx);
+            }
+        }
         self.right_sidebar_view = view;
         if view == RightSidebarView::Changes {
             self.load_diff(self.diff_root.clone(), cx);
@@ -44,7 +74,7 @@ impl AdeApp {
     ///
     /// Uses the cached [`AdeApp::fold_state_root_key`], never `fold_state::worktree_key` - see
     /// that field's docs for the blocking-syscall-per-click this avoids.
-    fn record_dir_expanded(&mut self, path: &Path, expanded: bool) -> bool {
+    pub(in crate::sidebar) fn record_dir_expanded(&mut self, path: &Path, expanded: bool) -> bool {
         if expanded {
             self.expanded_dirs.insert(path.to_path_buf());
         } else {
@@ -274,19 +304,43 @@ impl AdeApp {
         // unreadable directory is an arbitrarily long string that used to be scrollable inside
         // that outer container. Dropping it would silently clip the very message the user needs
         // in order to understand why the tree is empty.
+        //
+        // Both are still wrapped by [`Self::file_tree_shell`], so an unreadable or empty
+        // directory still has a focusable tree with a working empty-area context menu - "New
+        // file" on a directory with nothing in it yet is exactly when that menu is most needed
+        // (GitHub issue #19 §1).
         if let Some(error) = &self.file_tree_error {
-            return scrollable_sidebar_message(
+            let message = scrollable_sidebar_message(
                 "file-tree-error",
                 format!("failed to read directory: {error}"),
                 theme::status::FAIL.into(),
             );
+            // An in-progress name editor is still drawn here, above the error. A walk can start
+            // failing *while* a name is being typed (an agent removing the folder underneath it),
+            // and the alternative - showing only the error - would leave the editor's typed text
+            // alive in `AdeApp::tree_inline_edit` and its `"tree-editing"` key context alive on
+            // this node, with nothing on screen to explain why every tree keybinding had gone
+            // dead. Discarding the text instead would break issue #19 §4's own requirement.
+            let body = div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .when(self.tree_inline_edit.is_some(), |el| {
+                    el.child(self.render_tree_inline_edit_row(0, cx))
+                })
+                .child(message)
+                .into_any_element();
+            return self.file_tree_shell(body, cx);
         }
-        if self.file_tree.is_empty() {
-            return scrollable_sidebar_message(
+        if self.file_tree.is_empty() && self.tree_inline_edit.is_none() {
+            let message = scrollable_sidebar_message(
                 "file-tree-empty",
                 "(empty directory)".to_string(),
                 theme::text::FAINT.into(),
             );
+            return self.file_tree_shell(message, cx);
         }
 
         // Every visible row is rendered - there is no render-time cap and no "... and N more
@@ -304,11 +358,20 @@ impl AdeApp {
         // indices are valid for exactly as long as they need to be, since nothing can mutate
         // `file_tree` between this line and the closure's last call within one frame. They are
         // still bounds-checked below rather than indexed blindly.
-        let visible_indices: Rc<Vec<usize>> = Rc::new(file_tree::visible_indices(
-            &self.file_tree,
-            &self.expanded_dirs,
-        ));
-        let rendered_count = visible_indices.len();
+        let visible_indices = file_tree::visible_indices(&self.file_tree, &self.expanded_dirs);
+        // The in-progress inline name editor is woven into that same row list as a real row
+        // (issue #19 §2: "an inline name editor at the right spot in the tree"), rather than
+        // floating over it - so it scrolls with the tree, is indented like its neighbours, and
+        // costs the virtualization nothing.
+        //
+        // Its position is re-derived here, by *path*, on every frame. That is what makes it
+        // survive a walk that replaced every row underneath it (issue #19 §4): the editor's own
+        // state lives on `AdeApp`, not in `file_tree`, and this lookup simply re-finds its
+        // anchor - falling back to the top of the list when the anchor genuinely no longer
+        // exists, rather than dropping the editor and the user's typed text with it.
+        let (rows, editor_depth) = self.file_tree_rows(&visible_indices);
+        let rows: Rc<Vec<TreeRow>> = Rc::new(rows);
+        let rendered_count = rows.len();
 
         // Built once per render, not once per row - see `Self::tree_change_marks`'s docs, and
         // `visible_indices` above for why anything the row-builder closure needs is captured
@@ -340,12 +403,20 @@ impl AdeApp {
                 // of panicking. `start` is clamped to `end`, not just to the length: clamping
                 // only the upper bound still leaves `start > end`, which panics in the slice
                 // expression below rather than degrading.
-                let end = range.end.min(visible_indices.len());
+                let end = range.end.min(rows.len());
                 let start = range.start.min(end);
-                visible_indices[start..end]
+                rows[start..end]
                     .iter()
-                    .filter_map(|index| this.file_tree.get(*index).cloned())
-                    .map(|entry| this.render_file_tree_row(&entry, &marks, cx))
+                    .filter_map(|row| match row {
+                        TreeRow::Entry(index) => this
+                            .file_tree
+                            .get(*index)
+                            .cloned()
+                            .map(|entry| this.render_file_tree_row(&entry, &marks, cx)),
+                        TreeRow::InlineEditor => {
+                            Some(this.render_tree_inline_edit_row(editor_depth, cx))
+                        }
+                    })
                     .collect::<Vec<_>>()
             }),
         )
@@ -420,7 +491,229 @@ impl AdeApp {
             );
         }
 
-        column.into_any_element()
+        // The real, honest surface for a failed file operation (a refused rename, a trash
+        // command that didn't run) - next to the tree it happened in, not buried in the log.
+        if let Some(error) = self.tree_op_error.clone() {
+            column = column.child(
+                div()
+                    .id("file-tree-op-error")
+                    .debug_selector(|| "file-tree-op-error".to_string())
+                    .flex_none()
+                    .w_full()
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(10.0))
+                    .text_color(theme::status::FAIL)
+                    .cursor_pointer()
+                    .tooltip(text_tooltip("Click to dismiss"))
+                    .child(error)
+                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.tree_op_error = None;
+                        cx.notify();
+                    })),
+            );
+        }
+
+        self.file_tree_shell(column.into_any_element(), cx)
+    }
+
+    /// The tree's real *outer* element - the one node that carries keyboard focus, the
+    /// `"file-tree"` key context every tree keybinding is scoped to, the empty-area right-click,
+    /// and the `gpui::canvas` that records where the tree is painted (GitHub issue #19 §1).
+    ///
+    /// Wrapping every arm of [`Self::render_file_tree`] - including the "(empty directory)" and
+    /// unreadable-directory messages - rather than only the list arm is deliberate: an empty
+    /// directory is precisely when "right-click → New file" matters most, and a tree that lost
+    /// its focus target whenever a walk failed would silently disable every one of its
+    /// keybindings until the next successful walk.
+    ///
+    /// The context string gains a second word, `"tree-editing"`, while an inline name editor is
+    /// open. That is the real mechanism that stops `Ctrl+C`/`Ctrl+X`/`Ctrl+V`/`F2`/`Shift+F10`
+    /// from firing while the user is typing a name - see `crate::sidebar::tree_ops`'s module
+    /// docs and `crate::default_key_bindings`' own entries for why a second context word is used
+    /// rather than conditionally omitting the bindings.
+    fn file_tree_shell(&self, body: gpui::AnyElement, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // Space-separated context *words*, which is what `KeyBindingContextPredicate`'s
+        // identifier terms match against - so `Some("file-tree && !tree-editing")` really does
+        // stop matching the moment `"tree-editing"` is added here. Two independent modal states
+        // add a word each: an open inline name editor, and the modal delete confirmation (which
+        // would otherwise let `F2`/`Shift+F10` fire behind its own scrim).
+        let key_context = match (
+            self.tree_inline_edit.is_some(),
+            self.tree_delete_confirm.is_some(),
+        ) {
+            (true, true) => "file-tree tree-editing tree-delete-confirm",
+            (true, false) => "file-tree tree-editing",
+            (false, true) => "file-tree tree-delete-confirm",
+            (false, false) => "file-tree",
+        };
+        div()
+            .id("file-tree-shell")
+            .key_context(key_context)
+            .track_focus(&self.tree_focus_handle)
+            .on_action(cx.listener(Self::handle_file_tree_context_menu_action))
+            .on_action(cx.listener(Self::handle_file_tree_rename_action))
+            .on_action(cx.listener(Self::handle_file_tree_copy_action))
+            .on_action(cx.listener(Self::handle_file_tree_cut_action))
+            .on_action(cx.listener(Self::handle_file_tree_paste_action))
+            .on_key_down(cx.listener(Self::handle_tree_key_down))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            // The empty area below the last row: this container's own right-click, which a row's
+            // handler pre-empts with `cx.stop_propagation()` (GPUI dispatches a mouse listener
+            // on the deepest element first and stops walking outwards once propagation is
+            // stopped - `vendor/zed/crates/gpui/src/window.rs`'s `dispatch_mouse_event`).
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.open_tree_context_menu(
+                        context_menu::ContextTarget::Empty,
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .child({
+                // Where a keyboard-opened menu (`Shift+F10`) anchors - the same real
+                // `gpui::canvas` bounds-capture pattern `Self::render_tab_strip_plus` uses for
+                // the `+` button's own popover.
+                let this = cx.entity();
+                gpui::canvas(
+                    move |bounds, _window, cx| {
+                        this.update(cx, |this, _cx| {
+                            this.file_tree_bounds = bounds;
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            })
+            .child(body)
+            .into_any_element()
+    }
+
+    /// The rows [`Self::render_file_tree`]'s `uniform_list` will build, and the indent depth the
+    /// inline editor row (if any) should be drawn at.
+    ///
+    /// A rename *replaces* its target's row - the editor is that row, for as long as it's open.
+    /// A New File / New Folder editor is *inserted* immediately after its parent folder's row, at
+    /// one level deeper, which is where the created entry itself will appear. An editor whose
+    /// anchor isn't in the visible list (a new entry in the worktree root, which has no row of
+    /// its own; or an anchor a fresh walk no longer lists) goes to the top of the list rather
+    /// than being dropped - see [`Self::render_file_tree`]'s own docs.
+    fn file_tree_rows(&self, visible_indices: &[usize]) -> (Vec<TreeRow>, usize) {
+        let mut rows: Vec<TreeRow> = visible_indices
+            .iter()
+            .copied()
+            .map(TreeRow::Entry)
+            .collect();
+        let Some(edit) = self.tree_inline_edit.as_ref() else {
+            return (rows, 0);
+        };
+        let anchor = edit.kind.anchor();
+        // `.get()`, not direct indexing, per this file's own stated discipline for `file_tree`
+        // indices (see `render_file_tree`'s comment on `visible_indices`): a future divergence
+        // degrades to "the editor goes to the top of the list" rather than panicking.
+        let anchor_row = visible_indices.iter().position(|index| {
+            self.file_tree
+                .get(*index)
+                .is_some_and(|entry| entry.path == anchor)
+        });
+        let anchor_depth = anchor_row
+            .and_then(|row| visible_indices.get(row))
+            .and_then(|index| self.file_tree.get(*index))
+            .map(|entry| entry.depth);
+        match (&edit.kind, anchor_row) {
+            (tree_ops::InlineEditKind::Rename { .. }, Some(row)) => {
+                rows[row] = TreeRow::InlineEditor;
+                (rows, anchor_depth.unwrap_or(0))
+            }
+            (tree_ops::InlineEditKind::Rename { .. }, None) => {
+                rows.insert(0, TreeRow::InlineEditor);
+                (rows, 0)
+            }
+            (_, Some(row)) => {
+                rows.insert(row + 1, TreeRow::InlineEditor);
+                (rows, anchor_depth.unwrap_or(0) + 1)
+            }
+            (_, None) => {
+                rows.insert(0, TreeRow::InlineEditor);
+                (rows, 0)
+            }
+        }
+    }
+
+    /// The inline name editor's row (issue #19 §2) - a real, append/backspace-only text field
+    /// drawn at `depth`'s indentation, with the typed name, a caret, and the real rejection hint
+    /// when one applies.
+    ///
+    /// It has no focus handle of its own: keystrokes reach it through
+    /// [`Self::file_tree_shell`]'s `on_key_down`, which the tree's own focus already delivers.
+    /// One focus target for the tree and its editor is what makes the
+    /// `"file-tree tree-editing"` context switch above a single, honest fact rather than two
+    /// handles that could disagree about which is focused.
+    fn render_tree_inline_edit_row(
+        &self,
+        depth: usize,
+        _cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(edit) = self.tree_inline_edit.as_ref() else {
+            return div().into_any_element();
+        };
+        let indent = px(file_tree::INDENT_STEP * depth as f32);
+        let name = edit.name.clone();
+        // Exactly `theme::band::TREE_ROW` tall, like every other row - a `uniform_list`'s one
+        // real requirement is that every row is the same height, so the rejection hint is a
+        // trailing element *inside* this row rather than a second line under it (which would
+        // silently overlap the row below).
+        div()
+            .debug_selector(|| "file-tree-inline-edit".to_string())
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .w_full()
+            .h(theme::band::TREE_ROW)
+            .pl(px(file_tree::ROW_LEFT_PAD) + indent)
+            .pr(px(8.0))
+            .bg(theme::surface::ROW_SELECTED)
+            .font(font(theme::font::MONO))
+            .text_size(self.ui_text_size(11.5))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(self.ui_text_size(9.0))
+                    .text_color(theme::text::GHOST)
+                    .child(edit.kind.title()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_color(theme::text::STRONG)
+                    // A real caret glyph, so an empty field still reads as "type here" rather
+                    // than as a blank row.
+                    .child(format!("{name}\u{2502}")),
+            )
+            .when_some(edit.error.clone(), |el, error| {
+                el.child(
+                    div()
+                        .debug_selector(|| "file-tree-inline-edit-error".to_string())
+                        .flex_none()
+                        .overflow_hidden()
+                        .text_size(self.ui_text_size(9.5))
+                        .text_color(theme::status::FAIL)
+                        .child(error),
+                )
+            })
+            .into_any_element()
     }
 
     /// One file-tree row: indent (13px/level, per the README), a composed icon (a folder's
@@ -520,12 +813,46 @@ impl AdeApp {
             );
         }
 
+        // This row's own right-click (GitHub issue #19 §1). `cx.stop_propagation()` is what keeps
+        // it from *also* reaching `Self::file_tree_shell`'s empty-area handler, which would
+        // otherwise replace this row's menu with the empty-area one a moment later.
+        {
+            let path = entry.path.clone();
+            let is_dir = entry.is_dir;
+            row = row.on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let target = if is_dir {
+                        context_menu::ContextTarget::Folder(path.clone())
+                    } else {
+                        context_menu::ContextTarget::File(path.clone())
+                    };
+                    this.open_tree_context_menu(
+                        target,
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                        window,
+                        cx,
+                    );
+                }),
+            );
+        }
+
         if entry.is_dir {
             let path = entry.path.clone();
             row = row
                 .cursor_pointer()
                 .hover(|el| el.bg(theme::surface::ROW_HOVER))
-                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                    // Selecting *and* focusing, both real: a folder click is what gives the tree
+                    // keyboard focus (so its `Ctrl+C`/`F2`/`Shift+F10` bindings can match at
+                    // all) and what gives those bindings a target. Deliberately here, in the
+                    // click handler, and not inside `toggle_dir_expanded` - that method is also
+                    // called programmatically (`start_tree_new_entry`, the reveal paths), where
+                    // moving the selection would be a side effect nobody asked for.
+                    this.selected_tree_path = Some(path.clone());
+                    this.focus_file_tree(window, cx);
                     this.toggle_dir_expanded(path.clone(), cx);
                 }));
         } else {
@@ -625,7 +952,7 @@ impl AdeApp {
             &[ChoiceOption::new("Files"), ChoiceOption::new("Changes")],
             selected.to_string(),
             cx,
-            |this, index, cx| {
+            |this, index, window, cx| {
                 // Structural, not a label re-match: index 0 is `Files`, index 1 is `Changes`,
                 // per the `options` array literal right above - see
                 // `Self::render_choice_control`'s own docs for why dispatch is index-based.
@@ -633,7 +960,7 @@ impl AdeApp {
                     1 => RightSidebarView::Changes,
                     _ => RightSidebarView::Files,
                 };
-                this.set_right_sidebar_view(view, cx);
+                this.set_right_sidebar_view(view, window, cx);
             },
         );
 
@@ -1090,6 +1417,269 @@ pub(crate) enum RightSidebarView {
     Changes,
 }
 
+/// One row of [`AdeApp::render_file_tree`]'s virtualized list: either a real walked entry (by
+/// index into [`AdeApp::file_tree`]) or the in-progress inline name editor.
+///
+/// An index rather than the entry itself, for the same reason
+/// `crate::sidebar::file_tree::visible_indices` returns indices: the `uniform_list` row-builder
+/// closure is `'static` and cannot hold a borrow of `self`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeRow {
+    Entry(usize),
+    InlineEditor,
+}
+
+impl AdeApp {
+    /// The file tree's right-click context menu popover (GitHub issue #19 §1).
+    ///
+    /// The same real overlay shape `crate::work_surface::render::AdeApp::render_plus_menu`
+    /// established for this app's other floating popover - a full-window transparent scrim whose
+    /// `on_click` dismisses ("click-away dismisses"), plus an absolutely-positioned panel that
+    /// stops that click from bubbling. Zed's own `ui::ContextMenu` is not reachable here: it
+    /// lives in Zed's `ui` crate, which this workspace deliberately doesn't depend on (only
+    /// `gpui`/`gpui_platform`).
+    ///
+    /// The panel's origin is [`AdeApp::tree_context_menu`]'s already-clamped one, resolved at
+    /// open time from the real click and the real `Window::bounds()` - so the menu near a window
+    /// edge is repositioned once, not re-solved (and possibly moved) on every frame it's open.
+    pub(crate) fn render_tree_context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let menu = self.tree_context_menu.clone();
+        let macos = self.window_controls_style().is_macos();
+        let (shadow_x, shadow_y, shadow_blur) = theme::shadow::PLUS_MENU;
+        let items = menu
+            .as_ref()
+            .map(|menu| context_menu::menu_items(&menu.target, self.tree_clipboard.is_some()))
+            .unwrap_or_default();
+        let origin_x = menu.as_ref().map(|menu| menu.origin_x).unwrap_or(0.0);
+        let origin_y = menu.as_ref().map(|menu| menu.origin_y).unwrap_or(0.0);
+
+        div()
+            .id("tree-context-menu-scrim")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .bg(work_surface::TRANSPARENT)
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                this.close_tree_context_menu(cx);
+            }))
+            // A right-click on the scrim must dismiss too - otherwise the next right-click
+            // anywhere would land on the scrim and do nothing at all, which reads as a frozen
+            // app rather than as a menu that is still open.
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(|this, _event: &gpui::MouseDownEvent, _window, cx| {
+                    this.close_tree_context_menu(cx);
+                }),
+            )
+            .child(
+                div()
+                    .id("tree-context-menu")
+                    .debug_selector(|| "tree-context-menu".to_string())
+                    .absolute()
+                    .left(px(origin_x))
+                    .top(px(origin_y))
+                    .w(px(context_menu::MENU_WIDTH))
+                    .py(px(context_menu::MENU_VERTICAL_PADDING / 2.0))
+                    .bg(theme::surface::PALETTE)
+                    .border_1()
+                    .border_color(theme::border::POPOVER)
+                    .rounded(theme::radius::CARD)
+                    .shadow(vec![gpui::BoxShadow::new(
+                        shadow_x,
+                        shadow_y,
+                        gpui::black().opacity(0.55),
+                    )
+                    .blur_radius(shadow_blur)])
+                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                    }))
+                    .children(
+                        items
+                            .into_iter()
+                            .map(|item| self.render_tree_context_menu_row(item, macos, cx)),
+                    ),
+            )
+    }
+
+    /// One context-menu row. A disabled row is still drawn (so the menu's shape doesn't jump
+    /// between right-clicks) but carries no click handler at all - not a handler that returns
+    /// early, which would be a row that looks clickable and silently isn't.
+    fn render_tree_context_menu_row(
+        &self,
+        item: context_menu::MenuItem,
+        macos: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let action = item.action;
+        let keycaps = action
+            .keystroke_spec()
+            .map(|spec| keymap::resolve_combo(spec, macos))
+            .unwrap_or_default();
+        let color = if !item.enabled {
+            theme::text::GHOST
+        } else if action.is_destructive() {
+            theme::status::FAIL
+        } else {
+            theme::text::BODY
+        };
+
+        let mut row = div()
+            .id(gpui::SharedString::from(format!(
+                "tree-context-menu-{}",
+                action.label()
+            )))
+            .debug_selector(move || format!("tree-context-menu-{}", action.label()))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .w_full()
+            .h(px(context_menu::MENU_ROW_HEIGHT))
+            .px(px(10.0))
+            .font(font(theme::font::SANS))
+            .text_size(self.ui_text_size(11.0))
+            .text_color(color)
+            .child(div().flex_1().min_w_0().child(action.label()))
+            .child(render_keycap_row(&keycaps, KeycapSize::Hint));
+
+        if item.enabled {
+            row = row
+                .cursor_pointer()
+                .hover(|el| el.bg(theme::surface::ROW_HOVER))
+                .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.run_tree_menu_action(action, window, cx);
+                }));
+        } else if let Some(reason) = item.disabled_reason {
+            row = row.tooltip(text_tooltip(reason));
+        }
+
+        row.into_any_element()
+    }
+
+    /// The delete confirmation (issue #19 §3: "Delete asks for confirmation and prefers the OS
+    /// trash over a hard delete where available").
+    ///
+    /// A real modal panel with two explicit buttons rather than this app's other
+    /// "click once to arm, click again to run" pattern
+    /// (`crate::worktree_history::flow::AdeApp::request_discard_worktree`): that shape works for
+    /// a button that stays in one place, but a context-menu row disappears the moment the menu
+    /// closes, so there would be nothing left to click a second time. The confirm button's label
+    /// and the sentence above it both come from the already-resolved
+    /// [`crate::sidebar::tree_ops::PendingTreeDelete::mechanism`], so what is promised here and
+    /// what actually runs cannot disagree.
+    pub(crate) fn render_tree_delete_confirm(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let pending = self.tree_delete_confirm.clone();
+        let name = pending
+            .as_ref()
+            .and_then(|pending| pending.path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let explanation = pending
+            .as_ref()
+            .map(|pending| pending.explanation())
+            .unwrap_or_default();
+        let confirm_label = pending
+            .as_ref()
+            .map(|pending| pending.confirm_label())
+            .unwrap_or("Delete");
+
+        div()
+            .id("tree-delete-scrim")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::black().opacity(0.35))
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                this.cancel_tree_delete(cx);
+            }))
+            .child(
+                div()
+                    .id("tree-delete-panel")
+                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                    }))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .w(px(340.0))
+                    .p(px(12.0))
+                    .bg(theme::surface::PALETTE)
+                    .border_1()
+                    .border_color(theme::border::POPOVER)
+                    .rounded(theme::radius::CARD)
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_size(px(11.5))
+                            .text_color(theme::text::HEADING)
+                            .child(format!("Delete \"{name}\"?")),
+                    )
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .text_size(px(10.5))
+                            .text_color(theme::text::DIM)
+                            .child(explanation),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .id("tree-delete-cancel")
+                                    .debug_selector(|| "tree-delete-cancel".to_string())
+                                    .cursor_pointer()
+                                    .px(px(10.0))
+                                    .py(px(4.0))
+                                    .rounded(theme::radius::CHIP)
+                                    .bg(theme::surface::SEGMENT_TRACK)
+                                    .font(font(theme::font::SANS))
+                                    .text_size(px(10.5))
+                                    .text_color(theme::text::BODY)
+                                    .child("Cancel")
+                                    .on_click(cx.listener(
+                                        |this, _event: &ClickEvent, _window, cx| {
+                                            this.cancel_tree_delete(cx);
+                                        },
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("tree-delete-confirm")
+                                    .debug_selector(|| "tree-delete-confirm".to_string())
+                                    .cursor_pointer()
+                                    .px(px(10.0))
+                                    .py(px(4.0))
+                                    .rounded(theme::radius::CHIP)
+                                    .bg(theme::surface::SEGMENT_TRACK)
+                                    .font(font(theme::font::SANS))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_size(px(10.5))
+                                    .text_color(theme::status::FAIL)
+                                    .child(confirm_label)
+                                    .on_click(cx.listener(
+                                        |this, _event: &ClickEvent, _window, cx| {
+                                            this.confirm_tree_delete(cx);
+                                        },
+                                    )),
+                            ),
+                    ),
+            )
+    }
+}
+
 /// The Changes list's footer 29. The README's spec text also mentions `] next file`, dropped
 /// here since `]` isn't actually bound to anything (only `secondary-n` is - see
 /// `crate::default_key_bindings`); advertising a dead shortcut is worse than a shorter,
@@ -1458,8 +2048,8 @@ mod virtualization_tests {
         }
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        app.update(cx, |app, cx| {
-            app.set_right_sidebar_view(RightSidebarView::Changes, cx);
+        app.update_in(cx, |app, window, cx| {
+            app.set_right_sidebar_view(RightSidebarView::Changes, window, cx);
         });
         cx.run_until_parked();
 

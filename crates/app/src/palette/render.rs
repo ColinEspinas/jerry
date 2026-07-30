@@ -271,7 +271,7 @@ impl AdeApp {
                     RightSidebarView::Files => RightSidebarView::Changes,
                     RightSidebarView::Changes => RightSidebarView::Files,
                 };
-                self.set_right_sidebar_view(next, cx);
+                self.set_right_sidebar_view(next, window, cx);
             }
             palette::PaletteCommand::ToggleRailGrouping => self.toggle_rail_mode(cx),
             palette::PaletteCommand::PruneWorktrees => self.request_prune(cx),
@@ -597,7 +597,7 @@ impl AdeApp {
             ],
             self.palette_scope.label().to_string(),
             cx,
-            |this, index, cx| {
+            |this, index, _window, cx| {
                 // Index-based, matching the `options` array literal right above: 0 = `All`,
                 // 1 = `Commands`, 2 = `Files`.
                 this.palette_scope = match index {

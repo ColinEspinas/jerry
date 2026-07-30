@@ -70,6 +70,15 @@ impl AdeApp {
             // Nothing has been walked yet, so nothing may be pruned yet either.
             file_tree_complete: false,
             file_tree_limit_override: None,
+            tree_context_menu: None,
+            tree_inline_edit: None,
+            tree_clipboard: None,
+            tree_delete_confirm: None,
+            tree_op_error: None,
+            tree_focus_handle: cx.focus_handle(),
+            file_tree_bounds: gpui::Bounds::default(),
+            _tree_delete_task: None,
+            _tree_copy_task: None,
             reviewed_files: HashSet::new(),
             open_files: Vec::new(),
             open_change: None,
@@ -462,6 +471,18 @@ impl AdeApp {
         self.set_file_tree_root(path.clone());
         self.file_tree = Vec::new();
         self.reload_expanded_dirs_from_fold_state();
+        // Every one of these holds an absolute path in the worktree being *left* (GitHub issue
+        // #19): an open context menu targeting a row that is about to stop existing, a
+        // half-typed name for a folder in the old tree, a cut/copied entry a paste here would
+        // move across worktrees, and an armed delete for a path in the old tree. Cleared
+        // together, in the same step as `file_tree`/`expanded_dirs` above and for the same
+        // reason - the window between here and the new walk landing must not leave a control
+        // pointing at the old worktree.
+        self.tree_context_menu = None;
+        self.tree_inline_edit = None;
+        self.tree_clipboard = None;
+        self.tree_delete_confirm = None;
+        self.tree_op_error = None;
         // "Show me the whole listing" was a decision about the worktree being left.
         self.file_tree_limit_override = None;
         self.file_tree_truncated = false;

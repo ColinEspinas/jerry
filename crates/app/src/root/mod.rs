@@ -76,6 +76,7 @@ use crate::settings::store::{self as settings_store, CfgFormat, Settings};
 use crate::sidebar::changes::{self, ChangeTag};
 use crate::sidebar::file_tree::{self, FileTreeEntry};
 use crate::sidebar::fold_state;
+use crate::sidebar::tree_ops;
 use crate::status_bar::process_stats;
 use crate::theme;
 use crate::title_bar::menu as title_bar;
@@ -164,6 +165,11 @@ actions!(
         CompletionsDismiss,
         Undo,
         Redo,
+        FileTreeContextMenu,
+        FileTreeRename,
+        FileTreeCopy,
+        FileTreeCut,
+        FileTreePaste,
     ]
 );
 
@@ -299,6 +305,47 @@ pub struct AdeApp {
     /// and per-worktree: reset on every worktree switch, since "show me more of *this* tree"
     /// says nothing about the next one.
     pub(crate) file_tree_limit_override: Option<usize>,
+    /// The file tree's open right-click context menu (GitHub issue #19 §1), `None` when closed -
+    /// see `crate::sidebar::tree_ops::TreeContextMenu`.
+    pub(crate) tree_context_menu: Option<tree_ops::TreeContextMenu>,
+    /// The file tree's in-progress inline name editor (New File / New Folder / Rename), `None`
+    /// when none is open. Held here rather than inside [`Self::file_tree`] on purpose - see
+    /// `crate::sidebar::tree_ops::TreeInlineEdit`'s own docs for the watcher-refresh race that
+    /// placement closes (issue #19 §4).
+    pub(crate) tree_inline_edit: Option<tree_ops::TreeInlineEdit>,
+    /// The tree's own cut/copy buffer - a real filesystem entry, deliberately not the system
+    /// clipboard (see `crate::sidebar::tree_ops::TreeClipboard`).
+    pub(crate) tree_clipboard: Option<tree_ops::TreeClipboard>,
+    /// A delete that has been requested but not yet confirmed. Nothing is ever removed while
+    /// this is merely `Some`; `crate::sidebar::tree_ops::AdeApp::confirm_tree_delete` is the only
+    /// path that acts, and it is only reachable from the confirmation panel's own button.
+    pub(crate) tree_delete_confirm: Option<tree_ops::PendingTreeDelete>,
+    /// The most recent file-operation failure (a refused rename, a failed trash command),
+    /// surfaced under the tree rather than dropped into the log - the same small, honest error
+    /// surface [`Self::file_save_error`] uses for a failed save.
+    pub(crate) tree_op_error: Option<String>,
+    /// The file tree's keyboard-focus target. `track_focus`'d by
+    /// `crate::sidebar::render::AdeApp::render_file_tree`'s container, which is also the node
+    /// carrying the `"file-tree"` `key_context` every tree keybinding is scoped to - so
+    /// `Ctrl+C`/`Ctrl+X`/`Ctrl+V` can never match while a terminal session has focus. See
+    /// `crate::sidebar::tree_ops`'s module docs.
+    pub(crate) tree_focus_handle: FocusHandle,
+    /// The file tree container's real painted bounds, captured by a `gpui::canvas` child each
+    /// render (the same pattern [`Self::plus_button_bounds`] uses) - where a *keyboard*-opened
+    /// context menu (`Shift+F10`) anchors, since there is no cursor position to use.
+    pub(crate) file_tree_bounds: gpui::Bounds<Pixels>,
+    /// The in-flight confirmed delete (a real `gio trash` child process, or a real
+    /// `remove_dir_all`), one slot: a second delete can't be requested until the confirmation
+    /// panel is open again, so there is never more than one.
+    pub(crate) _tree_delete_task: Option<Task<()>>,
+    /// The in-flight Duplicate / paste-a-copy - a real, recursive `std::fs` tree copy, run on the
+    /// background executor rather than in the click listener that started it (see
+    /// `crate::sidebar::tree_ops::AdeApp::spawn_tree_copy`). One slot, superseding: a second copy
+    /// started while one is running drops the first *task handle*, which cannot stop a copy
+    /// already in progress - deliberately, since abandoning one half-way is strictly worse than
+    /// letting it finish, and the two have different destinations (each is
+    /// `file_ops::unique_destination`-resolved) so they cannot collide with each other.
+    pub(crate) _tree_copy_task: Option<Task<()>>,
     /// Per-file "reviewed" toggle state for the Changes list - a file's path is in this set iff
     /// its checkbox is checked. No backend "review" concept exists yet; this is purely local UI
     /// state that `Self::render_changes_header`'s progress bar and count read directly.
@@ -1267,6 +1314,32 @@ impl Render for AdeApp {
             .when(self.new_file_input.is_some(), |el| {
                 el.child(self.render_new_file_prompt(cx))
             })
+            // The file tree's context menu and its delete confirmation (GitHub issue #19) -
+            // both are window-positioned overlays, so they live here beside the `+` menu and the
+            // "New file" prompt rather than inside the sidebar's own clipped column.
+            //
+            // Gated on `!settings_open`, which is a real fix rather than defensive padding
+            // (found in this change's own review): the Settings surface *replaces* the workspace
+            // body one child up, so an ungated menu would paint a full-window transparent scrim
+            // and a file-tree menu over Settings, swallowing every click on the page underneath.
+            // `Self::open_settings` clears `plus_menu_open`/`title_menu_open`/`new_file_input`
+            // for exactly this reason; the tree's own state is cleared alongside them there, and
+            // this guard is the belt to that braces. The context menu additionally requires the
+            // Files tab, since every one of its actions targets a row only that tab renders.
+            .when(
+                !self.settings_open
+                    && self.right_sidebar_view == RightSidebarView::Files
+                    && self.tree_context_menu.is_some(),
+                |el| el.child(self.render_tree_context_menu(cx)),
+            )
+            // The delete confirmation deliberately does *not* require the Files tab: it is a
+            // window-level modal the user is mid-way through answering, not a tree affordance,
+            // and hiding it on a tab switch would leave a destructive confirmation armed with no
+            // way to answer or cancel it.
+            .when(
+                !self.settings_open && self.tree_delete_confirm.is_some(),
+                |el| el.child(self.render_tree_delete_confirm(cx)),
+            )
             .when(self.palette_open, |el| el.child(self.render_palette(cx)))
     }
 }
