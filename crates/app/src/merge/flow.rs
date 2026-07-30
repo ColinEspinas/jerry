@@ -1861,6 +1861,102 @@ mod merge_regression_tests {
         assert!(app.read_with(cx, |app, _| app.merge_edit.is_none()));
     }
 
+    /// GitHub issue #17 for Surface D's merge hand-edit buffer - the sixth and last real
+    /// text-typing surface. Driven through the real, bound `secondary-z` keystroke, so this also
+    /// proves the `"merge-editor text-input"` context really does route text undo here and never
+    /// to `crate::worktree_history`'s worktree-level `Undo`.
+    #[gpui::test]
+    fn secondary_z_in_the_merge_hand_edit_buffer_undoes_its_text_not_the_worktree_history(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        fs::write(repo.path().join("shared.txt"), "line1\nline2\nline3\n").expect("write");
+        git(repo.path(), &["add", "shared.txt"]);
+        git(repo.path(), &["commit", "-m", "seed shared.txt"]);
+
+        let feature = add_worktree(repo.path(), "feature", "feature-wt");
+        fs::write(
+            repo.path().join("shared.txt"),
+            "line1\nBASE CHANGED\nline3\n",
+        )
+        .expect("write");
+        git(repo.path(), &["commit", "-am", "base changes shared.txt"]);
+        fs::write(
+            feature.join("shared.txt"),
+            "line1\nFEATURE CHANGED\nline3\n",
+        )
+        .expect("write");
+        git(&feature, &["commit", "-am", "feature changes shared.txt"]);
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        bind_real_keys(cx);
+        let feature_session_id = app.update_in(cx, |app, window, cx| {
+            app.sessions.spawn(
+                SessionKind::Shell,
+                feature.clone(),
+                app.settings.appearance.terminal_font_size,
+                window,
+                cx,
+            )
+        });
+        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.start_merge_hand_edit(window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        let before = app.read_with(cx, |app, _| {
+            app.merge_edit
+                .as_ref()
+                .expect("merge_edit")
+                .buffer
+                .content
+                .clone()
+        });
+        assert!(app.read_with(cx, |app, _| app.worktree_history_status.is_none()));
+
+        cx.simulate_input("HAND");
+        let typed = app.read_with(cx, |app, _| {
+            app.merge_edit
+                .as_ref()
+                .expect("merge_edit")
+                .buffer
+                .content
+                .clone()
+        });
+        assert_ne!(
+            typed, before,
+            "sanity check: the real keystrokes must have reached the merge hand-edit buffer"
+        );
+
+        let secondary_z = if cfg!(target_os = "macos") {
+            "cmd-z"
+        } else {
+            "ctrl-z"
+        };
+        cx.simulate_keystrokes(secondary_z);
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .merge_edit
+                .as_ref()
+                .expect("merge_edit")
+                .buffer
+                .content
+                .clone()),
+            before,
+            "the typing burst must undo as one step in the merge hand-edit buffer too"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
+            "and secondary-z must never reach the worktree-level Undo from this surface"
+        );
+    }
+
     /// Required regression test: this exact bug class ("a shortcut steals a keystroke a text
     /// field needed") has shipped six separate times in this codebase per BUILD-LOG (Revisions
     /// R2, R4a, R4b, R8.5a, R8.5b) - proves the new `"merge-editor"` key context does not swallow

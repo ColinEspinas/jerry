@@ -186,9 +186,18 @@ impl AdeApp {
         // the same real `&&`/`!` predicate mechanism the `"]"` binding already established, not a
         // new one.
         let completions_open = is_file_editor && self.completions_open_for_active_path();
+        // `"text-input"` (GitHub issue #17) rides alongside `"file-editor"` on exactly the same
+        // node, for exactly the same real reason `"file-editor"` itself does (see above): it is
+        // the one shared tag every real text-typing surface in this app carries, and it is what
+        // routes `secondary-z` to text undo rather than to `crate::worktree_history`'s
+        // worktree-level `Undo` - which is correspondingly scoped `"!terminal && !text-input"`, so
+        // the two are provably disjoint rather than order-dependent. See
+        // `crate::default_key_bindings`' own docs for the full rationale. It is added only in the
+        // `is_file_editor` cases: the read-only Diff view has no text history to undo, and must
+        // keep leaving `secondary-z` to the worktree-level `Undo`, exactly as before.
         let key_context = match (is_file_editor, completions_open) {
-            (true, true) => "diff file-editor completions",
-            (true, false) => "diff file-editor",
+            (true, true) => "diff file-editor text-input completions",
+            (true, false) => "diff file-editor text-input",
             (false, _) => "diff",
         };
 
@@ -226,6 +235,8 @@ impl AdeApp {
             .on_action(cx.listener(Self::handle_editor_paste_action))
             .on_action(cx.listener(Self::handle_editor_save_action))
             .on_action(cx.listener(Self::handle_editor_save_anyway_action))
+            .on_action(cx.listener(Self::handle_text_undo_action))
+            .on_action(cx.listener(Self::handle_text_redo_action))
             .on_action(cx.listener(Self::handle_completions_up_action))
             .on_action(cx.listener(Self::handle_completions_down_action))
             .on_action(cx.listener(Self::handle_completions_accept_action))

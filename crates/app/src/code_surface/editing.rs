@@ -60,7 +60,7 @@ use crate::root::{
     AdeApp, EditorBackspace, EditorCopy, EditorCut, EditorDelete, EditorDown, EditorEnd,
     EditorEnter, EditorHome, EditorLeft, EditorPaste, EditorRight, EditorSave, EditorSaveAnyway,
     EditorSelectAll, EditorSelectDown, EditorSelectLeft, EditorSelectRight, EditorSelectUp,
-    EditorUp,
+    EditorUp, TextRedo, TextUndo,
 };
 use crate::theme;
 
@@ -484,7 +484,11 @@ impl AdeApp {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
+        // Same real group-boundary reasoning as `Self::handle_editor_paste_action` - a cut is a
+        // discrete, deliberate action, not part of a backspace run on either side of it.
+        self.seal_active_edit_history();
         self.replace_text_in_range(None, "", window, cx);
+        self.seal_active_edit_history();
         self.sync_cursor_and_scroll();
     }
 
@@ -497,8 +501,100 @@ impl AdeApp {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
+        // A paste is one of GitHub issue #17's four named undo-group boundaries, and it can't be
+        // inferred from the splice itself (an ordinary typed character reaches the same
+        // `EditBuffer::replace_range`). Sealing on both sides makes it its own step in both
+        // directions: whatever was being typed before doesn't absorb it, and whatever is typed
+        // after doesn't either.
+        self.seal_active_edit_history();
         self.replace_text_in_range(None, &text, window, cx);
+        self.seal_active_edit_history();
         self.sync_cursor_and_scroll();
+    }
+
+    /// Closes the active buffer's current undo group - the caller-driven half of
+    /// `crate::text_history`'s coalescing policy. See
+    /// `crate::code_surface::edit_buffer::EditBuffer::seal_history`'s own docs.
+    pub(crate) fn seal_active_edit_history(&mut self) {
+        if let Some(buffer) = self.active_edit_buffer_mut() {
+            buffer.seal_history();
+        }
+    }
+
+    /// `TextUndo` for the code surface and the merge hand-edit surface (GitHub issue #17). Bound
+    /// to `secondary-z` scoped `Some("text-input")`, registered on the exact focused node that
+    /// carries that tag - see `crate::default_key_bindings`' own docs for why the routing is
+    /// structural (per-node `on_action`) rather than a state lookup, and why this can never
+    /// collide with `crate::worktree_history`'s worktree-level `Undo`.
+    pub(crate) fn handle_text_undo_action(
+        &mut self,
+        _: &TextUndo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.perform_text_undo(cx);
+    }
+
+    pub(crate) fn handle_text_redo_action(
+        &mut self,
+        _: &TextRedo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.perform_text_redo(cx);
+    }
+
+    /// The keystroke-independent entry points, so the title bar's Edit menu drives the exact same
+    /// real code path the `secondary-z` binding does rather than a second implementation - the
+    /// same split `crate::worktree_history::flow`'s own `perform_undo`/`handle_undo_action` pair
+    /// already established for the worktree-level stack.
+    pub(crate) fn perform_text_undo(&mut self, cx: &mut Context<Self>) {
+        self.step_edit_history(cx, true);
+    }
+
+    pub(crate) fn perform_text_redo(&mut self, cx: &mut Context<Self>) {
+        self.step_edit_history(cx, false);
+    }
+
+    /// Shared plumbing for [`Self::handle_text_undo_action`]/[`Self::handle_text_redo_action`]:
+    /// steps the active buffer's own history and then runs the exact same post-edit bookkeeping
+    /// every ordinary keystroke already runs (re-highlight debounce, language-server sync, caret
+    /// scroll-into-view). An undo genuinely changes the buffer's text, so skipping any of those
+    /// would leave real, visible staleness - stale syntax colors, a language server answering
+    /// about content that no longer exists.
+    fn step_edit_history(&mut self, cx: &mut Context<Self>, undo: bool) {
+        match self.active_edit_target() {
+            Some(EditTarget::File(path)) => {
+                let Some(buffer) = self.edit_buffers.get_mut(&path) else {
+                    return;
+                };
+                let changed = if undo { buffer.undo() } else { buffer.redo() };
+                if !changed {
+                    return;
+                }
+                // A caret that jumped somewhere else makes whatever the popup was anchored to
+                // meaningless - the same reasoning `Self::move_active_buffer` already applies.
+                self.dismiss_completions();
+                self.schedule_rehighlight(path.clone(), cx);
+                self.schedule_lsp_sync(path, cx);
+            }
+            Some(EditTarget::Merge) => {
+                let Some(edit) = self.merge_edit.as_mut() else {
+                    return;
+                };
+                let changed = if undo {
+                    edit.buffer.undo()
+                } else {
+                    edit.buffer.redo()
+                };
+                if !changed {
+                    return;
+                }
+            }
+            None => return,
+        }
+        self.sync_cursor_and_scroll();
+        cx.notify();
     }
 
     /// Generalized (Revision R8.5c): routes to [`Self::save_active_file`] (the File view's own
@@ -2897,5 +2993,363 @@ mod editing_tests {
                  still move the real caret, not silently do nothing"
             );
         }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // GitHub issue #17 - real, dispatched undo/redo. These deliberately drive `simulate_keystrokes`
+    // rather than calling the handlers directly: this project's own history is that
+    // state-assertion-only tests miss real dispatch-routing bugs, and routing is exactly what is
+    // at risk here (two distinct undo systems on one physical key).
+    // ------------------------------------------------------------------------------------------
+
+    /// `secondary-z`, resolved for the real build target - `crate::default_key_bindings`' own
+    /// convention.
+    const SECONDARY_Z: &str = if cfg!(target_os = "macos") {
+        "cmd-z"
+    } else {
+        "ctrl-z"
+    };
+    const SECONDARY_SHIFT_Z: &str = if cfg!(target_os = "macos") {
+        "cmd-shift-z"
+    } else {
+        "ctrl-shift-z"
+    };
+
+    fn buffer_content(
+        app: &Entity<AdeApp>,
+        cx: &gpui::VisualTestContext,
+        relative: &Path,
+    ) -> String {
+        app.read_with(cx, |app, _| {
+            app.edit_buffers
+                .get(relative)
+                .expect("buffer should exist")
+                .content
+                .clone()
+        })
+    }
+
+    /// The headline behaviour of GitHub issue #17 §2, end to end through the real key bindings:
+    /// a real typing burst is one undo step, undo puts the real caret back, and redo replays both.
+    #[gpui::test]
+    fn a_real_typing_burst_undoes_and_redoes_as_one_step_through_the_real_key_bindings(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.txt", "ab\ncd\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.txt");
+
+        cx.simulate_input("hello");
+        assert_eq!(buffer_content(&app, cx, &relative), "helloab\ncd\n");
+        let caret_after_typing = app.read_with(cx, |app, _| {
+            app.edit_buffers.get(&relative).unwrap().cursor_offset()
+        });
+        assert_eq!(caret_after_typing, 5);
+
+        cx.simulate_keystrokes(SECONDARY_Z);
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "ab\ncd\n",
+            "a real secondary-z keystroke must undo the whole burst in one step"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .unwrap()
+                .cursor_offset()),
+            0,
+            "and restore the real caret from before the burst"
+        );
+
+        cx.simulate_keystrokes(SECONDARY_SHIFT_Z);
+        assert_eq!(buffer_content(&app, cx, &relative), "helloab\ncd\n");
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .unwrap()
+                .cursor_offset()),
+            5,
+            "redo must replay the real post-edit caret too"
+        );
+    }
+
+    /// `ctrl-y` as a real, alternative redo key - GitHub issue #17's checklist asks for it
+    /// explicitly, and it is a literal `Ctrl` on every OS (see `crate::default_key_bindings`).
+    #[gpui::test]
+    fn ctrl_y_really_redoes_in_the_code_editor(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.txt", "ab\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.txt");
+
+        cx.simulate_input("xy");
+        cx.simulate_keystrokes(SECONDARY_Z);
+        assert_eq!(buffer_content(&app, cx, &relative), "ab\n");
+        cx.simulate_keystrokes("ctrl-y");
+        assert_eq!(buffer_content(&app, cx, &relative), "xyab\n");
+    }
+
+    /// The central scoping guarantee of GitHub issue #17 §3, proven by dispatch rather than by
+    /// reading the predicate: with a real file editor focused, `secondary-z` must reach **text**
+    /// undo and must *not* reach `crate::worktree_history`'s worktree-level `Undo` - whose own
+    /// honest "nothing to undo" status is a real, observable signal that it ran.
+    #[gpui::test]
+    fn secondary_z_in_the_code_editor_never_reaches_the_worktree_level_history_undo(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.txt", "ab\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.txt");
+
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
+            "sanity check: nothing has touched the worktree-level history yet"
+        );
+
+        cx.simulate_input("z");
+        cx.simulate_keystrokes(SECONDARY_Z);
+
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "ab\n",
+            "the text undo must genuinely have run"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
+            "and the worktree-level Undo must NOT have - it would have set its own honest \
+             \"nothing to undo\" status if the keystroke had reached it. This is the exact \
+             \"a keystroke goes to the wrong handler\" bug class crate::default_key_bindings' \
+             own docs catalogue seven-plus instances of."
+        );
+
+        // Same again for redo, in both of its real spellings.
+        cx.simulate_keystrokes(SECONDARY_SHIFT_Z);
+        cx.simulate_keystrokes("ctrl-y");
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
+            "neither redo spelling may reach the worktree-level Redo either"
+        );
+    }
+
+    /// The same routing guarantee with the real Completions popup **also** open - a real
+    /// overlapping-scope case (`"file-editor text-input completions"` all live on one node at
+    /// once) that the narrower `"file-editor && completions"` bindings share a dispatch path
+    /// with.
+    #[gpui::test]
+    fn secondary_z_still_reaches_text_undo_while_the_completions_popup_is_open(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "ab\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        cx.simulate_input("zz");
+        assert_eq!(buffer_content(&app, cx, &relative), "zzab\n");
+
+        // A real, seeded `Ready` popup - the same construction
+        // `completions_keybindings_are_correctly_scoped_in_both_the_open_and_closed_state` uses.
+        let fake_item = |label: &str| lsp_core::lsp_types::CompletionItem {
+            label: label.to_string(),
+            ..Default::default()
+        };
+        app.update(cx, |app, cx| {
+            app.completions = Some(crate::lsp::completion_popup::CompletionsEntry {
+                path: relative.clone(),
+                status: crate::lsp::completion_popup::CompletionsStatus::Ready {
+                    items: vec![fake_item("alpha")],
+                    selected: 0,
+                },
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.completions_open_for_active_path()),
+            "sanity check: the popup must genuinely be open, or this test proves nothing"
+        );
+
+        cx.simulate_keystrokes(SECONDARY_Z);
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "ab\n",
+            "an open completions popup must not divert secondary-z away from text undo"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
+            "and it must still never reach the worktree-level Undo"
+        );
+    }
+
+    /// GitHub issue #17 §2's "history survives switching tabs" requirement, driven through the
+    /// real tab-activation path rather than by poking `edit_buffers` directly.
+    #[gpui::test]
+    fn a_files_undo_history_survives_switching_to_another_tab_and_back(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let first = write_file(repo.path(), "first.txt", "one\n");
+        let second = write_file(repo.path(), "second.txt", "two\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, first.clone());
+        bind_real_keys(cx);
+        let first_relative = PathBuf::from("first.txt");
+
+        cx.simulate_input("AAA");
+        assert_eq!(buffer_content(&app, cx, &first_relative), "AAAone\n");
+
+        // Switch to a genuinely different file, edit it too, then come back.
+        open_file_for_editing(&app, cx, second.clone());
+        cx.simulate_input("B");
+        assert_eq!(
+            buffer_content(&app, cx, &PathBuf::from("second.txt")),
+            "Btwo\n"
+        );
+        open_file_for_editing(&app, cx, first.clone());
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(first_relative.clone()),
+            "sanity check: the first file must really be the active tab again"
+        );
+
+        cx.simulate_keystrokes(SECONDARY_Z);
+        assert_eq!(
+            buffer_content(&app, cx, &first_relative),
+            "one\n",
+            "the first file's own undo history must have survived the round trip through \
+             another tab"
+        );
+        assert_eq!(
+            buffer_content(&app, cx, &PathBuf::from("second.txt")),
+            "Btwo\n",
+            "and the other file's buffer must be untouched - undo is strictly per buffer"
+        );
+    }
+
+    /// A real external rewrite of a **clean** buffer, landing through the real file-load path the
+    /// freshness check dispatches - not a direct `reload_from_disk` call. The reload must be one
+    /// real undo step with the pre-reload history still behind it.
+    #[gpui::test]
+    fn an_external_rewrite_of_a_clean_buffer_reloads_as_one_undoable_step(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.txt", "original\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.txt");
+
+        cx.simulate_input("X");
+        assert_eq!(buffer_content(&app, cx, &relative), "Xoriginal\n");
+        // Save, so the buffer is genuinely clean against disk before the external write.
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-s"
+        } else {
+            "ctrl-s"
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| !app
+                .edit_buffers
+                .get(&relative)
+                .unwrap()
+                .is_dirty()),
+            "sanity check: the buffer must really be clean before the external rewrite"
+        );
+
+        // A real external writer rewrites the file, with a genuinely newer mtime.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&file_path, "rewritten by an agent\n").expect("external rewrite");
+        // Force the throttled freshness check to run, then let the load it dispatches resolve.
+        app.update(cx, |app, _| {
+            app.file_view_last_freshness_check = None;
+        });
+        for _ in 0..3 {
+            app.update(cx, |app, cx| {
+                app.render_center_pane(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "rewritten by an agent\n",
+            "a clean buffer whose file was rewritten externally must adopt the new content - \
+             showing bytes that no longer exist anywhere would be silently stale"
+        );
+
+        cx.simulate_keystrokes(SECONDARY_Z);
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "Xoriginal\n",
+            "the reload must be one real undoable step"
+        );
+        cx.simulate_keystrokes(SECONDARY_Z);
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "original\n",
+            "and the history recorded before the reload must still be there - never a silent \
+             wipe mid-stack"
+        );
+    }
+
+    /// The dirty half of the same case: an external rewrite while the user has real unsaved edits
+    /// must leave the buffer *and* its history completely alone, and surface the real conflict
+    /// instead.
+    #[gpui::test]
+    fn an_external_rewrite_of_a_dirty_buffer_leaves_the_buffer_and_its_history_untouched(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.txt", "original\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.txt");
+
+        cx.simulate_input("MINE");
+        assert!(app.read_with(cx, |app, _| app
+            .edit_buffers
+            .get(&relative)
+            .unwrap()
+            .is_dirty()));
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&file_path, "theirs\n").expect("external rewrite");
+        app.update(cx, |app, _| {
+            app.file_view_last_freshness_check = None;
+        });
+        for _ in 0..3 {
+            app.update(cx, |app, cx| {
+                app.render_center_pane(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "MINEoriginal\n",
+            "a dirty buffer's unsaved content is the user's - an external rewrite must never \
+             silently replace it"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.file_external_conflict.contains(&relative)),
+            "the real divergence must be surfaced as a conflict instead"
+        );
+        cx.simulate_keystrokes(SECONDARY_Z);
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "original\n",
+            "and the user's own undo history must be exactly as it was"
+        );
     }
 }

@@ -243,23 +243,91 @@ impl AdeApp {
         ]
     }
 
-    /// The Edit menu: `Undo`/`Redo` (Revision R10's real, worktree-level "keep all changes"/
-    /// "discard worktree" undo stack - labelled with a "worktree history" sub-line, not text
-    /// editing, since this app has no separate per-buffer text undo/redo to offer), then
+    /// The Edit menu: real **text** `Undo`/`Redo` for whichever edit buffer is currently active
+    /// (GitHub issue #17, `crate::text_history`), then the worktree-level "keep all changes"/
+    /// "discard worktree" undo stack (Revision R10) as its own separately-labelled pair, then
     /// Cut/Copy/Paste/Select All against the real active edit buffer (File view or merge
     /// hand-edit - [`crate::code_surface::editing::AdeApp::active_edit_buffer`]), dimmed when there's no
     /// real edit target right now.
+    ///
+    /// The two undo pairs are deliberately separate rows with separate labels, and only the text
+    /// pair carries a keycap. Before GitHub issue #17 there was one pair, labelled `Undo` with a
+    /// `"worktree history"` sub-line and a `mod+z` keycap, and that was accurate. It stopped being
+    /// accurate the moment `mod+z` started resolving to `TextUndo` inside every real text widget
+    /// (see `crate::default_key_bindings`' own scoping docs): a keycap that is only true when no
+    /// text input has focus, on a row that fires a real `git reset --soft`, is exactly the kind of
+    /// confidently-wrong affordance this project's discipline forbids. The worktree rows are still
+    /// fully clickable - only their (now context-dependent) keycap is gone, with the sub-line
+    /// saying where the shortcut does apply.
+    ///
+    /// The text rows are dimmed, per [`crate::work_surface::render::render_dropdown_menu_row`]'s
+    /// own enabled/disabled convention, whenever there is genuinely nothing to undo or redo -
+    /// rather than looking exactly as actionable as a working row and silently doing nothing.
+    ///
+    /// Their sub-line says `"editor"`, not `"text"`, and that word is load-bearing: enablement
+    /// comes from [`crate::code_surface::editing::AdeApp::active_edit_buffer`], which only ever
+    /// resolves to an `EditBuffer` (the File view or the merge hand-edit surface). The app's four
+    /// single-line `crate::text_history::TextField` inputs - palette query, rail filter, Settings
+    /// keybindings filter, New file prompt - have real, working undo histories of their own that
+    /// this menu genuinely cannot reach, so a row labelled `"text"` would sit permanently dimmed
+    /// while `mod+z` worked perfectly well inside them. Found by an independent adversarial audit.
+    /// Narrowing the label is the honest fix rather than routing the menu through whatever widget
+    /// happens to be focused: a menu click moves focus to the menu, so "the focused text widget"
+    /// is not a thing this row could resolve at click time anyway.
     fn edit_menu_rows(&self, macos: bool, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let editing = self.active_edit_buffer().is_some();
+        let can_text_undo = self
+            .active_edit_buffer()
+            .is_some_and(|buffer| buffer.can_undo());
+        let can_text_redo = self
+            .active_edit_buffer()
+            .is_some_and(|buffer| buffer.can_redo());
 
         let mut rows = vec![
+            {
+                let mut row = render_dropdown_menu_row(
+                    "U",
+                    theme::text::DIM.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
+                    "Undo",
+                    "editor".to_string(),
+                    keymap::resolve_combo("mod+z", macos),
+                    can_text_undo,
+                );
+                if can_text_undo {
+                    row = row.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.title_menu_open = None;
+                        this.perform_text_undo(cx);
+                    }));
+                }
+                row.into_any_element()
+            },
+            {
+                let mut row = render_dropdown_menu_row(
+                    "R",
+                    theme::text::DIM.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
+                    "Redo",
+                    "editor".to_string(),
+                    keymap::resolve_combo("mod+shift+z", macos),
+                    can_text_redo,
+                );
+                if can_text_redo {
+                    row = row.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.title_menu_open = None;
+                        this.perform_text_redo(cx);
+                    }));
+                }
+                row.into_any_element()
+            },
+            Self::render_title_menu_divider(),
             render_dropdown_menu_row(
                 "U",
                 theme::text::DIM.into(),
                 theme::surface::CHIP_NEUTRAL.into(),
-                "Undo",
-                "worktree history".to_string(),
-                keymap::resolve_combo("mod+z", macos),
+                "Undo worktree action",
+                "history \u{b7} shortcut applies outside text inputs".to_string(),
+                Vec::new(),
                 true,
             )
             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
@@ -271,9 +339,9 @@ impl AdeApp {
                 "R",
                 theme::text::DIM.into(),
                 theme::surface::CHIP_NEUTRAL.into(),
-                "Redo",
-                "worktree history".to_string(),
-                keymap::resolve_combo("mod+shift+z", macos),
+                "Redo worktree action",
+                "history \u{b7} shortcut applies outside text inputs".to_string(),
+                Vec::new(),
                 true,
             )
             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
@@ -622,7 +690,7 @@ impl AdeApp {
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                 this.title_menu_open = None;
                 this.open_settings(window, cx);
-                this.select_settings_page(settings::SettingsPage::About, cx);
+                this.select_settings_page(settings::SettingsPage::About, window, cx);
             }))
             .into_any_element(),
         ]
@@ -768,14 +836,19 @@ mod title_menu_tests {
         );
     }
 
-    /// The Edit menu's first row ("Undo") really calls the real
+    /// The Edit menu's `Undo worktree action` row really calls the real
     /// `crate::worktree_history::flow::AdeApp::perform_undo` - with nothing in
     /// [`AdeApp::undo_stack`] yet (a fresh test app), that's a real, honest "nothing to undo"
     /// status (Revision R10's own fix for the "looks actionable, silently does nothing" bug
     /// class - see that revision's build-log entry), not a silent no-op, and is exactly the
     /// observable effect this test asserts actually happened.
+    ///
+    /// It is the *third* row now, behind the text `Undo`/`Redo` pair and a divider (GitHub issue
+    /// #17) - clicked by its real structural position through the shared
+    /// [`nth_row_click_point`] geometry, so the two undo pairs can't silently swap places without
+    /// this failing.
     #[gpui::test]
-    fn edit_menu_undo_row_runs_the_real_undo_stack(cx: &mut TestAppContext) {
+    fn edit_menu_worktree_undo_row_runs_the_real_undo_stack(cx: &mut TestAppContext) {
         let (app, cx) = open_windows_variant(cx);
         app.update(cx, |app, cx| {
             app.title_menu_open = Some(TitleMenu::Edit);
@@ -786,7 +859,7 @@ mod title_menu_tests {
             app.title_menu_button_bounds[TitleMenu::Edit.index()]
         });
 
-        cx.simulate_click(first_row_click_point(bounds), gpui::Modifiers::none());
+        cx.simulate_click(nth_row_click_point(bounds, 2, 1), gpui::Modifiers::none());
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| {
@@ -797,6 +870,90 @@ mod title_menu_tests {
             );
             assert_eq!(app.title_menu_open, None);
         });
+    }
+
+    /// The Edit menu's *first* row is now real **text** undo (GitHub issue #17), and it is a real
+    /// affordance in both directions: inert with nothing to undo (no `on_click` attached at all,
+    /// per `render_dropdown_menu_row`'s own enabled/disabled contract), and genuinely undoing the
+    /// active buffer's own last step once there is one.
+    ///
+    /// The negative half matters as much as the positive one: before this issue that same first
+    /// row fired a real `git reset --soft` while advertising `mod+z`, which is no longer what
+    /// `mod+z` does inside a text widget.
+    #[gpui::test]
+    fn edit_menu_text_undo_row_is_inert_until_there_is_real_text_to_undo(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("notes.txt");
+        std::fs::write(&file_path, "hello\n").expect("write notes.txt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, cx| {
+            app.set_window_controls_style(WindowControlsStyle::WindowsLinuxStyle, cx);
+        });
+        cx.run_until_parked();
+
+        let open_edit_menu = |app: &Entity<AdeApp>, cx: &mut gpui::VisualTestContext| {
+            app.update(cx, |app, cx| {
+                app.title_menu_open = Some(TitleMenu::Edit);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                app.title_menu_button_bounds[TitleMenu::Edit.index()]
+            })
+        };
+
+        // Nothing open, nothing typed: the row must be genuinely inert, not merely ineffective.
+        let bounds = open_edit_menu(&app, cx);
+        cx.simulate_click(first_row_click_point(bounds), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
+            "a disabled text-undo row must never fall through to the worktree-level undo - that              would be the exact confidently-wrong affordance this row was split out to remove"
+        );
+
+        // Now open a real file, type into it, and click the same row again.
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.simulate_input("typed");
+        let relative = PathBuf::from("notes.txt");
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .expect("buffer")
+                .content
+                .clone()),
+            "typedhello\n",
+            "sanity check: the real keystrokes must have reached the real buffer"
+        );
+
+        let bounds = open_edit_menu(&app, cx);
+        cx.simulate_click(first_row_click_point(bounds), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .expect("buffer")
+                .content
+                .clone()),
+            "hello\n",
+            "the Edit menu's own text-undo row must drive the exact same real history the              secondary-z binding does"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
+            "and it must never touch the worktree-level stack"
+        );
+        assert_eq!(app.read_with(cx, |app, _| app.title_menu_open), None);
     }
 
     #[gpui::test]
@@ -910,7 +1067,7 @@ mod title_menu_tests {
         app.update_in(cx, |app, window, cx| {
             app.title_menu_open = None;
             app.open_settings(window, cx);
-            app.select_settings_page(settings::SettingsPage::About, cx);
+            app.select_settings_page(settings::SettingsPage::About, window, cx);
         });
         cx.run_until_parked();
 

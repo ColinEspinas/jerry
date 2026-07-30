@@ -315,21 +315,105 @@ impl AdeApp {
                         // is_valid_utf8` is the exact real flag `code_view::load_file` already
                         // computes for this (already surfaced in the status bar's `UTF-8`
                         // label) - reused here rather than a second check.
-                        if !parsed.truncated
-                            && parsed.is_valid_utf8
-                            && !this.edit_buffers.contains_key(&relative_path)
-                        {
-                            this.edit_buffers.insert(
-                                relative_path.clone(),
-                                edit_buffer::EditBuffer::from_highlighted(
-                                    path.clone(),
-                                    source,
-                                    extension.clone(),
-                                    parsed.lines.clone(),
-                                    parsed.mtime,
-                                    parsed.len,
-                                ),
-                            );
+                        // `Some(line)` only when an *existing*, clean buffer was reloaded in
+                        // place below - see that arm's own docs.
+                        let mut reloaded_cursor_line: Option<usize> = None;
+                        // Set alongside it, so the language-server sync can run after the
+                        // `edit_buffers` borrow above has ended.
+                        let mut reloaded = false;
+                        // A write this app itself issued for this exact path is still queued or
+                        // running, so anything this background read saw is by definition not the
+                        // final on-disk state - and the `(mtime, len)` guard below can't catch it
+                        // if two of our own writes land inside one filesystem mtime granularity
+                        // tick. Never adopt a read that raced our own writer; the next freshness
+                        // tick re-reads once the writer has drained. Read before the
+                        // `edit_buffers` borrow starts.
+                        let save_in_flight = this.file_save_pending.contains(&relative_path)
+                            || this.file_save_running.contains(&relative_path);
+                        if !parsed.truncated && parsed.is_valid_utf8 {
+                            match this.edit_buffers.get_mut(&relative_path) {
+                                // An existing buffer with **no** unsaved edits, whose file has
+                                // since been rewritten on disk by someone else (an agent CLI
+                                // running in this very worktree - this app's whole domain - a
+                                // formatter, another editor). Adopting that content is the honest
+                                // result: this buffer has nothing of the user's to lose, and
+                                // leaving it showing bytes that no longer exist anywhere would be
+                                // silently stale. Recorded as one single undoable step rather
+                                // than a fresh buffer, per GitHub issue #17: an external rewrite
+                                // must never be a silent history wipe mid-stack, and Ctrl+Z
+                                // straight after one really does put the pre-reload content back.
+                                // See `EditBuffer::reload_from_disk`'s own docs.
+                                //
+                                // The `(mtime, len)` guard is a real staleness check, not
+                                // belt-and-braces: this read started before the `this.update`
+                                // it is now inside, and a real, documented user action can land in
+                                // between - `EditorSaveAnyway` (`force_save_active_file`), the
+                                // explicit escape hatch for an external-change conflict, writes the
+                                // user's own content and marks the buffer clean again. Without this
+                                // check, the now-stale read would then be adopted over content the
+                                // user had *just* deliberately force-saved, and would stamp the
+                                // buffer's `saved_mtime`/`saved_len` to an on-disk identity the
+                                // file no longer has. Refusing anything not strictly newer than
+                                // what the buffer already believes about disk closes that window;
+                                // the next freshness tick re-reads and gets it right.
+                                Some(buffer)
+                                    if !buffer.is_dirty()
+                                        && (parsed.mtime, parsed.len)
+                                            != (buffer.saved_mtime, buffer.saved_len)
+                                        && parsed.mtime >= buffer.saved_mtime
+                                        && !save_in_flight =>
+                                {
+                                    buffer.reload_from_disk(
+                                        source,
+                                        parsed.lines.clone(),
+                                        parsed.mtime,
+                                        parsed.len,
+                                    );
+                                    // The reloaded content is genuinely different text at genuinely
+                                    // different offsets - every other content mutation in this
+                                    // crate pairs with an LSP sync (see `Self::step_edit_history`),
+                                    // and skipping it here would leave the language server
+                                    // answering hover/diagnostics/goto about a document that is no
+                                    // longer on screen until the user's next keystroke.
+                                    reloaded = true;
+                                    // `reload_from_disk` keeps the real caret (clamped into the
+                                    // new content), so the caret-line indicator below must follow
+                                    // it rather than snapping back to line 1 the way a genuinely
+                                    // fresh load's does - the buffer's own caret is the truth
+                                    // here, and an indicator disagreeing with it would be a real,
+                                    // visible lie.
+                                    let (line, _) =
+                                        buffer.line_col_for_offset(buffer.cursor_offset());
+                                    reloaded_cursor_line = Some(line + 1);
+                                }
+                                // A **dirty** buffer is deliberately left completely alone: its
+                                // unsaved content is the user's, and this app already surfaces the
+                                // real divergence as an explicit conflict
+                                // (`AdeApp::file_external_conflict`, plus the save-time refusal in
+                                // `save_active_file`) for the user to resolve, rather than picking
+                                // a winner for them. Nothing touches the history in this case
+                                // either - no wipe, no boundary, because no edit happened.
+                                Some(_) => {}
+                                // First open of this file in the editable File view - see this
+                                // block's own docs above for why a truncated/invalid-UTF-8 file
+                                // deliberately never reaches here at all.
+                                None => {
+                                    this.edit_buffers.insert(
+                                        relative_path.clone(),
+                                        edit_buffer::EditBuffer::from_highlighted(
+                                            path.clone(),
+                                            source,
+                                            extension.clone(),
+                                            parsed.lines.clone(),
+                                            parsed.mtime,
+                                            parsed.len,
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        if reloaded {
+                            this.schedule_lsp_sync(relative_path.clone(), cx);
                         }
                         this.file_view_cache = Some(parsed);
                         // A pending go-to-definition target line applies only if it names the
@@ -344,7 +428,7 @@ impl AdeApp {
                             this.file_view_scroll_handle
                                 .scroll_to_item(line.saturating_sub(1), ScrollStrategy::Center);
                         }
-                        this.code_cursor = Some(target_line.unwrap_or(1));
+                        this.code_cursor = Some(target_line.or(reloaded_cursor_line).unwrap_or(1));
                         this.file_load_state = FileLoadState::Idle;
                     }
                     Err(error) => {

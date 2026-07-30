@@ -539,8 +539,15 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::CompletionsDown" => Some("Completions: select next"),
         "app::CompletionsAccept" => Some("Completions: accept selected"),
         "app::CompletionsDismiss" => Some("Completions: dismiss"),
-        "app::Undo" => Some("Undo"),
-        "app::Redo" => Some("Redo"),
+        // Deliberately *not* bare "Undo"/"Redo": GitHub issue #17 adds a second, genuinely
+        // distinct undo system on the same physical keys (text undo, below), and two rows both
+        // labelled "Undo" on this page would be exactly the confusion this project's own
+        // "distinguishable rows" rule exists to prevent. The context column already differs, but
+        // a context predicate is not what a user reads first.
+        "app::Undo" => Some("Worktree history: undo"),
+        "app::Redo" => Some("Worktree history: redo"),
+        "app::TextUndo" => Some("Text: undo"),
+        "app::TextRedo" => Some("Text: redo"),
         _ => None,
     }
 }
@@ -1060,8 +1067,11 @@ mod tests {
                 "New session",
                 "Command palette",
                 "Open settings",
-                "Undo",
-                "Redo",
+                "Worktree history: undo",
+                "Worktree history: redo",
+                "Text: undo",
+                "Text: redo",
+                "Text: redo",
                 "Go to definition",
                 "New terminal",
                 "New agent pane",
@@ -1160,6 +1170,12 @@ mod tests {
         // Linux/Windows, which a focused terminal needs unclaimed to send the real `SIGTSTP`
         // suspend control byte (`crate::terminal::pane::keystroke_to_bytes`) - see
         // `crate::default_key_bindings`'s own docs for the full reasoning.
+        // GitHub issue #17 added 3 more real scoped bindings, `TextUndo` (`secondary-z`) and
+        // `TextRedo` (bound twice - `secondary-shift-z` and `ctrl-y`), each `Some("text-input")`,
+        // and correspondingly narrowed `Undo`/`Redo` from `Some("!terminal")` to
+        // `Some("!terminal && !text-input")` - still scoped either way, so only the count of
+        // scoped rows moves. See `crate::default_key_bindings`'s own docs for why the two undo
+        // systems are kept disjoint structurally rather than by dispatch order.
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings, &[]);
         assert!(!rows.is_empty());
@@ -1167,10 +1183,10 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            45,
+            48,
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
              every real Completions* binding (5) plus every real merge-editor binding (18) plus \
-             Undo/Redo (2) to be scoped, not global"
+             Undo/Redo (2) plus TextUndo/TextRedo (3) to be scoped, not global"
         );
         assert!(
             scoped.iter().any(|row| row.command == "Next changed file"),

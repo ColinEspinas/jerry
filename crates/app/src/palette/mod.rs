@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use gpui::{div, font, prelude::*, px, App, BoxShadow, ClickEvent, Context, KeyDownEvent, Window};
 use wt_core::diff::{DiffFile, FileChangeStatus};

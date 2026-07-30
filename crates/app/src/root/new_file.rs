@@ -18,8 +18,10 @@ pub(crate) struct NewFileInputState {
     /// The real directory the new file will be created in - the selected worktree's root (the
     /// `+` menu row) or the specific directory row the file tree's own hover "+" was clicked on.
     pub(super) parent_dir: PathBuf,
-    /// The name typed so far - append/backspace only, mirroring [`AdeApp::filter_query`].
-    pub(super) name: String,
+    /// The name typed so far - append/backspace only, mirroring [`AdeApp::filter_query`], with
+    /// its own real undo history (GitHub issue #17). The history lives and dies with this prompt,
+    /// which is exactly the per-widget lifetime that issue asks for.
+    pub(super) name: text_history::TextField,
 }
 
 impl AdeApp {
@@ -32,7 +34,7 @@ impl AdeApp {
     ) {
         self.new_file_input = Some(NewFileInputState {
             parent_dir,
-            name: String::new(),
+            name: text_history::TextField::new(),
         });
         self.new_file_error = None;
         window.focus(&self.new_file_focus_handle, cx);
@@ -55,14 +57,16 @@ impl AdeApp {
         // file tab *and* no active session, a real, reachable state under the tabs rework
         // (`Sessions::active_id`'s own docs, and `Self::select_worktree`'s identical fallback) -
         // `Sessions::focus_active` is a genuine no-op, so fall back to the rail's own filter
-        // field (`Self::filter_focus_handle`) the same way `Self::select_worktree` does, rather
+        // root container (`Self::rail_focus_handle`) the same way `Self::select_worktree` does -
+        // deliberately the rail's root, not its filter field, which this used to target; see that
+        // handle's own docs for the real keystroke-swallowing bug that was - rather
         // than leaving `Window::focus` dangling on the just-closed prompt field.
         if self.open_change.is_some() {
             window.focus(&self.code_focus_handle, cx);
         } else if self.sessions.active_id().is_some() {
             self.sessions.focus_active(window, cx);
         } else {
-            window.focus(&self.filter_focus_handle, cx);
+            window.focus(&self.rail_focus_handle, cx);
         }
         cx.notify();
     }
@@ -91,7 +95,7 @@ impl AdeApp {
             }
             "backspace" => {
                 if let Some(input) = self.new_file_input.as_mut() {
-                    input.name.pop();
+                    input.name.pop(Instant::now());
                     cx.notify();
                     cx.stop_propagation();
                 }
@@ -103,12 +107,47 @@ impl AdeApp {
                     .filter(|text| !text.is_empty())
                 {
                     if let Some(input) = self.new_file_input.as_mut() {
-                        input.name.push_str(text);
+                        input.name.push_str(text, Instant::now());
                         cx.notify();
                         cx.stop_propagation();
                     }
                 }
             }
+        }
+    }
+
+    /// `TextUndo`/`TextRedo` for the "New file" name prompt (GitHub issue #17). Clears the
+    /// stale validation error alongside the text: a message like "file name can't contain a path
+    /// separator" describes a name the user has just stepped away from.
+    pub(super) fn handle_new_file_text_undo(
+        &mut self,
+        _: &TextUndo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .new_file_input
+            .as_mut()
+            .is_some_and(|input| input.name.undo())
+        {
+            self.new_file_error = None;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn handle_new_file_text_redo(
+        &mut self,
+        _: &TextRedo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .new_file_input
+            .as_mut()
+            .is_some_and(|input| input.name.redo())
+        {
+            self.new_file_error = None;
+            cx.notify();
         }
     }
 
@@ -125,7 +164,7 @@ impl AdeApp {
         let name = self
             .new_file_input
             .as_ref()
-            .map(|input| input.name.clone())
+            .map(|input| input.name.as_str().to_string())
             .unwrap_or_default();
         let parent_label = self
             .new_file_input
@@ -151,6 +190,11 @@ impl AdeApp {
                 div()
                     .id("new-file-panel")
                     .track_focus(&self.new_file_focus_handle)
+                    // See `crate::default_key_bindings`' `TextUndo`/`TextRedo` docs for why the
+                    // tag and the listeners both live on this exact node.
+                    .key_context("text-input")
+                    .on_action(cx.listener(Self::handle_new_file_text_undo))
+                    .on_action(cx.listener(Self::handle_new_file_text_redo))
                     .on_key_down(cx.listener(Self::handle_new_file_key_down))
                     .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
                         cx.stop_propagation();
@@ -230,7 +274,7 @@ impl AdeApp {
         let Some(input) = self.new_file_input.clone() else {
             return;
         };
-        let name = input.name.trim();
+        let name = input.name.as_str().trim();
         if name.is_empty() {
             self.new_file_error = Some("file name can't be empty".to_string());
             cx.notify();
@@ -290,6 +334,7 @@ impl AdeApp {
 mod tests {
     use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
+    use std::time::Instant;
 
     /// Real, live-reproduced regression coverage for the self-audit finding: cancelling the
     /// "New file" prompt while a file tab is showing must not leave `Window::focus` dangling on
@@ -386,7 +431,8 @@ mod tests {
             app.new_file_input
                 .as_mut()
                 .expect("prompt should be open")
-                .name = "notes.md".to_string();
+                .name
+                .set("notes.md", Instant::now());
             app.create_new_file(window, cx);
         });
         cx.run_until_parked();
@@ -432,7 +478,8 @@ mod tests {
             app.new_file_input
                 .as_mut()
                 .expect("prompt should be open")
-                .name = "existing.txt".to_string();
+                .name
+                .set("existing.txt", Instant::now());
             app.create_new_file(window, cx);
         });
         cx.run_until_parked();
@@ -464,7 +511,8 @@ mod tests {
             app.new_file_input
                 .as_mut()
                 .expect("prompt should be open")
-                .name = "abandoned.rs".to_string();
+                .name
+                .set("abandoned.rs", Instant::now());
             app.cancel_new_file(window, cx);
         });
         cx.run_until_parked();

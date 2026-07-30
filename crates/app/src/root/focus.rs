@@ -36,7 +36,10 @@ impl AdeApp {
         self.new_file_input = None;
         self.palette_focus.capture(window, &self.sessions, cx);
         self.palette_scope = palette::PaletteScope::default();
-        self.palette_query.clear();
+        // A reopened palette is a genuinely new widget instance, so its predecessor's undo
+        // history must not be reachable from it - `reset`, not `clear` (which is itself a real,
+        // undoable step). See `crate::text_history::TextField`'s own docs.
+        self.palette_query.reset();
         self.palette_selected = 0;
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
@@ -221,7 +224,7 @@ pub(crate) mod palette_focus_tests {
         cx.simulate_input(">");
         app.read_with(cx, |app, _| {
             assert_eq!(app.palette_scope, palette::PaletteScope::Commands);
-            assert_eq!(app.palette_query, "");
+            assert_eq!(app.palette_query.as_str(), "");
         });
 
         // Back to a fresh, empty-query palette state before the mid-query case.
@@ -229,7 +232,7 @@ pub(crate) mod palette_focus_tests {
         cx.dispatch_action(TogglePalette);
         app.read_with(cx, |app, _| {
             assert_eq!(app.palette_scope, palette::PaletteScope::All);
-            assert_eq!(app.palette_query, "");
+            assert_eq!(app.palette_query.as_str(), "");
         });
 
         cx.simulate_input("x");
@@ -240,7 +243,7 @@ pub(crate) mod palette_focus_tests {
                 palette::PaletteScope::All,
                 "a `>` typed mid-query (query is non-empty) must not switch scope"
             );
-            assert_eq!(app.palette_query, "x>");
+            assert_eq!(app.palette_query.as_str(), "x>");
         });
     }
 
@@ -984,8 +987,8 @@ mod settings_focus_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(ToggleSettings);
-        app.update(cx, |app, cx| {
-            app.select_settings_page(SettingsPage::Worktrees, cx);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Worktrees, window, cx);
         });
         assert_eq!(
             app.read_with(cx, |app, _| app.settings_page),
@@ -1122,8 +1125,8 @@ mod settings_focus_tests {
         cx.run_until_parked();
 
         for page in SettingsPage::ALL {
-            app.update(cx, |app, cx| {
-                app.select_settings_page(page, cx);
+            app.update_in(cx, |app, window, cx| {
+                app.select_settings_page(page, window, cx);
             });
             cx.run_until_parked();
             assert_eq!(
@@ -1276,6 +1279,446 @@ mod code_focus_tests {
             "secondary-, must still reach handle_toggle_settings_action after closing the File view - \
              AdeApp::close_change_diff must have restored real focus onto the active session's \
              terminal pane, not left it dangling on code_focus_handle"
+        );
+    }
+}
+
+/// GitHub issue #17 §1/§3: real, dispatched `secondary-z` routing across every overlapping-scope
+/// case this app actually has. Deliberately `simulate_keystrokes`-driven throughout - the whole
+/// risk here is *which handler a keystroke reaches*, which no state-assertion-only test can see.
+///
+/// `crate::worktree_history::flow::AdeApp::perform_undo`'s own honest "nothing to undo" status is
+/// used as the real, observable tripwire for "the worktree-level Undo ran": it is set
+/// synchronously, on an empty stack, whenever that handler is genuinely reached.
+#[cfg(test)]
+mod text_undo_scoping_tests {
+    use super::*;
+    use gpui::{Entity, TestAppContext};
+
+    const SECONDARY_Z: &str = if cfg!(target_os = "macos") {
+        "cmd-z"
+    } else {
+        "ctrl-z"
+    };
+    const SECONDARY_SHIFT_Z: &str = if cfg!(target_os = "macos") {
+        "cmd-shift-z"
+    } else {
+        "ctrl-shift-z"
+    };
+
+    fn bind_real_keys(cx: &mut gpui::VisualTestContext) {
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+    }
+
+    /// Opens `path` in the File view and drives the render/park cycle the background load needs
+    /// before `edit_buffers` is really seeded - the same shape
+    /// `crate::code_surface::editing::editing_tests::open_file_for_editing` uses.
+    fn open_file_for_editing(
+        app: &Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        path: PathBuf,
+    ) {
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(path, window, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+    }
+
+    /// The hardest real case for §3's terminal rule: a real edit buffer with a real undo history
+    /// genuinely exists, and focus is genuinely back on a terminal. `secondary-z` must reach
+    /// *neither* undo system - not the worktree-level one (`!terminal`), and not text undo (no
+    /// `"text-input"` anywhere in a terminal's dispatch path) - leaving the keystroke free to
+    /// reach the pty as the real `SIGTSTP` control byte, which
+    /// `crate::terminal::pane::keystroke_tests::ctrl_z_maps_to_the_real_sigtstp_control_byte`
+    /// covers the other half of.
+    #[gpui::test]
+    fn secondary_z_with_a_terminal_focused_reaches_neither_undo_system(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("notes.txt");
+        std::fs::write(&file_path, "hello\n").expect("write notes.txt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("notes.txt");
+
+        cx.simulate_input("TYPED");
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .unwrap()
+                .content
+                .clone()),
+            "TYPEDhello\n"
+        );
+
+        // Close the file tab: `close_file_tab` deliberately keeps the `edit_buffers` entry (and
+        // so its whole undo history) alive while restoring real focus to the active session's
+        // terminal pane - exactly the overlapping state this test needs.
+        app.update_in(cx, |app, window, cx| {
+            app.close_change_diff(window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(app.read_with(cx, |app, _| app.open_change.clone()), None);
+        assert!(
+            app.read_with(cx, |app, _| app.edit_buffers.contains_key(&relative)),
+            "sanity check: the buffer (and its history) must still be alive, or this test would \
+             pass for the wrong reason"
+        );
+        assert!(app.read_with(cx, |app, _| app.worktree_history_status.is_none()));
+
+        cx.simulate_keystrokes(SECONDARY_Z);
+        cx.simulate_keystrokes(SECONDARY_SHIFT_Z);
+        cx.simulate_keystrokes("ctrl-y");
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .unwrap()
+                .content
+                .clone()),
+            "TYPEDhello\n",
+            "with a real terminal focused, secondary-z must not undo a background buffer's text"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
+            "and it must not reach the worktree-level Undo either - crate::default_key_bindings \
+             scopes it Some(\"!terminal && !text-input\") precisely so the keystroke stays free \
+             to reach the pty as literal input"
+        );
+    }
+
+    /// The palette-over-an-open-editor case `crate::default_key_bindings`' own docs single out:
+    /// `secondary-z` must undo the *palette query*, because the palette is what has focus - not
+    /// the file editor still open behind it, and not the worktree-level history.
+    #[gpui::test]
+    fn secondary_z_with_the_palette_open_undoes_the_query_not_the_file_editor_behind_it(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("notes.txt");
+        std::fs::write(&file_path, "hello\n").expect("write notes.txt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("notes.txt");
+
+        cx.simulate_input("EDITED");
+        let content_before = app.read_with(cx, |app, _| {
+            app.edit_buffers.get(&relative).unwrap().content.clone()
+        });
+        assert_eq!(content_before, "EDITEDhello\n");
+
+        app.update_in(cx, |app, window, cx| app.open_palette(window, cx));
+        cx.run_until_parked();
+        cx.simulate_input("query");
+        assert_eq!(
+            app.read_with(cx, |app, _| app.palette_query.as_str().to_string()),
+            "query"
+        );
+
+        cx.simulate_keystrokes(SECONDARY_Z);
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.palette_query.as_str().to_string()),
+            "",
+            "the focused widget's own history is what secondary-z must step - a handler that \
+             inspected app state instead of relying on GPUI's focused-node dispatch would have \
+             undone the file editor here, since its buffer is just as live"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .unwrap()
+                .content
+                .clone()),
+            content_before,
+            "the file editor behind the palette must be completely untouched"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
+            "and the worktree-level Undo must not have run"
+        );
+
+        cx.simulate_keystrokes(SECONDARY_SHIFT_Z);
+        assert_eq!(
+            app.read_with(cx, |app, _| app.palette_query.as_str().to_string()),
+            "query",
+            "redo must replay the query"
+        );
+    }
+
+    /// A reopened palette is a genuinely new widget instance: its predecessor's history must not
+    /// be reachable, or Ctrl+Z would resurrect a query the user already dismissed.
+    #[gpui::test]
+    fn reopening_the_palette_starts_a_genuinely_fresh_history(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        bind_real_keys(cx);
+
+        app.update_in(cx, |app, window, cx| app.open_palette(window, cx));
+        cx.run_until_parked();
+        cx.simulate_input("gone");
+        app.update_in(cx, |app, window, cx| app.close_palette(window, cx));
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| app.open_palette(window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes(SECONDARY_Z);
+        assert_eq!(
+            app.read_with(cx, |app, _| app.palette_query.as_str().to_string()),
+            "",
+            "a fresh palette must have nothing to undo back to"
+        );
+    }
+
+    /// Settings › Keybindings' own filter field. Also the real contrast case for the pre-existing
+    /// `secondary_z_reaches_undo_once_real_focus_moves_off_the_terminal` test above: Settings
+    /// being *open* is not enough to claim `"text-input"` - only the filter row itself is tagged,
+    /// so the worktree-level Undo still owns the keystroke everywhere else on that surface.
+    #[gpui::test]
+    fn secondary_z_in_the_settings_keybindings_filter_undoes_the_filter_not_the_worktree_history(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        bind_real_keys(cx);
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_settings(window, cx);
+            app.settings_page = settings::SettingsPage::Keymap;
+            window.focus(&app.settings_keymap_filter_focus_handle, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_input("palette");
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings_keymap_filter.as_str().to_string()),
+            "palette"
+        );
+
+        cx.simulate_keystrokes(SECONDARY_Z);
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings_keymap_filter.as_str().to_string()),
+            "",
+            "the focused settings text field's own history is what secondary-z must step"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
+            "and the worktree-level Undo must not have run - it would have set its honest \
+             \"nothing to undo\" status"
+        );
+
+        cx.simulate_keystrokes("ctrl-y");
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings_keymap_filter.as_str().to_string()),
+            "palette",
+            "ctrl-y must redo here too"
+        );
+    }
+
+    /// The rail's session filter - the fourth and last of this app's hand-rolled single-line
+    /// inputs. Also covers that `Esc`-clearing a filter is a real, undoable step rather than a
+    /// silent loss.
+    #[gpui::test]
+    fn secondary_z_in_the_rail_filter_undoes_it_including_a_real_escape_clear(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        bind_real_keys(cx);
+
+        app.update_in(cx, |app, window, cx| {
+            window.focus(&app.filter_focus_handle, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_input("main");
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.as_str().to_string()),
+            "main"
+        );
+        cx.simulate_keystrokes("escape");
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.as_str().to_string()),
+            ""
+        );
+
+        cx.simulate_keystrokes(SECONDARY_Z);
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.as_str().to_string()),
+            "main",
+            "Esc clearing a filter must be a real, undoable step, not a silent loss"
+        );
+        assert!(app.read_with(cx, |app, _| app.worktree_history_status.is_none()));
+
+        cx.simulate_keystrokes(SECONDARY_Z);
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.as_str().to_string()),
+            "",
+            "and the typing burst before it is its own further step"
+        );
+    }
+
+    /// The fourth single-line input: the inline "New file" name prompt. Its history is created and
+    /// destroyed with the prompt, which is the per-widget lifetime GitHub issue #17 asks for.
+    #[gpui::test]
+    fn secondary_z_in_the_new_file_prompt_undoes_the_name_and_a_fresh_prompt_has_no_history(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        bind_real_keys(cx);
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_new_file(repo.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("notes.md");
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .new_file_input
+                .as_ref()
+                .unwrap()
+                .name
+                .as_str()
+                .to_string()),
+            "notes.md"
+        );
+
+        cx.simulate_keystrokes(SECONDARY_Z);
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .new_file_input
+                .as_ref()
+                .unwrap()
+                .name
+                .as_str()
+                .to_string()),
+            "",
+            "the focused prompt's own history is what secondary-z must step"
+        );
+        assert!(app.read_with(cx, |app, _| app.worktree_history_status.is_none()));
+
+        // Cancel and reopen: a genuinely new prompt, so nothing to undo back to.
+        app.update_in(cx, |app, window, cx| app.cancel_new_file(window, cx));
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.start_new_file(repo.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(SECONDARY_Z);
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .new_file_input
+                .as_ref()
+                .unwrap()
+                .name
+                .as_str()
+                .to_string()),
+            "",
+            "a fresh prompt must have no predecessor history reachable from it"
+        );
+    }
+
+    /// The exact sequence self-review turned up: with nothing left to focus, the app falls
+    /// back to the rail, and `secondary-z` must still reach the worktree-level `Undo` rather than
+    /// being silently swallowed by a text input the user never asked to type in.
+    ///
+    /// This is the regression for a real, reachable bug this issue's own first draft introduced:
+    /// the fallback used to target `filter_focus_handle`, which now carries a `"text-input"` key
+    /// context, so `Undo`'s `!terminal && !text-input` predicate became unsatisfiable and
+    /// `TextUndo` won against an empty field - a keystroke consumed with no effect and no
+    /// feedback, verbatim the bug class `crate::default_key_bindings`' own docs catalogue
+    /// seven-plus instances of. Fixed by giving the rail's context-less root its own focus handle
+    /// (`AdeApp::rail_focus_handle`) and pointing all three fallback sites at that instead.
+    #[gpui::test]
+    fn secondary_z_still_reaches_the_worktree_undo_after_focus_falls_back_to_the_rail(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        bind_real_keys(cx);
+
+        let session_id = app
+            .read_with(cx, |app, _| app.sessions.active_id())
+            .expect("a fresh window always starts with one real, focused shell session");
+        app.update_in(cx, |app, window, cx| {
+            app.close_session(session_id, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.sessions.active_id().is_none()
+                && app.open_change.is_none()
+                && !app.settings_open),
+            "sanity check: this must really be the \"nothing left to focus\" fallback state, or \
+             the assertion below would pass for the wrong reason"
+        );
+        assert!(app.read_with(cx, |app, _| app.worktree_history_status.is_none()));
+
+        cx.simulate_keystrokes(SECONDARY_Z);
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.worktree_history_status.clone()),
+            Some("nothing to undo".to_string()),
+            "with focus on the app's fallback target - not a text widget anyone chose - \
+             secondary-z must still reach the worktree-level Undo and produce its real, honest \
+             status, never be swallowed by an empty text field's own history"
+        );
+    }
+
+    /// The fourth dangling-focus site of this shape, found by an independent adversarial audit
+    /// after the three already fixed on this branch: switching Settings pages away from
+    /// Keybindings left focus on that page's own now-unrendered filter field. GPUI then falls back
+    /// to the dispatch root with an **empty** context stack, against which every scoped predicate
+    /// is dead - so `secondary-z` reached neither undo system and vanished with no feedback at all.
+    ///
+    /// Asserts real feedback, not merely "the filter didn't change": silence is exactly the
+    /// symptom, so a test that only checked the text would have passed against the bug.
+    #[gpui::test]
+    fn secondary_z_still_reaches_a_real_handler_after_switching_away_from_the_keybindings_page(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        bind_real_keys(cx);
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_settings(window, cx);
+            app.select_settings_page(settings::SettingsPage::Keymap, window, cx);
+            window.focus(&app.settings_keymap_filter_focus_handle, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("abc");
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings_keymap_filter.as_str().to_string()),
+            "abc",
+            "sanity check: the filter must really be focused and receiving real keystrokes"
+        );
+
+        // Leave the page. The filter row stops being rendered entirely.
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(settings::SettingsPage::Appearance, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(app.read_with(cx, |app, _| app.worktree_history_status.is_none()));
+        cx.simulate_keystrokes(SECONDARY_Z);
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.worktree_history_status.clone()),
+            Some("nothing to undo".to_string()),
+            "with the filter no longer rendered, secondary-z must reach a real handler and \
+             produce real feedback - not fall into an empty dispatch context and vanish"
         );
     }
 }

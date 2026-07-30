@@ -20,6 +20,8 @@
 #[cfg(test)]
 use std::path::PathBuf;
 
+use std::time::Instant;
+
 use gpui::{div, font, prelude::*, px, ClickEvent, Context, KeyDownEvent, Window};
 
 use crate::keymap::{self, WindowControlsStyle};

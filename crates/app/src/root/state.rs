@@ -68,7 +68,7 @@ impl AdeApp {
             file_external_conflict: HashSet::new(),
             palette_open: false,
             palette_scope: palette::PaletteScope::default(),
-            palette_query: String::new(),
+            palette_query: text_history::TextField::new(),
             palette_selected: 0,
             palette_focus_handle: cx.focus_handle(),
             palette_focus: OverlayFocus::default(),
@@ -78,8 +78,9 @@ impl AdeApp {
             body_bounds: gpui::Bounds::default(),
             title_bar_move_armed: false,
             rail_mode: RailMode::default(),
-            filter_query: String::new(),
+            filter_query: text_history::TextField::new(),
             filter_focus_handle: cx.focus_handle(),
+            rail_focus_handle: cx.focus_handle(),
             diff_cache: HashMap::new(),
             worktree_notes: HashMap::new(),
             ahead_behind_cache: HashMap::new(),
@@ -157,7 +158,7 @@ impl AdeApp {
             settings_cfg_format: settings_store::CfgFormat::default(),
             lsp_rows: Vec::new(),
             _lsp_rows_task: None,
-            settings_keymap_filter: String::new(),
+            settings_keymap_filter: text_history::TextField::new(),
             settings_keymap_filter_focus_handle: cx.focus_handle(),
             keymap_recording: None,
             _keymap_intercept: None,
@@ -382,11 +383,13 @@ impl AdeApp {
         // open session at all (`Sessions::focus_active` has nothing to focus) - so if a
         // previously-focused session's pane belonged to the worktree just left, it's now exactly
         // as dangling as the case the comment above already covers, just with no session to
-        // redirect *onto*. Fall back to the rail's own filter field
-        // (`Self::filter_focus_handle`), which is part of the rendered tree whenever the
+        // redirect *onto*. Fall back to the rail's own root container
+        // (`Self::rail_focus_handle`), which is part of the rendered tree whenever the
         // workspace body is showing (never while Settings has replaced it - `!self.settings_open`
-        // guards that the same way `focus_newly_spawned_session` itself does) - real, if
-        // imperfect, UX (it makes the filter box look focused without being asked to), but it
+        // guards that the same way `focus_newly_spawned_session` itself does). Deliberately the
+        // rail's root, not its filter field, which this used to target - see
+        // `Self::rail_focus_handle`'s own docs for the real, audit-found keystroke-swallowing bug
+        // that became once the filter field started carrying a `"text-input"` key context. It
         // keeps the focused `FocusId` genuinely findable in the next rendered frame, which is the
         // actual invariant this exists to protect: a dangling `FocusId` makes GPUI's action
         // dispatch fall back to a disconnected root with no real `on_action` handlers at all, not
@@ -394,7 +397,7 @@ impl AdeApp {
         // included) until the next click.
         if self.sessions.active_id().is_none() && self.open_change.is_none() && !self.settings_open
         {
-            window.focus(&self.filter_focus_handle, cx);
+            window.focus(&self.rail_focus_handle, cx);
         }
         // The File view's own per-worktree state (a cached parse and diff lookup that are about
         // to belong to a different `file_tree_root`) - reset for the same reason as above.
