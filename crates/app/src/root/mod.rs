@@ -1081,6 +1081,7 @@ impl Render for AdeApp {
             .when_some(self.title_menu_open, |el, menu| {
                 el.child(self.render_title_menu(menu, cx))
             })
+            .children(self.render_hover_card(cx))
             .children(self.render_completions_popover(cx))
             .when(self.new_file_input.is_some(), |el| {
                 el.child(self.render_new_file_prompt(cx))

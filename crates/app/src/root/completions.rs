@@ -60,13 +60,20 @@ pub(super) enum CompletionsStatus {
 /// tail is never silently selectable via keyboard nav either.
 const MAX_RENDERED_COMPLETION_ITEMS: usize = 12;
 
-const POPOVER_WIDTH: gpui::Pixels = gpui::px(360.0);
-const POPOVER_ROW_HEIGHT: gpui::Pixels = gpui::px(24.0);
-/// 8 real rows' worth of [`POPOVER_ROW_HEIGHT`] plus the popover's own real `py(4.0)` top/bottom
+/// The popup's real total width - matches `design_handoff_jerry_ade/revision/Jerry.dc.html`'s
+/// own real completions-list column width (`290px`) plus its `1px` right divider (this app has
+/// no separate signature/doc detail pane the way the mockup's own two-column popup does - see
+/// [`AdeApp::render_completions_popover`]'s own docs for why a single, label+detail row is the
+/// deliberately narrower scope here), rounded up slightly (`gpui::px(300.0)`) so a real,
+/// moderately long label + detail pair doesn't visually crowd the popup's own right edge.
+const POPOVER_WIDTH: gpui::Pixels = gpui::px(300.0);
+/// The design mockup's own real completion-item row height (`Jerry.dc.html`: `height:22px`).
+const POPOVER_ROW_HEIGHT: gpui::Pixels = gpui::px(22.0);
+/// 8 real rows' worth of [`POPOVER_ROW_HEIGHT`] plus the popover's own real `py(3.0)` top/bottom
 /// padding (see [`AdeApp::render_completions_popover`]'s own padding) - not derived arithmetically
 /// from [`POPOVER_ROW_HEIGHT`] itself, since `gpui::Pixels`' inner `f32` is only `pub(crate)`
 /// inside `gpui`, not reachable for a real `const`-context multiply from this crate.
-const POPOVER_MAX_HEIGHT: gpui::Pixels = gpui::px(200.0);
+const POPOVER_MAX_HEIGHT: gpui::Pixels = gpui::px(182.0);
 
 impl AdeApp {
     /// Whether [`Self::completions`] is genuinely, *actionably* open *for the currently active
@@ -276,15 +283,26 @@ impl AdeApp {
             .overflow_hidden()
             .flex()
             .flex_col()
-            .py(gpui::px(4.0))
+            // `py(3.0)`, not `py(4.0)`: the design mockup's own completions-list column padding
+            // is `3px 0` (`Jerry.dc.html`: `padding:3px 0` on the `.290px` list column) - see
+            // `POPOVER_MAX_HEIGHT`'s own docs for why this exact value matters there too.
+            .py(gpui::px(3.0))
             .bg(theme::surface::POPOVER)
             .border_1()
             .border_color(theme::border::POPOVER)
-            .rounded(theme::radius::CARD)
+            // `CARD_SM` (`5px`), not `CARD` (`6px`) - the design mockup's own completions popup
+            // border-radius is `5px` (`Jerry.dc.html`: `border-radius:5px` on the popup itself),
+            // matching `crate::root::code_surface::AdeApp::render_hover_card`'s own popover,
+            // which already used the correct radius here.
+            .rounded(theme::radius::CARD_SM)
             .shadow(vec![BoxShadow::new(
                 shadow_x,
                 shadow_y,
-                gpui::black().opacity(0.55),
+                // `0.50`, not `0.55` - the design mockup's own completions popup shadow is
+                // `rgba(0,0,0,.5)` (`Jerry.dc.html`: `box-shadow:0 8px 20px rgba(0,0,0,.5)`),
+                // matching `theme::shadow::POPOVER`'s own doc comment, which already recorded
+                // the correct `0.50` even though this call site had drifted from it.
+                gpui::black().opacity(0.50),
             )
             .blur_radius(shadow_blur)])
             .font(gpui::font(theme::font::MONO))
@@ -303,28 +321,46 @@ impl AdeApp {
                 for (index, item) in items.iter().take(MAX_RENDERED_COMPLETION_ITEMS).enumerate() {
                     let (label, detail) = completion_view::completion_item_display(item);
                     let is_selected = index == *selected;
+                    let kind_badge = completion_view::completion_kind_badge(item.kind);
                     popover = popover.child(
                         gpui::div()
                             .id(("completion-item", index))
                             .flex_none()
                             .h(POPOVER_ROW_HEIGHT)
-                            .px(gpui::px(10.0))
+                            // `px(8.0)`, not `px(10.0)` - the design mockup's own completion-item
+                            // row padding is `0 8px` (`Jerry.dc.html`: `padding:0 8px` on each
+                            // `.completions` row).
+                            .px(gpui::px(8.0))
                             .flex()
                             .items_center()
                             .gap(gpui::px(8.0))
                             .cursor_pointer()
-                            .when(is_selected, |el| el.bg(theme::surface::CURRENT_LINE))
+                            // `theme::completions_popup::ITEM_SELECTED_BG` (`#243c50`), not
+                            // `theme::surface::CURRENT_LINE` (`#181c20`) - `CURRENT_LINE` is the
+                            // exact same hex as this popover's own background
+                            // (`theme::surface::POPOVER`), so the "selected" row highlight used
+                            // to be genuinely invisible; see that token's own docs.
+                            .when(is_selected, |el| {
+                                el.bg(theme::completions_popup::ITEM_SELECTED_BG)
+                            })
+                            .children(kind_badge.map(render_completion_kind_badge))
                             .child(
                                 gpui::div()
                                     .flex_1()
                                     .min_w_0()
-                                    .text_color(theme::text::PRIMARY)
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(if is_selected {
+                                        theme::completions_popup::ITEM_SELECTED_FG
+                                    } else {
+                                        theme::completions_popup::ITEM_FG
+                                    })
                                     .child(label),
                             )
                             .children(detail.map(|detail| {
                                 gpui::div()
                                     .flex_none()
-                                    .text_color(theme::text::DIM)
+                                    .text_size(gpui::px(10.0))
+                                    .text_color(theme::text::GHOST)
                                     .child(detail)
                             }))
                             // A real click both selects *and* accepts this row in one step -
@@ -364,11 +400,37 @@ impl AdeApp {
     }
 }
 
+/// A real completion item's kind badge - a 13x13 box with a one-letter glyph, colored per
+/// [`completion_view::CompletionKindBadge`] - matches the design mockup's own kind-badge markup
+/// exactly (`Jerry.dc.html`: `width:13px;height:13px;border-radius:2px` with `font:500 8px`).
+fn render_completion_kind_badge(kind: completion_view::CompletionKindBadge) -> gpui::AnyElement {
+    let (fg, bg) = match kind {
+        completion_view::CompletionKindBadge::Function => theme::completions_popup::KIND_FUNCTION,
+        completion_view::CompletionKindBadge::Variable => theme::completions_popup::KIND_VARIABLE,
+        completion_view::CompletionKindBadge::Type => theme::completions_popup::KIND_TYPE,
+    };
+    gpui::div()
+        .flex_none()
+        .w(gpui::px(13.0))
+        .h(gpui::px(13.0))
+        .rounded(theme::radius::MARK)
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(bg)
+        .text_color(fg)
+        .font(gpui::font(theme::font::MONO))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_size(gpui::px(8.0))
+        .child(kind.letter())
+        .into_any_element()
+}
+
 fn popover_message_row(text: &str) -> gpui::AnyElement {
     gpui::div()
         .flex_none()
         .h(POPOVER_ROW_HEIGHT)
-        .px(gpui::px(10.0))
+        .px(gpui::px(8.0))
         .flex()
         .items_center()
         .text_color(theme::text::FAINT)

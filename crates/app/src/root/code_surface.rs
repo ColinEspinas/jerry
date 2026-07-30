@@ -1540,7 +1540,6 @@ impl AdeApp {
         // Hover only applies to a file whose extension has a real LSP identity; cloned once here
         // and reused per row for the same reason as `file_uri` above.
         let hover_target = has_lsp.then(|| absolute_path.clone());
-        let hover_card = render_hover_card(self.hover.as_ref(), &absolute_path, cx);
         let row_line_height = px(self.effective_code_rem_px() * 1.6);
         let code_focus_handle = self.code_focus_handle.clone();
         let entity = cx.entity();
@@ -1550,8 +1549,13 @@ impl AdeApp {
             .as_ref()
             .filter(|(path, _)| path == &relative_path_buf)
             .map(|(_, message)| message.clone());
+        // Captured here, before `relative_path_buf` is moved into the row-builder closure below
+        // (`cx.processor`'s own `move` closure takes it by value) - the real fallback click
+        // handler further down (see its own docs) needs its own independent copy of both.
+        let has_buffer = self.edit_buffers.contains_key(&relative_path_buf);
+        let below_content_click_path = relative_path_buf.clone();
 
-        let code = uniform_list(
+        let mut code = uniform_list(
             "file-view-code",
             line_count,
             cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
@@ -1681,7 +1685,50 @@ impl AdeApp {
         // `rems()`, not `px()`, so this text scales with `zoom_scoped`'s rem-size override
         // below rather than the window's own (unused) default rem size.
         .text_size(rems(1.0))
-        .line_height(rems(1.6));
+        .line_height(rems(1.6))
+        // Lets a real test measure this real container's own painted bounds (see
+        // `editing::editing_tests::clicking_below_the_last_line_places_the_cursor_at_the_end_of_
+        // the_buffer`) - a no-op outside test builds, matching every other `debug_selector` in
+        // this crate.
+        .debug_selector(|| "file-view-code-list".to_string());
+
+        // Real bug fix (this revision): `uniform_list` only ever paints a real row element for a
+        // real line index - the real blank space below the last rendered row (whenever the
+        // file's content is shorter than the viewport) has no element at all, so a real click
+        // there used to be silently swallowed. This container-level handler is the real, honest
+        // fallback: it only ever fires for a click that no row's own `on_mouse_down`
+        // (`render_editable_file_view_line`, which always calls `cx.stop_propagation()`) already
+        // claimed, so it can never fire "underneath" an ordinary in-content click - matching
+        // every real code editor's own "click past the end of the buffer places the caret at its
+        // real end" behavior. Gated on a real edit buffer existing for this path (`has_buffer`):
+        // the read-only fallback view (`render_file_view_line`, no buffer) has no real caret to
+        // place at all.
+        if has_buffer {
+            let click_path = below_content_click_path;
+            let click_line_count = line_count;
+            code = code.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    window.focus(&this.code_focus_handle, cx);
+                    // A real click moves the caret somewhere the completions popup's own anchor
+                    // almost certainly no longer describes - same real dismiss-on-caret-move
+                    // reasoning as the per-row click handler in `crate::root::editing`.
+                    this.dismiss_completions();
+                    let Some(buffer) = this.edit_buffers.get_mut(&click_path) else {
+                        return;
+                    };
+                    let end = buffer.content.len();
+                    if event.modifiers.shift {
+                        buffer.select_to(end);
+                    } else {
+                        buffer.move_to(end);
+                    }
+                    this.code_cursor = Some(click_line_count.max(1));
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            );
+        }
 
         // The real `"file-editor"` key context and `Editor*` `on_action` handlers (Revision
         // R8.5a) live on `Self::render_code_surface`'s outer, focused "code-surface" div, not
@@ -1736,9 +1783,10 @@ impl AdeApp {
         if let Some(card) = diagnostics_card {
             body = body.child(card);
         }
-        if let Some(card) = hover_card {
-            body = body.child(card);
-        }
+        // Real Hover popover (this revision): no longer embedded here as an in-flow child - see
+        // `Self::render_hover_card`'s own docs for why it now paints as a real, absolutely-
+        // positioned top-level sibling instead (`crate::root::AdeApp::render`), the same real
+        // mechanism `Self::render_completions_popover` already established.
 
         body.child(status_bar).into_any_element()
     }
@@ -1892,26 +1940,96 @@ pub(super) fn render_diagnostics_card(
     Some(card.into_any_element())
 }
 
-/// Surface C's Hover-state card: signature, doc prose, module path, `F12 definition` footer.
-/// `None` when [`AdeApp::hover`] is `None`, or (defensively) belongs to a different file than
-/// `open_absolute_path`. The design anchors this under the caret as a floating popup, but this
-/// app has no floating-popup infrastructure, so - like [`render_diagnostics_card`] - it renders
-/// as a card below the code instead.
-pub(super) fn render_hover_card(
-    hover: Option<&HoverEntry>,
-    open_absolute_path: &Path,
-    cx: &mut Context<AdeApp>,
-) -> Option<gpui::AnyElement> {
-    let hover = hover.filter(|entry| entry.path == open_absolute_path)?;
+/// 220px - a soft cap on the real Hover popover's height, purely so
+/// [`AdeApp::render_hover_card`]'s own real "is there room below the hovered row" measurement
+/// (mirroring [`AdeApp::render_completions_popover`]'s identical `POPOVER_MAX_HEIGHT` judgment -
+/// see that constant's own docs) has a concrete number to compare real available space against,
+/// and so a real, unusually long doc string can't paint past the window. Not derived from the
+/// design mockup (`design_handoff_jerry_ade/revision/Jerry.dc.html`'s own hover card has no
+/// fixed height - it's exactly as tall as its own real content), just a practical, generous
+/// ceiling comfortably above what a real signature + doc + footer normally needs.
+const HOVER_CARD_MAX_HEIGHT: gpui::Pixels = px(220.0);
 
+impl AdeApp {
+    /// Surface C's real, token-anchored Hover popover (signature, doc prose, module path, `F12
+    /// definition` footer) - mirrors [`Self::render_completions_popover`]'s own real positioning
+    /// mechanism exactly, matching that method's own top-doc'd reasoning for why: both anchor off
+    /// a real, already-painted `(Bounds, ShapedLine)` pair and both paint as a real, absolutely-
+    /// positioned top-level sibling in [`Render::render`] (`crate::root::AdeApp::render`), never
+    /// nested inside the File view's own virtualized `uniform_list` - a popup anchored to one row
+    /// must not be clipped by that row's own scroll container.
+    ///
+    /// The one real difference from [`Self::render_completions_popover`]: this reads
+    /// [`Self::file_view_row_layout`] (every currently *visible* row, keyed by 1-based line
+    /// number) rather than [`Self::file_view_last_layout`]/[`Self::file_view_last_bounds`] (the
+    /// *caret's own* row alone). [`Self::hover`]'s own target line is the line a real click
+    /// landed a token on, which today always also happens to be wherever the caret just moved to
+    /// (`crate::root::editing`'s click handler moves the caret and requests hover from the same
+    /// click) - but reading the hovered line's own real layout entry directly is still the more
+    /// directly correct real position to anchor from, not a second, independently-computed one
+    /// that merely happens to agree in practice.
+    ///
+    /// `None` whenever there's nothing real to anchor to: no [`Self::hover`] entry, the entry
+    /// belongs to a file that isn't the one currently on screen, or the hovered row's own real
+    /// layout isn't in [`Self::file_view_row_layout`] right now (e.g. scrolled out of view since
+    /// the click landed) - the same honest "degrade to nothing rather than paint at a guessed
+    /// position" discipline [`Self::render_completions_popover`] already established.
+    pub(super) fn render_hover_card(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let hover = self.hover.as_ref()?;
+        let active_relative = self.active_editable_path()?;
+        if hover.path != self.file_tree_root.join(&active_relative) {
+            return None;
+        }
+        let (row_bounds, shaped) = self.file_view_row_layout.get(&hover.line_number)?;
+
+        let anchor_x = row_bounds.left() + shaped.x_for_index(hover.byte_range.start);
+        let row_top = row_bounds.top();
+        let row_bottom = row_bounds.bottom();
+
+        // Flip above the hovered row when there isn't real room below it in the window body -
+        // the same real "measure real available space, flip if it doesn't fit" judgment
+        // `Self::render_completions_popover` already makes (see that method's own docs for the
+        // `vendor/zed` precedent this follows).
+        let space_below = self.body_bounds.bottom() - row_bottom;
+        let fits_below = space_below >= HOVER_CARD_MAX_HEIGHT;
+        let top = if fits_below {
+            row_bottom
+        } else {
+            (row_top - HOVER_CARD_MAX_HEIGHT).max(self.body_bounds.top())
+        };
+
+        Some(render_hover_card_content(hover, anchor_x, top, cx))
+    }
+}
+
+/// The real Hover popover's own content - split out of [`AdeApp::render_hover_card`] purely so
+/// the real positioning math above (which needs `&self`) stays visually separate from the real
+/// per-status content build below (which doesn't) - mirrors
+/// [`AdeApp::render_completions_popover`]'s own inline match, just factored into its own function
+/// since this one has a real early-return position/anchor computation ahead of it.
+fn render_hover_card_content(
+    hover: &HoverEntry,
+    anchor_x: Pixels,
+    top: Pixels,
+    cx: &mut Context<AdeApp>,
+) -> gpui::AnyElement {
     let mut card = div()
+        .id("hover-card")
+        // Lets a real test measure this real popover's own painted bounds (`debug_bounds` reads
+        // this, not `.id(..)` - see `hover_popover_position_tests`) - a no-op outside test
+        // builds, matching every other `debug_selector` in this crate.
+        .debug_selector(|| "hover-card".to_string())
+        .absolute()
+        .left(anchor_x)
+        .top(top)
         .flex_none()
         .flex()
         .flex_col()
         .gap(px(4.0))
         .p(px(10.0))
-        .m(px(8.0))
         .max_w(px(430.0))
+        .max_h(HOVER_CARD_MAX_HEIGHT)
+        .overflow_hidden()
         .rounded(theme::radius::CARD_SM)
         .bg(theme::surface::POPOVER)
         .border_1()
@@ -2001,7 +2119,7 @@ pub(super) fn render_hover_card(
         }
     }
 
-    Some(card.into_any_element())
+    card.into_any_element()
 }
 
 /// The diff view's `⋯ N unchanged lines` fold marker. `N` is derived from the hunks' `@@ ... @@`
@@ -4131,6 +4249,202 @@ mod stale_completions_popup_tests {
             app.read_with(cx, |app, _| app.completions.is_none()),
             "reopening the same path after its tab was closed must not resurrect a stale popup \
              from before the close"
+        );
+    }
+}
+
+/// Real regression coverage for bug 2 in this revision's brief: the Hover popover used to render
+/// at a fixed position (an in-flow card below the code, effectively at whatever a given render
+/// pass's flow put it - in practice, the bottom of the visible content) instead of anchored near
+/// the real hovered token. These tests bypass the real `textDocument/hover` round trip entirely
+/// (seeding [`AdeApp::hover`] directly, the same established pattern
+/// `stale_completions_popup_tests::fake_ready_entry` already uses for completions) since the bug
+/// and its fix are purely about *where* an already-resolved hover result paints, never about the
+/// real LSP request/response plumbing itself (out of scope per this revision's own brief).
+#[cfg(test)]
+mod hover_popover_position_tests {
+    use super::*;
+    use gpui::{Entity, TestAppContext};
+
+    fn seed_ready_hover_for_line(
+        app: &Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        path: PathBuf,
+        line_number: usize,
+    ) {
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path,
+                line_number,
+                byte_range: 0..3,
+                position: lsp_core::lsp_types::Position {
+                    line: line_number as u32 - 1,
+                    character: 0,
+                },
+                status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                    module_path: None,
+                    signature: "fn real_symbol()".to_string(),
+                    doc: None,
+                })),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    /// The real, load-bearing proof that the popover is anchored to the real hovered row, not
+    /// painted at a fixed position: seeding the exact same [`HoverEntry`] content for two
+    /// different real lines must move the real painted popover to two different real positions,
+    /// each one genuinely close to that line's own real painted row - a fixed-position popover
+    /// (the pre-fix bug) would paint at the same spot regardless of which line was hovered.
+    #[gpui::test]
+    fn the_real_painted_hover_card_moves_with_the_real_hovered_row(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.txt");
+        std::fs::write(&file_path, "one\ntwo\nthree\nfour\nfive\n").expect("write sample.txt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+
+        let row_2_bounds = app
+            .read_with(cx, |app, _| app.file_view_row_layout.get(&2).cloned())
+            .map(|(bounds, _)| bounds)
+            .expect("line 2's real row should have painted real layout by now");
+        let row_4_bounds = app
+            .read_with(cx, |app, _| app.file_view_row_layout.get(&4).cloned())
+            .map(|(bounds, _)| bounds)
+            .expect("line 4's real row should have painted real layout by now");
+        assert!(
+            row_4_bounds.top() > row_2_bounds.top(),
+            "sanity check: line 4 must really paint below line 2"
+        );
+
+        seed_ready_hover_for_line(&app, cx, file_path.clone(), 2);
+        let card_for_line_2 = cx
+            .debug_bounds("hover-card")
+            .expect("the real hover card should have painted real bounds for line 2");
+        assert!(
+            (card_for_line_2.top() - row_2_bounds.bottom()).abs() < gpui::px(2.0),
+            "the real hover card for line 2 must paint directly under line 2's own real row \
+             (row bottom {:?}, card top {:?})",
+            row_2_bounds.bottom(),
+            card_for_line_2.top()
+        );
+
+        seed_ready_hover_for_line(&app, cx, file_path, 4);
+        let card_for_line_4 = cx
+            .debug_bounds("hover-card")
+            .expect("the real hover card should have painted real bounds for line 4");
+        assert!(
+            (card_for_line_4.top() - row_4_bounds.bottom()).abs() < gpui::px(2.0),
+            "the real hover card for line 4 must paint directly under line 4's own real row \
+             (row bottom {:?}, card top {:?})",
+            row_4_bounds.bottom(),
+            card_for_line_4.top()
+        );
+
+        assert!(
+            card_for_line_4.top() > card_for_line_2.top(),
+            "hovering a real, later line must move the real painted popover further down - a \
+             fixed-position popover (the real bug this revision fixes) would paint both at the \
+             exact same spot: line 2's card was at {:?}, line 4's card was at {:?}",
+            card_for_line_2.top(),
+            card_for_line_4.top()
+        );
+    }
+
+    /// The real popover's horizontal anchor tracks the real hovered token's own column, not a
+    /// fixed left offset either - hovering a token further into a line must shift the real
+    /// painted card's own real left edge to the right by roughly the same real pixel distance.
+    #[gpui::test]
+    fn the_real_painted_hover_card_moves_horizontally_with_the_real_hovered_column(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.txt");
+        std::fs::write(&file_path, "aaaa bbbb cccc dddd\n").expect("write sample.txt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+
+        let row_bounds = app
+            .read_with(cx, |app, _| app.file_view_row_layout.get(&1).cloned())
+            .map(|(bounds, _)| bounds)
+            .expect("line 1's real row should have painted real layout by now");
+
+        // Hover the first token (byte 0..4, "aaaa").
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path.clone(),
+                line_number: 1,
+                byte_range: 0..4,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                    module_path: None,
+                    signature: "fn real_symbol()".to_string(),
+                    doc: None,
+                })),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let card_for_first_token = cx
+            .debug_bounds("hover-card")
+            .expect("the real hover card should have painted real bounds for the first token");
+
+        // Hover the last token (byte 15..19, "dddd") on the exact same line.
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path,
+                line_number: 1,
+                byte_range: 15..19,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 15,
+                },
+                status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                    module_path: None,
+                    signature: "fn real_symbol()".to_string(),
+                    doc: None,
+                })),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let card_for_last_token = cx
+            .debug_bounds("hover-card")
+            .expect("the real hover card should have painted real bounds for the last token");
+
+        assert!(
+            card_for_last_token.left() > card_for_first_token.left(),
+            "hovering a real token further into the same line must move the real painted card's \
+             own real left edge to the right - a fixed-position popover would paint both at the \
+             exact same horizontal spot: first-token card was at {:?}, last-token card was at \
+             {:?} (row bounds: {:?})",
+            card_for_first_token.left(),
+            card_for_last_token.left(),
+            row_bounds
         );
     }
 }

@@ -135,6 +135,55 @@ pub fn completion_item_display(item: &lsp_types::CompletionItem) -> (String, Opt
     (item.label.clone(), detail)
 }
 
+/// The Completions popup's real kind-badge category (design:
+/// `design_handoff_jerry_ade/revision/Jerry.dc.html`'s own `f`/`v`/`t` kind badges, lines
+/// ~1792-1793 and ~467-473) - a coarse grouping of the much finer-grained real
+/// `lsp_types::CompletionItemKind` a server actually reports, kept here (not in
+/// `crate::root::completions`) so the mapping is testable without a live `gpui` window, matching
+/// this module's own gpui-free convention (see this module's own top docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionKindBadge {
+    Function,
+    Variable,
+    Type,
+}
+
+impl CompletionKindBadge {
+    /// The one-letter glyph the popup's real kind badge paints - `f`/`v`/`t`, matching the design
+    /// mockup's own real `c.kind` values byte-for-byte.
+    pub fn letter(self) -> &'static str {
+        match self {
+            Self::Function => "f",
+            Self::Variable => "v",
+            Self::Type => "t",
+        }
+    }
+}
+
+/// Maps a real `lsp_types::CompletionItemKind` (from a real `CompletionItem::kind`, `None` for a
+/// server that didn't report one) onto the popup's three-way real kind badge - `None` for any
+/// real kind the design mockup's own three-category badge has no real slot for (`Keyword`,
+/// `Snippet`, `File`, ...), which [`crate::root::completions`]'s render simply skips (no badge at
+/// all), never a guessed/default category.
+pub fn completion_kind_badge(
+    kind: Option<lsp_types::CompletionItemKind>,
+) -> Option<CompletionKindBadge> {
+    use lsp_types::CompletionItemKind as Kind;
+    match kind? {
+        Kind::FUNCTION | Kind::METHOD | Kind::CONSTRUCTOR => Some(CompletionKindBadge::Function),
+        Kind::VARIABLE | Kind::FIELD | Kind::PROPERTY | Kind::CONSTANT | Kind::ENUM_MEMBER => {
+            Some(CompletionKindBadge::Variable)
+        }
+        Kind::CLASS
+        | Kind::STRUCT
+        | Kind::INTERFACE
+        | Kind::ENUM
+        | Kind::TYPE_PARAMETER
+        | Kind::MODULE => Some(CompletionKindBadge::Type),
+        _ => None,
+    }
+}
+
 /// A completion item's byte range, purely for a caller (`crate::root::completions`) that already
 /// has a resolved fallback `Range<usize>` (the identifier prefix, per [`identifier_prefix_start`])
 /// and just needs a shared type - kept here only as a doc anchor; the real conversion from
@@ -297,6 +346,70 @@ mod tests {
     fn identifier_prefix_start_is_the_cursor_itself_with_no_real_prefix() {
         assert_eq!(identifier_prefix_start("foo.", 4), 4);
         assert_eq!(identifier_prefix_start("", 0), 0);
+    }
+
+    #[test]
+    fn completion_kind_badge_groups_function_like_kinds() {
+        assert_eq!(
+            completion_kind_badge(Some(lsp_types::CompletionItemKind::FUNCTION)),
+            Some(CompletionKindBadge::Function)
+        );
+        assert_eq!(
+            completion_kind_badge(Some(lsp_types::CompletionItemKind::METHOD)),
+            Some(CompletionKindBadge::Function)
+        );
+        assert_eq!(
+            completion_kind_badge(Some(lsp_types::CompletionItemKind::CONSTRUCTOR)),
+            Some(CompletionKindBadge::Function)
+        );
+    }
+
+    #[test]
+    fn completion_kind_badge_groups_variable_like_kinds() {
+        assert_eq!(
+            completion_kind_badge(Some(lsp_types::CompletionItemKind::VARIABLE)),
+            Some(CompletionKindBadge::Variable)
+        );
+        assert_eq!(
+            completion_kind_badge(Some(lsp_types::CompletionItemKind::FIELD)),
+            Some(CompletionKindBadge::Variable)
+        );
+        assert_eq!(
+            completion_kind_badge(Some(lsp_types::CompletionItemKind::CONSTANT)),
+            Some(CompletionKindBadge::Variable)
+        );
+    }
+
+    #[test]
+    fn completion_kind_badge_groups_type_like_kinds() {
+        assert_eq!(
+            completion_kind_badge(Some(lsp_types::CompletionItemKind::STRUCT)),
+            Some(CompletionKindBadge::Type)
+        );
+        assert_eq!(
+            completion_kind_badge(Some(lsp_types::CompletionItemKind::CLASS)),
+            Some(CompletionKindBadge::Type)
+        );
+        assert_eq!(
+            completion_kind_badge(Some(lsp_types::CompletionItemKind::ENUM)),
+            Some(CompletionKindBadge::Type)
+        );
+    }
+
+    #[test]
+    fn completion_kind_badge_is_none_for_a_kind_with_no_real_badge_slot_or_no_kind_at_all() {
+        assert_eq!(
+            completion_kind_badge(Some(lsp_types::CompletionItemKind::KEYWORD)),
+            None
+        );
+        assert_eq!(completion_kind_badge(None), None);
+    }
+
+    #[test]
+    fn completion_kind_badge_letters_match_the_design_mockups_own_glyphs() {
+        assert_eq!(CompletionKindBadge::Function.letter(), "f");
+        assert_eq!(CompletionKindBadge::Variable.letter(), "v");
+        assert_eq!(CompletionKindBadge::Type.letter(), "t");
     }
 
     #[test]

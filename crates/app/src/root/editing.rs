@@ -1216,8 +1216,24 @@ pub(super) fn render_editable_file_view_line(
             }),
         );
 
+    // `.w_full()` (real fix, this revision): without it, a real GPUI row painted at the root of
+    // `uniform_list`'s per-item layout sizes itself to its own content (shrink-to-fit), not to
+    // the list's full available width - confirmed by measuring `file-view-text-row-N`'s own real
+    // painted bounds, which used to differ per line length. That made a real click land nowhere
+    // (no element to hit-test against) anywhere past a short line's own last glyph: not in the
+    // blank space to the right of short text, and not on a blank line at all past column zero -
+    // exactly the real "click only works on existing text" bug this revision fixes. `.w_full()`
+    // makes every row (and, since `text_row`/its wrapper are already `.flex_1()`, the click
+    // target nested inside it) span the row's real full available width regardless of content,
+    // so `text_row`'s own `on_mouse_down` below - which already correctly clamps via
+    // `gpui::LineLayout::closest_index_for_x` returning the shaped line's real length for any `x`
+    // past its last glyph - now actually receives the click in the first place. A same-width
+    // real side effect: the current-line highlight below now also spans the row's full width,
+    // matching every real code editor's own current-line highlight instead of stopping at the
+    // last character.
     let mut row = gpui::div()
         .id(("file-view-line", line_number))
+        .w_full()
         .flex_none()
         .flex()
         .items_center();
@@ -2070,9 +2086,16 @@ mod editing_tests {
     /// reading `this.edit_buffers` directly instead of a second entity handle, and (b) rendering
     /// the visible glyphs from real, content-sized `div`s (matching the read-only path) with the
     /// `canvas` demoted to an absolutely-positioned overlay - see `render_editable_file_view_line`'s
-    /// own docs for both fixes in full. This test measures a real row's real painted width to
-    /// confirm it now actually reflects real line content, not a fixed collapsed constant, before
-    /// clicking inside it.
+    /// own docs for both fixes in full.
+    ///
+    /// A later revision (this one) made every row `.w_full()` (see that call's own docs) to fix a
+    /// *third* bug in the same family: a row that stayed content-sized could never be clicked
+    /// anywhere past its own last glyph. That real behavior change is exactly what this test now
+    /// measures instead of the old "longer content paints a wider row" assertion, which the fix
+    /// makes structurally false (every row now paints the list's own full available width,
+    /// regardless of content) - `clicking_past_the_end_of_a_short_line_places_the_cursor_at_the_
+    /// end_of_that_line`, below, is what now covers the "real content past the first glyph is
+    /// genuinely clickable" property this test used to be the one proving.
     #[gpui::test]
     fn clicking_a_real_editable_row_places_the_real_cursor_without_panicking(
         cx: &mut TestAppContext,
@@ -2093,13 +2116,12 @@ mod editing_tests {
         let long_row_bounds = cx
             .debug_bounds("file-view-text-row-2")
             .expect("line 2's real text row should have painted real bounds");
-        assert!(
-            long_row_bounds.size.width > short_row_bounds.size.width,
-            "a real, longer line's row must paint measurably wider than a shorter line's - \
-             confirms the row's real width tracks real content, not a fixed collapsed constant \
-             (short: {:?}, long: {:?})",
-            short_row_bounds.size.width,
-            long_row_bounds.size.width
+        assert_eq!(
+            short_row_bounds.size.width, long_row_bounds.size.width,
+            "every row now spans the list's real full available width regardless of its own \
+             content - a short line's row and a long line's row must paint the exact same real \
+             width (short: {:?}, long: {:?})",
+            short_row_bounds.size.width, long_row_bounds.size.width
         );
 
         let row_bounds = long_row_bounds;
@@ -2129,6 +2151,151 @@ mod editing_tests {
             "an ordinary click (no shift) should place a caret, not a selection"
         );
         assert_eq!(app.read_with(cx, |app, _| app.code_cursor), Some(2));
+    }
+
+    /// Real regression coverage for real bug 1 in this revision's brief: "click-to-place-cursor
+    /// only works on existing text, not anywhere in the editor". Before the `.w_full()` fix (see
+    /// that call's own docs, in `render_editable_file_view_line`), a short line's row painted
+    /// only as wide as its own glyphs, so a click landing in the real, visible blank space to the
+    /// right of a short line's text had no element under it at all - the click was silently
+    /// swallowed, nothing moved. `gpui::LineLayout::closest_index_for_x` (which the row's own
+    /// `on_mouse_down` already calls) has always correctly clamped an out-of-range `x` to the
+    /// shaped line's own real length; the missing piece was purely that the row never extended
+    /// far enough to receive that click in the first place.
+    #[gpui::test]
+    fn clicking_past_the_end_of_a_short_line_places_the_cursor_at_the_end_of_that_line(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(
+            repo.path(),
+            "sample.txt",
+            "a short line\nworld, a longer real line of text that runs on for a while\n",
+        );
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        let relative = PathBuf::from("sample.txt");
+
+        let short_row_bounds = cx
+            .debug_bounds("file-view-text-row-1")
+            .expect("line 1's real text row should have painted real bounds");
+
+        // Clearly past "a short line"'s own 12 real glyphs (the row is now real full width, per
+        // the fix above) - a point an old, content-sized row would never have painted an element
+        // under at all.
+        let click_point = gpui::point(
+            short_row_bounds.right() - gpui::px(4.0),
+            short_row_bounds.center().y,
+        );
+        cx.simulate_click(click_point, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let (cursor_line, cursor_col) = app.read_with(cx, |app, _| {
+            let buffer = app.edit_buffers.get(&relative).expect("buffer");
+            buffer.line_col_for_offset(buffer.cursor_offset())
+        });
+        assert_eq!(
+            cursor_line, 0,
+            "the click was on line 1's own row - the real caret must land on line 1, not be \
+             silently swallowed or misplaced onto another line"
+        );
+        assert_eq!(
+            cursor_col,
+            "a short line".len(),
+            "clicking past a short line's own last glyph must clamp the real caret to that \
+             line's real end, not leave it at column 0 (which a swallowed/no-op click would look \
+             like) or panic"
+        );
+        assert_eq!(app.read_with(cx, |app, _| app.code_cursor), Some(1));
+    }
+
+    /// Real regression coverage for the other half of real bug 1: clicking on a real blank line
+    /// (no glyphs at all) must still place the real caret there, not silently do nothing. Before
+    /// the `.w_full()` fix, an empty line's row had essentially zero content-derived width, so -
+    /// like a short line's trailing blank space - there was no real element for a click landing
+    /// anywhere but the very first pixel column to hit-test against.
+    #[gpui::test]
+    fn clicking_on_a_real_blank_line_places_the_cursor_there(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.txt", "first\n\nthird\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        let relative = PathBuf::from("sample.txt");
+
+        let blank_row_bounds = cx
+            .debug_bounds("file-view-text-row-2")
+            .expect("the real blank line 2 must still paint a real, clickable row");
+        assert!(
+            blank_row_bounds.size.width > gpui::px(100.0),
+            "a blank line's row must still span the row's real full available width, not \
+             collapse to near-zero - measured {:?}",
+            blank_row_bounds.size.width
+        );
+
+        cx.simulate_click(blank_row_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let (cursor_line, cursor_col) = app.read_with(cx, |app, _| {
+            let buffer = app.edit_buffers.get(&relative).expect("buffer");
+            buffer.line_col_for_offset(buffer.cursor_offset())
+        });
+        assert_eq!(
+            cursor_line, 1,
+            "clicking the real blank second line must place the real caret on that line"
+        );
+        assert_eq!(cursor_col, 0, "a blank line's only real valid column is 0");
+        assert_eq!(app.read_with(cx, |app, _| app.code_cursor), Some(2));
+    }
+
+    /// Real regression coverage for the other real symptom bug 1's brief calls out: clicking in
+    /// the real blank area *below* the last line of content (still inside the File view's own
+    /// viewport, just past every real rendered row) must place the real caret at the real end of
+    /// the buffer, matching every real code editor, instead of being silently swallowed because
+    /// `uniform_list` only ever paints rows for real line indices.
+    #[gpui::test]
+    fn clicking_below_the_last_line_places_the_cursor_at_the_end_of_the_buffer(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.txt", "one\ntwo\nthree");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        let relative = PathBuf::from("sample.txt");
+
+        let last_row_bounds = cx
+            .debug_bounds("file-view-text-row-3")
+            .expect("the real last line's row should have painted real bounds");
+        let list_bounds = cx
+            .debug_bounds("file-view-code-list")
+            .expect("the real code list container should have painted real bounds");
+
+        // Real, genuinely below every rendered row, but still real, live-clickable space inside
+        // the code list's own real viewport - a real editor's own tail-of-buffer clickable area.
+        let click_point = gpui::point(
+            last_row_bounds.center().x,
+            (last_row_bounds.bottom() + gpui::px(20.0)).min(list_bounds.bottom() - gpui::px(1.0)),
+        );
+        cx.simulate_click(click_point, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let expected_end = app.read_with(cx, |app, _| {
+            let buffer = app.edit_buffers.get(&relative).expect("buffer");
+            buffer.content.len()
+        });
+        let (cursor_offset, selected_range) = app.read_with(cx, |app, _| {
+            let buffer = app.edit_buffers.get(&relative).expect("buffer");
+            (buffer.cursor_offset(), buffer.selected_range.clone())
+        });
+        assert_eq!(
+            cursor_offset, expected_end,
+            "clicking below the last line must place the real caret at the real end of the \
+             buffer, not leave it wherever it was (a swallowed click) or panic"
+        );
+        assert!(
+            selected_range.is_empty(),
+            "an ordinary click below the content (no shift) must place a caret, not a selection"
+        );
+        assert_eq!(app.read_with(cx, |app, _| app.code_cursor), Some(3));
     }
 
     /// Regression coverage for a real bug an audit caught: seeding an editable buffer from a

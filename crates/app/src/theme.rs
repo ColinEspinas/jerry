@@ -572,6 +572,36 @@ pub mod tag {
     pub const TREE_MODIFIED: ColorToken = hex(0xa3873f); // "M" mark
 }
 
+/// Exact colours for Surface C's real Completions popup item rows - read directly from
+/// `design_handoff_jerry_ade/revision/Jerry.dc.html`'s own `completions`/`KBG`/`KFG` data (the
+/// `sel ? ... : ...` ternaries around line 2289, and the `KBG`/`KFG` maps around line 1792) - not
+/// reused from any nearby-but-not-identical existing token (e.g. [`super::text::SELECTED`]
+/// (`#dde2e7`) is a real, different colour from this module's own [`ITEM_SELECTED_FG`]
+/// (`#e3e8ed`), and [`super::surface::CURRENT_LINE`] (`#181c20`) - the File view's current-line
+/// tint - is the exact same hex as [`super::surface::POPOVER`] itself, which is why reusing it as
+/// the selected-row highlight here used to paint an invisible selection).
+pub mod completions_popup {
+    use super::{hex, ColorToken};
+
+    /// A selected completion row's real background (`Jerry.dc.html`: `c.sel ? '#243c50' : ...`).
+    pub const ITEM_SELECTED_BG: ColorToken = hex(0x243c50);
+    /// A selected completion row's real label colour (`Jerry.dc.html`: `c.sel ? '#e3e8ed' : ...`).
+    pub const ITEM_SELECTED_FG: ColorToken = hex(0xe3e8ed);
+    /// An unselected completion row's real label colour (`Jerry.dc.html`: `... : '#b8bfc6'`) -
+    /// the exact same hex as [`super::text::BODY`], reused directly rather than duplicated.
+    pub const ITEM_FG: ColorToken = super::text::BODY;
+
+    /// `(fg, bg)` for a `function`/`method`/`constructor`-shaped completion item's kind badge
+    /// (`Jerry.dc.html`'s `KFG.f`/`KBG.f`).
+    pub const KIND_FUNCTION: (ColorToken, ColorToken) = (hex(0x8fbde6), hex(0x243c50));
+    /// `(fg, bg)` for a `variable`/`field`/`property`/`constant`-shaped completion item's kind
+    /// badge (`Jerry.dc.html`'s `KFG.v`/`KBG.v`).
+    pub const KIND_VARIABLE: (ColorToken, ColorToken) = (hex(0xd8a94a), hex(0x33280f));
+    /// `(fg, bg)` for a `class`/`struct`/`interface`/`enum`/`type`-shaped completion item's kind
+    /// badge (`Jerry.dc.html`'s `KFG.t`/`KBG.t`).
+    pub const KIND_TYPE: (ColorToken, ColorToken) = (hex(0xc294e0), hex(0x33203e));
+}
+
 /// Settings-surface-only colours read directly from `Jerry.dc.html`'s inline literals for the
 /// `settingsOpen` block - real values present in the mockup but missing from `tokens.rs`'s
 /// transcription (predates the Settings section). Every other Settings colour reuses an
