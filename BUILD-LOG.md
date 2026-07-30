@@ -1763,3 +1763,27 @@ call sites really do route through `ColorToken::resolve()` against the live-sele
 Independently re-verified directly: all four gates clean (one run hit the documented
 diff-highlight-cache flake under full-suite parallel ordering, confirmed unrelated by two
 clean re-runs), 707 app tests passing.
+
+## Editor UX pass: click-anywhere cursor, real hover anchoring, completions styling
+
+Three real bugs. Click-to-place-cursor only worked on existing text: each editable line's row
+div sized itself to its own text content's width, so a short line's row painted only as wide
+as its glyphs - clicking to the right of it, on a blank line past column 0, or below the last
+line hit no element at all. Made the row span the full row width so the click target matches
+what's visually clickable; added a fallback for clicks below the last rendered row, moving the
+cursor to the real end of the buffer.
+
+Hover/go-to-definition popups rendered at a fixed bottom-of-window position instead of
+anchored near the real hovered content - converted hover-card rendering into a real
+cursor-anchored overlay reusing Revision R8.5b's own completions-popover anchoring mechanism
+(anchor off the real painted line bounds, flip above if there's no room below), painted as a
+top-level sibling so it isn't clipped by the file view's virtualized scroll container.
+
+Completions popup styling had drifted from the design mockup - the most significant find: the
+selected-item highlight used the exact same hex color as the popup's own background, making
+the "selected" row genuinely invisible. Fixed with a real, visually distinct token, plus
+corrected row height/corner radius/shadow opacity/padding against the real mockup values.
+
+Independently re-verified directly: all four gates clean, the invisible-selection bug
+spot-checked directly in source, full workspace test suite green at 717 app tests (up from
+707).
