@@ -15,11 +15,20 @@
 //! `PtySession::output()` is a bounded `std::sync::mpsc::Receiver<Vec<u8>>`; rather than a
 //! second dedicated OS thread to bridge it, this drains it with non-blocking `try_recv()`
 //! from inside a GPUI foreground async task that wakes every [`POLL_INTERVAL`] via
-//! `cx.background_executor().timer(..)` - the same "batch-drain-then-notify" shape Zed's own
-//! `terminal` crate uses for its PTY event loop (`vendor/zed/crates/terminal/src/terminal.rs`,
-//! `cx.spawn` + `cx.background_executor().timer`). `try_recv()` never blocks, but see
-//! [`MAX_CHUNKS_PER_TICK`] for why the drain loop itself is still bounded - "never blocks"
+//! `cx.background_executor().timer(..)`. `try_recv()` never blocks, but see
+//! [`MAX_BYTES_PER_TICK`] for why the drain loop itself is still bounded - "never blocks"
 //! isn't the same as "bounded work per call".
+//!
+//! This is a *poller*, and that is a real, deliberate difference from Zed's own terminal, which
+//! is event-driven: `vendor/zed/crates/terminal/src/terminal.rs`'s event loop blocks on
+//! `self.events_rx.next().await` (a `futures` channel fed by `alacritty_terminal`'s own reader
+//! thread), processes the first event immediately "for lowered latency", and only then
+//! coalesces further events behind a 4ms timer. It can do that because its producer is an async
+//! channel; `pty_core::PtySession::output()` is a `std::sync::mpsc::Receiver`, which has no
+//! `await`, so bridging it event-driven would need a second OS thread per pane purely to turn
+//! blocking `recv()`s into wakeups. Polling avoids that thread, at the cost of up to one
+//! [`POLL_INTERVAL`] of latency per byte - which is why that interval is sized against the
+//! frame budget rather than picked as a "redraw rate"; see its own docs.
 //!
 //! ## Input
 //!
@@ -67,18 +76,54 @@ use crate::terminal_links::{self, LinkMatch};
 use crate::theme;
 
 /// How often the foreground poll task wakes up to drain any pty output that has arrived
-/// and, if there was any, re-render. 33ms is close to a 30fps redraw rate: fast enough that
-/// streaming shell output feels live, without re-rendering every single byte.
-const POLL_INTERVAL: Duration = Duration::from_millis(33);
+/// and, if there was any, re-render.
+///
+/// 8ms, i.e. roughly twice per 60Hz frame, so a byte that arrives from the child is decoded
+/// into the grid within the same frame it arrived in. This was 33ms ("close to a 30fps redraw
+/// rate"), which was measurably wrong on two counts, both confirmed against a real streaming
+/// child in a release build:
+///
+/// - **It was not a redraw *rate*, it was a sleep *between* drains.** The loop's real period is
+///   `POLL_INTERVAL` plus however long the tick's own work took, so 33ms produced ~24 ticks/s,
+///   not 30 - and every one of those ticks found output already waiting, meaning the loop spent
+///   >99% of its time asleep on top of bytes that had already arrived.
+/// - **It throttled the child.** `pty-core`'s output channel is bounded and deliberately
+///   backpressures (see that crate's docs), so a drain that runs 24x/s with a bounded per-tick
+///   budget caps how fast the child is *allowed* to write. Measured against a child that
+///   streams 4.3MB/s standalone, the pane consumed 0.80MB/s - the UI was holding the process
+///   to ~19% of its natural speed, and the visible grid ran correspondingly behind.
+///
+/// Polling this often is not expensive when there is nothing to do: an empty tick is one
+/// `try_recv` returning `Empty`, and `cx.notify()` is only called when bytes actually arrived,
+/// so an idle pane still invalidates zero frames. `vendor/zed/crates/terminal/src/terminal.rs`
+/// uses a 4ms window for the same job (it coalesces pty events for 4ms before re-rendering).
+const POLL_INTERVAL: Duration = Duration::from_millis(8);
 
-/// Defensive cap on how many output chunks a single poll tick will drain and decode on the
-/// GPUI foreground thread. Without this, a firehose child (`yes`, a chatty build tool) could
+/// Defensive cap on how many output *bytes* a single poll tick will drain and decode on the
+/// GPUI foreground thread. Without a cap, a firehose child (`yes`, a chatty build tool) could
 /// hand the poll loop the full contents of `pty-core`'s bounded output channel (~1MB) to
 /// decode in a single tick, on the same thread responsible for input handling and
-/// re-rendering. Capping chunks-per-tick spreads that cost across ticks instead - whatever
-/// isn't drained is still sitting in the channel (pty-core's reader thread backpressures)
-/// and gets picked up next tick.
-const MAX_CHUNKS_PER_TICK: usize = 64;
+/// re-rendering. Capping the per-tick budget spreads that cost across ticks instead - whatever
+/// isn't drained is still sitting in the channel (pty-core's reader thread backpressures) and
+/// gets picked up next tick.
+///
+/// This is deliberately a byte bound, not the chunk-count bound it replaced
+/// (`MAX_CHUNKS_PER_TICK = 64`). A chunk is "whatever one `read(2)` on the pty master returned", which ranges
+/// from a couple of dozen bytes to a full `pty_core` read buffer - so a chunk-count cap
+/// bounded a tick's real work only to within orders of magnitude, and in practice bound it far
+/// too tightly: measured against a real streaming child, *every single tick* hit the 64-chunk
+/// cap while carrying only ~29KB, i.e. the cap was throttling throughput rather than defending
+/// against a pathological tick. 256KiB is the same worst-case byte budget the old cap allowed
+/// (64 chunks x pty-core's 4KiB read buffer), now expressed in the unit that actually bounds
+/// the work; at the ~90MB/s `TerminalGrid::append_bytes` decodes at (measured in situ) it costs
+/// the foreground thread ~3ms in the worst case. `alacritty_terminal`'s own reader bounds its
+/// equivalent batch by bytes too (`MAX_LOCKED_READ = u16::MAX`, the number of bytes it will
+/// process before releasing the terminal lock), for the same reason.
+///
+/// Note this is a *budget*, not a buffer: the drain stops once it has taken **at least** this
+/// many bytes, so one oversized chunk is always taken whole. Chunks are never split, so byte
+/// order and chunk boundaries reaching `TerminalGrid::append_bytes` are unchanged.
+const MAX_BYTES_PER_TICK: usize = 256 * 1024;
 
 /// Initial pty size used for the spawned shell, before the first real resize (see
 /// `maybe_resize_pty`) has a chance to run during the first render.
@@ -88,7 +133,15 @@ const TERMINAL_COLS: u16 = 160;
 /// How many [`POLL_INTERVAL`] ticks (~10s total) [`TerminalPane`]'s poll loop keeps retrying
 /// `PtySession::try_wait` after observing pty EOF before giving up - see
 /// [`eof_poll_decision`]'s docs for the race this bounds.
-const MAX_EOF_POLL_TICKS: u32 = 300;
+///
+/// Derived from [`POLL_INTERVAL`] rather than written as a literal tick count, so the real
+/// grace period stays ~10s of wall time no matter what the poll interval is set to. It was a
+/// bare `300` back when [`POLL_INTERVAL`] happened to be 33ms; shortening the interval to 8ms
+/// would silently have cut the grace to 2.4s, making the very race `eof_poll_decision` exists
+/// to survive (a child that closes its pty stdio well before it exits) reappear for any child
+/// that takes longer than that to exit - reported, wrongly, as
+/// [`crate::status::Status::Fail`].
+const MAX_EOF_POLL_TICKS: u32 = (10_000 / POLL_INTERVAL.as_millis()) as u32;
 
 /// Decides what a poll tick should do once pty EOF has been observed (the output channel's
 /// `TryRecvError::Disconnected`) but the child's exit status hasn't been confirmed yet, given
@@ -583,11 +636,19 @@ impl TerminalPane {
                             None => process_ended = true, // defensive; shouldn't happen
                         }
                     } else if let Some(session) = this.session.as_mut() {
-                        // Capped at `MAX_CHUNKS_PER_TICK`, not drained to empty - see that
+                        // Capped at `MAX_BYTES_PER_TICK`, not drained to empty - see that
                         // constant's docs. Anything left in the channel is picked up next tick.
-                        for _ in 0..MAX_CHUNKS_PER_TICK {
+                        let mut drained_bytes = 0usize;
+                        while drained_bytes < MAX_BYTES_PER_TICK {
                             match session.output().try_recv() {
                                 Ok(chunk) => {
+                                    // `.max(1)` so the loop is bounded by its own iteration
+                                    // count too, not only by bytes: a zero-length chunk would
+                                    // otherwise never advance `drained_bytes`. `pty-core`
+                                    // never sends one (its reader treats `read` returning 0 as
+                                    // EOF and breaks), but a drain bound that silently becomes
+                                    // unbounded if that ever changes is not a bound.
+                                    drained_bytes += chunk.len().max(1);
                                     this.grid.append_bytes(&chunk);
                                     this.activity_at = Some(Instant::now());
                                     appended = true;

@@ -174,8 +174,38 @@ pub use portable_pty::ExitStatus;
 /// buffers before the reader thread blocks. Bounds worst-case buffered memory to
 /// roughly `OUTPUT_CHANNEL_CAPACITY * READ_BUF_SIZE` (~1MB) regardless of how fast the
 /// child produces output or how slowly the caller drains it.
+///
+/// This is **also the dominant control on delivered throughput**, which is not obvious from
+/// the memory-bound framing above and is worth stating explicitly, because it makes lowering
+/// this constant look free when it very much isn't. The consumer drains on an interval
+/// (`app`'s `TerminalPane::POLL_INTERVAL`, 8ms), so the most that can be delivered per drain is
+/// whatever the channel managed to buffer in between - i.e. capacity x actual chunk size. A
+/// measured sweep against a real pty firehose with a drain every 8ms:
+///
+/// ```text
+/// capacity  16 ->  4.3 MB/s
+/// capacity 256 -> 36.2 MB/s
+/// ```
+///
+/// An earlier revision of this change cut this to 16 to "preserve the ~1MB bound" alongside a
+/// 64KiB [`READ_BUF_SIZE`]; that was an 8.5x throughput regression bought for nothing, since
+/// the larger read buffer turned out to be worth ~2%. Do not lower this without measuring
+/// delivered MB/s under a *slow* consumer - a fast-consumer benchmark cannot see this at all
+/// (both capacities reach ~42 MB/s when drained in a tight loop).
 const OUTPUT_CHANNEL_CAPACITY: usize = 256;
 /// Size of each read from the pty master per loop iteration of the reader thread.
+///
+/// Deliberately left at 4KiB after measuring the alternative. `alacritty_terminal`'s own reader
+/// uses a 1MiB buffer (`READ_BUFFER_SIZE = 0x10_0000` in its `src/event_loop.rs`, verified in
+/// the `zed-industries/alacritty` revision this workspace pins), so raising this looks like an
+/// obvious win - it isn't, here. Against a real pty firehose, raising it to 64KiB moved
+/// delivered throughput by ~2%: 4.27 -> 4.42 MB/s with a slow (backpressured) consumer, and
+/// 41.8 -> 42.0 MB/s with a fast one. The reason is that `read(2)` returns whatever is
+/// available rather than waiting to fill the buffer, and on a pty the available amount is
+/// governed by the line discipline, not by the caller's buffer: measured chunk sizes stayed at
+/// p50 ~600-700 bytes and p95 4095 either way. Only the rare `max` grew (4KiB -> ~23KiB), which
+/// is exactly the tail that a 16x larger worst-case memory bound would have to be sized for.
+/// What actually governs throughput here is [`OUTPUT_CHANNEL_CAPACITY`] - see its docs.
 const READ_BUF_SIZE: usize = 4096;
 /// How long [`PtySession::shutdown`] waits for a graceful exit (after `SIGHUP`) before
 /// unconditionally following up with `SIGKILL`. `Drop`'s fast path uses zero grace.
@@ -1025,6 +1055,84 @@ mod tests {
             text.contains("hello-pty-core"),
             "expected pty output to contain the echoed text, got: {text:?}"
         );
+    }
+
+    /// A long stream must arrive over the output channel **complete and in order**, no matter
+    /// how it happens to get split into chunks.
+    ///
+    /// This is the property [`READ_BUF_SIZE`] and [`OUTPUT_CHANNEL_CAPACITY`] are otherwise free
+    /// to trade against each other without anyone noticing, and it is what breaks silently and
+    /// catastrophically if they're changed carelessly. Every line carries its own index, so a
+    /// dropped, duplicated or truncated chunk fails on the exact line it went wrong at rather
+    /// than on a vague length mismatch.
+    ///
+    /// The consumer below deliberately drains **slowly**, pausing every
+    /// [`OUTPUT_CHANNEL_CAPACITY`] receives. That is the point of the test and not an accident:
+    /// a tight `recv` loop keeps the channel near-empty, so the reader thread never blocks in
+    /// `send` and the bounded-channel backpressure path - the one the real consumer
+    /// (`app`'s `TerminalPane`, which drains on an 8ms timer) exercises constantly, and the one
+    /// where a mistake would actually lose bytes - goes completely untested. Pausing forces the
+    /// channel to fill, the reader to block mid-stream, and the whole fill/block/resume cycle to
+    /// repeat many times over the run.
+    ///
+    /// Ordering is asserted but, honestly, is structurally guaranteed rather than at risk: one
+    /// reader thread sends into one FIFO `mpsc`. The assertion is cheap insurance against that
+    /// structure changing, not a live hazard being probed.
+    ///
+    /// `seq` writes into a pty, so the line discipline turns each `\n` into `\r\n`; the
+    /// comparison below normalizes that rather than pretending it doesn't happen.
+    #[test]
+    fn long_output_arrives_complete_and_in_order_across_chunk_boundaries() {
+        const LINES: usize = 200_000;
+
+        let session = spawn(SpawnOptions::new("seq").arg("1").arg(LINES.to_string()))
+            .expect("spawning `seq` should succeed");
+
+        // Drain to EOF (the reader thread's `output_tx` drops once the pty closes), not to a
+        // needle: this test is about the *whole* stream, so stopping early would hide loss.
+        let mut collected = Vec::new();
+        let mut received = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match session.output().recv_timeout(remaining) {
+                Ok(chunk) => {
+                    collected.extend_from_slice(&chunk);
+                    received += 1;
+                    // See the doc comment: this pause is what makes the channel actually fill
+                    // and the reader thread actually block, which is the path under test.
+                    if received.is_multiple_of(OUTPUT_CHANNEL_CAPACITY) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected | RecvTimeoutError::Timeout) => break,
+            }
+        }
+
+        let text = String::from_utf8(collected).expect("`seq` output is plain ASCII");
+        let normalized = text.replace("\r\n", "\n");
+        let lines: Vec<&str> = normalized.trim_end_matches('\n').split('\n').collect();
+
+        assert_eq!(
+            lines.len(),
+            LINES,
+            "expected every one of the {LINES} lines to arrive exactly once; got {} (first \
+             line {:?}, last line {:?})",
+            lines.len(),
+            lines.first(),
+            lines.last(),
+        );
+        for (index, line) in lines.iter().enumerate() {
+            assert_eq!(
+                *line,
+                (index + 1).to_string(),
+                "line {index} is out of order or corrupted - the byte stream was reordered, \
+                 truncated or duplicated somewhere around a chunk boundary",
+            );
+        }
     }
 
     // unix-only: uses pid_exists/is_executable directly, which are #[cfg(unix)]

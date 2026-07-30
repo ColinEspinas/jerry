@@ -149,7 +149,7 @@ actions!(
 );
 
 /// How often `crate::rail::compute_status_snapshot`'s background `git` status/diff refresh
-/// re-runs. Coarser than `crate::terminal_pane`'s 33ms poll since this spawns real `git` child
+/// re-runs. Coarser than `crate::terminal_pane`'s 8ms poll since this spawns real `git` child
 /// processes per worktree/session path, not a cheap channel `try_recv`.
 const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
@@ -178,7 +178,7 @@ pub(super) type DiffHighlightCache = (
 );
 
 /// How often [`AdeApp::ensure_lsp_poll_task`]'s background loop checks for a newly-arrived
-/// `publishDiagnostics` notification. Coarser than `crate::terminal_pane::POLL_INTERVAL` (33ms):
+/// `publishDiagnostics` notification. Coarser than `crate::terminal_pane::POLL_INTERVAL` (8ms):
 /// pty output is latency-sensitive, rust-analyzer's diagnostics are not.
 const LSP_DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 

@@ -129,9 +129,13 @@ pub fn find_links(text: &str) -> Vec<LinkMatch> {
 
 /// Lexically collapses `..`/`.` path components - no filesystem access (no
 /// `Path::canonicalize()`, which resolves symlinks via a blocking `stat` and requires the path
-/// to exist). [`resolve`] runs once per detected link on every rendered terminal row, every
-/// `crate::terminal_pane::POLL_INTERVAL` (~33ms) poll tick, so a filesystem-touching
-/// normalization here would be a real per-frame cost for a purely textual concern.
+/// to exist). [`resolve`] runs once per detected link on every rendered terminal row, on every
+/// frame a streaming session re-renders on, so a filesystem-touching normalization here would
+/// be a real per-frame cost for a purely textual concern. (It is per *frame*, not per
+/// `crate::terminal_pane::POLL_INTERVAL` poll tick as this used to claim: a tick that drains
+/// bytes calls `cx.notify()`, but GPUI coalesces however many invalidations land between two
+/// draws into a single frame, so at an 8ms poll interval several ticks routinely share one
+/// render.)
 /// `Path::components()` already classifies `..`/`.`; a `..` with nowhere left to pop is simply
 /// dropped, the same as a shell's own `cd ..` at `/`.
 fn normalize_lexically(path: &Path) -> PathBuf {
