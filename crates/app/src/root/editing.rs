@@ -101,7 +101,7 @@ impl AdeApp {
     /// handle go-to-definition already drives (see that field's own docs) rather than a second
     /// mechanism. Called after every real cursor-moving action and every real edit - both change
     /// where the caret is.
-    fn sync_cursor_and_scroll(&mut self) {
+    pub(super) fn sync_cursor_and_scroll(&mut self) {
         let Some(buffer) = self.active_edit_buffer() else {
             return;
         };
@@ -116,7 +116,7 @@ impl AdeApp {
     /// A single slot per path in [`AdeApp::_rehighlight_tasks`]: assigning a fresh task here drops
     /// (cancels) whatever earlier debounce timer for the same path was still waiting, so only the
     /// most recent keystroke's timer ever actually fires - real debounce, not a queue.
-    fn schedule_rehighlight(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    pub(super) fn schedule_rehighlight(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let Some(buffer) = self.edit_buffers.get(&path) else {
             return;
         };
@@ -180,7 +180,8 @@ impl AdeApp {
         // silent duplication this project's history (Revision R5.5) has already flagged once
         // for a different bug class.
         buffer.backspace();
-        self.schedule_rehighlight(path, cx);
+        self.schedule_rehighlight(path.clone(), cx);
+        self.schedule_lsp_sync(path, cx);
         self.sync_cursor_and_scroll();
         cx.notify();
     }
@@ -200,7 +201,8 @@ impl AdeApp {
         // See `Self::handle_editor_backspace_action`'s own docs - delegates to
         // `EditBuffer::delete_forward` for the same real reason.
         buffer.delete_forward();
-        self.schedule_rehighlight(path, cx);
+        self.schedule_rehighlight(path.clone(), cx);
+        self.schedule_lsp_sync(path, cx);
         self.sync_cursor_and_scroll();
         cx.notify();
     }
@@ -211,6 +213,25 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Defense in depth, not the only guard: `crate::default_key_bindings` already scopes
+        // this action's own binding to `"file-editor && !completions"` so a real `Enter`
+        // keystroke never reaches this handler while the popup is *genuinely, actionably* open
+        // (`CompletionsAccept`'s own `"file-editor && completions"` binding claims it instead) -
+        // but this handler is also reachable by a direct call (as `crate::root::editing::
+        // editing_tests` already does for the analogous Diff-view guard), so it must
+        // independently refuse to insert a newline in that same case, matching this project's
+        // own established "guard the handler, not just the binding" discipline.
+        //
+        // `Self::completions_open_for_active_path` only returns `true` for a genuine
+        // `CompletionsStatus::Ready` popup (see that method's own docs) - a real, live-reproduced
+        // bug this project's audit caught (Revision R8.5b finding 1): while a completion request
+        // is merely `Loading` (seeded on *every* completion-worthy keystroke, before the real
+        // request even completes) or `Failed`, there is nothing real to accept/navigate, so
+        // `Enter` must still reach here and insert a real newline, not be silently swallowed for
+        // the whole real round-trip a completion request can take.
+        if self.completions_open_for_active_path() {
+            return;
+        }
         self.replace_text_in_range(None, "\n", window, cx);
         self.sync_cursor_and_scroll();
     }
@@ -239,6 +260,12 @@ impl AdeApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // See `Self::handle_editor_enter_action`'s own docs - the same real, independent guard,
+        // since `CompletionsUp`'s binding is meant to move the popup's own selection instead
+        // while it's open, not the real caret.
+        if self.completions_open_for_active_path() {
+            return;
+        }
         self.move_active_buffer(cx, EditBuffer::move_up);
     }
 
@@ -248,6 +275,10 @@ impl AdeApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // See `Self::handle_editor_enter_action`'s own docs.
+        if self.completions_open_for_active_path() {
+            return;
+        }
         self.move_active_buffer(cx, EditBuffer::move_down);
     }
 
@@ -322,6 +353,11 @@ impl AdeApp {
             return;
         };
         f(buffer);
+        // A real caret move away from wherever the popup was anchored invalidates it - real
+        // editors close completions the moment the caret leaves the word being completed, rather
+        // than leaving a popup up that no longer describes the real insertion point Tab/Enter
+        // would act on.
+        self.dismiss_completions();
         cx.notify();
         self.sync_cursor_and_scroll();
     }
@@ -641,7 +677,8 @@ impl EntityInputHandler for AdeApp {
         };
         let range = range_utf16.map(|range_utf16| buffer.range_from_utf16(&range_utf16));
         buffer.replace_range(range, text);
-        self.schedule_rehighlight(path, cx);
+        self.schedule_rehighlight(path.clone(), cx);
+        self.schedule_lsp_sync(path, cx);
         self.sync_cursor_and_scroll();
         cx.notify();
     }
@@ -662,7 +699,8 @@ impl EntityInputHandler for AdeApp {
         };
         let range = range_utf16.map(|range_utf16| buffer.range_from_utf16(&range_utf16));
         buffer.replace_and_mark_range(range, new_text, new_selected_range_utf16);
-        self.schedule_rehighlight(path, cx);
+        self.schedule_rehighlight(path.clone(), cx);
+        self.schedule_lsp_sync(path, cx);
         self.sync_cursor_and_scroll();
         cx.notify();
     }
@@ -938,19 +976,20 @@ pub(super) fn render_editable_file_view_line(
                 let Some(line_range) = buffer.line_ranges.get(click_line_index).cloned() else {
                     return;
                 };
-                // A real, deliberate decision (finding 4), not a silent gap: `hover_view::
-                // position_for_line_byte_offset` below is computed from the *edited* buffer's own
-                // text, but the language server it would be sent to only ever knows about the
-                // last-*saved* content (this phase's own scope - see `crate::root::code_surface`'s
-                // own `buffer_dirty` docs). Requesting hover against a dirty buffer would send a
-                // real, live-computed position the server can't meaningfully answer for, and the
-                // File view's own "unsaved edits" banner already tells the user why - so hover is
-                // suppressed here while dirty rather than firing a request that's honest about
-                // nothing.
-                let buffer_dirty = buffer.is_dirty();
+                // Revision R8.5b: hover is no longer suppressed on a dirty buffer - `hover_view::
+                // position_for_line_byte_offset` below is computed from `click_line_text`, the
+                // *live* buffer's own line text (see `EditableLineContext::line`'s docs), and the
+                // language server now genuinely tracks that same live content via
+                // `Self::schedule_lsp_sync`'s real `didChange` sync, not just the last-saved
+                // snapshot (see `crate::root::code_surface`'s own `sync_pending` docs for the
+                // one, honest remaining latency-window caveat this doesn't try to hide).
                 let absolute_offset = line_range.start + local_offset;
 
                 window.focus(&this.code_focus_handle, cx);
+                // A real click moves the caret somewhere the popup's own anchor almost certainly
+                // no longer describes - see `Self::move_active_buffer`'s own docs for the same
+                // real dismiss-on-caret-move reasoning.
+                this.dismiss_completions();
                 if let Some(buffer) = this.edit_buffers.get_mut(&row_path) {
                     if event.modifiers.shift {
                         buffer.select_to(absolute_offset);
@@ -960,25 +999,23 @@ pub(super) fn render_editable_file_view_line(
                 }
                 this.code_cursor = Some(click_line_number);
 
-                if !buffer_dirty {
-                    if let Some(hover_target) = &click_hover_target {
-                        if let Some(token_range) = token_at_offset(&click_line_runs, local_offset) {
-                            let token_text =
-                                click_line_text.get(token_range.clone()).unwrap_or_default();
-                            if !token_text.trim().is_empty() {
-                                let position = hover_view::position_for_line_byte_offset(
-                                    click_line_number as u32 - 1,
-                                    &click_line_text,
-                                    token_range.start,
-                                );
-                                this.request_hover(
-                                    hover_target.clone(),
-                                    click_line_number,
-                                    token_range,
-                                    position,
-                                    cx,
-                                );
-                            }
+                if let Some(hover_target) = &click_hover_target {
+                    if let Some(token_range) = token_at_offset(&click_line_runs, local_offset) {
+                        let token_text =
+                            click_line_text.get(token_range.clone()).unwrap_or_default();
+                        if !token_text.trim().is_empty() {
+                            let position = hover_view::position_for_line_byte_offset(
+                                click_line_number as u32 - 1,
+                                &click_line_text,
+                                token_range.start,
+                            );
+                            this.request_hover(
+                                hover_target.clone(),
+                                click_line_number,
+                                token_range,
+                                position,
+                                cx,
+                            );
                         }
                     }
                 }
@@ -2234,5 +2271,264 @@ mod editing_tests {
              the File view is in editing mode, not be swallowed by the unrelated \
              NextChangedFile binding"
         );
+    }
+
+    /// Regression coverage for the keybinding-collision bug class this project has now shipped
+    /// four times (R2, R4a, R4b, R8.5a) - Revision R8.5b's own instance, for the real Completions
+    /// popup's `Up`/`Down`/`Enter`/`Escape` bindings. Two real, keystroke-simulated states, not
+    /// just one: with the popup closed, `up`/`down`/`enter` must still behave exactly as the
+    /// plain `Editor*` actions always have (the real regression risk from narrowing their own
+    /// predicate to `!completions`); with the popup genuinely open, the same keystrokes must
+    /// route to the popup instead, never touching the real caret/buffer, and `Escape` must
+    /// dismiss it. The popup state itself is seeded directly (a real `Ready` `CompletionsEntry`,
+    /// not a real LSP round trip) - matching `crate::root::lsp::lsp_client_eviction_tests`' own
+    /// established precedent for isolating real routing/bookkeeping proofs from a real process
+    /// spawn; the real end-to-end proof (a genuine server's completions actually opening this
+    /// same popup) lives in `crate::root::lsp::lsp_diagnostics_wiring_tests`.
+    #[gpui::test]
+    fn completions_keybindings_are_correctly_scoped_in_both_the_open_and_closed_state(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "ab\ncd\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        // State 1: no popup open - `up`/`down`/`enter` must behave exactly like the plain
+        // editor actions always have.
+        app.update(cx, |app, cx| {
+            app.edit_buffers.get_mut(&relative).unwrap().move_to(1);
+            cx.notify();
+        });
+        cx.simulate_keystrokes("down");
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .unwrap()
+                .cursor_offset()),
+            4,
+            "with no popup open, `down` must still move the real caret to line 2 exactly as \
+             before"
+        );
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .unwrap()
+                .content
+                .clone()),
+            "ab\nc\nd\n",
+            "with no popup open, `enter` must still insert a real newline at the real caret \
+             exactly as before"
+        );
+
+        // State 2: a real, seeded `Ready` popup.
+        let fake_item = |label: &str| lsp_core::lsp_types::CompletionItem {
+            label: label.to_string(),
+            ..Default::default()
+        };
+        app.update(cx, |app, cx| {
+            app.completions = Some(crate::root::completions::CompletionsEntry {
+                path: relative.clone(),
+                status: crate::root::completions::CompletionsStatus::Ready {
+                    items: vec![fake_item("alpha"), fake_item("beta")],
+                    selected: 0,
+                },
+            });
+            cx.notify();
+        });
+
+        let cursor_before = app.read_with(cx, |app, _| {
+            app.edit_buffers.get(&relative).unwrap().cursor_offset()
+        });
+        let content_before = app.read_with(cx, |app, _| {
+            app.edit_buffers.get(&relative).unwrap().content.clone()
+        });
+        cx.simulate_keystrokes("down");
+        assert_eq!(
+            app.read_with(cx, |app, _| {
+                let entry = app
+                    .completions
+                    .as_ref()
+                    .expect("popup should still be open");
+                match &entry.status {
+                    crate::root::completions::CompletionsStatus::Ready { selected, .. } => {
+                        *selected
+                    }
+                    _ => panic!("expected Ready"),
+                }
+            }),
+            1,
+            "with the popup open, `down` must move its own real selection, not the real caret"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .unwrap()
+                .cursor_offset()),
+            cursor_before,
+            "the real caret must not have moved while the popup owns `down`"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .unwrap()
+                .content
+                .clone()),
+            content_before,
+            "the real buffer content must be untouched while the popup owns `down`"
+        );
+
+        cx.simulate_keystrokes("enter");
+        let content_after_enter = app.read_with(cx, |app, _| {
+            app.edit_buffers.get(&relative).unwrap().content.clone()
+        });
+        assert!(
+            content_after_enter.contains("beta"),
+            "with the popup open, `enter` must accept the real selected item (\"beta\", index \
+             1 after the real `down` above), not insert a real newline - got: \
+             {content_after_enter:?}"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.completions.is_none()),
+            "accepting must close the real popup"
+        );
+
+        // A fresh popup, dismissed by a real `Escape` keystroke without touching the buffer.
+        app.update(cx, |app, cx| {
+            app.completions = Some(crate::root::completions::CompletionsEntry {
+                path: relative.clone(),
+                status: crate::root::completions::CompletionsStatus::Ready {
+                    items: vec![fake_item("gamma")],
+                    selected: 0,
+                },
+            });
+            cx.notify();
+        });
+        let content_before_escape = app.read_with(cx, |app, _| {
+            app.edit_buffers.get(&relative).unwrap().content.clone()
+        });
+        cx.simulate_keystrokes("escape");
+        assert!(
+            app.read_with(cx, |app, _| app.completions.is_none()),
+            "a real Escape keystroke must dismiss the real popup"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .unwrap()
+                .content
+                .clone()),
+            content_before_escape,
+            "dismissing via Escape must not touch the real buffer content"
+        );
+    }
+
+    /// Revision R8.5b audit finding 1's direct regression test: the sixth instance of this
+    /// project's recurring "a keystroke gets swallowed" bug class. Before this fix, `Self::
+    /// completions_open_for_active_path` returned `true` for *any* real [`CompletionsEntry`],
+    /// including a merely `Loading`/`Failed` one - which `AdeApp::prepare_lsp_sync` seeds on
+    /// *every* completion-worthy keystroke, before the real request even completes - so the real
+    /// `"completions"` key context stayed active (claiming `Enter`/`Down`) for the *entire* real
+    /// round trip a completion request takes, live-reproduced against a real rust-analyzer as:
+    /// pressing Enter while a request was merely loading inserted no newline at all, and Down did
+    /// nothing either. Verified here by simulating real keystrokes (not calling handlers
+    /// directly) against a real, seeded `Loading` entry, then a real `Failed` one - both must
+    /// fall all the way through to the plain `Editor*` behavior, exactly as if no popup existed.
+    #[gpui::test]
+    fn enter_and_down_are_not_swallowed_while_completions_are_merely_loading_or_failed(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "ab\ncd\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        for (label, status) in [
+            (
+                "Loading",
+                crate::root::completions::CompletionsStatus::Loading,
+            ),
+            (
+                "Failed",
+                crate::root::completions::CompletionsStatus::Failed("timed out".to_string()),
+            ),
+        ] {
+            app.update(cx, |app, cx| {
+                app.edit_buffers.get_mut(&relative).unwrap().move_to(1);
+                app.completions = Some(crate::root::completions::CompletionsEntry {
+                    path: relative.clone(),
+                    status,
+                });
+                cx.notify();
+            });
+
+            // The real "completions" key context must not even be present while merely
+            // `Loading`/`Failed` - `Self::completions_open_for_active_path` is the single real
+            // predicate both the key context and the handlers' own defense-in-depth guards share.
+            assert!(
+                !app.read_with(cx, |app, _| app.completions_open_for_active_path()),
+                "[{label}] a merely {label} entry must not report the popup as actionably open"
+            );
+
+            let content_before = app.read_with(cx, |app, _| {
+                app.edit_buffers.get(&relative).unwrap().content.clone()
+            });
+            cx.simulate_keystrokes("enter");
+            let content_after_enter = app.read_with(cx, |app, _| {
+                app.edit_buffers.get(&relative).unwrap().content.clone()
+            });
+            assert_ne!(
+                content_after_enter, content_before,
+                "[{label}] a real Enter keystroke while completions are merely {label} must \
+                 still insert a real newline - it must not be silently swallowed"
+            );
+            assert!(
+                content_after_enter.len() == content_before.len() + 1
+                    && content_after_enter.contains('\n'),
+                "[{label}] expected exactly one real newline to have been inserted, got: \
+                 {content_before:?} -> {content_after_enter:?}"
+            );
+
+            // A real Down keystroke must genuinely move the real caret, not silently no-op -
+            // re-seed a fresh `Loading`/`Failed` entry (the Enter above already dismissed the
+            // previous one via `Self::move_active_buffer`'s own caret-move dismissal).
+            app.update(cx, |app, cx| {
+                let buffer = app.edit_buffers.get_mut(&relative).unwrap();
+                buffer.move_to(1);
+                let status = match label {
+                    "Loading" => crate::root::completions::CompletionsStatus::Loading,
+                    _ => {
+                        crate::root::completions::CompletionsStatus::Failed("timed out".to_string())
+                    }
+                };
+                app.completions = Some(crate::root::completions::CompletionsEntry {
+                    path: relative.clone(),
+                    status,
+                });
+                cx.notify();
+            });
+            let cursor_before_down = app.read_with(cx, |app, _| {
+                app.edit_buffers.get(&relative).unwrap().cursor_offset()
+            });
+            cx.simulate_keystrokes("down");
+            let cursor_after_down = app.read_with(cx, |app, _| {
+                app.edit_buffers.get(&relative).unwrap().cursor_offset()
+            });
+            assert_ne!(
+                cursor_after_down, cursor_before_down,
+                "[{label}] a real Down keystroke while completions are merely {label} must \
+                 still move the real caret, not silently do nothing"
+            );
+        }
     }
 }

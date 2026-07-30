@@ -58,6 +58,7 @@ use crate::work_surface;
 use crate::worktrees::{self, WorktreeItem};
 
 use crate::root::code_surface::{DiffLoadState, FileLoadState, HoverEntry};
+use crate::root::completions::CompletionsEntry;
 use crate::root::lsp::LspClientState;
 use crate::root::resize::{PaneResizeDrag, ResizeTarget};
 use crate::root::sidebar_render::RightSidebarView;
@@ -80,6 +81,19 @@ use crate::root::task_pool::TaskPool;
 // editable File view container (`crate::root::code_surface::render_file_view`'s inner container,
 // not the shared outer Diff/File surface `.key_context("diff")` also uses) - see that function's
 // own docs for why the Diff view must never receive these bindings.
+//
+// `Completions*` (Revision R8.5b) navigate/accept/dismiss the real Completions popup
+// (`crate::root::completions`). Bound with `Some("file-editor && completions")` - a real,
+// *narrower* context than the plain `Editor*` bindings above, added to the same code-surface node
+// only while `AdeApp::completions` is genuinely `Ready` (see `crate::root::code_surface::
+// AdeApp::render_code_surface`'s own docs, and `crate::root::completions::AdeApp::
+// completions_open_for_active_path`'s own docs for why a merely `Loading`/`Failed` entry does
+// *not* count - a real, live-reproduced keystroke-swallowing bug this project's own audit caught,
+// see that method's docs) - and the plain `up`/`down`/`enter` `Editor*` bindings are
+// correspondingly narrowed to `Some("file-editor && !completions")`, so the two sets can never
+// both match the same keystroke. This is the same real `KeyBindingContextPredicate` mechanism
+// (`&&`, `!`) Revision R8.5a's own `"]"`/`"diff && !file-editor"` fix already established for this
+// exact bug class - see that binding's own docs in `crate::default_key_bindings`.
 actions!(
     app,
     [
@@ -117,6 +131,10 @@ actions!(
         EditorPaste,
         EditorSave,
         EditorSaveAnyway,
+        CompletionsUp,
+        CompletionsDown,
+        CompletionsAccept,
+        CompletionsDismiss,
     ]
 );
 
@@ -541,6 +559,97 @@ pub struct AdeApp {
     /// re-sends `didOpen` with a stale version. Never removed on file close: this viewer
     /// deliberately doesn't send a matching `didClose` (see [`Self::dispatch_did_open`]).
     lsp_opened_files: HashSet<PathBuf>,
+    /// Real, monotonically-increasing `textDocument/didChange` document versions (Revision
+    /// R8.5b), keyed by absolute path - matching [`Self::lsp_opened_files`]'s own key convention,
+    /// since both track per-*file* (not per-worktree-relative-path) LSP document identity. Seeded
+    /// to `1` (matching [`Self::dispatch_did_open`]'s own hardcoded `didOpen` version) the first
+    /// time a real sync is sent for a path, and bumped by [`Self::prepare_lsp_sync`] on every real
+    /// `didChange` it plans to send - never on a tick that skips sending one (unchanged content,
+    /// or no ready client), so a version is never "spent" without a matching real notification.
+    lsp_document_versions: HashMap<PathBuf, i32>,
+    /// The real buffer content last *successfully* sent via a `didChange` notification for each
+    /// open, dirty file - keyed by worktree-relative path, matching [`Self::edit_buffers`]'s own
+    /// convention (unlike [`Self::lsp_document_versions`] above, this only ever needs to answer
+    /// "does the *editor's* buffer already match what the server was told", which is naturally
+    /// worktree-relative-scoped the same way the buffer itself is). [`Self::prepare_lsp_sync`]'s
+    /// real "is there anything new to sync" check compares against this rather than resending
+    /// identical content (and burning a real document version) on every debounce tick even when
+    /// nothing changed since the last one that actually fired. Written only from [`Self::
+    /// schedule_lsp_sync`]'s async continuation, and only after a real `did_change_full` call has
+    /// genuinely returned `Ok` (Revision R8.5b audit finding 6's fix) - never at *plan* time in
+    /// [`Self::prepare_lsp_sync`], which would confidently record content as "sent" before the
+    /// send was even attempted, let alone known to have succeeded.
+    lsp_last_synced_content: HashMap<PathBuf, String>,
+    /// The real document version (see [`Self::lsp_document_versions`]) whose content was most
+    /// recently *successfully* sent via a real `didChange`, keyed the same worktree-relative way
+    /// as [`Self::lsp_last_synced_content`] (written alongside it, same real "the send genuinely
+    /// succeeded" moment - Revision R8.5b audit finding 6). Compared against [`Self::
+    /// lsp_diagnostics_confirmed_version`] by [`Self::render_file_view`]'s own `sync_pending`
+    /// banner to answer a stronger question than "was the content sent": "has the server actually
+    /// *answered* for it yet".
+    lsp_synced_version: HashMap<PathBuf, i32>,
+    /// The highest real document version [`Self::schedule_lsp_sync`]'s diagnostics-pull sequence
+    /// (or, for a server with no real pull support, the send itself) has *confirmed* an actual
+    /// answer for - keyed the same worktree-relative way as [`Self::lsp_last_synced_content`]
+    /// (Revision R8.5b audit findings 5/6). While this trails [`Self::lsp_synced_version`], the
+    /// server genuinely has the latest edit but hasn't answered for it yet - the real gap
+    /// [`Self::render_file_view`]'s own `sync_pending` banner now stays honestly "pending"
+    /// through, not just through the `didChange` send itself. Written with `.max(..)`, never a
+    /// bare overwrite, so a real, late-arriving confirmation for an older version (the same
+    /// reordering [`lsp_core::LspClient::pull_diagnostics`]'s own version guard protects against
+    /// for the diagnostics map itself) can never regress this back down.
+    lsp_diagnostics_confirmed_version: HashMap<PathBuf, i32>,
+    /// A real, per-absolute-path cache of [`lsp_core::LspClient::uri_for_path`]'s own result
+    /// (Revision R8.5b audit finding 8's fix for a real hard-rule violation) - populated exactly
+    /// once per path, off the GPUI foreground thread, by [`Self::dispatch_did_open`]'s own
+    /// background task (the same real moment a path's content is first read for `didOpen`), and
+    /// read (never recomputed inline) by [`Self::prepare_lsp_sync`] on every subsequent debounced
+    /// sync tick. `uri_for_path` performs a real, blocking `canonicalize()` syscall - this
+    /// codebase's own established convention (see [`Self::schedule_lsp_sync`]'s own docs on the
+    /// identical rule already followed for `lsp_core::LspClient::diagnostics_for`) is that such a
+    /// call is never acceptable to run inline on the GPUI thread; an earlier version of [`Self::
+    /// prepare_lsp_sync`] did exactly that, on every single real debounce tick, before this cache
+    /// existed. Pruned alongside [`Self::lsp_document_versions`] by [`Self::
+    /// evict_stale_lsp_clients`]'s own root-scoped retain pass (same absolute-path-keyed
+    /// convention, same reasoning for why a blanket per-worktree-switch reset isn't needed).
+    lsp_uri_cache: HashMap<PathBuf, lsp_core::lsp_types::Uri>,
+    /// Every in-flight debounced real `textDocument/didChange` sync (Revision R8.5b), one slot
+    /// per worktree-relative path - see [`Self::schedule_lsp_sync`]'s own docs for why a single
+    /// slot (not a [`TaskPool`]) is the real, correct discipline here: a fresh edit to the same
+    /// path must cancel (not race alongside) whatever earlier sync cycle was still in flight for
+    /// it, the same "only the most recent keystroke's work should ever land" guarantee
+    /// [`Self::_rehighlight_tasks`] already establishes for re-highlighting - the real mechanism
+    /// this project's own history (Revision R3, R5.5) keeps needing for exactly this "a fast
+    /// typist must never produce out-of-order server state" shape. Also explicitly cleared by
+    /// [`crate::root::code_surface::AdeApp::close_file_tab`] for whichever path's tab just closed
+    /// (Revision R8.5b audit finding 3), so an in-flight sync for a file that's no longer open
+    /// can't keep running.
+    _lsp_sync_tasks: HashMap<PathBuf, Task<()>>,
+    /// The single, real in-flight `textDocument/completion` request task, if any (Revision
+    /// R8.5b audit finding 2) - a single slot, not a [`TaskPool`], mirroring [`Self::
+    /// _hover_request_task`]'s own reasoning: [`Self::completions`] shows only one popup at a
+    /// time, so a fresh completion request always supersedes an in-flight one. Deliberately its
+    /// *own* slot, independent of [`Self::_lsp_sync_tasks`] - an earlier version awaited the
+    /// completion request inline, at the end of the same task that also ran the diagnostics-pull
+    /// retry sequence, which meant a real completion response could never arrive until that whole
+    /// sequence (up to a real, measured ~8s) finished. [`Self::completions_generation`]'s own
+    /// staleness check still independently guards against a stale result ever being applied, the
+    /// same defense-in-depth this module already establishes elsewhere.
+    _completions_request_task: Option<Task<()>>,
+    /// Surface C's real Completions popup state (Revision R8.5b) - `None` when no popup is
+    /// showing. Keyed implicitly to whichever [`Self::edit_buffers`] path
+    /// [`CompletionsEntry::path`] names; a stale entry for a file that's no
+    /// longer open simply never matches [`Self::active_editable_path`] and is treated as absent
+    /// by every render/keybinding site that reads it.
+    completions: Option<CompletionsEntry>,
+    /// A real generation counter bumped every time a completions request is dispatched or the
+    /// popup is dismissed (`Self::dismiss_completions`) - see [`Self::schedule_lsp_sync`]'s own
+    /// docs for the real, live race this closes: an in-flight `textDocument/completion` request
+    /// whose *task* wasn't cancelled (e.g. the user pressed Escape, which doesn't touch
+    /// [`Self::_completions_request_task`]) must not resurrect a popup the user already dismissed
+    /// once its slow response finally arrives. A request's completion handler only ever applies
+    /// its result if the generation it captured at dispatch time still matches this field.
+    completions_generation: u64,
     /// Per-line diagnostic index (`crate::diagnostics_view::index_diagnostics_by_line`) for
     /// whichever Rust file [`Self::render_file_view`] last rendered - recomputed at the start of
     /// every render for a Rust file, cleared for a non-Rust file so diagnostics can't bleed
@@ -794,6 +903,7 @@ impl Render for AdeApp {
             .when(self.plus_menu_open, |el| {
                 el.child(self.render_plus_menu(cx))
             })
+            .children(self.render_completions_popover(cx))
             .when(self.palette_open, |el| el.child(self.render_palette(cx)))
     }
 }
@@ -1128,6 +1238,7 @@ mod settings_persist_tests {
 }
 
 mod code_surface;
+mod completions;
 mod editing;
 mod focus;
 mod lsp;

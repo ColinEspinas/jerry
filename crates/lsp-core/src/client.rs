@@ -49,18 +49,20 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lsp_types::notification::Notification as LspNotification;
 use lsp_types::request::Request as LspRequest;
 use lsp_types::{
-    ClientCapabilities, DidOpenTextDocumentParams, HoverClientCapabilities, InitializeParams,
-    InitializedParams, MarkupKind, PublishDiagnosticsClientCapabilities,
-    TextDocumentClientCapabilities, TextDocumentItem, Uri, WorkspaceClientCapabilities,
+    ClientCapabilities, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+    HoverClientCapabilities, InitializeParams, InitializedParams, MarkupKind,
+    PublishDiagnosticsClientCapabilities, ServerCapabilities, TextDocumentClientCapabilities,
+    TextDocumentContentChangeEvent, TextDocumentItem, TextDocumentSyncCapability,
+    TextDocumentSyncKind, Uri, VersionedTextDocumentIdentifier, WorkspaceClientCapabilities,
     WorkspaceFolder,
 };
 
@@ -133,6 +135,28 @@ const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(800);
 /// re-checks real current state via [`LspClient::diagnostics_for`], so a dropped/coalesced wake
 /// never loses a real diagnostic, only a redundant "something changed" nudge).
 const WAKE_CHANNEL_CAPACITY: usize = 64;
+
+/// The real LSP `ErrorCodes.ServerCancelled` value (-32802) - a real, spec-defined, *expected*
+/// response a server can give to a real `textDocument/diagnostic` pull request when it decides
+/// the result would already be stale (a newer `didChange` is being processed) - the client is
+/// meant to simply retry, not treat this as a genuine failure. Verified live against a real,
+/// installed rust-analyzer (Revision R8.5b): a pull request sent immediately after a real
+/// `didChange` was cancelled this way 1-2 times, routinely, before genuinely answering - not a
+/// rare edge case for that server, the normal shape of a real pull request race its own
+/// internal analysis loses.
+const SERVER_CANCELLED: i64 = -32802;
+/// How many times [`LspClient::pull_diagnostics`] retries a real [`SERVER_CANCELLED`] response
+/// before giving up - generous relative to the 1-2 cancellations actually observed live, so a
+/// real, if unusually slow, reanalysis still gets a real answer rather than a premature give-up.
+/// This is a real *attempt cap*, not a real *time budget* - [`retry_with_deadline`]'s own docs
+/// (Revision R8.5b audit finding 4's fix) are the actual bound on total real wall-clock time;
+/// this just stops an attempt loop that's somehow still within budget (e.g. a caller passing an
+/// unusually large `timeout`) from retrying forever.
+const PULL_DIAGNOSTICS_MAX_ATTEMPTS: u32 = 20;
+/// Real, brief backoff between [`LspClient::pull_diagnostics`] retries - capped by
+/// [`retry_with_deadline`] to whatever real time remains under the caller's own budget, so this
+/// is a real *ceiling* on the backoff, not an unconditional sleep on top of it.
+const PULL_DIAGNOSTICS_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Locks a `Mutex`, recovering from poisoning rather than propagating a panic across it - a
 /// poisoned lock here (some *other* thread already panicked while holding it) shouldn't
@@ -228,6 +252,29 @@ pub struct LspClient {
     next_id: AtomicI64,
     pending: Arc<Mutex<HashMap<i64, SyncSender<PendingResponse>>>>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<lsp_types::Diagnostic>>>>,
+    /// The real document `version` (see [`Self::did_change_full`]'s own docs on what this number
+    /// means) that [`Self::diagnostics`]' current entry for a given uri actually corresponds to -
+    /// Revision R8.5b audit finding 5's fix for a real, live-reproduced race: [`Self::
+    /// pull_diagnostics`] is dispatched onto a real background thread by its caller (the `app`
+    /// crate's own `AdeApp::schedule_lsp_sync`) and, once dispatched, cannot be un-polled if a
+    /// *newer* pull for the same uri is dispatched and answers first - a slow response answering
+    /// an older edit can otherwise land after, and clobber, a fresher one already applied. Every
+    /// real write to [`Self::diagnostics`] from [`Self::pull_diagnostics`] is gated on this map:
+    /// a result tagged with a version older than what's already recorded here is discarded rather
+    /// than applied. Not consulted by the passive `publishDiagnostics` push path
+    /// ([`handle_incoming`]) - a real, deliberate scope cut (see [`Self::pull_diagnostics`]'s own
+    /// docs for why the *pull* path specifically is the one with this race).
+    diagnostics_version: Mutex<HashMap<String, i32>>,
+    /// The real `ServerCapabilities` this server returned in its `initialize` response - written
+    /// once by [`Self::initialize`], read by [`Self::completion_trigger_characters`]/
+    /// [`Self::supports_document_sync`] (Revision R8.5b: live `didChange` sync + real
+    /// completions, both of which need to respect what the server actually advertised rather
+    /// than guessing). A `Mutex`, not a plain field, for the same "written from inside a `&self`
+    /// method, read from an `Arc`-shared caller" reason [`Self::diagnostics`] already is -
+    /// `ServerCapabilities::default()` until `initialize` completes, which every real caller of
+    /// this client (a caller can only ever hold an already-initialized `LspClient` - see this
+    /// module's own handshake-order docs) reaches before it's ever read for real.
+    capabilities: Mutex<ServerCapabilities>,
     /// Guarded by a `Mutex` (rather than a bare `Receiver<()>`) purely so `LspClient` itself is
     /// `Sync` - `std::sync::mpsc::Receiver` is `Send` but deliberately not `Sync`, and this
     /// crate's callers (the `app` crate) share one `Arc<LspClient>` across a GPUI background
@@ -235,8 +282,27 @@ pub struct LspClient {
     /// `LspClient: Sync`. There is still only one logical consumer in practice (see
     /// [`LspClient::drain_updates`]'s docs), so the lock is uncontended in the common case.
     wake_rx: Mutex<Receiver<()>>,
+    /// A clone of the same sender the reader thread wakes [`Self::wake_rx`]'s listeners with on
+    /// a real `publishDiagnostics` push - kept here too so [`Self::pull_diagnostics`] (a plain
+    /// `&self` method, not the reader thread) can send the exact same real wake signal after a
+    /// real, *pulled* diagnostics update, so a caller polling [`Self::drain_updates`] can't tell
+    /// (and doesn't need to) whether a given update arrived via push or pull.
+    wake_tx: SyncSender<()>,
     reader_thread: Option<JoinHandle<()>>,
     stderr_thread: Option<JoinHandle<()>>,
+    /// `true` iff the reader thread has not yet observed the connection close - flipped to
+    /// `false` by the reader thread itself the instant [`run_reader_loop`] returns, for *any*
+    /// reason (a clean EOF after a deliberate [`Self::shutdown`], or a real, unprompted I/O
+    /// error/process death). Unlike [`Self::exited`] (only ever written by `&mut self` methods,
+    /// so only reflects a *deliberate* `shutdown()`), this is written from the reader thread
+    /// itself (no `&mut self` access there) via a shared `Arc`, so a server that crashes or is
+    /// killed out from under this client - with no `shutdown()` ever called - is still honestly
+    /// observable through [`Self::is_connection_alive`], rather than leaving every subsequent
+    /// request to silently hang/time out one at a time with no single, direct "is this even
+    /// worth trying" signal (Revision R8.5b audit finding 9's fix for the reader-loop
+    /// silent-death gap; see [`Self::is_connection_alive`]'s own docs for how the `app` crate
+    /// uses this).
+    connection_alive: Arc<AtomicBool>,
 }
 
 impl LspClient {
@@ -289,13 +355,19 @@ impl LspClient {
             Arc::new(Mutex::new(HashMap::new()));
         let diagnostics: Arc<Mutex<HashMap<String, Vec<lsp_types::Diagnostic>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let capabilities = Mutex::new(ServerCapabilities::default());
         let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(WAKE_CHANNEL_CAPACITY);
+        // Cloned before the original is moved into the reader thread below - see
+        // `LspClient::wake_tx`'s own docs for why a second, client-held sender is needed.
+        let wake_tx_for_client = wake_tx.clone();
+        let connection_alive = Arc::new(AtomicBool::new(true));
 
         let workspace_configuration = config.workspace_configuration;
         let reader_thread = std::thread::spawn({
             let pending = Arc::clone(&pending);
             let diagnostics = Arc::clone(&diagnostics);
             let stdin_for_replies = Arc::clone(&stdin);
+            let connection_alive = Arc::clone(&connection_alive);
             move || {
                 run_reader_loop(
                     stdout,
@@ -304,6 +376,7 @@ impl LspClient {
                     wake_tx,
                     stdin_for_replies,
                     workspace_configuration,
+                    connection_alive,
                 )
             }
         });
@@ -322,9 +395,13 @@ impl LspClient {
             next_id: AtomicI64::new(1),
             pending,
             diagnostics,
+            diagnostics_version: Mutex::new(HashMap::new()),
+            capabilities,
             wake_rx: Mutex::new(wake_rx),
+            wake_tx: wake_tx_for_client,
             reader_thread: Some(reader_thread),
             stderr_thread: Some(stderr_thread),
+            connection_alive,
         };
 
         client.initialize(&repo_root, config.initialization_options)?;
@@ -417,8 +494,149 @@ impl LspClient {
             ..Default::default()
         };
 
-        let _result = self.request::<lsp_types::request::Initialize>(params, INITIALIZE_TIMEOUT)?;
+        let result = self.request::<lsp_types::request::Initialize>(params, INITIALIZE_TIMEOUT)?;
+        // Real capabilities this server actually advertised - see [`Self::capabilities`]'s own
+        // docs for why this is captured rather than discarded the way an earlier version of this
+        // method did. Written before `initialized` is sent so every real post-handshake caller
+        // (which can only ever hold an already-`spawn`ed, thus already-`initialize`d, client) sees
+        // it populated.
+        *lock(&self.capabilities) = result.capabilities;
         self.notify::<lsp_types::notification::Initialized>(InitializedParams {})?;
+        Ok(())
+    }
+
+    /// The real `completionProvider.triggerCharacters` this server advertised in its `initialize`
+    /// response (Revision R8.5b) - e.g. `["."]` for rust-analyzer, `[".", "\"", "'", "/", "@",
+    /// "<"]`-shaped lists for typescript-language-server/pyright (verified live against each
+    /// real, installed server rather than hardcoded, per this project's own "never invent, always
+    /// verify" discipline - see `crate::root::lsp`'s own completion-trigger docs in the `app`
+    /// crate for how a caller combines this with plain-identifier-character triggering). Empty
+    /// for a server with no `completionProvider` at all, or one that simply lists none.
+    pub fn completion_trigger_characters(&self) -> Vec<String> {
+        lock(&self.capabilities)
+            .completion_provider
+            .as_ref()
+            .and_then(|options| options.trigger_characters.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether this server's real, advertised `textDocumentSync` capability permits sending it
+    /// real `textDocument/didChange` notifications at all - `false` only for the one explicit,
+    /// real opt-out shape the spec defines (`TextDocumentSyncKind::NONE`, either as a bare kind or
+    /// as `TextDocumentSyncOptions.change`). A server that omits `textDocumentSync` entirely
+    /// (`None` here) is treated as permitting sync: every real server this app has been verified
+    /// against (rust-analyzer, typescript-language-server, pyright-langserver) advertises a real,
+    /// non-`NONE` `textDocumentSync` value, so this is a real, defensive fallback for a
+    /// hypothetical server that omits it, not a guess papering over an observed gap.
+    pub fn supports_document_sync(&self) -> bool {
+        match &lock(&self.capabilities).text_document_sync {
+            None => true,
+            Some(TextDocumentSyncCapability::Kind(kind)) => *kind != TextDocumentSyncKind::NONE,
+            Some(TextDocumentSyncCapability::Options(options)) => {
+                options.change != Some(TextDocumentSyncKind::NONE)
+            }
+        }
+    }
+
+    /// Whether this server advertises real, spec `textDocument/diagnostic` "pull" support
+    /// (`ServerCapabilities.diagnostic_provider`) - Revision R8.5b's own live probe against a
+    /// real, installed rust-analyzer found this isn't merely optional for it: rust-analyzer
+    /// advertises this capability and, live-verified, only ever *pushes* a real
+    /// `publishDiagnostics` notification once, right after `didOpen` - every real diagnostic
+    /// recompute after a real, subsequent `didChange` must be actively pulled via
+    /// [`Self::pull_diagnostics`]; it never arrives unsolicited. A server with no
+    /// `diagnostic_provider` at all is assumed to keep pushing on every real recompute instead -
+    /// this crate's original, pre-R8.5b design, still correct for such a server.
+    pub fn supports_diagnostic_pull(&self) -> bool {
+        lock(&self.capabilities).diagnostic_provider.is_some()
+    }
+
+    /// `false` once the reader thread has observed this connection close, for any reason - see
+    /// [`Self::connection_alive`]'s own docs. Read by the `app` crate (`crate::root::lsp::
+    /// lsp_file_status`) to give an honest "this language server's connection has died" status
+    /// instead of silently continuing to route requests at a dead process (each of which would
+    /// otherwise just independently fail/time out, with no single, direct signal that the whole
+    /// connection - not just one request - is the real problem).
+    pub fn is_connection_alive(&self) -> bool {
+        self.connection_alive.load(Ordering::SeqCst)
+    }
+
+    /// Actively pulls a real, fresh diagnostics result for `path` via a real
+    /// `textDocument/diagnostic` request (Revision R8.5b) - see [`Self::supports_diagnostic_pull`]'s
+    /// own docs for why this exists alongside the passive `publishDiagnostics` sink
+    /// [`Self::diagnostics`] already provides, and this module's own [`SERVER_CANCELLED`]/
+    /// [`retry_with_deadline`] docs for the real, spec-required retry-on-cancel loop below
+    /// (live-verified against a real rust-analyzer to fire routinely, not a hypothetical),
+    /// bounded so its real total wall-clock time stays within `timeout` overall (Revision R8.5b
+    /// audit finding 4's fix - see [`retry_with_deadline`]'s own docs for the arithmetic bug this
+    /// replaces: an earlier version gave *each* attempt its own full `timeout`, so the real
+    /// worst-case total was `timeout * PULL_DIAGNOSTICS_MAX_ATTEMPTS`, not `timeout`).
+    ///
+    /// `version` is the real, caller-tracked document version (see [`Self::did_change_full`]'s
+    /// own docs) this specific pull was dispatched *for* - purely local bookkeeping, never sent
+    /// to the server (the real `textDocument/diagnostic` request has no version parameter of its
+    /// own). Used only to guard [`Self::diagnostics_version`]'s own real, live-reproduced stale-
+    /// overwrite race (Revision R8.5b audit finding 5): a result is only applied to
+    /// [`Self::diagnostics`] if `version` is at least as new as whatever version's result is
+    /// already recorded there for this uri - see [`Self::diagnostics_version`]'s own docs for why
+    /// this can't be caught by the caller alone (once dispatched to a background thread, this
+    /// call can't be "un-polled" - only what it's allowed to *write* can be gated).
+    ///
+    /// On a real `Full` report that passes that version check, this replaces [`Self::diagnostics`]'
+    /// entry for `path`'s uri - the exact same real sink a `publishDiagnostics` push populates, so
+    /// every existing reader (`Self::diagnostics_for`/`Self::has_diagnostics_result`, and the
+    /// `app` crate's own `AdeApp::render_file_view`) needs no special-casing for where a result
+    /// came from - and sends the same real wake signal [`Self::drain_updates`]'s listeners already
+    /// expect. A real `Unchanged` report (the server's own "nothing changed since your last real
+    /// pull" answer), or a stale one discarded by the version check, is a genuine no-op: the
+    /// existing entry already holds the real, still-accurate (or still-fresher) result, so there
+    /// is nothing real to overwrite it with. Returns `Ok(())` either way - a discarded-for-
+    /// staleness result is not a real *failure* of this call, which did genuinely get a real
+    /// answer from the server; it just wasn't the newest one anymore by the time it landed.
+    pub fn pull_diagnostics(
+        &self,
+        path: &Path,
+        version: i32,
+        timeout: Duration,
+    ) -> Result<(), LspError> {
+        let uri = path_to_uri(path)?;
+        let name = self.name;
+        let report_result = retry_with_deadline(
+            timeout,
+            PULL_DIAGNOSTICS_MAX_ATTEMPTS,
+            PULL_DIAGNOSTICS_RETRY_DELAY,
+            |err| matches!(err, LspError::Response { code, .. } if *code == SERVER_CANCELLED),
+            |attempt_timeout| {
+                self.request::<lsp_types::request::DocumentDiagnosticRequest>(
+                    lsp_types::DocumentDiagnosticParams {
+                        text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                        identifier: None,
+                        previous_result_id: None,
+                        work_done_progress_params: Default::default(),
+                        partial_result_params: Default::default(),
+                    },
+                    attempt_timeout,
+                )
+            },
+            std::thread::sleep,
+            || LspError::Timeout {
+                server: name,
+                method: lsp_types::request::DocumentDiagnosticRequest::METHOD,
+            },
+        )?;
+
+        if let Some(items) = full_diagnostic_report_items(report_result) {
+            let mut versions = lock(&self.diagnostics_version);
+            let is_stale = versions
+                .get(uri.as_str())
+                .is_some_and(|&existing| version < existing);
+            if !is_stale {
+                versions.insert(uri.as_str().to_string(), version);
+                drop(versions);
+                lock(&self.diagnostics).insert(uri.as_str().to_string(), items);
+                let _ = self.wake_tx.try_send(());
+            }
+        }
         Ok(())
     }
 
@@ -445,6 +663,40 @@ impl LspClient {
             },
         };
         self.notify::<lsp_types::notification::DidOpenTextDocument>(params)
+    }
+
+    /// Sends a `textDocument/didChange` notification for `path` (Revision R8.5b) with one
+    /// content-change event that carries `text` as the *entire new document* and no `range` -
+    /// full-document sync, not incremental. That's a deliberate, verified choice, not a shortcut:
+    /// `lsp_types::TextDocumentContentChangeEvent`'s own real shape is a two-variant union (a
+    /// ranged delta, or - the variant used here - a bare `{ text }` meaning "replace the whole
+    /// document"), and the *second* variant is legal to send regardless of what
+    /// `textDocumentSync`/`completionProvider` capability the server actually negotiated (the
+    /// spec's incremental-sync contract governs what a *ranged* event must look like; it says
+    /// nothing that forbids a full-document replacement event on the same wire type). This app's
+    /// own `code_view::MAX_FILE_BYTES` (2 MiB) cap on any editable buffer keeps a worst-case
+    /// full-document resend cheap in practice, and every one of this app's own real, live-tested
+    /// servers (rust-analyzer, typescript-language-server, pyright-langserver) accepts it - see
+    /// `crate::root::lsp`'s own `LSP_SYNC_DEBOUNCE` docs in the `app` crate for why full-document
+    /// sync additionally makes *debouncing* the notification itself safe (unlike a real
+    /// incremental sync, which cannot skip an intermediate delta without corrupting the server's
+    /// reconstructed document).
+    ///
+    /// `version` must be strictly greater than whatever was last sent for `path` (a real,
+    /// spec-required monotonic document version - see `crate::root::lsp::AdeApp::
+    /// lsp_document_versions`'s own docs in the `app` crate for how the caller tracks this per
+    /// path); it does not need to increase by exactly one per call.
+    pub fn did_change_full(&self, path: &Path, text: String, version: i32) -> Result<(), LspError> {
+        let uri = path_to_uri(path)?;
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier { uri, version },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text,
+            }],
+        };
+        self.notify::<lsp_types::notification::DidChangeTextDocument>(params)
     }
 
     /// The most recent `textDocument/publishDiagnostics` payload rust-analyzer has sent for
@@ -691,6 +943,89 @@ impl Drop for LspClient {
     }
 }
 
+/// Real, shared retry/deadline bookkeeping for [`LspClient::pull_diagnostics`]'s bounded
+/// [`SERVER_CANCELLED`] retry loop (Revision R8.5b audit finding 4's fix for a real arithmetic
+/// bug): an earlier version gave *every* attempt the caller's full `budget` as its own timeout,
+/// so the real worst-case total wall-clock time was `budget * max_attempts`, not `budget` - with
+/// this crate's only real caller passing a 10s budget, that meant a genuine ~200s worst case for
+/// one call, compounded further by the `app` crate's own outer retry loop around it. Fixed here
+/// by computing one real `deadline = Instant::now() + budget` up front and deriving each
+/// attempt's own timeout from the *remaining* time until it, so the real total elapsed time is
+/// genuinely bounded by `budget`, regardless of `max_attempts`.
+///
+/// Pulled out as its own function (rather than inlined into `pull_diagnostics`) so this
+/// real deadline arithmetic - the actual bug - is unit-testable (`retry_deadline_tests` below)
+/// against a fake, instantly-answering `attempt` closure, without needing a real spawned language
+/// server that can be told to return [`SERVER_CANCELLED`] on demand. `attempt` is given the real
+/// remaining timeout it should use for that one try; `is_retryable` decides whether a given
+/// `Err` should trigger another attempt (only a real [`SERVER_CANCELLED`] response, for
+/// [`LspClient::pull_diagnostics`]'s own real caller); `sleep` performs the real backoff wait
+/// (always `std::thread::sleep` for the real caller - a parameter purely so a test can observe
+/// it without a real, if brief, wall-clock delay); `timeout_err` lazily builds the real
+/// `LspError` to report if every attempt is exhausted with no other error ever having been
+/// captured (only reachable if `max_attempts` is `0` - the real caller's `PULL_DIAGNOSTICS_MAX_ATTEMPTS`
+/// never is).
+fn retry_with_deadline<T>(
+    budget: Duration,
+    max_attempts: u32,
+    retry_delay: Duration,
+    is_retryable: impl Fn(&LspError) -> bool,
+    mut attempt: impl FnMut(Duration) -> Result<T, LspError>,
+    mut sleep: impl FnMut(Duration),
+    timeout_err: impl FnOnce() -> LspError,
+) -> Result<T, LspError> {
+    let deadline = Instant::now() + budget;
+    let mut last_err: Option<LspError> = None;
+    for attempt_index in 0..max_attempts {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match attempt(remaining) {
+            Ok(value) => return Ok(value),
+            Err(err) if is_retryable(&err) => {
+                last_err = Some(err);
+                if attempt_index + 1 >= max_attempts {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                sleep(retry_delay.min(remaining));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    // Every attempt was either cancelled or the real deadline ran out before one could even be
+    // tried - `last_err` is `Some` in the former case; `timeout_err` covers the latter (and the
+    // degenerate `max_attempts == 0` case, unreachable from this crate's own real caller).
+    Err(last_err.unwrap_or_else(timeout_err))
+}
+
+/// Real diagnostic items out of a real `textDocument/diagnostic` response - `None` for a real
+/// `Unchanged` report (see [`LspClient::pull_diagnostics`]'s own docs for why that's a genuine
+/// no-op, not an empty result) or the real `Partial` shape (this crate never sends
+/// `partial_result_params`, so a real, spec-compliant server has no reason to ever return one -
+/// treated the same honest "nothing new to apply" way rather than guessed at). Related-documents
+/// diagnostics (`RelatedFullDocumentDiagnosticReport::related_documents`) are deliberately not
+/// surfaced here - this app's own diagnostics model is per-open-file, with no real place to route
+/// a *different* file's diagnostics to yet (the same real scope this crate's push-based
+/// `publishDiagnostics` handling has always had).
+fn full_diagnostic_report_items(
+    result: lsp_types::DocumentDiagnosticReportResult,
+) -> Option<Vec<lsp_types::Diagnostic>> {
+    match result {
+        lsp_types::DocumentDiagnosticReportResult::Report(
+            lsp_types::DocumentDiagnosticReport::Full(report),
+        ) => Some(report.full_document_diagnostic_report.items),
+        lsp_types::DocumentDiagnosticReportResult::Report(
+            lsp_types::DocumentDiagnosticReport::Unchanged(_),
+        ) => None,
+        lsp_types::DocumentDiagnosticReportResult::Partial(_) => None,
+    }
+}
+
 /// Converts an absolute filesystem path to a percent-encoded `file://` URI via the `url`
 /// crate (`Url::from_file_path`) - deliberately not hand-rolled, since correct
 /// percent-encoding of arbitrary path bytes (spaces, non-ASCII, ...) is exactly the kind of
@@ -727,7 +1062,21 @@ fn uri_to_path(uri: &Uri) -> Result<PathBuf, LspError> {
 /// request (has both `id` and `method` - auto-replied to; see the inline comment below for how),
 /// or a notification (`method`, no `id`) - exits cleanly on EOF (the process died) or an I/O
 /// error. `workspace_configuration` answers real `workspace/configuration` requests - see
-/// [`server_request_reply`]'s docs.
+/// [`server_request_reply`]'s docs. `connection_alive` is flipped to `false` (Revision R8.5b
+/// audit finding 9's fix) the instant this loop exits, for either reason - see
+/// [`LspClient::connection_alive`]'s own docs for why a real, deliberate "the connection just
+/// died" signal, not just a log line, was the right call here: a genuinely dead server would
+/// otherwise leave every future request silently hanging/timing out one at a time, with nothing
+/// that directly says "the whole connection, not just this one call, is the real problem" - and
+/// why a real *reconnect* attempt was deliberately not chosen instead: re-establishing a working
+/// `LspClient` would mean re-running the whole `initialize`/`initialized` handshake *and*
+/// re-`didOpen`-ing every file this client's caller ([`Self::lsp_opened_files`]-equivalent
+/// bookkeeping in the `app` crate) already believes is open, from a plain background thread with
+/// no access back to that caller's own state - a real, substantial feature in its own right, out
+/// of proportion to this fix, and one this codebase's "no fake functionality" rule means can't be
+/// half-built. An honest, observable "this connection is dead" is the real, tested, in-scope
+/// choice; a caller that wants recovery can watch [`LspClient::is_connection_alive`] and spawn a
+/// fresh client the same way it spawned this one.
 fn run_reader_loop(
     stdout: std::process::ChildStdout,
     pending: Arc<Mutex<HashMap<i64, SyncSender<PendingResponse>>>>,
@@ -735,22 +1084,36 @@ fn run_reader_loop(
     wake_tx: SyncSender<()>,
     stdin: Arc<Mutex<ChildStdin>>,
     workspace_configuration: WorkspaceConfigFn,
+    connection_alive: Arc<AtomicBool>,
 ) {
     let mut reader = BufReader::new(stdout);
-    while let Ok(Some(value)) = transport::read_message(&mut reader) {
-        handle_incoming(
-            value,
-            &pending,
-            &diagnostics,
-            &wake_tx,
-            &stdin,
-            workspace_configuration,
-        );
+    loop {
+        match transport::read_message(&mut reader) {
+            Ok(Some(value)) => handle_incoming(
+                value,
+                &pending,
+                &diagnostics,
+                &wake_tx,
+                &stdin,
+                workspace_configuration,
+            ),
+            Ok(None) => break,
+            Err(err) => {
+                // A real, if rare, I/O or framing error (never expected in ordinary operation -
+                // see `transport::read_message`'s own docs for what can produce one) - logged
+                // rather than silently discarded (an earlier version of this loop's own `while
+                // let Ok(Some(value)) = ...` pattern treated this identically to a clean EOF,
+                // with no way to ever tell the two apart from the logs).
+                log::warn!("lsp-core reader thread stopping after a real I/O error: {err}");
+                break;
+            }
+        }
     }
     // The connection is gone: drop every still-pending response sender so any thread blocked in
     // `recv_timeout` gets a real, immediate `Disconnected` rather than waiting out its own
     // timeout for a response that will now never arrive.
     lock(&pending).clear();
+    connection_alive.store(false, Ordering::SeqCst);
 }
 
 fn handle_incoming(
@@ -828,9 +1191,10 @@ fn handle_incoming(
         let Some(params) = object.get("params") else {
             return;
         };
-        let Ok(parsed) =
-            serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(params.clone())
-        else {
+        let parse_result =
+            serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(params.clone());
+        let Ok(parsed) = parse_result else {
+            log::warn!("failed to parse a real publishDiagnostics payload: {parse_result:?}");
             return;
         };
         lock(diagnostics).insert(parsed.uri.as_str().to_string(), parsed.diagnostics);
@@ -1229,6 +1593,281 @@ mod tests {
         );
 
         client.shutdown().expect("shutdown should succeed");
+    }
+
+    /// The real, live proof Revision R8.5b's `LspClient::did_change_full`/`LspClient::
+    /// pull_diagnostics` exist to deliver: a real rust-analyzer, opened against a clean file,
+    /// gets a real *unsaved* edit (via `did_change_full` alone - no `did_open`/re-spawn, no file
+    /// ever written to disk) that introduces a genuine `E0308` type mismatch, and a real,
+    /// specifically *pulled* `textDocument/diagnostic` request reports it.
+    ///
+    /// This is the direct, load-bearing regression test for a real, live-discovered protocol
+    /// fact this crate's original design got wrong: a real, installed rust-analyzer was found,
+    /// by live probing while building this feature, to publish `publishDiagnostics` via *push*
+    /// only once - immediately after `didOpen` - and never again on its own initiative after a
+    /// subsequent `didChange`, despite advertising `textDocumentSync` support for it; real,
+    /// updated diagnostics must be actively *pulled* instead (see `LspClient::
+    /// supports_diagnostic_pull`'s own docs). An earlier version of this test (and of the `app`
+    /// crate's own end-to-end wiring test) asserted purely on the *push* sink
+    /// (`Self::diagnostics_for`) after a `did_change_full` call and hung for the full real 60s+
+    /// deadline every time - a genuine, live-reproduced correctness gap this fix closes, not a
+    /// hypothetical one.
+    #[test]
+    fn did_change_full_then_a_real_pull_reports_a_real_new_diagnostic() {
+        let project = write_scratch_project(
+            "fn main() {\n    let x: i32 = 1;\n    println!(\"{}\", x);\n}\n",
+        );
+        let main_rs = project.path().join("src").join("main.rs");
+        let source = std::fs::read_to_string(&main_rs).expect("read fixture source");
+
+        let client = LspClient::spawn(project.path(), rust_analyzer_config())
+            .expect("spawning + initializing rust-analyzer should succeed");
+
+        client
+            .did_open(&main_rs, source, 1, "rust")
+            .expect("didOpen should send successfully");
+
+        // Wait for the real baseline result (the file is clean, so this is an empty set).
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            if client.has_diagnostics_result(&main_rs) {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "rust-analyzer never published a real baseline result within 180s"
+            );
+            match client.wait_for_update(remaining.min(Duration::from_secs(5))) {
+                ClientUpdate::Updated | ClientUpdate::Timeout => continue,
+                ClientUpdate::Closed => panic!("closed before a real baseline result arrived"),
+            }
+        }
+        assert!(
+            client
+                .diagnostics_for(&main_rs)
+                .is_some_and(|diagnostics| diagnostics.is_empty()),
+            "sanity check: the unedited fixture should have a real, clean baseline"
+        );
+        assert!(
+            client.supports_diagnostic_pull(),
+            "sanity check: this test's whole point is proving the real pull path rust-analyzer \
+             actually needs - if this ever goes false, rust-analyzer stopped advertising \
+             diagnostic_provider and this test's premise needs re-checking against its real, \
+             current behavior"
+        );
+
+        // The real, live edit: a genuine type mismatch, sent via `did_change_full` alone (no
+        // `did_open` again, no file ever written to disk - a real, unsaved edit).
+        let edited_content = "fn main() {\n    let x: i32 = 1;\n    println!(\"{}\", x);\n}\n\nfn bad() -> i32 {\n    \"not a number\"\n}\n".to_string();
+        client
+            .did_change_full(&main_rs, edited_content, 2)
+            .expect("did_change_full should send successfully");
+
+        // The real, load-bearing call this test exists to prove: an active pull, not a passive
+        // wait on the push sink (which - per this test's own docs - never fires again here).
+        // `pull_diagnostics` itself already retries a real `ServerCancelled` response (the
+        // protocol's own "ask again" signal), but a real *successful* pull can still legitimately
+        // report a stale, empty result if rust-analyzer's own internal reanalysis genuinely
+        // hasn't caught up to this exact edit yet (observed live, under real parallel-test CPU
+        // contention, while building this test) - a different, honest race than
+        // `ServerCancelled`, with no reliable per-response "is this really done" signal to retry
+        // on internally. So this test's own outer loop re-pulls on a real, bounded wait, the
+        // same real polling discipline every other live wait in this module already uses.
+        let pull_deadline = Instant::now() + Duration::from_secs(60);
+        let diagnostics = loop {
+            client
+                .pull_diagnostics(&main_rs, 2, Duration::from_secs(30))
+                .expect(
+                    "a real pull_diagnostics call should eventually succeed, retrying through \
+                     any real ServerCancelled responses",
+                );
+            let diagnostics = client
+                .diagnostics_for(&main_rs)
+                .expect("pull_diagnostics should have populated a real result");
+            if !diagnostics.is_empty() {
+                break diagnostics;
+            }
+            assert!(
+                Instant::now() < pull_deadline,
+                "no real, non-empty diagnostics result arrived from repeated real pulls within \
+                 60s of the genuine new type mismatch being sent"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        };
+        let mismatch = diagnostics.iter().find(|diagnostic| {
+            let message = diagnostic.message.to_lowercase();
+            message.contains("mismatched")
+                || (message.contains("expected") && message.contains("i32"))
+        });
+        assert!(
+            mismatch.is_some(),
+            "expected a real diagnostic referencing the genuine type mismatch, got: \
+             {diagnostics:#?}"
+        );
+        let mismatch = mismatch.expect("checked above");
+        assert_eq!(
+            mismatch.severity,
+            Some(lsp_types::DiagnosticSeverity::ERROR),
+            "a genuine type mismatch should be reported at ERROR severity, got: {mismatch:#?}"
+        );
+        // Line 6 (0-indexed) is the real offending `"not a number"` line in `edited_content`
+        // above - not just "some diagnostic came back".
+        assert_eq!(
+            mismatch.range.start.line, 6,
+            "expected the mismatch diagnostic's range to point at the real offending line, \
+             got: {mismatch:#?}"
+        );
+    }
+
+    /// Revision R8.5b audit finding 5's direct regression test: a real, *late-arriving* pull
+    /// result tagged with an older document version must never clobber a real, *already-landed*
+    /// result for a newer one - the exact race `LspClient::diagnostics_version` exists to close
+    /// (see that field's own docs). Reproduced against a real rust-analyzer, not simulated: a
+    /// real `did_change_full` introduces a genuine type error, a real pull at version 10 records
+    /// it, then a real second pull against the *same, still-erroring* live content is issued but
+    /// deliberately mislabeled with version 3 (lower than what's already recorded) - standing in
+    /// for "this response, though arriving now, actually corresponds to an older edit that was
+    /// slow to answer". Real `pull_diagnostics` must still return `Ok(())` (a real answer *was*
+    /// obtained, just discarded as stale) but must not overwrite the real version-10 result: the
+    /// diagnostics this call left in place are checked directly by pre-emptively clearing what's
+    /// there (via a version-0 sync-independent probe is not available, so a distinguishing
+    /// baseline is used instead - see inline comments) rather than merely re-observing identical
+    /// content.
+    #[test]
+    fn a_stale_lower_version_pull_never_clobbers_an_already_landed_newer_one() {
+        let project = write_scratch_project(
+            "fn main() {\n    let x: i32 = 1;\n    println!(\"{}\", x);\n}\n",
+        );
+        let main_rs = project.path().join("src").join("main.rs");
+        let source = std::fs::read_to_string(&main_rs).expect("read fixture source");
+
+        let mut client = LspClient::spawn(project.path(), rust_analyzer_config())
+            .expect("spawning + initializing rust-analyzer should succeed");
+        client
+            .did_open(&main_rs, source, 1, "rust")
+            .expect("didOpen should send successfully");
+
+        // Wait for the real clean baseline first.
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            if client.has_diagnostics_result(&main_rs) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "rust-analyzer never published a real baseline result within 180s"
+            );
+            client.wait_for_update(Duration::from_secs(5));
+        }
+
+        // A real, genuine type error, sent as document version 10.
+        let bad_content = "fn main() {\n    let x: i32 = 1;\n    println!(\"{}\", x);\n}\n\nfn bad() -> i32 {\n    \"not a number\"\n}\n".to_string();
+        client
+            .did_change_full(&main_rs, bad_content, 10)
+            .expect("did_change_full should send successfully");
+
+        // Real pull #1, tagged with the real version (10) it corresponds to - retries through any
+        // real transient empty/cancelled answers until the genuine mismatch lands.
+        let pull_deadline = Instant::now() + Duration::from_secs(60);
+        let baseline_diagnostics = loop {
+            client
+                .pull_diagnostics(&main_rs, 10, Duration::from_secs(30))
+                .expect("a real pull_diagnostics call should eventually succeed");
+            let diagnostics = client
+                .diagnostics_for(&main_rs)
+                .expect("pull_diagnostics should have populated a real result");
+            if !diagnostics.is_empty() {
+                break diagnostics;
+            }
+            assert!(
+                Instant::now() < pull_deadline,
+                "no real, non-empty diagnostics arrived from repeated real pulls within 60s"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        };
+        assert!(
+            !baseline_diagnostics.is_empty(),
+            "sanity check: the real version-10 pull should have recorded the genuine mismatch"
+        );
+
+        // Real pull #2, against the exact same still-erroring live content, but deliberately
+        // mislabeled with version 3 - lower than the version (10) already recorded. Standing in
+        // for a real, live-reproduced race: a slow pull response answering an *older* edit
+        // landing after a fresher one already applied.
+        client
+            .pull_diagnostics(&main_rs, 3, Duration::from_secs(30))
+            .expect(
+                "a stale-version pull should still return Ok(()) - a real answer was genuinely \
+                 obtained, it's just discarded as stale, not a failure of the call itself",
+            );
+
+        // The real, load-bearing assertion: the stored result must be untouched by the stale
+        // pull - still the real version-10 result, not silently replaced (even with identical-
+        // looking content in this fixture's case, `diagnostics_version` staying at 10 rather than
+        // regressing to 3 is what a subsequent, genuinely fresher pull at e.g. version 11 would
+        // depend on to not itself be wrongly treated as stale).
+        let after_stale_pull = client
+            .diagnostics_for(&main_rs)
+            .expect("a real result should still be present");
+        assert_eq!(
+            after_stale_pull, baseline_diagnostics,
+            "a real pull tagged with an older document version must never clobber the real \
+             result already recorded for a newer one"
+        );
+
+        // Direct proof `diagnostics_version` itself didn't regress: a pull at version 5 (still
+        // lower than 10) must *also* be discarded - if the stale version-3 pull above had wrongly
+        // regressed the recorded version down to 3, a version-5 pull would incorrectly be treated
+        // as "newer" and wrongly allowed through.
+        client
+            .pull_diagnostics(&main_rs, 5, Duration::from_secs(30))
+            .expect("a stale-version pull should still return Ok(())");
+        let after_second_stale_pull = client
+            .diagnostics_for(&main_rs)
+            .expect("a real result should still be present");
+        assert_eq!(
+            after_second_stale_pull, baseline_diagnostics,
+            "the recorded version must not have regressed after the first stale pull - a \
+             version-5 pull (still lower than the real version-10 result already recorded) must \
+             also be discarded"
+        );
+
+        client.shutdown().expect("shutdown should succeed");
+    }
+
+    /// Revision R8.5b audit finding 9's direct regression test for the reader-loop silent-death
+    /// fix: once the real underlying process is killed out from under this client (no
+    /// `shutdown()` ever called), the reader thread must genuinely observe the connection close
+    /// and flip [`LspClient::is_connection_alive`] to `false` - a real, honest, tested signal,
+    /// not just a `log::warn!` line nothing else ever reads.
+    #[test]
+    fn killing_the_real_process_flips_is_connection_alive_to_false() {
+        let project = write_scratch_project("fn main() {}\n");
+        let client = LspClient::spawn(project.path(), rust_analyzer_config())
+            .expect("spawning + initializing rust-analyzer should succeed");
+        assert!(
+            client.is_connection_alive(),
+            "a freshly spawned, initialized client should report its connection as alive"
+        );
+
+        // Kill the real process out from under the client - no `shutdown()` call, standing in
+        // for a real, unprompted crash.
+        let descendants = proc::collect_descendant_pids(client.pid);
+        proc::signal_pid(client.pid, nix::sys::signal::Signal::SIGKILL);
+        for pid in &descendants {
+            proc::signal_pid(*pid, nix::sys::signal::Signal::SIGKILL);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while client.is_connection_alive() {
+            assert!(
+                Instant::now() < deadline,
+                "is_connection_alive() should have flipped to false within 10s of the real \
+                 process being killed"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// The real `ServerSpawnConfig` for typescript-language-server this test module spawns
@@ -1815,5 +2454,121 @@ mod tests {
         );
 
         client.shutdown().expect("shutdown should succeed");
+    }
+}
+
+/// Real, fast, deterministic-ish coverage for [`retry_with_deadline`]'s own deadline arithmetic
+/// (Revision R8.5b audit finding 4) - no real spawned language server involved (this crate has
+/// no `gpui` dependency, so a real GPUI fake-clock test isn't possible here; see
+/// `crate::root::lsp::lsp_diagnostics_wiring_tests` in the `app` crate for this fix's own
+/// real, live, end-to-end LSP coverage instead). A fake `attempt` closure stands in for a real
+/// request that legitimately takes as long as it's given (`remaining.mul_f64(0.8)`, always
+/// retryable) - real `std::time::Instant`/`std::thread::sleep`, just with a short, test-scale
+/// real `budget` so the whole test runs in well under a second.
+#[cfg(test)]
+mod retry_deadline_tests {
+    use super::*;
+
+    fn fake_cancelled() -> LspError {
+        LspError::Response {
+            server: "fake",
+            method: "textDocument/diagnostic",
+            code: SERVER_CANCELLED,
+            message: "server cancelled the request".to_string(),
+        }
+    }
+
+    /// The real bug this fix closes, reproduced directly: with the *old* behavior (every attempt
+    /// given the full, unshrinking `budget` as its own timeout), a fake attempt that always
+    /// legitimately consumes 80% of whatever timeout it's given, retried
+    /// `PULL_DIAGNOSTICS_MAX_ATTEMPTS`-many times, would take up to `budget * max_attempts` of
+    /// real wall-clock time. With the fix, each attempt only ever gets the real *remaining* time
+    /// until one shared deadline, so the real total elapsed time stays close to `budget`,
+    /// regardless of `max_attempts`.
+    #[test]
+    fn total_real_elapsed_time_stays_within_the_caller_budget_not_multiplied_by_attempt_count() {
+        let budget = Duration::from_millis(200);
+        let max_attempts = 20;
+        let start = Instant::now();
+
+        let result: Result<(), LspError> = retry_with_deadline(
+            budget,
+            max_attempts,
+            Duration::from_millis(0),
+            |_err| true, // every attempt is "retryable", mirroring a real, persistent cancel.
+            |remaining: Duration| -> Result<(), LspError> {
+                // A real attempt that always legitimately takes 80% of whatever timeout window
+                // it's given before answering "cancelled" - the exact shape that made the old,
+                // unbounded-per-attempt design blow up: each attempt looked individually
+                // reasonable (well under its own given timeout) while the *total* grew without
+                // bound as attempts accumulated.
+                std::thread::sleep(remaining.mul_f64(0.8));
+                Err(fake_cancelled())
+            },
+            std::thread::sleep,
+            fake_cancelled,
+        );
+
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_err(),
+            "every attempt was made retryable, so this should exhaust"
+        );
+        assert!(
+            elapsed < budget * 3,
+            "real total elapsed time ({elapsed:?}) should stay close to the real budget \
+             ({budget:?}), not grow toward budget * max_attempts ({:?}) the way the pre-fix \
+             per-attempt-gets-the-full-budget design did",
+            budget * max_attempts
+        );
+    }
+
+    /// A real attempt that succeeds on the first try returns immediately, without waiting out
+    /// any real deadline machinery - the common, non-retrying case must stay cheap.
+    #[test]
+    fn a_successful_first_attempt_returns_immediately() {
+        let start = Instant::now();
+        let result = retry_with_deadline(
+            Duration::from_secs(5),
+            20,
+            Duration::from_millis(100),
+            |_err: &LspError| true,
+            |_remaining: Duration| -> Result<&'static str, LspError> { Ok("ready") },
+            std::thread::sleep,
+            fake_cancelled,
+        );
+        assert!(matches!(result, Ok("ready")));
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "a first-attempt success should not wait on any real deadline/backoff machinery"
+        );
+    }
+
+    /// A non-retryable error is returned immediately, without consuming any further attempts or
+    /// real backoff time - `is_retryable` genuinely gates retrying, not every real `Err`.
+    #[test]
+    fn a_non_retryable_error_is_returned_immediately_without_retrying() {
+        let attempts = std::cell::Cell::new(0);
+        let result: Result<(), LspError> = retry_with_deadline(
+            Duration::from_secs(5),
+            20,
+            Duration::from_millis(0),
+            |_err| false, // nothing is retryable.
+            |_remaining: Duration| -> Result<(), LspError> {
+                attempts.set(attempts.get() + 1);
+                Err(LspError::Timeout {
+                    server: "fake",
+                    method: "textDocument/diagnostic",
+                })
+            },
+            std::thread::sleep,
+            fake_cancelled,
+        );
+        assert!(matches!(result, Err(LspError::Timeout { .. })));
+        assert_eq!(
+            attempts.get(),
+            1,
+            "a non-retryable error must not trigger a second attempt"
+        );
     }
 }

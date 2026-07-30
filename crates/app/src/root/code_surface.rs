@@ -85,8 +85,13 @@ impl AdeApp {
         self.code_view = code_view::CodeView::Diff;
         self.restore_zoom_for_open_change(&path);
         self.refresh_open_diff_file_cache();
-        // A hover card is only valid for the file it was requested against.
+        // A hover card is only valid for the file it was requested against - and so is a real
+        // Completions popup (Revision R8.5b audit finding 3's fix for a real, live-reproduced
+        // data-corruption bug: without this, a popup left open from switching away from a file
+        // could resurrect and splice stale text into whatever's active when the same path
+        // becomes active again - see `Self::dismiss_completions`'s own docs).
         self.hover = None;
+        self.dismiss_completions();
         cx.notify();
     }
 
@@ -112,8 +117,11 @@ impl AdeApp {
         self.restore_zoom_for_open_change(&relative);
         self.selected_tree_path = Some(path);
         self.refresh_open_diff_file_cache();
-        // See `Self::select_worktree`'s identical reset for why.
+        // See `Self::select_worktree`'s identical reset for why - and `Self::open_change_diff`'s
+        // sibling `dismiss_completions()` call for the real data-corruption bug closing this
+        // alongside `hover` prevents (Revision R8.5b audit finding 3).
         self.hover = None;
+        self.dismiss_completions();
         cx.notify();
     }
 
@@ -157,6 +165,9 @@ impl AdeApp {
         self.restore_zoom_for_open_change(&path);
         self.refresh_open_diff_file_cache();
         self.hover = None;
+        // See `Self::open_change_diff`'s identical `dismiss_completions()` call for why
+        // (Revision R8.5b audit finding 3).
+        self.dismiss_completions();
         self.code_cursor = None;
         self.prune_confirm_armed = false;
         cx.notify();
@@ -166,6 +177,18 @@ impl AdeApp {
     /// `path` was the active tab, activates the neighbor to its right, else the one to its left,
     /// else falls back to the active session's terminal (restoring focus like
     /// [`Self::close_settings`] does). No-op if `path` isn't an open tab.
+    ///
+    /// Cancels any real, in-flight debounced LSP sync/completion-request task for `path` (via
+    /// [`Self::_lsp_sync_tasks`]) and drops a real, stale [`Self::completions`] popup for it, if
+    /// one is open - Revision R8.5b audit finding 3's fix for a real, live-reproduced data-
+    /// corruption bug: without this, a completions popup requested against `path` could survive
+    /// its own tab closing entirely, then resurrect and let stale, wrong-context text be spliced
+    /// into whatever file is active if `path`'s tab (with the same buffer, still held in
+    /// [`Self::edit_buffers`] - this viewer never actually drops a buffer on tab close, only its
+    /// tab entry) is reopened later. The buffer itself is deliberately *not* dropped here (a real
+    /// tab close is not a "discard this file's edits" action - reopening the same path restores
+    /// its real, still-unsaved content), only the completions/sync state tied to the tab that no
+    /// longer exists.
     pub(super) fn close_file_tab(
         &mut self,
         path: PathBuf,
@@ -180,6 +203,14 @@ impl AdeApp {
         // fresh at the 100% default instead of resurrecting a stale value, and so this map
         // doesn't grow unbounded for the life of the worktree session.
         self.file_zoom_percent.remove(&path);
+        self._lsp_sync_tasks.remove(&path);
+        if self
+            .completions
+            .as_ref()
+            .is_some_and(|entry| entry.path == path)
+        {
+            self.dismiss_completions();
+        }
         let was_active = self.open_change.as_deref() == Some(path.as_path());
         if was_active {
             // After removal, the tab that was to the right (if any) has shifted into `index`;
@@ -195,11 +226,13 @@ impl AdeApp {
                     self.restore_zoom_for_open_change(&next_path);
                     self.refresh_open_diff_file_cache();
                     self.hover = None;
+                    self.dismiss_completions();
                 }
                 None => {
                     self.open_change = None;
                     self.refresh_open_diff_file_cache();
                     self.hover = None;
+                    self.dismiss_completions();
                     restore_focus(&self.sessions, &mut self.code_focus, window, cx);
                 }
             }
@@ -420,14 +453,17 @@ impl AdeApp {
 
         let Some(client) = self.lsp_client_for_path(&absolute_path) else {
             // No ready LSP client for this file's language yet; nothing to show, so clear any
-            // stale entry.
+            // stale entry - a real completions popup is equally stale in that case (Revision
+            // R8.5b audit finding 3), so it's dropped alongside `hover` here too.
             self.hover = None;
+            self.dismiss_completions();
             cx.notify();
             return;
         };
 
         let Ok(uri) = lsp_core::LspClient::uri_for_path(&absolute_path) else {
             self.hover = None;
+            self.dismiss_completions();
             cx.notify();
             return;
         };
@@ -798,10 +834,27 @@ impl AdeApp {
         // `"file-editor"` in that case.
         let is_file_editor = effective_view == code_view::CodeView::File
             && self.edit_buffers.contains_key(relative_path);
-        let key_context = if is_file_editor {
-            "diff file-editor"
-        } else {
-            "diff"
+        // Real Completions popup context (Revision R8.5b) - added the same way `"file-editor"`
+        // itself is, only while a popup is genuinely, *actionably* open *for this exact file*
+        // (matching `Self::completions_open_for_active_path`'s own guard, though that reads the
+        // active tab rather than `relative_path` directly - both agree here, since this whole
+        // surface only ever renders for whichever path is actually active). "Actionably" is
+        // load-bearing, not decoration: `completions_open_for_active_path` only returns `true`
+        // for a genuine `CompletionsStatus::Ready` entry, never a merely-`Loading`/`Failed` one
+        // (Revision R8.5b audit finding 1's fix for a real, live-reproduced bug - see that
+        // method's own docs) - so `Enter`/`Up`/`Down` fall back to the plain `Editor*` bindings
+        // below for the entire real round-trip a completion request takes, not just once it
+        // resolves. `crate::default_key_bindings` scopes `CompletionsUp`/`CompletionsDown`/
+        // `CompletionsAccept`/`CompletionsDismiss` to `Some("file-editor && completions")` and
+        // correspondingly narrows the plain `Editor*` up/down/enter bindings to
+        // `Some("file-editor && !completions")` - see those bindings' own docs for why this is
+        // the same real `&&`/`!` predicate mechanism the `"]"` binding already established, not a
+        // new one.
+        let completions_open = is_file_editor && self.completions_open_for_active_path();
+        let key_context = match (is_file_editor, completions_open) {
+            (true, true) => "diff file-editor completions",
+            (true, false) => "diff file-editor",
+            (false, _) => "diff",
         };
 
         div()
@@ -838,6 +891,10 @@ impl AdeApp {
             .on_action(cx.listener(Self::handle_editor_paste_action))
             .on_action(cx.listener(Self::handle_editor_save_action))
             .on_action(cx.listener(Self::handle_editor_save_anyway_action))
+            .on_action(cx.listener(Self::handle_completions_up_action))
+            .on_action(cx.listener(Self::handle_completions_down_action))
+            .on_action(cx.listener(Self::handle_completions_accept_action))
+            .on_action(cx.listener(Self::handle_completions_dismiss_action))
             .flex()
             .flex_col()
             .flex_1()
@@ -1283,6 +1340,10 @@ impl AdeApp {
             }
         }
 
+        // Computed early (moved up from where it used to be derived, below) - Revision R8.5b's
+        // diagnostics indexing needs it before `file_view_cache` is even guaranteed present.
+        let relative_path_buf = relative_path.to_path_buf();
+
         // Diagnostics apply to any extension `crate::language`'s registry spawns a real LSP
         // client for (Rust/TypeScript-family/Python as of Revision R8 - see that module's own
         // docs for Vue/Go's deliberate scope-down). `ensure_lsp_client`/`dispatch_did_open` are
@@ -1315,11 +1376,30 @@ impl AdeApp {
             let diagnostics_map = match (&state, &file_uri) {
                 (Some(LspClientState::Ready(client)), Some(uri)) => {
                     let diagnostics = client.diagnostics_for_uri(uri).unwrap_or_default();
-                    match self.file_view_cache.as_ref() {
-                        Some(parsed) => {
-                            diagnostics_view::index_diagnostics_by_line(&diagnostics, &parsed.lines)
+                    // Real live tracking (Revision R8.5b): index against the *live* edit
+                    // buffer's own `lines` when one exists for this file, not
+                    // `file_view_cache.lines` (the last-*saved* snapshot). Now that
+                    // `Self::schedule_lsp_sync` keeps the server's own document state in sync
+                    // with real, live *unsaved* edits (not just what's on disk - see that
+                    // method's own docs), a real diagnostic's line/character position is
+                    // reported relative to that same live content. Indexing it against stale
+                    // last-saved line boundaries would silently misplace it (or drop it
+                    // outright - a diagnostic on a line that only exists post-edit has no
+                    // matching last-saved line at all), the exact live-reproduced bug this fix
+                    // closes. `file_view_cache`/`parsed.lines` is still the real fallback for a
+                    // file with no edit buffer at all (still-loading, or truncated/non-UTF-8 and
+                    // thus permanently read-only - see `EditBuffer`'s own docs).
+                    match self.edit_buffers.get(&relative_path_buf) {
+                        Some(buffer) => {
+                            diagnostics_view::index_diagnostics_by_line(&diagnostics, &buffer.lines)
                         }
-                        None => HashMap::new(),
+                        None => match self.file_view_cache.as_ref() {
+                            Some(parsed) => diagnostics_view::index_diagnostics_by_line(
+                                &diagnostics,
+                                &parsed.lines,
+                            ),
+                            None => HashMap::new(),
+                        },
                     }
                 }
                 _ => HashMap::new(),
@@ -1350,35 +1430,76 @@ impl AdeApp {
         // Real, editable file-view state (Revision R8.5a): whichever `EditBuffer`
         // `spawn_file_load`'s completion already lazily seeded for `relative_path` (`None` only
         // for a truncated file, which stays read-only - see that method's own docs). Its `lines`,
-        // not `parsed.lines`, is what's actually on screen from here on whenever it exists -
-        // `parsed`/`file_view_cache` stays the freshness-check/diagnostics/hover source of truth
-        // (the last-*saved* snapshot), never the live edited text, per this phase's own scope.
-        let relative_path_buf = relative_path.to_path_buf();
+        // not `parsed.lines`, is what's actually on screen from here on whenever it exists.
+        // `parsed`/`file_view_cache` stays the freshness/reload source of truth (see
+        // `Self::render_file_view`'s own top docs on the throttled `std::fs::metadata` check);
+        // diagnostics/hover now track the *live* buffer instead, per Revision R8.5b, above.
         let line_count = self
             .edit_buffers
             .get(&relative_path_buf)
             .map(|buffer| buffer.lines.len())
             .unwrap_or_else(|| parsed.lines.len());
-        // `true` while the real edit buffer for this file has genuine unsaved changes - the
-        // real, honest gate finding 4's fix hinges on. `self.file_view_diagnostics`/
-        // `self.file_view_changed_lines` are both keyed by line numbers derived from the
-        // last-*saved* content (see this method's own docs above); once the buffer is dirty,
-        // those line numbers can no longer be trusted to name the same real line in the *edited*
-        // text an inserted/removed line anywhere above a diagnostic/change shifts every
-        // subsequent one onto the wrong row. Rather than confidently painting a diagnostic
-        // underline/red row background/git-gutter stripe on what may now be the *wrong* line,
-        // every per-row decoration below is suppressed while dirty, and one honest banner (below)
-        // takes their place - this phase's own scope (LSP reflects last-saved content only)
-        // honestly justifies *stale* diagnostics, not *confidently mis-anchored* ones.
+        // `true` while the real edit buffer for this file has genuine unsaved changes.
+        //
+        // Revision R8.5b: diagnostics/hover are **no longer** suppressed while dirty - now that
+        // `Self::schedule_lsp_sync` keeps the server's own document state genuinely in sync with
+        // live, unsaved edits (see that method's own docs, and the diagnostics-indexing fix
+        // above), a diagnostic's real position is relative to the *live* buffer's own lines, the
+        // exact same lines this row builder already renders from - no more confidently-wrong-row
+        // risk to guard against for diagnostics specifically. `self.file_view_changed_lines`
+        // (the git-gutter changed-line stripe) is a genuinely different case that still keeps
+        // this same real suppression below: it comes from `wt_core::diff`, a real diff against
+        // this file's content **on disk**, which has no way to know about an unsaved edit at all
+        // - a line shifted by typing would still misalign that marker onto the wrong row, so
+        // suppressing it while dirty is still the honest choice, not a leftover gap.
         let buffer_dirty = self
             .edit_buffers
             .get(&relative_path_buf)
             .is_some_and(|buffer| buffer.is_dirty());
-        let diagnostics_card = if buffer_dirty {
-            None
-        } else {
-            render_diagnostics_card(&self.file_view_diagnostics)
-        };
+        // `true` while a dirty buffer's own content hasn't reached the language server yet, *or*
+        // has reached it but the server hasn't genuinely answered for it yet (the real debounce
+        // in `Self::schedule_lsp_sync` hasn't fired, there's no ready client at all, or a real
+        // `didChange` was sent but its own diagnostics pull hasn't confirmed a fresh answer -
+        // Revision R8.5b audit finding 6) - the one real, honest signal this phase adds in place
+        // of R8.5a's old, now-inaccurate "diagnostics reflect only the last saved version"
+        // banner: diagnostics *do* track live edits now, but not *instantly* - a real language
+        // server's own recompute latency is real, non-zero time, and `self.file_view_diagnostics`
+        // legitimately still shows whatever the server last actually reported (the previous,
+        // still-real result) until a fresher one arrives, rather than flickering blank or hiding
+        // the gap.
+        //
+        // Two real, independent gates, either of which keeps this honestly "pending":
+        // - `content_unsynced`: the live buffer's content hasn't matched what was last
+        //   *successfully* sent (`AdeApp::lsp_last_synced_content`) - the original, plan-time-vs-
+        //   send-time signal.
+        // - `diagnostics_unconfirmed`: content *was* sent (a real `AdeApp::lsp_synced_version`
+        //   exists), but no confirmed diagnostics answer for that exact version has landed yet
+        //   (`AdeApp::lsp_diagnostics_confirmed_version`) - the real gap between "didChange
+        //   dispatched" and "a fresh diagnostics answer for that edit actually arrived" that an
+        //   earlier version of this gate closed only the first half of (flipping to "synced" the
+        //   instant the send succeeded, even though the server hadn't answered for it yet). A
+        //   file with no `lsp_synced_version` entry at all has nothing real to be unconfirmed
+        //   about yet - `content_unsynced` alone already covers that case honestly.
+        let sync_pending = has_lsp
+            && buffer_dirty
+            && self
+                .edit_buffers
+                .get(&relative_path_buf)
+                .is_some_and(|buffer| {
+                    let content_unsynced = self.lsp_last_synced_content.get(&relative_path_buf)
+                        != Some(&buffer.content);
+                    let diagnostics_unconfirmed =
+                        match self.lsp_synced_version.get(&relative_path_buf) {
+                            Some(sent_version) => {
+                                self.lsp_diagnostics_confirmed_version
+                                    .get(&relative_path_buf)
+                                    != Some(sent_version)
+                            }
+                            None => false,
+                        };
+                    content_unsynced || diagnostics_unconfirmed
+                });
+        let diagnostics_card = render_diagnostics_card(&self.file_view_diagnostics);
         // Hover only applies to a file whose extension has a real LSP identity; cloned once here
         // and reused per row for the same reason as `file_uri` above.
         let hover_target = has_lsp.then(|| absolute_path.clone());
@@ -1433,20 +1554,18 @@ impl AdeApp {
                         };
                         let line_number = index + 1;
                         let is_current = cursor_line == Some(line_number);
-                        // Suppressed while dirty - see this method's own `buffer_dirty` docs
-                        // above for why a stale-line-numbered decoration painted on the wrong
-                        // real row is worse than none at all.
+                        // Still suppressed while dirty - see `buffer_dirty`'s own docs, above,
+                        // for why this one (the git-gutter changed-line stripe, sourced from a
+                        // real on-disk diff) is a genuinely different case from the real-time
+                        // diagnostics below, which are no longer suppressed here.
                         let is_changed =
                             !buffer_dirty && this.file_view_changed_lines.contains(&line_number);
                         let empty_diagnostics: Vec<diagnostics_view::LineDiagnostic> = Vec::new();
-                        let line_diagnostics = if buffer_dirty {
-                            &empty_diagnostics
-                        } else {
-                            this.file_view_diagnostics
-                                .get(&line_number)
-                                .unwrap_or(&empty_diagnostics)
-                        }
-                        .clone();
+                        let line_diagnostics = this
+                            .file_view_diagnostics
+                            .get(&line_number)
+                            .unwrap_or(&empty_diagnostics)
+                            .clone();
                         let hovered_byte_range = this.hover.as_ref().and_then(|entry| {
                             (entry.path == absolute_path && entry.line_number == line_number)
                                 .then(|| entry.byte_range.clone())
@@ -1538,20 +1657,20 @@ impl AdeApp {
             .min_h_0()
             .child(render_file_breadcrumb(relative_path));
 
-        if buffer_dirty {
-            // The one honest banner finding 4's fix replaces every per-row diagnostic/change-
-            // marker/hover decoration with, right below the breadcrumb where it's genuinely hard
-            // to miss - see `buffer_dirty`'s own docs above for the real, confidently-wrong-row
-            // bug this exists instead of. `debug_selector`'d (matching `render_file_view_line`'s
-            // own `file-view-gutter-{n}` precedent) so a real test can assert on its real,
-            // painted presence/absence rather than only on the underlying boolean.
+        if sync_pending {
+            // Revision R8.5b's replacement for R8.5a's old (now inaccurate) "reflects only the
+            // last saved version" banner - see `sync_pending`'s own docs above for the real,
+            // honest condition this fires on. `debug_selector`'d (matching
+            // `render_file_view_line`'s own `file-view-gutter-{n}` precedent) so a real test can
+            // assert on its real, painted presence/absence rather than only on the underlying
+            // boolean.
             body = body.child(
                 div()
-                    .debug_selector(|| "file-view-dirty-diagnostics-banner".to_string())
+                    .debug_selector(|| "file-view-sync-pending-banner".to_string())
                     .child(render_sidebar_message(
-                        "unsaved edits: diagnostics, change markers, and hover-to-inspect below \
-                         reflect the last saved version, not your live edits - save to refresh \
-                         them"
+                        "unsaved edits: syncing with the language server\u{2026} diagnostics/\
+                         hover may briefly lag behind your very latest keystroke (change markers \
+                         still reflect only the saved file until you save)"
                             .to_string(),
                         theme::text::FAINT,
                     )),
@@ -2741,22 +2860,27 @@ mod code_view_cache_tests {
     }
 }
 
-/// Regression coverage (finding 4): once a File view's real `EditBuffer` is dirty,
-/// `file_view_diagnostics`/`file_view_changed_lines` (both keyed by line numbers from the last-
-/// *saved* content) can no longer be trusted to name the same real row in the *edited* text - see
-/// `AdeApp::render_file_view`'s own `buffer_dirty` docs for the full "confidently mis-anchored,
-/// not just stale" reasoning. Confirms the real, honest banner this fix adds is genuinely absent
-/// on a clean buffer (the legitimate case must not regress) and genuinely present once the same
-/// buffer becomes dirty.
+/// Regression coverage for Revision R8.5b's `AdeApp::sync_pending` gate (the replacement for
+/// R8.5a's old, now-inaccurate "diagnostics reflect only the last saved version" banner - see
+/// `AdeApp::render_file_view`'s own `sync_pending` docs). Confirms the real banner is absent on a
+/// clean buffer (the legitimate case must not regress), present the instant a buffer becomes
+/// dirty with no real sync recorded yet, and disappears again - the real, new behavior this fix
+/// specifically adds - once `AdeApp::lsp_last_synced_content` shows the language server has
+/// genuinely been told about this exact content, even though the buffer is still dirty (unsaved).
+/// `lsp_last_synced_content` is seeded directly rather than waiting on a real spawned
+/// rust-analyzer, matching `crate::root::lsp::lsp_client_eviction_tests`' own established
+/// precedent for testing real bookkeeping without paying for a real process spawn - the full,
+/// real end-to-end proof (a genuine `rust-analyzer`/`typescript-language-server`/
+/// `pyright-langserver` round trip) lives in `crate::root::lsp::lsp_diagnostics_wiring_tests`.
 #[cfg(test)]
 mod dirty_buffer_stale_decoration_tests {
     use super::*;
     use gpui::TestAppContext;
 
-    const BANNER_SELECTOR: &str = "file-view-dirty-diagnostics-banner";
+    const BANNER_SELECTOR: &str = "file-view-sync-pending-banner";
 
     #[gpui::test]
-    fn the_honest_stale_decoration_banner_is_absent_on_a_clean_buffer_and_present_once_dirty(
+    fn the_honest_sync_pending_banner_tracks_real_sync_state_not_just_raw_dirtiness(
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2772,33 +2896,13 @@ mod dirty_buffer_stale_decoration_tests {
             app.render_center_pane(cx);
         });
 
-        // A real, synthetic diagnostic/changed-line entry - standing in for what a real language
-        // server/git diff would otherwise populate, so this test doesn't need a real spawned
-        // rust-analyzer to exercise the real gating logic under test.
-        app.update(cx, |app, _cx| {
-            app.file_view_changed_lines.insert(2);
-            app.file_view_diagnostics.insert(
-                2,
-                vec![diagnostics_view::LineDiagnostic {
-                    byte_range: 0..1,
-                    severity: diagnostics_view::Severity::Error,
-                    message: "a real synthetic diagnostic".to_string(),
-                    source: None,
-                    code: None,
-                }],
-            );
-        });
-        app.update(cx, |app, cx| {
-            app.render_center_pane(cx);
-        });
-
         assert!(
             cx.debug_bounds(BANNER_SELECTOR).is_none(),
-            "the legitimate, clean-buffer case must not regress: a clean buffer with real \
-             diagnostics/changed lines must not show the dirty-staleness banner"
+            "the legitimate, clean-buffer case must not regress: a freshly-opened, unedited \
+             buffer must never show the sync-pending banner"
         );
 
-        // Dirty the buffer with a real edit.
+        // Dirty the buffer with a real edit - no real sync has been recorded for it yet.
         let relative = PathBuf::from("sample.rs");
         app.update(cx, |app, cx| {
             app.edit_buffers
@@ -2810,11 +2914,163 @@ mod dirty_buffer_stale_decoration_tests {
         app.update(cx, |app, cx| {
             app.render_center_pane(cx);
         });
-
         assert!(
             cx.debug_bounds(BANNER_SELECTOR).is_some(),
-            "once the buffer is genuinely dirty, the real honest banner must be shown instead of \
-             confidently painting decorations that may now be anchored to the wrong real row"
+            "a genuinely dirty buffer with no real sync recorded yet must show the honest \
+             sync-pending banner"
+        );
+
+        // The real debounce settles and `Self::schedule_lsp_sync`'s async continuation records
+        // this exact content as synced (`AdeApp::lsp_last_synced_content`) - the banner must
+        // disappear even though the buffer is still, correctly, dirty (unsaved). Seeding only
+        // `lsp_last_synced_content` here (not `lsp_synced_version`/
+        // `lsp_diagnostics_confirmed_version`) deliberately exercises the plain content-match
+        // half of `sync_pending`'s real gate in isolation - the version-confirmation half
+        // (Revision R8.5b audit finding 6) has its own dedicated coverage in
+        // `sync_pending_diagnostics_confirmation_tests`, below.
+        let synced_content = app.read_with(cx, |app, _| {
+            app.edit_buffers
+                .get(&relative)
+                .expect("buffer")
+                .content
+                .clone()
+        });
+        app.update(cx, |app, cx| {
+            app.lsp_last_synced_content
+                .insert(relative.clone(), synced_content);
+            cx.notify();
+        });
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        assert!(
+            cx.debug_bounds(BANNER_SELECTOR).is_none(),
+            "once the language server has genuinely been told about this exact content, the \
+             banner must disappear - the buffer being dirty (unsaved) alone is not the real \
+             condition this banner tracks"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .expect("buffer")
+                .is_dirty()),
+            "sanity check: the buffer must still genuinely be dirty/unsaved at this point"
+        );
+
+        // A further real edit moves the content past what was last synced - the banner must
+        // reappear.
+        app.update(cx, |app, cx| {
+            app.edit_buffers
+                .get_mut(&relative)
+                .expect("buffer")
+                .replace_range(None, "more ");
+            cx.notify();
+        });
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        assert!(
+            cx.debug_bounds(BANNER_SELECTOR).is_some(),
+            "a further real edit past what was last synced must bring the honest banner back"
+        );
+    }
+}
+
+/// Revision R8.5b audit finding 6's direct regression coverage: the real `sync_pending` banner
+/// must stay honestly "pending" for the whole real gap between "content was successfully sent"
+/// and "a version-matched diagnostics answer for it actually landed" - not flip to "synced" the
+/// instant the send alone succeeds. `AdeApp::lsp_last_synced_content`/`AdeApp::lsp_synced_version`/
+/// `AdeApp::lsp_diagnostics_confirmed_version` are seeded directly (matching
+/// `dirty_buffer_stale_decoration_tests`' own established precedent for testing this real gate
+/// without a real LSP round trip) rather than waiting on one.
+#[cfg(test)]
+mod sync_pending_diagnostics_confirmation_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    const BANNER_SELECTOR: &str = "file-view-sync-pending-banner";
+
+    #[gpui::test]
+    fn the_banner_stays_pending_until_a_version_matched_diagnostics_answer_lands(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn main() {\n    1\n}\n").expect("write sample.rs");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let relative = PathBuf::from("sample.rs");
+        app.update(cx, |app, cx| {
+            app.edit_buffers
+                .get_mut(&relative)
+                .expect("real edit buffer should have been seeded for sample.rs")
+                .replace_range(None, "// ");
+            cx.notify();
+        });
+
+        // The content was genuinely sent (`lsp_last_synced_content`/`lsp_synced_version` both
+        // recorded, matching a real, successful `did_change_full` - see `Self::schedule_lsp_sync`'s
+        // own docs for exactly where this write happens now, post-success), but *no* confirmed
+        // diagnostics answer for that version has landed yet - the real, honest "sent but not yet
+        // answered" gap this fix exists to keep the banner truthful through.
+        let synced_content = app.read_with(cx, |app, _| {
+            app.edit_buffers
+                .get(&relative)
+                .expect("buffer")
+                .content
+                .clone()
+        });
+        app.update(cx, |app, cx| {
+            app.lsp_last_synced_content
+                .insert(relative.clone(), synced_content);
+            app.lsp_synced_version.insert(relative.clone(), 7);
+            cx.notify();
+        });
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        assert!(
+            cx.debug_bounds(BANNER_SELECTOR).is_some(),
+            "content sent (version 7) but no confirmed diagnostics answer for that version yet \
+             must keep the honest sync-pending banner showing - the send alone is not \
+             confirmation"
+        );
+
+        // A confirmed answer for an *older* version (a real, late-arriving stale confirmation -
+        // see finding 5's own version-guard) must not satisfy this either.
+        app.update(cx, |app, cx| {
+            app.lsp_diagnostics_confirmed_version
+                .insert(relative.clone(), 6);
+            cx.notify();
+        });
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        assert!(
+            cx.debug_bounds(BANNER_SELECTOR).is_some(),
+            "a confirmed answer for an older version (6) than what was actually sent (7) must \
+             not clear the honest sync-pending banner"
+        );
+
+        // The real, version-matched confirmation lands - only now should the banner clear.
+        app.update(cx, |app, cx| {
+            app.lsp_diagnostics_confirmed_version
+                .insert(relative.clone(), 7);
+            cx.notify();
+        });
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        assert!(
+            cx.debug_bounds(BANNER_SELECTOR).is_none(),
+            "once a real, version-matched diagnostics answer has genuinely landed, the honest \
+             sync-pending banner must clear"
         );
     }
 }
@@ -3677,6 +3933,150 @@ mod multi_file_tab_tests {
             code_view::CodeView::File,
             "re-activating a tab that's active-but-not-really-showing must fall back to File \
              view, which always has real content, instead of staying a dead no-op"
+        );
+    }
+}
+
+/// Revision R8.5b audit finding 3's direct regression coverage: a genuine data-corruption bug -
+/// a stale [`AdeApp::completions`] popup surviving a tab switch/close and resurrecting later,
+/// letting stale text be spliced into whatever file happens to become active again. The real
+/// `Ready` popup state is seeded directly (no real LSP round trip needed to prove this real
+/// navigation/bookkeeping bug - matching `multi_file_tab_tests`' own established precedent, and
+/// `crate::root::lsp::lsp_diagnostics_wiring_tests` for the real, live end-to-end completions
+/// proof this module doesn't duplicate).
+#[cfg(test)]
+mod stale_completions_popup_tests {
+    use super::*;
+    use crate::root::completions::{CompletionsEntry, CompletionsStatus};
+    use gpui::TestAppContext;
+
+    fn write_two_files(dir: &std::path::Path) -> ((PathBuf, PathBuf), (PathBuf, PathBuf)) {
+        let a = dir.join("a.rs");
+        let b = dir.join("b.rs");
+        std::fs::write(&a, "fn a() {}\n").expect("write a.rs");
+        std::fs::write(&b, "fn b() {}\n").expect("write b.rs");
+        ((a, b), (PathBuf::from("a.rs"), PathBuf::from("b.rs")))
+    }
+
+    fn fake_ready_entry(path: PathBuf, label: &str) -> CompletionsEntry {
+        CompletionsEntry {
+            path,
+            status: CompletionsStatus::Ready {
+                items: vec![lsp_core::lsp_types::CompletionItem {
+                    label: label.to_string(),
+                    ..Default::default()
+                }],
+                selected: 0,
+            },
+        }
+    }
+
+    /// The exact scenario the audit reproduced live: open a completions popup on file A, switch
+    /// to file B, switch back to A - the popup must not resurrect. Exercised via
+    /// [`AdeApp::activate_file_tab`] (the tab-strip click handler), the real code path a real tab
+    /// switch drives.
+    #[gpui::test]
+    fn switching_tabs_away_and_back_does_not_resurrect_a_stale_completions_popup(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ((a, b), (a_rel, b_rel)) = write_two_files(repo.path());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        for path in [a, b] {
+            app.update_in(cx, |app, window, cx| {
+                app.open_file_view(path, window, cx);
+            });
+            cx.run_until_parked();
+        }
+        // `open_file_view` activates whichever file was opened last (`b`) - reactivate `a` so a
+        // real popup can be seeded "for" it.
+        app.update_in(cx, |app, window, cx| {
+            app.activate_file_tab(a_rel.clone(), window, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.completions = Some(fake_ready_entry(a_rel.clone(), "stale_for_a"));
+            cx.notify();
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.completions_open_for_active_path()),
+            "sanity check: the seeded popup should genuinely be open for the active file, a"
+        );
+
+        // Switch to b - a real, ordinary tab switch, not a close.
+        app.update_in(cx, |app, window, cx| {
+            app.activate_file_tab(b_rel.clone(), window, cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.completions.is_none()),
+            "switching tabs away from a must drop the real completions popup that was open for \
+             it, not merely hide it - a stale entry left behind is exactly the real, live-\
+             reproduced bug this fix closes"
+        );
+
+        // Switch back to a - the real, load-bearing assertion: no resurrection.
+        app.update_in(cx, |app, window, cx| {
+            app.activate_file_tab(a_rel, window, cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.completions.is_none()),
+            "switching back to a must not resurrect the stale popup that was open for it before \
+             the switch away - accepting it would splice stale, wrong-context text into the \
+             buffer, the real data-corruption bug this fix closes"
+        );
+    }
+
+    /// The second half of the audit's own scenario: closing a tab with an open popup, then
+    /// opening a *different* file, must never show or let the user accept stale completions meant
+    /// for the closed file - and, separately, reopening the *same*, closed path later must not
+    /// resurrect it either (the buffer itself survives a tab close - see [`AdeApp::
+    /// close_file_tab`]'s own docs - so the popup must be dropped independently of the buffer).
+    #[gpui::test]
+    fn closing_a_tab_with_an_open_popup_never_lets_it_resurface_for_another_file(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ((a, b), (a_rel, _b_rel)) = write_two_files(repo.path());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        for path in [a.clone(), b] {
+            app.update_in(cx, |app, window, cx| {
+                app.open_file_view(path, window, cx);
+            });
+            cx.run_until_parked();
+        }
+        app.update_in(cx, |app, window, cx| {
+            app.activate_file_tab(a_rel.clone(), window, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.completions = Some(fake_ready_entry(a_rel.clone(), "stale_for_a"));
+            cx.notify();
+        });
+
+        // Close a's tab while its popup is open.
+        app.update_in(cx, |app, window, cx| {
+            app.close_file_tab(a_rel.clone(), window, cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.completions.is_none()),
+            "closing a tab with an open real completions popup must drop it, not leave it \
+             dangling for a file that's no longer open"
+        );
+        assert!(
+            app.read_with(cx, |app, _| !app.open_files.contains(&a_rel)),
+            "sanity check: a's tab should genuinely be closed"
+        );
+
+        // Reopening the exact same path later (the buffer itself survives a close - see
+        // `AdeApp::close_file_tab`'s own docs) must not resurrect the popup either.
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(a, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.completions.is_none()),
+            "reopening the same path after its tab was closed must not resurrect a stale popup \
+             from before the close"
         );
     }
 }

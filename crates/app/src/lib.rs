@@ -10,6 +10,7 @@
 
 pub mod changes;
 pub mod code_view;
+pub mod completion_view;
 pub mod diagnostics_view;
 pub mod edit_buffer;
 pub mod env_info;
@@ -121,6 +122,14 @@ use gpui::{
 ///   own docs for the real permanent-deadlock bug (a conflict that, once flagged, could never
 ///   clear again through the ordinary save path) this exists to let the user deliberately break
 ///   out of.
+/// - The `Completions*` entries (Revision R8.5b) back the real Completions popup
+///   (`crate::root::completions`), scoped to `Some("file-editor && completions")` - a real,
+///   narrower sibling context added to the same node only while the popup is genuinely open (see
+///   `crate::root::code_surface::AdeApp::render_code_surface`'s own docs). `enter`/`up`/`down`
+///   above are correspondingly narrowed to `!completions` so the two mutually-exclusive predicate
+///   sets can never both match the same keystroke - the same real `&&`/`!`
+///   `KeyBindingContextPredicate` mechanism the `"]"` entry already established for this exact
+///   bug class.
 pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
     vec![
         gpui::KeyBinding::new("secondary-n", root::NewSession, None),
@@ -140,11 +149,23 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("secondary-8", root::JumpToSession8, None),
         gpui::KeyBinding::new("backspace", root::EditorBackspace, Some("file-editor")),
         gpui::KeyBinding::new("delete", root::EditorDelete, Some("file-editor")),
-        gpui::KeyBinding::new("enter", root::EditorEnter, Some("file-editor")),
+        // Narrowed to `!completions` (Revision R8.5b) - see the `Completions*` entries below and
+        // this list's own docs for why: while the real Completions popup is open, `Enter`/`Up`/
+        // `Down` must reach `CompletionsAccept`/`CompletionsUp`/`CompletionsDown` instead of
+        // inserting a newline/moving the real caret.
+        gpui::KeyBinding::new(
+            "enter",
+            root::EditorEnter,
+            Some("file-editor && !completions"),
+        ),
         gpui::KeyBinding::new("left", root::EditorLeft, Some("file-editor")),
         gpui::KeyBinding::new("right", root::EditorRight, Some("file-editor")),
-        gpui::KeyBinding::new("up", root::EditorUp, Some("file-editor")),
-        gpui::KeyBinding::new("down", root::EditorDown, Some("file-editor")),
+        gpui::KeyBinding::new("up", root::EditorUp, Some("file-editor && !completions")),
+        gpui::KeyBinding::new(
+            "down",
+            root::EditorDown,
+            Some("file-editor && !completions"),
+        ),
         gpui::KeyBinding::new("shift-left", root::EditorSelectLeft, Some("file-editor")),
         gpui::KeyBinding::new("shift-right", root::EditorSelectRight, Some("file-editor")),
         gpui::KeyBinding::new("shift-up", root::EditorSelectUp, Some("file-editor")),
@@ -160,6 +181,48 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
             "secondary-shift-s",
             root::EditorSaveAnyway,
             Some("file-editor"),
+        ),
+        // Real Completions popup navigation/accept/dismiss (Revision R8.5b) - scoped to
+        // `"file-editor && completions"`, the real *narrower* mirror of the `!completions`
+        // narrowing on `enter`/`up`/`down` above, added to the same code-surface node only while
+        // `AdeApp::completions` is genuinely, actionably `Ready` for the active file (see
+        // `crate::root::code_surface::AdeApp::render_code_surface`'s own docs for exactly where
+        // that context tag comes from, and `crate::root::completions::AdeApp::
+        // completions_open_for_active_path`'s own docs for why `Loading`/`Failed` don't count).
+        // `Tab` has no competing plain-`Editor*` *action* binding anywhere in this list - but the
+        // real, live-verified reason scoping it only to `"file-editor && completions"` is safe
+        // isn't "nothing else claims it": a real, live keystroke test confirms that with the
+        // popup closed, an unbound `tab` keystroke still reaches the real edit buffer and inserts
+        // a literal `\t`, the same way any other unbound printable character does - GPUI falls
+        // through to the platform's ordinary text-input/IME path (`crate::root::editing`'s
+        // `EntityInputHandler::replace_text_in_range`) for any keystroke with no matching
+        // `KeyBinding` in the currently active context, rather than dropping it. So `Tab` is
+        // never actually *unhandled* outside this narrow context; it's handled by a different,
+        // pre-existing real mechanism than a `KeyBinding`/action at all.
+        gpui::KeyBinding::new(
+            "up",
+            root::CompletionsUp,
+            Some("file-editor && completions"),
+        ),
+        gpui::KeyBinding::new(
+            "down",
+            root::CompletionsDown,
+            Some("file-editor && completions"),
+        ),
+        gpui::KeyBinding::new(
+            "tab",
+            root::CompletionsAccept,
+            Some("file-editor && completions"),
+        ),
+        gpui::KeyBinding::new(
+            "enter",
+            root::CompletionsAccept,
+            Some("file-editor && completions"),
+        ),
+        gpui::KeyBinding::new(
+            "escape",
+            root::CompletionsDismiss,
+            Some("file-editor && completions"),
         ),
     ]
 }

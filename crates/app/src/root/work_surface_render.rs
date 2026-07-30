@@ -81,6 +81,9 @@ impl AdeApp {
             self.open_change = None;
             self.refresh_open_diff_file_cache();
             self.hover = None;
+            // See `crate::root::code_surface::AdeApp::open_change_diff`'s identical
+            // `dismiss_completions()` call for why (Revision R8.5b audit finding 3).
+            self.dismiss_completions();
             restore_focus(&self.sessions, &mut self.code_focus, window, cx);
         }
         let cwd = self

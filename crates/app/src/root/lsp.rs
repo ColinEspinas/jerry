@@ -1,4 +1,5 @@
 use super::*;
+use crate::root::completions::{CompletionsEntry, CompletionsStatus};
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
 
@@ -6,6 +7,108 @@ use crate::root::focus::palette_focus_tests;
 /// running for it - see that field's own docs for why a bare `PathBuf` was widened to this
 /// (Revision R8) once more than one language could have a live client under the same root.
 pub(super) type LspClientKey = (PathBuf, &'static str);
+
+/// How long after the last keystroke [`AdeApp::schedule_lsp_sync`] waits before sending a real
+/// `textDocument/didChange` (and, when the resulting context is completion-worthy, chaining a
+/// real `textDocument/completion` request right after it) - matches Zed's own real
+/// `LSP_REQUEST_DEBOUNCE_TIMEOUT` (`vendor/zed/crates/editor/src/editor.rs:307`,
+/// `Duration::from_millis(50)`), which Zed uses to debounce the *expensive requests* (hover,
+/// completions) a buffer edit can trigger.
+///
+/// That citation needs a real caveat, not a blind copy: per `vendor/zed/crates/editor/src/
+/// editor.rs:9566-9608`'s own `on_buffer_event` -> `update_lsp_data`, Zed sends the `didChange`
+/// *notification* itself promptly, on every edit, undebounced - only the requests are debounced.
+/// This app deliberately debounces the notification too, and that's a considered, verified
+/// deviation, not a shortcut: [`lsp_core::LspClient::did_change_full`] always sends
+/// **full-document** sync (a `TextDocumentContentChangeEvent` with no `range` - see that method's
+/// own docs), which makes coalescing safe in a way Zed's own per-edit *incremental* sync cannot
+/// be - an incremental delta that gets silently skipped corrupts the server's reconstructed
+/// document, but a full-document replacement event never depends on any earlier one, so sending
+/// only the *latest* content a debounce window settles on loses nothing a server needs to know.
+/// Reusing Zed's exact 50ms figure keeps this in the same "still feels live while typing" range
+/// that number was chosen for, without inventing a second, unverified constant for what is, in
+/// this app's case, a safe generalization of the same underlying idea.
+const LSP_SYNC_DEBOUNCE: Duration = Duration::from_millis(50);
+
+/// How many extra times [`AdeApp::schedule_lsp_sync`] re-pulls diagnostics if a real
+/// `lsp_core::LspClient::pull_diagnostics` call succeeds but reports an empty result right after
+/// a real `didChange` - a genuine, live-observed race distinct from the `ServerCancelled` retry
+/// `pull_diagnostics` itself already handles internally: a real rust-analyzer's own internal
+/// reanalysis can still be catching up to the exact content just sent even when it *doesn't*
+/// cancel the pull, answering instead with a real, structurally valid, but stale "no problems"
+/// report (observed live, under real parallel-process CPU contention, while building this
+/// feature - see `lsp_core::client::tests::did_change_full_then_a_real_pull_reports_a_real_new_diagnostic`'s
+/// own docs for the same race caught at the `lsp-core` layer).
+///
+/// Only ever consulted when [`LspSyncRequest::previous_result_was_non_empty`] is `true`
+/// (Revision R8.5b audit finding 2's fix for a real, live-measured bug): retrying *every* real
+/// empty pull result, unconditionally, meant that for any genuinely clean file - where an empty
+/// result is simply the honest truth, not staleness - every single settled keystroke paid this
+/// retry budget's full real ~8s in the common case, live-measured to also gate the real
+/// `textDocument/completion` request behind it (see [`AdeApp::schedule_lsp_sync`]'s own docs for
+/// why that gating is *also* now independently fixed). "The previous known result for this file
+/// was non-empty" is the real, honest signal that a *fresh* empty result is actually suspicious
+/// (diagnostics don't just vanish on their own) rather than assumed by default; a file with no
+/// prior non-empty result (freshly opened and clean, or this is the very first sync) gets exactly
+/// one real pull and accepts whatever it says, trusting the next real sync tick to naturally
+/// refresh it rather than pre-emptively distrusting an honest "no problems" answer.
+const PULL_DIAGNOSTICS_EMPTY_RETRIES: u32 = 20;
+/// Real backoff between [`PULL_DIAGNOSTICS_EMPTY_RETRIES`] re-pulls - together with that count,
+/// a real ~8s worst-case total budget, only ever actually paid for a file whose diagnostics were
+/// genuinely non-empty a moment ago (see that constant's own docs).
+const PULL_DIAGNOSTICS_EMPTY_RETRY_DELAY: Duration = Duration::from_millis(400);
+
+/// The real, snapshotted work [`AdeApp::prepare_lsp_sync`] decides needs to happen once a
+/// debounce settles - computed synchronously on the foreground thread (reading
+/// [`AdeApp::edit_buffers`]/[`AdeApp::lsp_clients`], which only that thread may touch), then
+/// handed to [`AdeApp::schedule_lsp_sync`]'s async continuation to actually execute off-thread.
+/// Either field may be `None` independently: a debounce tick can have new content to sync but no
+/// completion-worthy context (an edit that isn't near an identifier/trigger character), or vice
+/// versa (the caret sits after an identifier but the content already matches what was last sent).
+struct LspSyncPlan {
+    sync: Option<LspSyncRequest>,
+    completion: Option<CompletionRequestPlan>,
+}
+
+/// The real snapshot needed to send one `textDocument/didChange` (and, for a pull-capable
+/// server, the real diagnostics pull that follows it) - see [`AdeApp::schedule_lsp_sync`]'s own
+/// docs for how this is actually used.
+struct LspSyncRequest {
+    client: std::sync::Arc<lsp_core::LspClient>,
+    absolute_path: PathBuf,
+    /// The real, full buffer content to send - a single owned clone (Revision R8.5b audit
+    /// finding 7's fix: an earlier version independently cloned `buffer.content` up to three
+    /// times per debounce tick across this struct's construction and two now-removed early
+    /// writes; this is the only clone taken in [`AdeApp::prepare_lsp_sync`] itself, moved
+    /// straight into this field with no further copy made there. [`AdeApp::schedule_lsp_sync`]'s
+    /// own async continuation still needs a *second* owned copy - one to actually consume in the
+    /// real `did_change_full` wire call, one to keep for [`AdeApp::lsp_last_synced_content`]'s
+    /// own post-success bookkeeping - so the real total is two clones per genuine sync, not one,
+    /// but that's the honest minimum for "send this content" and "remember what was sent" to both
+    /// hold their own real owned copy, down from the audit-identified three.
+    content: String,
+    version: i32,
+    /// Whether [`AdeApp::lsp_client_for_path`]'s client's [`lsp_core::LspClient::diagnostics_for_uri`]
+    /// already held a real, *non-empty* result for this path just before this sync was planned -
+    /// see [`PULL_DIAGNOSTICS_EMPTY_RETRIES`]'s own docs for why this, not an unconditional
+    /// retry-on-empty, is what actually gates [`AdeApp::schedule_lsp_sync`]'s post-sync retry
+    /// loop (Revision R8.5b audit finding 2). Computed via the cached [`AdeApp::lsp_uri_cache`]
+    /// entry when one exists (never a fresh, blocking `uri_for_path` call here - see that field's
+    /// own docs); `false` when there's no cached uri yet, the same honest "nothing to distrust
+    /// yet" default a freshly opened file gets.
+    previous_result_was_non_empty: bool,
+}
+
+/// The real snapshot needed to issue one `textDocument/completion` request and apply its result
+/// only if nothing superseded it in the meantime - see [`AdeApp::completions_generation`]'s own
+/// docs for what `generation` guards against.
+struct CompletionRequestPlan {
+    client: std::sync::Arc<lsp_core::LspClient>,
+    generation: u64,
+    params: lsp_core::lsp_types::CompletionParams,
+    /// Worktree-relative, matching [`AdeApp::edit_buffers`]'s own key convention.
+    relative_path: PathBuf,
+}
 
 impl AdeApp {
     /// Tears down every [`Self::lsp_clients`] entry whose *root* is not `active_root` - every
@@ -42,6 +145,17 @@ impl AdeApp {
             stale_keys.iter().map(|(root, _)| root.clone()).collect();
         for root in &stale_roots {
             self.lsp_opened_files.retain(|path| !path.starts_with(root));
+            // `lsp_document_versions` is absolute-path-keyed the same way `lsp_opened_files` is
+            // (see that field's own docs) - pruned here for the same reason: a stale root's
+            // version numbers are meaningless once its client (and thus its whole document set)
+            // is gone, and an unbounded map here would otherwise grow for the life of the window
+            // across every worktree ever visited.
+            self.lsp_document_versions
+                .retain(|path, _| !path.starts_with(root));
+            // `lsp_uri_cache` is absolute-path-keyed the same way (see that field's own docs) -
+            // pruned here for the same reason, so it doesn't grow unbounded across every
+            // worktree ever visited in the window's lifetime either.
+            self.lsp_uri_cache.retain(|path, _| !path.starts_with(root));
         }
 
         for key in stale_keys {
@@ -178,6 +292,20 @@ impl AdeApp {
     /// happens once per file open, not per render). Runs on `cx.background_executor()` since
     /// both the file read and the write to the server's stdin are blocking I/O.
     ///
+    /// Also computes and caches `path`'s real `file://` [`lsp_core::lsp_types::Uri`] into
+    /// [`Self::lsp_uri_cache`] here, off-thread (Revision R8.5b audit finding 8's fix) - a real,
+    /// live-reproduced rule violation: an earlier version of [`Self::prepare_lsp_sync`] called
+    /// [`lsp_core::LspClient::uri_for_path`] (a blocking `canonicalize()` syscall) inline, on the
+    /// GPUI foreground thread, on *every* real debounced sync tick, directly contradicting this
+    /// same module's own stated "never acceptable to run inline on the GPUI thread" convention
+    /// (see [`Self::schedule_lsp_sync`]'s own docs for the identical rule already being followed
+    /// for [`lsp_core::LspClient::diagnostics_for`]'s own internal canonicalize). Computing it
+    /// exactly once here - the same real moment `path` is confirmed to have a real, ready LSP
+    /// client and is about to have its content read anyway - means [`Self::prepare_lsp_sync`]
+    /// never needs to call it at all: a cache miss there (only possible if an edit somehow lands
+    /// before this background task resolves) just honestly skips dispatching a completion request
+    /// for that one tick, rather than falling back to a second, still-blocking inline computation.
+    ///
     /// ## Judgment call: no `textDocument/didClose` is ever sent
     ///
     /// A real editor sends `didClose` when a buffer stops being open. This viewer is read-only
@@ -201,25 +329,40 @@ impl AdeApp {
         }
         self.lsp_opened_files.insert(path.clone());
 
-        let task = cx.spawn(async move |_this, cx| {
-            cx.background_executor()
-                .spawn(async move {
-                    match std::fs::read_to_string(&path) {
-                        Ok(text) => {
-                            if let Err(err) = client.did_open(&path, text, 1, language_id) {
-                                log::warn!(
-                                    "failed to send didOpen for {} to {}: {err}",
-                                    path.display(),
-                                    client.name()
-                                );
+        let task = cx.spawn(async move |this, cx| {
+            let uri = cx
+                .background_executor()
+                .spawn({
+                    let path = path.clone();
+                    async move {
+                        match std::fs::read_to_string(&path) {
+                            Ok(text) => {
+                                if let Err(err) = client.did_open(&path, text, 1, language_id) {
+                                    log::warn!(
+                                        "failed to send didOpen for {} to {}: {err}",
+                                        path.display(),
+                                        client.name()
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                log::warn!("failed to read {} for didOpen: {err}", path.display());
                             }
                         }
-                        Err(err) => {
-                            log::warn!("failed to read {} for didOpen: {err}", path.display());
-                        }
+                        // Computed here (off the foreground thread), regardless of whether the
+                        // read/didOpen above succeeded - a real, valid uri for `path` doesn't
+                        // depend on either having gone well, and caching it here is strictly
+                        // additive: worst case, a failed didOpen still leaves a usable cache entry
+                        // for whenever a client for this path does become genuinely usable.
+                        lsp_core::LspClient::uri_for_path(&path).ok()
                     }
                 })
                 .await;
+            if let Some(uri) = uri {
+                let _ = this.update(cx, |this, _cx| {
+                    this.lsp_uri_cache.insert(path, uri);
+                });
+            }
         });
         self._lsp_tasks.push(task);
     }
@@ -259,6 +402,444 @@ impl AdeApp {
             }
         });
         self._lsp_poll_task = Some(task);
+    }
+
+    /// Debounces a real live `textDocument/didChange` sync for `relative_path`'s buffer,
+    /// dispatching a real `textDocument/completion` request alongside it when the settled edit
+    /// looks completion-worthy - see [`LSP_SYNC_DEBOUNCE`]'s own docs for why coalescing both
+    /// into one debounced step is safe. Called from every real edit call site in
+    /// `crate::root::editing` (`replace_text_in_range`/`replace_and_mark_text_in_range`/
+    /// backspace/delete), alongside `Self::schedule_rehighlight`.
+    ///
+    /// A single slot per path in [`AdeApp::_lsp_sync_tasks`] (matching
+    /// `Self::schedule_rehighlight`'s own `_rehighlight_tasks` discipline): assigning a fresh
+    /// task here drops whatever earlier debounce/in-flight sync+pull cycle was still running for
+    /// the same path, so a fast typist can never produce two overlapping real `didChange`/pull
+    /// round trips for one file - the same "only the most recent keystroke's work should ever
+    /// land" guarantee this project's own history (Revision R3, R5.5) keeps needing.
+    ///
+    /// ## The real completion request is never gated behind the diagnostics pull
+    ///
+    /// Revision R8.5b audit finding 2's fix for a real, live-measured bug: an earlier version
+    /// dispatched the real `textDocument/completion` request only *after* the whole diagnostics-
+    /// pull retry sequence below finished - up to a real, measured ~8s on a genuinely clean file
+    /// (see [`PULL_DIAGNOSTICS_EMPTY_RETRIES`]'s own docs), during which real `Enter`/`Up`/`Down`
+    /// keystrokes had nothing to act on (compounding finding 1's own bug). The real completion
+    /// request is now dispatched as its own, genuinely independent [`Self::_completions_request_task`]
+    /// the moment the server is known to have the latest content - either right after a real sync
+    /// this tick succeeds, or immediately if there was nothing new to sync in the first place -
+    /// rather than being sequenced after the pull loop. It's still dispatched *after*, not
+    /// *before*, a real sync that did need to happen: both a `didChange` notification and a
+    /// completion request travel over the same real, `Mutex`-guarded stdin pipe (see
+    /// `lsp_core::client`'s own module docs), so reversing that order would risk the server
+    /// answering completions against stale, pre-edit content - a real correctness bug, not just a
+    /// latency one; only the diagnostics-*pull* retry loop, the actual multi-second offender, is
+    /// being decoupled here.
+    pub(super) fn schedule_lsp_sync(&mut self, relative_path: PathBuf, cx: &mut Context<Self>) {
+        let task = cx.spawn({
+            let relative_path = relative_path.clone();
+            async move |this, cx| {
+                cx.background_executor().timer(LSP_SYNC_DEBOUNCE).await;
+                let Ok(Some(plan)) =
+                    this.update(cx, |this, cx| this.prepare_lsp_sync(&relative_path, cx))
+                else {
+                    return;
+                };
+                let LspSyncPlan { sync, completion } = plan;
+
+                // The real sync, if this tick has new content to send - always awaited (not
+                // spawned as a separate task) before the completion request below, for the real
+                // wire-ordering correctness reason explained in this method's own docs.
+                let mut server_has_latest_content = true;
+                let mut pull_context = None;
+                if let Some(request) = sync {
+                    let LspSyncRequest {
+                        client,
+                        absolute_path,
+                        content,
+                        version,
+                        previous_result_was_non_empty,
+                    } = request;
+                    let sync_client = client.clone();
+                    let sync_path = absolute_path.clone();
+                    let content_for_wire = content.clone();
+                    let sync_result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            sync_client.did_change_full(&sync_path, content_for_wire, version)
+                        })
+                        .await;
+                    server_has_latest_content = sync_result.is_ok();
+                    if sync_result.is_ok() {
+                        // Written only now, after `did_change_full` genuinely returned `Ok`
+                        // (Revision R8.5b audit finding 6's fix) - an earlier version wrote
+                        // `lsp_last_synced_content` at *plan* time, before the send was even
+                        // attempted, which meant a failed send still left this bookkeeping
+                        // (and thus `Self::render_file_view`'s own `sync_pending` banner)
+                        // confidently, wrongly claiming the server had content it never actually
+                        // received.
+                        let record_path = relative_path.clone();
+                        let _ = this.update(cx, |this, _cx| {
+                            this.lsp_last_synced_content
+                                .insert(record_path.clone(), content);
+                            this.lsp_synced_version.insert(record_path, version);
+                        });
+                        pull_context = Some((
+                            client,
+                            absolute_path,
+                            version,
+                            previous_result_was_non_empty,
+                        ));
+                    }
+                }
+
+                // Real Completions dispatch - see this method's own docs for why this is a
+                // genuinely independent task, not awaited inline, and dispatched here rather than
+                // after the diagnostics-pull sequence further below.
+                if server_has_latest_content {
+                    if let Some(request) = completion {
+                        // A genuinely independent task (Revision R8.5b audit finding 2), not
+                        // awaited inline here - `cx.spawn` inside an already-async `Context::spawn`
+                        // continuation only takes a plain `AsyncFnOnce(&mut AsyncApp)` (unlike the
+                        // outer, entity-scoped `Context::spawn` that provided `this`/`cx` above),
+                        // so the already-weak `this` handle is cloned and moved in explicitly
+                        // rather than re-received as a closure parameter.
+                        let completion_this = this.clone();
+                        let completion_task = cx.spawn(async move |cx| {
+                            let CompletionRequestPlan {
+                                client,
+                                generation,
+                                params,
+                                relative_path,
+                            } = request;
+                            let result = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    client.request::<lsp_core::lsp_types::request::Completion>(
+                                        params,
+                                        LSP_QUERY_TIMEOUT,
+                                    )
+                                })
+                                .await;
+                            let _ = completion_this.update(cx, |this, cx| {
+                                this.apply_completion_result(
+                                    &relative_path,
+                                    generation,
+                                    result,
+                                    cx,
+                                );
+                            });
+                        });
+                        let _ = this.update(cx, |this, _cx| {
+                            this._completions_request_task = Some(completion_task);
+                        });
+                    }
+                }
+
+                let Some((client, absolute_path, version, previous_result_was_non_empty)) =
+                    pull_context
+                else {
+                    return;
+                };
+                // Real, live-verified fact (Revision R8.5b), not a guess: a real, installed
+                // rust-analyzer was found, by live probing while building this feature, to
+                // *push* a real `publishDiagnostics` notification only once - right after
+                // `didOpen` - and never again on its own initiative after a subsequent real
+                // `didChange`, even though it advertises `textDocumentSync` support for one;
+                // real, updated diagnostics only ever arrive there via an actively *pulled*
+                // `textDocument/diagnostic` request. `lsp_core::LspClient::
+                // supports_diagnostic_pull` reads each real server's own advertised
+                // `diagnostic_provider` capability to decide whether this extra pull is
+                // needed at all, rather than hardcoding a per-server list - real, live-tested
+                // end to end against all three of this app's supported servers (`crate::root::
+                // lsp::lsp_diagnostics_wiring_tests`), each correctly exercising whichever
+                // real path its own advertised capability calls for. A real pull is a genuine
+                // no-op for a server that never advertises the capability, so it's skipped
+                // rather than always attempted. Errors are intentionally swallowed here (not
+                // surfaced as a user-facing failure): a failed pull just means diagnostics
+                // stay whatever they were until the *next* sync tick tries again, which
+                // `Self::render_file_view`'s own `sync_pending` banner already communicates
+                // honestly - this app has no separate "diagnostics refresh failed" affordance
+                // for this phase's scope, and inventing one for a single best-effort
+                // background refresh isn't worth it.
+                if client.supports_diagnostic_pull() {
+                    // See `PULL_DIAGNOSTICS_EMPTY_RETRIES`'s own docs for the real,
+                    // live-observed race this bounded retry-on-empty closes, and for why it's
+                    // only even entered at all when `previous_result_was_non_empty` (Revision
+                    // R8.5b audit finding 2) - on a genuinely clean file this loop now runs
+                    // exactly once, not up to 21 times. The actual blocking LSP call is
+                    // still always off the foreground thread (a fresh `cx.background_executor()
+                    // .spawn()` per attempt); only the real, deterministic-clock-aware
+                    // `cx.background_executor().timer()` between attempts runs in this outer
+                    // async task, matching this file's own established convention (see
+                    // `AdeApp::ensure_lsp_poll_task`'s identical `timer(..)`-then-recheck
+                    // shape) rather than a second, unverified sleep mechanism from inside a
+                    // `'static` background closure that has no `cx` of its own to time with.
+                    let max_retries = if previous_result_was_non_empty {
+                        PULL_DIAGNOSTICS_EMPTY_RETRIES
+                    } else {
+                        0
+                    };
+                    for attempt in 0..=max_retries {
+                        let pull_client = client.clone();
+                        let pull_path = absolute_path.clone();
+                        // The real pull *and* the real "was the result empty" check both run
+                        // off the foreground thread together (the latter's own
+                        // `LspClient::diagnostics_for` does a real, if cheap,
+                        // `std::fs::canonicalize` syscall internally - never acceptable to
+                        // run inline on the GPUI thread per this crate's own convention).
+                        // `version` is threaded through so a real, late-landing result for an
+                        // older version can never clobber a fresher one already applied
+                        // (Revision R8.5b audit finding 5 - see `lsp_core::LspClient::
+                        // pull_diagnostics`'s own docs for where that guard actually lives).
+                        let outcome = cx
+                            .background_executor()
+                            .spawn(async move {
+                                pull_client
+                                    .pull_diagnostics(&pull_path, version, LSP_QUERY_TIMEOUT)
+                                    .ok()?;
+                                Some(
+                                    pull_client
+                                        .diagnostics_for(&pull_path)
+                                        .is_some_and(|diagnostics| diagnostics.is_empty()),
+                                )
+                            })
+                            .await;
+                        if outcome.is_some() {
+                            // A real, successful pull answer landed for this exact version - the
+                            // real "the server has genuinely answered for this edit" confirmation
+                            // `Self::render_file_view`'s own `sync_pending` banner now waits on
+                            // (Revision R8.5b audit finding 6), not just the send itself.
+                            // `.max(..)` so a real, late-arriving confirmation for an older
+                            // version (the same reordering finding 5 guards `pull_diagnostics`'s
+                            // own map against) can never regress this back down either.
+                            let record_path = relative_path.clone();
+                            let _ = this.update(cx, |this, _cx| {
+                                let confirmed = this
+                                    .lsp_diagnostics_confirmed_version
+                                    .entry(record_path)
+                                    .or_insert(version);
+                                *confirmed = (*confirmed).max(version);
+                            });
+                        }
+                        match outcome {
+                            Some(true) if attempt < max_retries => {
+                                cx.background_executor()
+                                    .timer(PULL_DIAGNOSTICS_EMPTY_RETRY_DELAY)
+                                    .await;
+                            }
+                            _ => break,
+                        }
+                    }
+                } else {
+                    // No pull needed - this server pushes fresh diagnostics on its own timeline
+                    // (or doesn't advertise `diagnostic_provider` at all), so there's no further
+                    // real confirmation step this app's own side can wait on; the successful send
+                    // itself is the honest "confirmed" signal in that case.
+                    let record_path = relative_path.clone();
+                    let _ = this.update(cx, |this, _cx| {
+                        let confirmed = this
+                            .lsp_diagnostics_confirmed_version
+                            .entry(record_path)
+                            .or_insert(version);
+                        *confirmed = (*confirmed).max(version);
+                    });
+                }
+            }
+        });
+        self._lsp_sync_tasks.insert(relative_path, task);
+    }
+
+    /// The synchronous, foreground half of [`Self::schedule_lsp_sync`]'s debounced work - reads
+    /// [`AdeApp::edit_buffers`]/[`AdeApp::lsp_clients`] fresh (this is the *first* foreground step
+    /// after the debounce timer, so this is always the real, current state, never a stale
+    /// snapshot from when the debounce was armed), decides what real work is owed, and performs
+    /// every mutation that work implies (bumping [`AdeApp::lsp_document_versions`],
+    /// seeding/advancing [`AdeApp::completions`]) before handing the actual I/O off to
+    /// [`Self::schedule_lsp_sync`]'s async continuation. `None` when there's nothing real to do
+    /// at all (no buffer, no ready client, content already in sync and no completion-worthy
+    /// context).
+    ///
+    /// Deliberately does **not** write [`AdeApp::lsp_last_synced_content`]/[`AdeApp::
+    /// lsp_synced_version`] here (Revision R8.5b audit finding 6's fix - see [`Self::
+    /// schedule_lsp_sync`]'s own docs for where that write actually happens now, and why): this
+    /// is *plan* time, before the real `did_change_full` send is even attempted, let alone known
+    /// to have succeeded.
+    fn prepare_lsp_sync(
+        &mut self,
+        relative_path: &Path,
+        cx: &mut Context<Self>,
+    ) -> Option<LspSyncPlan> {
+        let buffer = self.edit_buffers.get(relative_path)?;
+        let absolute_path = buffer.path.clone();
+        // A single owned clone, reused for everything below (Revision R8.5b audit finding 7's
+        // fix) - see `LspSyncRequest::content`'s own docs for the real, honest minimum this was
+        // brought down to.
+        let content = buffer.content.clone();
+        let cursor = buffer.cursor_offset();
+        let (line, _) = buffer.line_col_for_offset(cursor);
+        let line_utf16_start = buffer.utf16_line_starts.get(line).copied().unwrap_or(0);
+        let character = (buffer
+            .offset_to_utf16(cursor)
+            .saturating_sub(line_utf16_start)) as u32;
+        let position = lsp_core::lsp_types::Position {
+            line: line as u32,
+            character,
+        };
+
+        let Some(client) = self.lsp_client_for_path(&absolute_path) else {
+            // No ready client for this file's language (not spawned yet, still spawning, or
+            // failed) - nothing real to sync or complete against. A stale popup from *before* the
+            // client went away (e.g. a worktree switch mid-flight) shouldn't linger either.
+            if self
+                .completions
+                .as_ref()
+                .is_some_and(|entry| entry.path == relative_path)
+            {
+                self.dismiss_completions();
+                cx.notify();
+            }
+            return None;
+        };
+
+        let content_unchanged = self.lsp_last_synced_content.get(relative_path) == Some(&content);
+        let should_sync = !content_unchanged && client.supports_document_sync();
+
+        let char_before_cursor = crate::completion_view::char_before(&content, cursor);
+        let trigger_characters = client.completion_trigger_characters();
+        let completion_context =
+            crate::completion_view::completion_trigger(char_before_cursor, &trigger_characters);
+
+        if !should_sync && completion_context.is_none() {
+            if self
+                .completions
+                .as_ref()
+                .is_some_and(|entry| entry.path == relative_path)
+            {
+                // The context that justified the popup no longer holds (e.g. the user just typed
+                // a space, or a delimiter that isn't a real advertised trigger character) - dismiss
+                // it rather than let it silently go stale with no further edit ever refreshing it.
+                self.dismiss_completions();
+                cx.notify();
+            }
+            return None;
+        }
+
+        // The real, cached `file://` uri for `absolute_path` - see [`Self::lsp_uri_cache`]'s own
+        // docs (Revision R8.5b audit finding 8) for why this is a cache lookup, never a fresh,
+        // blocking `uri_for_path` call here on the GPUI foreground thread. Used both for building
+        // the real completion request below and (Revision R8.5b audit finding 2) for checking
+        // whether this path's last known diagnostics result was non-empty, without a second
+        // blocking call.
+        let cached_uri = self.lsp_uri_cache.get(&absolute_path).cloned();
+        let previous_result_was_non_empty = cached_uri
+            .as_ref()
+            .and_then(|uri| client.diagnostics_for_uri(uri))
+            .is_some_and(|diagnostics| !diagnostics.is_empty());
+
+        let sync = if should_sync {
+            let version_slot = self
+                .lsp_document_versions
+                .entry(absolute_path.clone())
+                .or_insert(1);
+            *version_slot += 1;
+            let version = *version_slot;
+            Some(LspSyncRequest {
+                client: client.clone(),
+                absolute_path: absolute_path.clone(),
+                content,
+                version,
+                previous_result_was_non_empty,
+            })
+        } else {
+            None
+        };
+
+        let completion = match (completion_context, cached_uri) {
+            (Some(context), Some(uri)) => {
+                self.completions_generation = self.completions_generation.wrapping_add(1);
+                self.completions = Some(CompletionsEntry {
+                    path: relative_path.to_path_buf(),
+                    status: CompletionsStatus::Loading,
+                });
+                cx.notify();
+                let params = lsp_core::lsp_types::CompletionParams {
+                    text_document_position: lsp_core::lsp_types::TextDocumentPositionParams {
+                        text_document: lsp_core::lsp_types::TextDocumentIdentifier { uri },
+                        position,
+                    },
+                    work_done_progress_params: lsp_core::lsp_types::WorkDoneProgressParams::default(
+                    ),
+                    partial_result_params: lsp_core::lsp_types::PartialResultParams::default(),
+                    context: Some(context),
+                };
+                Some(CompletionRequestPlan {
+                    client,
+                    generation: self.completions_generation,
+                    params,
+                    relative_path: relative_path.to_path_buf(),
+                })
+            }
+            // A completion-worthy context with no cached uri yet (only possible in the narrow
+            // window before `Self::dispatch_did_open`'s own background task resolves) is an
+            // honest "nothing to dispatch this tick" - the next debounce tick will very likely
+            // find the cache populated, rather than falling back to a second, still-blocking
+            // inline `uri_for_path` call here.
+            _ => None,
+        };
+
+        Some(LspSyncPlan { sync, completion })
+    }
+
+    /// Applies a real, completed `textDocument/completion` response - see
+    /// [`AdeApp::completions_generation`]'s own docs for the real stale-response race this
+    /// `generation` check closes (an in-flight request whose *task* wasn't cancelled, because the
+    /// user dismissed the popup via `Escape` rather than a further edit, must not resurrect it).
+    /// Also refuses to apply a response for a path that's no longer what [`AdeApp::completions`]
+    /// is even showing - defensive in the same spirit as `Self::request_hover`'s own
+    /// `still_current` check, though `generation` alone already covers every real path this
+    /// method is reachable from.
+    fn apply_completion_result(
+        &mut self,
+        relative_path: &Path,
+        generation: u64,
+        result: Result<Option<lsp_core::lsp_types::CompletionResponse>, lsp_core::LspError>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.completions_generation != generation {
+            return;
+        }
+        let matches_current = self
+            .completions
+            .as_ref()
+            .is_some_and(|entry| entry.path == relative_path);
+        if !matches_current {
+            return;
+        }
+
+        let new_state = match result {
+            Ok(Some(response)) => {
+                let items = match response {
+                    lsp_core::lsp_types::CompletionResponse::Array(items) => items,
+                    lsp_core::lsp_types::CompletionResponse::List(list) => list.items,
+                };
+                if items.is_empty() {
+                    None
+                } else {
+                    Some(CompletionsEntry {
+                        path: relative_path.to_path_buf(),
+                        status: CompletionsStatus::Ready { items, selected: 0 },
+                    })
+                }
+            }
+            Ok(None) => None,
+            Err(err) => Some(CompletionsEntry {
+                path: relative_path.to_path_buf(),
+                status: CompletionsStatus::Failed(err.to_string()),
+            }),
+        };
+        self.completions = new_state;
+        cx.notify();
     }
 }
 
@@ -329,6 +910,19 @@ pub(super) fn lsp_file_status(
     match state {
         None | Some(LspClientState::Spawning) => LspFileStatus::Spawning,
         Some(LspClientState::Failed(message)) => LspFileStatus::Failed(message.clone()),
+        // A real, honest degrade (Revision R8.5b audit finding 9's fix) for a `Ready` client
+        // whose underlying process has actually died out from under it - see
+        // `lsp_core::LspClient::is_connection_alive`'s own docs for how/why this is tracked.
+        // Reported via the same `Failed` variant a spawn/handshake failure already uses (real,
+        // honest text explaining *why*, not a fabricated distinct status this phase's scope
+        // doesn't otherwise need) rather than silently continuing to report `Indexing`/
+        // `Analyzed` off a client that will never answer another real request again.
+        Some(LspClientState::Ready(client)) if !client.is_connection_alive() => {
+            LspFileStatus::Failed(format!(
+                "{}'s connection was lost (the process exited unexpectedly)",
+                client.name()
+            ))
+        }
         Some(LspClientState::Ready(client)) => {
             let Some(uri) = uri else {
                 return LspFileStatus::Indexing;
@@ -588,7 +1182,7 @@ mod lsp_client_eviction_tests {
 #[cfg(test)]
 mod lsp_diagnostics_wiring_tests {
     use super::*;
-    use gpui::{Entity, TestAppContext, VisualTestContext};
+    use gpui::{Entity, EntityInputHandler, TestAppContext, VisualTestContext};
     use std::time::{Duration, Instant};
 
     /// Same minimal, dependency-free scratch cargo project shape as
@@ -813,6 +1407,458 @@ mod lsp_diagnostics_wiring_tests {
                     .contains_key(&(dir.path().to_path_buf(), "typescript-language-server")),
                 "the real entry should be keyed by the real typescript-language-server binary, \
                  not left over from some other server"
+            );
+        });
+    }
+
+    /// Generic real-time poll, shared by every Revision R8.5b test below: repeatedly re-renders
+    /// the centre pane (the real trigger for `AdeApp::ensure_lsp_client`/`dispatch_did_open`/
+    /// diagnostics indexing to progress) and drains the deterministic test executor, checking
+    /// `predicate` against the live `AdeApp` after each pass, until it's true or `deadline`
+    /// passes - the same real polling shape [`wait_for_real_diagnostics`] already established,
+    /// generalized so these tests can wait for a live completions popup or a specific diagnostic
+    /// message, not just "any diagnostic at all".
+    fn wait_until(
+        app: &Entity<AdeApp>,
+        cx: &mut VisualTestContext,
+        deadline: Instant,
+        message: &str,
+        predicate: impl Fn(&AdeApp) -> bool,
+    ) {
+        loop {
+            app.update(cx, |app, cx| {
+                app.render_center_pane(cx);
+            });
+            cx.run_until_parked();
+            if app.read_with(cx, |app, _| predicate(app)) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{message}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// Drives a real edit through the exact same code path a real keystroke does
+    /// (`EntityInputHandler::replace_text_in_range`, which is what `crate::root::editing`'s own
+    /// `on_key_down`/IME plumbing ultimately calls), then advances the deterministic test clock
+    /// past [`LSP_SYNC_DEBOUNCE`] and drains the executor so the real, debounced
+    /// `AdeApp::schedule_lsp_sync` task this edit armed actually fires (mirrors
+    /// `crate::root::editing::editing_tests`' own `REHIGHLIGHT_DEBOUNCE` advance-then-park
+    /// pattern for the sibling re-highlight debounce).
+    fn type_text(app: &Entity<AdeApp>, cx: &mut VisualTestContext, offset: usize, text: &str) {
+        app.update_in(cx, |app, window, cx| {
+            let relative = app
+                .active_editable_path()
+                .expect("a real editable File view tab should be active");
+            let buffer = app.edit_buffers.get_mut(&relative).expect("a real buffer");
+            buffer.move_to(offset);
+            app.replace_text_in_range(None, text, window, cx);
+        });
+        cx.background_executor
+            .advance_clock(LSP_SYNC_DEBOUNCE + Duration::from_millis(50));
+        cx.run_until_parked();
+    }
+
+    /// The real, live proof Revision R8.5b exists to deliver, for `rust-analyzer`: opening a
+    /// clean real file, then making a real *unsaved* edit that introduces a genuine type error,
+    /// reaches a real new diagnostic through nothing but this app's own real
+    /// `AdeApp::schedule_lsp_sync` -> `lsp_core::LspClient::did_change_full` path - not a saved-
+    /// disk-content reload, and not a synthetic notification. The same real, indexed client is
+    /// then reused (no second spawn) to prove real, live Completions: typing a real partial
+    /// identifier reaches a real `textDocument/completion` response, and accepting it splices the
+    /// real chosen item's text into the real buffer via `EditBuffer::replace_range`.
+    #[gpui::test]
+    fn rust_analyzer_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
+        cx: &mut TestAppContext,
+    ) {
+        let project = write_scratch_project(
+            "fn main() {\n    let x: i32 = 1;\n    println!(\"{}\", x);\n}\n",
+        );
+        let main_rs = project.path().join("src").join("main.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, project.path().to_path_buf());
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(main_rs.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let indexed_deadline = Instant::now() + Duration::from_secs(180);
+        wait_until(
+            &app,
+            cx,
+            indexed_deadline,
+            "rust-analyzer never reported a clean (zero-error) baseline for the real, \
+             unedited scratch file within the deadline",
+            |app| app.file_view_error_count == Some(0),
+        );
+
+        // A real, unsaved edit - inserted, not saved to disk - introducing a genuine type
+        // mismatch on a fresh line.
+        let insert_at = "fn main() {\n    let x: i32 = 1;\n    println!(\"{}\", x);\n}\n".len();
+        type_text(
+            &app,
+            cx,
+            insert_at,
+            "\nfn bad() -> i32 {\n    \"not a number\"\n}\n",
+        );
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.edit_buffers
+                    .values()
+                    .next()
+                    .expect("a real buffer")
+                    .is_dirty(),
+                "the edit must be a real, genuinely unsaved one - this proof is specifically \
+                 that live sync doesn't depend on a save"
+            );
+        });
+
+        let diagnostic_deadline = Instant::now() + Duration::from_secs(180);
+        wait_until(
+            &app,
+            cx,
+            diagnostic_deadline,
+            "no real diagnostic referencing the genuine new type mismatch arrived within the \
+             deadline after a real live didChange sync",
+            |app| {
+                app.file_view_diagnostics
+                    .values()
+                    .flatten()
+                    .any(|diagnostic| {
+                        let message = diagnostic.message.to_lowercase();
+                        message.contains("mismatched")
+                            || (message.contains("expected") && message.contains("i32"))
+                    })
+            },
+        );
+
+        // The same real, already-`Ready` client (no second spawn) now proves real, live
+        // completions: a fresh line with a genuine partial identifier - and, at the same time,
+        // Revision R8.5b audit finding 2's own regression coverage: the earlier `bad()` mismatch
+        // above was never fixed, so a real `client.diagnostics_for_uri` result for this file is
+        // already known, confirmed non-empty *before* this edit - exactly the condition under
+        // which `AdeApp::schedule_lsp_sync`'s post-sync diagnostics-pull retry loop is eligible to
+        // retry up to `PULL_DIAGNOSTICS_EMPTY_RETRIES` times (real behavior this test doesn't
+        // fake). `type_text` only ever advances the deterministic test clock by
+        // `LSP_SYNC_DEBOUNCE` - never again after this - so if the real completion request were
+        // still sequenced *after* that whole pull sequence (the pre-fix bug), and the pull
+        // sequence needed even one real retry, its own `cx.background_executor()
+        // .timer(PULL_DIAGNOSTICS_EMPTY_RETRY_DELAY)` wait would never fire on this frozen
+        // deterministic clock, and `app.completions` could never reach `Ready` here at all - it
+        // would hang until this test's own real, wall-clock deadline below and fail. Reaching
+        // `Ready` (bounded, additionally, by a real wall-clock budget well under the real ~8s the
+        // old, fully-serialized worst case could add on top of the real completion round trip
+        // itself) is the real, live proof the completion request no longer depends on that pull
+        // sequence completing, retrying, or its own timer ever advancing.
+        let relative = PathBuf::from("src/main.rs");
+        let completion_trigger_offset = app.read_with(cx, |app, _| {
+            app.edit_buffers
+                .get(&relative)
+                .expect("a real buffer")
+                .content
+                .len()
+        });
+        let completion_dispatch_started = Instant::now();
+        type_text(
+            &app,
+            cx,
+            completion_trigger_offset,
+            "\nfn call() {\n    prin",
+        );
+
+        let completion_deadline = Instant::now() + Duration::from_secs(60);
+        wait_until(
+            &app,
+            cx,
+            completion_deadline,
+            "no real completions ever arrived for the genuine \"prin\" prefix within the \
+             deadline - if this hangs, the real completion request may have regressed back to \
+             being sequenced after the diagnostics-pull retry loop, whose own retry timer this \
+             test deliberately never advances past the initial debounce",
+            |app| {
+                app.completions
+                    .as_ref()
+                    .is_some_and(|entry| matches!(&entry.status, CompletionsStatus::Ready { .. }))
+            },
+        );
+        assert!(
+            completion_dispatch_started.elapsed() < Duration::from_secs(20),
+            "the real completion request reaching Ready took {:?} of real wall-clock time - \
+             expected well under the real ~8s the pre-fix design's fully-serialized diagnostics-\
+             pull retry sequence alone could add on top of the completion round trip itself \
+             (Revision R8.5b audit finding 2)",
+            completion_dispatch_started.elapsed()
+        );
+        app.read_with(cx, |app, _| {
+            let entry = app.completions.as_ref().expect("checked above");
+            let CompletionsStatus::Ready { items, .. } = &entry.status else {
+                panic!("checked above");
+            };
+            assert!(
+                items.iter().any(|item| item.label.contains("println")),
+                "expected a real completion item for the genuine \"println\" macro among \
+                 rust-analyzer's own real response, got: {:?}",
+                items.iter().map(|item| &item.label).collect::<Vec<_>>()
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.handle_completions_accept_action(&CompletionsAccept, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let content = &app
+                .edit_buffers
+                .get(&relative)
+                .expect("a real buffer")
+                .content;
+            assert!(
+                content.contains("println"),
+                "accepting the real completion should have spliced its real text into the \
+                 real buffer, got: {content:?}"
+            );
+            assert!(
+                !content.contains("prinprintln") && !content.contains("println!ln"),
+                "the already-typed real prefix (\"prin\") must be replaced, not duplicated \
+                 alongside the accepted real completion text, got: {content:?}"
+            );
+        });
+    }
+
+    /// The same real, live proof as the rust-analyzer test above, for `typescript-language-server`
+    /// - see `crate::language`'s own docs on why `npm install typescript@5` is a genuine, real
+    /// project-local requirement in this sandbox, not conservative caution.
+    #[gpui::test]
+    fn typescript_language_server_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            "{\"compilerOptions\": {\"strict\": true, \"target\": \"ES2020\"}}\n",
+        )
+        .expect("write tsconfig.json");
+        let main_ts = dir.path().join("main.ts");
+        let baseline = "const ok: number = 1;\nconsole.log(ok);\n";
+        std::fs::write(&main_ts, baseline).expect("write main.ts");
+        let status = std::process::Command::new("npm")
+            .args([
+                "install",
+                "typescript@5",
+                "--no-audit",
+                "--no-fund",
+                "--silent",
+            ])
+            .current_dir(dir.path())
+            .status()
+            .expect("npm should be on PATH in this sandbox (real, live network install)");
+        assert!(status.success(), "npm install typescript@5 failed");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, dir.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(main_ts.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let indexed_deadline = Instant::now() + Duration::from_secs(120);
+        wait_until(
+            &app,
+            cx,
+            indexed_deadline,
+            "typescript-language-server never reported a clean (zero-error) baseline within \
+             the deadline",
+            |app| app.file_view_error_count == Some(0),
+        );
+
+        type_text(
+            &app,
+            cx,
+            baseline.len(),
+            "\nconst bad: number = \"not a number\";\n",
+        );
+        app.read_with(cx, |app, _| {
+            assert!(app
+                .edit_buffers
+                .values()
+                .next()
+                .expect("a real buffer")
+                .is_dirty());
+        });
+
+        let diagnostic_deadline = Instant::now() + Duration::from_secs(120);
+        wait_until(
+            &app,
+            cx,
+            diagnostic_deadline,
+            "no real diagnostic referencing the genuine new TypeScript type mismatch arrived \
+             within the deadline after a real live didChange sync",
+            |app| {
+                app.file_view_diagnostics
+                    .values()
+                    .flatten()
+                    .any(|diagnostic| diagnostic.message.to_lowercase().contains("not assignable"))
+            },
+        );
+
+        let relative = PathBuf::from("main.ts");
+        let completion_trigger_offset = app.read_with(cx, |app, _| {
+            app.edit_buffers
+                .get(&relative)
+                .expect("a real buffer")
+                .content
+                .len()
+        });
+        type_text(&app, cx, completion_trigger_offset, "\nconsol");
+
+        let completion_deadline = Instant::now() + Duration::from_secs(60);
+        wait_until(
+            &app,
+            cx,
+            completion_deadline,
+            "no real completions ever arrived for the genuine \"consol\" prefix within the \
+             deadline",
+            |app| {
+                app.completions
+                    .as_ref()
+                    .is_some_and(|entry| matches!(&entry.status, CompletionsStatus::Ready { .. }))
+            },
+        );
+        app.read_with(cx, |app, _| {
+            let entry = app.completions.as_ref().expect("checked above");
+            let CompletionsStatus::Ready { items, .. } = &entry.status else {
+                panic!("checked above");
+            };
+            assert!(
+                items.iter().any(|item| item.label.contains("console")),
+                "expected a real completion item for the genuine \"console\" global among \
+                 typescript-language-server's own real response, got: {:?}",
+                items.iter().map(|item| &item.label).collect::<Vec<_>>()
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.handle_completions_accept_action(&CompletionsAccept, window, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let content = &app
+                .edit_buffers
+                .get(&relative)
+                .expect("a real buffer")
+                .content;
+            assert!(
+                content.contains("console"),
+                "accepting the real completion should have spliced its real text into the \
+                 real buffer, got: {content:?}"
+            );
+        });
+    }
+
+    /// The same real, live proof as the two tests above, for `pyright-langserver`.
+    #[gpui::test]
+    fn pyright_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main_py = dir.path().join("main.py");
+        let baseline = "ok: int = 1\nprint(ok)\n";
+        std::fs::write(&main_py, baseline).expect("write main.py");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, dir.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(main_py.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let indexed_deadline = Instant::now() + Duration::from_secs(120);
+        wait_until(
+            &app,
+            cx,
+            indexed_deadline,
+            "pyright-langserver never reported a clean (zero-error) baseline within the \
+             deadline",
+            |app| app.file_view_error_count == Some(0),
+        );
+
+        type_text(&app, cx, baseline.len(), "\nbad: int = \"not a number\"\n");
+        app.read_with(cx, |app, _| {
+            assert!(app
+                .edit_buffers
+                .values()
+                .next()
+                .expect("a real buffer")
+                .is_dirty());
+        });
+
+        let diagnostic_deadline = Instant::now() + Duration::from_secs(120);
+        wait_until(
+            &app,
+            cx,
+            diagnostic_deadline,
+            "no real diagnostic referencing the genuine new Python type mismatch arrived \
+             within the deadline after a real live didChange sync",
+            |app| {
+                app.file_view_diagnostics
+                    .values()
+                    .flatten()
+                    .any(|diagnostic| {
+                        let message = diagnostic.message.to_lowercase();
+                        message.contains("not assignable") || message.contains("incompatible")
+                    })
+            },
+        );
+
+        let relative = PathBuf::from("main.py");
+        let completion_trigger_offset = app.read_with(cx, |app, _| {
+            app.edit_buffers
+                .get(&relative)
+                .expect("a real buffer")
+                .content
+                .len()
+        });
+        type_text(&app, cx, completion_trigger_offset, "\npri");
+
+        let completion_deadline = Instant::now() + Duration::from_secs(60);
+        wait_until(
+            &app,
+            cx,
+            completion_deadline,
+            "no real completions ever arrived for the genuine \"pri\" prefix within the \
+             deadline",
+            |app| {
+                app.completions
+                    .as_ref()
+                    .is_some_and(|entry| matches!(&entry.status, CompletionsStatus::Ready { .. }))
+            },
+        );
+        app.read_with(cx, |app, _| {
+            let entry = app.completions.as_ref().expect("checked above");
+            let CompletionsStatus::Ready { items, .. } = &entry.status else {
+                panic!("checked above");
+            };
+            assert!(
+                items.iter().any(|item| item.label.contains("print")),
+                "expected a real completion item for the genuine \"print\" builtin among \
+                 pyright-langserver's own real response, got: {:?}",
+                items.iter().map(|item| &item.label).collect::<Vec<_>>()
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.handle_completions_accept_action(&CompletionsAccept, window, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let content = &app
+                .edit_buffers
+                .get(&relative)
+                .expect("a real buffer")
+                .content;
+            assert!(
+                content.contains("print"),
+                "accepting the real completion should have spliced its real text into the \
+                 real buffer, got: {content:?}"
             );
         });
     }

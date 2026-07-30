@@ -112,6 +112,15 @@ impl AdeApp {
             _merge_write_tasks: TaskPool::new(),
             lsp_clients: HashMap::new(),
             lsp_opened_files: HashSet::new(),
+            lsp_document_versions: HashMap::new(),
+            lsp_last_synced_content: HashMap::new(),
+            lsp_synced_version: HashMap::new(),
+            lsp_diagnostics_confirmed_version: HashMap::new(),
+            lsp_uri_cache: HashMap::new(),
+            _lsp_sync_tasks: HashMap::new(),
+            _completions_request_task: None,
+            completions: None,
+            completions_generation: 0,
             file_view_diagnostics: HashMap::new(),
             file_view_error_count: None,
             _lsp_tasks: TaskPool::new(),
@@ -306,6 +315,19 @@ impl AdeApp {
         self.file_view_last_bounds = None;
         self.file_view_last_layout_for = None;
         self._rehighlight_tasks = HashMap::new();
+        // Real live LSP sync/completions state (Revision R8.5b) is worktree-relative-path-keyed
+        // (or entirely path-scoped) the same way `edit_buffers` above is - reset alongside it so
+        // a worktree switch can't leak a stale "already synced this content" record or a dangling
+        // popup from the worktree just left. `lsp_document_versions`/`lsp_uri_cache` are keyed by
+        // *absolute* path (see their own docs), so neither ever actually collides across
+        // worktrees and both are left to `evict_stale_lsp_clients`'s own root-scoped pruning
+        // instead of a blanket reset here.
+        self._lsp_sync_tasks = HashMap::new();
+        self._completions_request_task = None;
+        self.lsp_last_synced_content = HashMap::new();
+        self.lsp_synced_version = HashMap::new();
+        self.lsp_diagnostics_confirmed_version = HashMap::new();
+        self.dismiss_completions();
         self._file_save_tasks = HashMap::new();
         self.file_save_pending = HashSet::new();
         self.file_save_running = HashSet::new();
@@ -319,8 +341,15 @@ impl AdeApp {
         self._file_load_task = None;
         self.code_zoom_percent = AdeApp::ZOOM_DEFAULT_PERCENT;
         // The hover cache is per-file - clear it too, or a hover card from the worktree just
-        // left could reappear the instant a same-named file opens in the new one.
+        // left could reappear the instant a same-named file opens in the new one. The real
+        // Completions popup is already dropped above (alongside `_lsp_sync_tasks`/
+        // `lsp_last_synced_content`) via `Self::dismiss_completions()` - repeated here,
+        // idempotently, right next to `hover`'s own reset for the same reason every other real
+        // `self.hover = None` site in this codebase now pairs the two (Revision R8.5b audit
+        // finding 3), rather than relying solely on it having already run earlier in this
+        // function.
         self.hover = None;
+        self.dismiss_completions();
         self.pending_cursor_line = None;
         self.load_file_tree(path.clone(), cx);
         // `load_file_tree` above already set `self.file_tree_root = path` synchronously, so

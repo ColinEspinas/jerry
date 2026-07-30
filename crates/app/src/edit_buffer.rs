@@ -631,6 +631,21 @@ impl EditBuffer {
         base + local_text.chars().map(char::len_utf16).sum::<usize>()
     }
 
+    /// Real byte offset in [`Self::content`] for an LSP `Position` (a 0-based line plus a
+    /// UTF-16 code-unit `character` offset within it) - the inverse mapping Revision R8.5b's
+    /// real Completions popup needs to turn a real completion item's own `text_edit` range (or a
+    /// real diagnostic's range, in principle, though nothing here uses it for that yet) into a
+    /// real buffer splice, via `crate::root::completions`. An out-of-range `line` clamps to the
+    /// real last line (mirroring [`Self::offset_for_line_col`]'s own clamping) rather than
+    /// panicking on a language server's own response; [`Self::offset_from_utf16`]'s own
+    /// defensive per-line clamping (see its docs) then bounds `utf16_character` too, so this can
+    /// never walk past real buffer content even for a wildly out-of-range value.
+    pub fn offset_for_position(&self, line: u32, utf16_character: u32) -> usize {
+        let line = (line as usize).min(self.utf16_line_starts.len().saturating_sub(1));
+        let utf16_base = self.utf16_line_starts.get(line).copied().unwrap_or(0);
+        self.offset_from_utf16(utf16_base + utf16_character as usize)
+    }
+
     pub fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
         self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
     }
@@ -1090,6 +1105,33 @@ mod tests {
         let utf16_after_emoji = buf.offset_to_utf16(byte_after_emoji);
         assert_eq!(utf16_after_emoji, 1 + 2, "'a' (1) + surrogate pair (2)");
         assert_eq!(buf.offset_from_utf16(utf16_after_emoji), byte_after_emoji);
+    }
+
+    #[test]
+    fn offset_for_position_resolves_a_real_lsp_line_and_character_to_a_byte_offset() {
+        let buf = buffer("hello\nworld\n!");
+        assert_eq!(buf.offset_for_position(0, 0), 0);
+        assert_eq!(buf.offset_for_position(0, 3), 3);
+        assert_eq!(buf.offset_for_position(1, 2), "hello\nwo".len());
+    }
+
+    #[test]
+    fn offset_for_position_accounts_for_a_real_multi_byte_character_earlier_on_the_same_line() {
+        // "café " - 'é' is 1 UTF-16 unit but 2 UTF-8 bytes, so the real byte offset of the
+        // 'x' that follows must reflect that, not assume 1 UTF-16 unit == 1 byte.
+        let buf = buffer("caf\u{e9} x");
+        let x_utf16_character = 5; // c,a,f,é,space = 5 UTF-16 units before 'x'
+        assert_eq!(
+            buf.offset_for_position(0, x_utf16_character),
+            "caf\u{e9} ".len()
+        );
+    }
+
+    #[test]
+    fn offset_for_position_clamps_a_real_out_of_range_line_rather_than_panicking() {
+        let buf = buffer("abc\ndef");
+        // Clamps to the real *last line* ("def"), character 0 - not the buffer's own end.
+        assert_eq!(buf.offset_for_position(99, 0), "abc\n".len());
     }
 
     #[test]
