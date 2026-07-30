@@ -41,16 +41,21 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Moves focus onto the session [`Sessions::spawn`] just made active - but only when a file
-    /// tab isn't showing instead ([`Self::render_center_pane`] renders the file tab in that
-    /// case, not a session's `TerminalPane`), since focusing a session's pane while that's true
-    /// would point `Window::focus` at a node nothing in the rendered tree tracks.
+    /// Moves focus onto the session [`Sessions::spawn`] just made active - but only when neither
+    /// a file tab ([`Self::render_center_pane`] renders the file tab in that case, not a
+    /// session's `TerminalPane`) nor Settings ([`Self::settings_open`] - Settings replaces the
+    /// entire workspace body, per `crate::root::mod`'s own docs, so no session's pane is
+    /// rendered anywhere while it's showing) is occupying the centre pane instead, since focusing
+    /// a session's pane while either is true would point `Window::focus` at a node nothing in the
+    /// rendered tree tracks. Reachable with Settings open via the title bar's Session menu (New
+    /// Terminal/New Agent Pane), which is an unconditional sibling of the Settings/workspace-body
+    /// swap.
     pub(super) fn focus_newly_spawned_session(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.open_change.is_none() {
+        if self.open_change.is_none() && !self.settings_open {
             self.sessions.focus_active(window, cx);
         }
     }
@@ -86,7 +91,18 @@ impl AdeApp {
             // See `crate::root::code_surface::AdeApp::open_change_diff`'s identical
             // `dismiss_completions()` call for why (Revision R8.5b audit finding 3).
             self.dismiss_completions();
-            restore_focus(&self.sessions, &mut self.code_focus, window, cx);
+            if self.settings_open {
+                // Settings is showing over the whole workspace body right now (reachable here
+                // via the title bar's Session menu cycle rows/Archive Session, unconditional
+                // siblings of the Settings/workspace-body swap) - real focus already correctly
+                // lives on `settings_focus_handle`. Discard the captured pre-file-tab target
+                // rather than restoring it onto a session pane `Self::render_settings` isn't
+                // drawing, mirroring `Self::close_palette`'s identical Settings-aware branch
+                // (`self.palette_focus.clear()`).
+                self.code_focus.clear();
+            } else {
+                restore_focus(&self.sessions, &mut self.code_focus, window, cx);
+            }
         }
         let cwd = self
             .sessions
@@ -96,7 +112,7 @@ impl AdeApp {
         if let Some(cwd) = cwd {
             if let Some(index) = self.worktrees.iter().position(|item| item.path == cwd) {
                 if self.selected != Some(index) {
-                    self.select_worktree(index, cx);
+                    self.select_worktree(index, window, cx);
                     return;
                 }
             }
@@ -159,20 +175,36 @@ impl AdeApp {
     /// so archiving (or retrying) a mid-merge session left `merge_flow.session_id` pointing at a
     /// session that no longer existed, permanently disabling the `Merge` button for every
     /// session (`Self::render_merge_button`'s disabled check never cleared).
+    ///
+    /// Tells `Sessions::close` to skip its own focus move whenever the centre pane isn't
+    /// actually showing a session's pane right now - a file tab is open, *or* Settings has
+    /// replaced the whole workspace body (`Self::settings_open`, see the title bar's Session
+    /// menu docs - Archive Session is reachable from there while Settings is showing, and
+    /// moving focus onto a pane `Self::render_settings` isn't drawing would dangle it exactly
+    /// like the file-tab case this guard already covered).
+    ///
+    /// If closing `id` leaves its worktree with no session at all (and no file tab either), real
+    /// keyboard focus falls back onto [`Self::filter_focus_handle`] - the same fallback
+    /// [`Self::select_worktree`] uses for the identical "nothing left to focus" case - so
+    /// `Window::focus` never stays pointed at the just-`shutdown()`, no-longer-rendered pane.
     pub(super) fn close_session(
         &mut self,
         id: SessionId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let file_tab_active = self.open_change.is_some();
-        self.sessions.close(id, file_tab_active, window, cx);
+        let skip_focus_move = self.open_change.is_some() || self.settings_open;
+        self.sessions.close(id, skip_focus_move, window, cx);
         if self
             .merge_flow
             .as_ref()
             .is_some_and(|flow| flow.session_id == id)
         {
             self.clear_merge_flow_for_closed_session(cx);
+        }
+        if self.sessions.active_id().is_none() && self.open_change.is_none() && !self.settings_open
+        {
+            window.focus(&self.filter_focus_handle, cx);
         }
     }
 
@@ -250,63 +282,22 @@ impl AdeApp {
         }
     }
 
-    /// The "+ shell" / "+ claude" / "+ codex" row above the tab strip, spawning a session into
-    /// `active_session_cwd()` and showing which worktree that resolves to. Not part of the
-    /// mockup (whose rail/tab-strip `+` only spawn one default kind - per-kind selection lives
-    /// in the design's Settings › Agents page, out of scope here) - kept because without it this
-    /// app would have no way to start a `claude`/`codex` session at all.
-    pub(super) fn render_session_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let cwd = self.active_session_cwd();
-
-        let new_session_button = |label: &'static str, kind: SessionKind| {
-            div()
-                .id(format!("new-session-{}", kind.label()))
-                .cursor_pointer()
-                .px(px(8.0))
-                .py(px(3.0))
-                .rounded(theme::radius::CHIP)
-                .bg(theme::surface::CHIP_NEUTRAL)
-                .font(font(theme::font::MONO))
-                .text_size(px(10.5))
-                .text_color(theme::text::DIM)
-                .hover(|el| {
-                    el.bg(theme::surface::ROW_HOVER_ALT)
-                        .text_color(theme::text::PRIMARY)
-                })
-                .child(label)
-                .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                    this.new_session(kind, window, cx);
-                }))
-        };
-
-        div()
-            .id("session-toolbar")
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(6.0))
-            .px(px(12.0))
-            .h(px(30.0))
-            .bg(theme::surface::HEADER)
-            .border_b_1()
-            .border_color(theme::border::INNER)
-            .child(new_session_button("+ shell", SessionKind::Shell))
-            .child(new_session_button("+ claude", SessionKind::Claude))
-            .child(new_session_button("+ codex", SessionKind::Codex))
-            .child(div().flex_1())
-            .child(
-                div()
-                    .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
-                    .text_color(theme::text::GHOST)
-                    .child(format!("new sessions spawn in: {}", cwd.display())),
-            )
+    /// Every session open in the *currently selected* worktree (`Self::active_session_cwd`), in
+    /// creation order - the real per-worktree tab-strip filter (`crate::sessions::Sessions::
+    /// iter_for_cwd`) both [`Self::render_tab_strip`] and [`Self::session_jump_keys`]/
+    /// [`Self::jump_to_session_at`] share, so the tabs shown and the tabs a jump keycap can
+    /// reach can never disagree.
+    pub(super) fn current_worktree_sessions(&self) -> impl Iterator<Item = &Session> {
+        self.sessions.iter_for_cwd(self.active_session_cwd())
     }
 
-    /// The tab strip: one [`render_session_tab`] per live [`crate::sessions::Session`], followed
-    /// by one [`Self::render_file_tab`] per entry of [`Self::open_files`] in that `Vec`'s order,
-    /// then the `+` menu button ([`Self::render_tab_strip_plus`]) and right-aligned session-jump
-    /// keycaps.
+    /// The tab strip: one [`render_session_tab`] per session open in the *currently selected*
+    /// worktree (`Self::current_worktree_sessions`) - never every session across every
+    /// worktree, per this revision's whole point (see `crate::root::mod`'s "One rail row per
+    /// worktree" docs) - followed by one [`Self::render_file_tab`] per entry of
+    /// [`Self::open_files`] in that `Vec`'s order (already worktree-scoped: `Self::
+    /// select_worktree` clears it on every switch), then the `+` menu button
+    /// ([`Self::render_tab_strip_plus`]) and right-aligned session-jump keycaps.
     pub(super) fn render_tab_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut bar = div()
             .id("tab-strip")
@@ -318,8 +309,14 @@ impl AdeApp {
             .border_b_1()
             .border_color(theme::border::ZONE);
 
-        for session in self.sessions.iter() {
-            bar = bar.child(self.render_session_tab(session, cx));
+        let session_ids: Vec<SessionId> = self
+            .current_worktree_sessions()
+            .map(|session| session.id)
+            .collect();
+        for id in &session_ids {
+            if let Some(session) = self.sessions.iter().find(|session| session.id == *id) {
+                bar = bar.child(self.render_session_tab(session, cx));
+            }
         }
 
         for path in &self.open_files {
@@ -348,14 +345,15 @@ impl AdeApp {
         )
     }
 
-    /// The real `secondary-1`..`secondary-8` session-jump keycap labels: one per currently open
-    /// session, capped at 8 since those are the only ones actually bound
-    /// (`crate::default_key_bindings`) - never a keycap advertising a shortcut that silently
-    /// does nothing. Shared by [`Self::render_tab_strip`]'s own right-aligned cluster and the
-    /// status bar's session hint (`root::status_bar::render_status_session_hint`), so the two
-    /// can never independently drift on what's really bound.
+    /// The real `secondary-1`..`secondary-8` session-jump keycap labels: one per session open in
+    /// the *currently selected* worktree (`Self::current_worktree_sessions`), capped at 8 since
+    /// those are the only ones actually bound (`crate::default_key_bindings`) - never a keycap
+    /// advertising a shortcut that silently does nothing. Shared by [`Self::render_tab_strip`]'s
+    /// own right-aligned cluster and the status bar's session hint (`root::status_bar::
+    /// render_status_session_hint`), so the two can never independently drift on what's really
+    /// bound.
     pub(super) fn session_jump_keys(&self) -> Vec<String> {
-        let session_count = self.sessions.iter().count().min(8);
+        let session_count = self.current_worktree_sessions().count().min(8);
         (1..=session_count).map(|n| n.to_string()).collect()
     }
 
@@ -390,6 +388,10 @@ impl AdeApp {
             .edit_buffers
             .get(path)
             .is_some_and(|buffer| buffer.is_dirty());
+        let drag_value = DraggedFileTab {
+            path: path.to_path_buf(),
+            label: file_name.clone(),
+        };
 
         div()
             .id(format!("file-tab-{key}"))
@@ -399,6 +401,21 @@ impl AdeApp {
             .border_r_1()
             .border_color(theme::border::INNER)
             .bg(colors.bg)
+            // Real drag-to-reorder among file tabs - see `DraggedSessionTab`'s own docs for the
+            // identical mechanism, mirrored here for `Self::open_files` instead of `Sessions`.
+            .on_drag(drag_value, |dragged, _position, _window, cx| {
+                cx.new(|_| dragged.clone())
+            })
+            .drag_over::<DraggedFileTab>(|tab, _dragged, _window, _cx| {
+                tab.border_l(px(2.0)).border_color(theme::status::ASK)
+            })
+            .on_drop(cx.listener({
+                let target = path.to_path_buf();
+                move |this, dragged: &DraggedFileTab, _window, cx| {
+                    this.reorder_open_file_before(&dragged.path, &target);
+                    cx.notify();
+                }
+            }))
             .child(
                 div()
                     .id(format!("file-tab-hit-{key}"))
@@ -470,6 +487,29 @@ impl AdeApp {
             .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline))
     }
 
+    /// Moves `dragged` to sit immediately before `target` in [`Self::open_files`] - the file-tab
+    /// strip's own drag-to-reorder backing, mirroring `crate::sessions::Sessions::move_before`'s
+    /// identical shape for session tabs. A no-op if either path isn't currently open, or if
+    /// they're the same path.
+    pub(super) fn reorder_open_file_before(&mut self, dragged: &Path, target: &Path) {
+        if dragged == target {
+            return;
+        }
+        let Some(from) = self.open_files.iter().position(|path| path == dragged) else {
+            return;
+        };
+        if !self.open_files.iter().any(|path| path == target) {
+            return;
+        }
+        let path = self.open_files.remove(from);
+        let to = self
+            .open_files
+            .iter()
+            .position(|path| path == target)
+            .unwrap_or(self.open_files.len());
+        self.open_files.insert(to, path);
+    }
+
     /// The tab strip's `+` menu button - toggles [`Self::plus_menu_open`] (unconditionally
     /// spawning a shell is the rail's separate `+` -
     /// [`crate::root::rail_render::render_new_session_button`]). A `gpui::canvas` child captures
@@ -502,13 +542,6 @@ impl AdeApp {
                     .text_color(theme::text::GHOST)
                     .child("+"),
             )
-            .child(
-                div()
-                    .font(font(theme::font::MONO))
-                    .text_size(px(8.5))
-                    .text_color(theme::text::PATH)
-                    .child("\u{25be}"),
-            )
             .child({
                 let this = cx.entity();
                 gpui::canvas(
@@ -537,13 +570,15 @@ impl AdeApp {
     /// the panel stops that click from bubbling up (`cx.stop_propagation()`). Positioned off
     /// [`Self::plus_button_bounds`].
     ///
-    /// Four rows: *New terminal* ([`Self::new_session`] with [`SessionKind::Shell`]), *New agent
-    /// pane* ([`Self::new_agent_pane`]), *Open file…* ([`Self::open_palette`], scoped to
-    /// [`palette::PaletteScope::Files`]), and *Next changed file* ([`Self::next_changed_file`]).
-    /// The first, second, and fourth each dispatch the same method their own global keybinding
-    /// does (`crate::default_key_bindings`) and show that binding's keycap; *Open file…* has no
-    /// global keybinding of its own (a Ctrl+P/readline conflict ruled one out - see that
-    /// function's docs) and so shows no keycap. Every row's click handler also closes the menu.
+    /// Five rows: *New terminal* ([`Self::new_session`] with [`SessionKind::Shell`]), *New file*
+    /// ([`Self::start_new_file`]), *New agent pane* ([`Self::new_agent_pane`]), *Open file…*
+    /// ([`Self::open_palette`], scoped to [`palette::PaletteScope::Files`]), and *Next changed
+    /// file* ([`Self::next_changed_file`]). *New terminal*, *New agent pane*, and *Next changed
+    /// file* each dispatch the same method their own global keybinding does
+    /// (`crate::default_key_bindings`) and show that binding's keycap; *New file* and *Open
+    /// file…* have no global keybinding of their own (the latter's own docs cover a real
+    /// Ctrl+P/readline conflict that ruled one out; *New file* simply has no design-specified
+    /// shortcut) and so show no keycap. Every row's click handler also closes the menu.
     pub(super) fn render_plus_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let macos = self.window_controls_style().is_macos();
         let bounds = self.plus_button_bounds;
@@ -592,13 +627,14 @@ impl AdeApp {
                         cx.stop_propagation();
                     }))
                     .child(
-                        render_plus_menu_row(
+                        render_dropdown_menu_row(
                             "\u{276f}",
                             theme::text::DIM,
                             theme::surface::CHIP_NEUTRAL,
                             "New terminal",
                             "in this worktree".to_string(),
                             keymap::resolve_combo("ctrl+shift+T", macos),
+                            true,
                         )
                         .on_click(cx.listener(
                             |this, _event: &ClickEvent, window, cx| {
@@ -609,13 +645,35 @@ impl AdeApp {
                         )),
                     )
                     .child(
-                        render_plus_menu_row(
+                        render_dropdown_menu_row(
+                            "+",
+                            theme::text::DIM,
+                            theme::surface::CHIP_NEUTRAL,
+                            "New file",
+                            "in this worktree".to_string(),
+                            // No keycap: same reasoning as the "Open file…" row below - no
+                            // global keybinding exists for this (see `Self::start_new_file`'s
+                            // own docs).
+                            Vec::new(),
+                            true,
+                        )
+                        .on_click(cx.listener(
+                            |this, _event: &ClickEvent, window, cx| {
+                                this.plus_menu_open = false;
+                                let cwd = this.active_session_cwd();
+                                this.start_new_file(cwd, window, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        render_dropdown_menu_row(
                             agent_initial,
                             agent_fg,
                             agent_bg,
                             "New agent pane",
                             agent_label.to_string(),
                             keymap::resolve_combo("mod+shift+N", macos),
+                            true,
                         )
                         .on_click(cx.listener(
                             |this, _event: &ClickEvent, _window, cx| {
@@ -626,7 +684,7 @@ impl AdeApp {
                         )),
                     )
                     .child(
-                        render_plus_menu_row(
+                        render_dropdown_menu_row(
                             "@",
                             theme::palette::COMMAND_CHIP.0,
                             theme::palette::COMMAND_CHIP.1,
@@ -635,6 +693,7 @@ impl AdeApp {
                             // No keycap: this row has no global keybinding (see the function
                             // docs above), and `render_keycap_row` renders nothing for `&[]`.
                             Vec::new(),
+                            true,
                         )
                         .on_click(cx.listener(
                             |this, _event: &ClickEvent, window, cx| {
@@ -649,13 +708,14 @@ impl AdeApp {
                         )),
                     )
                     .child(
-                        render_plus_menu_row(
+                        render_dropdown_menu_row(
                             "]",
                             theme::text::DIM,
                             theme::surface::CHIP_NEUTRAL,
                             "Next changed file",
                             format!("{changed_count} changed"),
                             keymap::resolve_combo("]", macos),
+                            true,
                         )
                         .on_click(cx.listener(
                             |this, _event: &ClickEvent, window, cx| {
@@ -756,8 +816,8 @@ impl AdeApp {
 
     /// The tab strip's session-jump keycaps (`secondary-1`..`secondary-8`) - jumps to the
     /// session at 1-indexed `position` in the same order [`Self::render_tab_strip`] iterates
-    /// (`Self::sessions.iter()`), via [`Self::select_session`]. No-op if fewer than `position`
-    /// sessions currently exist.
+    /// (`Self::current_worktree_sessions`), via [`Self::select_session`]. No-op if fewer than
+    /// `position` sessions are currently open in the selected worktree.
     pub(super) fn jump_to_session_at(
         &mut self,
         position: usize,
@@ -766,12 +826,49 @@ impl AdeApp {
     ) {
         let Some(id) = position
             .checked_sub(1)
-            .and_then(|index| self.sessions.iter().nth(index))
+            .and_then(|index| self.current_worktree_sessions().nth(index))
             .map(|session| session.id)
         else {
             return;
         };
         self.select_session(id, window, cx);
+    }
+
+    /// The Windows/Linux title bar's Session menu "Next session"/"Previous session" rows
+    /// (`crate::root::title_bar::AdeApp::render_title_menu`) - `delta` is `1`/`-1`. Cycles
+    /// through [`Self::current_worktree_sessions`] in the same order
+    /// [`Self::jump_to_session_at`] indexes - **never** every session across every worktree
+    /// (a real, live-reproduced bug found in this revision's own self-audit: an earlier version
+    /// cycled `self.sessions` directly, so "Next Session" could jump to a *different* worktree's
+    /// session, which [`Self::select_session`] then silently promotes into a full
+    /// [`Self::select_worktree`] switch - discarding any unsaved `edit_buffers` content for the
+    /// worktree just left via `reset_per_worktree_ui_state`. A menu row labeled "cycle tabs" must
+    /// never have that side effect) - wrapping around both ends (mirroring
+    /// [`Self::next_changed_file`]'s own cyclic-index convention for "next" over an existing
+    /// ordered list), via the same real [`Self::select_session`] every tab-strip click and jump
+    /// keycap already goes through - no separate "next session" subsystem, just a cyclic index
+    /// over the existing per-worktree list. No-op with fewer than two sessions in the selected
+    /// worktree (nothing to cycle to) or no active session at all (both real, reachable states -
+    /// the latter only while every session has been closed).
+    pub(super) fn select_relative_session(
+        &mut self,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids: Vec<SessionId> = self.current_worktree_sessions().map(|s| s.id).collect();
+        if ids.len() < 2 {
+            return;
+        }
+        let Some(active_id) = self.sessions.active_id() else {
+            return;
+        };
+        let Some(current_index) = ids.iter().position(|id| *id == active_id) else {
+            return;
+        };
+        let len = ids.len() as isize;
+        let next_index = (current_index as isize + delta).rem_euclid(len) as usize;
+        self.select_session(ids[next_index], window, cx);
     }
 
     /// [`NewTerminal`]'s `ctrl-shift-T` action handler - the `+` menu's "New terminal" row's own
@@ -836,6 +933,10 @@ impl AdeApp {
         };
         let is_mono = matches!(chip_kind, work_surface::TabChipKind::Cli);
         let colors = work_surface::tab_colors(is_active);
+        let drag_value = DraggedSessionTab {
+            id,
+            label: label.clone(),
+        };
 
         div()
             .id(("session-tab", id))
@@ -845,6 +946,24 @@ impl AdeApp {
             .border_r_1()
             .border_color(theme::border::INNER)
             .bg(colors.bg)
+            // Real drag-to-reorder (see `DraggedSessionTab`'s own docs): dragging this tab and
+            // dropping it on another session tab in the same (per-worktree) strip moves it to
+            // sit immediately before whichever tab it was dropped on
+            // (`crate::sessions::Sessions::move_before`). No `can_drop` predicate needed - the
+            // `on_drop::<DraggedSessionTab>` type parameter alone already rejects a drop of any
+            // other dragged-value type (e.g. `DraggedFileTab`).
+            .on_drag(drag_value, |dragged, _position, _window, cx| {
+                cx.new(|_| dragged.clone())
+            })
+            .drag_over::<DraggedSessionTab>(|tab, _dragged, _window, _cx| {
+                tab.border_l(px(2.0)).border_color(theme::status::ASK)
+            })
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedSessionTab, _window, cx| {
+                    this.sessions.move_before(dragged.id, id);
+                    cx.notify();
+                }),
+            )
             .child(
                 div()
                     .id(("session-tab-hit", id))
@@ -1233,9 +1352,11 @@ impl AdeApp {
         )
     }
 
-    /// Surface A/B's shared footer: the `JERRY` wordmark plus git-level actions appropriate to
-    /// the session's status. See `crate::work_surface::footer_actions`/
-    /// [`Self::render_footer_action_button`] for which actions are implemented vs. disabled.
+    /// Surface A/B's shared footer: git-level actions appropriate to the session's status - see
+    /// `crate::work_surface::footer_actions`/[`Self::render_footer_action_button`] for which
+    /// actions are implemented vs. disabled. No longer shows a `JERRY` wordmark (deliberate
+    /// deviation from the design mockup, per direct user request - see this crate's `lib.rs`/
+    /// `BUILD-LOG.md` for context, not a bug fix).
     pub(super) fn render_pty_footer(
         &self,
         session: &Session,
@@ -1257,16 +1378,7 @@ impl AdeApp {
             .h(theme::band::SURFACE_FOOTER)
             .bg(theme::surface::FOOTER)
             .border_t_1()
-            .border_color(theme::border::INNER)
-            .child(
-                div()
-                    .flex_none()
-                    .font(font(theme::font::SANS))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_size(px(9.0))
-                    .text_color(theme::text::GHOSTER)
-                    .child("JERRY"),
-            );
+            .border_color(theme::border::INNER);
 
         for action in actions {
             let mut enabled = action.implemented;
@@ -1438,7 +1550,7 @@ impl AdeApp {
     /// `vendor/zed/crates/agent_ui/src/agent_panel.rs`'s own `.flex_1().min_w_0()` use for the
     /// same overflow guard).
     pub(super) fn render_center_pane(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let mut surface = div()
+        let surface = div()
             .id("work-surface")
             .flex()
             .flex_col()
@@ -1463,8 +1575,6 @@ impl AdeApp {
             }
             self.open_diff_file_cache = diff_file;
         }
-
-        surface = surface.child(self.render_session_toolbar(cx));
 
         match self.sessions.active() {
             Some(session) => {
@@ -1511,7 +1621,9 @@ impl AdeApp {
                     .font(font(theme::font::SANS))
                     .text_size(px(11.5))
                     .text_color(theme::text::FAINT)
-                    .child("no sessions open - start one with the buttons above"),
+                    .child(
+                        "no sessions open in this worktree - start one with the tab strip's + menu",
+                    ),
             ),
         }
         .into_any_element()
@@ -1524,60 +1636,88 @@ impl AdeApp {
 /// no `Context<AdeApp>` to build a listener from. `keys` is already platform-resolved
 /// (`crate::keymap::resolve_combo`'s output), rendered via [`render_keycap_row`] at
 /// [`KeycapSize::Hint`].
-fn render_plus_menu_row(
+/// One row in either the tab strip's `+` menu ([`AdeApp::render_plus_menu`]) or the Windows/
+/// Linux title bar's real File/Edit/View/Session/Help dropdowns
+/// (`crate::root::title_bar::AdeApp::render_title_menu`) - shared here since both are the same
+/// "labeled trigger opens a small popover of real actions" pattern, first built for the `+`
+/// menu and reused as-is (not re-derived) for the title-bar menus.
+///
+/// `enabled` mirrors [`AdeApp::render_footer_action_button`]'s own enabled/disabled convention:
+/// `false` dims the chip/label/sub text and drops `cursor_pointer`/hover, so a row a click
+/// through it right now would have no real effect on (e.g. "Cut" with no active selection) reads
+/// as visibly inert rather than looking exactly as actionable as a working row. Callers must
+/// also skip attaching `.on_click` when `enabled` is `false` - this function only controls the
+/// row's *look*, never whether it's wired up, so a disabled row a caller forgot to gate would
+/// still silently do nothing on click, exactly the "looks actionable, does nothing" bug class
+/// this project's discipline forbids.
+pub(super) fn render_dropdown_menu_row(
     chip_glyph: &'static str,
     chip_fg: gpui::Rgba,
     chip_bg: gpui::Rgba,
     label: &'static str,
     sub: String,
     keys: Vec<String>,
+    enabled: bool,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(format!("plus-menu-row-{label}"))
+    let (chip_fg, chip_bg, label_color) = if enabled {
+        (chip_fg, chip_bg, theme::text::HEADING)
+    } else {
+        (
+            theme::text::GHOSTER,
+            theme::surface::CHIP_NEUTRAL,
+            theme::text::GHOSTER,
+        )
+    };
+    let mut row = div()
+        .id(format!("dropdown-menu-row-{label}"))
         .flex()
         .items_center()
         .gap(px(9.0))
         .h(theme::band::PLUS_MENU_ROW)
-        .px(px(10.0))
-        .cursor_pointer()
-        .hover(|el| el.bg(theme::surface::PLUS_MENU_ROW_HOVER))
-        .child(
-            div()
-                .flex_none()
-                .w(px(14.0))
-                .h(px(14.0))
-                .rounded(theme::radius::CHIP)
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(chip_bg)
-                .font(font(theme::font::MONO))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_size(px(8.0))
-                .text_color(chip_fg)
-                .child(chip_glyph),
-        )
-        .child(
-            div()
-                .flex_none()
-                .font(font(theme::font::SANS))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_size(px(11.5))
-                .text_color(theme::text::HEADING)
-                .child(label),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .overflow_hidden()
-                .truncate()
-                .font(font(theme::font::MONO))
-                .text_size(px(10.0))
-                .text_color(theme::text::FAINTER)
-                .child(sub),
-        )
-        .child(render_keycap_row(&keys, KeycapSize::Hint))
+        .px(px(10.0));
+    row = if enabled {
+        row.cursor_pointer()
+            .hover(|el| el.bg(theme::surface::PLUS_MENU_ROW_HOVER))
+    } else {
+        row.cursor_default()
+    };
+    row.child(
+        div()
+            .flex_none()
+            .w(px(14.0))
+            .h(px(14.0))
+            .rounded(theme::radius::CHIP)
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(chip_bg)
+            .font(font(theme::font::MONO))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(px(8.0))
+            .text_color(chip_fg)
+            .child(chip_glyph),
+    )
+    .child(
+        div()
+            .flex_none()
+            .font(font(theme::font::SANS))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(px(11.5))
+            .text_color(label_color)
+            .child(label),
+    )
+    .child(
+        div()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .truncate()
+            .font(font(theme::font::MONO))
+            .text_size(px(10.0))
+            .text_color(theme::text::FAINTER)
+            .child(sub),
+    )
+    .child(render_keycap_row(&keys, KeycapSize::Hint))
 }
 
 /// The tab strip's 14×14 kind chip - a `❯` glyph tinted with the session's agent colour for
@@ -1630,6 +1770,62 @@ pub(super) fn render_tab_chip(kind: SessionKind, active: bool) -> gpui::AnyEleme
     }
 }
 
+/// The tab strip's drag-to-reorder value for a session tab (`Self::render_session_tab`'s
+/// `on_drag`/`on_drop`) - real GPUI drag-and-drop (`on_drag`/`drag_over`/`can_drop`/`on_drop`,
+/// verified against `vendor/zed/crates/gpui/src/elements/div.rs` and mirroring
+/// `vendor/zed/crates/workspace/src/pane.rs`'s own `DraggedTab` for exactly this "reorder tabs
+/// by dragging" pattern), not this project's earlier `on_drag`/`on_drag_move` use in
+/// `crate::root::resize` (a resize-handle hack with no real drag *payload* at all). `Render`ing
+/// the dragged value itself as its own small floating chip - the same choice Zed's own
+/// `DraggedTab` makes - rather than a generic ghost, so what's being dragged stays legible.
+#[derive(Clone)]
+pub(super) struct DraggedSessionTab {
+    pub(super) id: SessionId,
+    pub(super) label: String,
+}
+
+impl Render for DraggedSessionTab {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(10.0))
+            .py(px(4.0))
+            .rounded(theme::radius::CHIP)
+            .bg(theme::surface::PALETTE)
+            .border_1()
+            .border_color(theme::border::POPOVER)
+            .font(font(theme::font::SANS))
+            .text_size(px(11.0))
+            .text_color(theme::text::BODY)
+            .child(self.label.clone())
+    }
+}
+
+/// The file-tab strip's own drag-to-reorder value - see [`DraggedSessionTab`]'s own docs for the
+/// shared mechanism; kept as a distinct type (not a shared enum) so a session tab can never be
+/// accidentally dropped into a file-tab reorder or vice versa - GPUI's `on_drop::<T>` dispatches
+/// purely on the dragged value's concrete type.
+#[derive(Clone)]
+pub(super) struct DraggedFileTab {
+    pub(super) path: PathBuf,
+    pub(super) label: String,
+}
+
+impl Render for DraggedFileTab {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(10.0))
+            .py(px(4.0))
+            .rounded(theme::radius::CHIP)
+            .bg(theme::surface::PALETTE)
+            .border_1()
+            .border_color(theme::border::POPOVER)
+            .font(font(theme::font::SANS))
+            .text_size(px(11.0))
+            .text_color(theme::text::BODY)
+            .child(self.label.clone())
+    }
+}
+
 /// The session context bar's status pill: a coloured dot plus label in the status colour.
 pub(super) fn render_status_pill(status: Status) -> impl IntoElement {
     div()
@@ -1658,4 +1854,369 @@ pub(super) fn render_status_pill(status: Status) -> impl IntoElement {
                 .text_color(status.color())
                 .child(status.label()),
         )
+}
+
+/// Regression coverage for this revision's core claim: each worktree gets one rail entry, and
+/// its sessions become tabs scoped to whichever worktree's rail row is selected - the exact
+/// behavior `crate::root::mod`'s "One rail row per worktree" module docs describe. Also covers
+/// the real drag-to-reorder mechanism (`DraggedSessionTab`'s own docs).
+#[cfg(test)]
+mod tab_scoping_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use crate::worktrees::WorktreeItem;
+    use gpui::TestAppContext;
+
+    fn worktree_item(path: PathBuf, label: &str) -> WorktreeItem {
+        WorktreeItem {
+            path,
+            label: label.to_string(),
+            branch: Some(label.to_string()),
+            is_main: false,
+            is_locked: false,
+            error: None,
+        }
+    }
+
+    fn seed_two_worktrees(app: &mut AdeApp, wt_a: PathBuf, wt_b: PathBuf) {
+        app.worktrees = vec![worktree_item(wt_a, "wt-a"), worktree_item(wt_b, "wt-b")];
+    }
+
+    /// The exact bug `crate::rail::build_worktree_rows` fixes at the pure-logic level
+    /// (`crate::rail::tests::build_worktree_rows_folds_every_session_in_a_worktree_not_just_the_first`),
+    /// proven here end to end through the real `Sessions`/`AdeApp` plumbing: two sessions
+    /// spawned into the same worktree must both show up as that worktree's tabs.
+    #[gpui::test]
+    fn multiple_sessions_in_one_worktree_all_show_as_tabs_under_it(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_a = tempfile::tempdir().expect("tempdir a");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            app.sessions.spawn(
+                SessionKind::Shell,
+                wt_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            app.sessions.spawn(
+                SessionKind::Claude,
+                wt_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+        });
+
+        let ids: Vec<SessionId> = app.read_with(cx, |app, _| {
+            app.current_worktree_sessions().map(|s| s.id).collect()
+        });
+        assert_eq!(
+            ids.len(),
+            2,
+            "both sessions spawned into wt-a must show as tabs under it - not just the first \
+             one found (the exact bug the old ProjectChild model had)"
+        );
+    }
+
+    /// The real gap this revision's own self-audit found: switching to a worktree with *no*
+    /// open session leaves `Sessions::focus_active` with nothing to focus (a genuine no-op), so
+    /// a previously-focused session's pane - now unrendered once the tab strip's own
+    /// per-worktree filter applies - would otherwise leave `Window::focus` dangling, breaking
+    /// every global keybinding (including ⌘K itself) until the next click.
+    /// `Self::select_worktree`'s own fallback (redirecting focus to `Self::filter_focus_handle`
+    /// whenever the newly selected worktree has no session to focus) closes this.
+    #[gpui::test]
+    fn ctrl_k_still_works_after_switching_to_a_worktree_with_no_open_session(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_empty = tempfile::tempdir().expect("tempdir empty");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt_empty.path().to_path_buf(), "empty")];
+        });
+
+        // Explicitly focus the initial shell session (the real, concrete "focus is on a live
+        // terminal pane" starting state this bug needs), then switch to the session-less
+        // worktree - the exact transition the fix targets.
+        app.update_in(cx, |app, window, cx| {
+            app.sessions.focus_active(window, cx);
+            app.select_worktree(0, window, cx);
+        });
+
+        let key = if cfg!(target_os = "macos") {
+            "cmd-k"
+        } else {
+            "ctrl-k"
+        };
+        cx.simulate_keystrokes(key);
+
+        assert!(
+            app.read_with(cx, |app, _| app.palette_open),
+            "a real {key} keystroke after switching to a session-less worktree must still open \
+             the palette - before the fix, focus was left dangling on the previous worktree's \
+             now-unrendered terminal pane"
+        );
+    }
+
+    /// Switching the rail selection to a different worktree must show that worktree's own tabs,
+    /// not the previously selected worktree's - the centre-pane-follows-the-rail invariant, and
+    /// the exact behavior `crate::root::mod`'s "One rail row per worktree" docs describe: never
+    /// showing/pointing at the previously selected worktree's session.
+    #[gpui::test]
+    fn switching_worktree_selection_shows_that_worktrees_own_tabs(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_a = tempfile::tempdir().expect("tempdir a");
+        let wt_b = tempfile::tempdir().expect("tempdir b");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            seed_two_worktrees(app, wt_a.path().to_path_buf(), wt_b.path().to_path_buf());
+        });
+
+        let (id_a, id_b) = app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            let id_a = app.sessions.spawn(
+                SessionKind::Shell,
+                wt_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            app.select_worktree(1, window, cx);
+            let id_b = app.sessions.spawn(
+                SessionKind::Shell,
+                wt_b.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            (id_a, id_b)
+        });
+
+        // Still on wt-b (the last selection) - its tab strip must show only its own session.
+        let current: Vec<SessionId> = app.read_with(cx, |app, _| {
+            app.current_worktree_sessions().map(|s| s.id).collect()
+        });
+        assert_eq!(current, vec![id_b]);
+        assert_eq!(
+            app.read_with(cx, |app, _| app.sessions.active_id()),
+            Some(id_b)
+        );
+
+        // Switch back to wt-a - must show id_a, never id_b.
+        app.update_in(cx, |app, window, cx| app.select_worktree(0, window, cx));
+        let current: Vec<SessionId> = app.read_with(cx, |app, _| {
+            app.current_worktree_sessions().map(|s| s.id).collect()
+        });
+        assert_eq!(
+            current,
+            vec![id_a],
+            "switching back to wt-a must show its own tab, not wt-b's"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.sessions.active_id()),
+            Some(id_a),
+            "the active session must follow the selected worktree"
+        );
+    }
+
+    /// Closing the active tab in a worktree that still has another open tab must fall back to
+    /// that sibling - the ordinary, non-degenerate case.
+    #[gpui::test]
+    fn closing_the_active_tab_falls_back_to_a_sibling_in_the_same_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_a = tempfile::tempdir().expect("tempdir a");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
+        });
+
+        let (id1, id2) = app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            let id1 = app.sessions.spawn(
+                SessionKind::Shell,
+                wt_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            let id2 = app.sessions.spawn(
+                SessionKind::Shell,
+                wt_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            (id1, id2)
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.sessions.active_id()),
+            Some(id2)
+        );
+
+        app.update_in(cx, |app, window, cx| app.close_session(id2, window, cx));
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.sessions.active_id()),
+            Some(id1),
+            "closing the active tab must fall back to the remaining sibling in the same worktree"
+        );
+        let current: Vec<SessionId> = app.read_with(cx, |app, _| {
+            app.current_worktree_sessions().map(|s| s.id).collect()
+        });
+        assert_eq!(current, vec![id1]);
+    }
+
+    /// The degenerate case, and the real reason `Sessions::close`'s fallback had to become
+    /// worktree-scoped rather than a same-`Vec` neighbor: closing the *last* tab in one worktree
+    /// must never fall back to a different worktree's own still-open session, even though it
+    /// might sit right next to it in the flat underlying storage.
+    ///
+    /// Also real, live-reproduced coverage for another instance of this project's own "focus
+    /// left pointing at something unrendered" bug class (see `crate::root::focus`'s module doc):
+    /// before the fix, `Self::close_session` left `Window::focus` dangling on the
+    /// just-`shutdown()` `TerminalPane` in this exact case (`self.sessions.active = None`, and
+    /// `Sessions::focus_active` is a real no-op with nothing active) - so a real ⌘K afterward,
+    /// not just checking `active_id() == None`, is what actually proves focus isn't dangling,
+    /// matching every other test for this bug class in this project.
+    #[gpui::test]
+    fn closing_the_last_tab_in_a_worktree_never_falls_back_to_a_different_worktrees_session(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_a = tempfile::tempdir().expect("tempdir a");
+        let wt_b = tempfile::tempdir().expect("tempdir b");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+        app.update(cx, |app, _cx| {
+            seed_two_worktrees(app, wt_a.path().to_path_buf(), wt_b.path().to_path_buf());
+        });
+
+        let id_a = app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            app.sessions.spawn(
+                SessionKind::Shell,
+                wt_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            )
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(1, window, cx);
+            app.sessions.spawn(
+                SessionKind::Shell,
+                wt_b.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            app.close_session(id_a, window, cx);
+        });
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.sessions.active_id()),
+            None,
+            "closing the only tab in wt-a must leave it with no active session, never silently \
+             fall back to wt-b's own still-open session"
+        );
+
+        let key = if cfg!(target_os = "macos") {
+            "cmd-k"
+        } else {
+            "ctrl-k"
+        };
+        cx.simulate_keystrokes(key);
+        assert!(
+            app.read_with(cx, |app, _| app.palette_open),
+            "a real {key} keystroke after closing the last tab in a worktree must still open \
+             the palette - before the fix, Window::focus was left dangling on the just-closed \
+             session's now-unmounted pane, with nothing real for the next keystroke to reach"
+        );
+    }
+
+    /// Real drag-to-reorder: dropping one session tab onto another must actually change their
+    /// order in `Sessions`' own underlying storage (what `Self::render_tab_strip` iterates).
+    #[gpui::test]
+    fn drag_reordering_two_session_tabs_changes_their_order(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let (initial_id, id2, id3) = app.update_in(cx, |app, window, cx| {
+            let initial_id = app.sessions.active_id().expect("initial shell session");
+            let id2 = app.sessions.spawn(
+                SessionKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            let id3 = app.sessions.spawn(
+                SessionKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            (initial_id, id2, id3)
+        });
+
+        let before: Vec<SessionId> =
+            app.read_with(cx, |app, _| app.sessions.iter().map(|s| s.id).collect());
+        assert_eq!(before, vec![initial_id, id2, id3]);
+
+        // The real drop handler's own logic: drag id3, drop it on `initial_id`'s tab.
+        app.update(cx, |app, _cx| {
+            app.sessions.move_before(id3, initial_id);
+        });
+
+        let after: Vec<SessionId> =
+            app.read_with(cx, |app, _| app.sessions.iter().map(|s| s.id).collect());
+        assert_eq!(
+            after,
+            vec![id3, initial_id, id2],
+            "id3 must now sit immediately before initial_id, and id2 must be otherwise \
+             untouched"
+        );
+    }
+
+    /// `move_before` must never corrupt the tab order on a bad target - an unknown dragged id, an
+    /// unknown drop target, or dropping a tab onto itself must all be real no-ops.
+    #[gpui::test]
+    fn drag_reorder_is_a_no_op_for_an_unknown_or_identical_id(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let initial_id = app.read_with(cx, |app, _| {
+            app.sessions.active_id().expect("initial shell session")
+        });
+
+        app.update(cx, |app, _cx| {
+            app.sessions.move_before(initial_id, initial_id);
+            app.sessions.move_before(9999, initial_id);
+            app.sessions.move_before(initial_id, 9999);
+        });
+
+        let after: Vec<SessionId> =
+            app.read_with(cx, |app, _| app.sessions.iter().map(|s| s.id).collect());
+        assert_eq!(
+            after,
+            vec![initial_id],
+            "none of these malformed drops should have changed anything"
+        );
+    }
 }

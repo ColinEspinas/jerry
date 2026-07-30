@@ -117,41 +117,11 @@ pub fn sum_diff_stat(diff: &WorktreeDiff) -> (usize, usize) {
     (add, del)
 }
 
-/// One group in "by urgency" mode: a status plus every session row with that status, in the
-/// order they were given (stable - `crate::root` picks the input order, e.g. creation order).
-#[derive(Debug, Clone, PartialEq)]
-pub struct StatusGroup {
-    pub status: Status,
-    pub rows: Vec<SessionRow>,
-}
-
-/// Groups `rows` by [`Status`], in `Status::ORDER` (`Needs input → Failed → Review ready →
-/// Running → Idle`). Empty groups are omitted rather than rendered as a header with no rows.
-pub fn group_by_urgency(rows: &[SessionRow]) -> Vec<StatusGroup> {
-    Status::ORDER
-        .into_iter()
-        .filter_map(|status| {
-            let matching: Vec<SessionRow> = rows
-                .iter()
-                .filter(|row| row.status == status)
-                .cloned()
-                .collect();
-            if matching.is_empty() {
-                None
-            } else {
-                Some(StatusGroup {
-                    status,
-                    rows: matching,
-                })
-            }
-        })
-        .collect()
-}
-
 /// Real per-status counts across every session row, in [`Status::ORDER`] - the status bar's
 /// five urgency-counter squares (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 7).
-/// Unlike [`group_by_urgency`], a status with zero matching rows still gets a real `0` entry
-/// rather than being omitted, since the status bar always shows all five squares. Built from the
+/// Unlike [`group_worktrees_by_urgency`], a status with zero matching rows still gets a real `0`
+/// entry rather than being omitted, since the status bar always shows all five squares. Built
+/// from the
 /// same per-session [`Status`] every [`SessionRow`] already carries - not a second, independent
 /// status classification.
 pub fn urgency_counts(rows: &[SessionRow]) -> [(Status, usize); 5] {
@@ -243,7 +213,7 @@ fn format_utc_hhmm(unix_seconds: i64) -> String {
     format!("{hours:02}:{minutes:02}")
 }
 
-/// One worktree, as input to [`build_project_children`] - `crate::root`'s reduction of
+/// One worktree, as input to [`build_worktree_rows`] - `crate::root`'s reduction of
 /// `wt_core::WorktreeResult` (via `crate::worktrees::WorktreeItem`) plus its separately
 /// computed [`WorktreeNote`].
 #[derive(Debug, Clone, PartialEq)]
@@ -258,46 +228,144 @@ pub struct WorktreeEntry {
     pub error: Option<String>,
 }
 
-/// One child row under a project header in "by project" mode: either a session (if one is
-/// running in that worktree) or a bare worktree row with its clean/prunable note.
+/// One rail row: a single worktree, with **every** session currently open in it (not just the
+/// first one found) folded in as tabs - the real "one worktree = one rail entry, N sessions =
+/// N tabs" model this revision introduces, replacing the old `ProjectChild` shape whose
+/// `sessions.iter().find(...)` silently hid every session past the first in the same worktree.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ProjectChild {
-    Session(SessionRow),
-    Worktree(WorktreeEntry),
+pub struct WorktreeRow {
+    pub path: PathBuf,
+    pub label: String,
+    pub branch: Option<String>,
+    /// Clean/merged note - only meaningful (and only ever shown) when [`Self::sessions`] is
+    /// empty; a worktree with an open session shows its sessions' own real status instead.
+    pub note: WorktreeNote,
+    /// `Some(message)` if this worktree's metadata failed to read - see [`WorktreeEntry::error`]'s
+    /// own docs; a worktree row in this state is never interactive.
+    pub error: Option<String>,
+    /// Every session currently open in this worktree, in tab-strip order (creation order,
+    /// matching `crate::sessions::Sessions::iter_for_cwd`).
+    pub sessions: Vec<SessionRow>,
 }
 
-/// Builds the "by project" child list: one entry per worktree, in the given order, each
-/// replaced by its matching session row if one is open in that exact worktree path. Every
-/// worktree appears here, including ones with no session (e.g. `main`, or a merged/prunable
-/// leftover) - not just the ones with an active session.
-pub fn build_project_children(
+impl WorktreeRow {
+    /// The aggregate status shown on this row: the most urgent status among its open sessions
+    /// (`Status::urgency_rank`, lower = more urgent - the same ranking the old
+    /// `status_dot_cluster` already used to sort a worktree's per-session dots), or
+    /// [`Status::Idle`] when no session is open at all - mirroring
+    /// `crate::status::derive_status`'s own `ProcessSignal::NoProcess => Status::Idle`, since
+    /// "no process running" is exactly what a session-less worktree is.
+    pub fn aggregate_status(&self) -> Status {
+        self.sessions
+            .iter()
+            .map(|row| row.status)
+            .min_by_key(|status| status.urgency_rank())
+            .unwrap_or(Status::Idle)
+    }
+
+    /// The real `+added -deleted` totals summed across every open session's own diff summary -
+    /// double-counting is impossible since every session in [`Self::sessions`] shares this same
+    /// worktree's `cwd`, so they'd all report the identical per-worktree diff anyway; this just
+    /// reads the first one rather than literally summing duplicates.
+    pub fn diff_totals(&self) -> (usize, usize) {
+        self.sessions
+            .first()
+            .map(|row| (row.add, row.del))
+            .unwrap_or((0, 0))
+    }
+
+    /// Whether this row matches a rail filter query - its own label/branch/path (see
+    /// [`matches_filter_worktree_entry`]) or any of its open sessions' own title/branch/kind
+    /// (see [`SessionRow::matches_filter`]).
+    pub fn matches_filter(&self, query: &str) -> bool {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+        let entry_matches = {
+            let query = trimmed.to_lowercase();
+            self.label.to_lowercase().contains(&query)
+                || self
+                    .branch
+                    .as_deref()
+                    .is_some_and(|branch| branch.to_lowercase().contains(&query))
+                || self.path.to_string_lossy().to_lowercase().contains(&query)
+        };
+        entry_matches || self.sessions.iter().any(|row| row.matches_filter(trimmed))
+    }
+}
+
+/// Builds one [`WorktreeRow`] per worktree, in the given order, folding in **every** session
+/// whose `cwd` matches that worktree's path (not just the first one - the real fix for the bug
+/// the old `ProjectChild`-based `build_project_children` had: `sessions.iter().find(...)` only
+/// ever surfaced one session per worktree, silently hiding any additional ones). Every worktree
+/// appears here, including ones with no session (e.g. `main`, or a merged/prunable leftover).
+pub fn build_worktree_rows(
     worktrees: &[WorktreeEntry],
     sessions: &[SessionRow],
-) -> Vec<ProjectChild> {
+) -> Vec<WorktreeRow> {
     worktrees
         .iter()
-        .map(
-            |worktree| match sessions.iter().find(|session| session.cwd == worktree.path) {
-                Some(session) => ProjectChild::Session(session.clone()),
-                None => ProjectChild::Worktree(worktree.clone()),
-            },
-        )
+        .map(|worktree| {
+            let sessions: Vec<SessionRow> = sessions
+                .iter()
+                .filter(|session| session.cwd == worktree.path)
+                .cloned()
+                .collect();
+            WorktreeRow {
+                path: worktree.path.clone(),
+                label: worktree.label.clone(),
+                branch: worktree.branch.clone(),
+                note: worktree.note.clone(),
+                error: worktree.error.clone(),
+                sessions,
+            }
+        })
         .collect()
 }
 
-/// The project header's right-aligned status-dot cluster: every open session's status, sorted
-/// by urgency (most urgent first) - worktree-only children (no session) contribute no dot,
-/// since they have no [`Status`] of their own.
-pub fn status_dot_cluster(children: &[ProjectChild]) -> Vec<Status> {
-    let mut statuses: Vec<Status> = children
-        .iter()
-        .filter_map(|child| match child {
-            ProjectChild::Session(row) => Some(row.status),
-            ProjectChild::Worktree(_) => None,
+/// Filters a [`WorktreeRow`] list down to those matching `query` - applied *after*
+/// [`build_worktree_rows`], so which worktrees have open sessions folded in is always decided
+/// from the complete, unfiltered session list first.
+pub fn filter_worktree_rows<'a>(rows: &'a [WorktreeRow], query: &str) -> Vec<&'a WorktreeRow> {
+    rows.iter()
+        .filter(|row| row.matches_filter(query))
+        .collect()
+}
+
+/// One group in "by urgency" mode, now grouping [`WorktreeRow`]s (one per worktree) rather than
+/// individual sessions - `crate::rail::WorktreeRow::aggregate_status` is each row's sort key, so
+/// a worktree with several sessions in different states sorts under its single most-urgent one,
+/// and a worktree with no sessions at all sorts under [`Status::Idle`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct UrgencyWorktreeGroup {
+    pub status: Status,
+    pub rows: Vec<WorktreeRow>,
+}
+
+/// Groups `rows` by [`WorktreeRow::aggregate_status`], in [`Status::ORDER`] - the same "needs
+/// input → failed → review ready → running → idle" order [`urgency_counts`] uses for individual
+/// sessions, adapted to worktree rows now that a rail row represents a whole worktree's tabs
+/// rather than one session. Empty groups are omitted.
+pub fn group_worktrees_by_urgency(rows: &[WorktreeRow]) -> Vec<UrgencyWorktreeGroup> {
+    Status::ORDER
+        .into_iter()
+        .filter_map(|status| {
+            let matching: Vec<WorktreeRow> = rows
+                .iter()
+                .filter(|row| row.aggregate_status() == status)
+                .cloned()
+                .collect();
+            if matching.is_empty() {
+                None
+            } else {
+                Some(UrgencyWorktreeGroup {
+                    status,
+                    rows: matching,
+                })
+            }
         })
-        .collect();
-    statuses.sort_by_key(|status| status.urgency_rank());
-    statuses
+        .collect()
 }
 
 /// Whether a bare worktree row (no open session) matches a rail filter query - the "by
@@ -317,28 +385,6 @@ pub fn matches_filter_worktree_entry(entry: &WorktreeEntry, query: &str) -> bool
             .as_deref()
             .is_some_and(|branch| branch.to_lowercase().contains(&query))
         || entry.path.to_string_lossy().to_lowercase().contains(&query)
-}
-
-/// Whether a project-mode child row matches a rail filter query, dispatching to
-/// [`SessionRow::matches_filter`] or [`matches_filter_worktree_entry`].
-pub fn project_child_matches(child: &ProjectChild, query: &str) -> bool {
-    match child {
-        ProjectChild::Session(row) => row.matches_filter(query),
-        ProjectChild::Worktree(entry) => matches_filter_worktree_entry(entry, query),
-    }
-}
-
-/// Filters a "by project" child list down to those matching `query` - applied *after*
-/// [`build_project_children`], so which worktrees get a session row versus a plain worktree
-/// row is always decided from the complete, unfiltered session list first.
-pub fn filter_project_children<'a>(
-    children: &'a [ProjectChild],
-    query: &str,
-) -> Vec<&'a ProjectChild> {
-    children
-        .iter()
-        .filter(|child| project_child_matches(child, query))
-        .collect()
 }
 
 /// One completed round of the rail's periodic background refresh: `+N -M` diff totals for
@@ -544,41 +590,6 @@ mod tests {
     }
 
     #[test]
-    fn group_by_urgency_orders_groups_needs_input_first_idle_last() {
-        let rows = vec![
-            row(1, Status::Idle, "idle one", "/a"),
-            row(2, Status::Run, "run one", "/b"),
-            row(3, Status::Ask, "ask one", "/c"),
-            row(4, Status::Fail, "fail one", "/d"),
-            row(5, Status::Review, "review one", "/e"),
-        ];
-        let groups = group_by_urgency(&rows);
-        let statuses: Vec<Status> = groups.iter().map(|g| g.status).collect();
-        assert_eq!(
-            statuses,
-            vec![
-                Status::Ask,
-                Status::Fail,
-                Status::Review,
-                Status::Run,
-                Status::Idle
-            ]
-        );
-    }
-
-    #[test]
-    fn group_by_urgency_omits_empty_statuses_and_keeps_every_row_of_present_ones() {
-        let rows = vec![
-            row(1, Status::Ask, "ask one", "/a"),
-            row(2, Status::Ask, "ask two", "/b"),
-        ];
-        let groups = group_by_urgency(&rows);
-        assert_eq!(groups.len(), 1, "only Ask is present, so only one group");
-        assert_eq!(groups[0].status, Status::Ask);
-        assert_eq!(groups[0].rows.len(), 2);
-    }
-
-    #[test]
     fn urgency_counts_covers_every_status_in_order_including_zero_counts() {
         let rows = vec![
             row(1, Status::Ask, "a", "/a"),
@@ -777,58 +788,91 @@ mod tests {
     }
 
     #[test]
-    fn build_project_children_includes_worktrees_with_no_session_as_worktree_rows() {
+    fn build_worktree_rows_includes_worktrees_with_no_session_as_empty_rows() {
         let worktrees = vec![
             worktree_entry("/repo", clean_note(true)),
             worktree_entry("/repo-wt/leftover", clean_note(false)),
         ];
         let sessions: Vec<SessionRow> = Vec::new();
 
-        let children = build_project_children(&worktrees, &sessions);
-        assert_eq!(children.len(), 2);
-        assert!(matches!(children[0], ProjectChild::Worktree(_)));
-        assert!(matches!(children[1], ProjectChild::Worktree(_)));
+        let rows = build_worktree_rows(&worktrees, &sessions);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].sessions.is_empty());
+        assert!(rows[1].sessions.is_empty());
+        assert_eq!(rows[0].aggregate_status(), Status::Idle);
     }
 
     #[test]
-    fn build_project_children_replaces_a_worktree_with_its_session_when_one_is_open() {
+    fn build_worktree_rows_folds_every_session_in_a_worktree_not_just_the_first() {
         let worktrees = vec![
             worktree_entry("/repo", clean_note(true)),
             worktree_entry("/repo-wt/active", clean_note(false)),
         ];
-        let sessions = vec![row(1, Status::Run, "Fix bug", "/repo-wt/active")];
+        // Two sessions in the SAME worktree - the real bug the old `ProjectChild`-based
+        // `build_project_children` had: `sessions.iter().find(...)` only ever surfaced the
+        // first, silently hiding the second.
+        let sessions = vec![
+            row(1, Status::Run, "Fix bug", "/repo-wt/active"),
+            row(2, Status::Ask, "Second tab", "/repo-wt/active"),
+        ];
 
-        let children = build_project_children(&worktrees, &sessions);
+        let rows = build_worktree_rows(&worktrees, &sessions);
         assert_eq!(
-            children.len(),
+            rows.len(),
             2,
             "every worktree still produces exactly one row"
         );
-        assert!(matches!(children[0], ProjectChild::Worktree(_)));
-        match &children[1] {
-            ProjectChild::Session(session) => assert_eq!(session.id, 1),
-            other => panic!("expected the active worktree to show its session, got {other:?}"),
-        }
+        assert!(rows[0].sessions.is_empty());
+        assert_eq!(
+            rows[1].sessions.len(),
+            2,
+            "both sessions in the same worktree must be folded into its one row, not just the \
+             first one found"
+        );
+        assert_eq!(rows[1].sessions[0].id, 1);
+        assert_eq!(rows[1].sessions[1].id, 2);
     }
 
     #[test]
-    fn status_dot_cluster_only_counts_sessions_sorted_by_urgency() {
-        let worktrees = vec![
-            worktree_entry("/repo", clean_note(true)),
-            worktree_entry("/repo-wt/a", clean_note(false)),
-            worktree_entry("/repo-wt/b", clean_note(false)),
-        ];
+    fn aggregate_status_picks_the_most_urgent_contained_session() {
+        let worktrees = vec![worktree_entry("/repo-wt/a", clean_note(false))];
         let sessions = vec![
             row(1, Status::Run, "run", "/repo-wt/a"),
-            row(2, Status::Ask, "ask", "/repo-wt/b"),
+            row(2, Status::Ask, "ask", "/repo-wt/a"),
+            row(3, Status::Idle, "idle", "/repo-wt/a"),
         ];
-        let children = build_project_children(&worktrees, &sessions);
-        let dots = status_dot_cluster(&children);
+        let rows = build_worktree_rows(&worktrees, &sessions);
         assert_eq!(
-            dots,
-            vec![Status::Ask, Status::Run],
-            "worktree-only child contributes no dot; sessions are sorted by urgency"
+            rows[0].aggregate_status(),
+            Status::Ask,
+            "Ask is the most urgent of Run/Ask/Idle per Status::ORDER"
         );
+    }
+
+    #[test]
+    fn group_worktrees_by_urgency_groups_by_aggregate_status_and_omits_empty_groups() {
+        let worktrees = vec![
+            worktree_entry("/repo-wt/asking", clean_note(false)),
+            worktree_entry("/repo-wt/running", clean_note(false)),
+            worktree_entry("/repo-wt/idle-no-sessions", clean_note(false)),
+        ];
+        let sessions = vec![
+            row(1, Status::Ask, "ask", "/repo-wt/asking"),
+            row(2, Status::Run, "run", "/repo-wt/running"),
+        ];
+        let rows = build_worktree_rows(&worktrees, &sessions);
+        let groups = group_worktrees_by_urgency(&rows);
+        let statuses: Vec<Status> = groups.iter().map(|g| g.status).collect();
+        assert_eq!(
+            statuses,
+            vec![Status::Ask, Status::Run, Status::Idle],
+            "a session-less worktree groups under Idle, matching Status::ORDER"
+        );
+        assert!(
+            !statuses.contains(&Status::Fail),
+            "Fail has no rows, so it's omitted"
+        );
+        assert_eq!(groups.iter().map(|g| g.rows.len()).sum::<usize>(), 3);
     }
 
     #[test]
@@ -839,31 +883,38 @@ mod tests {
     }
 
     #[test]
-    fn filter_project_children_matches_session_title_worktree_label_or_worktree_path() {
-        let session_child = ProjectChild::Session(row(1, Status::Run, "Fix rate limiter", "/a"));
+    fn filter_worktree_rows_matches_session_title_worktree_label_or_worktree_path() {
+        let with_session = {
+            let worktrees = vec![worktree_entry("/a", clean_note(false))];
+            let sessions = vec![row(1, Status::Run, "Fix rate limiter", "/a")];
+            build_worktree_rows(&worktrees, &sessions).remove(0)
+        };
         // "leftover-branch" is the label (leaf name only); "repo-worktrees" can only match
-        // via the path fallback in `matches_filter_worktree_entry`, not the label.
-        let worktree_child = ProjectChild::Worktree(worktree_entry(
-            "/repo-worktrees/leftover-branch",
-            clean_note(false),
-        ));
-        let children = vec![session_child, worktree_child];
+        // via the path fallback, not the label.
+        let session_less = {
+            let worktrees = vec![worktree_entry(
+                "/repo-worktrees/leftover-branch",
+                clean_note(false),
+            )];
+            build_worktree_rows(&worktrees, &[]).remove(0)
+        };
+        let rows = vec![with_session, session_less];
 
-        assert_eq!(filter_project_children(&children, "").len(), 2);
+        assert_eq!(filter_worktree_rows(&rows, "").len(), 2);
         assert_eq!(
-            filter_project_children(&children, "rate").len(),
+            filter_worktree_rows(&rows, "rate").len(),
             1,
-            "matches only the session row, via its title"
+            "matches only the row with the session, via its title"
         );
         assert_eq!(
-            filter_project_children(&children, "leftover").len(),
+            filter_worktree_rows(&rows, "leftover").len(),
             1,
-            "matches only the worktree row, via its real (leaf-name) label"
+            "matches only the session-less row, via its real (leaf-name) label"
         );
         assert_eq!(
-            filter_project_children(&children, "repo-worktrees").len(),
+            filter_worktree_rows(&rows, "repo-worktrees").len(),
             1,
-            "matches only the worktree row, via its real path - the label alone never \
+            "matches only the session-less row, via its real path - the label alone never \
              contains a directory component like this"
         );
     }

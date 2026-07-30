@@ -28,9 +28,12 @@ impl AdeApp {
     /// something else".
     pub(super) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = true;
-        // The tab strip's `+` menu is an unconditional sibling of the palette - see
-        // `Self::plus_menu_open`'s docs.
+        // The tab strip's `+` menu, the title bar's File/Edit/View/Session/Help dropdown, and
+        // the "New file" prompt are all unconditional siblings of the palette - see
+        // `Self::plus_menu_open`'s/`Self::title_menu_open`'s/`Self::new_file_input`'s own docs.
         self.plus_menu_open = false;
+        self.title_menu_open = None;
+        self.new_file_input = None;
         self.palette_focus.capture(window, &self.sessions, cx);
         self.palette_scope = palette::PaletteScope::default();
         self.palette_query.clear();
@@ -70,6 +73,8 @@ impl AdeApp {
             self.close_palette(window, cx);
         }
         self.plus_menu_open = false;
+        self.title_menu_open = None;
+        self.new_file_input = None;
         self.settings_open = true;
         self.settings_focus.capture(window, &self.sessions, cx);
         self.prune_confirm_armed = false;

@@ -1,6 +1,6 @@
 use super::*;
 use crate::root::settings_widgets::ChoiceOption;
-use crate::root::widgets::{render_sidebar_message, render_tag_pill};
+use crate::root::widgets::{render_sidebar_message, render_tag_pill, text_tooltip};
 
 impl AdeApp {
     /// Switches which data source the right sidebar shows. Switching *to* the Changes view
@@ -196,6 +196,37 @@ impl AdeApp {
             );
         }
 
+        // A real, always-present (deliberately not hover-only - this project has no established
+        // "hidden until row hover" mechanism yet, and a subtle-but-always-there affordance beats
+        // an invented one) "new file in this directory" control - the file tree's own equivalent
+        // of a right-click "New file" context menu item, since this app has no context-menu
+        // mechanism anywhere yet either. Stops propagation so it never also toggles the
+        // directory's own collapse state (its row's own `on_click`, registered above).
+        if entry.is_dir {
+            let parent_dir = entry.path.clone();
+            row = row.child(
+                div()
+                    .id(format!("file-tree-new-file-{}", entry.path.display()))
+                    .flex_none()
+                    .cursor_pointer()
+                    .px(px(4.0))
+                    .rounded(theme::radius::CHIP)
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(11.0))
+                    .text_color(theme::text::GHOST)
+                    .hover(|el| {
+                        el.bg(theme::surface::ROW_HOVER_ALT)
+                            .text_color(theme::text::PRIMARY)
+                    })
+                    .tooltip(text_tooltip(format!("New file in {}", entry.name.as_str())))
+                    .child("+")
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.start_new_file(parent_dir.clone(), window, cx);
+                    })),
+            );
+        }
+
         row.into_any_element()
     }
 
@@ -256,6 +287,33 @@ impl AdeApp {
                                 .text_color(theme::diff::STAT_DEL)
                                 .child(format!("\u{2212}{del}")),
                         ),
+                )
+            })
+            // Root-level "New file" - creates directly in the worktree root, the one location
+            // the per-directory "+" on `Self::render_file_tree_row` can't reach (the root itself
+            // has no row of its own to attach to). Only shown for the Files view - the Changes
+            // list has no directory concept to anchor a "new file" affordance to.
+            .when(self.right_sidebar_view == RightSidebarView::Files, |el| {
+                let root = self.file_tree_root.clone();
+                el.child(
+                    div()
+                        .id("file-tree-new-file-root")
+                        .flex_none()
+                        .cursor_pointer()
+                        .px(px(5.0))
+                        .rounded(theme::radius::CHIP)
+                        .font(font(theme::font::MONO))
+                        .text_size(self.ui_text_size(12.0))
+                        .text_color(theme::text::GHOST)
+                        .hover(|el| {
+                            el.bg(theme::surface::ROW_HOVER_ALT)
+                                .text_color(theme::text::PRIMARY)
+                        })
+                        .tooltip(text_tooltip("New file in worktree root"))
+                        .child("+")
+                        .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                            this.start_new_file(root.clone(), window, cx);
+                        })),
                 )
             })
     }

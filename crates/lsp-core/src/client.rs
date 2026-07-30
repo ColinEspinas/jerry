@@ -45,7 +45,7 @@
 //! after the child dies, with no extra signaling needed. See [`LspClient::shutdown`]/`Drop`'s
 //! docs for how process termination is guaranteed before those code paths return.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -115,6 +115,21 @@ pub struct ServerSpawnConfig {
     /// Answers this server's real `workspace/configuration` requests - see
     /// [`WorkspaceConfigFn`]/[`default_workspace_configuration`]'s docs.
     pub workspace_configuration: WorkspaceConfigFn,
+    /// Which incoming notification methods this client's *caller* genuinely intends to handle
+    /// itself, beyond the `publishDiagnostics` this crate handles structurally - a real
+    /// subscription list, queued for [`LspClient::drain_custom_notifications`]. Empty for a server
+    /// whose caller has no such method (all three of rust-analyzer/typescript-language-server/
+    /// pyright today), which is exactly the pre-existing behavior: every notification other than
+    /// `publishDiagnostics` is simply ignored, at no cost.
+    ///
+    /// A subscription list rather than "queue everything unrecognized" for two real reasons: a
+    /// busy server's own `$/progress`/`window/logMessage` traffic would otherwise be cloned and
+    /// queued on every message for callers that will never read it (real, if small, added work on
+    /// a previously-working path), and a queue nobody drains would sit permanently at its own cap
+    /// warning about it. This keeps the mechanism fully generic - this crate still knows nothing
+    /// about what any subscribed method *means* - while costing an un-subscribed server a single
+    /// empty-slice check.
+    pub custom_notification_methods: Vec<&'static str>,
 }
 
 /// How long [`LspClient::spawn`] waits for `rust-analyzer`'s `initialize` **response**
@@ -135,6 +150,17 @@ const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(800);
 /// re-checks real current state via [`LspClient::diagnostics_for`], so a dropped/coalesced wake
 /// never loses a real diagnostic, only a redundant "something changed" nudge).
 const WAKE_CHANNEL_CAPACITY: usize = 64;
+/// Hard bound on how many un-drained entries [`LspClient::drain_custom_notifications`]' own queue
+/// holds - see [`LspClient::custom_notifications`]'s docs. A server that sends an unrecognized
+/// notification faster than its caller drains one (or a caller that never drains at all, which is
+/// the normal case for a server nobody is forwarding for) must not be able to grow this without
+/// limit for the life of the process, so the *oldest* entry is dropped (with a real `log::warn!`,
+/// not silently) once this many are already queued. Deliberately generous relative to the real
+/// traffic actually observed - a live `@vue/language-server` hybrid-mode session sends exactly one
+/// `tsserver/request` for the first `.vue` file opened, plus a handful of `$/progress`/
+/// `window/logMessage` notifications - so reaching this cap at all means something genuinely
+/// pathological, not ordinary operation.
+const CUSTOM_NOTIFICATION_CAPACITY: usize = 256;
 
 /// The real LSP `ErrorCodes.ServerCancelled` value (-32802) - a real, spec-defined, *expected*
 /// response a server can give to a real `textDocument/diagnostic` pull request when it decides
@@ -252,6 +278,26 @@ pub struct LspClient {
     next_id: AtomicI64,
     pending: Arc<Mutex<HashMap<i64, SyncSender<PendingResponse>>>>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<lsp_types::Diagnostic>>>>,
+    /// Every incoming notification whose method this client's caller explicitly subscribed to via
+    /// [`ServerSpawnConfig::custom_notification_methods`], in real arrival order - `(method,
+    /// params)`, with `params` left as raw [`serde_json::Value`] since this crate deliberately
+    /// knows nothing about what any particular subscribed method's payload means.
+    ///
+    /// Exists because [`handle_incoming`]'s notification branch used to drop every method except
+    /// `publishDiagnostics` on the floor, which made a real, protocol-mandated server-to-client
+    /// message genuinely invisible to callers: a language server can define its own custom
+    /// notifications that a *client* is required to act on (the concrete, real driver here is
+    /// `@vue/language-server`'s hybrid mode, which sends a custom notification asking the client to
+    /// relay a query to a second, companion server process and notify the answer back - see the
+    /// `app` crate's `crate::root::lsp` for that real coordination; this crate stays entirely
+    /// ignorant of it, and of Vue).
+    ///
+    /// Bounded by [`CUSTOM_NOTIFICATION_CAPACITY`] (oldest dropped first, with a real warning) so
+    /// a server that sends a subscribed notification faster than its caller drains one can't grow
+    /// this without limit. `publishDiagnostics` deliberately never lands here even if subscribed:
+    /// it has its own real, structured sink ([`Self::diagnostics`]), and routing it to both would
+    /// give callers two disagreeing sources for the same real data.
+    custom_notifications: Arc<Mutex<VecDeque<(String, serde_json::Value)>>>,
     /// The real document `version` (see [`Self::did_change_full`]'s own docs on what this number
     /// means) that [`Self::diagnostics`]' current entry for a given uri actually corresponds to -
     /// Revision R8.5b audit finding 5's fix for a real, live-reproduced race: [`Self::
@@ -355,6 +401,8 @@ impl LspClient {
             Arc::new(Mutex::new(HashMap::new()));
         let diagnostics: Arc<Mutex<HashMap<String, Vec<lsp_types::Diagnostic>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let custom_notifications: Arc<Mutex<VecDeque<(String, serde_json::Value)>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
         let capabilities = Mutex::new(ServerCapabilities::default());
         let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(WAKE_CHANNEL_CAPACITY);
         // Cloned before the original is moved into the reader thread below - see
@@ -363,19 +411,25 @@ impl LspClient {
         let connection_alive = Arc::new(AtomicBool::new(true));
 
         let workspace_configuration = config.workspace_configuration;
+        let custom_notification_methods = config.custom_notification_methods;
         let reader_thread = std::thread::spawn({
             let pending = Arc::clone(&pending);
             let diagnostics = Arc::clone(&diagnostics);
+            let custom_notifications = Arc::clone(&custom_notifications);
             let stdin_for_replies = Arc::clone(&stdin);
             let connection_alive = Arc::clone(&connection_alive);
             move || {
                 run_reader_loop(
                     stdout,
-                    pending,
-                    diagnostics,
-                    wake_tx,
-                    stdin_for_replies,
-                    workspace_configuration,
+                    IncomingSinks {
+                        pending,
+                        diagnostics,
+                        custom_notifications,
+                        custom_notification_methods,
+                        wake_tx,
+                        stdin: stdin_for_replies,
+                        workspace_configuration,
+                    },
                     connection_alive,
                 )
             }
@@ -395,6 +449,7 @@ impl LspClient {
             next_id: AtomicI64::new(1),
             pending,
             diagnostics,
+            custom_notifications,
             diagnostics_version: Mutex::new(HashMap::new()),
             capabilities,
             wake_rx: Mutex::new(wake_rx),
@@ -778,6 +833,36 @@ impl LspClient {
         any
     }
 
+    /// Non-blocking: takes every queued notification whose method this crate has no built-in
+    /// handling for, in real arrival order, leaving the queue empty. See
+    /// [`Self::custom_notifications`]'s own docs for why this exists and why `publishDiagnostics`
+    /// deliberately never appears here.
+    ///
+    /// Mirrors [`Self::drain_updates`]'s own locking shape exactly: the lock is taken, the whole
+    /// queue moved out, and the lock released before this returns - so a caller that goes on to do
+    /// real, blocking I/O with what it drained (which is the entire point: a custom notification
+    /// worth surfacing is usually one that needs answering) never holds this lock across that work.
+    pub fn drain_custom_notifications(&self) -> Vec<(String, serde_json::Value)> {
+        let mut queue = lock(&self.custom_notifications);
+        queue.drain(..).collect()
+    }
+
+    /// Sends a framed notification for a `method` this crate has no [`LspNotification`] type for -
+    /// the outbound half of [`Self::drain_custom_notifications`]' inbound one, for the same real
+    /// reason (a server's own custom protocol extension, whose method name this crate deliberately
+    /// doesn't know). `params` is passed through verbatim as the notification's real `params`
+    /// field, so the caller owns the exact wire shape that method requires.
+    ///
+    /// [`Self::notify`] stays the right call for every method `lsp_types` genuinely models: it
+    /// gets real, compile-time-checked params types, which this cannot.
+    pub fn notify_raw(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> Result<(), LspError> {
+        self.send_notification_raw(method, params)
+    }
+
     /// Blocking, bounded wait for the next wake signal - see [`Self::drain_updates`]'s docs for
     /// what it means. Exists for deterministic test/tooling waits; `crate::root`'s actual GPUI
     /// polling always uses the non-blocking [`Self::drain_updates`] instead, since blocking is
@@ -879,18 +964,17 @@ impl LspClient {
 
     /// Deterministically tears the session down: a best-effort `shutdown` request
     /// (rust-analyzer may already be unresponsive, which is not itself an error for teardown
-    /// purposes), an `exit` notification, then `SIGTERM` to the process (and any descendants it
-    /// spawned, see `crate::proc`'s docs), a bounded grace period, `SIGKILL` if still alive, a
-    /// blocking reap, and finally joining the reader/stderr threads (which exit on their own
-    /// once the process is confirmed dead, see this module's top-level docs on why no explicit
-    /// shutdown signal is needed for them, unlike `pty-core`'s pty case). Safe to call more
-    /// than once.
+    /// purposes), an `exit` notification, then a real process kill (see the `#[cfg(unix)]`/
+    /// `#[cfg(windows)]` split below), a blocking reap, and finally joining the reader/stderr
+    /// threads (which exit on their own once the process is confirmed dead, see this module's
+    /// top-level docs on why no explicit shutdown signal is needed for them, unlike
+    /// `pty-core`'s pty case). Safe to call more than once.
     pub fn shutdown(&mut self) -> Result<(), LspError> {
         if !self.exited {
             let _ = self.request::<lsp_types::request::Shutdown>((), SHUTDOWN_REQUEST_TIMEOUT);
             let _ = self.notify::<lsp_types::notification::Exit>(());
 
-            proc::terminate_tree(self.pid, SHUTDOWN_GRACE_PERIOD);
+            self.kill_process_tree();
             if let Some(child) = self.child.as_mut() {
                 let _ = child.wait();
             }
@@ -905,6 +989,27 @@ impl LspClient {
         }
         Ok(())
     }
+
+    /// `SIGTERM` to the process (and any descendants it spawned, see `crate::proc`'s docs), a
+    /// bounded grace period, then `SIGKILL` if still alive - unix only, since both the `/proc`
+    /// descendant walk and the signals themselves are unix-specific (see `crate::proc`'s own
+    /// module docs).
+    #[cfg(unix)]
+    fn kill_process_tree(&mut self) {
+        proc::terminate_tree(self.pid, SHUTDOWN_GRACE_PERIOD);
+    }
+
+    /// Windows equivalent of [`Self::kill_process_tree`]: a direct `std::process::Child::kill()`
+    /// on the already-held child handle (`TerminateProcess` under the hood), with no grace
+    /// period or process-tree walk - see `crate::proc`'s own module docs for why this is
+    /// narrower (only the direct `rust-analyzer` process, not any `cargo check`/`rustc`/
+    /// proc-macro-server descendants it spawned) but real, not a no-op.
+    #[cfg(windows)]
+    fn kill_process_tree(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
+    }
 }
 
 impl Drop for LspClient {
@@ -913,10 +1018,23 @@ impl Drop for LspClient {
             // `Drop` must not block the caller for long (the same discipline
             // `pty_core::PtySession::drop`'s own docs establish) - no graceful `shutdown`
             // request/grace period here, straight to `SIGKILL` for the whole real process tree.
-            let descendants = proc::collect_descendant_pids(self.pid);
-            proc::signal_pid(self.pid, nix::sys::signal::Signal::SIGKILL);
-            for pid in &descendants {
-                proc::signal_pid(*pid, nix::sys::signal::Signal::SIGKILL);
+            #[cfg(unix)]
+            {
+                let descendants = proc::collect_descendant_pids(self.pid);
+                proc::signal_pid(self.pid, nix::sys::signal::Signal::SIGKILL);
+                for pid in &descendants {
+                    proc::signal_pid(*pid, nix::sys::signal::Signal::SIGKILL);
+                }
+            }
+            // Windows: no process-tree concept (see `crate::proc`'s own module docs) -
+            // `child.kill()` below is the direct-child-only equivalent, and (like
+            // `Self::kill_process_tree`'s Windows twin) leaves any grandchild the killed
+            // process itself spawned (`cargo check`/`rustc`/proc-macro-server, ...) as a
+            // real, un-terminated orphan - the same tracked, real gap `pty-core`'s own
+            // `#[cfg(windows)] PtySession::drop` documents.
+            #[cfg(windows)]
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.kill();
             }
 
             let reaped_immediately = self
@@ -1077,26 +1195,30 @@ fn uri_to_path(uri: &Uri) -> Result<PathBuf, LspError> {
 /// half-built. An honest, observable "this connection is dead" is the real, tested, in-scope
 /// choice; a caller that wants recovery can watch [`LspClient::is_connection_alive`] and spawn a
 /// fresh client the same way it spawned this one.
-fn run_reader_loop(
-    stdout: std::process::ChildStdout,
+/// Everything the reader thread needs to route one incoming message somewhere real - grouped into
+/// one owned value rather than passed as a long positional argument list, so adding a real new
+/// sink (this revision's [`LspClient::custom_notifications`]) doesn't keep widening two signatures
+/// in lockstep.
+struct IncomingSinks {
     pending: Arc<Mutex<HashMap<i64, SyncSender<PendingResponse>>>>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<lsp_types::Diagnostic>>>>,
+    custom_notifications: Arc<Mutex<VecDeque<(String, serde_json::Value)>>>,
+    /// See [`ServerSpawnConfig::custom_notification_methods`].
+    custom_notification_methods: Vec<&'static str>,
     wake_tx: SyncSender<()>,
     stdin: Arc<Mutex<ChildStdin>>,
     workspace_configuration: WorkspaceConfigFn,
+}
+
+fn run_reader_loop(
+    stdout: std::process::ChildStdout,
+    sinks: IncomingSinks,
     connection_alive: Arc<AtomicBool>,
 ) {
     let mut reader = BufReader::new(stdout);
     loop {
         match transport::read_message(&mut reader) {
-            Ok(Some(value)) => handle_incoming(
-                value,
-                &pending,
-                &diagnostics,
-                &wake_tx,
-                &stdin,
-                workspace_configuration,
-            ),
+            Ok(Some(value)) => handle_incoming(value, &sinks),
             Ok(None) => break,
             Err(err) => {
                 // A real, if rare, I/O or framing error (never expected in ordinary operation -
@@ -1112,18 +1234,11 @@ fn run_reader_loop(
     // The connection is gone: drop every still-pending response sender so any thread blocked in
     // `recv_timeout` gets a real, immediate `Disconnected` rather than waiting out its own
     // timeout for a response that will now never arrive.
-    lock(&pending).clear();
+    lock(&sinks.pending).clear();
     connection_alive.store(false, Ordering::SeqCst);
 }
 
-fn handle_incoming(
-    value: serde_json::Value,
-    pending: &Arc<Mutex<HashMap<i64, SyncSender<PendingResponse>>>>,
-    diagnostics: &Arc<Mutex<HashMap<String, Vec<lsp_types::Diagnostic>>>>,
-    wake_tx: &SyncSender<()>,
-    stdin: &Arc<Mutex<ChildStdin>>,
-    workspace_configuration: WorkspaceConfigFn,
-) {
+fn handle_incoming(value: serde_json::Value, sinks: &IncomingSinks) {
     let Some(object) = value.as_object() else {
         return;
     };
@@ -1137,8 +1252,12 @@ fn handle_incoming(
             // see [`server_request_reply`]'s docs for why that one gets a real, server-aware
             // reply instead.
             let method = object.get("method").and_then(|m| m.as_str()).unwrap_or("");
-            let reply =
-                server_request_reply(id, method, object.get("params"), workspace_configuration);
+            let reply = server_request_reply(
+                id,
+                method,
+                object.get("params"),
+                sinks.workspace_configuration,
+            );
 
             // Written from a short-lived, detached thread rather than inline from this reader
             // thread: `transport::write_message` is a blocking `write_all` to the child's
@@ -1151,7 +1270,7 @@ fn handle_incoming(
             // thread-spawn cost is negligible; the spawned thread reuses the same
             // lock-then-`write_message` path every other outbound message goes through
             // (`LspClient::send_request_raw`/`send_notification_raw`).
-            let stdin = Arc::clone(stdin);
+            let stdin = Arc::clone(&sinks.stdin);
             std::thread::spawn(move || {
                 let mut guard = lock(&stdin);
                 let _ = transport::write_message(&mut *guard, &reply);
@@ -1161,7 +1280,7 @@ fn handle_incoming(
 
         // A response to one of our own requests.
         let Some(id) = id.as_i64() else { return };
-        let sender = lock(pending).remove(&id);
+        let sender = lock(&sinks.pending).remove(&id);
         let Some(sender) = sender else { return };
         if let Some(error) = object.get("error") {
             let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
@@ -1181,9 +1300,10 @@ fn handle_incoming(
         return;
     }
 
-    // A notification - the only one this crate cares about is `publishDiagnostics`;
-    // everything else (`$/progress`, `window/logMessage`, ...) is deliberately ignored here
-    // rather than half-handled.
+    // A notification. `publishDiagnostics` is the one this crate understands structurally and
+    // routes into its own real, typed sink; a method this client's caller explicitly subscribed to
+    // (see [`ServerSpawnConfig::custom_notification_methods`]) is queued verbatim for it; anything
+    // else is ignored exactly as it always was.
     let Some(method) = object.get("method").and_then(|m| m.as_str()) else {
         return;
     };
@@ -1197,9 +1317,39 @@ fn handle_incoming(
             log::warn!("failed to parse a real publishDiagnostics payload: {parse_result:?}");
             return;
         };
-        lock(diagnostics).insert(parsed.uri.as_str().to_string(), parsed.diagnostics);
-        let _ = wake_tx.try_send(());
+        lock(&sinks.diagnostics).insert(parsed.uri.as_str().to_string(), parsed.diagnostics);
+        let _ = sinks.wake_tx.try_send(());
+        return;
     }
+
+    if !sinks.custom_notification_methods.contains(&method) {
+        return;
+    }
+
+    {
+        let mut queue = lock(&sinks.custom_notifications);
+        while queue.len() >= CUSTOM_NOTIFICATION_CAPACITY {
+            let dropped = queue.pop_front();
+            log::warn!(
+                "dropping the oldest un-drained custom notification ({:?}) - {} are already \
+                 queued, which is this client's real cap; nothing appears to be draining them",
+                dropped.map(|(method, _)| method),
+                CUSTOM_NOTIFICATION_CAPACITY
+            );
+        }
+        queue.push_back((
+            method.to_string(),
+            object
+                .get("params")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ));
+    }
+    // The same real wake signal `publishDiagnostics` already sends, deliberately reused rather
+    // than inventing a second channel: the `app` crate's existing per-tick poll loop already
+    // drains this client on a wake, so a custom notification reaches it with no new polling
+    // machinery (see [`LspClient::drain_custom_notifications`]'s own docs).
+    let _ = sinks.wake_tx.try_send(());
 }
 
 /// Builds a protocol-shaped reply to one server-initiated request (`id` + `method` both
@@ -1298,6 +1448,7 @@ mod tests {
             args: Vec::new(),
             initialization_options: None,
             workspace_configuration: default_workspace_configuration,
+            custom_notification_methods: Vec::new(),
         }
     }
 
@@ -1413,6 +1564,241 @@ mod tests {
         assert!(
             reply["result"].is_null(),
             "a method with no real special case should keep the legal generic null reply"
+        );
+    }
+
+    /// The real collaborators [`handle_incoming`] needs, built without spawning a language server:
+    /// a genuine `ChildStdin` (taken from a real, trivial `cat` child, since `ChildStdin` has no
+    /// constructor of its own and the notification branches under test never write to it), plus
+    /// the same real `Arc<Mutex<..>>` sinks [`LspClient::spawn`] wires up. Returns the child too,
+    /// so the caller keeps it alive - and kills it - for the duration of the test.
+    struct IncomingHarness {
+        child: Child,
+        sinks: IncomingSinks,
+        wake_rx: Receiver<()>,
+    }
+
+    impl IncomingHarness {
+        /// `subscribed` is the real [`ServerSpawnConfig::custom_notification_methods`] list this
+        /// harness's `handle_incoming` calls are driven with.
+        fn new(subscribed: &[&'static str]) -> Self {
+            let mut child = Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawning a real `cat` for its stdin handle");
+            let stdin = child.stdin.take().expect("piped stdin");
+            let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(WAKE_CHANNEL_CAPACITY);
+            Self {
+                child,
+                sinks: IncomingSinks {
+                    pending: Arc::new(Mutex::new(HashMap::new())),
+                    diagnostics: Arc::new(Mutex::new(HashMap::new())),
+                    custom_notifications: Arc::new(Mutex::new(VecDeque::new())),
+                    custom_notification_methods: subscribed.to_vec(),
+                    wake_tx,
+                    stdin: Arc::new(Mutex::new(stdin)),
+                    workspace_configuration: default_workspace_configuration,
+                },
+                wake_rx,
+            }
+        }
+
+        fn feed(&self, message: serde_json::Value) {
+            handle_incoming(message, &self.sinks);
+        }
+
+        fn drain_custom(&self) -> Vec<(String, serde_json::Value)> {
+            lock(&self.sinks.custom_notifications).drain(..).collect()
+        }
+    }
+
+    impl Drop for IncomingHarness {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// The real capability `crate::client`'s notification branch gained so a server's own custom
+    /// protocol extension stops being invisible: a subscribed method is queued verbatim, method
+    /// and raw params both intact, in real arrival order.
+    #[test]
+    fn a_subscribed_notification_is_queued_verbatim_for_draining() {
+        let harness = IncomingHarness::new(&["tsserver/request", "server/other"]);
+        harness.feed(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tsserver/request",
+            "params": [[1, "_vue:projectInfo", { "file": "/tmp/App.vue" }]],
+        }));
+        harness.feed(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "server/other",
+            "params": { "token": "t" },
+        }));
+
+        let drained = harness.drain_custom();
+        assert_eq!(
+            drained.len(),
+            2,
+            "every subscribed notification should be queued, in arrival order"
+        );
+        assert_eq!(drained[0].0, "tsserver/request");
+        assert_eq!(
+            drained[0].1,
+            serde_json::json!([[1, "_vue:projectInfo", { "file": "/tmp/App.vue" }]]),
+            "the raw params must survive verbatim - this crate deliberately doesn't interpret them"
+        );
+        assert_eq!(drained[1].0, "server/other");
+        assert!(
+            harness.drain_custom().is_empty(),
+            "draining should leave the queue genuinely empty, not re-yield the same entries"
+        );
+    }
+
+    /// The real "no added cost for the servers that were already working" guarantee: a client that
+    /// subscribed to nothing (rust-analyzer, typescript-language-server, pyright - all three of
+    /// this app's pre-existing servers) queues nothing at all, no matter how much unrelated
+    /// notification traffic its server produces. Behaviorally identical to before this capability
+    /// existed.
+    #[test]
+    fn a_client_that_subscribed_to_nothing_queues_nothing_at_all() {
+        let harness = IncomingHarness::new(&[]);
+        for method in ["$/progress", "window/logMessage", "tsserver/request"] {
+            harness.feed(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": { "anything": true },
+            }));
+        }
+        assert!(
+            harness.drain_custom().is_empty(),
+            "an un-subscribed method must be ignored exactly as it always was, not queued for a              caller that will never read it"
+        );
+        assert!(
+            harness.wake_rx.try_recv().is_err(),
+            "and it must not even cost a spurious wake signal"
+        );
+    }
+
+    /// Subscription is per-method, not all-or-nothing: an un-subscribed method is still ignored
+    /// even on a client that subscribed to something else.
+    #[test]
+    fn an_unsubscribed_method_is_ignored_even_when_other_methods_are_subscribed() {
+        let harness = IncomingHarness::new(&["tsserver/request"]);
+        harness.feed(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "$/progress",
+            "params": { "token": "t" },
+        }));
+        assert!(harness.drain_custom().is_empty());
+    }
+
+    /// The other half of the partition: `publishDiagnostics` keeps going only to its own real,
+    /// typed sink and must never *also* appear on the custom-notification path, which would give
+    /// callers two disagreeing sources for the same real data.
+    #[test]
+    fn publish_diagnostics_never_appears_on_the_custom_notification_path() {
+        // Subscribed on purpose: even an explicit subscription must not divert it from its own
+        // real, typed sink.
+        let harness = IncomingHarness::new(&["textDocument/publishDiagnostics"]);
+        harness.feed(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": "file:///tmp/main.rs",
+                "diagnostics": [{
+                    "range": {
+                        "start": { "line": 1, "character": 4 },
+                        "end": { "line": 1, "character": 5 },
+                    },
+                    "severity": 1,
+                    "message": "mismatched types",
+                }],
+            },
+        }));
+
+        assert!(
+            harness.drain_custom().is_empty(),
+            "publishDiagnostics has its own real sink and must not be duplicated onto the \
+             generic custom-notification queue"
+        );
+        let diagnostics = lock(&harness.sinks.diagnostics);
+        let recorded = diagnostics
+            .get("file:///tmp/main.rs")
+            .expect("the real, typed diagnostics sink should still have been populated");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].message, "mismatched types");
+    }
+
+    /// Both paths send the same real wake signal, so the `app` crate's single existing poll loop
+    /// notices either without new polling machinery.
+    #[test]
+    fn a_custom_notification_sends_the_same_real_wake_signal_diagnostics_do() {
+        let harness = IncomingHarness::new(&["tsserver/request"]);
+        assert!(
+            harness.wake_rx.try_recv().is_err(),
+            "no wake should be pending before anything arrives"
+        );
+        harness.feed(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tsserver/request",
+            "params": [[1, "_vue:projectInfo", {}]],
+        }));
+        assert!(
+            harness.wake_rx.try_recv().is_ok(),
+            "a subscribed notification should wake a poller the same way a real \
+             publishDiagnostics push does"
+        );
+    }
+
+    /// A server that sends a subscribed notification faster than anything drains it must not grow
+    /// this queue without limit - the *oldest* entry is dropped, so the newest, most relevant ones
+    /// are the ones that survive.
+    #[test]
+    fn the_custom_notification_queue_is_bounded_and_drops_the_oldest_first() {
+        let harness = IncomingHarness::new(&["server/custom"]);
+        let total = CUSTOM_NOTIFICATION_CAPACITY + 10;
+        for index in 0..total {
+            harness.feed(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "server/custom",
+                "params": { "index": index },
+            }));
+        }
+
+        let drained = harness.drain_custom();
+        assert_eq!(
+            drained.len(),
+            CUSTOM_NOTIFICATION_CAPACITY,
+            "the queue must stay capped rather than growing for the life of the process"
+        );
+        assert_eq!(
+            drained[0].1["index"],
+            serde_json::json!(total - CUSTOM_NOTIFICATION_CAPACITY),
+            "the oldest entries are the ones dropped, so the newest survive"
+        );
+        assert_eq!(
+            drained[drained.len() - 1].1["index"],
+            serde_json::json!(total - 1)
+        );
+    }
+
+    /// A server-initiated *request* (an `id` alongside the `method`) still takes the real
+    /// reply path and must not leak onto the notification queue, which has no way to answer one.
+    #[test]
+    fn a_server_initiated_request_is_not_treated_as_a_custom_notification() {
+        let harness = IncomingHarness::new(&["client/registerCapability"]);
+        harness.feed(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "client/registerCapability",
+            "params": { "registrations": [] },
+        }));
+        assert!(
+            harness.drain_custom().is_empty(),
+            "a request needs a real reply, not to be queued as an unanswerable notification"
         );
     }
 
@@ -1880,6 +2266,7 @@ mod tests {
             args: vec!["--stdio".to_string()],
             initialization_options: None,
             workspace_configuration: default_workspace_configuration,
+            custom_notification_methods: Vec::new(),
         }
     }
 
@@ -2093,6 +2480,7 @@ mod tests {
                 }
             })),
             workspace_configuration,
+            custom_notification_methods: Vec::new(),
         }
     }
 

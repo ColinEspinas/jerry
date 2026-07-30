@@ -330,7 +330,7 @@ impl AdeApp {
                             // A real click both selects *and* accepts this row in one step -
                             // `on_mouse_down`, not `on_click`, matching this app's own established
                             // idiom for a popover row that both selects and immediately commits
-                            // (`crate::root::work_surface_render::render_plus_menu_row`'s sibling
+                            // (`crate::root::work_surface_render::render_dropdown_menu_row`'s sibling
                             // rows use `on_click` since picking one never needs an intermediate
                             // "select" state the way this popup's keyboard nav does).
                             .on_mouse_down(

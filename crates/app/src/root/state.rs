@@ -55,8 +55,6 @@ impl AdeApp {
             file_load_state: FileLoadState::Idle,
             file_view_changed_lines: HashSet::new(),
             code_cursor: None,
-            code_zoom_percent: AdeApp::ZOOM_DEFAULT_PERCENT,
-            file_zoom_percent: HashMap::new(),
             edit_buffers: HashMap::new(),
             file_view_row_layout: HashMap::new(),
             file_view_last_layout: None,
@@ -163,7 +161,12 @@ impl AdeApp {
             settings_keymap_filter_focus_handle: cx.focus_handle(),
             plus_menu_open: false,
             plus_button_bounds: gpui::Bounds::default(),
+            title_menu_open: None,
+            title_menu_button_bounds: [gpui::Bounds::default(); title_bar::TitleMenu::ALL.len()],
             _new_agent_pane_task: TaskPool::new(),
+            new_file_input: None,
+            new_file_focus_handle: cx.focus_handle(),
+            new_file_error: None,
         };
         // A fresh window starts with one shell in the repo root, as a tab like any other.
         // `focus_active` below moves real keyboard focus onto it - see `Sessions::focus_active`'s
@@ -290,7 +293,12 @@ impl AdeApp {
         }
     }
 
-    pub(super) fn select_worktree(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub(super) fn select_worktree(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(item) = self.worktrees.get(index) else {
             return;
         };
@@ -300,22 +308,64 @@ impl AdeApp {
         }
         let path = item.path.clone();
         self.selected = Some(index);
+        // Makes this worktree's own last-active tab (or its first session, or none) the
+        // globally active one - see `Sessions::activate_for_worktree`'s own docs for why this
+        // invariant ("the active session always belongs to the selected worktree") is the real
+        // fix this revision makes: before it, selecting a worktree never touched `self.sessions`
+        // at all, so the centre pane could keep showing a completely different worktree's
+        // terminal after a rail click.
+        self.sessions.activate_for_worktree(&path);
         // Browsing to a different worktree disarms a pending prune confirmation - see
         // `Self::request_prune`'s docs.
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
         // Reset per-worktree UI state (see `reset_per_worktree_ui_state`'s docs) so switching
         // worktrees never leaks a "reviewed" checkbox, open diff, or collapsed-dir entry from
-        // the worktree just left.
+        // the worktree just left. Deliberately runs *before* the focus-fallback block below: both
+        // `focus_newly_spawned_session` and the `filter_focus_handle` fallback branch on
+        // `self.open_change`, and until this call runs, `open_change` can still reflect the
+        // worktree just *left* (a file tab open there) rather than the real post-switch state -
+        // evaluating either guard first (a real, live-reproduced bug found in this revision's own
+        // self-audit) made both branches see a stale `Some` and skip moving focus at all, leaving
+        // `Window::focus` dangling on `code_focus_handle` once `open_change` was cleared one
+        // statement later.
         reset_per_worktree_ui_state(
             &mut self.reviewed_files,
             &mut self.open_files,
             &mut self.open_change,
             &mut self.collapsed_dirs,
             &mut self.selected_tree_path,
-            &mut self.file_zoom_percent,
             &mut self.edit_buffers,
         );
+        // `focus_newly_spawned_session` (despite its name - its body has no "newly spawned" logic
+        // in it, just the shared "move focus unless a file tab/Settings is showing" guard) closes
+        // the dangling-focus risk this switch creates: the previously-active session's pane may
+        // no longer be part of the rendered tree at all once the tab strip's own per-worktree
+        // filter (`Self::render_tab_strip`) applies, so keyboard focus left pointing at it would
+        // silently break every keybinding until the next click - the same "focus left pointing at
+        // something no longer rendered" bug class this project's own `OverlayFocus`/
+        // `restore_focus` mechanism exists to prevent, applied here to a plain worktree switch
+        // rather than an overlay open/close. `open_change` above is already this switch's real
+        // post-reset value by the time this runs, so the guard it checks is genuine.
+        self.focus_newly_spawned_session(window, cx);
+        // `focus_newly_spawned_session` is a real no-op when the newly selected worktree has no
+        // open session at all (`Sessions::focus_active` has nothing to focus) - so if a
+        // previously-focused session's pane belonged to the worktree just left, it's now exactly
+        // as dangling as the case the comment above already covers, just with no session to
+        // redirect *onto*. Fall back to the rail's own filter field
+        // (`Self::filter_focus_handle`), which is part of the rendered tree whenever the
+        // workspace body is showing (never while Settings has replaced it - `!self.settings_open`
+        // guards that the same way `focus_newly_spawned_session` itself does) - real, if
+        // imperfect, UX (it makes the filter box look focused without being asked to), but it
+        // keeps the focused `FocusId` genuinely findable in the next rendered frame, which is the
+        // actual invariant this exists to protect: a dangling `FocusId` makes GPUI's action
+        // dispatch fall back to a disconnected root with no real `on_action` handlers at all, not
+        // just this worktree's own missing ones - silently breaking every global keybinding (⌘K
+        // included) until the next click.
+        if self.sessions.active_id().is_none() && self.open_change.is_none() && !self.settings_open
+        {
+            window.focus(&self.filter_focus_handle, cx);
+        }
         // The File view's own per-worktree state (a cached parse and diff lookup that are about
         // to belong to a different `file_tree_root`) - reset for the same reason as above.
         // Dropping `_file_load_task` cancels any in-flight load for the worktree just left.
@@ -360,7 +410,10 @@ impl AdeApp {
         // active).
         self.diff_highlight_cache = None;
         self._file_load_task = None;
-        self.code_zoom_percent = AdeApp::ZOOM_DEFAULT_PERCENT;
+        // Editor zoom (`Settings.appearance.editor_zoom_percent`) is a real, globally-persisted
+        // Settings field now - see `settings_store`'s "Editor zoom is one global, persisted
+        // number now" docs - so it deliberately does *not* get reset here anymore.
+        //
         // The hover cache is per-file - clear it too, or a hover card from the worktree just
         // left could reappear the instant a same-named file opens in the new one. The real
         // Completions popup is already dropped above (alongside `_lsp_sync_tasks`/
@@ -387,10 +440,11 @@ impl AdeApp {
     pub(super) fn select_worktree_by_path(
         &mut self,
         path: &std::path::Path,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(index) = self.worktrees.iter().position(|item| item.path == path) {
-            self.select_worktree(index, cx);
+            self.select_worktree(index, window, cx);
         }
     }
 }
@@ -409,7 +463,6 @@ pub(super) fn reset_per_worktree_ui_state(
     open_change: &mut Option<PathBuf>,
     collapsed_dirs: &mut HashSet<PathBuf>,
     selected_tree_path: &mut Option<PathBuf>,
-    file_zoom_percent: &mut HashMap<PathBuf, u16>,
     edit_buffers: &mut HashMap<PathBuf, edit_buffer::EditBuffer>,
 ) {
     reviewed_files.clear();
@@ -417,9 +470,8 @@ pub(super) fn reset_per_worktree_ui_state(
     *open_change = None;
     collapsed_dirs.clear();
     *selected_tree_path = None;
-    file_zoom_percent.clear();
     // Real, live unsaved-edit state (Revision R8.5a) is just as worktree-relative-path-keyed as
-    // `file_zoom_percent` above - without this, a same-named file in a different worktree could
+    // `open_files` above - without this, a same-named file in a different worktree could
     // silently inherit another worktree's in-memory buffer/cursor/selection.
     edit_buffers.clear();
 }
@@ -437,7 +489,6 @@ mod tests {
         let mut open_change = Some(PathBuf::from("src/main.rs"));
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
-        let mut file_zoom_percent = HashMap::new();
         let mut edit_buffers = HashMap::new();
 
         reset_per_worktree_ui_state(
@@ -446,7 +497,6 @@ mod tests {
             &mut open_change,
             &mut collapsed_dirs,
             &mut selected_tree_path,
-            &mut file_zoom_percent,
             &mut edit_buffers,
         );
 
@@ -466,7 +516,6 @@ mod tests {
         let mut open_change = Some(PathBuf::from("Cargo.toml"));
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
-        let mut file_zoom_percent = HashMap::new();
         let mut edit_buffers = HashMap::new();
 
         reset_per_worktree_ui_state(
@@ -475,7 +524,6 @@ mod tests {
             &mut open_change,
             &mut collapsed_dirs,
             &mut selected_tree_path,
-            &mut file_zoom_percent,
             &mut edit_buffers,
         );
 
@@ -493,7 +541,6 @@ mod tests {
         let mut open_change = None;
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
-        let mut file_zoom_percent = HashMap::new();
         let mut edit_buffers = HashMap::new();
 
         reset_per_worktree_ui_state(
@@ -502,7 +549,6 @@ mod tests {
             &mut open_change,
             &mut collapsed_dirs,
             &mut selected_tree_path,
-            &mut file_zoom_percent,
             &mut edit_buffers,
         );
 
@@ -518,7 +564,6 @@ mod tests {
         let mut open_change = None;
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
-        let mut file_zoom_percent = HashMap::new();
         let mut edit_buffers = HashMap::new();
         collapsed_dirs.insert(PathBuf::from("/repo/worktree-a/src"));
         collapsed_dirs.insert(PathBuf::from("/repo/worktree-a/tests"));
@@ -529,7 +574,6 @@ mod tests {
             &mut open_change,
             &mut collapsed_dirs,
             &mut selected_tree_path,
-            &mut file_zoom_percent,
             &mut edit_buffers,
         );
 
@@ -543,7 +587,6 @@ mod tests {
         let mut open_change = None;
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = Some(PathBuf::from("/repo/worktree-a/src/main.rs"));
-        let mut file_zoom_percent = HashMap::new();
         let mut edit_buffers = HashMap::new();
 
         reset_per_worktree_ui_state(
@@ -552,44 +595,15 @@ mod tests {
             &mut open_change,
             &mut collapsed_dirs,
             &mut selected_tree_path,
-            &mut file_zoom_percent,
             &mut edit_buffers,
         );
 
         assert_eq!(selected_tree_path, None);
     }
 
-    /// `file_zoom_percent` is keyed the same way as `open_files`; without this reset a zoom
-    /// level remembered for `src/main.rs` in one worktree would apply to a same-named file in a
-    /// different one.
-    #[test]
-    fn reset_per_worktree_ui_state_clears_file_zoom_percent() {
-        let mut reviewed_files = HashSet::new();
-        let mut open_files = Vec::new();
-        let mut open_change = None;
-        let mut collapsed_dirs = HashSet::new();
-        let mut selected_tree_path = None;
-        let mut file_zoom_percent = HashMap::new();
-        let mut edit_buffers = HashMap::new();
-        file_zoom_percent.insert(PathBuf::from("src/main.rs"), 150u16);
-        file_zoom_percent.insert(PathBuf::from("Cargo.toml"), 80u16);
-
-        reset_per_worktree_ui_state(
-            &mut reviewed_files,
-            &mut open_files,
-            &mut open_change,
-            &mut collapsed_dirs,
-            &mut selected_tree_path,
-            &mut file_zoom_percent,
-            &mut edit_buffers,
-        );
-
-        assert!(file_zoom_percent.is_empty());
-    }
-
-    /// `edit_buffers` is keyed the same way as `file_zoom_percent`/`open_files`; without this
-    /// reset, a same-named file's real unsaved edits from one worktree could silently reappear
-    /// (or be silently overwritten by) an unrelated file in a different worktree.
+    /// `edit_buffers` is keyed the same way as `open_files`; without this reset, a same-named
+    /// file's real unsaved edits from one worktree could silently reappear (or be silently
+    /// overwritten by) an unrelated file in a different worktree.
     #[test]
     fn reset_per_worktree_ui_state_clears_edit_buffers() {
         let mut reviewed_files = HashSet::new();
@@ -597,7 +611,6 @@ mod tests {
         let mut open_change = None;
         let mut collapsed_dirs = HashSet::new();
         let mut selected_tree_path = None;
-        let mut file_zoom_percent = HashMap::new();
         let mut edit_buffers = HashMap::new();
         edit_buffers.insert(
             PathBuf::from("src/main.rs"),
@@ -616,7 +629,6 @@ mod tests {
             &mut open_change,
             &mut collapsed_dirs,
             &mut selected_tree_path,
-            &mut file_zoom_percent,
             &mut edit_buffers,
         );
 

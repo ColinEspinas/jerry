@@ -546,20 +546,36 @@ impl AdeApp {
         let Some(buffer) = self.edit_buffers.get(&path) else {
             return;
         };
-        if !buffer.is_dirty() {
+
+        let metadata = std::fs::metadata(&buffer.path).ok();
+        // A genuinely brand-new, never-loaded-or-saved buffer (`crate::root::AdeApp::
+        // create_new_file`) has no real on-disk metadata on *either* side: `saved_mtime` was
+        // never seeded from a real load (there was nothing to load yet), and the path itself
+        // doesn't exist on disk yet either. That's the ordinary, expected shape of a file's
+        // first-ever save, not an external-change conflict - a naive version of the checks below
+        // would misread it as one (`saved_mtime: None` can never equal a real `Some(mtime)`) and
+        // permanently refuse to create the file at all, without a real `EditorSaveAnyway` making
+        // sense for it either (there's nothing "external" to override - see that action's own
+        // docs). It also needs to skip the plain dirty-buffer check just below: an empty new
+        // file's `content`/`saved_content` are both `""`, so `is_dirty()` alone would say "no
+        // edits to save" even though the file genuinely doesn't exist on disk yet.
+        let is_new_never_saved = buffer.saved_mtime.is_none() && metadata.is_none();
+
+        if !is_new_never_saved && !buffer.is_dirty() {
             return;
         }
 
-        let metadata = std::fs::metadata(&buffer.path).ok();
-        let unchanged_since_load = match &metadata {
-            Some(metadata) => {
-                metadata.modified().ok() == buffer.saved_mtime && metadata.len() == buffer.saved_len
-            }
-            // The file having vanished entirely (deleted externally) is itself a real external
-            // change - refuse the same way a real mtime/len mismatch would, rather than silently
-            // recreating it as if nothing happened.
-            None => false,
-        };
+        let unchanged_since_load = is_new_never_saved
+            || match &metadata {
+                Some(metadata) => {
+                    metadata.modified().ok() == buffer.saved_mtime
+                        && metadata.len() == buffer.saved_len
+                }
+                // The file having vanished entirely (deleted externally) is itself a real
+                // external change - refuse the same way a real mtime/len mismatch would, rather
+                // than silently recreating it as if nothing happened.
+                None => false,
+            };
         if !unchanged_since_load {
             self.file_external_conflict.insert(path.clone());
             self.file_save_error = Some((

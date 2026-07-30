@@ -762,7 +762,7 @@ impl AdeApp {
                     .hover(|el| el.text_color(theme::text::SECONDARY))
                     .child("Open")
                     .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                        this.select_worktree_by_path(&path, cx);
+                        this.select_worktree_by_path(&path, window, cx);
                         this.close_settings(window, cx);
                     })),
             ),
@@ -900,7 +900,7 @@ impl AdeApp {
         );
         let editor_font_row = self.render_settings_row(
             "Editor font size",
-            "Per-tab zoom shifts this without changing the default.",
+            "The code surface's toolbar zoom multiplies this baseline; both are saved globally.",
             self.render_stepper_control(
                 "settings-editor-font",
                 format!("{:.0} px", self.settings.appearance.editor_font_size),
@@ -930,17 +930,6 @@ impl AdeApp {
                 |this, cx| this.toggle_follow_system_text_size(cx),
             ),
         );
-        let per_tab_zoom_row = self.render_settings_row(
-            "Zoom per editor tab",
-            "Zoom applies to the focused tab only; the rest of the UI keeps its scale.",
-            self.render_toggle_control(
-                "settings-per-tab-zoom",
-                self.settings.appearance.per_tab_zoom,
-                cx,
-                |this, cx| this.toggle_per_tab_zoom(cx),
-            ),
-        );
-
         div()
             .flex()
             .flex_col()
@@ -974,7 +963,6 @@ impl AdeApp {
             .child(editor_font_row)
             .child(terminal_font_row)
             .child(follow_system_row)
-            .child(per_tab_zoom_row)
             .child(self.render_snippet_block(settings_store::ConfigPage::Appearance))
     }
 
@@ -1608,28 +1596,6 @@ impl AdeApp {
     fn toggle_follow_system_text_size(&mut self, cx: &mut Context<Self>) {
         self.settings.appearance.follow_system_text_size =
             !self.settings.appearance.follow_system_text_size;
-        self.persist_settings(cx);
-        cx.notify();
-    }
-
-    /// `pub(super)`, not private - `crate::root::code_surface`'s `code_zoom_tests` module drives
-    /// this directly, the same edit path the Appearance page's toggle click invokes.
-    ///
-    /// Seeds every currently-open tab (`Self::open_files`) with the shared zoom *before* the
-    /// mode flips on: `Self::file_zoom_percent` is only ever written while per-tab mode is
-    /// already on, so without this seeding, turning it on would leave the map empty and the
-    /// next tab switch would silently reset a real, user-set zoom back to
-    /// `Self::ZOOM_DEFAULT_PERCENT` via `Self::restore_zoom_for_open_change`'s "never-zoomed
-    /// tab" branch.
-    pub(super) fn toggle_per_tab_zoom(&mut self, cx: &mut Context<Self>) {
-        let turning_on = !self.settings.appearance.per_tab_zoom;
-        if turning_on {
-            let shared_zoom = self.code_zoom_percent;
-            for path in &self.open_files {
-                self.file_zoom_percent.insert(path.clone(), shared_zoom);
-            }
-        }
-        self.settings.appearance.per_tab_zoom = turning_on;
         self.persist_settings(cx);
         cx.notify();
     }

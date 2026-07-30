@@ -11,13 +11,19 @@
 //!
 //! ## Scope: which languages actually spawn a server here
 //!
-//! `lsp: Some(..)` for Rust/TypeScript-family/Python - real, live-tested end to end (see
-//! `lsp_core::client`'s own tests for Rust, and this crate's `language::tests` /
-//! `root::lsp`-adjacent integration tests for TypeScript/Python). `lsp: None` for TOML/Markdown/
-//! SQL (never had a server), Go (the user's explicit ask named TypeScript/Vue/Python, not Go;
-//! `gopls` stays PATH-detection-only on the Settings page, matching its pre-existing "not
-//! installed" real state there), and **Vue** - a deliberate, evidence-backed scope-down, not an
-//! oversight:
+//! `lsp: Some(..)` for Rust/TypeScript-family/Python/**Vue** - all real, live-tested end to end
+//! (see `lsp_core::client`'s own tests for Rust, and this crate's `language::tests` /
+//! `root::lsp`-adjacent integration tests for the rest). `lsp: None` for TOML/Markdown/SQL (never
+//! had a server) and Go (the user's explicit ask named TypeScript/Vue/Python, not Go; `gopls`
+//! stays PATH-detection-only on the Settings page, matching its pre-existing "not installed" real
+//! state there).
+//!
+//! ## Vue: the investigation that led to [`CompanionServer`]
+//!
+//! Vue was deferred through Revision R8 rather than faked, and the investigation narrative is kept
+//! here because it's what the eventual design is justified by - the deferral itself is now
+//! resolved (this module's [`VUE_LSP`] and [`CompanionServer`], plus `crate::root::lsp`'s own
+//! `LspConnection` facade, are that resolution).
 //!
 //! Live-probing the sandbox's actual installed `@vue/language-server@3.3.8` (`vue-language-server
 //! --stdio`, no `--tsdk`) showed it completes a real `initialize` handshake and advertises
@@ -27,30 +33,44 @@
 //! with no `<script>` block at all.
 //!
 //! Correction (a previous version of this doc comment got the evidence backwards): that crash is
-//! specifically what happens when `--tsdk` is **omitted**, not when it's passed. A real `ls -la`
-//! on this sandbox's actual TypeScript `lib/` directory shows a genuine, present `typescript.js`
-//! (9,112,572 bytes) - the earlier claim that no real `typescript.js` exists at that path for
-//! either a project-local `npm install typescript` or the server's own bundled copy was simply
-//! false, and live-spawning `vue-language-server --stdio --tsdk=<that real path>` does **not**
-//! crash at startup the way omitting the flag does.
+//! specifically what happens when `--tsdk` is **omitted**, not when it's passed - the server then
+//! falls back to `require('typescript')`, resolving its own bundled copy, which in this
+//! environment is TypeScript 7.0.2 whose restructured module layout has no `.server.protocol` on
+//! the base module. [`vue_dynamic_args`] below is the real `--tsdk` resolution that avoids it.
 //!
-//! The real reason Vue support is still deferred, live-verified separately: even *with* `--tsdk`
-//! correctly set (avoiding the startup crash above), the real installed server's "hybrid mode"
-//! then sends a real `tsserver/request` (e.g. for `_vue:projectInfo`) expecting a companion
-//! `typescript-language-server` process (running `@vue/typescript-plugin`) to answer it over
-//! custom `tsserver/request`/`tsserver/response` notifications - and no such companion process
-//! exists in this codebase's current architecture, so real diagnostics still never arrive even
-//! once the startup crash itself is avoided. Building that real two-process coordination (a
-//! second LSP client, wired specifically to talk Vue-specific `tsserver/*` notifications to the
-//! first) is genuine new architecture this phase's other priorities (generalizing `lsp-core`
-//! itself, real TypeScript/Python support) shouldn't be sacrificed for - so Vue's
-//! [`ExtensionEntry::lsp`] stays `None`. PATH-detection (`crate::settings::LSP_LANGUAGES`,
-//! unaffected by this) and the chip color below still work regardless, per this phase's own
-//! stated minimum bar.
+//! Legacy "takeover mode" (a single monolithic server needing no companion, historically
+//! selectable via `initializationOptions.vue.hybridMode = false`) was re-checked live for this
+//! revision and is genuinely **gone**, not merely deprecated: passing that flag still produces the
+//! identical crash, and reading the installed `@vue/language-server@3.3.8`'s own `lib/server.js`
+//! shows no `hybridMode` string anywhere in it - `getLanguageService()` unconditionally issues the
+//! `tsserver` request the first time any file needs a language service, with no code path that
+//! skips it. So there is no shortcut: hybrid mode's real two-process coordination is the only real
+//! way to support Vue against this server.
+//!
+//! What hybrid mode actually needs, verified byte-for-byte against both real processes:
+//! `vue-language-server` sends a custom `tsserver/request` notification asking its *client* to
+//! relay a query to a companion `typescript-language-server` running `@vue/typescript-plugin`, and
+//! to notify the answer back as `tsserver/response`. [`CompanionServer`] is this registry's half
+//! of that (which companion, how to configure it, which methods carry the relay);
+//! `crate::root::lsp`'s `LspConnection` is the half that actually performs it.
+//!
+//! One live-verified consequence shapes the whole design, and is worth stating plainly because it
+//! looks like a bug otherwise: in hybrid mode the *split is the point*. The primary
+//! (`vue-language-server`) answers Vue-specific things - a real, live-observed example being
+//! template compile diagnostics (`"Element is missing end tag."`, `"Invalid end tag."`) - and
+//! genuinely returns nothing for TypeScript-semantic queries, because those are the companion's
+//! job: opening the same `.vue` file directly in the companion (with the plugin loaded,
+//! `language_id: "vue"`) produces the real `"Type 'string' is not assignable to type 'number'."`
+//! diagnostic and a real `const bad: number` hover, entirely on its own. Neither server is the
+//! whole answer for a `.vue` file, which is exactly why `LspConnection` merges diagnostics from
+//! both and falls back to the companion for hover.
 
 use std::path::Path;
 
 use gpui::Rgba;
+use lsp_core::lsp_types::request::{
+    Completion, GotoDefinition, HoverRequest, Request as LspRequest,
+};
 use lsp_core::{ServerSpawnConfig, WorkspaceConfigFn};
 
 use crate::theme;
@@ -74,6 +94,77 @@ pub struct LspIdentity {
     /// looks up the cheap, static [`lsp_binary_for_extension`] instead of calling this.
     pub initialization_options: fn() -> Option<serde_json::Value>,
     pub workspace_configuration: WorkspaceConfigFn,
+    /// Real, dynamic *extra* arguments appended after [`Self::args`], resolved fresh per real
+    /// spawn against the actual repository being opened - [`no_dynamic_args`] (an unconditional
+    /// `Ok(vec![])`) for every server whose real command line is fully static, which is all three
+    /// of Rust/TypeScript/Python.
+    ///
+    /// Takes `repo_root` because the one real user of it genuinely needs it: Vue's `--tsdk` must
+    /// point at *this project's own* TypeScript installation (see [`vue_dynamic_args`]). Fallible
+    /// for the same reason [`CompanionServer::initialization_options`] is - an `Err` means a real,
+    /// checked prerequisite is genuinely missing, and [`server_spawn_config`] then refuses to
+    /// spawn rather than starting a process already known to crash.
+    ///
+    /// Same "built fresh, off the GPUI thread, only when a spawn is actually needed" contract as
+    /// [`Self::initialization_options`] - it does real filesystem probing.
+    pub dynamic_args: fn(repo_root: &Path) -> Result<Vec<String>, String>,
+    /// The second, coordinated server this language's primary needs alongside it, if any - `None`
+    /// for every single-process language (Rust/TypeScript/Python). See [`CompanionServer`].
+    pub companion: Option<CompanionServer>,
+}
+
+/// A second, coordinated LSP server process some languages need alongside the primary one - see
+/// this module's own top-level docs for the real, concrete reason (Vue's hybrid mode) and
+/// `crate::root::lsp`'s `LspConnection` for the facade that actually drives both.
+///
+/// Deliberately concrete to that one real, verified protocol rather than a speculative N-server
+/// framework: the relay is one request-shaped notification in, one response-shaped notification
+/// out, through one `workspace/executeCommand` on the companion. A third multi-server language
+/// that needed a genuinely different coordination shape should extend this against *its* real
+/// requirement, not against a guess made here.
+#[derive(Debug, Clone, Copy)]
+pub struct CompanionServer {
+    /// The second half of this companion's own `LspClientKey` in `crate::root::AdeApp::
+    /// lsp_clients`, and the real `name` its `lsp_core::LspClient` reports in every log/status
+    /// message. Deliberately distinct from [`Self::binary`]'s own plain name (e.g.
+    /// `"typescript-language-server (vue)"` vs `"typescript-language-server"`) so a
+    /// Vue-companion-flavored spawn - which carries a real, extra `@vue/typescript-plugin` in its
+    /// `initializationOptions` - never collides with, or gets silently reused as, the plain
+    /// TypeScript client the same repo root might independently have running for real `.ts` files.
+    pub client_key: &'static str,
+    pub binary: &'static str,
+    pub args: &'static [&'static str],
+    /// `didOpen`'s `language_id` when opening the *same* file in this companion too. The companion
+    /// is a real, independent analyzer of the file, not a passive relay - see this module's
+    /// top-level docs for the live-verified split that makes its own `didOpen` necessary.
+    pub language_id: &'static str,
+    /// Real, dynamic (PATH/filesystem-probing) companion `initializationOptions` - mirrors
+    /// [`LspIdentity::initialization_options`]'s own "built fresh per real spawn, off the GPUI
+    /// thread" contract, but fallible: `Err` is a genuine missing prerequisite (e.g. no real,
+    /// resolvable `@vue/typescript-plugin` on disk), and spawning is refused rather than started
+    /// knowing it can't do its job.
+    pub initialization_options: fn() -> Result<Option<serde_json::Value>, String>,
+    /// The custom notification method the **primary** sends to ask its client to relay a query to
+    /// this companion. Named here, in the registry, rather than in `crate::root::lsp`, so the
+    /// forwarding code stays free of any particular server's protocol vocabulary.
+    pub relay_request_method: &'static str,
+    /// The custom notification method the client sends **back to the primary** carrying the
+    /// companion's answer.
+    pub relay_response_method: &'static str,
+    /// The real `workspace/executeCommand` command name this companion registers for answering a
+    /// relayed query (`typescript-language-server` registers `"typescript.tsserverRequest"`
+    /// specifically to make raw tsserver queries reachable over standard LSP - confirmed by
+    /// reading its own `lib/cli.mjs`).
+    pub relay_command: &'static str,
+    /// The real `lsp_types::request::Request::METHOD` strings whose *empty* primary answer should
+    /// be retried against this companion - see `crate::root::lsp::LspConnection::request`, which
+    /// reads exactly this list instead of hardcoding any method of its own.
+    ///
+    /// Lives here, in the registry, because "which questions does the primary genuinely not answer
+    /// for its own files" is a property of the specific two-server split, not of the facade: a
+    /// future companion for a different language would have its own, different list, and the
+    /// coordination code shouldn't need editing to accommodate it.
+    pub fallback_methods: &'static [&'static str],
 }
 
 /// Which of `crate::code_view`'s real `tree-sitter`-backed syntax highlighters applies to an
@@ -101,14 +192,17 @@ pub struct ExtensionEntry {
     /// row per *family*, not per extension - `.tsx`/`.js`/`.jsx` share TypeScript's row), `None`
     /// for every other entry (TOML/Markdown/SQL never had a server; `.tsx`/`.js`/`.jsx` aren't a
     /// second, redundant TypeScript row). Carries the real detection binary independently of
-    /// [`Self::lsp`] - Vue/Go are real, `$PATH`-detectable binaries this phase deliberately
-    /// doesn't spawn a live client for (see this module's top-level docs), so the Settings page
-    /// still needs a binary name for them even where [`Self::lsp`] is `None`.
+    /// [`Self::lsp`] - Go is a real, `$PATH`-detectable binary this app deliberately doesn't spawn
+    /// a live client for (see this module's top-level docs), so the Settings page still needs a
+    /// binary name for it even though its [`Self::lsp`] is `None`. This row also names only the
+    /// *primary* binary: Vue genuinely runs a second, companion process too (see
+    /// [`CompanionServer`]), which the page deliberately doesn't show a separate row for - it is
+    /// an implementation detail of Vue support, not a language the user picks.
     pub settings_row: Option<SettingsLspRow>,
     /// Which real `crate::code_view` highlighter function parses this extension's real syntax -
     /// `None` for an extension with no `tree-sitter` grammar wired at all (TOML/Markdown/SQL, and
-    /// Vue - highlighting is unrelated to and independent of [`Self::lsp`]'s LSP scope-down, see
-    /// this module's top-level docs). Previously `crate::code_view::load_file` maintained its own
+    /// Vue - there is no `.vue` grammar dependency in this workspace, which is entirely unrelated
+    /// to and independent of whether [`Self::lsp`] spawns a real server for it, and it does). Previously `crate::code_view::load_file` maintained its own
     /// second, independent extension -> highlighter `match` that this same registry knew nothing
     /// about - a real, live gap where a new registered language could silently render as plain
     /// text with no compile error or test failure to catch it. This field, plus
@@ -139,6 +233,126 @@ pub struct SettingsLspRow {
 
 fn no_initialization_options() -> Option<serde_json::Value> {
     None
+}
+
+/// The shared [`LspIdentity::dynamic_args`] for every server whose real command line is fully
+/// static - an unconditional `Ok(vec![])`, so its real spawn `args` are exactly
+/// [`LspIdentity::args`] and nothing else. Mirrors [`no_initialization_options`]'s own shape.
+fn no_dynamic_args(_repo_root: &Path) -> Result<Vec<String>, String> {
+    Ok(Vec::new())
+}
+
+/// Vue's real, required `--tsdk` argument: the directory holding a **classic-layout** TypeScript's
+/// own `lib/typescript.js`. Resolved from the real project being opened, existence-checked, with
+/// an honest `Err` (and so a refused spawn, surfaced as a real `LspClientState::Failed` message)
+/// when there genuinely isn't one - never a fabricated path, and never a spawn this app already
+/// knows will crash.
+///
+/// Project-local (`<repo_root>/node_modules/typescript/lib`) is the correct real signal, not a
+/// global npm root: `--tsdk` is what supplies the type information for *this* project's own code,
+/// so this project's own installed TypeScript is exactly what it should point at.
+///
+/// The existence check is on `lib/typescript.js` **specifically**, not on the directory: that
+/// file's presence is the real, verifiable distinction between a classic-layout TypeScript (5.x,
+/// which works) and the newer restructured layout (7.x, which has no `.server.protocol` on its
+/// base module and reproduces the exact crash this flag exists to avoid). A directory-only check
+/// would happily pass for the version that crashes.
+fn vue_dynamic_args(repo_root: &Path) -> Result<Vec<String>, String> {
+    let tsdk = repo_root
+        .join("node_modules")
+        .join("typescript")
+        .join("lib");
+    if !tsdk.join("typescript.js").is_file() {
+        return Err(format!(
+            "Vue support needs a project-local `typescript` (run `npm install typescript`) \
+             providing node_modules/typescript/lib/typescript.js; none found under {}",
+            repo_root.display()
+        ));
+    }
+    // `.to_str()`, not `.to_string_lossy()` - the same discipline
+    // [`pyright_initialization_options`] already follows: a real non-UTF-8 path handed over
+    // lossily would point the server at a directory that doesn't exist, which is worse than an
+    // honest refusal.
+    let tsdk = tsdk.to_str().ok_or_else(|| {
+        format!(
+            "the project-local TypeScript path under {} is not valid UTF-8, so it cannot be \
+             passed as `--tsdk`",
+            repo_root.display()
+        )
+    })?;
+    Ok(vec![format!("--tsdk={tsdk}")])
+}
+
+/// The real `@vue/typescript-plugin` directory, resolved from the actually-installed
+/// `vue-language-server` binary rather than guessed - `@vue/typescript-plugin` is a real
+/// `dependencies` entry in `@vue/language-server`'s own `package.json`, so npm always installs it
+/// as a nested `node_modules/@vue/typescript-plugin` under that package's root. That makes this a
+/// deterministic filesystem walk, not a heuristic:
+///
+/// 1. `$PATH`-resolve `vue-language-server` (the same [`pty_core::resolve_on_path`] helper
+///    [`pyright_initialization_options`] already uses).
+/// 2. `canonicalize` it, following through any shim/symlink (e.g. mise's) onto the real script.
+/// 3. The package root is two directories up (`<root>/bin/vue-language-server.js`).
+///
+/// Returns the **package root**, which is what the companion's plugin `location` field wants:
+/// `typescript-language-server` forwards that value to `tsserver` as a `--pluginProbeLocations`
+/// entry, and tsserver resolves the plugin by Node module resolution *from* that directory - so it
+/// must be a directory containing `node_modules/@vue/typescript-plugin`, not the plugin's own
+/// directory. Verified live against both real processes.
+fn vue_typescript_plugin_location() -> Result<String, String> {
+    let binary = pty_core::resolve_on_path("vue-language-server").ok_or_else(|| {
+        "Vue's TypeScript companion needs `vue-language-server` on PATH to locate its own \
+         bundled `@vue/typescript-plugin`; none found"
+            .to_string()
+    })?;
+    let script = std::fs::canonicalize(&binary).map_err(|err| {
+        format!(
+            "could not resolve the real `vue-language-server` script behind {}: {err}",
+            binary.display()
+        )
+    })?;
+    let package_root = script
+        .parent()
+        .and_then(|bin_dir| bin_dir.parent())
+        .ok_or_else(|| {
+            format!(
+                "the real `vue-language-server` script at {} is not inside a `<package>/bin/` \
+                 directory, so its package root cannot be resolved",
+                script.display()
+            )
+        })?;
+    let plugin_dir = package_root
+        .join("node_modules")
+        .join("@vue")
+        .join("typescript-plugin");
+    if !plugin_dir.is_dir() {
+        return Err(format!(
+            "Vue's TypeScript companion needs a real `@vue/typescript-plugin`; none found at {}",
+            plugin_dir.display()
+        ));
+    }
+    package_root.to_str().map(str::to_string).ok_or_else(|| {
+        format!(
+            "the `@vue/language-server` package root at {} is not valid UTF-8, so it cannot \
+                 be passed as a plugin location",
+            package_root.display()
+        )
+    })
+}
+
+/// The companion's real `initializationOptions`: `typescript-language-server`'s own documented
+/// `plugins` mechanism, loading the real `@vue/typescript-plugin` and registering it for the
+/// `"vue"` language. This is what makes the companion able to answer both the relayed
+/// `tsserver/request` queries *and* real, independent diagnostics/hover for `.vue` files.
+fn vue_companion_initialization_options() -> Result<Option<serde_json::Value>, String> {
+    let location = vue_typescript_plugin_location()?;
+    Ok(Some(serde_json::json!({
+        "plugins": [{
+            "name": "@vue/typescript-plugin",
+            "location": location,
+            "languages": ["vue"],
+        }],
+    })))
 }
 
 /// Pyright expects a real, non-empty `initializationOptions` block up front (unlike
@@ -221,6 +435,8 @@ const TYPESCRIPT_LSP: LspIdentity = LspIdentity {
     // TypeScript integration test for confirmation this isn't just an assumption.
     initialization_options: no_initialization_options,
     workspace_configuration: lsp_core::default_workspace_configuration,
+    dynamic_args: no_dynamic_args,
+    companion: None,
 };
 
 const PYRIGHT_LSP: LspIdentity = LspIdentity {
@@ -228,6 +444,8 @@ const PYRIGHT_LSP: LspIdentity = LspIdentity {
     args: &["--stdio"],
     initialization_options: pyright_initialization_options,
     workspace_configuration: pyright_workspace_configuration,
+    dynamic_args: no_dynamic_args,
+    companion: None,
 };
 
 const RUST_ANALYZER_LSP: LspIdentity = LspIdentity {
@@ -235,6 +453,60 @@ const RUST_ANALYZER_LSP: LspIdentity = LspIdentity {
     args: &[],
     initialization_options: no_initialization_options,
     workspace_configuration: lsp_core::default_workspace_configuration,
+    dynamic_args: no_dynamic_args,
+    companion: None,
+};
+
+/// Vue's real companion: the *same* `typescript-language-server` binary this registry already
+/// spawns for `.ts`/`.tsx`/`.js`/`.jsx`, but under its own distinct [`CompanionServer::client_key`]
+/// and carrying the real `@vue/typescript-plugin` - see [`CompanionServer`]'s own field docs, and
+/// this module's top-level docs for why a plain LSP server (rather than a bespoke raw-`tsserver`
+/// connection) is the correct, reachable integration point for a generic LSP client like this app.
+const VUE_TYPESCRIPT_COMPANION: CompanionServer = CompanionServer {
+    client_key: "typescript-language-server (vue)",
+    binary: "typescript-language-server",
+    args: &["--stdio"],
+    language_id: "vue",
+    initialization_options: vue_companion_initialization_options,
+    relay_request_method: "tsserver/request",
+    relay_response_method: "tsserver/response",
+    relay_command: "typescript.tsserverRequest",
+    fallback_methods: VUE_FALLBACK_METHODS,
+};
+
+/// The three real requests a hybrid-mode `vue-language-server` genuinely does not answer for the
+/// TypeScript inside a `.vue` file - measured by hand against the real installed pair, on a real
+/// `.vue` fixture with a `<script setup lang="ts">` block, one method at a time:
+///
+/// | request                     | `vue-language-server` | `typescript-language-server` + plugin |
+/// |-----------------------------|-----------------------|---------------------------------------|
+/// | `textDocument/hover`        | `null`                | ``const bad: number``                 |
+/// | `textDocument/definition`   | `[]`                  | one real `Location`                   |
+/// | `textDocument/completion`   | `items: []`           | `["alpha", "beta"]`                   |
+///
+/// Note the three different *shapes* of "nothing here" in that middle column - only hover's is a
+/// wire `null`. That's why `crate::root::lsp::lsp_result_is_empty`, not a plain null check, is
+/// what decides when to actually replay one of these against the companion.
+///
+/// Deliberately not "every method": a request the primary answers correctly must keep going to the
+/// primary alone, so the companion can never quietly substitute a different answer for a real one
+/// (`crate::root::lsp::lsp_connection_facade_tests::a_request_outside_the_fallback_list_never_consults_the_companion`).
+const VUE_FALLBACK_METHODS: &[&str] = &[
+    HoverRequest::METHOD,
+    GotoDefinition::METHOD,
+    Completion::METHOD,
+];
+
+const VUE_LSP: LspIdentity = LspIdentity {
+    binary: "vue-language-server",
+    args: &["--stdio"],
+    // No `initializationOptions` needed: the one real setting this server requires (`tsdk`) is
+    // supplied on the command line by [`vue_dynamic_args`] instead, which is where the real,
+    // repo-root-dependent resolution lives.
+    initialization_options: no_initialization_options,
+    workspace_configuration: lsp_core::default_workspace_configuration,
+    dynamic_args: vue_dynamic_args,
+    companion: Some(VUE_TYPESCRIPT_COMPANION),
 };
 
 /// The one real table every extension-keyed lookup in this crate now reads from - see this
@@ -338,15 +610,16 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
         lsp_language_id: "vue",
         chip_label: "vue",
         chip_colors: theme::lang::VUE,
-        // Deliberately `None` - see this module's top-level docs for the real, evidence-backed
-        // reason (a reproducible upstream crash, not an oversight).
-        lsp: None,
+        // Real, and genuinely two coordinated processes - see this module's top-level docs and
+        // [`CompanionServer`]. Deferred through Revision R8 for a real, reproduced reason; now
+        // built rather than still deferred.
+        lsp: Some(VUE_LSP),
         settings_row: Some(SettingsLspRow {
             binary: "vue-language-server",
-            // Honest, not the old "starts when a .vue file opens" claim - this phase's client
-            // isn't wired for `.vue` at all (see this module's top-level docs for the real,
-            // reproduced crash that's why), so the note must not promise it does.
-            note: "detected on PATH; live analysis not wired this phase (see docs)",
+            // Honest about the real shape of what starts: a `.vue` file genuinely brings up two
+            // real processes, not one, and the second one carries the TypeScript half of the
+            // analysis (see this module's top-level docs for the live-verified split).
+            note: "starts when a .vue file opens, with a TypeScript companion",
             install_url: "https://github.com/vuejs/language-tools",
         }),
         // No `.vue` `tree-sitter` grammar dependency exists in this workspace - unrelated to,
@@ -426,7 +699,7 @@ pub fn chip_for_extension(extension: Option<&str>) -> (&'static str, Rgba, Rgba)
 
 /// The real `textDocument/didOpen` `language_id` for `extension`, if this crate would spawn an
 /// LSP client for it at all (`None` for an extension with no [`ExtensionEntry::lsp`], e.g.
-/// `.vue`/`.go`, or one absent from [`EXTENSIONS`] entirely) - the replacement for the old
+/// `.go`, or one absent from [`EXTENSIONS`] entirely) - the replacement for the old
 /// `is_rust` boolean gate in `crate::root::code_surface`: "is there an `lsp_language_id` for this
 /// extension" now answers "should this app try to talk to a language server for this file" for
 /// every supported language, not just Rust.
@@ -443,19 +716,84 @@ pub fn lsp_binary_for_extension(extension: Option<&str>) -> Option<&'static str>
     entry_for_extension(extension).and_then(|entry| entry.lsp.map(|lsp| lsp.binary))
 }
 
-/// Builds a real, owned [`ServerSpawnConfig`] for `extension`, if this crate spawns a server for
-/// it - `None` for an extension with no [`ExtensionEntry::lsp`] entry. Calls
-/// [`LspIdentity::initialization_options`] fresh each time (see that field's own docs on why
-/// that's cheap and correctly *not* memoized: it can depend on real, possibly-changed PATH state
-/// at the moment of a real spawn).
-pub fn server_spawn_config(extension: Option<&str>) -> Option<ServerSpawnConfig> {
-    let lsp = entry_for_extension(extension)?.lsp?;
-    Some(ServerSpawnConfig {
+/// Builds a real, owned [`ServerSpawnConfig`] for `extension` under the real repository at
+/// `repo_root`. Calls [`LspIdentity::initialization_options`]/[`LspIdentity::dynamic_args`] fresh
+/// each time (see those fields' own docs on why that's correctly *not* memoized: both can depend
+/// on real, possibly-changed PATH/filesystem state at the moment of a real spawn).
+///
+/// The three-way return distinguishes two genuinely different "no server" answers that used to be
+/// collapsed into one:
+///
+/// - `Ok(None)` - a **static** fact: this extension has no [`ExtensionEntry::lsp`] entry at all
+///   (TOML, Go, anything unrecognized). Nothing failed; there is simply nothing to spawn.
+/// - `Err(reason)` - a **dynamic** failure: there is a real LSP entry, but a real, checked
+///   prerequisite for it is missing (see [`vue_dynamic_args`]). The caller surfaces `reason`
+///   honestly rather than spawning a process already known not to work.
+/// - `Ok(Some(config))` - a real, spawnable configuration.
+pub fn server_spawn_config(
+    repo_root: &Path,
+    extension: Option<&str>,
+) -> Result<Option<ServerSpawnConfig>, String> {
+    let Some(lsp) = entry_for_extension(extension).and_then(|entry| entry.lsp) else {
+        return Ok(None);
+    };
+    let mut args: Vec<String> = lsp.args.iter().map(|arg| arg.to_string()).collect();
+    args.extend((lsp.dynamic_args)(repo_root)?);
+    Ok(Some(ServerSpawnConfig {
         name: lsp.binary,
         binary: lsp.binary,
-        args: lsp.args.iter().map(|arg| arg.to_string()).collect(),
+        args,
         initialization_options: (lsp.initialization_options)(),
         workspace_configuration: lsp.workspace_configuration,
+        // A primary with a companion is the only kind of server this app has a real handler for a
+        // custom notification from, and the only method it handles is that companion's own
+        // declared relay request - so that is exactly, and only, what it subscribes to. Every
+        // other server subscribes to nothing and pays nothing (see
+        // [`lsp_core::ServerSpawnConfig::custom_notification_methods`]).
+        custom_notification_methods: lsp
+            .companion
+            .map(|companion| vec![companion.relay_request_method])
+            .unwrap_or_default(),
+    }))
+}
+
+/// The [`CompanionServer`] this extension's primary needs alongside it, if any - `None` for every
+/// single-process language, and for an extension with no LSP entry at all. Mirrors
+/// [`lsp_binary_for_extension`]'s shape: a cheap, static registry lookup safe to call on the
+/// render path.
+pub fn companion_for_extension(extension: Option<&str>) -> Option<CompanionServer> {
+    entry_for_extension(extension).and_then(|entry| entry.lsp.and_then(|lsp| lsp.companion))
+}
+
+/// The [`CompanionServer`] belonging to whichever registry entry spawns `binary` as its *primary*
+/// server - the real, honest way for `crate::root::lsp`'s poll loop to ask "is this specific
+/// client the kind that can send a relay notification, and if so where do its relays go?" without
+/// naming any particular server, and without blanket-handling a method for every client.
+pub fn companion_for_primary_binary(binary: &str) -> Option<CompanionServer> {
+    EXTENSIONS
+        .iter()
+        .filter_map(|entry| entry.lsp)
+        .find(|lsp| lsp.binary == binary)
+        .and_then(|lsp| lsp.companion)
+}
+
+/// Builds a real, owned [`ServerSpawnConfig`] for `companion`. `Err(reason)` when its own real,
+/// checked prerequisite is genuinely missing (see [`CompanionServer::initialization_options`]) -
+/// which the caller surfaces as that companion's own `Failed` state without preventing the primary
+/// from still starting, since a primary alone is a real, if reduced, working experience.
+pub fn companion_spawn_config(companion: &CompanionServer) -> Result<ServerSpawnConfig, String> {
+    Ok(ServerSpawnConfig {
+        // The distinct `client_key`, not the plain `binary` name - so every log line, error
+        // message and status string this companion produces says which of the two
+        // `typescript-language-server` processes a repo root might have running it actually is.
+        name: companion.client_key,
+        binary: companion.binary,
+        args: companion.args.iter().map(|arg| arg.to_string()).collect(),
+        initialization_options: (companion.initialization_options)()?,
+        workspace_configuration: lsp_core::default_workspace_configuration,
+        // A companion never sends a relay request of its own - it only ever answers one - so it
+        // has no custom notification for this app to handle.
+        custom_notification_methods: Vec::new(),
     })
 }
 
@@ -558,30 +896,247 @@ mod tests {
         );
     }
 
+    /// A scratch repo root with a real, project-local classic-layout TypeScript's own
+    /// `lib/typescript.js` present - the exact real file [`vue_dynamic_args`] existence-checks.
+    /// A genuine `npm install typescript` would produce a ~9 MB one; this writes a tiny stand-in
+    /// because what's under test here is only this crate's own resolution/refusal logic, which
+    /// looks at nothing but the path. The real, live end-to-end Vue test in `crate::root::lsp`
+    /// uses a genuine `npm install typescript` instead, since *that* one hands the path to a real
+    /// server that really does load it.
+    fn scratch_root_with_local_typescript() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let lib = dir
+            .path()
+            .join("node_modules")
+            .join("typescript")
+            .join("lib");
+        std::fs::create_dir_all(&lib).expect("mkdir node_modules/typescript/lib");
+        std::fs::write(lib.join("typescript.js"), "// stand-in\n").expect("write typescript.js");
+        dir
+    }
+
     #[test]
-    fn vue_and_go_are_detected_but_never_spawn_a_real_client() {
-        assert!(lsp_language_id_for_extension(Some("vue")).is_none());
-        assert!(lsp_binary_for_extension(Some("vue")).is_none());
-        assert!(server_spawn_config(Some("vue")).is_none());
+    fn go_is_detected_but_never_spawns_a_real_client() {
+        let root = tempfile::TempDir::new().expect("tempdir");
         assert!(lsp_language_id_for_extension(Some("go")).is_none());
-        // The chip still resolves for real regardless (this phase's stated minimum bar).
-        assert_eq!(chip_for_extension(Some("vue")).0, "vue");
+        assert!(lsp_binary_for_extension(Some("go")).is_none());
+        assert!(
+            matches!(server_spawn_config(root.path(), Some("go")), Ok(None)),
+            "an extension with no LSP entry at all is a static `Ok(None)`, not a failure"
+        );
         assert_eq!(chip_for_extension(Some("go")).0, "go");
     }
 
     #[test]
     fn rust_typescript_and_python_all_produce_a_real_spawn_config() {
+        let root = tempfile::TempDir::new().expect("tempdir");
         for ext in ["rs", "ts", "py"] {
-            let config = server_spawn_config(Some(ext))
+            let config = server_spawn_config(root.path(), Some(ext))
+                .unwrap_or_else(|err| panic!("{ext} should not fail a prerequisite check: {err}"))
                 .unwrap_or_else(|| panic!("{ext} should have a real spawn config"));
             assert!(!config.binary.is_empty());
             assert_eq!(config.name, config.binary);
         }
     }
 
+    /// The real regression guard for this revision's generalization: the three already-working
+    /// languages' actual spawn command lines must be **byte-for-byte** what they were before
+    /// [`LspIdentity::dynamic_args`]/[`LspIdentity::companion`] existed. Pins the exact real
+    /// `args` lists (not just "unchanged in spirit"), and proves both new fields are genuinely
+    /// inert for them - `dynamic_args` an unconditional empty vec, `companion` a `None` - so no
+    /// second process can ever appear for a `.rs`/`.ts`/`.py` file.
+    #[test]
+    fn the_three_pre_existing_languages_spawn_exactly_what_they_did_before() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let expected: [(&str, &str, &[&str]); 3] = [
+            ("rs", "rust-analyzer", &[]),
+            ("ts", "typescript-language-server", &["--stdio"]),
+            ("py", "pyright-langserver", &["--stdio"]),
+        ];
+        for (ext, binary, args) in expected {
+            let entry = entry_for_extension(Some(ext)).expect("a real registry entry");
+            let lsp = entry.lsp.expect("a real lsp identity");
+            assert_eq!(
+                (lsp.dynamic_args)(root.path()),
+                Ok(Vec::new()),
+                "{ext}'s dynamic_args must be a genuine no-op, adding nothing to its real \
+                 command line"
+            );
+            assert!(
+                lsp.companion.is_none(),
+                "{ext} is a real single-process language and must never gain a companion"
+            );
+            assert!(
+                companion_for_extension(Some(ext)).is_none(),
+                "{ext} must resolve to no companion through the public lookup too"
+            );
+
+            let config = server_spawn_config(root.path(), Some(ext))
+                .expect("no prerequisite check applies")
+                .expect("a real spawn config");
+            assert_eq!(config.binary, binary);
+            assert_eq!(config.name, binary);
+            assert_eq!(
+                config.args,
+                args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
+                "{ext}'s real spawn args must be exactly what they were before dynamic_args \
+                 existed"
+            );
+        }
+    }
+
+    /// Vue's real `--tsdk` resolution, against a real repo root that genuinely has a
+    /// project-local `node_modules/typescript/lib/typescript.js`.
+    #[test]
+    fn vue_appends_a_real_tsdk_argument_pointing_at_the_projects_own_typescript() {
+        let root = scratch_root_with_local_typescript();
+        let config = server_spawn_config(root.path(), Some("vue"))
+            .expect("a real project-local typescript is present, so this must not fail")
+            .expect("vue has a real lsp entry");
+        assert_eq!(config.binary, "vue-language-server");
+        let expected_tsdk = root
+            .path()
+            .join("node_modules")
+            .join("typescript")
+            .join("lib");
+        assert_eq!(
+            config.args,
+            vec![
+                "--stdio".to_string(),
+                format!("--tsdk={}", expected_tsdk.display()),
+            ],
+            "the static args come first, then the real, dynamically-resolved --tsdk"
+        );
+    }
+
+    /// The honest-failure half: with no real project-local TypeScript there is genuinely nothing
+    /// valid to point `--tsdk` at, so this must be a real `Err` naming the actual missing
+    /// prerequisite - never a fabricated path, and never a silent `Ok` that would spawn a process
+    /// already known to crash.
+    #[test]
+    fn vue_refuses_to_spawn_when_the_project_has_no_local_typescript() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let error = server_spawn_config(root.path(), Some("vue"))
+            .expect_err("no project-local typescript means a real, refused spawn");
+        assert!(
+            error.contains("npm install typescript"),
+            "the message should name the real, actionable prerequisite, got: {error}"
+        );
+        assert!(
+            error.contains(&root.path().display().to_string()),
+            "the message should name the real root it actually looked under, got: {error}"
+        );
+    }
+
+    /// A `node_modules/typescript/lib` directory that exists but has no real `typescript.js` in it
+    /// (the shape a restructured TypeScript 7.x install has) must still be refused - the
+    /// existence check is on that specific file precisely because the directory alone doesn't
+    /// distinguish the layout that works from the one that reproduces the crash.
+    #[test]
+    fn vue_refuses_a_typescript_lib_directory_with_no_real_typescript_js_in_it() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(
+            root.path()
+                .join("node_modules")
+                .join("typescript")
+                .join("lib"),
+        )
+        .expect("mkdir");
+        assert!(
+            server_spawn_config(root.path(), Some("vue")).is_err(),
+            "a directory with no real lib/typescript.js is not a usable --tsdk target"
+        );
+    }
+
+    /// Vue's real companion identity - pinned exactly, since every one of these values is a real
+    /// wire-level requirement verified against both live processes, not a naming preference.
+    #[test]
+    fn vue_carries_a_real_distinctly_keyed_typescript_companion() {
+        let companion = companion_for_extension(Some("vue")).expect("vue has a real companion");
+        assert_eq!(companion.binary, "typescript-language-server");
+        assert_eq!(companion.args, &["--stdio"]);
+        assert_eq!(companion.language_id, "vue");
+        assert_eq!(companion.relay_request_method, "tsserver/request");
+        assert_eq!(companion.relay_response_method, "tsserver/response");
+        assert_eq!(companion.relay_command, "typescript.tsserverRequest");
+        assert_eq!(
+            companion.fallback_methods,
+            &[
+                "textDocument/hover",
+                "textDocument/definition",
+                "textDocument/completion"
+            ],
+            "all three of these were measured, by hand, to come back genuinely empty from the \
+             real primary inside a .vue <script setup lang=\"ts\"> block while the real companion \
+             answers each of them - see VUE_FALLBACK_METHODS' own table"
+        );
+        assert_ne!(
+            companion.client_key, companion.binary,
+            "the companion's client key must differ from the plain binary name, so a \
+             Vue-flavored typescript-language-server (which carries an extra real plugin) can \
+             never be silently reused as - or collide with - the plain one a .ts file spawns"
+        );
+        assert_eq!(
+            companion_for_primary_binary("vue-language-server").map(|c| c.client_key),
+            Some(companion.client_key),
+            "the binary-keyed lookup the forwarding dispatch uses must find the same companion"
+        );
+        for binary in [
+            "rust-analyzer",
+            "typescript-language-server",
+            "pyright-langserver",
+        ] {
+            assert!(
+                companion_for_primary_binary(binary).is_none(),
+                "{binary} is a real single-process primary and must not resolve a companion"
+            );
+        }
+    }
+
+    /// The companion's own real prerequisite resolution, run against the actually-installed
+    /// toolchain. Both outcomes are honest and neither is a test failure: if a real
+    /// `vue-language-server` (with its real nested `@vue/typescript-plugin`) is installed, this
+    /// must produce a real plugin entry pointing at a directory that genuinely exists on disk; if
+    /// it isn't installed, this must be a real `Err` explaining which piece is missing rather
+    /// than a fabricated success.
+    #[test]
+    fn the_vue_companions_plugin_resolution_is_real_either_way() {
+        match vue_companion_initialization_options() {
+            Ok(options) => {
+                let options =
+                    options.expect("the companion always needs real initializationOptions");
+                let plugin = &options["plugins"][0];
+                assert_eq!(plugin["name"], "@vue/typescript-plugin");
+                assert_eq!(plugin["languages"], serde_json::json!(["vue"]));
+                let location = plugin["location"]
+                    .as_str()
+                    .expect("a real, resolved location path");
+                let plugin_dir = Path::new(location)
+                    .join("node_modules")
+                    .join("@vue")
+                    .join("typescript-plugin");
+                assert!(
+                    plugin_dir.is_dir(),
+                    "the resolved location must be a real probe directory that genuinely \
+                     contains the plugin, since tsserver resolves it by Node module resolution \
+                     from there - got {location}"
+                );
+            }
+            Err(error) => {
+                assert!(
+                    error.contains("vue-language-server") || error.contains("typescript-plugin"),
+                    "an honest failure should name the real missing piece, got: {error}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn pyright_gets_real_non_null_initialization_options() {
-        let config = server_spawn_config(Some("py")).expect("python spawn config");
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let config = server_spawn_config(root.path(), Some("py"))
+            .expect("python has no dynamic prerequisite")
+            .expect("python spawn config");
         let options = config
             .initialization_options
             .expect("Pyright should get real, non-None initializationOptions");
@@ -637,8 +1192,9 @@ mod tests {
     }
 
     /// The other half of the same guard: extensions with no real `tree-sitter` grammar dependency
-    /// in this workspace (TOML/Markdown/SQL never had one; Vue/Go's lack of one is independent of
-    /// their separate LSP scope-down) must not carry a stray, fabricated `highlighter`.
+    /// in this workspace (TOML/Markdown/SQL never had one; Vue's and Go's lack of one is
+    /// independent of whether either spawns a real server) must not carry a stray, fabricated
+    /// `highlighter`.
     #[test]
     fn extensions_with_no_real_grammar_have_no_highlighter_wired() {
         for ext in ["toml", "md", "sql", "vue", "go"] {

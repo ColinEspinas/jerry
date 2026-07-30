@@ -97,11 +97,17 @@ impl AdeApp {
             .collect()
     }
 
-    /// Builds the "by project" worktree list: every worktree `wt_core::list_worktrees`
-    /// reported, including ones that failed to read - `crate::worktrees::WorktreeItem`'s docs
-    /// say a per-entry error is kept in the list rather than filtered out, and
-    /// `Self::render_worktree_note_row` renders an errored entry as a visible,
-    /// non-interactive row.
+    /// Builds one [`WorktreeRow`] per worktree, folding in every currently open session
+    /// (`crate::rail::build_worktree_rows`) - the single real per-render source both rail modes
+    /// now build their list from (see [`Self::render_rail_list`]).
+    pub(super) fn build_worktree_rows(&self, cx: &App) -> Vec<WorktreeRow> {
+        rail::build_worktree_rows(&self.build_worktree_entries(), &self.build_session_rows(cx))
+    }
+
+    /// Builds the worktree list: every worktree `wt_core::list_worktrees` reported, including
+    /// ones that failed to read - `crate::worktrees::WorktreeItem`'s docs say a per-entry error
+    /// is kept in the list rather than filtered out, and `Self::render_worktree_row` renders an
+    /// errored entry as a visible, non-interactive row.
     ///
     /// Readable entries get their clean/merged note from [`Self::worktree_notes`] (refreshed
     /// by the same periodic task as [`Self::diff_cache`]), defaulting to "unknown yet"
@@ -502,42 +508,18 @@ impl AdeApp {
             )
     }
 
-    /// Dispatches to the real urgency- or project-grouped list, per [`Self::rail_mode`].
-    /// Builds [`SessionRow`]s fresh from live state every render (cheap: no I/O, just field
-    /// reads plus the cached [`Self::diff_cache`]/[`Self::worktree_notes`] snapshots) - see
-    /// [`Self::build_session_rows`]'s docs.
+    /// Dispatches to the real urgency- or project-grouped worktree list, per [`Self::rail_mode`].
+    /// Builds [`rail::WorktreeRow`]s fresh from live state every render (cheap: no I/O, just
+    /// field reads plus the cached [`Self::diff_cache`]/[`Self::worktree_notes`] snapshots) -
+    /// see [`Self::build_worktree_rows`]'s docs. One row per worktree either way now - see the
+    /// module docs on `crate::root::mod`'s "One rail row per worktree" section for why this
+    /// replaced the old per-*session* row model.
     pub(super) fn render_rail_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let rows = self.build_session_rows(cx);
+        let rows = self.build_worktree_rows(cx);
         match self.rail_mode {
-            RailMode::Urgency => self.render_urgency_list(&rows, cx),
-            RailMode::Project => self.render_project_list(&rows, cx),
+            RailMode::Urgency => self.render_urgency_worktree_list(&rows, cx),
+            RailMode::Project => self.render_project_worktree_list(&rows, cx),
         }
-    }
-
-    pub(super) fn render_urgency_list(
-        &self,
-        rows: &[SessionRow],
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let filtered: Vec<SessionRow> = rail::filter_sessions(rows, &self.filter_query)
-            .into_iter()
-            .cloned()
-            .collect();
-        let groups = rail::group_by_urgency(&filtered);
-
-        if groups.is_empty() {
-            return self.render_rail_empty_message(if rows.is_empty() {
-                "no sessions open"
-            } else {
-                "no sessions match this filter"
-            });
-        }
-
-        let mut list = div().id("rail-urgency-groups").flex().flex_col();
-        for group in &groups {
-            list = list.child(self.render_status_group(group, cx));
-        }
-        list.into_any_element()
     }
 
     pub(super) fn render_rail_empty_message(&self, message: &'static str) -> gpui::AnyElement {
@@ -555,11 +537,42 @@ impl AdeApp {
             .into_any_element()
     }
 
-    /// One urgency group: the 5×5 status-colour square + uppercase label + count header
-    /// row, then every session row in that status.
-    pub(super) fn render_status_group(
+    /// "By urgency" mode: every worktree row grouped by its own [`rail::WorktreeRow::
+    /// aggregate_status`] (the most urgent of its open sessions', or `Idle` if it has none) -
+    /// see [`rail::group_worktrees_by_urgency`]'s own docs for why this is the sensible
+    /// adaptation of the old per-session urgency sort now that a row represents a whole
+    /// worktree's tabs.
+    pub(super) fn render_urgency_worktree_list(
         &self,
-        group: &StatusGroup,
+        rows: &[WorktreeRow],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let filtered: Vec<WorktreeRow> = rail::filter_worktree_rows(rows, &self.filter_query)
+            .into_iter()
+            .cloned()
+            .collect();
+        let groups = rail::group_worktrees_by_urgency(&filtered);
+
+        if groups.is_empty() {
+            return self.render_rail_empty_message(if rows.is_empty() {
+                "no worktrees found"
+            } else {
+                "no worktrees match this filter"
+            });
+        }
+
+        let mut list = div().id("rail-urgency-groups").flex().flex_col();
+        for group in &groups {
+            list = list.child(self.render_urgency_worktree_group(group, cx));
+        }
+        list.into_any_element()
+    }
+
+    /// One urgency group: the 5×5 status-colour square + uppercase label + count header
+    /// row, then every worktree row aggregating to that status.
+    pub(super) fn render_urgency_worktree_group(
+        &self,
+        group: &rail::UrgencyWorktreeGroup,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
@@ -594,26 +607,23 @@ impl AdeApp {
                 group
                     .rows
                     .iter()
-                    .map(|row| self.render_session_row(row, 0, cx)),
+                    .enumerate()
+                    .map(|(index, row)| self.render_worktree_row(row, index, cx)),
             )
     }
 
     /// "By project" mode: a single project header (this app manages exactly one repository -
     /// see the module docs on why multi-project support is out of scope) followed by every
-    /// worktree as a child row, indented, each either a real session row or a real
-    /// session-less worktree row - see [`rail::build_project_children`]'s docs for why every
-    /// worktree appears here, not just ones with an open session.
-    pub(super) fn render_project_list(
+    /// worktree as an indented child row.
+    pub(super) fn render_project_worktree_list(
         &self,
-        rows: &[SessionRow],
+        rows: &[WorktreeRow],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let worktrees = self.build_worktree_entries();
-        let children = rail::build_project_children(&worktrees, rows);
-        let filtered = rail::filter_project_children(&children, &self.filter_query);
+        let filtered = rail::filter_worktree_rows(rows, &self.filter_query);
 
         if filtered.is_empty() {
-            return self.render_rail_empty_message(if children.is_empty() {
+            return self.render_rail_empty_message(if rows.is_empty() {
                 "no worktrees found"
             } else {
                 "no worktrees match this filter"
@@ -630,8 +640,12 @@ impl AdeApp {
             .iter()
             .find(|item| item.is_main)
             .and_then(|item| item.branch.clone());
-        let dots = rail::status_dot_cluster(&children);
-        let worktree_count = worktrees.len();
+        // Aggregate status summary across every worktree row, sorted most-urgent-first -
+        // the same real per-session urgency ranking `rail::WorktreeRow::aggregate_status`
+        // itself uses, just one dot per worktree rather than per session.
+        let mut dots: Vec<Status> = rows.iter().map(|row| row.aggregate_status()).collect();
+        dots.sort_by_key(|status| status.urgency_rank());
+        let worktree_count = rows.len();
 
         let mut list = div().id("rail-project").flex().flex_col();
         list = list.child(
@@ -660,9 +674,8 @@ impl AdeApp {
                 })
                 .child(div().flex_1())
                 .child(
-                    // Aggregate status summary (`rail::status_dot_cluster`): 5×5 dots, same
-                    // size as `Self::render_status_group`'s header marker - deliberately
-                    // larger than an individual session row's 4×4 dot.
+                    // 5×5 dots, same size as `Self::render_urgency_worktree_group`'s header
+                    // marker - deliberately larger than a worktree row's own 4×4 dot.
                     div().flex().items_center().gap(px(3.0)).children(
                         dots.into_iter()
                             .map(|status| div().w(px(5.0)).h(px(5.0)).bg(status.color())),
@@ -677,52 +690,44 @@ impl AdeApp {
                 ),
         );
 
-        for (index, child) in filtered.into_iter().enumerate() {
-            list = list.child(self.render_project_child(child, index, cx));
+        for (index, row) in filtered.into_iter().enumerate() {
+            list = list.child(
+                div()
+                    .flex()
+                    .pl(px(16.0))
+                    .border_l_1()
+                    .border_color(theme::border::ZONE)
+                    .child(self.render_worktree_row(row, index, cx)),
+            );
         }
 
         list.into_any_element()
     }
 
-    /// One indented child row under the project header, with a 1px vertical spine (README:
-    /// "indented 16 with a 1px `#1e2225` vertical spine"). `index` is only used to keep
-    /// element ids unique for the degenerate case of two error'd `WorktreeEntry`s sharing the
-    /// same (empty) path - see `Self::render_worktree_note_row`'s docs.
-    pub(super) fn render_project_child(
+    /// One rail row: a whole worktree, with every open session folded in as a tab (see
+    /// [`rail::WorktreeRow`]'s own docs) - agent badge (the first open session's kind, or a
+    /// neutral placeholder for a session-less worktree), label, aggregate status meta, then a
+    /// second line with the aggregate status dot, branch, and either a real tab count/diff stat
+    /// (a worktree with open sessions) or the real clean/prunable note (one without) - and a
+    /// question-preview card for whichever open session is the most urgently waiting, if any.
+    ///
+    /// Clicking selects this worktree (`Self::select_worktree_by_path`) - switching tabs within
+    /// it happens in the centre pane's own tab strip, not here; the rail no longer exposes
+    /// individual session rows at all now that a row represents the whole worktree.
+    ///
+    /// `index` (unique within whichever list is currently being rendered - a status group in
+    /// Urgency mode, or the flat filtered list in Project mode) disambiguates element ids for the
+    /// real degenerate case `crate::worktrees::WorktreeItem`'s docs call out: more than one
+    /// unreadable worktree entry shares the same (empty) `path`, which alone would collide.
+    pub(super) fn render_worktree_row(
         &self,
-        child: &ProjectChild,
+        row: &WorktreeRow,
         index: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let row: gpui::AnyElement = match child {
-            ProjectChild::Session(session_row) => self
-                .render_session_row(session_row, 0, cx)
-                .into_any_element(),
-            ProjectChild::Worktree(entry) => self
-                .render_worktree_note_row(entry, index, cx)
-                .into_any_element(),
-        };
+        let id = format!("worktree-row-{index}-{}", row.path.display());
 
-        div()
-            .flex()
-            .pl(px(16.0))
-            .border_l_1()
-            .border_color(theme::border::ZONE)
-            .child(row)
-    }
-
-    /// A session-less worktree row in "by project" mode - real path/branch, real
-    /// `checkout · clean` / `merged HH:MM · prunable` note (see [`rail::WorktreeNote::
-    /// label`]).
-    pub(super) fn render_worktree_note_row(
-        &self,
-        entry: &WorktreeEntry,
-        index: usize,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let id = format!("worktree-row-{index}-{}", entry.path.display());
-
-        if let Some(error) = &entry.error {
+        if let Some(error) = &row.error {
             // A real error row, per `crate::worktrees::WorktreeItem`'s documented intent:
             // visible, not silently dropped - and deliberately not clickable (an errored
             // entry has no usable, real path to select into).
@@ -739,7 +744,7 @@ impl AdeApp {
                         .font(font(theme::font::SANS))
                         .text_size(self.ui_text_size(12.0))
                         .text_color(theme::status::FAIL)
-                        .child(entry.label.clone()),
+                        .child(row.label.clone()),
                 )
                 .child(
                     div()
@@ -747,104 +752,95 @@ impl AdeApp {
                         .text_size(self.ui_text_size(10.0))
                         .text_color(theme::status::FAIL)
                         .child(error.clone()),
-                );
+                )
+                .into_any_element();
         }
 
-        let path = entry.path.clone();
-        div()
+        let is_selected = self.active_session_cwd() == row.path;
+        let status = row.aggregate_status();
+        let has_sessions = !row.sessions.is_empty();
+        let (badge_fg, badge_bg) = match row.sessions.first() {
+            Some(session) => work_surface::agent_tint(session.kind),
+            None => (theme::text::GHOST, theme::surface::CHIP_NEUTRAL),
+        };
+        let badge_glyph = match row.sessions.first() {
+            Some(session) => work_surface::agent_initial(session.kind),
+            None => "\u{2014}",
+        };
+
+        let title_color = if is_selected {
+            theme::text::SELECTED
+        } else if status == Status::Idle {
+            theme::text::DIMMER
+        } else {
+            theme::text::BODY
+        };
+
+        let meta_text = if has_sessions {
+            match status {
+                Status::Ask => "waiting".to_string(),
+                Status::Fail => "failed".to_string(),
+                Status::Review => "ready".to_string(),
+                Status::Run => "running".to_string(),
+                Status::Idle => "idle".to_string(),
+            }
+        } else {
+            String::new()
+        };
+        let meta_color = if status == Status::Ask {
+            theme::status::ASK_CARD_FG
+        } else {
+            theme::text::GHOST
+        };
+
+        let (add, del) = row.diff_totals();
+        let failed_exit_code = row
+            .sessions
+            .iter()
+            .find(|session| session.status == Status::Fail)
+            .and_then(|session| session.exit_code);
+        let stat_text = if !has_sessions {
+            row.note.label()
+        } else if status == Status::Fail {
+            failed_exit_code
+                .map(|code| format!("exit {code}"))
+                .unwrap_or_else(|| "failed".to_string())
+        } else if add > 0 || del > 0 {
+            format!("+{add} \u{2212}{del}")
+        } else {
+            let count = row.sessions.len();
+            format!("{count} tab{}", if count == 1 { "" } else { "s" })
+        };
+        let stat_color = if has_sessions && status == Status::Fail {
+            theme::button::DANGER_FG
+        } else {
+            theme::text::GHOST
+        };
+
+        let path = row.path.clone();
+        let mut container = div()
             .id(id)
             .cursor_pointer()
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
-            .px(px(10.0))
-            .py(px(6.0))
-            .hover(|el| el.bg(theme::surface::ROW_HOVER))
-            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                this.select_worktree_by_path(&path, cx);
-            }))
-            .child(
-                div()
-                    .font(font(theme::font::SANS))
-                    .text_size(self.ui_text_size(12.0))
-                    .text_color(theme::text::BODY)
-                    .child(entry.label.clone()),
-            )
-            .child(
-                div()
-                    .font(font(theme::font::MONO))
-                    .text_size(self.ui_text_size(10.0))
-                    .text_color(theme::text::GHOST)
-                    .child(entry.note.label()),
-            )
-    }
-
-    /// One session row, exactly per the README's spec: agent badge, title, meta, second line
-    /// (status dot + branch + stat), and a question-preview card for waiting sessions.
-    /// `indent` is currently always `0` (project mode already indents the whole child row via
-    /// [`Self::render_project_child`]'s spine) - kept as a parameter so a future nested
-    /// grouping doesn't need to change this method's signature.
-    pub(super) fn render_session_row(
-        &self,
-        row: &SessionRow,
-        indent: usize,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let is_selected = self.sessions.active_id() == Some(row.id);
-        let (badge_fg, badge_bg) = work_surface::agent_tint(row.kind);
-
-        let title_color = if is_selected {
-            theme::text::SELECTED
-        } else if row.status == Status::Idle {
-            theme::text::DIMMER
-        } else {
-            theme::text::BODY
-        };
-
-        let (meta_text, meta_color) = match row.status {
-            Status::Ask => ("waiting".to_string(), theme::status::ASK_CARD_FG),
-            Status::Fail => ("failed".to_string(), theme::text::GHOST),
-            Status::Review => ("ready".to_string(), theme::text::GHOST),
-            Status::Run => ("running".to_string(), theme::text::GHOST),
-            Status::Idle => ("idle".to_string(), theme::text::GHOST),
-        };
-
-        let stat_text = if row.status == Status::Fail {
-            row.exit_code
-                .map(|code| format!("exit {code}"))
-                .unwrap_or_else(|| "failed".to_string())
-        } else if row.add > 0 || row.del > 0 {
-            format!("+{} \u{2212}{}", row.add, row.del)
-        } else {
-            String::new()
-        };
-        let stat_color = if row.status == Status::Fail {
-            theme::button::DANGER_FG
-        } else {
-            theme::text::GHOST
-        };
-
-        let id = row.id;
-        let mut container = div()
-            .id(("session-row", id))
-            .cursor_pointer()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .pl(px(12.0 + indent as f32 * 16.0))
+            .pl(px(12.0))
             .pr(px(10.0))
             .pt(px(6.0))
             .pb(px(7.0))
             .border_l(px(2.0))
-            .border_color(row.status.color())
+            .border_color(if has_sessions {
+                status.color()
+            } else {
+                theme::border::ZONE
+            })
             .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED))
             .when(!is_selected, |el| {
                 el.hover(|el| el.bg(theme::surface::ROW_HOVER))
             })
             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                this.select_session(id, window, cx);
+                this.select_worktree_by_path(&path, window, cx);
             }))
             .child(
                 div()
@@ -864,7 +860,7 @@ impl AdeApp {
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_size(self.ui_text_size(9.0))
                             .text_color(badge_fg)
-                            .child(work_surface::agent_initial(row.kind)),
+                            .child(badge_glyph),
                     )
                     .child(
                         div()
@@ -874,7 +870,7 @@ impl AdeApp {
                             .font(font(theme::font::SANS))
                             .text_size(self.ui_text_size(12.0))
                             .text_color(title_color)
-                            .child(row.title.clone()),
+                            .child(row.label.clone()),
                     )
                     .child(
                         div()
@@ -892,7 +888,11 @@ impl AdeApp {
                     .pt(px(2.0))
                     // 4×4, smaller than the group-header/project-summary dots (5×5) - matches
                     // the mockup's `s.dot`/`r.dot` fixtures.
-                    .child(div().w(px(4.0)).h(px(4.0)).bg(row.status.color()))
+                    .child(div().w(px(4.0)).h(px(4.0)).bg(if has_sessions {
+                        status.color()
+                    } else {
+                        theme::border::ZONE
+                    }))
                     .child(
                         div()
                             .flex_1()
@@ -920,7 +920,15 @@ impl AdeApp {
                     ),
             );
 
-        if let Some(preview) = &row.question_preview {
+        // The most urgently-waiting open session's own question preview, if any - matches the
+        // old per-session row's card exactly, just picked from among this worktree's several
+        // possible tabs rather than always having exactly one to show.
+        let question_preview = row
+            .sessions
+            .iter()
+            .filter(|session| session.status == Status::Ask)
+            .find_map(|session| session.question_preview.as_ref());
+        if let Some(preview) = question_preview {
             container = container.child(
                 div()
                     .mt(px(4.0))
@@ -937,7 +945,7 @@ impl AdeApp {
             );
         }
 
-        container
+        container.into_any_element()
     }
 
     /// The real `Y GB` (`+` suffixed if [`Self::disk_usage`] was truncated) disk-usage label, or

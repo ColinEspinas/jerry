@@ -269,10 +269,11 @@ impl AdeApp {
     }
 
     /// `N servers · M errors` - server count is the real number of [`LspClientState::Ready`]
-    /// entries in [`Self::lsp_clients`] (per that field's own docs, eviction keeps this to at
-    /// most one - the active root's own client - which is a real, honest count for this app's
-    /// current single-warm-client architecture, not a stand-in for a richer number this app
-    /// doesn't track). The error count is only ever shown while
+    /// entries in [`Self::lsp_clients`] (per that field's own docs, eviction keeps this to the
+    /// active root's own clients only). That is genuinely more than one for a language whose
+    /// primary needs a coordinated companion process: a `.vue` file really does have two live
+    /// language servers working on it, so `2 servers` there is the honest count, not a
+    /// double-count of one. The error count is only ever shown while
     /// [`Self::status_bar_active_parsed_file`] confirms a real file's File view is genuinely on
     /// screen right now (see that method's docs for why) - otherwise just `N servers` is shown,
     /// rather than a stale count left over from a file that isn't even open anymore.
@@ -405,7 +406,7 @@ impl AdeApp {
             .text_size(self.ui_text_size(10.0))
             .text_color(theme::text::DIM)
             .hover(|el| el.text_color(theme::text::SELECTED))
-            .child(format!("{}%", self.code_zoom_percent))
+            .child(format!("{}%", self.settings.appearance.editor_zoom_percent))
             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                 this.reset_zoom(cx);
             }))
@@ -519,7 +520,7 @@ mod status_bar_zoom_click_tests {
         });
         cx.run_until_parked();
         assert_eq!(
-            app.read_with(cx, |app, _| app.code_zoom_percent),
+            app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent),
             120,
             "sanity check: two real zoom-in steps from 100% land on 120%"
         );
@@ -531,7 +532,7 @@ mod status_bar_zoom_click_tests {
         cx.run_until_parked();
 
         assert_eq!(
-            app.read_with(cx, |app, _| app.code_zoom_percent),
+            app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent),
             AdeApp::ZOOM_DEFAULT_PERCENT,
             "a real click on the status bar's zoom value must reset zoom to 100%, through the \
              same AdeApp::reset_zoom the toolbar's own zoom control calls"

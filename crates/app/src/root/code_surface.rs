@@ -1,7 +1,12 @@
 use super::*;
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
-use crate::root::lsp::{lsp_file_status, LspClientState, LspFileStatus};
+use crate::root::lsp::{lsp_file_status, LspFileStatus};
+// Only this module's own tests read `LspClientState` directly now - the render path goes through
+// `AdeApp::lsp_connection_for_path`'s facade instead of raw client states (see
+// `crate::root::lsp::LspConnection`), so a non-test import here would be genuinely unused.
+#[cfg(test)]
+use crate::root::lsp::LspClientState;
 use crate::root::rem_scope::WithRemSize;
 use crate::root::settings_widgets::ChoiceOption;
 use crate::root::widgets::{
@@ -83,7 +88,6 @@ impl AdeApp {
         self.push_open_file(&path);
         self.open_change = Some(path.clone());
         self.code_view = code_view::CodeView::Diff;
-        self.restore_zoom_for_open_change(&path);
         self.refresh_open_diff_file_cache();
         // A hover card is only valid for the file it was requested against - and so is a real
         // Completions popup (Revision R8.5b audit finding 3's fix for a real, live-reproduced
@@ -115,7 +119,6 @@ impl AdeApp {
         self.push_open_file(&relative);
         self.open_change = Some(relative.clone());
         self.code_view = code_view::CodeView::File;
-        self.restore_zoom_for_open_change(&relative);
         self.selected_tree_path = Some(path);
         self.refresh_open_diff_file_cache();
         // See `Self::select_worktree`'s identical reset for why - and `Self::open_change_diff`'s
@@ -163,7 +166,6 @@ impl AdeApp {
         } else {
             code_view::CodeView::File
         };
-        self.restore_zoom_for_open_change(&path);
         self.refresh_open_diff_file_cache();
         self.hover = None;
         // See `Self::open_change_diff`'s identical `dismiss_completions()` call for why
@@ -201,10 +203,6 @@ impl AdeApp {
             return;
         };
         self.open_files.remove(index);
-        // Drop the closed tab's remembered zoom too, so reopening the same path later starts
-        // fresh at the 100% default instead of resurrecting a stale value, and so this map
-        // doesn't grow unbounded for the life of the worktree session.
-        self.file_zoom_percent.remove(&path);
         self._lsp_sync_tasks.remove(&path);
         if self
             .completions
@@ -225,7 +223,6 @@ impl AdeApp {
             match neighbor {
                 Some(next_path) => {
                     self.open_change = Some(next_path.clone());
-                    self.restore_zoom_for_open_change(&next_path);
                     self.refresh_open_diff_file_cache();
                     self.hover = None;
                     self.dismiss_completions();
@@ -253,22 +250,32 @@ impl AdeApp {
         }
     }
 
-    /// Editor-zoom range (70-200%, in steps of 10) and default (100%).
-    pub(super) const ZOOM_MIN_PERCENT: u16 = 70;
-    pub(super) const ZOOM_MAX_PERCENT: u16 = 200;
-    pub(super) const ZOOM_STEP_PERCENT: u16 = 10;
-    pub(super) const ZOOM_DEFAULT_PERCENT: u16 = 100;
+    /// Editor-zoom range (70-200%, in steps of 10) and default (100%) - re-exported from
+    /// `settings_store`'s real, single source of truth (see that module's "Editor zoom is one
+    /// global, persisted number now" docs) so this file's own call sites/doc comments below
+    /// didn't need to be renamed.
+    pub(super) const ZOOM_MIN_PERCENT: u16 = settings_store::EDITOR_ZOOM_PERCENT_MIN;
+    pub(super) const ZOOM_MAX_PERCENT: u16 = settings_store::EDITOR_ZOOM_PERCENT_MAX;
+    pub(super) const ZOOM_STEP_PERCENT: u16 = settings_store::EDITOR_ZOOM_PERCENT_STEP;
+    pub(super) const ZOOM_DEFAULT_PERCENT: u16 = settings_store::EDITOR_ZOOM_PERCENT_DEFAULT;
 
     /// The effective rem size (px) the zoom-scoped code surface renders `rems()`-based text at:
-    /// `editor_font_size` times [`Self::code_zoom_percent`] as a fraction.
+    /// `editor_font_size` times [`Settings.appearance.editor_zoom_percent`]
+    /// (`crate::settings_store::AppearanceSettings::editor_zoom_percent`) as a fraction. Both
+    /// factors are real, globally-persisted `Settings` fields now - see that field's own docs for
+    /// why this used to also read a third, in-memory-only, per-worktree-reset value.
     pub(super) fn effective_code_rem_px(&self) -> f32 {
-        self.settings.appearance.editor_font_size * (self.code_zoom_percent as f32 / 100.0)
+        self.settings.appearance.editor_font_size
+            * (self.settings.appearance.editor_zoom_percent as f32 / 100.0)
     }
 
     /// Zooms in one step (the toolbar `+` button).
     pub(super) fn zoom_in(&mut self, cx: &mut Context<Self>) {
         self.set_code_zoom(
-            clamp_zoom_percent(self.code_zoom_percent as i32 + Self::ZOOM_STEP_PERCENT as i32),
+            clamp_zoom_percent(
+                self.settings.appearance.editor_zoom_percent as i32
+                    + Self::ZOOM_STEP_PERCENT as i32,
+            ),
             cx,
         );
     }
@@ -276,7 +283,10 @@ impl AdeApp {
     /// Zooms out one step (the toolbar `−` button).
     pub(super) fn zoom_out(&mut self, cx: &mut Context<Self>) {
         self.set_code_zoom(
-            clamp_zoom_percent(self.code_zoom_percent as i32 - Self::ZOOM_STEP_PERCENT as i32),
+            clamp_zoom_percent(
+                self.settings.appearance.editor_zoom_percent as i32
+                    - Self::ZOOM_STEP_PERCENT as i32,
+            ),
             cx,
         );
     }
@@ -286,30 +296,16 @@ impl AdeApp {
         self.set_code_zoom(Self::ZOOM_DEFAULT_PERCENT, cx);
     }
 
-    /// The single place [`Self::code_zoom_percent`] is written by a user action; `zoom_in`/
-    /// `zoom_out`/`reset_zoom` all delegate here. When `per_tab_zoom` is on, also remembers
-    /// `percent` per-file in [`Self::file_zoom_percent`] so switching tabs restores it.
+    /// The single place `Settings.appearance.editor_zoom_percent` is written by a user action;
+    /// `zoom_in`/`zoom_out`/`reset_zoom` all delegate here. Global and persisted (see
+    /// `settings_store`'s module docs) - applies uniformly to every open file, in every worktree,
+    /// and queues a real settings-file save via [`Self::persist_settings`], the same writer every
+    /// other Settings-page mutation already goes through, so a zoom change made from the toolbar
+    /// survives a restart exactly like one made from the Settings page would.
     fn set_code_zoom(&mut self, percent: u16, cx: &mut Context<Self>) {
-        self.code_zoom_percent = percent;
-        if self.settings.appearance.per_tab_zoom {
-            if let Some(path) = self.open_change.clone() {
-                self.file_zoom_percent.insert(path, percent);
-            }
-        }
+        self.settings.appearance.editor_zoom_percent = percent;
+        self.persist_settings(cx);
         cx.notify();
-    }
-
-    /// Restores [`Self::code_zoom_percent`] for `path`, called wherever `open_change` is pointed
-    /// at a (possibly different) file. When `per_tab_zoom` is on, looks up `path`'s remembered
-    /// zoom, defaulting a never-zoomed tab to 100%; when off, leaves the shared value untouched.
-    pub(super) fn restore_zoom_for_open_change(&mut self, path: &Path) {
-        if self.settings.appearance.per_tab_zoom {
-            self.code_zoom_percent = self
-                .file_zoom_percent
-                .get(path)
-                .copied()
-                .unwrap_or(Self::ZOOM_DEFAULT_PERCENT);
-        }
     }
 
     /// Recomputes [`Self::open_diff_file_cache`] (and [`Self::file_view_changed_lines`] with it)
@@ -454,7 +450,7 @@ impl AdeApp {
             return;
         }
 
-        let Some(client) = self.lsp_client_for_path(&absolute_path) else {
+        let Some(client) = self.lsp_connection_for_path(&absolute_path) else {
             // No ready LSP client for this file's language yet; nothing to show, so clear any
             // stale entry - a real completions popup is equally stale in that case (Revision
             // R8.5b audit finding 3), so it's dropped alongside `hover` here too.
@@ -539,7 +535,7 @@ impl AdeApp {
         let path = hover.path.clone();
         let position = hover.position;
 
-        let Some(client) = self.lsp_client_for_path(&path) else {
+        let Some(client) = self.lsp_connection_for_path(&path) else {
             return;
         };
         let Ok(uri) = lsp_core::LspClient::uri_for_path(&path) else {
@@ -975,8 +971,8 @@ impl AdeApp {
             el
         };
 
-        let can_zoom_out = self.code_zoom_percent > AdeApp::ZOOM_MIN_PERCENT;
-        let can_zoom_in = self.code_zoom_percent < AdeApp::ZOOM_MAX_PERCENT;
+        let can_zoom_out = self.settings.appearance.editor_zoom_percent > AdeApp::ZOOM_MIN_PERCENT;
+        let can_zoom_in = self.settings.appearance.editor_zoom_percent < AdeApp::ZOOM_MAX_PERCENT;
 
         div()
             .id("code-zoom-control")
@@ -1004,7 +1000,7 @@ impl AdeApp {
                     .text_size(px(10.0))
                     .text_color(theme::text::DIM)
                     .hover(|el| el.text_color(theme::text::SELECTED))
-                    .child(format!("{}%", self.code_zoom_percent))
+                    .child(format!("{}%", self.settings.appearance.editor_zoom_percent))
                     .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                         this.reset_zoom(cx);
                     })),
@@ -1348,13 +1344,19 @@ impl AdeApp {
         let relative_path_buf = relative_path.to_path_buf();
 
         // Diagnostics apply to any extension `crate::language`'s registry spawns a real LSP
-        // client for (Rust/TypeScript-family/Python as of Revision R8 - see that module's own
-        // docs for Vue/Go's deliberate scope-down). `ensure_lsp_client`/`dispatch_did_open` are
+        // client for (Rust/TypeScript-family/Python, and - as of this revision - Vue, which
+        // genuinely spawns two coordinated processes; Go stays detection-only, see that module's
+        // own docs). `ensure_lsp_client`/`dispatch_did_open` are
         // idempotent `&mut self` calls that must finish before the immutable `file_view_cache`
         // borrow below is taken.
         let extension = absolute_path.extension().and_then(|ext| ext.to_str());
         let language_id = language::lsp_language_id_for_extension(extension);
         let has_lsp = language_id.is_some();
+        // Hoisted out of the block below (Revision R11 audit finding 2) so the exact same
+        // already-computed primary binary name that keys `lsp_clients` also names the server in
+        // this file's own footer - see `lsp_status_label`, which used to say "rust-analyzer" for
+        // every language regardless.
+        let lsp_binary = language::lsp_binary_for_extension(extension);
 
         let lsp_status = if let Some(language_id) = language_id {
             let repo_root = self.file_tree_root.clone();
@@ -1365,20 +1367,47 @@ impl AdeApp {
             let canonical_extension =
                 language::entry_for_extension(extension).map(|entry| entry.extension);
             self.ensure_lsp_client(repo_root.clone(), canonical_extension, cx);
-            let binary = language::lsp_binary_for_extension(extension);
-            let state =
-                binary.and_then(|binary| self.lsp_clients.get(&(repo_root, binary)).cloned());
-            if let Some(LspClientState::Ready(client)) = &state {
-                self.dispatch_did_open(client.clone(), absolute_path.clone(), language_id, cx);
+            let state = lsp_binary
+                .and_then(|binary| self.lsp_clients.get(&(repo_root.clone(), binary)).cloned());
+            // The companion's own independent lifecycle entry, for a language that has one (see
+            // `crate::language::CompanionServer`) - `None` for every single-server language, which
+            // keeps this whole block's behavior there exactly what it was.
+            let companion_state = language::companion_for_extension(extension).and_then(|spec| {
+                self.lsp_clients
+                    .get(&(repo_root.clone(), spec.client_key))
+                    .cloned()
+            });
+            // One resolved facade for this whole render pass - `didOpen` fan-out, the merged
+            // diagnostics below, and the status line all read the same real view, so they can't
+            // disagree about which processes are actually backing this file right now.
+            let connection = self.lsp_connection_for_path(&absolute_path);
+            // A `didOpen` is sent exactly once per real path (see `AdeApp::lsp_opened_files`), so
+            // it must not go out while a companion is still mid-spawn: the connection would be a
+            // `Single` at that moment, the primary alone would be opened, and the companion -
+            // arriving `Ready` a moment later - would never be told about the file at all, which
+            // live-reproduced as an entire real half of the diagnostics silently never appearing.
+            // A companion that has genuinely `Failed` is never coming, so it is not waited on.
+            let companion_still_spawning =
+                matches!(companion_state, None | Some(LspClientState::Spawning))
+                    && language::companion_for_extension(extension).is_some();
+            if let Some(connection) = &connection {
+                if !companion_still_spawning {
+                    self.dispatch_did_open(
+                        connection.clone(),
+                        absolute_path.clone(),
+                        language_id,
+                        cx,
+                    );
+                }
             }
 
             // Computed once and reused below, since `uri_for_path` does a blocking
             // `canonicalize()` syscall and this method runs on every repaint.
             let file_uri = lsp_core::LspClient::uri_for_path(&absolute_path).ok();
 
-            let diagnostics_map = match (&state, &file_uri) {
-                (Some(LspClientState::Ready(client)), Some(uri)) => {
-                    let diagnostics = client.diagnostics_for_uri(uri).unwrap_or_default();
+            let diagnostics_map = match (&connection, &file_uri) {
+                (Some(connection), Some(uri)) => {
+                    let diagnostics = connection.diagnostics_for_uri(uri).unwrap_or_default();
                     // Real live tracking (Revision R8.5b): index against the *live* edit
                     // buffer's own `lines` when one exists for this file, not
                     // `file_view_cache.lines` (the last-*saved* snapshot). Now that
@@ -1409,7 +1438,12 @@ impl AdeApp {
             };
             self.file_view_diagnostics = diagnostics_map;
 
-            Some(lsp_file_status(&state, file_uri.as_ref()))
+            Some(lsp_file_status(
+                &state,
+                companion_state.as_ref(),
+                connection.as_deref(),
+                file_uri.as_ref(),
+            ))
         } else {
             self.file_view_diagnostics = HashMap::new();
             None
@@ -1428,7 +1462,7 @@ impl AdeApp {
         };
 
         let cursor = self.code_cursor;
-        let status_bar = render_file_status_bar(parsed, cursor, lsp_status.as_ref());
+        let status_bar = render_file_status_bar(parsed, cursor, lsp_status.as_ref(), lsp_binary);
         let truncated = parsed.truncated;
         // Real, editable file-view state (Revision R8.5a): whichever `EditBuffer`
         // `spawn_file_load`'s completion already lazily seeded for `relative_path` (`None` only
@@ -2516,15 +2550,55 @@ pub(super) fn render_file_view_line(
         .into_any_element()
 }
 
+/// The dot color and text the File view's footer shows for one real [`LspFileStatus`], given the
+/// real *primary* server binary backing this file (`crate::language::lsp_binary_for_extension`'s
+/// own answer for its extension - `None` only when the caller couldn't resolve one, which for a
+/// file that has any status at all shouldn't happen, and falls back to the honest generic word
+/// "language server" rather than naming some other language's binary).
+///
+/// Derived, never hardcoded: these strings used to say `"rust-analyzer"` literally, for every
+/// language. That was merely generic until a two-server language could produce a status of its
+/// own. `LspConnection::liveness_failure_reason` names the real dead process, so a dead Vue
+/// companion rendered as the actively-wrong `"rust-analyzer: typescript-language-server (vue)'s
+/// connection was lost..."`, and a `.vue` file mid-spawn said `"starting rust-analyzer..."` while
+/// `vue-language-server` was the thing actually starting.
+///
+/// [`LspFileStatus::Failed`]'s own message deliberately gets **no** prefix at all: every real
+/// source of it already names its own server (`lsp_core::LspError`'s variants all carry `server`,
+/// `liveness_failure_reason` carries `LspClient::name()`, and the companion's prerequisite errors
+/// name Vue), so prefixing would either duplicate that name or contradict it.
+fn lsp_status_label(status: &LspFileStatus, binary: Option<&str>) -> (gpui::Rgba, String) {
+    let binary = binary.unwrap_or("language server");
+    match status {
+        LspFileStatus::Spawning => (theme::text::GHOST, format!("starting {binary}...")),
+        LspFileStatus::Failed(message) => (theme::status::FAIL, message.clone()),
+        LspFileStatus::Indexing => (theme::status::ASK, format!("{binary}: indexing...")),
+        LspFileStatus::Analyzed { errors, warnings } => {
+            let color = if *errors > 0 {
+                theme::status::FAIL
+            } else {
+                theme::status::REVIEW
+            };
+            let label = if *errors == 0 && *warnings == 0 {
+                format!("{binary}: no diagnostics")
+            } else {
+                format!("{binary}: {errors} errors, {warnings} warnings")
+            };
+            (color, label)
+        }
+    }
+}
+
 /// The File view's status bar: language, last-click cursor line (`None` until the first click,
-/// per `AdeApp::code_cursor`), a byte-detected line-ending label, and - for a `.rs` file with a
-/// live LSP client - a `rust-analyzer` status. The design's `col 14` is deliberately omitted:
-/// there's no per-character column tracking in this app, so showing a column would always read
-/// `1`.
+/// per `AdeApp::code_cursor`), a byte-detected line-ending label, and - for a file with a live LSP
+/// client - that language's own real server status (see [`lsp_status_label`]). The design's
+/// `col 14` is deliberately omitted: there's no per-character column tracking in this app, so
+/// showing a column would always read `1`.
 pub(super) fn render_file_status_bar(
     parsed: &code_view::ParsedFile,
     cursor: Option<usize>,
     lsp_status: Option<&LspFileStatus>,
+    lsp_binary: Option<&str>,
 ) -> impl IntoElement {
     let position = cursor
         .map(|line| format!("ln {line}"))
@@ -2546,30 +2620,7 @@ pub(super) fn render_file_status_bar(
         .text_color(theme::text::HINT);
 
     if let Some(status) = lsp_status {
-        let (dot_color, label) = match status {
-            LspFileStatus::Spawning => {
-                (theme::text::GHOST, "starting rust-analyzer...".to_string())
-            }
-            LspFileStatus::Failed(message) => {
-                (theme::status::FAIL, format!("rust-analyzer: {message}"))
-            }
-            LspFileStatus::Indexing => {
-                (theme::status::ASK, "rust-analyzer: indexing...".to_string())
-            }
-            LspFileStatus::Analyzed { errors, warnings } => {
-                let color = if *errors > 0 {
-                    theme::status::FAIL
-                } else {
-                    theme::status::REVIEW
-                };
-                let label = if *errors == 0 && *warnings == 0 {
-                    "rust-analyzer: no diagnostics".to_string()
-                } else {
-                    format!("rust-analyzer: {errors} errors, {warnings} warnings")
-                };
-                (color, label)
-            }
-        };
+        let (dot_color, label) = lsp_status_label(status, lsp_binary);
         bar = bar
             .child(
                 div()
@@ -4773,7 +4824,7 @@ mod code_zoom_tests {
         });
 
         assert_eq!(
-            app.read_with(cx, |app, _| app.code_zoom_percent),
+            app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent),
             AdeApp::ZOOM_DEFAULT_PERCENT,
             "a freshly opened file starts at the real 100% default"
         );
@@ -4784,7 +4835,7 @@ mod code_zoom_tests {
             }
         });
         assert_eq!(
-            app.read_with(cx, |app, _| app.code_zoom_percent),
+            app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent),
             AdeApp::ZOOM_MIN_PERCENT,
             "zooming out far past the real minimum must clamp at 70%, never go lower"
         );
@@ -4795,7 +4846,7 @@ mod code_zoom_tests {
             }
         });
         assert_eq!(
-            app.read_with(cx, |app, _| app.code_zoom_percent),
+            app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent),
             AdeApp::ZOOM_MAX_PERCENT,
             "zooming in far past the real maximum must clamp at 200%, never wrap"
         );
@@ -4815,201 +4866,125 @@ mod code_zoom_tests {
             app.zoom_in(cx);
             app.zoom_in(cx);
         });
-        assert_eq!(app.read_with(cx, |app, _| app.code_zoom_percent), 130);
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent),
+            130
+        );
 
         app.update(cx, |app, cx| app.reset_zoom(cx));
         assert_eq!(
-            app.read_with(cx, |app, _| app.code_zoom_percent),
+            app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent),
             AdeApp::ZOOM_DEFAULT_PERCENT,
             "resetting zoom - the toolbar value's own click affordance - must land exactly on \
              100%, matching design_handoff_jerry_ade/revision/CHANGELOG.md's change 6"
         );
     }
 
-    /// `per_tab_zoom` on (the default) - each open file tab must remember its own zoom
-    /// independently.
+    /// Zoom is a single, global `Settings.appearance.editor_zoom_percent` value now (see
+    /// `settings_store`'s "Editor zoom is one global, persisted number now" docs) - zooming one
+    /// open file must change what every other open file (and a freshly opened one) shows too,
+    /// which is the real behavior this replaced `per_tab_zoom`'s two modes to guarantee
+    /// unconditionally rather than only when the toggle happened to be off.
     #[gpui::test]
-    fn per_tab_zoom_on_remembers_each_tabs_own_zoom_independently(cx: &mut TestAppContext) {
+    fn zoom_applies_globally_to_every_open_file_not_just_the_active_one(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let a = repo.path().join("a.rs");
         let b = repo.path().join("b.rs");
         std::fs::write(&a, "fn a() {}\n").expect("write a.rs");
         std::fs::write(&b, "fn b() {}\n").expect("write b.rs");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        assert!(
-            app.read_with(cx, |app, _| app.settings.appearance.per_tab_zoom),
-            "per_tab_zoom should default to true - see AppearanceSettings::default"
-        );
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(a.clone(), window, cx);
         });
-        app.update(cx, |app, cx| app.zoom_in(cx)); // a.rs -> 110%
+        app.update(cx, |app, cx| app.zoom_in(cx)); // 110%, global
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(b.clone(), window, cx);
         });
         assert_eq!(
-            app.read_with(cx, |app, _| app.code_zoom_percent),
-            AdeApp::ZOOM_DEFAULT_PERCENT,
-            "a tab that has never been zoomed must start at the real 100% default, not inherit \
-             the previously active tab's zoom"
-        );
-        app.update(cx, |app, cx| {
-            app.zoom_in(cx);
-            app.zoom_in(cx);
-        }); // b.rs -> 120%
-
-        app.update_in(cx, |app, window, cx| {
-            app.activate_file_tab(PathBuf::from("a.rs"), window, cx);
-        });
-        assert_eq!(
-            app.read_with(cx, |app, _| app.code_zoom_percent),
+            app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent),
             110,
-            "switching back to a.rs must restore its own real, previously set zoom"
+            "opening a different file must keep the one global zoom value, not reset to 100%"
         );
 
-        app.update_in(cx, |app, window, cx| {
-            app.activate_file_tab(PathBuf::from("b.rs"), window, cx);
-        });
-        assert_eq!(
-            app.read_with(cx, |app, _| app.code_zoom_percent),
-            120,
-            "switching back to b.rs must restore its own, independently remembered zoom"
-        );
-    }
-
-    /// `Settings.appearance.per_tab_zoom` off - one shared zoom value must apply uniformly to
-    /// every open file, and switching tabs must never silently revert it.
-    #[gpui::test]
-    fn per_tab_zoom_off_shares_one_zoom_value_across_every_open_file(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let a = repo.path().join("a.rs");
-        let b = repo.path().join("b.rs");
-        std::fs::write(&a, "fn a() {}\n").expect("write a.rs");
-        std::fs::write(&b, "fn b() {}\n").expect("write b.rs");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        app.update(cx, |app, cx| app.toggle_per_tab_zoom(cx));
-        assert!(!app.read_with(cx, |app, _| app.settings.appearance.per_tab_zoom));
-
-        app.update_in(cx, |app, window, cx| {
-            app.open_file_view(a.clone(), window, cx);
-        });
-        app.update(cx, |app, cx| app.zoom_in(cx)); // 110%, shared
-
-        app.update_in(cx, |app, window, cx| {
-            app.open_file_view(b.clone(), window, cx);
-        });
-        assert_eq!(
-            app.read_with(cx, |app, _| app.code_zoom_percent),
-            110,
-            "with per-tab zoom off, opening a different file must keep the one shared zoom \
-             value, not reset to 100%"
-        );
-
-        app.update(cx, |app, cx| app.zoom_in(cx)); // 120%, shared
+        app.update(cx, |app, cx| app.zoom_in(cx)); // 120%, global
 
         app.update_in(cx, |app, window, cx| {
             app.activate_file_tab(PathBuf::from("a.rs"), window, cx);
         });
         assert_eq!(
-            app.read_with(cx, |app, _| app.code_zoom_percent),
+            app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent),
             120,
-            "with per-tab zoom off, switching back to a.rs must show the same shared 120% - not \
-             the 110% it happened to be at when it was left, which would mean the value was \
-             secretly still being tracked per-tab"
+            "switching back to a.rs must show the same global 120% - not the 110% it happened to \
+             be at when it was left, which would mean zoom was secretly still tracked per-tab"
         );
     }
 
-    /// Regression: set a shared zoom, then turn per-tab zoom on - every already-open tab must
-    /// keep showing the zoom it already had, not reset to 100%. Root cause: `file_zoom_percent`
-    /// used to only be written while per-tab mode was already on, so turning it on left the map
-    /// empty for every open tab.
+    /// Regression for the removed per-worktree reset (`AdeApp::select_worktree` used to reset
+    /// `code_zoom_percent` to 100% on every switch, back when it was in-memory-only UI state -
+    /// see `Self::select_worktree`'s docs before this consolidation). Zoom is now a real
+    /// `Settings` field, so it must survive a worktree switch exactly like `editor_font_size`
+    /// already does.
     #[gpui::test]
-    fn turning_per_tab_zoom_on_seeds_every_open_tab_with_the_current_shared_zoom(
-        cx: &mut TestAppContext,
-    ) {
+    fn zoom_survives_a_worktree_switch(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
-        let a = repo.path().join("a.rs");
-        let b = repo.path().join("b.rs");
-        std::fs::write(&a, "fn a() {}\n").expect("write a.rs");
-        std::fs::write(&b, "fn b() {}\n").expect("write b.rs");
+        let worktree_b = tempfile::tempdir().expect("tempdir b");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
-        // Start in shared mode (per-tab off) - the default is per-tab on, so this toggle sets up
-        // the starting state.
-        app.update(cx, |app, cx| app.toggle_per_tab_zoom(cx));
-        assert!(!app.read_with(cx, |app, _| app.settings.appearance.per_tab_zoom));
+        // A plain, directly-seeded `worktrees` list (mirroring
+        // `lsp_client_eviction_tests::switching_between_several_worktrees_never_lets_lsp_clients_
+        // grow_past_one`'s own pattern) - `select_worktree` only needs a real, readable path on
+        // disk, not an actual git worktree.
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![
+                worktrees::WorktreeItem {
+                    path: repo.path().to_path_buf(),
+                    label: "wt-a".to_string(),
+                    branch: None,
+                    is_main: true,
+                    is_locked: false,
+                    error: None,
+                },
+                worktrees::WorktreeItem {
+                    path: worktree_b.path().to_path_buf(),
+                    label: "wt-b".to_string(),
+                    branch: None,
+                    is_main: false,
+                    is_locked: false,
+                    error: None,
+                },
+            ];
+        });
 
-        app.update_in(cx, |app, window, cx| {
-            app.open_file_view(a.clone(), window, cx);
-        });
-        app.update_in(cx, |app, window, cx| {
-            app.open_file_view(b.clone(), window, cx);
-        });
         app.update(cx, |app, cx| {
             app.zoom_in(cx);
             app.zoom_in(cx);
-            app.zoom_in(cx);
-            app.zoom_in(cx);
-            app.zoom_in(cx);
-        }); // 150%, shared - both a.rs and b.rs are showing this right now
-        assert_eq!(app.read_with(cx, |app, _| app.code_zoom_percent), 150);
-
-        app.update(cx, |app, cx| app.toggle_per_tab_zoom(cx));
-        assert!(app.read_with(cx, |app, _| app.settings.appearance.per_tab_zoom));
+        });
         assert_eq!(
-            app.read_with(cx, |app, _| app.code_zoom_percent),
-            150,
-            "turning per-tab zoom on must never itself change what the currently active tab is \
-             showing"
+            app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent),
+            120
         );
 
-        // b.rs is the active tab (opened last) - switching away and back must restore 150%.
-        // `activate_file_tab` (unlike `open_file_view`) takes the relative path `open_files`/
-        // `file_zoom_percent` are keyed by, not an absolute one.
-        app.update_in(cx, |app, window, cx| {
-            app.activate_file_tab(PathBuf::from("a.rs"), window, cx);
-        });
-        app.update_in(cx, |app, window, cx| {
-            app.activate_file_tab(PathBuf::from("b.rs"), window, cx);
-        });
-        assert_eq!(
-            app.read_with(cx, |app, _| app.code_zoom_percent),
-            150,
-            "b.rs was showing 150% the instant per-tab zoom was turned on - switching away and \
-             back must not have silently discarded that and reset it to the real 100% default"
-        );
+        app.update_in(cx, |app, window, cx| app.select_worktree(1, window, cx));
+        cx.run_until_parked();
 
-        // a.rs never got its own explicit zoom action, but it was also visibly at 150% (the
-        // shared value) the instant the mode flipped - it must have been seeded too.
-        app.update_in(cx, |app, window, cx| {
-            app.activate_file_tab(PathBuf::from("a.rs"), window, cx);
-        });
         assert_eq!(
-            app.read_with(cx, |app, _| app.code_zoom_percent),
-            150,
-            "a.rs was also showing the shared 150% at the moment per-tab zoom turned on - it \
-             must have been seeded with that value too, not just whichever tab happened to be \
-             active"
+            app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent),
+            120,
+            "zoom is a global Settings field now - a worktree switch must not reset it"
         );
     }
 
-    /// Regression: zoom a tab, close it, reopen the same path - it must come back at the 100%
-    /// default, not resurrect the stale zoom it was left at. See `close_file_tab`'s docs: the
-    /// closed path's `file_zoom_percent` entry is removed immediately.
+    /// Closing a zoomed tab and reopening the same path must keep showing the same global zoom -
+    /// the opposite of the old per-file behavior (which deliberately reset a closed-then-reopened
+    /// tab to 100%, since the zoom used to be remembered *per path*, not globally).
     #[gpui::test]
-    fn closing_a_tab_clears_its_remembered_zoom_so_reopening_it_starts_fresh(
-        cx: &mut TestAppContext,
-    ) {
+    fn closing_and_reopening_a_tab_keeps_the_same_global_zoom(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let a = repo.path().join("a.rs");
         std::fs::write(&a, "fn a() {}\n").expect("write a.rs");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        assert!(
-            app.read_with(cx, |app, _| app.settings.appearance.per_tab_zoom),
-            "per_tab_zoom should default to true - see AppearanceSettings::default"
-        );
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(a.clone(), window, cx);
@@ -5018,8 +4993,11 @@ mod code_zoom_tests {
             app.zoom_in(cx);
             app.zoom_in(cx);
             app.zoom_in(cx);
-        }); // a.rs -> 130%
-        assert_eq!(app.read_with(cx, |app, _| app.code_zoom_percent), 130);
+        }); // 130%, global
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent),
+            130
+        );
 
         app.update_in(cx, |app, window, cx| {
             app.close_file_tab(PathBuf::from("a.rs"), window, cx);
@@ -5033,10 +5011,10 @@ mod code_zoom_tests {
             app.open_file_view(a.clone(), window, cx);
         });
         assert_eq!(
-            app.read_with(cx, |app, _| app.code_zoom_percent),
-            AdeApp::ZOOM_DEFAULT_PERCENT,
-            "reopening a.rs after closing it must start at the real 100% default, not resurrect \
-             the 130% it was left at before it was closed"
+            app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent),
+            130,
+            "reopening a.rs after closing it must still show the same global 130% zoom, not \
+             reset to the 100% default - zoom no longer belongs to any one file"
         );
     }
 
@@ -5131,5 +5109,509 @@ mod code_zoom_tests {
              single-row-height measurement (taken from line 1 alone) would paint straight into \
              the row below's slot, exactly the real overlap the audit measured live"
         );
+    }
+}
+
+/// Coverage for the File view footer's real server label (see [`lsp_status_label`]) - Revision R11
+/// audit finding 2: every one of these strings was hardcoded to `"rust-analyzer"` regardless of
+/// which language was actually open.
+#[cfg(test)]
+mod lsp_status_label_tests {
+    use super::*;
+
+    /// The real binary names this app's own registry resolves, used exactly as
+    /// `AdeApp::render_file_view` passes them in - not string literals invented here, so a
+    /// registry rename can't leave this test passing against a name nothing uses.
+    fn binary_for(extension: &str) -> Option<&'static str> {
+        language::lsp_binary_for_extension(Some(extension))
+    }
+
+    #[test]
+    fn the_server_name_in_every_label_is_derived_from_the_real_language() {
+        assert_eq!(binary_for("rs"), Some("rust-analyzer"));
+        assert_eq!(binary_for("vue"), Some("vue-language-server"));
+
+        assert_eq!(
+            lsp_status_label(&LspFileStatus::Spawning, binary_for("rs")).1,
+            "starting rust-analyzer..."
+        );
+        assert_eq!(
+            lsp_status_label(&LspFileStatus::Spawning, binary_for("vue")).1,
+            "starting vue-language-server...",
+            "a .vue file is waiting on vue-language-server, not on rust-analyzer"
+        );
+        assert_eq!(
+            lsp_status_label(&LspFileStatus::Indexing, binary_for("py")).1,
+            "pyright-langserver: indexing..."
+        );
+        assert_eq!(
+            lsp_status_label(
+                &LspFileStatus::Analyzed {
+                    errors: 0,
+                    warnings: 0
+                },
+                binary_for("ts")
+            )
+            .1,
+            "typescript-language-server: no diagnostics"
+        );
+        assert_eq!(
+            lsp_status_label(
+                &LspFileStatus::Analyzed {
+                    errors: 2,
+                    warnings: 1
+                },
+                binary_for("vue")
+            )
+            .1,
+            "vue-language-server: 2 errors, 1 warnings"
+        );
+    }
+
+    /// The specific bug this issue's own new `LspConnection::liveness_failure_reason` made
+    /// actively wrong rather than merely generic: it already names the real dead process, so the
+    /// old `format!("rust-analyzer: {message}")` produced a label naming two different servers,
+    /// one of which had nothing to do with the file.
+    #[test]
+    fn a_failure_message_is_shown_as_is_because_it_already_names_its_own_server() {
+        let dead_companion =
+            "typescript-language-server (vue)'s connection was lost (the process exited \
+             unexpectedly)"
+                .to_string();
+        let (_, label) = lsp_status_label(
+            &LspFileStatus::Failed(dead_companion.clone()),
+            binary_for("vue"),
+        );
+        assert_eq!(label, dead_companion);
+        assert!(
+            !label.contains("rust-analyzer"),
+            "a dead Vue companion must never be reported under rust-analyzer's name, got: {label}"
+        );
+
+        // The single-server path's own message is equally self-describing (every
+        // `lsp_core::LspError` variant carries its own `server`), so it is also shown untouched.
+        let dead_primary = "failed to spawn `rust-analyzer` (is it installed and on PATH?)";
+        assert_eq!(
+            lsp_status_label(
+                &LspFileStatus::Failed(dead_primary.to_string()),
+                binary_for("rs")
+            )
+            .1,
+            dead_primary
+        );
+    }
+
+    /// The honest fallback when no binary could be resolved at all - a generic word, never some
+    /// other language's real server name.
+    #[test]
+    fn an_unresolved_binary_falls_back_to_a_generic_word_not_another_language() {
+        assert_eq!(
+            lsp_status_label(&LspFileStatus::Spawning, None).1,
+            "starting language server..."
+        );
+        assert_eq!(
+            lsp_status_label(&LspFileStatus::Indexing, None).1,
+            "language server: indexing..."
+        );
+    }
+}
+
+/// The real, live end-to-end proof for this app's two-server (primary + companion) LSP support:
+/// a genuine `.vue` file, analyzed by a genuinely spawned `vue-language-server` **and** a
+/// genuinely spawned `typescript-language-server` carrying the real `@vue/typescript-plugin`,
+/// coordinated by this app's own real relay - reaching real diagnostics and a real hover through
+/// nothing but the production code path (`AdeApp::open_file_view` -> `render_file_view` ->
+/// `ensure_lsp_client` (both halves) -> `dispatch_did_open` (both halves) -> render).
+///
+/// Nothing here is stubbed: two real Node processes, a real `npm install typescript` for the real
+/// `--tsdk` this app resolves on its own, and real assertions on the actual diagnostic text and
+/// hover markdown the real servers produce. It is genuinely slow for that reason, and kept in the
+/// normal (non-`#[ignore]`) suite on purpose - this project has no separate slow-test lane.
+///
+/// The fixture carries **two** deliberately different real errors, because in Vue's hybrid mode
+/// each server answers a genuinely different class of question (see `crate::language`'s own docs):
+/// a template compile error only `vue-language-server` reports, and a TypeScript type error only
+/// the companion reports. Asserting on both is what actually proves the merge is a real union of
+/// two live contributors rather than one server's answer dressed up as two.
+#[cfg(test)]
+mod vue_two_server_wiring_tests {
+    use super::*;
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+    use std::time::{Duration, Instant};
+
+    /// A real `<script setup lang="ts">` type error (`bad`) plus a real template compile error
+    /// (the mismatched `</span>`), in one real single-file component. The `shape`/`picked` lines
+    /// exist for the real go-to-definition and completion probes below - a genuine cross-line
+    /// reference and a genuine member-access position, both valid TypeScript so they can't disturb
+    /// the two deliberate errors above them.
+    const FIXTURE_VUE: &str = "<script setup lang=\"ts\">\n\
+         const bad: number = \"not a number\"\n\
+         const shape = { alpha: 1, beta: 2 }\n\
+         const picked = shape.alpha\n\
+         </script>\n\
+         \n\
+         <template>\n\
+         \x20 <div>{{ bad }}</span>\n\
+         </template>\n";
+
+    /// 0-based line 1, character 7 - inside the real `bad` identifier of
+    /// `const bad: number = "not a number"`. `request_hover`'s `line_number` is 1-based (see
+    /// `AdeApp::code_cursor`'s own convention) and its `byte_range` is within that line's text:
+    /// `"const "` is 6 bytes, `"bad"` 3 more.
+    const SCRIPT_LINE: usize = 2;
+    const SCRIPT_BYTE_RANGE: Range<usize> = 6..9;
+    const SCRIPT_POSITION: lsp_core::lsp_types::Position = lsp_core::lsp_types::Position {
+        line: 1,
+        character: 7,
+    };
+
+    /// 0-based line 3, inside the `shape` of `const picked = shape.alpha` (`"const picked = "` is
+    /// 15 characters, `shape` the next 5) - a real reference whose real declaration is one line up.
+    const REFERENCE_POSITION: lsp_core::lsp_types::Position = lsp_core::lsp_types::Position {
+        line: 3,
+        character: 17,
+    };
+    /// The same line, immediately after the real `.` (character 20) - a genuine member-access
+    /// completion context on a genuinely typed object.
+    const MEMBER_ACCESS_POSITION: lsp_core::lsp_types::Position = lsp_core::lsp_types::Position {
+        line: 3,
+        character: 21,
+    };
+
+    /// Writes the real scratch Vue project and performs the real, project-local
+    /// `npm install typescript@5` this app's own `--tsdk` resolution genuinely needs (see
+    /// `crate::language::vue_dynamic_args`: it existence-checks
+    /// `node_modules/typescript/lib/typescript.js` specifically, and refuses to spawn without it).
+    /// A stubbed stand-in would be worse than useless here - the real `vue-language-server` really
+    /// does load this file, and a fake one would produce a different, equally fake failure.
+    fn write_scratch_vue_project() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            "{\"compilerOptions\": {\"strict\": true, \"target\": \"ES2020\", \
+             \"module\": \"ESNext\", \"moduleResolution\": \"Bundler\", \"jsx\": \"preserve\"}, \
+             \"include\": [\"**/*.ts\", \"**/*.vue\"]}\n",
+        )
+        .expect("write tsconfig.json");
+        std::fs::write(dir.path().join("App.vue"), FIXTURE_VUE).expect("write App.vue");
+        let status = std::process::Command::new("npm")
+            .args([
+                "install",
+                "typescript@5",
+                "--no-audit",
+                "--no-fund",
+                "--silent",
+            ])
+            .current_dir(dir.path())
+            .status()
+            .expect("npm should be on PATH in this sandbox (real, live network install)");
+        assert!(status.success(), "npm install typescript@5 failed");
+        assert!(
+            dir.path()
+                .join("node_modules/typescript/lib/typescript.js")
+                .is_file(),
+            "the real --tsdk target this app resolves must genuinely exist after the install"
+        );
+        dir
+    }
+
+    /// Re-renders, advances the deterministic clock past one `LSP_DIAGNOSTICS_POLL_INTERVAL`, and
+    /// drains, until `predicate` holds or `deadline` passes.
+    ///
+    /// Advancing the clock is load-bearing here and not in the single-server tests: this app's
+    /// relay dispatch lives in `AdeApp::ensure_lsp_poll_task`'s own `timer(..)`-driven loop, which
+    /// on GPUI's deterministic test executor only ticks when the clock is actually advanced - and
+    /// the real `vue-language-server` will not produce a single diagnostic until its relayed
+    /// `tsserver/request` has been answered.
+    fn wait_until(
+        app: &Entity<AdeApp>,
+        cx: &mut VisualTestContext,
+        deadline: Instant,
+        message: &str,
+        predicate: impl Fn(&AdeApp) -> bool,
+    ) {
+        loop {
+            app.update(cx, |app, cx| {
+                app.render_center_pane(cx);
+            });
+            cx.background_executor
+                .advance_clock(LSP_DIAGNOSTICS_POLL_INTERVAL + Duration::from_millis(10));
+            cx.run_until_parked();
+            if app.read_with(cx, |app, _| predicate(app)) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{message}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn diagnostic_messages(app: &AdeApp) -> Vec<String> {
+        app.file_view_diagnostics
+            .values()
+            .flatten()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect()
+    }
+
+    #[gpui::test]
+    fn a_real_vue_file_gets_real_diagnostics_from_both_servers_and_a_real_hover(
+        cx: &mut TestAppContext,
+    ) {
+        // Silent unless `RUST_LOG` is actually set, so this doesn't spam the normal suite - but
+        // `RUST_LOG=app::root::lsp=debug cargo test ...` then surfaces the real relay round-trip
+        // timing `AdeApp::dispatch_companion_relay` logs (measured live at ~223ms for the real
+        // `_vue:projectInfo` query while building this).
+        let _ = env_logger::builder().parse_default_env().try_init();
+        let project = write_scratch_vue_project();
+        let app_vue = project.path().join("App.vue");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, project.path().to_path_buf());
+
+        let opened_at = Instant::now();
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(app_vue.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        // Both halves must genuinely be spawned by the production path - two real, independently
+        // keyed clients, not one client pretending to be two.
+        let companion_key = language::companion_for_extension(Some("vue"))
+            .expect("vue has a real companion")
+            .client_key;
+        wait_until(
+            &app,
+            cx,
+            Instant::now() + Duration::from_secs(180),
+            "the real vue-language-server and its real typescript-language-server companion were \
+             never both Ready - check that both are installed and that @vue/typescript-plugin \
+             resolved",
+            |app| {
+                let root = &app.file_tree_root;
+                [("vue-language-server"), (companion_key)]
+                    .iter()
+                    .all(|key| {
+                        matches!(
+                            app.lsp_clients.get(&(root.clone(), *key)),
+                            Some(LspClientState::Ready(_))
+                        )
+                    })
+            },
+        );
+
+        // The companion's own contribution: a real TypeScript semantic error for `.vue` content,
+        // which only exists because the real `@vue/typescript-plugin` is genuinely loaded.
+        wait_until(
+            &app,
+            cx,
+            Instant::now() + Duration::from_secs(180),
+            "no real TypeScript diagnostic for the genuine `.vue` script type error ever reached \
+             file_view_diagnostics",
+            |app| {
+                diagnostic_messages(app)
+                    .iter()
+                    .any(|message| message.to_lowercase().contains("not assignable"))
+            },
+        );
+        let companion_diagnostic_at = opened_at.elapsed();
+
+        // The primary's own contribution: a real Vue template compile error, which the companion
+        // does not and cannot report.
+        wait_until(
+            &app,
+            cx,
+            Instant::now() + Duration::from_secs(120),
+            "no real Vue template diagnostic ever reached file_view_diagnostics - without it, \
+             only one of the two real servers is genuinely contributing",
+            |app| {
+                diagnostic_messages(app)
+                    .iter()
+                    .any(|message| message.to_lowercase().contains("end tag"))
+            },
+        );
+
+        app.read_with(cx, |app, _| {
+            let messages = diagnostic_messages(app);
+            println!(
+                "vue e2e: real merged diagnostics after {:?}: {messages:?}",
+                opened_at.elapsed()
+            );
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.to_lowercase().contains("not assignable")),
+                "the companion's real TypeScript diagnostic must still be present in the merged \
+                 view alongside the primary's, got: {messages:?}"
+            );
+            assert_eq!(
+                app.lsp_clients.len(),
+                2,
+                "exactly two real clients - one primary, one companion - should exist for this \
+                 repo root, got: {:?}",
+                app.lsp_clients.keys().collect::<Vec<_>>()
+            );
+        });
+        println!(
+            "vue e2e: first real companion diagnostic reached the render path in \
+             {companion_diagnostic_at:?} from open_file_view"
+        );
+
+        // A real hover, through the facade's real companion fallback: the primary answers `null`
+        // for every position in a `.vue` file (real, expected hybrid-mode behavior), so a
+        // non-`None` result here can only have come from the companion via `LspConnection`.
+        let hover_deadline = Instant::now() + Duration::from_secs(120);
+        let hover_started = Instant::now();
+        let model = loop {
+            app.update(cx, |app, cx| {
+                app.hover = None;
+                app.request_hover(
+                    app_vue.clone(),
+                    SCRIPT_LINE,
+                    SCRIPT_BYTE_RANGE,
+                    SCRIPT_POSITION,
+                    cx,
+                );
+            });
+            loop {
+                cx.run_until_parked();
+                let settled = app.read_with(cx, |app, _| {
+                    matches!(
+                        app.hover.as_ref().map(|entry| &entry.status),
+                        Some(HoverStatus::Ready(_)) | Some(HoverStatus::Failed(_))
+                    )
+                });
+                if settled {
+                    break;
+                }
+                assert!(
+                    Instant::now() < hover_deadline,
+                    "AdeApp::hover never left its real Loading state within the real deadline"
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let resolved = app.update(cx, |app, _| match &app.hover {
+                Some(HoverEntry {
+                    status: HoverStatus::Ready(Some(model)),
+                    ..
+                }) => Some(model.clone()),
+                _ => None,
+            });
+            if let Some(model) = resolved {
+                break model;
+            }
+            assert!(
+                Instant::now() < hover_deadline,
+                "no real, non-empty hover ever came back for the genuine `bad` identifier in the \
+                 real .vue script block - the companion fallback in LspConnection::request is \
+                 what has to supply it, since the primary genuinely answers null there"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        };
+        println!(
+            "vue e2e: real hover resolved in {:?}: {model:?}",
+            hover_started.elapsed()
+        );
+        let rendered = format!("{model:?}");
+        assert!(
+            rendered.contains("bad") && rendered.contains("number"),
+            "the real hover should describe the genuine `const bad: number` declaration, got: \
+             {rendered}"
+        );
+
+        // Revision R11 audit finding 1, proven against the real toolchain rather than only against
+        // `lsp_connection_facade_tests`' small real servers: hover was never the only request the
+        // real primary answers emptily inside a `.vue` script block. Both of these go through the
+        // exact same `LspConnection::request` the production F12 handler and
+        // `AdeApp::schedule_lsp_sync`'s completion request use, and before this fix both came back
+        // empty here - go-to-definition as an empty *array* and completion as an empty
+        // `CompletionList`, neither of which the old null-only check recognized.
+        let connection = app
+            .read_with(cx, |app, _| app.lsp_connection_for_path(&app_vue))
+            .expect("both real halves are Ready by now");
+        let uri = lsp_core::LspClient::uri_for_path(&app_vue).expect("a real file:// uri");
+
+        let definition = retry_until_some(
+            Instant::now() + Duration::from_secs(120),
+            "no real go-to-definition ever came back for `shape` in the real .vue script block - \
+             the real vue-language-server answers an empty array there, so only the companion \
+             fallback in LspConnection::request can supply one",
+            || {
+                let params = lsp_core::lsp_types::GotoDefinitionParams {
+                    text_document_position_params:
+                        lsp_core::lsp_types::TextDocumentPositionParams {
+                            text_document: lsp_core::lsp_types::TextDocumentIdentifier {
+                                uri: uri.clone(),
+                            },
+                            position: REFERENCE_POSITION,
+                        },
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                };
+                match connection
+                    .request::<lsp_core::lsp_types::request::GotoDefinition>(
+                        params,
+                        LSP_QUERY_TIMEOUT,
+                    )
+                    .ok()
+                    .flatten()
+                {
+                    Some(lsp_core::lsp_types::GotoDefinitionResponse::Array(locations))
+                        if locations.is_empty() =>
+                    {
+                        None
+                    }
+                    other => other,
+                }
+            },
+        );
+        println!("vue e2e: real go-to-definition answer: {definition:?}");
+
+        let completions = retry_until_some(
+            Instant::now() + Duration::from_secs(120),
+            "no real completions ever came back after `shape.` in the real .vue script block - \
+             the real vue-language-server answers an empty items list there",
+            || {
+                let params = lsp_core::lsp_types::CompletionParams {
+                    text_document_position: lsp_core::lsp_types::TextDocumentPositionParams {
+                        text_document: lsp_core::lsp_types::TextDocumentIdentifier {
+                            uri: uri.clone(),
+                        },
+                        position: MEMBER_ACCESS_POSITION,
+                    },
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                    context: None,
+                };
+                let items = match connection
+                    .request::<lsp_core::lsp_types::request::Completion>(params, LSP_QUERY_TIMEOUT)
+                    .ok()
+                    .flatten()
+                {
+                    Some(lsp_core::lsp_types::CompletionResponse::Array(items)) => items,
+                    Some(lsp_core::lsp_types::CompletionResponse::List(list)) => list.items,
+                    None => Vec::new(),
+                };
+                (!items.is_empty()).then_some(items)
+            },
+        );
+        let labels: Vec<String> = completions.iter().map(|item| item.label.clone()).collect();
+        println!("vue e2e: real completion labels after `shape.`: {labels:?}");
+        assert!(
+            labels.iter().any(|label| label == "alpha")
+                && labels.iter().any(|label| label == "beta"),
+            "the real companion knows both members of the genuine `{{ alpha, beta }}` object, \
+             got: {labels:?}"
+        );
+    }
+
+    /// Calls `attempt` until it returns a real `Some` or `deadline` passes. Both real servers are
+    /// still settling for a while after the first diagnostic lands, so a single shot would be a
+    /// race; nothing is fabricated on timeout, the assertion just fails.
+    fn retry_until_some<T>(deadline: Instant, message: &str, attempt: impl Fn() -> Option<T>) -> T {
+        loop {
+            if let Some(value) = attempt() {
+                return value;
+            }
+            assert!(Instant::now() < deadline, "{message}");
+            std::thread::sleep(Duration::from_millis(300));
+        }
     }
 }

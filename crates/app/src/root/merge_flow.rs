@@ -1245,7 +1245,7 @@ mod merge_regression_tests {
     }
 
     /// Real merge-surface zoom: the active hunk's code rows must genuinely grow with
-    /// `AdeApp::code_zoom_percent`, mirroring `code_surface::code_zoom_tests::
+    /// `Settings.appearance.editor_zoom_percent`, mirroring `code_surface::code_zoom_tests::
     /// zoom_scales_text_but_not_the_gutter_width`'s real-bounds-measurement shape - see
     /// `merge_flow_render::AdeApp::render_conflict_columns`'s `zoom_scoped` wrap. Reaches a real
     /// `Conflicted` state through a real `git merge` (base and feature branches each edit line 2

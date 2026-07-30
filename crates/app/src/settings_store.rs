@@ -32,13 +32,25 @@
 //! [`AppearanceSettings`]'s scaling fields are each applied through their own narrow mechanism -
 //! see each field's own doc comment: `interface_scale_percent` scales text size at a growing
 //! (not exhaustive) list of render call sites via `crate::root::AdeApp::ui_text_size`;
-//! `editor_font_size` is Surface C's editor-zoom baseline
-//! (`crate::root::AdeApp::effective_code_rem_px`); `terminal_font_size` resizes
-//! `crate::terminal_pane::TerminalPane`'s live cells, grid, and pty; `per_tab_zoom` governs
-//! which of two zoom-persistence modes Surface C's zoom is in. `follow_system_text_size` stays
-//! persisted-only - investigated and found to have no real backing signal available (see
+//! `editor_font_size` and `editor_zoom_percent` together are Surface C's editor-zoom baseline and
+//! multiplier (`crate::root::AdeApp::effective_code_rem_px`); `terminal_font_size` resizes
+//! `crate::terminal_pane::TerminalPane`'s live cells, grid, and pty. `follow_system_text_size`
+//! stays persisted-only - investigated and found to have no real backing signal available (see
 //! `crate::root::settings_render`'s `toggle_follow_system_text_size` docs for the specific Linux
 //! GPUI APIs checked).
+//!
+//! ## Editor zoom is one global, persisted number now (was three overlapping mechanisms)
+//!
+//! Before this consolidation, "how big is the editor text" was governed by three separate,
+//! overlapping mechanisms: this same persisted `editor_font_size` baseline; an in-memory-only
+//! `AdeApp::code_zoom_percent` multiplier that got reset to 100% on every worktree switch
+//! (`AdeApp::select_worktree`); and an optional `AdeApp::file_zoom_percent` per-open-file
+//! override, gated by a `per_tab_zoom` toggle. None of the last two survived an app restart, and
+//! the worktree-reset meant even a single session's zoom wasn't stable while browsing worktrees.
+//! `editor_zoom_percent` replaces both: one real, `settings.toml`-persisted multiplier, applied
+//! uniformly to every open file, in every worktree, exactly like `editor_font_size` itself
+//! already was. `per_tab_zoom`, `AdeApp::file_zoom_percent`, and the worktree-reset are gone
+//! entirely - see `crate::root::code_surface`'s zoom methods for the surviving mechanism.
 //!
 //! [`ThemeSettings`] round-trips correctly but nothing in the render pipeline reads it yet to
 //! re-skin colours - `crate::theme` is a set of compile-time `const` colour tokens, not yet a
@@ -81,7 +93,13 @@ pub struct AppearanceSettings {
     pub editor_font_size: f32,
     pub terminal_font_size: f32,
     pub follow_system_text_size: bool,
-    pub per_tab_zoom: bool,
+    /// Surface C's global editor-zoom multiplier, applied on top of [`Self::editor_font_size`]
+    /// (`crate::root::AdeApp::effective_code_rem_px`) - see the module docs' "Editor zoom is one
+    /// global, persisted number now" section for why this replaced three overlapping mechanisms.
+    /// A percentage (`100` = unchanged), not raw pixels, so the toolbar's existing "100%"/"130%"
+    /// display and `code_surface::clamp_zoom_percent`'s step logic carry over unchanged - only
+    /// *where* the number lives (persisted here, globally) changed.
+    pub editor_zoom_percent: u16,
 }
 
 impl Default for AppearanceSettings {
@@ -91,7 +109,7 @@ impl Default for AppearanceSettings {
             editor_font_size: 13.0,
             terminal_font_size: 12.5,
             follow_system_text_size: false,
-            per_tab_zoom: true,
+            editor_zoom_percent: EDITOR_ZOOM_PERCENT_DEFAULT,
         }
     }
 }
@@ -109,6 +127,15 @@ pub const FONT_SIZE_MAX: f32 = 32.0;
 pub const INTERFACE_SCALE_PERCENT_MIN: u16 = 50;
 pub const INTERFACE_SCALE_PERCENT_MAX: u16 = 300;
 
+/// Editor-zoom range (70-200%, in steps of 10) and default (100%) - the single real source for
+/// these bounds. `crate::root::code_surface` re-exports these as `AdeApp::ZOOM_*` associated
+/// consts (unchanged names, so its own call sites and doc comments didn't need to move) rather
+/// than duplicating the literals.
+pub const EDITOR_ZOOM_PERCENT_MIN: u16 = 70;
+pub const EDITOR_ZOOM_PERCENT_MAX: u16 = 200;
+pub const EDITOR_ZOOM_PERCENT_STEP: u16 = 10;
+pub const EDITOR_ZOOM_PERCENT_DEFAULT: u16 = 100;
+
 impl AppearanceSettings {
     /// Clamps every numeric field into its documented range. UI mutators
     /// (`crate::root::settings_render`) already clamp their own edits; this exists so a
@@ -121,6 +148,9 @@ impl AppearanceSettings {
             .clamp(INTERFACE_SCALE_PERCENT_MIN, INTERFACE_SCALE_PERCENT_MAX);
         self.editor_font_size = self.editor_font_size.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX);
         self.terminal_font_size = self.terminal_font_size.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX);
+        self.editor_zoom_percent = self
+            .editor_zoom_percent
+            .clamp(EDITOR_ZOOM_PERCENT_MIN, EDITOR_ZOOM_PERCENT_MAX);
     }
 }
 
@@ -278,7 +308,7 @@ pub fn config_keys_line(page: ConfigPage) -> &'static str {
         ConfigPage::Appearance => {
             "appearance.interface_scale_percent \u{b7} appearance.editor_font_size \u{b7} \
              appearance.terminal_font_size \u{b7} appearance.follow_system_text_size \u{b7} \
-             appearance.per_tab_zoom"
+             appearance.editor_zoom_percent"
         }
         ConfigPage::Theme => {
             "theme.name \u{b7} theme.follow_system \u{b7} theme.high_contrast_diff"
@@ -385,7 +415,7 @@ mod tests {
         assert_eq!(settings.appearance.editor_font_size, 13.0);
         assert_eq!(settings.appearance.terminal_font_size, 12.5);
         assert!(!settings.appearance.follow_system_text_size);
-        assert!(settings.appearance.per_tab_zoom);
+        assert_eq!(settings.appearance.editor_zoom_percent, 100);
         assert_eq!(settings.theme.name, "Jerry Dark");
         assert!(!settings.theme.follow_system);
         assert!(!settings.theme.high_contrast_diff);
@@ -479,7 +509,8 @@ mod tests {
             "[appearance]\n\
              interface_scale_percent = 5000\n\
              editor_font_size = 900.0\n\
-             terminal_font_size = -12.0\n",
+             terminal_font_size = -12.0\n\
+             editor_zoom_percent = 9000\n",
         )
         .expect("write out-of-range file");
 
@@ -491,6 +522,42 @@ mod tests {
         );
         assert_eq!(loaded.appearance.editor_font_size, FONT_SIZE_MAX);
         assert_eq!(loaded.appearance.terminal_font_size, FONT_SIZE_MIN);
+        assert_eq!(
+            loaded.appearance.editor_zoom_percent, EDITOR_ZOOM_PERCENT_MAX,
+            "an absurdly large hand-edited zoom percentage must be clamped too"
+        );
+    }
+
+    /// The real regression guard for removing `per_tab_zoom`/`AdeApp::file_zoom_percent`: an old
+    /// `settings.toml` written before this consolidation has a real `per_tab_zoom` key under
+    /// `[appearance]` that no longer maps to any field. `serde`'s default (non-`deny_unknown_
+    /// fields`) behavior is to ignore unrecognized keys rather than fail the whole parse, so this
+    /// must still load cleanly and fall back to the new field's real default - not crash, and not
+    /// silently produce a `Settings::default()` fallback (which would also discard every *other*
+    /// real value the same file had set).
+    #[test]
+    fn an_old_settings_toml_with_the_removed_per_tab_zoom_key_still_loads_cleanly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "[appearance]\n\
+             interface_scale_percent = 110\n\
+             editor_font_size = 15.0\n\
+             terminal_font_size = 13.0\n\
+             follow_system_text_size = false\n\
+             per_tab_zoom = true\n",
+        )
+        .expect("write old-format file");
+
+        let loaded = Settings::load_or_init_at(&path);
+
+        assert_eq!(loaded.appearance.interface_scale_percent, 110);
+        assert_eq!(loaded.appearance.editor_font_size, 15.0);
+        assert_eq!(
+            loaded.appearance.editor_zoom_percent, EDITOR_ZOOM_PERCENT_DEFAULT,
+            "a field genuinely absent from an old file must fall back to its real default"
+        );
     }
 
     #[test]
@@ -500,7 +567,7 @@ mod tests {
             editor_font_size: 15.0,
             terminal_font_size: 13.5,
             follow_system_text_size: true,
-            per_tab_zoom: false,
+            editor_zoom_percent: 130,
         };
         let before = appearance.clone();
 

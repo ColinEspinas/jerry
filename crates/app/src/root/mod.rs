@@ -10,15 +10,23 @@
 //! resolves. `crate::file_tree::build_file_tree`'s `std::fs::read_dir` walk follows the same
 //! pattern.
 //!
-//! ## Selecting a worktree does not respawn a session
+//! ## One rail row per worktree; sessions are tabs scoped to it
 //!
 //! [`crate::sessions::Sessions`] holds any number of independent, simultaneously-running
 //! terminal sessions (a plain shell, or an agent CLI), each pinned to the worktree it was
-//! started in. Selecting a worktree in the sidebar only updates [`AdeApp::selected`] (which
-//! drives the file tree, and which worktree `active_session_cwd` resolves to for the *next*
-//! "New Shell"/"New Claude Session" click) - it never respawns or kills anything. Spawning a
-//! session is always its own explicit action (the toolbar buttons), never an implicit side
-//! effect of browsing.
+//! started in. The session rail shows exactly one row per worktree
+//! (`crate::rail::WorktreeRow`, aggregating every session open in it), and the centre pane's tab
+//! strip (`AdeApp::render_tab_strip`) only ever shows the *currently selected* worktree's own
+//! sessions - never a flat, unscoped list of every session across every worktree.
+//!
+//! Selecting a worktree in the sidebar still never spawns or kills anything - but, unlike
+//! before this revision, it *does* change which session is "active"
+//! (`crate::sessions::Sessions::activate_for_worktree`, called from [`AdeApp::select_worktree`]):
+//! the active session must always belong to the selected worktree, or the centre pane would show
+//! one worktree's terminal while the rail highlights another. [`AdeApp::selected`] itself still
+//! drives the file tree, and which worktree `active_session_cwd` resolves to for the *next* "New
+//! terminal"/"New agent pane" click - that part is unchanged. Spawning a session is still always
+//! its own explicit action, never an implicit side effect of browsing.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -46,9 +54,7 @@ use crate::layout;
 use crate::merge;
 use crate::palette;
 use crate::process_stats;
-use crate::rail::{
-    self, ProjectChild, RailMode, SessionRow, StatusGroup, WorktreeEntry, WorktreeNote,
-};
+use crate::rail::{self, RailMode, SessionRow, WorktreeEntry, WorktreeNote, WorktreeRow};
 use crate::sessions::{Session, SessionId, SessionKind, Sessions};
 use crate::settings::{self, SettingsPage};
 use crate::settings_store::{self, CfgFormat, Settings};
@@ -287,21 +293,10 @@ pub struct AdeApp {
     /// No column tracking: per-character hit-testing against a monospace run wasn't implemented
     /// this phase, so no column is shown at all rather than a fabricated `col 1`.
     code_cursor: Option<usize>,
-    /// Surface C's current editor zoom for whichever file [`Self::open_change`] names - a
-    /// percentage of `Settings.appearance.editor_font_size`'s 100% baseline, clamped to
-    /// `code_surface::ZOOM_MIN_PERCENT..=ZOOM_MAX_PERCENT` by
-    /// [`code_surface::clamp_zoom_percent`], written only through
-    /// [`Self::zoom_in`]/[`Self::zoom_out`]/[`Self::reset_zoom`].
-    code_zoom_percent: u16,
-    /// Each open file tab's independently-remembered zoom - only read/written while
-    /// `Settings.appearance.per_tab_zoom` is on; otherwise every tab shares
-    /// [`Self::code_zoom_percent`]. Keyed like [`Self::open_files`], so it gets the same
-    /// per-worktree reset in `reset_per_worktree_ui_state`.
-    file_zoom_percent: HashMap<PathBuf, u16>,
     /// Real, live per-tab text-editing state for the File view (Revision R8.5a) - keyed the same
-    /// way as [`Self::open_files`]/[`Self::file_zoom_percent`] (a worktree-relative path), so
-    /// switching between open file tabs never loses unsaved edits in a background tab. Created
-    /// lazily the first time a file is opened in File view (see
+    /// way as [`Self::open_files`] (a worktree-relative path), so switching between open file
+    /// tabs never loses unsaved edits in a background tab. Created lazily the first time a file
+    /// is opened in File view (see
     /// [`crate::root::code_surface::AdeApp::render_file_view`]), seeded from the exact same
     /// background read [`Self::spawn_file_load`] already performs. [`Self::file_view_cache`]
     /// stays the freshness-check/diagnostics/hover source of truth (the last-*saved* snapshot,
@@ -312,7 +307,10 @@ pub struct AdeApp {
     /// phase) would be a real, silent data-loss risk; reopening the same file later restores the
     /// exact in-memory buffer. Reset alongside `open_files` in `reset_per_worktree_ui_state` so a
     /// worktree switch doesn't leak another worktree's buffers, matching the same
-    /// per-worktree-reset convention `open_files`/`file_zoom_percent` already follow.
+    /// per-worktree-reset convention `open_files` already follows. (Editor zoom used to be
+    /// reset the same way too - see `settings_store`'s "Editor zoom is one global, persisted
+    /// number now" docs for why it no longer is: it moved to `Settings.appearance.
+    /// editor_zoom_percent`, a real persisted field, not per-worktree UI state.)
     edit_buffers: HashMap<PathBuf, edit_buffer::EditBuffer>,
     /// Every visible File-view row's real painted bounds and shaped line, captured by
     /// `crate::root::editing`'s per-row `gpui::canvas` paint callback each render - read back by
@@ -431,7 +429,7 @@ pub struct AdeApp {
     /// [`crate::rail::RailMode`].
     rail_mode: RailMode,
     /// The rail's filter query - filters the rendered session/worktree rows in both grouping
-    /// modes (see `crate::rail::filter_sessions`/`filter_project_children`).
+    /// modes (see `crate::rail::filter_sessions`/`filter_worktree_rows`).
     filter_query: String,
     filter_focus_handle: FocusHandle,
     /// Real `+N -M`/has-changes totals per worktree or session cwd, refreshed by the
@@ -665,6 +663,16 @@ pub struct AdeApp {
     /// keeping more than one warm isn't worth the memory. This still applies per-root, not
     /// per-(root, binary): switching worktrees evicts *every* language's client for the old
     /// root, not just one - see `lsp::lsp_client_eviction_tests` for the regression test.
+    ///
+    /// A language whose primary needs a coordinated companion process (see
+    /// `crate::language::CompanionServer` - Vue is the one real case) gets a **second,
+    /// independent entry** here, keyed by that companion's own distinct
+    /// `CompanionServer::client_key` rather than its bare binary name. That's deliberate: the
+    /// companion then goes through 100% of the same already-proven spawn/poll/evict machinery as
+    /// any other client, and its distinct key means a Vue-flavored `typescript-language-server`
+    /// (carrying an extra real plugin) can never collide with, or be silently reused as, the
+    /// plain one a `.ts` file in the same repo spawns. `crate::root::lsp::LspConnection` is what
+    /// presents a matched pair as one thing to callers.
     lsp_clients: HashMap<(PathBuf, &'static str), LspClientState>,
     /// Absolute paths that have already had `textDocument/didOpen` sent for their owning
     /// [`Self::lsp_clients`] entry - checked by [`Self::render_file_view`] so a re-render never
@@ -870,10 +878,29 @@ pub struct AdeApp {
     /// directly off this rather than a second, independently-computed offset that could drift
     /// once the rail's adjustable width shifts the button. `Bounds::default()` until first paint.
     plus_button_bounds: gpui::Bounds<Pixels>,
+    /// Which of the Windows/Linux title bar's five menu labels ([`title_bar::TitleMenu::ALL`])
+    /// has its real dropdown open right now, if any - see [`title_bar::render_title_menu`]'s own
+    /// docs. Closed the same way [`Self::plus_menu_open`] is: its own scrim click, picking a row,
+    /// and defensively by [`Self::open_palette`]/[`Self::open_settings`].
+    title_menu_open: Option<title_bar::TitleMenu>,
+    /// Each of the five title-bar menu labels' painted bounds, captured every render the same
+    /// `gpui::canvas` way [`Self::plus_button_bounds`] is - indexed by
+    /// [`title_bar::TitleMenu::index`]. [`title_bar::render_title_menu`] positions the open
+    /// menu's popover directly off the matching entry. `Bounds::default()` until first paint.
+    title_menu_button_bounds: [gpui::Bounds<Pixels>; title_bar::TitleMenu::ALL.len()],
     /// Every in-flight [`Self::new_agent_pane`] background `$PATH` detection - a [`TaskPool`]
     /// rather than a single slot, so two rapid "New agent pane" clicks each produce their own
     /// session instead of the second cancelling the first's still-in-flight search.
     _new_agent_pane_task: TaskPool,
+    /// Real "New file" creation state (`crate::root::new_file`) - `Some` only while the inline
+    /// name prompt is showing. See [`new_file::NewFileInputState`]'s own docs.
+    new_file_input: Option<new_file::NewFileInputState>,
+    new_file_focus_handle: FocusHandle,
+    /// The most recent "New file" attempt's real refusal (name already exists, empty name, a
+    /// path separator) - shown next to the inline prompt, mirroring [`Self::file_save_error`]'s
+    /// convention. Cleared by [`Self::start_new_file`]/[`Self::create_new_file`]'s own success
+    /// path.
+    new_file_error: Option<String>,
 }
 
 impl AdeApp {
@@ -1033,7 +1060,13 @@ impl Render for AdeApp {
             .when(self.plus_menu_open, |el| {
                 el.child(self.render_plus_menu(cx))
             })
+            .when_some(self.title_menu_open, |el, menu| {
+                el.child(self.render_title_menu(menu, cx))
+            })
             .children(self.render_completions_popover(cx))
+            .when(self.new_file_input.is_some(), |el| {
+                el.child(self.render_new_file_prompt(cx))
+            })
             .when(self.palette_open, |el| el.child(self.render_palette(cx)))
     }
 }
@@ -1375,6 +1408,7 @@ mod lsp;
 mod merge_editing;
 mod merge_flow;
 mod merge_flow_render;
+mod new_file;
 mod palette_render;
 mod rail_render;
 mod rem_scope;
