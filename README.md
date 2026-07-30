@@ -12,11 +12,15 @@ The UI is three fixed zones:
   CLI, rendered through genuine `alacritty_terminal` grid emulation (cursor-addressed
   redraw, not a scrolling text dump).
 - **Files / changes** (right) — a real recursive file tree, a real diff view against the
-  session's detected base branch, real merge-conflict resolution, and a read-only code
-  viewer with syntax highlighting and a real `rust-analyzer` LSP client (hover, go-to-
-  definition, diagnostics).
+  session's detected base branch, and a real code editor (not read-only): full text
+  editing with real cursor/selection/IME support, backed by a real LSP client (hover,
+  go-to-definition, diagnostics, completions) generalized across several languages, not
+  just Rust. Merge conflicts can be resolved either structurally (per-hunk accept/reject)
+  or by hand-editing the raw conflict markers directly, using the same real editor.
 
-There's also a command palette and a settings surface. See [BUILD-LOG.md](BUILD-LOG.md)
+There's also a command palette (with a real "History" group for undoing/redoing worktree-
+level actions like committing or discarding a session's changes) and a settings surface
+(including real Keybindings and Language Servers pages). See [BUILD-LOG.md](BUILD-LOG.md)
 for the full, step-by-step history of how each of these was built, and
 [ASSESSMENT.md](ASSESSMENT.md) for a candid end-of-build assessment of what's genuinely
 solid versus rough. This README does not repeat their content, and tries not to oversell
@@ -47,10 +51,16 @@ ASSESSMENT.md for why).
   enumeration) and the real **`git` CLI** (via explicit argument vectors, never shell
   strings) for anything that mutates the repository (worktree add/remove, merges).
 - **[`lsp-types`](https://crates.io/crates/lsp-types)** plus a hand-written client in
-  `lsp-core` for real `rust-analyzer` integration (not `vendor/zed`'s own LSP client —
-  see `crates/lsp-core/Cargo.toml` for why).
-- **`tree-sitter`** / **`tree-sitter-rust`** for real Rust syntax highlighting in the
-  code viewer.
+  `lsp-core` (not `vendor/zed`'s own LSP client — see `crates/lsp-core/Cargo.toml` for
+  why) that speaks to real, separately-installed language servers: `rust-analyzer`,
+  `typescript-language-server` (TS/TSX/JS/JSX), Vue Language Tools, `pyright`, and
+  `gopls`, auto-detected per-server from each server's own real `initialize` response
+  (e.g. push- vs. pull-based diagnostics) rather than assuming one protocol style fits
+  all of them. The Settings → Language Servers page has a real "Install" action linking
+  to each server's own install docs.
+- **`tree-sitter`**, with real grammars for Rust, TypeScript/TSX, and Python (the
+  languages with dedicated `tree-sitter-*` crates wired up so far — see
+  `crates/app/src/code_view.rs`), for syntax highlighting in the editor.
 
 ## Workspace layout
 
@@ -58,7 +68,7 @@ ASSESSMENT.md for why).
 crates/
   wt-core/    git worktree management (gix reads, git-CLI mutations)
   pty-core/   real PTY process spawning, I/O streaming, resize, process-tree teardown
-  lsp-core/   real LSP client (spawns and speaks LSP to rust-analyzer)
+  lsp-core/   real LSP client (spawns and speaks LSP to rust-analyzer and other servers)
   app/        the GPUI application itself (binary crate)
 vendor/zed/   a local checkout of zed-industries/zed — gitignored, see below
 assets/       bundled fonts (IBM Plex Sans/Mono, OFL) used by the app
