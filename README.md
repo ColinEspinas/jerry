@@ -39,10 +39,10 @@ ASSESSMENT.md for why).
 
 - **Rust**, pinned to the exact toolchain in [`rust-toolchain.toml`](rust-toolchain.toml)
   (currently `1.95.0`, with `rustfmt`/`clippy` components).
-- **[GPUI](https://www.gpui.rs/)** for the UI, pulled in as a path dependency on a local
-  checkout of [zed-industries/zed](https://github.com/zed-industries/zed) — see
-  [vendor/zed](#vendorzed-required-setup) below, this is **not optional** and the
-  workspace will not build without it.
+- **[GPUI](https://www.gpui.rs/)** for the UI, pulled in as a plain git dependency on
+  [zed-industries/zed](https://github.com/zed-industries/zed), pinned to a specific
+  commit (see [below](#gpui-version-pin)) — no local checkout or extra setup required,
+  Cargo fetches it like any other dependency.
 - **[`alacritty_terminal`](https://github.com/zed-industries/alacritty)** (the same fork
   and pinned revision Zed's own `terminal` crate uses) for real ANSI/grid terminal
   emulation, and **`portable-pty`** for spawning and managing the underlying PTY
@@ -51,7 +51,7 @@ ASSESSMENT.md for why).
   enumeration) and the real **`git` CLI** (via explicit argument vectors, never shell
   strings) for anything that mutates the repository (worktree add/remove, merges).
 - **[`lsp-types`](https://crates.io/crates/lsp-types)** plus a hand-written client in
-  `lsp-core` (not `vendor/zed`'s own LSP client — see `crates/lsp-core/Cargo.toml` for
+  `lsp-core` (not upstream Zed's own LSP client — see `crates/lsp-core/Cargo.toml` for
   why) that speaks to real, separately-installed language servers: `rust-analyzer`,
   `typescript-language-server` (TS/TSX/JS/JSX), Vue Language Tools, `pyright`, and
   `gopls`, auto-detected per-server from each server's own real `initialize` response
@@ -70,7 +70,6 @@ crates/
   pty-core/   real PTY process spawning, I/O streaming, resize, process-tree teardown
   lsp-core/   real LSP client (spawns and speaks LSP to rust-analyzer and other servers)
   app/        the GPUI application itself (binary crate)
-vendor/zed/   a local checkout of zed-industries/zed — gitignored, see below
 assets/       bundled fonts (IBM Plex Sans/Mono, OFL) used by the app
 design_handoff_jerry_ade/
               the design handoff this UI ("Jerry") was built from: a high-fidelity
@@ -80,26 +79,19 @@ design_handoff_jerry_ade/
 
 ## Building and running it
 
-### `vendor/zed` (required setup)
+### GPUI version pin
 
-`vendor/zed` is **not** a git submodule and is **not** committed to this repository — it's
-gitignored outright (see [`.gitignore`](.gitignore)) because it's a full checkout of a
-separate, very large upstream Cargo workspace. `crates/app/Cargo.toml` depends on
-`gpui_platform` via a path into it, and the root [`Cargo.toml`](Cargo.toml) depends on
-`gpui` the same way, so **the workspace will not build until this exists on disk**. Fetch
-the exact commit this workspace was built and verified against (also pinned in
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) as `ZED_VENDOR_COMMIT`):
-
-```sh
-git init vendor/zed
-git -C vendor/zed remote add origin https://github.com/zed-industries/zed
-git -C vendor/zed fetch --depth 1 origin 7b030b500810b04cf5fb4aa5973be99a502d9f36
-git -C vendor/zed checkout FETCH_HEAD
-```
+`gpui` and `gpui_platform` are plain git dependencies on
+[zed-industries/zed](https://github.com/zed-industries/zed), pinned via `rev =` in the
+root [`Cargo.toml`](Cargo.toml) and in `crates/app/Cargo.toml` to
+`7b030b500810b04cf5fb4aa5973be99a502d9f36` — the exact commit this workspace was built
+and verified against. Cargo fetches and builds it like any other git dependency; no local
+checkout or manual setup step is required.
 
 A different (e.g. newer) `zed-industries/zed` commit may or may not still build against
 this workspace's code — GPUI's API isn't stable across arbitrary upstream revisions. If
-you deliberately bump it, expect to fix real compile errors, not just update a hash.
+you deliberately bump it, update the `rev =` in **both** `Cargo.toml` files together and
+expect to fix real compile errors, not just update a hash.
 
 ### System dependencies (Linux)
 
@@ -119,7 +111,8 @@ sudo apt-get install -y \
   libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev
 ```
 
-This list is derived from (a trimmed-down subset of) `vendor/zed/script/linux`'s own
+This list is derived from (a trimmed-down subset of) upstream Zed's own
+[`script/linux`](https://github.com/zed-industries/zed/blob/main/script/linux)
 Ubuntu/Debian dependency list — see that script for the authoritative, exhaustive version,
 and the comment above the equivalent CI step in `.github/workflows/ci.yml` for what was
 trimmed and why. `libasound2-dev`/`libssl-dev`/`libsqlite3-dev`/`libzstd-dev` were dropped
@@ -182,7 +175,7 @@ the project's other hard rules.
 `.github/workflows/ci.yml` runs `cargo build`, `cargo test`, `cargo clippy -D warnings`,
 and `cargo fmt --check` on Linux (the platform this project can actually verify end to
 end), plus a build-only job on macOS and Windows. See that file's comments for the
-`vendor/zed` fetch strategy and the reasoning behind the trimmed system-dependency list.
+reasoning behind the trimmed system-dependency list.
 
 ## License
 

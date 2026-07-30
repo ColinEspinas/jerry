@@ -6,13 +6,6 @@ members = [
     "crates/lsp-core",
     "crates/app",
 ]
-# `vendor/zed` is its own separate Cargo workspace (it has its own `[workspace]` table
-# with its own `workspace.dependencies`, e.g. `accesskit`, that gpui's Cargo.toml
-# inherits from via `.workspace = true`). Without this exclude, Cargo treats every path
-# dependency under `vendor/zed` that isn't an explicit member as belonging to *this*
-# workspace instead, and gpui's manifest fails to parse because this workspace's
-# `[workspace.dependencies]` doesn't define those keys.
-exclude = ["vendor/zed"]
 
 [workspace.package]
 edition = "2021"
@@ -20,7 +13,11 @@ publish = false
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-gpui = { path = "vendor/zed/crates/gpui" }
+# Pinned to the exact zed-industries/zed commit this workspace was built and verified
+# against (see BUILD-LOG.md). Bump only deliberately, together with re-running the full
+# test/build/clippy suite - GPUI's API surface is not stable across arbitrary upstream
+# commits.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36" }
 anyhow = "1"
 thiserror = "1"
 # Real config-file (de)serialization for `crate::settings_store::Settings`

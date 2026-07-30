@@ -7,23 +7,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
-  # The exact zed-industries/zed commit this workspace's GPUI path dependencies
-  # (crates/app/Cargo.toml -> gpui_platform, and the workspace-level `gpui` dependency
-  # in the root Cargo.toml) were built and verified against. `vendor/zed` is
-  # intentionally NOT committed to this repository and is not a git submodule either
-  # (see .gitignore, which ignores `vendor/` outright, and BUILD-LOG.md's "Environment
-  # / setup decisions" section) — it's a full upstream checkout of a separate, very
-  # large Cargo workspace (excluded from this one via `[workspace] exclude` in the
-  # root Cargo.toml), so every job below fetches this exact commit fresh instead, via
-  # the shared `./.github/actions/fetch-vendor-zed` composite action (see its own
-  # `action.yml` for why this is a real, deliberately shallow `git fetch --depth 1`
-  # rather than a plain Cargo `git = "...", rev = "..."` dependency).
-  #
-  # Bump this only deliberately, together with re-checking out that commit locally
-  # and re-running the full test/build/clippy suite against it (see CONTRIBUTING.md)
-  # - never as a side effect of an unrelated change, since GPUI's API surface is not
-  # stable across arbitrary upstream commits.
-  ZED_VENDOR_COMMIT: 7b030b500810b04cf5fb4aa5973be99a502d9f36
 
 jobs:
   # Full verification on Linux: this is the platform this project is actually
@@ -40,11 +23,6 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
-
-      - name: Fetch vendor/zed (pinned commit)
-        uses: ./.github/actions/fetch-vendor-zed
-        with:
-          commit: ${{ env.ZED_VENDOR_COMMIT }}
 
       # System libraries GPUI's Linux backend (both the `wayland` and `x11`
       # gpui_platform features are compiled in, Revision R12 - see that file's own
@@ -194,11 +172,6 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Fetch vendor/zed (pinned commit)
-        uses: ./.github/actions/fetch-vendor-zed
-        with:
-          commit: ${{ env.ZED_VENDOR_COMMIT }}
-
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master
         with:
@@ -226,11 +199,6 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
-
-      - name: Fetch vendor/zed (pinned commit)
-        uses: ./.github/actions/fetch-vendor-zed
-        with:
-          commit: ${{ env.ZED_VENDOR_COMMIT }}
 
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master

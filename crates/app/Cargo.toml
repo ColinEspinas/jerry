@@ -153,7 +153,7 @@ tree-sitter-javascript = "0.23.1"
 # `"freebsd"` as one of its real cases) already treats as a supported target elsewhere in this
 # crate.
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
-gpui_platform = { path = "../../vendor/zed/crates/gpui_platform", features = [
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36", features = [
     "wayland",
     "x11",
 ] }
@@ -161,12 +161,12 @@ gpui_platform = { path = "../../vendor/zed/crates/gpui_platform", features = [
 # macOS: `gpui_macos` is pulled in by `gpui_platform` itself purely from `target_os`, so no
 # feature request is needed or possible here.
 [target.'cfg(target_os = "macos")'.dependencies]
-gpui_platform = { path = "../../vendor/zed/crates/gpui_platform" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36" }
 
 # Windows: same as macOS - `gpui_windows` (and `gpui`'s own `windows-manifest` feature) are
 # pulled in automatically by `gpui_platform`'s own Windows target section.
 [target.'cfg(target_os = "windows")'.dependencies]
-gpui_platform = { path = "../../vendor/zed/crates/gpui_platform" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36" }
 
 [dev-dependencies]
 tempfile = "3"
