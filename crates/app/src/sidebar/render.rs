@@ -21,72 +21,90 @@ impl AdeApp {
     }
 
     /// Toggles a directory's expanded state - `crate::sidebar::file_tree::visible_entries` does
-    /// the actual hiding at render time, and [`Self::set_dir_expanded`] records the change on
-    /// disk before this returns.
+    /// the actual hiding at render time, and [`Self::set_dir_expanded`] records the change in
+    /// memory and queues an immediate background write of it (never a write awaited here on the
+    /// foreground thread).
     pub(crate) fn toggle_dir_expanded(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let expanded = !self.expanded_dirs.contains(&path);
         self.set_dir_expanded(path, expanded, cx);
     }
 
-    /// The single write path for one directory's expanded state: live set, persisted
-    /// [`AdeApp::fold_state`], and a real disk write, always together (GitHub issue #18 §2 -
-    /// "expanding or collapsing a folder is recorded immediately, not only on clean exit").
-    ///
-    /// The disk write is skipped only when `fold_state` reports that nothing actually changed -
-    /// a genuine no-op, not a debounce.
+    /// Records one directory's expanded state in the live set and in the persisted
+    /// [`AdeApp::fold_state`] - **the** single place either is mutated for a single directory, so
+    /// [`Self::set_dir_expanded`] and [`Self::reveal_in_tree`] can't drift apart (they used to be
+    /// two hand-copied bodies, log string and all). Returns whether the persisted state changed,
+    /// leaving the caller to decide when to write and when to notify: a reveal touches a whole
+    /// ancestor chain and wants one write for all of it, not one per level.
     ///
     /// The tree still expands when the state is *refusable* (a non-UTF-8 path, which has no
     /// honest TOML key - see `fold_state::worktree_key`): silently declining to open a folder
     /// because of how its name is encoded would be a far worse outcome than not remembering that
     /// it was opened. But it says so in the log rather than leaving the live tree and the file
     /// quietly disagreeing.
+    ///
+    /// Uses the cached [`AdeApp::fold_state_root_key`], never `fold_state::worktree_key` - see
+    /// that field's docs for the blocking-syscall-per-click this avoids.
+    fn record_dir_expanded(&mut self, path: &Path, expanded: bool) -> bool {
+        if expanded {
+            self.expanded_dirs.insert(path.to_path_buf());
+        } else {
+            self.expanded_dirs.remove(path);
+        }
+        let root = self.file_tree_root.clone();
+        let outcome = match self.fold_state_root_key.clone() {
+            Some(root_key) => {
+                let outcome = self
+                    .fold_state
+                    .set_expanded_with_key(&root_key, &root, path, expanded);
+                if outcome == fold_state::SetExpanded::Changed {
+                    // Claimed here rather than at each call site: "I changed this worktree's
+                    // entry" and "this worktree's entry is mine to overwrite on the next merged
+                    // write" are the same fact, and splitting them is how one of them gets
+                    // forgotten.
+                    self.fold_state_owned.insert(root_key);
+                }
+                outcome
+            }
+            None => fold_state::SetExpanded::Refused,
+        };
+        if outcome == fold_state::SetExpanded::Refused {
+            log::warn!(
+                "not recording the fold state of {} under {}: it is not a plain UTF-8 path \
+                 inside that worktree, so this expansion won't survive a restart",
+                path.display(),
+                root.display()
+            );
+        }
+        outcome == fold_state::SetExpanded::Changed
+    }
+
+    /// One directory's expand/collapse, recorded and queued for an immediate background write
+    /// (GitHub issue #18 §2 - "expanding or collapsing a folder is recorded immediately, not only
+    /// on clean exit"). The write is queued, not awaited: see [`AdeApp::persist_fold_state`] for
+    /// the serial writer loop it hands off to, and what happens when that write fails.
     pub(crate) fn set_dir_expanded(
         &mut self,
         path: PathBuf,
         expanded: bool,
         cx: &mut Context<Self>,
     ) {
-        if expanded {
-            self.expanded_dirs.insert(path.clone());
-        } else {
-            self.expanded_dirs.remove(&path);
-        }
-        let root = self.file_tree_root.clone();
-        match self.fold_state.set_expanded(&root, &path, expanded) {
-            fold_state::SetExpanded::Changed => {
-                self.claim_fold_state_for(&root);
-                self.persist_fold_state(cx);
-            }
-            fold_state::SetExpanded::Unchanged => {}
-            fold_state::SetExpanded::Refused => log::warn!(
-                "not recording the fold state of {} under {}: it is not a plain UTF-8 path \
-                 inside that worktree, so this expansion won't survive a restart",
-                path.display(),
-                root.display()
-            ),
+        if self.record_dir_expanded(&path, expanded) {
+            self.persist_fold_state(cx);
         }
         cx.notify();
-    }
-
-    /// Marks this worktree as one whose fold-state entry this instance owns and may overwrite -
-    /// see [`AdeApp::fold_state_owned`] and `crate::sidebar::fold_state`'s module docs for the
-    /// second-running-instance clobber this prevents.
-    fn claim_fold_state_for(&mut self, root: &Path) {
-        if let Some(key) = fold_state::worktree_key(root) {
-            self.fold_state_owned.insert(key);
-        }
     }
 
     /// "Collapse all" - resets the tree *and* the saved state for this worktree in one step
     /// (issue #18 §1), so relaunching doesn't bring the old expansions back.
     pub(crate) fn collapse_all_dirs(&mut self, cx: &mut Context<Self>) {
-        let root = self.file_tree_root.clone();
         self.expanded_dirs.clear();
-        if self.fold_state.clear_worktree(&root) {
-            // Claimed *because* the entry is now gone: the merge on write treats an owned key's
-            // absence as a real deletion, which is exactly what this action means.
-            self.claim_fold_state_for(&root);
-            self.persist_fold_state(cx);
+        if let Some(root_key) = self.fold_state_root_key.clone() {
+            if self.fold_state.clear_worktree_with_key(&root_key) {
+                // Claimed *because* the entry is now gone: the merge on write treats an owned
+                // key's absence as a real deletion, which is exactly what this action means.
+                self.fold_state_owned.insert(root_key);
+                self.persist_fold_state(cx);
+            }
         }
         cx.notify();
     }
@@ -112,25 +130,16 @@ impl AdeApp {
                 // record under this worktree's key.
                 break;
             }
-            self.expanded_dirs.insert(ancestor.to_path_buf());
-            // A refusal here is the same non-UTF-8 case [`Self::set_dir_expanded`] documents -
-            // the reveal still happens, it just isn't recorded - and it gets the same log line
-            // rather than leaving the live tree and the file silently disagreeing.
-            match self.fold_state.set_expanded(&root, ancestor, true) {
-                fold_state::SetExpanded::Changed => changed = true,
-                fold_state::SetExpanded::Unchanged => {}
-                fold_state::SetExpanded::Refused => log::warn!(
-                    "not recording the fold state of {} under {}: it is not a plain UTF-8 path \
-                     inside that worktree, so this expansion won't survive a restart",
-                    ancestor.display(),
-                    root.display()
-                ),
-            }
+            // The same real recording path a manual click takes, refusal logging included -
+            // one shared helper, not a second copy of it.
+            changed |= self.record_dir_expanded(ancestor, true);
         }
         if changed {
-            self.claim_fold_state_for(&root);
             self.persist_fold_state(cx);
         }
+        // A reveal genuinely changes what the tree shows, so it must repaint on its own rather
+        // than relying on every caller happening to notify afterwards.
+        cx.notify();
     }
 
     /// Drops fold-state entries for directories that no longer exist, against the tree that has
@@ -150,14 +159,29 @@ impl AdeApp {
         }
         let dirs = file_tree::directory_paths(&self.file_tree);
         let root = self.file_tree_root.clone();
-        let mut changed = self.fold_state.prune_missing_dirs(&root, &dirs);
+        let Some(root_key) = self.fold_state_root_key.clone() else {
+            return;
+        };
+        let mut changed = self
+            .fold_state
+            .prune_missing_dirs_with_key(&root_key, &root, &dirs);
         let before = self.expanded_dirs.len();
         self.expanded_dirs.retain(|path| dirs.contains(path));
         changed |= self.expanded_dirs.len() != before;
         if changed {
-            self.claim_fold_state_for(&root);
+            self.fold_state_owned.insert(root_key);
             self.persist_fold_state(cx);
         }
+    }
+
+    /// Whether the current walk budget is already at [`file_tree::MAX_LOAD_MORE_ENTRIES`], so
+    /// [`Self::load_more_file_tree_entries`] has nothing left to raise - the condition that turns
+    /// the sidebar's action row into a plain disclosure rather than a button that re-walks a
+    /// ceiling's worth of entries to no effect.
+    pub(crate) fn file_tree_limit_is_at_ceiling(&self) -> bool {
+        self.file_tree_limit_override
+            .unwrap_or(self.settings.file_tree.max_entries)
+            >= file_tree::MAX_LOAD_MORE_ENTRIES
     }
 
     /// The "load more" action's real handler - re-walks the current tree with a tenfold larger
@@ -168,15 +192,23 @@ impl AdeApp {
         let current = self
             .file_tree_limit_override
             .unwrap_or(self.settings.file_tree.max_entries);
-        // Ceilinged, not just `saturating_mul`: seven clicks from the 20,000 default would
-        // otherwise reach `usize::MAX`, at which point "still a real cap" would be true only
-        // literally. A million entries is already far past any tree this sidebar can usefully
-        // show, and the row keeps naming where the walk stopped either way.
-        self.file_tree_limit_override = Some(
-            current
-                .saturating_mul(10)
-                .min(file_tree::MAX_LOAD_MORE_ENTRIES),
-        );
+        // Ceilinged *and* monotonic. The ceiling is why this can't escalate into the unbounded
+        // walk again (see `file_tree::MAX_LOAD_MORE_ENTRIES`); the `.max(current)` is a real bug
+        // fix rather than defensive padding - a `max_entries` above the ceiling would otherwise
+        // make one click *shrink* the budget, so "load more" would visibly remove rows from the
+        // tree. A limit this action produces can never be smaller than the one it replaced.
+        let next = current
+            .saturating_mul(10)
+            .min(file_tree::MAX_LOAD_MORE_ENTRIES)
+            .max(current);
+        if next == current {
+            // Already at the ceiling: re-walking would burn a whole budget's worth of work to
+            // produce byte-identical rows. `render_file_tree` doesn't offer the action at all in
+            // this state (it renders a plain disclosure instead); this is the same fact enforced
+            // at the handler, so no other caller can reintroduce the dead-but-expensive click.
+            return;
+        }
+        self.file_tree_limit_override = Some(next);
         self.load_file_tree(self.file_tree_root.clone(), cx);
     }
 
@@ -305,9 +337,11 @@ impl AdeApp {
             cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
                 // Both the row range and each index into `file_tree` are clamped/checked rather
                 // than trusted, so a future divergence degrades to "renders fewer rows" instead
-                // of panicking.
-                let start = range.start.min(visible_indices.len());
+                // of panicking. `start` is clamped to `end`, not just to the length: clamping
+                // only the upper bound still leaves `start > end`, which panics in the slice
+                // expression below rather than degrading.
                 let end = range.end.min(visible_indices.len());
+                let start = range.start.min(end);
                 visible_indices[start..end]
                     .iter()
                     .filter_map(|index| this.file_tree.get(*index).cloned())
@@ -344,7 +378,20 @@ impl AdeApp {
         // (`Self::load_more_file_tree_entries`). Only ever shown when the walk genuinely stopped
         // early, and it names the exact count it stopped at rather than implying a total it
         // cannot know without walking the rest.
-        if self.file_tree_truncated {
+        if self.file_tree_truncated && self.file_tree_limit_is_at_ceiling() {
+            // The honest end of the escalation: still truncated, but no larger budget is
+            // available, so an action here would be a button that re-walks a whole ceiling's
+            // worth of entries to produce exactly the same rows. A plain, non-interactive
+            // disclosure instead - it still names the count, so the listing is never *silently*
+            // cut off, which is the actual requirement.
+            column = column.child(render_sidebar_message(
+                format!(
+                    "Showing the first {} entries (the most this tree can load)",
+                    self.file_tree.len()
+                ),
+                theme::text::FAINT.into(),
+            ));
+        } else if self.file_tree_truncated {
             let loaded = self.file_tree.len();
             column = column.child(
                 div()
@@ -1982,6 +2029,176 @@ mod fold_state_tests {
             Some(100),
             "the escape hatch raises the bound tenfold - it never removes it, or one click on a \
              pathological tree would pull the whole thing into memory"
+        );
+    }
+
+    /// CRITICAL 1: "load more" must never *shrink* the budget. With a `max_entries` above the
+    /// escalation ceiling, the old `saturating_mul(10).min(ceiling)` computed a smaller limit
+    /// than the one already in force, so clicking "load more" would visibly remove rows from the
+    /// tree.
+    #[gpui::test]
+    fn load_more_can_never_shrink_the_walk_budget(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let state_dir = TempDir::new().expect("tempdir");
+        seed_tree(&repo);
+        // Deliberately above `MAX_LOAD_MORE_ENTRIES`. `sanitize` clamps this on load from a real
+        // file, so this is constructed directly - the handler must still be correct for it.
+        let mut settings = settings_store::Settings::default();
+        settings.file_tree.max_entries = file_tree::MAX_LOAD_MORE_ENTRIES * 5;
+
+        let (app, cx) = open_app_with_state_dir_and_settings(
+            cx,
+            repo.path().to_path_buf(),
+            state_dir.path().join("settings.toml"),
+            settings,
+        );
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| app.load_more_file_tree_entries(cx));
+        cx.run_until_parked();
+
+        let effective = app.read_with(cx, |app, _| {
+            app.file_tree_limit_override
+                .unwrap_or(app.settings.file_tree.max_entries)
+        });
+        assert!(
+            effective >= file_tree::MAX_LOAD_MORE_ENTRIES * 5,
+            "the effective walk budget went *down* from {} to {effective} - one click on \
+             `load more` would remove rows from the tree",
+            file_tree::MAX_LOAD_MORE_ENTRIES * 5
+        );
+    }
+
+    /// CRITICAL 1, other half: once the budget is at the ceiling and the walk is *still*
+    /// truncated, the row must stop being an action. Clicking it would re-walk a whole ceiling's
+    /// worth of entries to produce byte-identical rows.
+    ///
+    /// The at-the-ceiling state is set directly rather than reached by walking: producing it
+    /// honestly needs `MAX_LOAD_MORE_ENTRIES` real files on disk. Everything asserted *from* that
+    /// precondition is real behaviour - what renders, and what the handler does.
+    #[gpui::test]
+    fn at_the_ceiling_the_row_stops_being_a_button(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let state_dir = TempDir::new().expect("tempdir");
+        seed_tree(&repo);
+
+        let (app, cx) = open_app_with_state_dir(
+            cx,
+            repo.path().to_path_buf(),
+            state_dir.path().join("settings.toml"),
+        );
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.file_tree_truncated = true;
+            app.file_tree_limit_override = Some(file_tree::MAX_LOAD_MORE_ENTRIES);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("file-tree-show-all").is_none(),
+            "at the ceiling there is nothing left to load, so the clickable row must be gone - \
+             a button that re-walks a ceiling's worth of entries for identical results is worse \
+             than no button"
+        );
+
+        let before = app.read_with(cx, |app, _| app.file_tree_limit_override);
+        app.update(cx, |app, cx| app.load_more_file_tree_entries(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.file_tree_limit_override),
+            before,
+            "and the handler itself must be a no-op at the ceiling, not just unreachable"
+        );
+    }
+
+    /// CRITICAL 2: the canonicalized worktree key is resolved once per real root change and
+    /// cached, because `worktree_key` calls the blocking `std::fs::canonicalize` and the callers
+    /// are clicks and per-ancestor reveals. What's asserted here is the part that would actually
+    /// break if the cache were wrong: reaching a worktree through a symlink must record against
+    /// the *canonical* path, and a reveal through that symlink must still persist.
+    #[cfg(unix)]
+    #[gpui::test]
+    fn the_cached_worktree_key_is_canonical_and_records_through_a_symlink(cx: &mut TestAppContext) {
+        let real = TempDir::new().expect("tempdir");
+        let link_parent = TempDir::new().expect("tempdir");
+        seed_tree(&real);
+        let link = link_parent.path().join("linked-worktree");
+        std::os::unix::fs::symlink(real.path(), &link).expect("symlink");
+        let state_dir = TempDir::new().expect("tempdir");
+
+        let (app, cx) =
+            open_app_with_state_dir(cx, link.clone(), state_dir.path().join("settings.toml"));
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.fold_state_root_key.clone()),
+            crate::sidebar::fold_state::worktree_key(&link),
+            "the cached key must be the canonicalized one, so the same worktree reached through \
+             a symlink and through its real path is one entry rather than two"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_palette_file_result(link.join("src/app/main.rs"), window, cx);
+        });
+        cx.run_until_parked();
+
+        // Reopening against the *real* path must see what was recorded through the symlink.
+        let (reloaded, cx) = open_app_with_state_dir(
+            cx,
+            real.path().to_path_buf(),
+            state_dir.path().join("settings.toml"),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            reloaded.read_with(cx, |app, _| expanded_names(app)),
+            vec!["src".to_string(), "src/app".to_string()],
+            "a symlinked and a direct open of one worktree must share one fold-state entry"
+        );
+    }
+
+    /// CRITICAL 4: a write that fails must not silently drop the change. The pending flag is
+    /// cleared *before* the write, so without an explicit re-queue on error the user's
+    /// expand/collapse is lost with only a log line - directly contradicting this feature's
+    /// "recorded immediately" claim.
+    ///
+    /// The failure is real, not injected: the settings path's parent is a regular *file*, so the
+    /// `create_dir_all` inside `FoldState::save_at` fails on every attempt.
+    #[gpui::test]
+    fn a_failed_fold_state_write_is_requeued_rather_than_dropped(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let state_dir = TempDir::new().expect("tempdir");
+        seed_tree(&repo);
+        let blocker = state_dir.path().join("not-a-directory");
+        fs::write(
+            &blocker,
+            "this is a file, so nothing can be created inside it",
+        )
+        .expect("write");
+
+        let (app, cx) =
+            open_app_with_state_dir(cx, repo.path().to_path_buf(), blocker.join("settings.toml"));
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.toggle_dir_expanded(repo.path().join("src"), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.fold_state_save_pending),
+            "after a failing write the change must still be pending a retry - clearing the flag \
+             before the write and not restoring it on error loses the change outright"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.fold_state_save_running),
+            "and the writer loop must still be alive to perform that retry"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.expanded_dirs.len()) == 1,
+            "the live tree keeps the expansion regardless - a failing disk is not a reason to \
+             refuse to open a folder"
         );
     }
 

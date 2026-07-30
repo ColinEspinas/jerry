@@ -2099,7 +2099,9 @@ in an unexpanded folder) now expands ancestors and records those expansions like
 with the row-builder closure, instead of re-walking the whole loaded tree on each of
 `uniform_list`'s three per-frame closure calls.
 
-An adversarial audit of the first draft found seven real problems, all fixed: `save_at` claimed
+An adversarial **self-review** of the first draft - a checker sub-agent the builder dispatched
+against its own work, not an independent or external audit - found seven real problems, all
+fixed: `save_at` claimed
 crash-safety it didn't have (no `fsync`, so only *process* crash was covered); a fixed `.tmp`
 name meant two `jerry` processes could interleave into one torn file, and whole-file writes made
 the last saver silently erase every other repository's state (writes now merge against a set of
@@ -2114,12 +2116,13 @@ on a still-rendered stale row recorded state against the wrong root; the live tr
 could diverge silently when a path wasn't recordable (now a three-state outcome and a real log
 line, with the expansion still happening - refusing to open a folder because of how its name is
 encoded would be worse than not remembering it); and one test asserted on state it had
-hand-written itself rather than on a walk that genuinely truncated. The audit also confirmed the
-absolute-positioning assumption directly against vendored taffy: absolute insets resolve against
+hand-written itself rather than on a walk that genuinely truncated. That same self-review also
+confirmed the absolute-positioning assumption directly against vendored taffy: absolute insets resolve against
 the container's border box, not its padding box, so a guide's `left` really is measured from the
 row's own left edge despite the row's left padding.
 
-A second audit of those fixes then caught the worst bug of the whole change: the merged write was
+A second self-review pass over those fixes (same mechanism, same caveat - the builder reviewing
+its own work) then caught the worst bug of the whole change: the merged write was
 *written but never wired* - one edit had silently failed to apply, so `persist_fold_state` still
 called the whole-file `save_at`, `save_merged_at` was reachable only from its own unit test, and
 `fold_state_owned` was write-only dead state, while three doc comments and this log claimed
@@ -2127,7 +2130,8 @@ otherwise. The unit test couldn't catch it (it called the unused function direct
 existing app-level leak test couldn't either (its second instance started before the first ever
 wrote, so a whole-file write preserved both). The regression test added for it drives the exact
 ordering that distinguishes the two - instance B starts, *then* A writes, *then* B writes - and
-was confirmed to fail against the un-wired version before being kept. The same round also found
+was confirmed to fail against the un-wired version before being kept. The same self-review round
+also found
 two more walk paths that could report an incomplete listing as complete (a `DirEntry` that errors
 mid-iteration, and a `file_type()` failure recording a real directory as a file - either one
 would have let pruning delete good fold state), a silent `Refused` in `reveal_in_tree` that
@@ -2139,7 +2143,55 @@ entries" behaviour. The remaining honest gap is stated in `fold_state`'s own mod
 than papered over: the merge is an unlocked read-modify-write, so two saves that genuinely
 interleave can still lose one update - it narrows the window rather than closing it.
 
+A third review round - this one genuinely independent, dispatched by the coordinator rather than
+by the builder - found four more real bugs, all fixed with revert-verified regression tests
+(each test was confirmed to fail against the pre-fix code before being kept):
+
+1. **"Load more" could shrink the tree.** `FileTreeSettings::sanitize` clamped `max_entries` up
+   but never down, so a hand-edited `max_entries` above the escalation ceiling made
+   `saturating_mul(10).min(ceiling)` compute a *smaller* budget than the one already in force -
+   one click on "load more" would visibly remove rows. The escalation is now monotonic
+   (`.max(current)`) and `max_entries` has a real upper clamp. Separately, once the ceiling was
+   reached the row remained a button that re-walked a full budget's worth of entries to produce
+   byte-identical results; at the ceiling it is now a plain, non-interactive disclosure, enforced
+   both in the render and in the handler.
+2. **Blocking `canonicalize` on the foreground thread, per gesture.** `fold_state::worktree_key`
+   calls `std::fs::canonicalize`, and it was being called once per expand/collapse and once *per
+   ancestor* in "reveal in tree" - up to a dozen blocking syscalls per gesture, which on a stale
+   NFS/FUSE mount is a frozen window rather than a slow one. The key is now resolved once per real
+   root change into `AdeApp::fold_state_root_key`, with `*_with_key` variants on `FoldState` for
+   every hot path. Resolving it lives in exactly one function (`set_file_tree_root`): the first
+   draft of this fix had the constructor computing it a second time, which the revert-verification
+   caught by passing when it should have failed - a real drift risk, closed by making startup go
+   through the same chokepoint as every later switch.
+3. **Unbounded main-thread work at the load ceiling.** Two foreground costs scale linearly with
+   loaded entries (`rebuild_palette_file_candidates` on load, the visible-row scan per frame), so
+   the ceiling was lowered to a number they can genuinely absorb, and `max_entries` clamps to the
+   same value. The sidebar still discloses the stop point, so this is a bounded honest cap rather
+   than a silent one.
+4. **A failed fold-state write was dropped.** The writer loop cleared its pending flag *before*
+   the write, so a real failure (full disk, read-only `~/.config`) lost the user's expand/collapse
+   with only a `log::warn!` - while the feature's whole claim is "recorded immediately". Failures
+   now re-queue with linear backoff and a bounded attempt budget, after which the next real
+   expand/collapse starts a fresh one.
+
+The same round also fixed: `reveal_in_tree` being a hand-copied second implementation of
+`set_dir_expanded`'s body (both now share one `record_dir_expanded`, and the reveal's missing
+`cx.notify()` - which worked only because every caller happened to notify afterwards - is gone);
+`theme::tree`'s two tokens being hand-copied hex duplicates instead of real aliases of
+`border::DIVIDER`/`border::SELECTED_EDGE`; a row-range clamp that guarded only the upper bound and
+would still have panicked on `start > end`; a doc comment claiming a fold change was written to
+disk "before this returns" when it is queued; the settings module's "every field is page-backed"
+invariant, which `file_tree.max_entries` genuinely breaks (now a documented exception rather than
+a quiet violation); and the missing test for the non-UTF-8 path refusal. The
+same-worktree-open-twice limitation of the merge (each instance replaces that key's whole entry,
+so two instances of one worktree revert each other for as long as both run) is now written down in
+`fold_state`'s module docs instead of being papered over by the "narrow window" claim, which was
+only true for the different-worktree case.
+
 All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`,
 `cargo clippy --workspace --all-targets -- -D warnings`, and
-`cargo test --workspace --lib -- --test-threads=1` - 790 app (up from 742: 48 new tests, none
-removed) + 42 lsp-core + 14 pty-core + 98 wt-core.
+`cargo test --workspace --lib -- --test-threads=1` - 795 app (up from 742: 53 new tests, none
+removed) + 42 lsp-core + 14 pty-core + 98 wt-core. One full run hit the project's known
+diff-rendering flake (`opening_a_real_diff_renders_real_syntax_highlighted_rows`); it passed alone,
+passed with its whole module, and the next full run was green with no other change.

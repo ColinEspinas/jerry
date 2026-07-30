@@ -197,6 +197,15 @@ pub(crate) type DiffHighlightCache = (
     Vec<Vec<(Option<usize>, Option<usize>)>>,
 );
 
+/// How many times [`AdeApp::persist_fold_state`]'s writer loop retries a failing write before
+/// giving up on it. Bounded so a permanently broken path (a read-only `~/.config`, say) can't
+/// spin the loop forever; the next real expand/collapse starts a fresh budget, since a new user
+/// action is the honest trigger for trying again.
+pub(crate) const FOLD_STATE_SAVE_MAX_ATTEMPTS: u32 = 5;
+
+/// Multiplied by the attempt number for [`AdeApp::persist_fold_state`]'s linear retry backoff.
+pub(crate) const FOLD_STATE_SAVE_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+
 /// How often [`AdeApp::ensure_lsp_poll_task`]'s background loop checks for a newly-arrived
 /// `publishDiagnostics` notification. Coarser than `crate::terminal::pane::POLL_INTERVAL` (8ms):
 /// pty output is latency-sensitive, rust-analyzer's diagnostics are not.
@@ -246,6 +255,15 @@ pub struct AdeApp {
     /// [`Self::settings_path`], and `None` for exactly the same tests that get a `None` settings
     /// path, which makes a fold-state save a real no-op rather than a special-cased test skip.
     pub(crate) fold_state_path: Option<PathBuf>,
+    /// [`Self::file_tree_root`]'s resolved `fold_state::worktree_key`, recomputed exactly once
+    /// per real root change (`Self::set_file_tree_root`) rather than per lookup. That caching is
+    /// not a micro-optimization: `worktree_key` calls `std::fs::canonicalize`, and the callers
+    /// are an expand/collapse click and - once per ancestor - a "reveal in tree", so resolving it
+    /// on demand meant up to a dozen blocking syscalls on the foreground thread per gesture,
+    /// which on a stale NFS/FUSE mount is a frozen window rather than a slow one. `None` when the
+    /// root isn't valid UTF-8 (see `worktree_key`), which makes every record attempt a logged
+    /// refusal instead of a silent mis-key.
+    pub(crate) fold_state_root_key: Option<String>,
     /// The `fold_state::worktree_key`s this instance has recorded anything for - what
     /// [`Self::persist_fold_state`] hands `FoldState::save_merged_at` as "mine to overwrite".
     /// Every other key in the file belongs to some other running instance (one `jerry` process
@@ -1114,30 +1132,71 @@ impl AdeApp {
             return;
         }
         self.fold_state_save_running = true;
-        let task = cx.spawn(async move |this, cx| loop {
-            // The state and the owned-key set are read in the *same* synchronous step, so the
-            // pair handed to `save_merged_at` can never be a mix of two different moments.
-            let step = this.update(cx, |this, _cx| {
-                if this.fold_state_save_pending {
-                    this.fold_state_save_pending = false;
-                    Some((this.fold_state.clone(), this.fold_state_owned.clone()))
-                } else {
-                    this.fold_state_save_running = false;
-                    None
+        let task = cx.spawn(async move |this, cx| {
+            let mut attempt: u32 = 0;
+            loop {
+                // The state and the owned-key set are read in the *same* synchronous step, so the
+                // pair handed to `save_merged_at` can never be a mix of two different moments.
+                let step = this.update(cx, |this, _cx| {
+                    if this.fold_state_save_pending {
+                        this.fold_state_save_pending = false;
+                        Some((this.fold_state.clone(), this.fold_state_owned.clone()))
+                    } else {
+                        this.fold_state_save_running = false;
+                        None
+                    }
+                });
+                let Ok(Some((state, owned))) = step else {
+                    break;
+                };
+                let result = cx
+                    .background_executor()
+                    .spawn({
+                        let path = path.clone();
+                        async move { state.save_merged_at(&path, &owned) }
+                    })
+                    .await;
+                match result {
+                    Ok(()) => attempt = 0,
+                    Err(err) => {
+                        // Do **not** drop the change. `fold_state_save_pending` was cleared above,
+                        // before the write, so without this a real failure (disk full, a read-only
+                        // `~/.config`, a permissions change) would lose the user's expand/collapse
+                        // with nothing but a log line - while this feature's whole claim is that a
+                        // fold change is recorded immediately. Re-marking it pending means the very
+                        // next iteration rewrites the *current* state, which is also why this needs
+                        // no queue: only the latest value ever matters.
+                        attempt += 1;
+                        if attempt > FOLD_STATE_SAVE_MAX_ATTEMPTS {
+                            log::error!(
+                            "giving up saving {} after {FOLD_STATE_SAVE_MAX_ATTEMPTS} attempts \
+                             ({err}) - file-tree fold state will not persist until something \
+                             changes again",
+                            path.display()
+                        );
+                            // Deliberately *not* re-marked pending: a permanently broken path would
+                            // otherwise spin this loop forever. A later real expand/collapse calls
+                            // `persist_fold_state` again and starts a fresh attempt budget, which is
+                            // the right retry trigger - the user did something new.
+                            continue;
+                        }
+                        log::warn!(
+                        "failed to save {} (attempt {attempt}/{FOLD_STATE_SAVE_MAX_ATTEMPTS}): \
+                         {err} - retrying",
+                        path.display()
+                    );
+                        let requeued =
+                            this.update(cx, |this, _cx| this.fold_state_save_pending = true);
+                        if requeued.is_err() {
+                            break;
+                        }
+                        // Linear backoff, so a transient failure (a full disk being cleared, a mount
+                        // coming back) is retried promptly without hammering a broken path.
+                        cx.background_executor()
+                            .timer(FOLD_STATE_SAVE_RETRY_BACKOFF * attempt)
+                            .await;
+                    }
                 }
-            });
-            let Ok(Some((state, owned))) = step else {
-                break;
-            };
-            let result = cx
-                .background_executor()
-                .spawn({
-                    let path = path.clone();
-                    async move { state.save_merged_at(&path, &owned) }
-                })
-                .await;
-            if let Err(err) = result {
-                log::warn!("failed to save {}: {err}", path.display());
             }
         });
         self._fold_state_save_task = Some(task);

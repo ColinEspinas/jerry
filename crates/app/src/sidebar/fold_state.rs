@@ -38,11 +38,19 @@
 //! owns. Without that merge, the last process to save would silently erase every other
 //! repository's fold state, since each holds a whole-file copy read at its own startup.
 //!
-//! Honest about what that does *not* buy: the merge is an unlocked read-modify-write, so two
-//! processes whose saves genuinely interleave can still lose one update. It narrows the window
-//! from "every save clobbers everything" to "a few microseconds around each save", which is the
-//! right trade for state of this consequence - a lock file guarding a fold-state write would be
-//! more machinery, and more failure modes, than the data is worth.
+//! Honest about the two things that does *not* buy, both real:
+//!
+//! 1. The merge is an unlocked read-modify-write, so two instances owning *different* worktrees
+//!    whose saves genuinely interleave can still lose one update. That narrows the exposure from
+//!    "every save clobbers every other repository" to "a few microseconds around each save".
+//! 2. Two instances that own the **same** worktree key - the same worktree open twice - are not
+//!    merged at all, and this is not a narrow window: each save replaces that key's whole entry
+//!    with its own copy, so the two instances permanently revert each other's expansions for
+//!    that worktree, last-writer-wins, for as long as both are running. Fixing it properly means
+//!    a delta-based merge (record what changed, not what the whole entry now is), which is a
+//!    materially bigger design than this feature justifies; the sibling-worktree case above is
+//!    the one that actually happens (one `jerry` per repository), and it *is* fixed. This is
+//!    written down rather than left to be discovered.
 //!
 //! ## Nothing is ever pruned because a path merely looks absent
 //!
@@ -88,6 +96,13 @@ pub fn fold_state_path_for(settings_path: &Path) -> PathBuf {
 /// through a symlink (or a `.`-relative invocation) resolves to one entry rather than two.
 /// Falls back to the path as given when it can't be canonicalized (it may not exist yet, or be
 /// a pure in-memory path in a unit test), which is still a stable key for that path.
+///
+/// **Calls `std::fs::canonicalize`, so it must never be called from a render or per-event
+/// path.** On a stale or slow mount (NFS, FUSE, a briefly-disconnected network drive) that syscall can
+/// block for the mount's full timeout, which on the foreground thread is a frozen window. Every
+/// hot caller instead uses the `*_with_key` variants below against
+/// `crate::root::AdeApp::fold_state_root_key`, which is resolved exactly once per worktree
+/// change; this function is called only from those few real change points (and from tests).
 ///
 /// `None` for a path that isn't valid UTF-8. TOML keys are strings, and the obvious shortcut -
 /// `to_string_lossy` - would map every undecodable byte to the same U+FFFD, so two genuinely
@@ -309,7 +324,16 @@ impl FoldState {
     /// compared against `crate::sidebar::file_tree::FileTreeEntry::path`. Entries that don't
     /// decode to a plain relative path are silently skipped ([`absolute_from_key`]).
     pub fn expanded_dirs(&self, root: &Path) -> HashSet<PathBuf> {
-        let Some(entry) = worktree_key(root).and_then(|key| self.worktrees.get(&key)) else {
+        match worktree_key(root) {
+            Some(key) => self.expanded_dirs_with_key(&key, root),
+            None => HashSet::new(),
+        }
+    }
+
+    /// [`Self::expanded_dirs`] against an already-resolved [`worktree_key`] - see that function's
+    /// own docs for why every hot path takes this variant.
+    pub fn expanded_dirs_with_key(&self, root_key: &str, root: &Path) -> HashSet<PathBuf> {
+        let Some(entry) = self.worktrees.get(root_key) else {
             return HashSet::new();
         };
         entry
@@ -324,9 +348,26 @@ impl FoldState {
     /// being non-UTF-8: those would have to be stored under a key they don't belong to, or under
     /// a lossily-mangled one that could collide with a different worktree's.
     pub fn set_expanded(&mut self, root: &Path, dir: &Path, expanded: bool) -> SetExpanded {
-        let (Some(root_key), Some(key)) = (worktree_key(root), relative_key(root, dir)) else {
+        match worktree_key(root) {
+            Some(root_key) => self.set_expanded_with_key(&root_key, root, dir, expanded),
+            None => SetExpanded::Refused,
+        }
+    }
+
+    /// [`Self::set_expanded`] against an already-resolved [`worktree_key`] - the variant every
+    /// real expand/collapse goes through, since [`worktree_key`] itself does blocking filesystem
+    /// work. `root` is still needed to make `dir` relative, which is pure string work.
+    pub fn set_expanded_with_key(
+        &mut self,
+        root_key: &str,
+        root: &Path,
+        dir: &Path,
+        expanded: bool,
+    ) -> SetExpanded {
+        let Some(key) = relative_key(root, dir) else {
             return SetExpanded::Refused;
         };
+        let root_key = root_key.to_string();
         let changed = if expanded {
             self.worktrees
                 .entry(root_key)
@@ -357,9 +398,12 @@ impl FoldState {
     /// which the issue asks to reset "both the tree and the saved state in one step". Returns
     /// whether anything was actually removed.
     pub fn clear_worktree(&mut self, root: &Path) -> bool {
-        worktree_key(root)
-            .and_then(|key| self.worktrees.remove(&key))
-            .is_some()
+        worktree_key(root).is_some_and(|key| self.clear_worktree_with_key(&key))
+    }
+
+    /// [`Self::clear_worktree`] against an already-resolved [`worktree_key`].
+    pub fn clear_worktree_with_key(&mut self, root_key: &str) -> bool {
+        self.worktrees.remove(root_key).is_some()
     }
 
     /// Drops any recorded directory for `root` that isn't in `existing_dirs` - the "stale entries
@@ -371,9 +415,20 @@ impl FoldState {
     /// importantly - it cannot prune an entry merely because a *slow or racing* filesystem check
     /// happened to miss it.
     pub fn prune_missing_dirs(&mut self, root: &Path, existing_dirs: &HashSet<PathBuf>) -> bool {
-        let Some(worktree_key) = worktree_key(root) else {
-            return false;
-        };
+        match worktree_key(root) {
+            Some(key) => self.prune_missing_dirs_with_key(&key, root, existing_dirs),
+            None => false,
+        }
+    }
+
+    /// [`Self::prune_missing_dirs`] against an already-resolved [`worktree_key`].
+    pub fn prune_missing_dirs_with_key(
+        &mut self,
+        root_key: &str,
+        root: &Path,
+        existing_dirs: &HashSet<PathBuf>,
+    ) -> bool {
+        let worktree_key = root_key.to_string();
         let Some(entry) = self.worktrees.get_mut(&worktree_key) else {
             return false;
         };
@@ -615,6 +670,45 @@ mod tests {
         let path = dir.path().join("file-tree-state.toml");
         std::fs::write(&path, "this is not valid toml {{{").expect("write");
         assert_eq!(FoldState::load_at(&path), FoldState::default());
+    }
+
+    /// The non-UTF-8 refusal, exercised against a genuinely non-UTF-8 path rather than only
+    /// described in the docs. Both halves matter: a directory name that isn't UTF-8 is refused
+    /// (it has no honest TOML key), and - crucially - refusing it does not disturb the entries
+    /// that *are* recordable for the same worktree.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_path_is_refused_and_leaves_the_rest_of_the_worktree_intact() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = Path::new("/repo/worktree-a");
+        let mut state = FoldState::default();
+        set(&mut state, root, &root.join("src"), true);
+
+        // 0xff is not valid UTF-8 in any position.
+        let invalid = root.join(OsStr::from_bytes(&[b'b', b'a', 0xff, b'd']));
+        assert_eq!(
+            state.set_expanded(root, &invalid, true),
+            SetExpanded::Refused,
+            "a directory whose name isn't UTF-8 has no honest TOML key, so it must be refused \
+             outright rather than stored lossily under a key that could collide"
+        );
+        assert_eq!(
+            expanded_set(&state, root),
+            vec!["/repo/worktree-a/src"],
+            "and the refusal must leave every recordable entry for the same worktree untouched"
+        );
+
+        // The same refusal for a non-UTF-8 *root*, which would otherwise mangle the map key
+        // itself - the collision this guard actually exists to prevent.
+        let invalid_root = PathBuf::from(OsStr::from_bytes(&[b'/', b'r', 0xff, b'p']));
+        assert_eq!(worktree_key(&invalid_root), None);
+        assert_eq!(
+            state.set_expanded(&invalid_root, &invalid_root.join("src"), true),
+            SetExpanded::Refused
+        );
+        assert!(state.expanded_dirs(&invalid_root).is_empty());
     }
 
     /// A hand-corrupted (or maliciously written) file must not be able to make the app treat a

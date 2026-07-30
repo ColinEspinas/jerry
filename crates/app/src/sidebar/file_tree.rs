@@ -66,9 +66,12 @@ impl FileTreeListing {
     }
 }
 
-/// The ceiling `crate::sidebar::render::AdeApp::load_more_file_tree_entries` escalates towards -
-/// see that method for why the escape hatch stays bounded.
-pub const MAX_LOAD_MORE_ENTRIES: usize = 1_000_000;
+/// The ceiling `crate::sidebar::render::AdeApp::load_more_file_tree_entries` escalates towards.
+/// Deliberately the same number as `crate::settings::store::FILE_TREE_MAX_ENTRIES_MAX` - see that
+/// constant for the real reasoning (two foreground-thread costs that scale with the loaded entry
+/// count). An escape hatch that could exceed the configured maximum would just be the unbounded
+/// walk again, wearing a click.
+pub const MAX_LOAD_MORE_ENTRIES: usize = crate::settings::store::FILE_TREE_MAX_ENTRIES_MAX;
 
 /// How deep the walk will recurse. A defensive bound on stack depth, not a product decision: the
 /// walk is recursive, and while `std::fs::DirEntry::file_type` doesn't follow symlinks (so a

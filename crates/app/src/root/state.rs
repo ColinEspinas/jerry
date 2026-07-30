@@ -40,7 +40,6 @@ impl AdeApp {
         // Issue #18 §1/§2: the tree opens with exactly what this worktree had expanded last
         // time, which for a worktree this file has never seen (including a freshly created one)
         // is nothing at all.
-        let expanded_dirs = fold_state.expanded_dirs(&repo_path);
 
         let mut this = Self {
             file_tree_root: repo_path.clone(),
@@ -55,9 +54,14 @@ impl AdeApp {
             right_sidebar_view: RightSidebarView::Files,
             diff_state: DiffLoadState::Loading,
             diff_totals: None,
-            expanded_dirs,
+            // Both are filled in immediately after this literal, through the same single
+            // chokepoints every later change uses (`set_file_tree_root` +
+            // `reload_expanded_dirs_from_fold_state`) - a second, constructor-only copy of that
+            // resolution is exactly how the cached key and the root it describes drift apart.
+            expanded_dirs: HashSet::new(),
             fold_state,
             fold_state_path,
+            fold_state_root_key: None,
             fold_state_owned: std::collections::BTreeSet::new(),
             _fold_state_save_task: None,
             fold_state_save_pending: false,
@@ -207,6 +211,11 @@ impl AdeApp {
             new_file_focus_handle: cx.focus_handle(),
             new_file_error: None,
         };
+        // See the `expanded_dirs`/`fold_state_root_key` note in the literal above: resolving the
+        // worktree key here, through the one function that ever resolves it, is what keeps the
+        // startup path and every later worktree switch structurally identical.
+        this.set_file_tree_root(repo_path.clone());
+        this.reload_expanded_dirs_from_fold_state();
         // Applies `this.settings.keymap.overrides` on top of `crate::default_key_bindings()` -
         // see `Self::apply_effective_key_bindings`'s own docs. Must run before this constructor
         // returns and the entity's first render, so a persisted rebind is live from the very
@@ -306,8 +315,33 @@ impl AdeApp {
         self._disk_usage_task = Some(task);
     }
 
+    /// The **one** place [`Self::file_tree_root`] is ever assigned, so its cached
+    /// `fold_state_root_key` can never drift out of step with it - the identity-guard discipline
+    /// this codebase has been bitten by repeatedly, applied to a derived value rather than a
+    /// borrowed one. `worktree_key`'s blocking `canonicalize` therefore runs once per real
+    /// worktree change and never on a click or a render.
+    /// Re-derives [`Self::expanded_dirs`] from the persisted fold state for whatever
+    /// [`Self::file_tree_root`] currently is - the one place that mapping is made, shared by
+    /// startup and by every worktree switch.
+    pub(crate) fn reload_expanded_dirs_from_fold_state(&mut self) {
+        self.expanded_dirs = match &self.fold_state_root_key {
+            Some(key) => self
+                .fold_state
+                .expanded_dirs_with_key(key, &self.file_tree_root),
+            None => HashSet::new(),
+        };
+    }
+
+    pub(crate) fn set_file_tree_root(&mut self, root: PathBuf) {
+        if self.file_tree_root == root && self.fold_state_root_key.is_some() {
+            return;
+        }
+        self.fold_state_root_key = fold_state::worktree_key(&root);
+        self.file_tree_root = root;
+    }
+
     pub(crate) fn load_file_tree(&mut self, root: PathBuf, cx: &mut Context<Self>) {
-        self.file_tree_root = root.clone();
+        self.set_file_tree_root(root.clone());
         // Always a real bound - see [`Self::file_tree_limit_override`] for why even the "load
         // more" escape hatch raises the cap rather than removing it.
         let limit = Some(
@@ -425,9 +459,9 @@ impl AdeApp {
         // the new worktree's expanded set - and a click on one of those stale rows would reach
         // `set_dir_expanded` with a path from a different worktree entirely. Clearing
         // `file_tree` makes that window render an honestly empty tree instead.
-        self.file_tree_root = path.clone();
+        self.set_file_tree_root(path.clone());
         self.file_tree = Vec::new();
-        self.expanded_dirs = self.fold_state.expanded_dirs(&path);
+        self.reload_expanded_dirs_from_fold_state();
         // "Show me the whole listing" was a decision about the worktree being left.
         self.file_tree_limit_override = None;
         self.file_tree_truncated = false;

@@ -12,6 +12,13 @@
 //! `crate::settings::render`'s per-page docs for which) - no field exists here "for
 //! completeness" just because the mockup shows a row for it.
 //!
+//! One documented exception, added with GitHub issue #18: [`FileTreeSettings`] is read and
+//! applied for real (`crate::root::AdeApp::load_file_tree` bounds every walk with it) but has no
+//! settings *page* and appears in no config banner - it is a file-only tunable. It is called out
+//! here rather than quietly breaking the rule above: the invariant that still holds for every
+//! field, this one included, is "loaded, saved, and genuinely consumed by real behaviour"; what
+//! this one lacks is a UI surface, not a consumer.
+//!
 //! ## TOML is the real file; JSON is a read-only alternate view
 //!
 //! The config banner's `TOML | JSON` segment (`crate::settings::widgets::render_config_banner`)
@@ -252,9 +259,23 @@ pub const FILE_TREE_MAX_ENTRIES_DEFAULT: usize = 20_000;
 /// rather than honoured - the same [`AppearanceSettings::sanitize`] discipline applied here.
 pub const FILE_TREE_MAX_ENTRIES_MIN: usize = 100;
 
+/// And a real upper clamp, which the first version of this setting was missing. It is not an
+/// arbitrary round number: two pieces of *foreground-thread* work scale linearly with the number
+/// of loaded entries - `crate::root::AdeApp::rebuild_palette_file_candidates` allocates one
+/// candidate per file in the walk-completion handler, and `render_file_tree` scans every loaded
+/// entry once per frame to resolve which rows are visible. At 100,000 both are real but
+/// absorbable; at the millions a hand-edited file could otherwise ask for, the first is a
+/// multi-second freeze on load and the second is a per-frame one. This is the honest hard
+/// ceiling on how much tree this sidebar holds, and the tree says so (see
+/// `crate::sidebar::render::AdeApp::render_file_tree`'s truncation row) rather than cutting off
+/// silently.
+pub const FILE_TREE_MAX_ENTRIES_MAX: usize = 100_000;
+
 impl FileTreeSettings {
     pub fn sanitize(&mut self) {
-        self.max_entries = self.max_entries.max(FILE_TREE_MAX_ENTRIES_MIN);
+        self.max_entries = self
+            .max_entries
+            .clamp(FILE_TREE_MAX_ENTRIES_MIN, FILE_TREE_MAX_ENTRIES_MAX);
     }
 }
 
@@ -518,10 +539,17 @@ mod tests {
     fn a_hand_edited_file_tree_cap_round_trips_and_an_absurd_one_is_clamped() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("settings.toml");
-        std::fs::write(&path, "[file_tree]\nmax_entries = 120000\n").expect("write");
+        std::fs::write(&path, "[file_tree]\nmax_entries = 50000\n").expect("write");
         assert_eq!(
             Settings::load_or_init_at(&path).file_tree.max_entries,
-            120_000
+            50_000
+        );
+
+        std::fs::write(&path, "[file_tree]\nmax_entries = 5000000\n").expect("write");
+        assert_eq!(
+            Settings::load_or_init_at(&path).file_tree.max_entries,
+            FILE_TREE_MAX_ENTRIES_MAX,
+            "a cap larger than the foreground thread can absorb is clamped down, not honoured"
         );
 
         std::fs::write(&path, "[file_tree]\nmax_entries = 1\n").expect("write");
