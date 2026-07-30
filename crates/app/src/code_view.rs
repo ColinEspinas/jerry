@@ -5,25 +5,82 @@
 //! (only [`gpui::Rgba`] is used, for plain colour data), mirroring this crate's split between
 //! pure logic modules and `crate::root`'s `Div` construction.
 //!
-//! `.rs`/`.ts`/`.tsx`/`.js`/`.jsx`/`.py` get real syntax spans (Revision R8 added the latter
-//! five, following [`highlight_rust`]'s own parse-then-walk shape exactly - see [`Lexicon`] for
-//! how the shared walker is parameterized per language rather than duplicating the walk itself
-//! three times); other extensions (including `.vue` - see `crate::language`'s docs for why this
-//! phase doesn't spawn an LSP client for it, unrelated to highlighting) render as plain monospace
-//! text. A further grammar would just add one more [`Lexicon`] plus a thin wrapper.
+//! `.rs`/`.ts`/`.tsx`/`.js`/`.jsx`/`.py` get real syntax spans; other extensions (including
+//! `.vue` - see `crate::language`'s docs for why this phase doesn't spawn an LSP client for it,
+//! unrelated to highlighting) render as plain monospace text.
 //!
-//! ## `tree-sitter` API usage
+//! ## How highlighting actually works here
 //!
-//! `tree_sitter::Parser::new()`, `set_language`, `Node::walk()`/`TreeCursor::goto_first_child`/
-//! `goto_next_sibling`, `Parser::parse`/`Tree::root_node`, and `TreeCursor::field_name` are all
-//! used below in their ordinary, documented shapes. Verified against
-//! `vendor/zed/crates/language/src/language.rs:135,1376,1673` and
-//! `vendor/zed/crates/language/src/outline.rs:102` (same `tree-sitter`/`tree-sitter-rust`
-//! version pair as this crate's `Cargo.toml`). The TypeScript/TSX and Python node-kind names
-//! [`Lexicon`]'s three table instances below use were verified for real by parsing real sample
-//! source with each grammar and inspecting the actual emitted node kinds (not guessed/invented -
-//! see this crate's Revision R8 step report for the probe), the same "verify the real API before
-//! using it" discipline this project applies to `vendor/zed`.
+//! Classification is done by the official `tree-sitter-highlight` crate, driving each grammar
+//! crate's **own published `queries/highlights.scm`** (exposed by all three as a `&'static str`
+//! constant, so no query file is vendored or read from disk). This replaced a hand-rolled
+//! recursive AST walk matching node kinds against per-language node-kind tables maintained here -
+//! see [`HIGHLIGHT_NAMES`] and [`HIGHLIGHT_KINDS`] for how the standard capture vocabulary those
+//! real query files emit (`keyword`, `function.method`, `constant.builtin`, `punctuation.bracket`,
+//! ...) is folded down into the six buckets `design_handoff_jerry_ade/README.md`'s File view
+//! colour table actually defines, and [`highlight_query_for`] for the one genuinely surprising
+//! part (TypeScript's own query file is a supplement, not a whole query).
+//!
+//! Adding a further grammar is now a [`Grammar`] variant plus a thin wrapper - no node-kind table.
+//!
+//! ## API verification
+//!
+//! `tree-sitter-highlight` is not used anywhere in `vendor/zed`, so there is no in-tree call site
+//! to check this against. Every non-obvious behavioural claim made in the docs below was instead
+//! verified by reading the real crate source on disk
+//! (`~/.cargo/registry/src/*/tree-sitter-highlight-0.26.9/src/highlight.rs`) and is cited to the
+//! exact lines there - specifically the recognized-name matching rule
+//! (`configure`, lines 458-484), the last-pattern-wins rule for two patterns capturing one node
+//! (lines 1043-1066), and the fact that the engine's internal parse passes `None` as its old tree
+//! with no way for a caller to supply one (lines 531-541).
+//!
+//! ## Why there is no incremental reparse here
+//!
+//! There is a real, measured ~55% win available from incremental reparsing, and it is
+//! nevertheless deliberately not taken. Both halves of that are worth recording, because the
+//! numbers say "obviously do it" and the API says "you cannot".
+//!
+//! Measured on this repository's own largest file (`root/code_surface.rs`, 5931 lines), release
+//! build, median of five runs on an idle machine: one full `highlight_rust` call costs ~31.4ms, of
+//! which the bare `tree_sitter::Parser::parse` is ~16.6ms (53%) and the query walk is the rest.
+//! Reparsing the same file after a real one-character edit, via `Tree::edit` +
+//! `parse(.., Some(&old_tree))`, costs **0.21ms** - a ~79x reduction, verified in the same run to
+//! produce a tree identical (compared as s-expressions) to a fresh parse of the edited text.
+//!
+//! For scale, the same call under the replaced hand-rolled walker cost ~21.5ms: the real query
+//! walk is genuinely more work than the old node-kind table lookup, and buys the accuracy gains
+//! this migration is for.
+//!
+//! It cannot be reached from here. `tree_sitter_highlight::Highlighter::highlight` owns its parse
+//! entirely and hard-codes `None` as the old-tree argument
+//! (`tree-sitter-highlight-0.26.9/src/highlight.rs:531-541`); there is no parameter, no builder
+//! and no callback to supply a previous tree, and the crate's newest release at time of writing
+//! (0.26.11) is identical in that respect - so this is an API limitation, not a version to
+//! upgrade past. The only way to have both would be to stop using the official highlight iterator
+//! and drive `config.query` by hand against a self-parsed tree, which would mean reimplementing
+//! its capture-precedence rules *and* its `#match?` predicate evaluation - and every one of these
+//! three grammars leans on `#match?` for its "identifier starting with a capital letter" rules.
+//! That is precisely the bespoke engine this module exists to have deleted, so it is not done.
+//!
+//! What makes that an acceptable trade rather than a swallowed regression is where the cost lands
+//! - which differs by caller, so it is worth being precise rather than sweeping:
+//!
+//! - **The File view's live re-highlight**, the one path that runs repeatedly while typing, is
+//!   already off the foreground thread: `crate::root::editing::AdeApp::schedule_rehighlight` runs
+//!   it on the background executor 150ms after the last keystroke, and the view keeps rendering
+//!   the previous highlighting until it lands. Not having incremental reparse costs that path a
+//!   background thread for ~31ms instead of ~15ms on the largest file here; it is not frame time.
+//! - **[`highlight_block`]'s Diff and Merge callers** (`crate::root::code_surface`'s
+//!   `ensure_diff_highlight_cache`, `crate::root::merge_flow_render`'s
+//!   `ensure_merge_highlight_cache`) do run synchronously on the main thread, by their own
+//!   deliberate design - but they are called only when the content actually changes, never per
+//!   frame, and each caps the work at a real per-file line budget rather than highlighting a whole
+//!   file. Incremental reparse would not have helped them regardless: each hunk is highlighted as
+//!   its own isolated source unit, so there is no previous tree of the *same* text to reuse.
+
+use std::sync::OnceLock;
+
+use tree_sitter_highlight::{Highlight, HighlightConfiguration, HighlightEvent, Highlighter};
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -175,277 +232,408 @@ pub struct HighlightSpan {
     pub end: usize,
     pub kind: HighlightKind,
 }
-
-/// One language's real node-kind vocabulary, feeding the single shared [`walk_node`] walker -
-/// see this module's top-level docs. Keeping one generic walker parameterized by a small table
-/// per language (rather than three near-identical copies of the walk itself) is the same
-/// "consolidate genuinely repeated shape, don't force an abstraction where fields would differ"
-/// call this codebase's Revision R5.5 already established elsewhere; the fields themselves are
-/// still just plain string-slice tables, no trait machinery.
-struct Lexicon {
-    /// Leaf-token kinds (`node.child_count() == 0`) whose literal text is a keyword.
-    keywords: &'static [&'static str],
-    /// Whole-node kinds classified as [`HighlightKind::Literal`] without descending into
-    /// children (a string node's inner quote/content/escape sub-nodes render as one span, not
-    /// three).
-    literal_kinds: &'static [&'static str],
-    /// Leaf texts, checked only when the leaf's own `kind()` is in [`Self::identifier_kinds`],
-    /// that should still be classified [`HighlightKind::Literal`] - exists for Python's `self`
-    /// specifically: unlike Rust (a dedicated `self`/`self_parameter` grammar node, already
-    /// covered by [`Self::literal_kinds`] without needing this) or TypeScript (`this` is a real
-    /// keyword token there), `tree-sitter-python`'s grammar has *no* distinct node kind for
-    /// `self` at all - it parses as a perfectly ordinary `identifier`, indistinguishable by kind
-    /// alone from any other name. Matching by literal text is the only way to give Python's
-    /// `self` the same Literal treatment Rust's own `self` gets, rather than leaving the two
-    /// languages inconsistently rendered for what plays the same syntactic role in both.
-    literal_identifier_texts: &'static [&'static str],
-    comment_kinds: &'static [&'static str],
-    /// Whole-node kinds classified as [`HighlightKind::Type`] without descending into children.
-    type_kinds: &'static [&'static str],
-    /// Leaf kinds eligible for [`HighlightKind::Function`]/[`HighlightKind::Type`] when
-    /// [`Self::declared_name_fields`] also matches that leaf's field name and its immediate
-    /// parent's real node kind matches [`Self::function_name_parent_kinds`]/
-    /// [`Self::type_name_parent_kinds`] respectively (Rust: `["identifier"]`; TypeScript
-    /// additionally needs `"property_identifier"` for a class method's own name).
-    identifier_kinds: &'static [&'static str],
-    /// Field names under which an [`Self::identifier_kinds`] leaf *might* be a declared/called
-    /// name, not a use - genuinely ambiguous on the field name alone (e.g. TypeScript's
-    /// `variable_declarator`, `function_declaration`, `interface_body` member, and JSX tag all
-    /// reuse the same `"name"` field for very different things), so [`walk_node`] also
-    /// requires the leaf's immediate *parent* node kind to appear in
-    /// [`Self::function_name_parent_kinds`]/[`Self::type_name_parent_kinds`] before actually
-    /// classifying it as [`HighlightKind::Function`]/[`HighlightKind::Type`] - see those fields'
-    /// own docs. Still the same narrow "declaration `name` field, or a plain-identifier call's
-    /// `function` field" heuristic [`highlight_rust`] originally established (still doesn't cover
-    /// `obj.foo()`'s `field_identifier`/`property_identifier` callee - an intentionally narrow,
-    /// documented gap carried over unchanged into TypeScript/Python, not widened here).
-    declared_name_fields: &'static [&'static str],
-    /// Real parent node kinds under which an [`Self::identifier_kinds`] leaf whose field name is
-    /// in [`Self::declared_name_fields`] is genuinely a function/method declaration's or a call
-    /// expression's own name - e.g. Rust's `function_item`/`function_signature_item`/
-    /// `call_expression`, not `variable_declarator`/`let_declaration`-shaped parents (Rust's own
-    /// `let` binding uses a `pattern` field, never `name`, so it was never at risk - see
-    /// [`RUST_LEXICON`]'s own docs; TypeScript/Python's `variable_declarator`/`class_definition`
-    /// *do* reuse `"name"`, which is exactly the real, live-verified collision this field exists
-    /// to rule out).
-    function_name_parent_kinds: &'static [&'static str],
-    /// Real parent node kinds under which an [`Self::identifier_kinds`] leaf whose field name is
-    /// in [`Self::declared_name_fields`] is genuinely a type's own declared name rather than a
-    /// function - exists specifically for Python's `class_definition`, whose `name` field is a
-    /// plain `identifier` (unlike Rust/TypeScript, where a class/struct/enum name is already a
-    /// distinct `type_identifier` node kind, caught by [`Self::type_kinds`] before this check is
-    /// ever reached - see [`PYTHON_LEXICON`]'s own docs). Empty for languages that don't need it.
-    type_name_parent_kinds: &'static [&'static str],
+/// Which real grammar a piece of source is parsed and queried with. `TypeScript` and `Tsx` are
+/// two genuinely different grammars in `tree-sitter-typescript` (not one grammar with a flag), and
+/// they need two different composed query strings - see [`highlight_query_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grammar {
+    Rust,
+    TypeScript,
+    Tsx,
+    Python,
 }
 
-/// Rust keyword tokens - tree-sitter-rust's grammar represents each as an unnamed leaf node
-/// whose `kind()` is the literal keyword text (see this module's tests). `self` is deliberately
-/// not here - it's real, but classified as [`HighlightKind::Literal`] instead (see
-/// [`RUST_LEXICON`]'s `literal_kinds`), matching how a self-reference reads visually closer to a
-/// value than a keyword.
-const RUST_KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
-    "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
-    "return", "static", "struct", "super", "trait", "type", "union", "unsafe", "use", "where",
-    "while", "yield",
-];
+impl Grammar {
+    /// Every real grammar, in [`Grammar::index`] order - the single list both
+    /// [`HIGHLIGHT_CONFIGS`]' slot count and this module's own coverage tests are derived from, so
+    /// adding a grammar cannot leave either behind.
+    const ALL: [Grammar; 4] = [
+        Grammar::Rust,
+        Grammar::TypeScript,
+        Grammar::Tsx,
+        Grammar::Python,
+    ];
 
-const RUST_LEXICON: Lexicon = Lexicon {
-    keywords: RUST_KEYWORDS,
-    literal_kinds: &[
-        "string_literal",
-        "raw_string_literal",
-        "char_literal",
-        "integer_literal",
-        "float_literal",
-        "boolean_literal",
-        "self",
-    ],
-    literal_identifier_texts: &[],
-    comment_kinds: &["line_comment", "block_comment"],
-    type_kinds: &["type_identifier", "primitive_type"],
-    identifier_kinds: &["identifier"],
-    declared_name_fields: &["name", "function"],
-    // Verified for real by parsing real sample source with `tree-sitter-rust` and inspecting the
-    // actual emitted tree while building this fix: a `fn` item's/trait method signature's own name
-    // is `name: identifier` under `function_item`/`function_signature_item`; a plain-identifier
-    // call's callee is `function: identifier` under `call_expression`. Rust's own `let` binding
-    // uses a `pattern` field (never `name`), so it was never at risk of this collision in the
-    // first place - see `declared_name_fields`' own docs.
-    function_name_parent_kinds: &[
-        "function_item",
-        "function_signature_item",
-        "call_expression",
-    ],
-    // Not needed for Rust: a struct/enum/trait name is already a distinct `type_identifier` node
-    // kind, caught by `type_kinds` above before this would ever be reached.
-    type_name_parent_kinds: &[],
-};
+    const COUNT: usize = Self::ALL.len();
 
-/// TypeScript/TSX keyword tokens - verified for real against `tree-sitter-typescript@0.23.2`'s
-/// own bundled `queries/highlights.scm` (its real keyword list) plus a direct parse probe of
-/// sample source (see this module's top-level docs), not guessed. `this`/`super` are included
-/// here rather than treated like Rust's `self` (a [`Lexicon::literal_kinds`] entry) purely for
-/// simplicity - no test or real-world hover/highlight distinction in this app depends on which
-/// bucket they land in.
-const TYPESCRIPT_KEYWORDS: &[&str] = &[
-    "abstract",
-    "declare",
-    "enum",
-    "export",
-    "implements",
-    "interface",
-    "keyof",
-    "namespace",
-    "private",
-    "protected",
-    "public",
-    "type",
-    "readonly",
-    "override",
-    "satisfies",
+    /// This grammar's slot in [`HIGHLIGHT_CONFIGS`]. Kept in step with [`Grammar::ALL`] by
+    /// `grammar_indices_match_their_position_in_all`, which is what makes indexing that array
+    /// without a bounds concern honest rather than assumed.
+    const fn index(self) -> usize {
+        match self {
+            Grammar::Rust => 0,
+            Grammar::TypeScript => 1,
+            Grammar::Tsx => 2,
+            Grammar::Python => 3,
+        }
+    }
+
+    fn language(self) -> tree_sitter::Language {
+        match self {
+            Grammar::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Grammar::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Grammar::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Grammar::Python => tree_sitter_python::LANGUAGE.into(),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Grammar::Rust => "rust",
+            Grammar::TypeScript => "typescript",
+            Grammar::Tsx => "tsx",
+            Grammar::Python => "python",
+        }
+    }
+}
+
+/// The ordered "recognized highlight names" list every [`HighlightConfiguration`] below is
+/// [`HighlightConfiguration::configure`]d with. `tree-sitter-highlight` resolves each of a query's
+/// own capture names against this list and hands back a [`tree_sitter_highlight::Highlight`]
+/// holding **an index into this exact slice**, so [`HIGHLIGHT_KINDS`] below is a positional
+/// parallel array: entry `i` here is classified as entry `i` there. The two are length-checked
+/// against each other at compile time (see [`HIGHLIGHT_KINDS`]) so they can never silently drift.
+///
+/// ## Why these names, and why so few
+///
+/// The real matching rule is not a prefix match, and this is the single most important thing to
+/// understand before editing this list. `HighlightConfiguration::configure`
+/// (`tree-sitter-highlight-0.26.9/src/highlight.rs:458-484`, read directly) splits both the
+/// query's capture name and each recognized name on `.`, and a recognized name matches when
+/// **every one of its own dot-parts is present among the capture's dot-parts**; among all
+/// matches, the one with the *most* parts wins, ties going to the earliest entry here. So the
+/// single entry `"function"` already claims the real captures `function`, `function.method`,
+/// `function.builtin` and `function.macro` that the three grammars' own bundled queries actually
+/// emit - there is no need to enumerate them, and enumerating them would not change the outcome.
+///
+/// Deliberately absent (each falls through to no match at all, i.e. [`HighlightKind::Text`]):
+/// `operator`, `punctuation.bracket`, `punctuation.delimiter`, `punctuation.special`, `property`,
+/// `attribute`, `label`, `embedded`, `variable`, `variable.parameter`. That is not an oversight -
+/// `design_handoff_jerry_ade/README.md`'s File view colour table has exactly six buckets and puts
+/// punctuation and plain identifiers in the `Text` one, so a capture with no bucket of its own
+/// must resolve to `Text` rather than being forced into a bucket it doesn't belong in.
+const HIGHLIGHT_NAMES: &[&str] = &[
+    "keyword",
     "function",
-    "const",
-    "let",
-    "var",
-    "return",
-    "class",
-    "if",
-    "else",
-    "for",
-    "while",
-    "do",
-    "switch",
-    "case",
-    "default",
-    "break",
-    "continue",
-    "new",
-    "delete",
-    "typeof",
-    "instanceof",
-    "in",
-    "of",
-    "try",
-    "catch",
-    "finally",
-    "throw",
-    "yield",
-    "async",
-    "await",
-    "import",
-    "from",
-    "extends",
-    "as",
-    "void",
-    "get",
-    "set",
-    "this",
-    "super",
-    "static",
+    "type",
+    "constructor",
+    "tag",
+    "string",
+    "escape",
+    "number",
+    "constant",
+    "variable.builtin",
+    "comment",
 ];
 
-/// Real node kinds verified by parsing sample TypeScript source with
-/// `tree_sitter_typescript::LANGUAGE_TYPESCRIPT` and inspecting the actual tree (see this
-/// module's top-level docs) - `predefined_type` (the `number`/`string`/`boolean`/`void`/...
-/// built-in type keywords) is a composite wrapper node, classified whole here rather than
-/// descended into, which is exactly what keeps its one anonymous leaf child (also, confusingly,
-/// often kind `"number"`/`"string"`/etc, colliding with the *literal* kinds below) from ever
-/// being reached as a separate leaf - the two never collide in practice because this whole-node
-/// check always wins first.
-const TYPESCRIPT_LEXICON: Lexicon = Lexicon {
-    keywords: TYPESCRIPT_KEYWORDS,
-    literal_kinds: &[
-        "string",
-        "template_string",
-        "number",
-        "true",
-        "false",
-        "null",
-        "undefined",
-        "regex",
-    ],
-    literal_identifier_texts: &[],
-    comment_kinds: &["comment"],
-    type_kinds: &["type_identifier", "predefined_type"],
-    identifier_kinds: &["identifier", "property_identifier"],
-    declared_name_fields: &["name", "function"],
-    // Verified for real by parsing real sample source with `tree-sitter-typescript` and inspecting
-    // the actual emitted tree while building this fix: a real, live-verified bug this narrows away -
-    // `variable_declarator`, `interface_body`'s `property_signature`, and a JSX tag
-    // (`jsx_self_closing_element`/`jsx_opening_element`/`jsx_closing_element`) all *also* reuse
-    // the `"name"` field, which is exactly why the old, parent-kind-unaware version misclassified
-    // `const s: string = ...`'s `s`, every interface member name, and every TSX tag name as
-    // Function. Only `function_declaration` (a real `fn`), `method_definition` (a real class
-    // method's own name), and `call_expression` (a real plain-identifier call's callee) actually
-    // are one.
-    function_name_parent_kinds: &[
-        "function_declaration",
-        "method_definition",
-        "call_expression",
-    ],
-    // Not needed for TypeScript: a class/interface name is already a distinct `type_identifier`
-    // node kind, caught by `type_kinds` above before this would ever be reached.
-    type_name_parent_kinds: &[],
-};
-
-/// Real node kinds verified by parsing sample Python source with `tree_sitter_python::LANGUAGE`
-/// and inspecting the actual tree (see this module's top-level docs). `"type"` is the composite
-/// wrapper both a parameter's and a return type's real annotation uses (`def f(x: int) -> None:`
-/// puts both `int` and `None` inside one `type` node), classified whole the same way
-/// TypeScript's `predefined_type` is above.
-const PYTHON_KEYWORDS: &[&str] = &[
-    "def", "class", "return", "if", "elif", "else", "for", "while", "in", "not", "and", "or", "is",
-    "pass", "break", "continue", "import", "from", "as", "with", "try", "except", "finally",
-    "raise", "lambda", "yield", "global", "nonlocal", "del", "assert", "async", "await",
+/// [`HIGHLIGHT_NAMES`]' positional parallel array: which of this app's six real buckets each
+/// recognized highlight name renders as. See [`HIGHLIGHT_NAMES`] for the indexing contract.
+///
+/// The non-obvious mappings, each a real judgement call rather than a mechanical rename:
+///
+/// - **`constructor` -> `Type`.** All three grammars use `@constructor` for their own
+///   "identifier that starts with a capital letter" heuristic (`tree-sitter-rust`'s own comment
+///   calls these "enum constructors ... either that, or struct names"). Those name a *type* or one
+///   of its variants, so `Type` is where they belong. Note this is *not* what makes Python's
+///   `class Foo:` come out right - `@constructor`'s `^[A-Z]` guard makes it unreliable for exactly
+///   that, which is [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]'s fourth rule's whole reason for existing.
+/// - **`tag` -> `Type`.** `tree-sitter-javascript`'s JSX query captures a *lowercase* JSX element
+///   name (`<div>`) as `@tag`, while an uppercase one (`<Foo>`) is already `@constructor`/`@type`.
+///   Sending both to `Type` is what makes the two read as the same kind of thing on screen, which
+///   is what they are.
+/// - **`variable.builtin` -> `Literal`.** This is the bucket the design table itself names
+///   "literal/self". Rust's `self` reached it in the replaced implementation through a dedicated
+///   `literal_kinds` entry, and Python's `self` through an even more special-cased
+///   leaf-*text* comparison; `tree-sitter-rust`'s own query emits `(self) @variable.builtin`
+///   directly, so Rust now gets it from the real grammar rather than from a local table.
+///   TypeScript's `this`/`super` move here too, which is a real, deliberate *change*: the
+///   replaced code classified them `Keyword` and its own comment recorded that as arbitrary
+///   ("purely for simplicity - no test or real-world distinction depends on which bucket they
+///   land in"). They now match Rust's and Python's `self`, which is the consistency the design
+///   table's own "literal/self" label asks for.
+/// - **`escape` -> `Literal`.** An escape sequence is captured *inside* an already-captured
+///   string, so it must land in the same bucket as the string or every `\n` in the file would
+///   punch a `Text`-coloured hole through a `Literal`-coloured string.
+/// - **`number`/`constant`/`constant.builtin` -> `Literal`.** Rust routes integer/float/boolean
+///   literals through `@constant.builtin` where Python and JavaScript use `@number`; both are the
+///   same bucket here, so the three languages stay consistent regardless of which capture name
+///   their own grammar happens to prefer.
+const HIGHLIGHT_KINDS: [HighlightKind; HIGHLIGHT_NAMES.len()] = [
+    HighlightKind::Keyword,
+    HighlightKind::Function,
+    HighlightKind::Type,
+    HighlightKind::Type,
+    HighlightKind::Type,
+    HighlightKind::Literal,
+    HighlightKind::Literal,
+    HighlightKind::Literal,
+    HighlightKind::Literal,
+    HighlightKind::Literal,
+    HighlightKind::Comment,
 ];
 
-const PYTHON_LEXICON: Lexicon = Lexicon {
-    keywords: PYTHON_KEYWORDS,
-    literal_kinds: &["string", "integer", "float", "true", "false", "none"],
-    // Python's `self` has no dedicated grammar node the way Rust's does - see
-    // `Lexicon::literal_identifier_texts`' own docs for why matching by leaf text is the only way
-    // to give it the same Literal treatment Rust's own `self` gets (a deliberate, documented
-    // choice to match Rust's convention, not an oversight - `self`/`this` play the same syntactic
-    // role in both languages).
-    literal_identifier_texts: &["self"],
-    comment_kinds: &["comment"],
-    type_kinds: &["type"],
-    identifier_kinds: &["identifier"],
-    declared_name_fields: &["name", "function"],
-    // Verified for real by parsing real sample source with `tree-sitter-python` and inspecting the
-    // actual emitted tree while building this fix: a `def`'s own name is `name: identifier` under
-    // `function_definition`; a plain-identifier call's callee is `function: identifier` under
-    // `call` (Python's call node kind - not `call_expression`, unlike Rust/TypeScript).
-    function_name_parent_kinds: &["function_definition", "call"],
-    // The real, live-verified bug this narrows away: `class_definition`'s own `name` field is a
-    // plain `identifier` (unlike Rust/TypeScript, where a class/struct name is already a distinct
-    // `type_identifier` node kind caught by `type_kinds` above) - without this, `class Foo:`
-    // misclassified `Foo` as a Function instead of a Type.
-    type_name_parent_kinds: &["class_definition"],
-};
+/// Real supplement appended after `tree-sitter-python`'s own bundled `queries/highlights.scm`,
+/// covering two genuine gaps that would otherwise be visible *regressions* against the hand-rolled
+/// implementation this module replaced. Appending (rather than prepending) is what makes these
+/// win: for two patterns capturing the same node, `tree-sitter-highlight` keeps iterating and
+/// takes the **last** one ("keep iterating over any later highlighting patterns that also match
+/// this node and set the match to it", `tree-sitter-highlight-0.26.9/src/highlight.rs:1043-1066`,
+/// read directly - not assumed).
+///
+/// 1. **Python's word operators.** `tree-sitter-python`'s bundled query puts `and`/`or`/`not`/
+///    `in`/`is` (and the two-word `not in`/`is not`) in its big `@operator` list, alongside `+`,
+///    `==` and friends. This app has no operator bucket - `@operator` is deliberately unrecognized
+///    and resolves to `Text` - so without this they would render as plain text, while the replaced
+///    `PYTHON_KEYWORDS` table listed all five as real keywords. Promoting only the *word*
+///    operators (never the symbolic ones, which really are punctuation by this app's colour table)
+///    keeps Python's keyword colouring exactly as complete as it was.
+/// 2. **`self`/`cls`.** `tree-sitter-python`'s bundled query has no rule for either; both arrive
+///    as a plain `(identifier) @variable`, indistinguishable from any other name. The replaced
+///    implementation carried a whole `Lexicon::literal_identifier_texts` field, and a long comment
+///    justifying it, for the single purpose of giving Python's `self` the same treatment Rust's
+///    gets. `@variable.builtin` is the real capture name Rust's own bundled query uses for exactly
+///    this, so matching it here keeps the two languages consistent through the standard
+///    vocabulary instead of a bespoke side table. `cls` is included because it plays the identical
+///    role in a `@classmethod`, and the replaced code's omission of it was an accident of only
+///    ever having been written with `self` in mind.
+/// 3. **Compound type annotations.** `tree-sitter-python`'s bundled rule is
+///    `(type (identifier) @type)` - it only fires when the annotation is a bare identifier that is
+///    a *direct* child of the `type` node. A real annotation usually is not: `dict[str, int]`
+///    parses as `(type (generic_type ...))`, `str | None` as `(type (binary_operator ...))`, and
+///    `pathlib.Path` as `(type (attribute ...))` (all three shapes read off real parses, not
+///    assumed). Every one of those rendered as plain text, where the replaced implementation
+///    classified the whole `type` node as `Type` - a real, measured regression across ~620 bytes
+///    of the Python files checked. Capturing `(type)` itself restores exactly the replaced
+///    behaviour. Note this does *not* drag literals inside an annotation along with it: a `None`
+///    return type is an inner `(none) @constant.builtin` node, and nesting means the inner capture
+///    still wins, so `None` renders as `Literal`. That is a deliberate improvement rather than a
+///    leftover - the replaced code rendered `None` as `Type` inside an annotation but `Literal`
+///    everywhere else in the same file, and it is now consistently `Literal` in both places.
+/// 4. **Class names.** `tree-sitter-python` has no `class_definition name:` rule; a class name
+///    reaches a bucket only via the query's two casing heuristics, and *neither is reliable*.
+///    `@constructor` requires `^[A-Z]`, so `class _Pickler:` and `class socket:` - a leading
+///    underscore and a lowercase name, both pervasive real Python - matched nothing and rendered
+///    as plain text. Worse, the `@constant` rule (`^[A-Z][A-Z_]*$`) fires *later* than
+///    `@constructor` and therefore wins, so an all-caps class like `class FTP:` came out
+///    `Literal`. The replaced implementation classified all four shapes `Type` via a dedicated
+///    table field. Capturing the name node directly restores that unconditionally, independent of
+///    casing. (Found by an adversarial re-audit against the CPython standard library after an
+///    earlier corpus, which happened to contain only conventionally-capitalised class names,
+///    showed nothing.)
+/// 5. **Method calls, and `cls(...)`.** Two ordering casualties, both fixed by these rules coming
+///    last. `tree-sitter-python` captures `(call function: (attribute attribute: (identifier)
+///    @function.method))` *before* its blanket `(attribute attribute: (identifier) @property)`,
+///    and last-pattern-wins means `@property` - which this app does not recognise - takes the
+///    node, so `obj.method()` rendered as plain text while Rust and TypeScript both coloured the
+///    equivalent call. Restating the method-call rule last genuinely closes that gap rather than
+///    just claiming to. Separately, rule 2's `self`/`cls` match is itself a later pattern than the
+///    bundled `(call function: (identifier) @function)`, so it had captured the *callee* of a real
+///    `cls(...)` construction and turned it from `Function` into `Literal`; restating the plain
+///    call rule after it puts that back.
+const PYTHON_HIGHLIGHTS_SUPPLEMENT: &str = r#"
+[
+  "and"
+  "or"
+  "not"
+  "in"
+  "is"
+  "not in"
+  "is not"
+] @keyword
 
-/// Parses `source` with `tree-sitter-rust` and walks the resulting AST into classified
-/// [`HighlightSpan`]s. Returns an empty `Vec` (rather than panicking) if the grammar fails to
-/// load or the parse produces no tree - neither expected in practice, but not assumed away.
-pub fn highlight_rust(source: &str) -> Vec<HighlightSpan> {
-    highlight_with(source, tree_sitter_rust::LANGUAGE.into(), &RUST_LEXICON)
+(type) @type
+
+(class_definition name: (identifier) @type)
+
+((identifier) @variable.builtin
+ (#match? @variable.builtin "^(self|cls)$"))
+
+(call function: (identifier) @function)
+(call function: (attribute attribute: (identifier) @function.method))
+"#;
+
+/// Real supplement appended after the composed JavaScript + TypeScript query (see
+/// [`highlight_query_for`]), repairing two regressions that a live old-vs-new diff over real
+/// TypeScript caught. Both come from the same root cause: `tree-sitter-typescript`'s own
+/// `((identifier) @type (#match? @type "^[A-Z]"))` heuristic and `tree-sitter-javascript`'s
+/// keyword list are each individually reasonable, but the concatenation order that makes
+/// TypeScript's type rules win over JavaScript's blanket `(identifier) @variable` also lets them
+/// win over two JavaScript rules that were actually right.
+///
+/// 1. **A capitalised function declaration, and a capitalised call.** `function Badge(...)` is a
+///    real function and `String(value)` is a real call, and JavaScript's query says so for both -
+///    but TypeScript's capital-letter heuristic runs later and reclassifies the name as a type.
+///    Restating the declaration and call rules last puts them back. This is a pure restoration:
+///    the replaced implementation classified both as `Function` too. Note this deliberately does
+///    *not* disturb the far more common capitalised identifier that is **not** being declared or
+///    called (`const x: SchemaObject`, `new Widget()` - a `new_expression`, not a
+///    `call_expression`), which keeps the real, large `Type` gain this migration brings.
+/// 2. **`void`.** In `(): void`, `void` is a `predefined_type`, which TypeScript's query captures
+///    as `@type.builtin`. But `void` is *also* a real JavaScript operator keyword, and the
+///    anonymous `"void"` token that JavaScript's `@keyword` list matches is a **child node** of
+///    that `predefined_type`. Nesting, not pattern order, decides that case - the inner node's
+///    highlight wins over the enclosing one - so no amount of reordering whole-node patterns fixes
+///    it; the inner token has to be captured directly. Without this, `void` was the only one of
+///    TypeScript's seven `predefined_type` keywords (`number`/`string`/`boolean`/`void`/`any`/
+///    `unknown`/`never`) not rendering as a type, which is an inconsistency a reader would notice.
+const TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT: &str = r#"
+(function_declaration name: (identifier) @function)
+(function_signature name: (identifier) @function)
+(call_expression function: (identifier) @function)
+(predefined_type "void" @type.builtin)
+"#;
+
+/// The real, composed highlights query source for `grammar`, built from the grammar crates' own
+/// published `queries/*.scm` files (exposed by each crate as a `&'static str` constant, so nothing
+/// here reads from disk or vendors a copy of a query file).
+///
+/// Rust and Python are one file each. **TypeScript and TSX are not**, and this is the single
+/// least obvious fact in this module: `tree-sitter-typescript`'s own `HIGHLIGHTS_QUERY` is a
+/// 35-line *supplement*, not a whole highlighting query - it defines types, type-argument
+/// brackets, parameters and the TypeScript-only keywords, and nothing else. It contains no rule
+/// for strings, comments, numbers, function calls or any of the JavaScript keywords, because
+/// upstream expects it to be concatenated onto `tree-sitter-javascript`'s query the way the
+/// `tree-sitter` CLI's own language inheritance does. Using it alone would compile and run
+/// perfectly happily while silently rendering every TypeScript comment, string and function call
+/// as plain text - which is exactly why `tree-sitter-javascript` is a real dependency of this
+/// crate despite this app never opening a `.js` file with a JavaScript-only grammar.
+///
+/// Order matters and is deliberate, per the "last matching pattern wins" rule cited on
+/// [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]: JavaScript's base rules go first so that TypeScript's own
+/// `(type_identifier) @type` and its capitalised-identifier rule can override JavaScript's
+/// blanket `(identifier) @variable` for the same node. The JSX query sits between them, and only
+/// for [`Grammar::Tsx`] - it references `jsx_opening_element` and friends, which genuinely do not
+/// exist in the plain TypeScript grammar, so including it there would fail query compilation
+/// outright rather than degrade quietly.
+fn highlight_query_for(grammar: Grammar) -> String {
+    match grammar {
+        Grammar::Rust => tree_sitter_rust::HIGHLIGHTS_QUERY.to_string(),
+        Grammar::Python => {
+            format!(
+                "{}\n{PYTHON_HIGHLIGHTS_SUPPLEMENT}",
+                tree_sitter_python::HIGHLIGHTS_QUERY
+            )
+        }
+        Grammar::TypeScript => format!(
+            "{}\n{}\n{TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT}",
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_typescript::HIGHLIGHTS_QUERY
+        ),
+        Grammar::Tsx => format!(
+            "{}\n{}\n{}\n{TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT}",
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
+            tree_sitter_typescript::HIGHLIGHTS_QUERY
+        ),
+    }
 }
 
-/// Parses `source` with `tree-sitter-typescript` and walks the resulting AST into classified
-/// [`HighlightSpan`]s, following [`highlight_rust`]'s exact shape. `is_tsx` selects the real TSX
-/// grammar variant (used for `.tsx`/`.jsx` - TSX's grammar is a superset that also parses plain
-/// JSX-free TypeScript/JavaScript correctly, and there is no separate JSX-only grammar in
-/// `tree-sitter-typescript`) over the plain TypeScript one (used for `.ts`/`.js` - TypeScript's
-/// grammar is itself a real syntactic superset of JavaScript, so `.js` deliberately reuses it
-/// rather than adding a third grammar dependency for plain JavaScript).
+/// Builds `grammar`'s real [`HighlightConfiguration`], already
+/// [`HighlightConfiguration::configure`]d against [`HIGHLIGHT_NAMES`].
+///
+/// Both the injection and the locals query are deliberately empty, and both omissions are real
+/// decisions rather than gaps left to fill in later:
+///
+/// - **Injections.** None of this app's four grammars need one. TSX parses JSX as part of its own
+///   single grammar rather than as an injected language, and the only injections the Rust and
+///   Python query files describe are things like SQL-in-a-string-literal, which this app has no
+///   second grammar to inject *into* anyway. Passing the injection query without a real
+///   `injection_callback` able to supply those grammars would add machinery that could never fire.
+/// - **Locals.** `tree-sitter-typescript` ships a `locals.scm`, and feeding it would switch on
+///   `tree-sitter-highlight`'s local-variable tracking, which exists to let a query colour a
+///   variable *reference* like its *definition*. This app's six buckets do not distinguish
+///   variables at all - every plain identifier is `Text` - so that machinery has nothing to
+///   express here, and enabling it would only add per-parse scope-tracking cost for an outcome
+///   that cannot differ.
+fn build_highlight_config(
+    grammar: Grammar,
+) -> Result<HighlightConfiguration, tree_sitter::QueryError> {
+    let mut config = HighlightConfiguration::new(
+        grammar.language(),
+        grammar.name(),
+        &highlight_query_for(grammar),
+        "",
+        "",
+    )?;
+    config.configure(HIGHLIGHT_NAMES);
+    Ok(config)
+}
+
+/// Process-wide cache of the real [`HighlightConfiguration`]s - **one independent slot per
+/// grammar**, each built at most once, and only if that grammar is ever actually asked for.
+///
+/// Caching at all is not a micro-optimisation: building one configuration means compiling a
+/// several-hundred-pattern `tree_sitter::Query` from source text, which costs far more than
+/// parsing a whole file (tens of milliseconds each, measured) and would otherwise be paid again on
+/// every keystroke's debounced re-highlight.
+///
+/// Caching them *separately* is the part that was gotten wrong first and is worth recording. A
+/// single `OnceLock<HashMap<..>>` populated in one pass reads naturally and is what this started
+/// as - but it makes the first request for *any* grammar compile *all four*. That cost is not
+/// hypothetical and it does not always land on a background thread: `CodeView::Diff` is the
+/// default view, and `crate::root::code_surface`'s `ensure_diff_highlight_cache` calls into here
+/// synchronously on the main thread, so opening the first `.rs` diff of a session paid the
+/// TypeScript, TSX *and* Python query-compile cost for grammars that diff would never use. Per-
+/// grammar slots mean a `.rs` file pays for Rust only.
+///
+/// A `HighlightConfiguration` is immutable once configured, so a shared `&'static` reference is
+/// all any caller needs; the per-call mutable state lives in [`tree_sitter_highlight::Highlighter`],
+/// which is cheap to construct and is created fresh per call.
+static HIGHLIGHT_CONFIGS: [OnceLock<Option<HighlightConfiguration>>; Grammar::COUNT] =
+    [const { OnceLock::new() }; Grammar::COUNT];
+
+/// `grammar`'s real, shared [`HighlightConfiguration`], compiling it on first use, or `None` if
+/// its query failed to compile.
+///
+/// A compile failure here is not expected and is not silently tolerated as an acceptable state:
+/// the query sources are compile-time constants, so a failure is fully deterministic and is caught
+/// by this module's own `every_real_grammar_config_compiles` test. `None` exists so that a
+/// hypothetical failure degrades to honest uncoloured text at runtime instead of panicking a
+/// running editor, and it is logged at `error` level rather than passing quietly. It is also
+/// cached like any other outcome, so a failing grammar is not re-compiled on every keystroke.
+fn highlight_config(grammar: Grammar) -> Option<&'static HighlightConfiguration> {
+    HIGHLIGHT_CONFIGS[grammar.index()]
+        .get_or_init(|| match build_highlight_config(grammar) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                log::error!(
+                    "syntax highlighting disabled for {}: its highlights query failed to \
+                     compile: {error}",
+                    grammar.name()
+                );
+                None
+            }
+        })
+        .as_ref()
+}
+
+/// Parses `source` with `tree-sitter-rust` and classifies it through the real, official
+/// `tree-sitter-highlight` engine driving `tree-sitter-rust`'s own bundled
+/// `queries/highlights.scm` - see [`highlight_with`]. Returns an empty `Vec` (rather than
+/// panicking) if the grammar's query failed to compile or the parse produced no tree, neither
+/// expected in practice.
+pub fn highlight_rust(source: &str) -> Vec<HighlightSpan> {
+    highlight_with(source, Grammar::Rust)
+}
+
+/// Parses `source` with `tree-sitter-typescript` and classifies it the same way [`highlight_rust`]
+/// does. `is_tsx` selects the real TSX grammar variant (used for `.tsx`/`.jsx` - TSX's grammar is
+/// a superset that also parses plain JSX-free TypeScript/JavaScript correctly, and there is no
+/// separate JSX-only grammar in `tree-sitter-typescript`) over the plain TypeScript one (used for
+/// `.ts`/`.js` - TypeScript's grammar is itself a real syntactic superset of JavaScript, so `.js`
+/// deliberately reuses it rather than adding a third grammar dependency for plain JavaScript).
+///
+/// Note that `tree-sitter-javascript` *is* nonetheless a real dependency of this crate - for its
+/// query file, not its grammar. See [`highlight_query_for`] for why.
 pub fn highlight_typescript(source: &str, is_tsx: bool) -> Vec<HighlightSpan> {
-    let language: tree_sitter::Language = if is_tsx {
-        tree_sitter_typescript::LANGUAGE_TSX.into()
-    } else {
-        tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
-    };
-    highlight_with(source, language, &TYPESCRIPT_LEXICON)
+    highlight_with(
+        source,
+        if is_tsx {
+            Grammar::Tsx
+        } else {
+            Grammar::TypeScript
+        },
+    )
 }
 
 /// A real `fn(&str) -> Vec<HighlightSpan>` wrapper over [`highlight_typescript`] with `is_tsx:
@@ -462,115 +650,82 @@ pub fn highlight_tsx(source: &str) -> Vec<HighlightSpan> {
     highlight_typescript(source, true)
 }
 
-/// Parses `source` with `tree-sitter-python` and walks the resulting AST into classified
-/// [`HighlightSpan`]s, following [`highlight_rust`]'s exact shape.
+/// Parses `source` with `tree-sitter-python` and classifies it the same way [`highlight_rust`]
+/// does - plus [`PYTHON_HIGHLIGHTS_SUPPLEMENT`], see there.
 pub fn highlight_python(source: &str) -> Vec<HighlightSpan> {
-    highlight_with(source, tree_sitter_python::LANGUAGE.into(), &PYTHON_LEXICON)
+    highlight_with(source, Grammar::Python)
 }
 
-fn highlight_with(
-    source: &str,
-    language: tree_sitter::Language,
-    lexicon: &Lexicon,
-) -> Vec<HighlightSpan> {
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&language).is_err() {
+/// The one real highlighting path every language wrapper above funnels into: run the official
+/// [`tree_sitter_highlight::Highlighter`] over `source` with `grammar`'s real
+/// [`HighlightConfiguration`], and fold the [`HighlightEvent`] stream it emits down into this
+/// app's six [`HighlightKind`] buckets.
+///
+/// The event stream is a flat, in-order sequence of `HighlightStart`/`Source`/`HighlightEnd`, and
+/// `HighlightStart`s **nest** - a Rust `\n` escape inside a string literal arrives as a real
+/// `escape` highlight opened while the enclosing `string` one is still open. The innermost open
+/// highlight is therefore the one that wins, which is what the stack below tracks; the engine has
+/// already split the `Source` events at every boundary, so each one falls entirely under exactly
+/// one innermost highlight and no span produced here can ever overlap another.
+///
+/// Every byte of `source` is covered, including whitespace between tokens (as explicit
+/// [`HighlightKind::Text`]). That is a real difference from the hand-rolled walker this replaced,
+/// which emitted spans only for leaf nodes and left the gaps to [`build_lines`]; the rendered
+/// result is identical either way, since `build_lines` fills any gap with exactly that same
+/// `Text`, but it means the span list here is gapless by construction rather than by downstream
+/// repair.
+///
+/// Errors are not expected to be reachable: `Error::Cancelled` requires the cancellation flag this
+/// passes `None` for, and `Error::InvalidLanguage` requires a language the config was not built
+/// with. If one does occur mid-stream, the spans accumulated so far are returned rather than
+/// discarded - partial real highlighting of a file's earlier lines is strictly better for the
+/// reader than dropping the whole file back to plain text, and matches the same best-effort
+/// posture [`highlight_block`] already documents for partial input.
+fn highlight_with(source: &str, grammar: Grammar) -> Vec<HighlightSpan> {
+    let Some(config) = highlight_config(grammar) else {
         return Vec::new();
-    }
-    let Some(tree) = parser.parse(source, None) else {
+    };
+    let mut highlighter = Highlighter::new();
+    let Ok(events) = highlighter.highlight(config, source.as_bytes(), None, |_| None) else {
         return Vec::new();
     };
 
-    let mut spans = Vec::new();
-    walk_node(tree.root_node(), None, None, source, lexicon, &mut spans);
-    spans
-}
-
-/// `field_name` is the field this node is held under on its immediate parent, if any (`None` for
-/// the root, or an unnamed child) - `parent_kind` is that immediate parent's own real node kind
-/// (also `None` for the root). Both are needed, together, to correctly classify a leaf whose
-/// field name alone is ambiguous across several different real parent shapes - see
-/// [`Lexicon::function_name_parent_kinds`]/[`Lexicon::type_name_parent_kinds`]'s own docs for why
-/// the field name by itself (this walker's original, Rust-only design) isn't enough once
-/// TypeScript/Python's grammars are in the mix. `source` is only consulted for
-/// [`Lexicon::literal_identifier_texts`]'s leaf-text check (Python's `self`).
-fn walk_node(
-    node: tree_sitter::Node<'_>,
-    field_name: Option<&str>,
-    parent_kind: Option<&str>,
-    source: &str,
-    lexicon: &Lexicon,
-    spans: &mut Vec<HighlightSpan>,
-) {
-    let kind = node.kind();
-
-    if lexicon.comment_kinds.contains(&kind) {
-        spans.push(HighlightSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-            kind: HighlightKind::Comment,
-        });
-        return;
-    }
-    if lexicon.literal_kinds.contains(&kind) {
-        spans.push(HighlightSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-            kind: HighlightKind::Literal,
-        });
-        return;
-    }
-    if lexicon.type_kinds.contains(&kind) {
-        spans.push(HighlightSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-            kind: HighlightKind::Type,
-        });
-        return;
-    }
-
-    if node.child_count() == 0 {
-        let is_declared_name = lexicon.identifier_kinds.contains(&kind)
-            && field_name.is_some_and(|field| lexicon.declared_name_fields.contains(&field));
-        let classified = if lexicon.keywords.contains(&kind) {
-            HighlightKind::Keyword
-        } else if is_declared_name
-            && parent_kind.is_some_and(|parent| lexicon.type_name_parent_kinds.contains(&parent))
-        {
-            HighlightKind::Type
-        } else if is_declared_name
-            && parent_kind
-                .is_some_and(|parent| lexicon.function_name_parent_kinds.contains(&parent))
-        {
-            HighlightKind::Function
-        } else if lexicon.identifier_kinds.contains(&kind)
-            && node
-                .utf8_text(source.as_bytes())
-                .is_ok_and(|text| lexicon.literal_identifier_texts.contains(&text))
-        {
-            HighlightKind::Literal
-        } else {
-            HighlightKind::Text
+    let mut spans: Vec<HighlightSpan> = Vec::new();
+    let mut open: Vec<HighlightKind> = Vec::new();
+    for event in events {
+        let Ok(event) = event else {
+            break;
         };
-        spans.push(HighlightSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-            kind: classified,
-        });
-        return;
-    }
-
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            let child = cursor.node();
-            let child_field = cursor.field_name();
-            walk_node(child, child_field, Some(kind), source, lexicon, spans);
-            if !cursor.goto_next_sibling() {
-                break;
+        match event {
+            HighlightEvent::HighlightStart(Highlight(index)) => {
+                // `index` is an index into `HIGHLIGHT_NAMES`, which `HIGHLIGHT_KINDS` is a
+                // compile-time-length-checked parallel array of - so this cannot be out of range.
+                open.push(HIGHLIGHT_KINDS[index]);
+            }
+            HighlightEvent::HighlightEnd => {
+                open.pop();
+            }
+            HighlightEvent::Source { start, end } => {
+                if start >= end {
+                    continue;
+                }
+                let kind = open.last().copied().unwrap_or(HighlightKind::Text);
+                // Coalesce with the previous span when it is both adjacent and the same bucket.
+                // Real, not cosmetic: the engine splits `Source` at every highlight boundary, so a
+                // string containing escapes arrives as several separate `Literal` runs that render
+                // identically to one. Merging here keeps `build_lines`' per-line run lists (and
+                // the `SharedString` allocation each run costs at render time) proportional to
+                // what is actually visually distinct.
+                match spans.last_mut() {
+                    Some(previous) if previous.end == start && previous.kind == kind => {
+                        previous.end = end;
+                    }
+                    _ => spans.push(HighlightSpan { start, end, kind }),
+                }
             }
         }
     }
+    spans
 }
 
 /// One already-highlighted display line: its text (never including line-ending bytes) plus a
@@ -997,6 +1152,15 @@ mod tests {
         assert_eq!(language_name_for_extension(None), "Plain Text");
     }
 
+    /// Finds the span whose byte range is *exactly* `text`'s first occurrence in `source`.
+    ///
+    /// This works for any token the highlighter actually classifies, because a classified token is
+    /// bounded on both sides by differently-classified neighbours. It deliberately does **not**
+    /// work for a token that comes out as plain [`HighlightKind::Text`]: [`highlight_with`]
+    /// coalesces adjacent same-kind spans, so an unclassified identifier is merged into one
+    /// wider `Text` run covering the surrounding whitespace and punctuation too, and has no span
+    /// of its own to find. Use [`kind_at`] for those - asserting on the kind covering a byte is
+    /// the meaningful question there, and it is the one the renderer itself asks.
     fn find_span<'a>(
         spans: &'a [HighlightSpan],
         source: &str,
@@ -1007,6 +1171,18 @@ mod tests {
         spans
             .iter()
             .find(|span| span.start == start && span.end == end)
+    }
+
+    /// The [`HighlightKind`] covering the first byte of `text`'s first occurrence in `source` -
+    /// i.e. exactly the colour the File view would paint that token's first character. Falls back
+    /// to [`HighlightKind::Text`] for a byte no span covers, matching [`build_lines`]' own
+    /// gap-filling rule, so this always answers the same question the renderer does.
+    fn kind_at(spans: &[HighlightSpan], source: &str, text: &str) -> HighlightKind {
+        let start = source.find(text).expect("substring present in source");
+        spans
+            .iter()
+            .find(|span| span.start <= start && start < span.end)
+            .map_or(HighlightKind::Text, |span| span.kind)
     }
 
     const SAMPLE_RUST: &str =
@@ -1135,13 +1311,13 @@ mod tests {
         let source = "const s: string = \"hi\";\n";
         let variable_start = source.find("const ").expect("const") + "const ".len();
         let spans = highlight_typescript(source, false);
-        let span = spans
+        let kind = spans
             .iter()
-            .find(|span| span.start == variable_start && span.end == variable_start + 1)
-            .expect("variable name span");
-        assert_ne!(
-            span.kind,
-            HighlightKind::Function,
+            .find(|span| span.start <= variable_start && variable_start < span.end)
+            .map_or(HighlightKind::Text, |span| span.kind);
+        assert_eq!(
+            kind,
+            HighlightKind::Text,
             "a const/let/var binding's own name must never be classified as a function"
         );
     }
@@ -1152,8 +1328,7 @@ mod tests {
     fn typescript_interface_member_name_is_not_misclassified_as_a_function() {
         let source = "interface Point { x: number }\n";
         let spans = highlight_typescript(source, false);
-        let span = find_span(&spans, source, "x").expect("interface member name span");
-        assert_ne!(span.kind, HighlightKind::Function);
+        assert_eq!(kind_at(&spans, source, "x: number"), HighlightKind::Text);
     }
 
     /// The same real collision, for a class method's own name (`method_definition`'s `name`
@@ -1249,9 +1424,10 @@ mod tests {
     }
 
     /// Matches Rust's own `self_is_classified_as_literal_not_keyword` test - a deliberate,
-    /// documented choice that Python's `self` gets the same Literal treatment Rust's does (see
-    /// `PYTHON_LEXICON`'s own docs on why this needs a leaf-text check, unlike Rust's dedicated
-    /// grammar node).
+    /// documented choice that Python's `self` gets the same Literal treatment Rust's does. Rust
+    /// gets it from its grammar's own `(self) @variable.builtin` rule; Python's grammar has no
+    /// rule for `self` at all, so it comes from [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]'s second rule -
+    /// see there.
     #[test]
     fn python_self_is_classified_as_literal_not_a_plain_identifier() {
         let source = "class Foo:\n    def bar(self):\n        return self.value\n";
@@ -1313,6 +1489,343 @@ mod tests {
     fn highlighting_invalid_python_still_returns_a_real_non_empty_span_list() {
         let spans = highlight_python("def (((( broken");
         assert!(spans.iter().any(|span| span.kind == HighlightKind::Keyword));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // `tree-sitter-highlight` migration coverage.
+    //
+    // These assert on specific real tokens, and each one exists because an old-vs-new span diff
+    // over real source files in this repository actually showed that token changing (or, for the
+    // "still" cases, showed a way it could plausibly have changed and did not). They are the
+    // executable form of that diff, not a generic "renders something" smoke test.
+    // ---------------------------------------------------------------------------------------
+
+    /// The migration's load-bearing precondition: all four real grammar configurations - including
+    /// the two *composed* TypeScript ones - actually compile. `highlight_config` degrades to
+    /// `None` (i.e. silently unhighlighted text) if a query fails to compile, so without this
+    /// test a broken composition would show up only as a file rendering flat, with every other
+    /// test in this module still passing.
+    #[test]
+    fn every_real_grammar_config_compiles() {
+        let grammars = Grammar::ALL;
+        for grammar in grammars {
+            build_highlight_config(grammar)
+                .unwrap_or_else(|error| panic!("{}'s highlights query: {error}", grammar.name()));
+        }
+
+        // `highlight_config` keys its process-wide cache on `Grammar::name`, so two grammars
+        // sharing a name would silently hand one grammar's configuration to the other - a
+        // wrong-language parse rendering as plausible-looking garbage rather than as an error.
+        // Nothing in the type system prevents that, so it is asserted here instead.
+        let mut names: Vec<&str> = grammars.iter().map(|grammar| grammar.name()).collect();
+        names.sort_unstable();
+        let distinct = names.len();
+        names.dedup();
+        assert_eq!(names.len(), distinct, "every Grammar needs a distinct name");
+
+        // And every one of those names must really resolve to a live configuration, or that
+        // grammar silently renders as plain text.
+        for grammar in grammars {
+            assert!(
+                highlight_config(grammar).is_some(),
+                "{} has no live highlight configuration",
+                grammar.name()
+            );
+        }
+    }
+
+    /// [`HIGHLIGHT_NAMES`] and [`HIGHLIGHT_KINDS`] are a positional parallel array pair, and the
+    /// whole classification mapping is wrong-but-compiling if they ever drift. The array length is
+    /// already tied together at compile time; this pins the *content* of the two mappings whose
+    /// index positions are easiest to get silently wrong.
+    #[test]
+    fn recognized_highlight_names_map_to_the_intended_buckets() {
+        let bucket = |name: &str| {
+            let index = HIGHLIGHT_NAMES
+                .iter()
+                .position(|candidate| *candidate == name)
+                .unwrap_or_else(|| panic!("{name} missing from HIGHLIGHT_NAMES"));
+            HIGHLIGHT_KINDS[index]
+        };
+        assert_eq!(bucket("keyword"), HighlightKind::Keyword);
+        assert_eq!(bucket("function"), HighlightKind::Function);
+        assert_eq!(bucket("comment"), HighlightKind::Comment);
+        // The three non-obvious ones, each argued for in `HIGHLIGHT_KINDS`' own docs.
+        assert_eq!(bucket("constructor"), HighlightKind::Type);
+        assert_eq!(bucket("tag"), HighlightKind::Type);
+        assert_eq!(bucket("variable.builtin"), HighlightKind::Literal);
+    }
+
+    /// Real gains the replaced implementation genuinely did not have. Its own docs called the
+    /// method-call gap "an intentionally narrow, documented gap" it did not cover; the real
+    /// grammar queries do.
+    #[test]
+    fn rust_method_calls_and_macros_are_now_classified_as_functions() {
+        let source = "fn main() {\n    let x = value.clone();\n    println!(\"{x}\");\n}\n";
+        let spans = highlight_rust(source);
+        assert_eq!(kind_at(&spans, source, "clone"), HighlightKind::Function);
+        assert_eq!(kind_at(&spans, source, "println"), HighlightKind::Function);
+    }
+
+    /// `mut` was listed in the replaced implementation's own Rust keyword table and never actually
+    /// matched: that table compared a leaf's `kind()`, and `mut`'s real node kind is
+    /// `mutable_specifier`, not `"mut"` - so it silently rendered as plain text the whole time.
+    /// The real grammar query captures `(mutable_specifier) @keyword` directly.
+    #[test]
+    fn rust_mut_is_now_really_classified_as_a_keyword() {
+        let source = "fn main() { let mut count = 0; }\n";
+        let spans = highlight_rust(source);
+        assert_eq!(kind_at(&spans, source, "mut "), HighlightKind::Keyword);
+    }
+
+    /// Rust's `self` stays `Literal`, now via the real grammar's own `(self) @variable.builtin`
+    /// rather than the replaced implementation's bespoke node-kind table entry - and TypeScript's
+    /// `this` *joins* it, which is the one deliberate cross-language reclassification in this
+    /// migration (see [`HIGHLIGHT_KINDS`]' docs).
+    #[test]
+    fn self_and_this_share_the_literal_self_bucket_across_languages() {
+        let rust = "impl T { fn get(&self) -> u8 { self.value } }\n";
+        assert_eq!(
+            kind_at(&highlight_rust(rust), rust, "self.value"),
+            HighlightKind::Literal
+        );
+        let python = "class T:\n    def get(self):\n        return self.value\n";
+        assert_eq!(
+            kind_at(&highlight_python(python), python, "self.value"),
+            HighlightKind::Literal
+        );
+        let typescript = "class T { get() { return this.value; } }\n";
+        assert_eq!(
+            kind_at(&highlight_typescript(typescript, false), typescript, "this"),
+            HighlightKind::Literal
+        );
+    }
+
+    /// Python's `and`/`or`/`not`/`in`/`is` live in `tree-sitter-python`'s `@operator` list, not
+    /// its `@keyword` list, and this app has no operator bucket - so without
+    /// [`PYTHON_HIGHLIGHTS_SUPPLEMENT`] they would render as plain text where the replaced
+    /// implementation made them real keywords. Symbolic operators must stay `Text`, which is what
+    /// the replaced implementation did with them and what the design colour table asks for.
+    #[test]
+    fn python_word_operators_are_keywords_but_symbolic_ones_stay_text() {
+        let source = "if a is not b and c in d or not e:\n    total = a + b\n";
+        let spans = highlight_python(source);
+        for word in ["is not", "and ", "in ", "or ", "not e"] {
+            assert_eq!(
+                kind_at(&spans, source, word),
+                HighlightKind::Keyword,
+                "python word operator {word:?}"
+            );
+        }
+        assert_eq!(kind_at(&spans, source, "+ b"), HighlightKind::Text);
+    }
+
+    /// A compound Python type annotation. `tree-sitter-python`'s own rule only fires for a bare
+    /// identifier directly under the `type` node, so all three of these real shapes rendered as
+    /// plain text until [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]'s `(type) @type` restored the replaced
+    /// implementation's whole-node behaviour - a regression a real old-vs-new diff caught.
+    #[test]
+    fn python_compound_type_annotations_are_classified_as_types() {
+        let source = "def f(a: dict[str, int], b: pathlib.Path) -> list[int]:\n    pass\n";
+        let spans = highlight_python(source);
+        assert_eq!(kind_at(&spans, source, "dict[str"), HighlightKind::Type);
+        assert_eq!(kind_at(&spans, source, "pathlib.Path"), HighlightKind::Type);
+        assert_eq!(kind_at(&spans, source, "list[int]"), HighlightKind::Type);
+    }
+
+    /// [`HIGHLIGHT_CONFIGS`] is indexed by [`Grammar::index`], so that mapping has to stay in step
+    /// with [`Grammar::ALL`] or one grammar silently reads another's cache slot.
+    #[test]
+    fn grammar_indices_match_their_position_in_all() {
+        for (position, grammar) in Grammar::ALL.into_iter().enumerate() {
+            assert_eq!(grammar.index(), position, "{}", grammar.name());
+        }
+        assert_eq!(Grammar::COUNT, HIGHLIGHT_CONFIGS.len());
+    }
+
+    /// Python's `class Foo:` name, across all four real casing shapes.
+    ///
+    /// The casing matters and is the entire point of this test. `tree-sitter-python` has no
+    /// `class_definition name:` rule, so before [`PYTHON_HIGHLIGHTS_SUPPLEMENT`] gained one this
+    /// depended on the query's casing heuristics and got three of these four wrong - a leading
+    /// underscore or a lowercase name matched nothing and fell to `Text`, and an all-caps name was
+    /// captured by the `@constant` rule and came out `Literal`. An earlier version of this test
+    /// used only `Widget`, the one shape that happened to work, and so passed against a genuinely
+    /// broken implementation. All four are pinned now.
+    #[test]
+    fn python_class_names_are_classified_as_types_whatever_their_casing() {
+        let source = "class Widget:\n    pass\nclass _Pickler:\n    pass\nclass socket:\n    pass\nclass FTP:\n    pass\n";
+        let spans = highlight_python(source);
+        for name in ["Widget", "_Pickler", "socket", "FTP"] {
+            assert_eq!(
+                kind_at(&spans, source, name),
+                HighlightKind::Type,
+                "class {name}"
+            );
+        }
+    }
+
+    /// Python method calls, which the replaced implementation left as plain text and which
+    /// `tree-sitter-python`'s own bundled query *also* leaves as plain text - its blanket
+    /// `@property` rule outranks its own method-call rule. Rust and TypeScript both colour the
+    /// equivalent call, so this is the rule that makes the claim of closing the method-call gap
+    /// true for all three languages rather than two.
+    #[test]
+    fn python_method_calls_match_rust_and_typescript() {
+        let source = "value = obj.method()\nother = cls(name)\n";
+        let spans = highlight_python(source);
+        assert_eq!(kind_at(&spans, source, "method"), HighlightKind::Function);
+        assert_eq!(
+            kind_at(&spans, source, "cls("),
+            HighlightKind::Function,
+            "a real `cls(...)` construction is a call, not the `cls` self-reference"
+        );
+        // ...while a bare `cls`/`self` reference stays in the literal/self bucket.
+        let reference = "def f(cls):\n    return cls\n";
+        assert_eq!(
+            kind_at(&highlight_python(reference), reference, "cls\n"),
+            HighlightKind::Literal
+        );
+    }
+
+    /// Both halves of the TypeScript query composition, which is the single most breakable part of
+    /// this migration: `tree-sitter-typescript`'s own query file defines none of these, so if the
+    /// JavaScript query ever stopped being concatenated in, every one of them would silently
+    /// collapse to plain text while the TypeScript-only assertions elsewhere kept passing.
+    #[test]
+    fn typescript_highlighting_covers_the_javascript_half_of_the_composed_query() {
+        let source = "// note\nasync function load() {\n  const url = \"/api\";\n  return fetch(url, 3);\n}\n";
+        let spans = highlight_typescript(source, false);
+        assert_eq!(kind_at(&spans, source, "// note"), HighlightKind::Comment);
+        assert_eq!(kind_at(&spans, source, "async"), HighlightKind::Keyword);
+        assert_eq!(kind_at(&spans, source, "\"/api\""), HighlightKind::Literal);
+        assert_eq!(kind_at(&spans, source, "3"), HighlightKind::Literal);
+        assert_eq!(kind_at(&spans, source, "fetch"), HighlightKind::Function);
+    }
+
+    /// The real TypeScript regressions [`TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT`] exists to repair, all
+    /// found by diffing old against new over real source rather than by inspection.
+    #[test]
+    fn typescript_supplement_repairs_capitalised_functions_and_void() {
+        let source = "function Badge(x: string): void {}\nconst s = String(x);\nconst w: Widget = new Widget();\n";
+        let spans = highlight_typescript(source, false);
+        assert_eq!(
+            kind_at(&spans, source, "Badge"),
+            HighlightKind::Function,
+            "a capitalised function declaration is still a function, not a type"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "String("),
+            HighlightKind::Function,
+            "a capitalised call is still a call, not a type"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "Widget = "),
+            HighlightKind::Type,
+            "a capitalised identifier that is neither declared nor called stays a type"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "void"),
+            HighlightKind::Type,
+            "`void` must classify like every other predefined_type keyword"
+        );
+        // The sibling predefined types it has to stay consistent with.
+        assert_eq!(kind_at(&spans, source, "string"), HighlightKind::Type);
+    }
+
+    /// Real TSX. The JSX query is only composed in for the TSX grammar (it references node kinds
+    /// the plain TypeScript grammar does not have), so this is the only place element-name
+    /// classification is exercised at all.
+    #[test]
+    fn tsx_jsx_element_names_are_classified_as_types() {
+        let source = "const view = <div className=\"row\"><Badge label={name} /></div>;\n";
+        let spans = highlight_tsx(source);
+        assert_eq!(
+            kind_at(&spans, source, "div"),
+            HighlightKind::Type,
+            "a lowercase JSX element name arrives as @tag"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "Badge"),
+            HighlightKind::Type,
+            "a capitalised JSX component name must match the lowercase case"
+        );
+        assert_eq!(kind_at(&spans, source, "\"row\""), HighlightKind::Literal);
+    }
+
+    /// Interpolated code inside a template literal / f-string is now classified as the real code
+    /// it is, instead of being swallowed whole by the enclosing string literal. Verified against
+    /// real occurrences in this repository's own vendored sources before being pinned here.
+    #[test]
+    fn interpolated_code_inside_strings_is_classified_as_code() {
+        let typescript = "const msg = `n=${count.toFixed(1)}`;\n";
+        let ts_spans = highlight_typescript(typescript, false);
+        assert_eq!(
+            kind_at(&ts_spans, typescript, "n=$"),
+            HighlightKind::Literal,
+            "the literal text of the template string is still a string"
+        );
+        assert_eq!(
+            kind_at(&ts_spans, typescript, "toFixed"),
+            HighlightKind::Function
+        );
+
+        let python = "msg = f\"n={value if value else other}\"\n";
+        let py_spans = highlight_python(python);
+        assert_eq!(kind_at(&py_spans, python, "n="), HighlightKind::Literal);
+        assert_eq!(
+            kind_at(&py_spans, python, "if value"),
+            HighlightKind::Keyword
+        );
+    }
+
+    /// The span list [`highlight_with`] produces must be sorted, non-overlapping and gapless, with
+    /// no empty spans - `build_lines` clips against it positionally and would mis-render if any of
+    /// that were violated. The replaced implementation emitted leaf-only spans with real gaps, so
+    /// this is a genuinely new invariant worth pinning rather than an inherited one.
+    #[test]
+    fn produced_spans_tile_the_whole_source_exactly_once() {
+        for (label, spans, len) in [
+            ("rust", highlight_rust(SAMPLE_RUST), SAMPLE_RUST.len()),
+            (
+                "python",
+                highlight_python(SAMPLE_PYTHON),
+                SAMPLE_PYTHON.len(),
+            ),
+            (
+                "tsx",
+                highlight_tsx(SAMPLE_TYPESCRIPT),
+                SAMPLE_TYPESCRIPT.len(),
+            ),
+        ] {
+            let mut cursor = 0usize;
+            for span in &spans {
+                assert!(span.start < span.end, "{label}: empty span {span:?}");
+                assert_eq!(span.start, cursor, "{label}: gap or overlap at {span:?}");
+                cursor = span.end;
+            }
+            assert_eq!(cursor, len, "{label}: spans must cover the whole source");
+        }
+    }
+
+    /// Adjacent same-kind spans are coalesced, so a string containing escape sequences renders as
+    /// one continuous `Literal` run rather than several - and, critically, the escape does not
+    /// punch a `Text`-coloured hole through the middle of the string the way an unrecognised
+    /// capture name would.
+    #[test]
+    fn escapes_inside_a_string_stay_one_continuous_literal_run() {
+        let source = "fn main() { let s = \"a\\nb\\tc\"; }\n";
+        let spans = highlight_rust(source);
+        let literal_start = source.find('"').expect("string start");
+        let span = spans
+            .iter()
+            .find(|span| span.start <= literal_start && literal_start < span.end)
+            .expect("string span");
+        assert_eq!(span.kind, HighlightKind::Literal);
+        assert!(
+            span.end >= source.find("c\"").expect("string end") + 2,
+            "the whole string literal, escapes included, must be one Literal run"
+        );
     }
 
     // Coverage for finding 5's fix: `highlighter_for_extension` reads from the real registry,

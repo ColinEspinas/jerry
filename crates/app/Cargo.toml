@@ -76,6 +76,30 @@ regex = "1.5"
 # already-locked crate to a direct dependency rather than adding new version surface - pinned to
 # the exact version this workspace's `Cargo.lock` already resolves.
 unicode-segmentation = "1.13.3"
+# The official tree-sitter highlighting engine, driving each grammar crate's own published
+# `queries/highlights.scm` - this replaced a hand-rolled recursive AST walk over per-language
+# node-kind tables maintained inside `crate::code_view`. Pinned with an exact `=` to the same
+# version as `tree-sitter` itself above, for a stronger reason than matching style: this crate is
+# released in lockstep with `tree-sitter` (it shares its version numbers) and its own manifest
+# requires `tree-sitter ^0.26.9`, read directly from the published crate rather than assumed. A
+# bare caret here would resolve to whatever the newest `0.26.x` is, which is exactly the silent
+# drift the `tree-sitter = "=0.26.9"` pin above was already added to stop. Not present anywhere in
+# `vendor/zed`, which hand-writes its own self-contained query files instead - so unlike the GPUI
+# APIs, there is no in-tree call site to verify against, and `crate::code_view`'s docs instead cite
+# the real crate source on disk for every non-obvious behaviour they rely on.
+tree-sitter-highlight = "=0.26.9"
+# Depended on for its *query file*, not its grammar - this app never parses anything with the
+# JavaScript grammar (`.js`/`.jsx` deliberately reuse the TypeScript/TSX ones, see
+# `crate::code_view::highlight_typescript`). `tree-sitter-typescript`'s own `HIGHLIGHTS_QUERY` is
+# a 35-line supplement covering types and TypeScript-only keywords and nothing else; upstream
+# expects it concatenated onto JavaScript's, and without that every TypeScript string, comment and
+# function call would silently render as plain text. See
+# `crate::code_view::highlight_query_for`'s own docs. `0.23.1` is the release paired with the
+# already-pinned `tree-sitter-typescript = "0.23.2"` (the two are versioned in step upstream), so
+# the query file matches the node kinds that grammar actually emits; that the composed query
+# really does compile against both the TypeScript and the TSX grammars is not assumed either -
+# `crate::code_view`'s `every_real_grammar_config_compiles` test asserts it.
+tree-sitter-javascript = "0.23.1"
 
 # Real per-target `gpui_platform` backend selection (Revision R11, extended in R12 to add
 # real X11 support). `gpui_platform`'s own Cargo.toml
