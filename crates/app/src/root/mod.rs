@@ -75,6 +75,8 @@ use crate::settings::state::SettingsPage;
 use crate::settings::store::{self as settings_store, CfgFormat, Settings};
 use crate::sidebar::changes::{self, ChangeTag};
 use crate::sidebar::file_tree::{self, FileTreeEntry};
+use crate::sidebar::fold_state;
+use crate::sidebar::tree_ops;
 use crate::status_bar::process_stats;
 use crate::text_history;
 use crate::theme;
@@ -166,6 +168,11 @@ actions!(
         Redo,
         TextUndo,
         TextRedo,
+        FileTreeContextMenu,
+        FileTreeRename,
+        FileTreeCopy,
+        FileTreeCut,
+        FileTreePaste,
     ]
 );
 
@@ -180,7 +187,8 @@ pub(crate) const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(3);
 pub(crate) const FILE_FRESHNESS_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Cap on how many changed files the diff view renders, independent of `wt_core::diff`'s own
-/// `MAX_FILES` cap (300) on the loaded diff. Mirrors `file_tree::MAX_RENDERED_FILE_ENTRIES`.
+/// `MAX_FILES` cap (300) on the loaded diff. The Files tree used to have a matching
+/// render cap; it no longer does (GitHub issue #18 §4), so this one now stands alone.
 pub(crate) const MAX_RENDERED_DIFF_FILES: usize = 40;
 
 /// Cap on how many hunk lines a single file's diff renders, independent of `wt_core::diff`'s
@@ -197,6 +205,15 @@ pub(crate) type DiffHighlightCache = (
     Vec<Vec<code_view::RenderedLine>>,
     Vec<Vec<(Option<usize>, Option<usize>)>>,
 );
+
+/// How many times [`AdeApp::persist_fold_state`]'s writer loop retries a failing write before
+/// giving up on it. Bounded so a permanently broken path (a read-only `~/.config`, say) can't
+/// spin the loop forever; the next real expand/collapse starts a fresh budget, since a new user
+/// action is the honest trigger for trying again.
+pub(crate) const FOLD_STATE_SAVE_MAX_ATTEMPTS: u32 = 5;
+
+/// Multiplied by the attempt number for [`AdeApp::persist_fold_state`]'s linear retry backoff.
+pub(crate) const FOLD_STATE_SAVE_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
 /// How often [`AdeApp::ensure_lsp_poll_task`]'s background loop checks for a newly-arrived
 /// `publishDiagnostics` notification. Coarser than `crate::terminal::pane::POLL_INTERVAL` (8ms):
@@ -228,11 +245,110 @@ pub struct AdeApp {
     /// [`Self::current_diff`]'s docs for exactly which [`DiffLoadState`]/[`DiffBase`]
     /// combinations count).
     pub(crate) diff_totals: Option<(u32, u32)>,
-    /// Real collapse/expand state for the file tree - a directory's path is in this set iff
-    /// the user has collapsed it (see `crate::sidebar::file_tree::visible_entries`, which this set
-    /// feeds directly). Absence means expanded, so a freshly loaded tree starts fully open,
-    /// matching the design's own default screenshots.
-    pub(crate) collapsed_dirs: HashSet<PathBuf>,
+    /// Real expand/collapse state for the file tree - a directory's absolute path is in this set
+    /// iff it is expanded (see `crate::sidebar::file_tree::visible_entries`, which this set feeds
+    /// directly). **Absence means collapsed**, so a worktree opened for the first time shows only
+    /// its root-level entries (GitHub issue #18 §1).
+    ///
+    /// This is the live, in-memory mirror of one worktree's entry in [`Self::fold_state`]; every
+    /// mutation goes through `AdeApp::set_dir_expanded`/`collapse_all_dirs`/`reveal_in_tree`,
+    /// which keep the two in step and write the change to disk immediately. Re-derived from
+    /// `fold_state` on every worktree switch (`Self::select_worktree`), never carried across one.
+    pub(crate) expanded_dirs: HashSet<PathBuf>,
+    /// Every worktree's persisted fold state, loaded once at startup from
+    /// `~/.config/jerry/file-tree-state.toml` - see `crate::sidebar::fold_state`'s module docs
+    /// for the file's shape, its per-worktree-path keying, and why it is a separate file from
+    /// `settings.toml` with a genuinely atomic write path.
+    pub(crate) fold_state: fold_state::FoldState,
+    /// The resolved path [`Self::persist_fold_state`] writes to - a sibling of
+    /// [`Self::settings_path`], and `None` for exactly the same tests that get a `None` settings
+    /// path, which makes a fold-state save a real no-op rather than a special-cased test skip.
+    pub(crate) fold_state_path: Option<PathBuf>,
+    /// [`Self::file_tree_root`]'s resolved `fold_state::worktree_key`, recomputed exactly once
+    /// per real root change (`Self::set_file_tree_root`) rather than per lookup. That caching is
+    /// not a micro-optimization: `worktree_key` calls `std::fs::canonicalize`, and the callers
+    /// are an expand/collapse click and - once per ancestor - a "reveal in tree", so resolving it
+    /// on demand meant up to a dozen blocking syscalls on the foreground thread per gesture,
+    /// which on a stale NFS/FUSE mount is a frozen window rather than a slow one. `None` when the
+    /// root isn't valid UTF-8 (see `worktree_key`), which makes every record attempt a logged
+    /// refusal instead of a silent mis-key.
+    pub(crate) fold_state_root_key: Option<String>,
+    /// The `fold_state::worktree_key`s this instance has recorded anything for - what
+    /// [`Self::persist_fold_state`] hands `FoldState::save_merged_at` as "mine to overwrite".
+    /// Every other key in the file belongs to some other running instance (one `jerry` process
+    /// per repository) and is passed through untouched; see `crate::sidebar::fold_state`'s
+    /// module docs for the whole-file-clobber this exists to prevent.
+    pub(crate) fold_state_owned: std::collections::BTreeSet<String>,
+    /// The fold-state file's serial writer loop - the exact same mechanism (and the same
+    /// reasoning) as [`Self::_settings_save_task`], just for the other file. Two writes to one
+    /// path are never allowed to overlap; a change that lands while a write is in flight is
+    /// picked up by the still-running loop.
+    pub(crate) _fold_state_save_task: Option<Task<()>>,
+    /// See [`Self::settings_save_pending`] - same contract, for the fold-state file.
+    pub(crate) fold_state_save_pending: bool,
+    /// See [`Self::settings_save_running`] - same contract, for the fold-state file.
+    pub(crate) fold_state_save_running: bool,
+    /// Whether the last completed file-tree walk stopped early at its configured entry cap
+    /// (`Settings.file_tree.max_entries`, or [`Self::file_tree_limit_override`]). Drives the
+    /// sidebar's real "load more" action - the explicit replacement for the removed
+    /// "... and N more entries not shown" row.
+    pub(crate) file_tree_truncated: bool,
+    /// Whether that walk was a *complete* inventory of the worktree's directories
+    /// (`file_tree::FileTreeListing::is_complete`) - false when it was truncated, and also when
+    /// it silently skipped an unreadable or too-deep subdirectory. The only condition under
+    /// which `AdeApp::prune_stale_fold_state` may read "not in this listing" as "deleted".
+    pub(crate) file_tree_complete: bool,
+    /// Set by the sidebar's "load more" action (`Self::load_more_file_tree_entries`): the cap
+    /// this worktree's walks use instead of `Settings.file_tree.max_entries`, raised tenfold per
+    /// click. Deliberately still a cap and never `None`: a single click that re-walked a
+    /// bind-mounted `$HOME` with an unbounded budget would allocate millions of `PathBuf`s on a
+    /// background thread and then hand them all to `rebuild_palette_file_candidates`. Each click
+    /// raises the bound and the row keeps reporting where the walk stopped, so the listing is
+    /// never *silently* cut off - which is what issue #18 §4 actually asks for. Session-scoped
+    /// and per-worktree: reset on every worktree switch, since "show me more of *this* tree"
+    /// says nothing about the next one.
+    pub(crate) file_tree_limit_override: Option<usize>,
+    /// The file tree's open right-click context menu (GitHub issue #19 §1), `None` when closed -
+    /// see `crate::sidebar::tree_ops::TreeContextMenu`.
+    pub(crate) tree_context_menu: Option<tree_ops::TreeContextMenu>,
+    /// The file tree's in-progress inline name editor (New File / New Folder / Rename), `None`
+    /// when none is open. Held here rather than inside [`Self::file_tree`] on purpose - see
+    /// `crate::sidebar::tree_ops::TreeInlineEdit`'s own docs for the watcher-refresh race that
+    /// placement closes (issue #19 §4).
+    pub(crate) tree_inline_edit: Option<tree_ops::TreeInlineEdit>,
+    /// The tree's own cut/copy buffer - a real filesystem entry, deliberately not the system
+    /// clipboard (see `crate::sidebar::tree_ops::TreeClipboard`).
+    pub(crate) tree_clipboard: Option<tree_ops::TreeClipboard>,
+    /// A delete that has been requested but not yet confirmed. Nothing is ever removed while
+    /// this is merely `Some`; `crate::sidebar::tree_ops::AdeApp::confirm_tree_delete` is the only
+    /// path that acts, and it is only reachable from the confirmation panel's own button.
+    pub(crate) tree_delete_confirm: Option<tree_ops::PendingTreeDelete>,
+    /// The most recent file-operation failure (a refused rename, a failed trash command),
+    /// surfaced under the tree rather than dropped into the log - the same small, honest error
+    /// surface [`Self::file_save_error`] uses for a failed save.
+    pub(crate) tree_op_error: Option<String>,
+    /// The file tree's keyboard-focus target. `track_focus`'d by
+    /// `crate::sidebar::render::AdeApp::render_file_tree`'s container, which is also the node
+    /// carrying the `"file-tree"` `key_context` every tree keybinding is scoped to - so
+    /// `Ctrl+C`/`Ctrl+X`/`Ctrl+V` can never match while a terminal session has focus. See
+    /// `crate::sidebar::tree_ops`'s module docs.
+    pub(crate) tree_focus_handle: FocusHandle,
+    /// The file tree container's real painted bounds, captured by a `gpui::canvas` child each
+    /// render (the same pattern [`Self::plus_button_bounds`] uses) - where a *keyboard*-opened
+    /// context menu (`Shift+F10`) anchors, since there is no cursor position to use.
+    pub(crate) file_tree_bounds: gpui::Bounds<Pixels>,
+    /// The in-flight confirmed delete (a real `gio trash` child process, or a real
+    /// `remove_dir_all`), one slot: a second delete can't be requested until the confirmation
+    /// panel is open again, so there is never more than one.
+    pub(crate) _tree_delete_task: Option<Task<()>>,
+    /// The in-flight Duplicate / paste-a-copy - a real, recursive `std::fs` tree copy, run on the
+    /// background executor rather than in the click listener that started it (see
+    /// `crate::sidebar::tree_ops::AdeApp::spawn_tree_copy`). One slot, superseding: a second copy
+    /// started while one is running drops the first *task handle*, which cannot stop a copy
+    /// already in progress - deliberately, since abandoning one half-way is strictly worse than
+    /// letting it finish, and the two have different destinations (each is
+    /// `file_ops::unique_destination`-resolved) so they cannot collide with each other.
+    pub(crate) _tree_copy_task: Option<Task<()>>,
     /// Per-file "reviewed" toggle state for the Changes list - a file's path is in this set iff
     /// its checkbox is checked. No backend "review" concept exists yet; this is purely local UI
     /// state that `Self::render_changes_header`'s progress bar and count read directly.
@@ -424,7 +540,7 @@ pub struct AdeApp {
     /// [`OverlayFocus`]/[`restore_focus`].
     pub(crate) palette_focus: OverlayFocus,
     /// The palette's file-candidate list (`crate::palette::state::FileCandidate`, one per non-directory
-    /// [`Self::file_tree`] entry, up to `file_tree::MAX_ENTRIES` = 5000) - built once by
+    /// [`Self::file_tree`] entry, up to `Settings.file_tree.max_entries`) - built once by
     /// [`Self::rebuild_palette_file_candidates`] when `file_tree`/the diff reload, not rebuilt on
     /// every `Self::build_palette_groups` call (which runs on every render while the palette is
     /// open, up to ~30x/sec during a streaming session). Session/command candidates aren't
@@ -1060,6 +1176,100 @@ impl AdeApp {
     pub(crate) fn set_settings_save_test_delay(&mut self, delay: Option<Duration>) {
         self.settings_save_test_delay = delay;
     }
+
+    /// Queues a background-executor save of [`Self::fold_state`] to [`Self::fold_state_path`].
+    /// Called from every single expand/collapse - that immediacy is the point (GitHub issue #18
+    /// §2 asks for fold changes to be "recorded immediately (crash-safe), not only on clean
+    /// exit"), and `FoldState::save_at`'s write-temp-then-rename is what makes an interrupted
+    /// write a no-op rather than a corrupted file.
+    ///
+    /// Structurally identical to [`Self::persist_settings`], including the "clear the running
+    /// flag in the same synchronous step that decides to stop" trick that keeps a change landing
+    /// at exactly the wrong moment from being silently dropped - see that method's own docs for
+    /// the full reasoning. It is a genuine no-op with a `None` path (every GPUI test that hasn't
+    /// asked for a real one).
+    ///
+    /// Unlike settings, the write is a *merge* (`FoldState::save_merged_at` against
+    /// [`Self::fold_state_owned`]): a second `jerry` process browsing a different repository is
+    /// writing the same file, and a whole-file write would erase its state.
+    pub(crate) fn persist_fold_state(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.fold_state_path.clone() else {
+            return;
+        };
+        self.fold_state_save_pending = true;
+        if self.fold_state_save_running {
+            return;
+        }
+        self.fold_state_save_running = true;
+        let task = cx.spawn(async move |this, cx| {
+            let mut attempt: u32 = 0;
+            loop {
+                // The state and the owned-key set are read in the *same* synchronous step, so the
+                // pair handed to `save_merged_at` can never be a mix of two different moments.
+                let step = this.update(cx, |this, _cx| {
+                    if this.fold_state_save_pending {
+                        this.fold_state_save_pending = false;
+                        Some((this.fold_state.clone(), this.fold_state_owned.clone()))
+                    } else {
+                        this.fold_state_save_running = false;
+                        None
+                    }
+                });
+                let Ok(Some((state, owned))) = step else {
+                    break;
+                };
+                let result = cx
+                    .background_executor()
+                    .spawn({
+                        let path = path.clone();
+                        async move { state.save_merged_at(&path, &owned) }
+                    })
+                    .await;
+                match result {
+                    Ok(()) => attempt = 0,
+                    Err(err) => {
+                        // Do **not** drop the change. `fold_state_save_pending` was cleared above,
+                        // before the write, so without this a real failure (disk full, a read-only
+                        // `~/.config`, a permissions change) would lose the user's expand/collapse
+                        // with nothing but a log line - while this feature's whole claim is that a
+                        // fold change is recorded immediately. Re-marking it pending means the very
+                        // next iteration rewrites the *current* state, which is also why this needs
+                        // no queue: only the latest value ever matters.
+                        attempt += 1;
+                        if attempt > FOLD_STATE_SAVE_MAX_ATTEMPTS {
+                            log::error!(
+                            "giving up saving {} after {FOLD_STATE_SAVE_MAX_ATTEMPTS} attempts \
+                             ({err}) - file-tree fold state will not persist until something \
+                             changes again",
+                            path.display()
+                        );
+                            // Deliberately *not* re-marked pending: a permanently broken path would
+                            // otherwise spin this loop forever. A later real expand/collapse calls
+                            // `persist_fold_state` again and starts a fresh attempt budget, which is
+                            // the right retry trigger - the user did something new.
+                            continue;
+                        }
+                        log::warn!(
+                        "failed to save {} (attempt {attempt}/{FOLD_STATE_SAVE_MAX_ATTEMPTS}): \
+                         {err} - retrying",
+                        path.display()
+                    );
+                        let requeued =
+                            this.update(cx, |this, _cx| this.fold_state_save_pending = true);
+                        if requeued.is_err() {
+                            break;
+                        }
+                        // Linear backoff, so a transient failure (a full disk being cleared, a mount
+                        // coming back) is retried promptly without hammering a broken path.
+                        cx.background_executor()
+                            .timer(FOLD_STATE_SAVE_RETRY_BACKOFF * attempt)
+                            .await;
+                    }
+                }
+            }
+        });
+        self._fold_state_save_task = Some(task);
+    }
 }
 
 impl Render for AdeApp {
@@ -1126,6 +1336,32 @@ impl Render for AdeApp {
             .when(self.new_file_input.is_some(), |el| {
                 el.child(self.render_new_file_prompt(cx))
             })
+            // The file tree's context menu and its delete confirmation (GitHub issue #19) -
+            // both are window-positioned overlays, so they live here beside the `+` menu and the
+            // "New file" prompt rather than inside the sidebar's own clipped column.
+            //
+            // Gated on `!settings_open`, which is a real fix rather than defensive padding
+            // (found in this change's own review): the Settings surface *replaces* the workspace
+            // body one child up, so an ungated menu would paint a full-window transparent scrim
+            // and a file-tree menu over Settings, swallowing every click on the page underneath.
+            // `Self::open_settings` clears `plus_menu_open`/`title_menu_open`/`new_file_input`
+            // for exactly this reason; the tree's own state is cleared alongside them there, and
+            // this guard is the belt to that braces. The context menu additionally requires the
+            // Files tab, since every one of its actions targets a row only that tab renders.
+            .when(
+                !self.settings_open
+                    && self.right_sidebar_view == RightSidebarView::Files
+                    && self.tree_context_menu.is_some(),
+                |el| el.child(self.render_tree_context_menu(cx)),
+            )
+            // The delete confirmation deliberately does *not* require the Files tab: it is a
+            // window-level modal the user is mid-way through answering, not a tree affordance,
+            // and hiding it on a tab switch would leave a destructive confirmation armed with no
+            // way to answer or cancel it.
+            .when(
+                !self.settings_open && self.tree_delete_confirm.is_some(),
+                |el| el.child(self.render_tree_delete_confirm(cx)),
+            )
             .when(self.palette_open, |el| el.child(self.render_palette(cx)))
     }
 }

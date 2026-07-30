@@ -155,7 +155,13 @@ use gpui::{
 ///     panel, `crate::rail`'s filter row, `crate::settings`' Keybindings filter row,
 ///     `crate::root::new_file`'s name prompt, `crate::code_surface::render`'s code surface (only
 ///     while the editable File view is genuinely showing, alongside its existing `"file-editor"`
-///     tag), and `crate::merge::editing`'s hand-edit surface (alongside `"merge-editor"`).
+///     tag), `crate::merge::editing`'s hand-edit surface (alongside `"merge-editor"`), and
+///     `crate::sidebar::render`'s file tree (only while its inline New File / New Folder / Rename
+///     name editor is open, alongside `"file-tree tree-editing"` - see
+///     `crate::keymap_overrides::file_tree_key_context`). That last one arrived by *merge* rather
+///     than by an edit to this file: GitHub issue #19 built those editors on a branch where this
+///     tag did not exist, and until they gained it `Ctrl+Z` mid-filename ran the worktree history.
+///     Keeping this enumeration complete is exactly what that incident argues for.
 ///   - `Undo`/`Redo` gain the matching `&& !text-input`, so the two predicate sets are provably
 ///     disjoint: no live context stack can satisfy both. That is deliberately *not* left to
 ///     GPUI's tie-break rules. `vendor/zed/crates/gpui/src/keymap.rs`'s own `bindings_for_input`
@@ -176,7 +182,7 @@ use gpui::{
 ///     usual `"secondary-"`): `Ctrl+Y` is the Windows-convention redo key, and `Cmd+Y` means
 ///     nothing on macOS. Safe to bind only because `"text-input"` is never live over a terminal,
 ///     where `Ctrl+Y` is a real control byte (`0x19`, readline `yank`).
-///   - Routing between the six text surfaces is *not* done by inspecting app state inside one
+///   - Routing between the seven text surfaces is *not* done by inspecting app state inside one
 ///     handler: each surface registers its own `on_action` listener on the exact node that carries
 ///     its `"text-input"` tag, and GPUI only dispatches an action along the focused node's own
 ///     ancestor path (`vendor/zed/crates/gpui/src/window.rs`'s `dispatch_action_on_node`), so the
@@ -315,6 +321,49 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("secondary-x", root::EditorCut, Some("merge-editor")),
         gpui::KeyBinding::new("secondary-v", root::EditorPaste, Some("merge-editor")),
         gpui::KeyBinding::new("secondary-s", root::EditorSave, Some("merge-editor")),
+        // GitHub issue #19's file-tree bindings. Every one is scoped to
+        // `"file-tree && !tree-editing && !tree-delete-confirm"`, and all three terms are
+        // load-bearing - see `crate::sidebar::tree_ops`'s own module docs for the full
+        // reasoning. The short version: `secondary-c`/`secondary-x`/`secondary-v` at `None`
+        // scope would claim the control bytes `crate::terminal::pane::keystroke_to_bytes` hands
+        // a focused shell (Ctrl+C is SIGINT - binding it globally would risk making it
+        // impossible to interrupt a running agent CLI), the exact bug class this list's `"]"`
+        // and `secondary-p` entries above already document; `!tree-editing` is what keeps them
+        // from firing while one of the tree's own inline name editors has the keystroke; and
+        // `!tree-delete-confirm` the same while the modal delete confirmation is up (`F2` or
+        // `Shift+F10` firing *behind* a modal scrim was a real finding in this change's own
+        // review). Both negated terms follow the `"file-editor && !completions"` shape above.
+        //
+        // `shift-f10` is the only context-menu keystroke bound. The dedicated Menu/Application
+        // key that some keyboards also carry is deliberately *not* bound: gpui's key names come
+        // from each platform backend at runtime and nothing in the vendored tree names that key
+        // (it isn't in `vendor/zed/crates/gpui/src/platform/keystroke.rs`'s own key vocabulary),
+        // so any spelling guessed here would be a binding that silently never matches.
+        gpui::KeyBinding::new(
+            "shift-f10",
+            root::FileTreeContextMenu,
+            Some("file-tree && !tree-editing && !tree-delete-confirm"),
+        ),
+        gpui::KeyBinding::new(
+            "f2",
+            root::FileTreeRename,
+            Some("file-tree && !tree-editing && !tree-delete-confirm"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-c",
+            root::FileTreeCopy,
+            Some("file-tree && !tree-editing && !tree-delete-confirm"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-x",
+            root::FileTreeCut,
+            Some("file-tree && !tree-editing && !tree-delete-confirm"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-v",
+            root::FileTreePaste,
+            Some("file-tree && !tree-editing && !tree-delete-confirm"),
+        ),
     ]
 }
 
@@ -418,8 +467,8 @@ mod undo_scoping_matrix_tests {
     fn stack_descriptions() -> Vec<&'static str> {
         vec![
             "a dangling focus handle - GPUI's empty-context dispatch-root fallback",
-            "any surface with no key context of its own (the Settings overlay, the file tree, \
-             the tab strip) - only the root div's baseline tag",
+            "any surface with no key context of its own (the Settings overlay, the tab strip) - \
+             only the root div's baseline tag",
             "a focused terminal session",
             "the read-only Diff view",
             "the editable File view",
@@ -427,6 +476,10 @@ mod undo_scoping_matrix_tests {
             "the merge hand-edit surface",
             "a focused single-line text input (palette / rail filter / settings filter / \
              new-file prompt)",
+            "the focused file tree, no overlay open",
+            "the file tree's inline name editor (new file / new folder / rename)",
+            "the file tree's modal delete confirmation",
+            "the file tree's inline name editor with the delete confirmation over it",
         ]
     }
 
@@ -484,8 +537,24 @@ mod undo_scoping_matrix_tests {
             (false, true),  // ...with completions open
             (false, true),  // the merge hand-edit surface
             (false, true),  // a focused single-line text input
+            // The file tree with no editor open is not a text surface: Ctrl+Z there means the
+            // worktree history, exactly as it does on the Diff view.
+            (true, false),
+            // ...but its inline name editor *is* one. This row is the whole reason issue #19's
+            // tree had to gain issue #17's `"text-input"` tag when the two branches merged:
+            // without it this read `(true, false)`, and Ctrl+Z while typing a filename ran the
+            // worktree undo - discarding or re-committing real git state from inside a rename
+            // box, with the tree's own key handler never even seeing the keystroke (it returns
+            // early on a `control`/`platform` modifier).
+            (false, true),
+            (true, false), // the modal delete confirmation - no text being typed
+            (false, true), // the name editor, delete confirmation over it
         ];
+        // Both pairings, not just one: the loop below is a `zip` chain, and `zip` truncates to
+        // the shortest input - so a stack added without a matching description would silently
+        // drop rows from this matrix rather than fail it.
         assert_eq!(expectations.len(), real_context_stacks().len());
+        assert_eq!(stack_descriptions().len(), real_context_stacks().len());
 
         for ((description, parts), (wants_worktree, wants_text)) in stack_descriptions()
             .into_iter()

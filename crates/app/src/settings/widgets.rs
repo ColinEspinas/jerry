@@ -16,6 +16,7 @@
 use super::*;
 use crate::settings::store::{CfgFormat, ConfigPage, SnippetLineKind};
 use std::ffi::{OsStr, OsString};
+use std::path::Path;
 
 /// Which program + args hand `target` to `target_os`'s default open handler - `target_os` is an
 /// injected `std::env::consts::OS`-shaped string (`"linux"`/`"macos"`/`"windows"`/...) so this
@@ -69,7 +70,7 @@ impl AdeApp {
     /// child is always reaped, matching every other subprocess spawn in this codebase
     /// (`lsp_core::proc`'s `child.wait()`; `pty_core::PtySession`'s `try_wait`/`wait`).
     /// `target_label` is only ever used for the log message, never passed to the child process.
-    fn spawn_open_command(
+    pub(crate) fn spawn_open_command(
         &mut self,
         program: &'static str,
         args: Vec<OsString>,
@@ -89,6 +90,16 @@ impl AdeApp {
                 }
             })
             .detach();
+    }
+
+    /// Hands a real local path to this platform's default-open handler - the file tree's
+    /// "Reveal in file manager" row (`crate::sidebar::tree_ops::AdeApp::reveal_in_file_manager`).
+    /// The same [`open_command_for`]/[`Self::spawn_open_command`] pair
+    /// [`Self::open_settings_file`] uses, exposed as its own entry point so the sidebar doesn't
+    /// have to reach into a settings-page method (or, worse, grow a second `xdg-open` call site).
+    pub(crate) fn open_path_with_os_handler(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let (program, args) = open_command_for(std::env::consts::OS, path.as_os_str());
+        self.spawn_open_command(program, args, path.display().to_string(), cx);
     }
 
     /// Opens the settings file - the config banner's `Open file` button - via
@@ -208,7 +219,7 @@ impl AdeApp {
                 &[ChoiceOption::new("TOML"), ChoiceOption::new("JSON")],
                 self.settings_cfg_format.label().to_string(),
                 cx,
-                |this, index, cx| {
+                |this, index, _window, cx| {
                     // Index into the `options` array above, not a label re-match.
                     this.settings_cfg_format = match index {
                         1 => CfgFormat::Json,
@@ -478,7 +489,7 @@ impl AdeApp {
         options: &[ChoiceOption],
         selected: String,
         cx: &mut Context<Self>,
-        on_select: impl Fn(&mut Self, usize, &mut Context<Self>) + Clone + 'static,
+        on_select: impl Fn(&mut Self, usize, &mut Window, &mut Context<Self>) + Clone + 'static,
     ) -> impl IntoElement {
         let mut track = div()
             .flex_none()
@@ -534,8 +545,8 @@ impl AdeApp {
                 });
             if option.enabled {
                 segment = segment.cursor_pointer().on_click(cx.listener(
-                    move |this, _event: &ClickEvent, _window, cx| {
-                        on_select(this, index, cx);
+                    move |this, _event: &ClickEvent, window, cx| {
+                        on_select(this, index, window, cx);
                     },
                 ));
             }

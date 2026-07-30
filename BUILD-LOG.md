@@ -2042,6 +2042,279 @@ confirming this added no new functionality and lost none. `git`'s own rename det
 final commit independently corroborates the move: the large majority of touched files show as
 high-percentage renames, not delete+create pairs.
 
+## File tree: collapsed by default, persisted fold state, indent guides, complete listings (GitHub issue #18)
+
+The Files tree now opens fully collapsed and remembers exactly what was left open, per worktree,
+across restarts. `AdeApp::collapsed_dirs` became `expanded_dirs` - the inversion is the whole of
+the "collapsed by default" requirement: absence from the set means collapsed, so a worktree this
+app has never seen (a freshly created one included) opens showing only its root-level entries,
+with no separate "first open" special case anywhere in the code.
+
+**Persistence.** A new `crate::sidebar::fold_state` writes
+`~/.config/jerry/file-tree-state.toml`, resolved as a sibling of the real `settings.toml` path,
+and driven by the same serial-writer-loop mechanism `AdeApp::persist_settings` already
+established (one write in flight at a time; a change landing mid-write is picked up by the
+running loop, never raced). It is a separate file from `settings.toml` for two real reasons:
+`Settings`' own module docs are explicit that every field there is something a settings *page*
+reads and writes and the config banner renders back as hand-editable config, which machine-
+managed fold state for every worktree ever opened is not; and `Settings::save_at` is a
+deliberately non-atomic truncate-then-write, while "recorded immediately (crash-safe)" is a
+requirement here. `FoldState::save_at` writes a process-unique temp file, `sync_all`s it,
+renames it over the target, and syncs the parent directory, so neither a killed process nor a
+power loss can leave a half-written file. The map is keyed by canonicalized worktree path with
+worktree-relative paths inside, and non-UTF-8 paths are refused outright rather than
+`to_string_lossy`'d - a lossy key would map every undecodable byte to the same U+FFFD and could
+collapse two different worktrees onto one entry, which is exactly the cross-worktree leak the
+keying exists to prevent.
+
+**Indent guides** are drawn as each row's own absolutely-positioned children, not as an overlay
+across the list. That is what makes them correct under the recently-landed `uniform_list`
+virtualization for free: a guide is a pure function of the row it belongs to (`entry.depth`, plus
+the selected path for the ancestor-chain highlight), so a recycled row can only ever draw the
+guides that belong to whatever row it now shows. An overlay would have to track the visible range
+and scroll offset itself and stay in step with them - the real source of the "gaps or misaligned
+segments as rows recycle" failure the issue names. Verified against real painted geometry rather
+than assumed: tests assert each guide's `debug_bounds` x-offset equals `indent_guide_x(level)`
+from its row's left edge, that consecutive rows' segments meet with no gap, and that all of that
+still holds for a row materialized only after a real 100,000px scroll event recycled the list.
+Two new `ColorToken`s (`theme::tree::INDENT_GUIDE`/`INDENT_GUIDE_ACTIVE`) go through the same
+derived-per-theme mechanism as the ~200 tokens around them; the active/resting branch is testable
+because each guide's `debug_selector` records which one it took.
+
+**Complete listings.** The 500-row `MAX_RENDERED_FILE_ENTRIES` render cap and its
+"... and N more entries not shown" row are gone; every visible row is rendered. One cap survives
+and it is a *load* bound, not a render one: the walk is eager and synchronous (the palette's file
+search needs the whole tree, so it can't be made lazy), so it is bounded by a real, configurable
+`settings.toml` value (`file_tree.max_entries`, 20,000 by default). When it is hit the sidebar
+shows a real "Stopped at N entries - load more" action that re-walks with a tenfold larger
+budget. Deliberately still a budget rather than an unbounded re-walk: one click on a directory
+containing a vendored tree or a bind-mounted `$HOME` would otherwise allocate millions of
+`PathBuf`s and hand them all to the palette candidate list. Each click raises the bound and the
+row keeps reporting where the walk stopped, so nothing is ever *silently* cut off.
+
+Also landed while in here: "collapse all" (clears the tree and the saved state in one step);
+"reveal in tree" (the palette's open-file flow, a just-created file, and go-to-definition landing
+in an unexpanded folder) now expands ancestors and records those expansions like manual ones; and
+`render_file_tree` resolves its visible-row set once per frame into an `Rc<Vec<usize>>` shared
+with the row-builder closure, instead of re-walking the whole loaded tree on each of
+`uniform_list`'s three per-frame closure calls.
+
+An adversarial **self-review** of the first draft - a checker sub-agent the builder dispatched
+against its own work, not an independent or external audit - found seven real problems, all
+fixed: `save_at` claimed
+crash-safety it didn't have (no `fsync`, so only *process* crash was covered); a fixed `.tmp`
+name meant two `jerry` processes could interleave into one torn file, and whole-file writes made
+the last saver silently erase every other repository's state (writes now merge against a set of
+owned worktree keys); a startup prune that dropped any worktree whose root `Path::exists()`
+reported gone would have permanently deleted state for a worktree on a briefly-unmounted volume
+(removed entirely - a few hundred stale bytes is cheaper than destroying real state on a false
+negative); a subdirectory the walk couldn't read looked identical to a deleted one, so pruning
+would have discarded every fold-state entry beneath it (the listing now reports `partial`, and
+pruning only ever runs against a genuinely complete walk); `select_worktree` moved `expanded_dirs`
+to the new worktree ~90 lines before `file_tree_root` followed, leaving a window in which a click
+on a still-rendered stale row recorded state against the wrong root; the live tree and the file
+could diverge silently when a path wasn't recordable (now a three-state outcome and a real log
+line, with the expansion still happening - refusing to open a folder because of how its name is
+encoded would be worse than not remembering it); and one test asserted on state it had
+hand-written itself rather than on a walk that genuinely truncated. That same self-review also
+confirmed the absolute-positioning assumption directly against vendored taffy: absolute insets resolve against
+the container's border box, not its padding box, so a guide's `left` really is measured from the
+row's own left edge despite the row's left padding.
+
+A second self-review pass over those fixes (same mechanism, same caveat - the builder reviewing
+its own work) then caught the worst bug of the whole change: the merged write was
+*written but never wired* - one edit had silently failed to apply, so `persist_fold_state` still
+called the whole-file `save_at`, `save_merged_at` was reachable only from its own unit test, and
+`fold_state_owned` was write-only dead state, while three doc comments and this log claimed
+otherwise. The unit test couldn't catch it (it called the unused function directly) and the
+existing app-level leak test couldn't either (its second instance started before the first ever
+wrote, so a whole-file write preserved both). The regression test added for it drives the exact
+ordering that distinguishes the two - instance B starts, *then* A writes, *then* B writes - and
+was confirmed to fail against the un-wired version before being kept. The same self-review round
+also found
+two more walk paths that could report an incomplete listing as complete (a `DirEntry` that errors
+mid-iteration, and a `file_type()` failure recording a real directory as a file - either one
+would have let pruning delete good fold state), a silent `Refused` in `reveal_in_tree` that
+bypassed the log line its sibling write path already had, an orphaned-temp-file leak that
+making the temp name process-unique had turned from one reusable file into unbounded
+accumulation (now swept on save, with an hour's age threshold so it can never race another
+instance's live write), and several docs still describing the earlier unbounded "Show all
+entries" behaviour. The remaining honest gap is stated in `fold_state`'s own module docs rather
+than papered over: the merge is an unlocked read-modify-write, so two saves that genuinely
+interleave can still lose one update - it narrows the window rather than closing it.
+
+A third review round - this one genuinely independent, dispatched by the coordinator rather than
+by the builder - found four more real bugs, all fixed with revert-verified regression tests
+(each test was confirmed to fail against the pre-fix code before being kept):
+
+1. **"Load more" could shrink the tree.** `FileTreeSettings::sanitize` clamped `max_entries` up
+   but never down, so a hand-edited `max_entries` above the escalation ceiling made
+   `saturating_mul(10).min(ceiling)` compute a *smaller* budget than the one already in force -
+   one click on "load more" would visibly remove rows. The escalation is now monotonic
+   (`.max(current)`) and `max_entries` has a real upper clamp. Separately, once the ceiling was
+   reached the row remained a button that re-walked a full budget's worth of entries to produce
+   byte-identical results; at the ceiling it is now a plain, non-interactive disclosure, enforced
+   both in the render and in the handler.
+2. **Blocking `canonicalize` on the foreground thread, per gesture.** `fold_state::worktree_key`
+   calls `std::fs::canonicalize`, and it was being called once per expand/collapse and once *per
+   ancestor* in "reveal in tree" - up to a dozen blocking syscalls per gesture, which on a stale
+   NFS/FUSE mount is a frozen window rather than a slow one. The key is now resolved once per real
+   root change into `AdeApp::fold_state_root_key`, with `*_with_key` variants on `FoldState` for
+   every hot path. Resolving it lives in exactly one function (`set_file_tree_root`): the first
+   draft of this fix had the constructor computing it a second time, which the revert-verification
+   caught by passing when it should have failed - a real drift risk, closed by making startup go
+   through the same chokepoint as every later switch.
+3. **Unbounded main-thread work at the load ceiling.** Two foreground costs scale linearly with
+   loaded entries (`rebuild_palette_file_candidates` on load, the visible-row scan per frame), so
+   the ceiling was lowered to a number they can genuinely absorb, and `max_entries` clamps to the
+   same value. The sidebar still discloses the stop point, so this is a bounded honest cap rather
+   than a silent one.
+4. **A failed fold-state write was dropped.** The writer loop cleared its pending flag *before*
+   the write, so a real failure (full disk, read-only `~/.config`) lost the user's expand/collapse
+   with only a `log::warn!` - while the feature's whole claim is "recorded immediately". Failures
+   now re-queue with linear backoff and a bounded attempt budget, after which the next real
+   expand/collapse starts a fresh one.
+
+The same round also fixed: `reveal_in_tree` being a hand-copied second implementation of
+`set_dir_expanded`'s body (both now share one `record_dir_expanded`, and the reveal's missing
+`cx.notify()` - which worked only because every caller happened to notify afterwards - is gone);
+`theme::tree`'s two tokens being hand-copied hex duplicates instead of real aliases of
+`border::DIVIDER`/`border::SELECTED_EDGE`; a row-range clamp that guarded only the upper bound and
+would still have panicked on `start > end`; a doc comment claiming a fold change was written to
+disk "before this returns" when it is queued; the settings module's "every field is page-backed"
+invariant, which `file_tree.max_entries` genuinely breaks (now a documented exception rather than
+a quiet violation); and the missing test for the non-UTF-8 path refusal. The
+same-worktree-open-twice limitation of the merge (each instance replaces that key's whole entry,
+so two instances of one worktree revert each other for as long as both run) is now written down in
+`fold_state`'s module docs instead of being papered over by the "narrow window" claim, which was
+only true for the different-worktree case.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace --lib -- --test-threads=1` - 795 app (up from 742: 53 new tests, none
+removed) + 42 lsp-core + 14 pty-core + 98 wt-core. One full run hit the project's known
+diff-rendering flake (`opening_a_real_diff_renders_real_syntax_highlighted_rows`); it passed alone,
+passed with its whole module, and the next full run was green with no other change.
+
+## File tree: right-click context menu and file operations (GitHub issue #19)
+
+The Files tree is writable now: right-click menus on a file row, a folder row and the empty area
+below the tree; inline New File / New Folder / Rename editors; a real cut/copy/paste buffer with
+`Ctrl+C`/`X`/`V`; and a confirmed delete that prefers the OS trash. Three new modules, split the
+way every feature folder in this crate is: `sidebar::context_menu` (which rows a target offers,
+plus the edge-aware popover geometry), `sidebar::file_ops` (name validation, collision-free
+naming, recursive copy/move/delete, the trash decision) - both pure and GPUI-free - and
+`sidebar::tree_ops`, the `impl AdeApp` glue that sequences them and repairs the app's own state
+afterwards.
+
+**Trash is real and named honestly.** On Linux/FreeBSD a confirmed delete shells out to
+`gio trash -- <path>`, GLib's own CLI wrapper around `g_file_trash`, which implements the
+freedesktop.org trash spec for local files in-process (no session bus, no gvfs daemon). Verified by
+running it in this environment rather than assumed: a file and a non-empty directory both really
+landed in `~/.local/share/Trash/files`, and the `--` terminator really does protect a leading-dash
+filename. No new dependency was added for it. macOS and Windows deliberately get **no** trash
+command: macOS's usual answer is an `osascript` snippet whose only interface is an AppleScript
+string literal (every quote and backslash in a filename hand-escaped, and a wrong escape acts on a
+different path than the one confirmed), and Windows has no built-in recycle-bin CLI at all. Those
+platforms take a real, permanent delete whose confirmation button reads "Delete permanently" and
+whose sentence says so, rather than a "moved to trash" claim for something that was destroyed. The
+mechanism is resolved once - against a real `$PATH` probe (`pty_core::resolve_on_path`, the same
+walk this workspace already uses for agent CLIs) - *before* the confirmation is shown, so the words
+the user agrees to and the command that runs come from the same value; a failed trash command is
+reported and never silently escalated into a permanent delete.
+
+**The empty area's "Collapse All" is issue #18's own reset**, `AdeApp::collapse_all_dirs` - the
+same method the Files header's `▾` button calls - not a parallel mechanism. That is asserted where
+the two would actually differ: the test writes a real fold-state file, expands a folder, confirms
+the expansion is genuinely on disk, runs the menu action, and asserts the entry is gone from the
+*file*. An implementation that only emptied `expanded_dirs` would pass every in-memory assertion
+and fail that one.
+
+**Watcher/refresh consistency.** The honest answer to §4's "do these just touch the filesystem, or
+do they need to trigger a refresh?" is: they are plain filesystem changes, so `git` sees them with
+no help - but nothing in this app polls the working tree for the sidebar. There is no filesystem
+watcher at all; the file tree is only ever re-walked by an explicit `load_file_tree`, and the diff
+view only by an explicit `load_diff` (the rail's 3-second status poll refreshes the *rail's*
+per-worktree summary, not `diff_state`). So every operation ends in `refresh_after_file_op`, which
+does both. The in-progress inline editor lives on `AdeApp`, never inside `AdeApp::file_tree` -
+that vector is *replaced wholesale* by each completed walk, which is exactly what an agent creating
+a file mid-session triggers - and the renderer re-finds the editor's anchor row by *path* each
+frame, falling back to the top of the list when the anchor has genuinely gone. Same discipline
+issue #18 applied to fold state. The regression test drives the real race (agent writes a file,
+real re-walk, run to parked) and was confirmed to fail against a completion handler that cleared
+the editor.
+
+**Keybinding scoping**, this project's most-repeated bug class, got two independent mechanisms and
+one corrected claim. The five new bindings are scoped to
+`"file-tree && !tree-editing && !tree-delete-confirm"`, and their `.on_action` handlers live only
+on the tree's own container. An earlier draft of the module docs asserted that handler placement
+was the *only* real protection for a focused terminal and that the `file-tree` half "isn't doing
+that work" - that was wrong, and revert-verification caught it: `dispatch_key` resolves bindings
+against the focused node's own dispatch-path context stack *before* any listener is consulted, so
+either mechanism alone suffices. Both are documented as independent now. The `!tree-editing` half
+has no redundant partner and is the one directly reproducible: with a bare `Some("file-tree")` the
+`shift_f10_while_an_inline_editor_is_open…` test fails, because while an editor is open the tree
+*is* the focused node, the listener runs, and GPUI stops propagation by default in the bubble
+phase - swallowing the keystroke being typed into the name field.
+
+An **adversarial review sub-agent was genuinely dispatched and its report genuinely received**
+(not the builder's own reasoning - said explicitly because a sibling agent misreported this
+earlier the same day). It found nothing fake or unwired, and eleven real problems, all fixed with
+tests:
+
+1. **`reviewed_files` was remapped in the wrong key space** - it is keyed by
+   `wt_core::diff::DiffFile::path` (worktree-relative) and was being remapped with the absolute
+   pair, making it a guaranteed silent no-op. A file's reviewed checkbox reset on every rename.
+2. **A cut+paste back into the source folder silently renamed the file** to `util copy.rs`: an
+   unconditional `unique_destination` for `Cut` as well as `Copy`. It is a no-op now.
+3. **The LSP's per-document bookkeeping survived a rename or delete.** `didOpen` early-returns for
+   a path already in `lsp_opened_files`, and that set is documented as never cleared on close - so
+   recreating a file at a renamed-away path silently got no diagnostics or completions for the
+   rest of the session. Six maps, in *two* key spaces; the reviewer's own split of which was which
+   was itself slightly wrong, and each field's docs were re-read one by one to get it right
+   (`lsp_synced_version`/`lsp_diagnostics_confirmed_version` are relative, not absolute).
+4. **Switching to the Changes tab left focus dangling** on `tree_focus_handle`, whose node stops
+   being rendered - the exact `OverlayFocus` invariant this project keeps re-finding, killing every
+   keybinding until the next click. `set_right_sidebar_view` now routes through `restore_focus`.
+5. **The tree's overlays floated over the Settings surface**, scrim and all, swallowing clicks.
+   Gated, and cleared in `open_settings` alongside the three overlays already cleared there.
+6. **Blocking recursive tree copy on the foreground thread** in a click listener - contradicting
+   the sibling `confirm_tree_delete`, whose own docs insist on "never the foreground thread".
+   Duplicate and paste-a-copy now run on the background executor.
+7. **A half-copied tree survived a failed copy**, then got repainted looking complete. Cleaned up.
+8. **A symlink to a directory aborted the copy** (`EISDIR`), and a symlinked subdirectory aborted
+   the recursion mid-tree - the dir/file decision used the non-following `symlink_metadata`. Now
+   follows, with a real depth bound for the symlink cycle that makes possible.
+9. **`forget_deleted_paths` was not the mirror of `rename_open_paths`** it claimed to be, leaving
+   eight fields pointing at a deleted path. Both now share one relative/absolute helper pair.
+10. **`menu_height` was 2px short** of the panel's real painted height (its own border), so the
+    edge-flip was computed against a size the menu isn't painted at. The height test asserted only
+    the *growth rate*, which is blind to a missing constant - it asserts the absolute value now.
+11. **Escape didn't dismiss the delete confirmation, and the tree's bindings fired behind its
+    scrim.** Hence the third context term.
+
+Two doc claims the review found false were corrected rather than deleted: the "atomic re-check"
+claim for `copy_path` (`fs::copy` opens `O_TRUNC`; it is a second real TOCTOU, now documented on
+the function like `move_path`'s already was), and the dispatch-causality claim above. One test was
+found passing for the wrong reason (`switching_worktrees_clears_every_tree_operation_in_flight`
+opened the context menu *after* the rename editor, and opening a menu cancels the editor - so its
+key assertion was already true before the switch); the builder had already found and documented
+one of the same class itself, on `ctrl_c_with_a_focused_terminal…`, which proves handler placement
+rather than the context predicate and now says so.
+
+Two limitations are stated rather than papered over: `F2`/`Shift+F10` on a *file* need a
+right-click (or a folder click) first, because a left-click on a file row opens it and moves focus
+to the code surface - stealing focus back would break typing in the editor just opened - and there
+are no up/down bindings to move the selection within the tree, which is where the issue's own
+keyboard requirement stops.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace --lib -- --test-threads=1` - 847 app (up from 795: 52 new tests, none
+removed) + 42 lsp-core + 14 pty-core + 98 wt-core. One full run hit the project's known
+diff-rendering flake (`switching_the_open_diff_to_a_different_file_recomputes_the_highlight_cache`);
+it passed alone with its whole module, and the next full run was green with no other change.
+
 ## Real per-widget undo/redo for every text input, and a real multi-step history in the code editor (GitHub issue #17)
 
 Two undo systems now share `Ctrl/Cmd+Z` in this app, and the whole point of the work was making
@@ -2253,3 +2526,132 @@ IME caret-jump one - was found to pass with the fix reverted and was rewritten u
 discriminated, rather than being kept as false assurance. The one failure seen in a full run is the project's known
 diff-rendering flake, reproduced at the same rate on the untouched `master` baseline (one failure
 in six isolated runs, a different test in the module each time) and unrelated to anything here.
+
+## Merging issue #17 (text undo/redo) with issues #18/#19 (the writable file tree)
+
+Two substantial branches built in parallel off the same base met here: `master`'s file-tree work
+(collapsed by default with persisted fold state, then the right-click context menu with real file
+operations) and issue #17's per-widget text undo/redo. Four files conflicted textually. The
+interesting defect was in none of them.
+
+**The four textual conflicts** were all genuine two-sided additions rather than competing
+rewrites, and each was resolved as a union preserving both intents: the `actions!` list in
+`crate::root` (issue #17's `TextUndo`/`TextRedo` plus issue #19's five `FileTree*`), the
+Keybindings page's action labels (both sets, keeping #17's deliberate "Worktree history: undo"
+relabelling so two rows are never both called "Undo"), and that page's scoped-binding count, which
+is now 53 = 48 + 5 and was verified against a real count of `Some("` in `default_key_bindings()`
+rather than by arithmetic on the two sides' own numbers. `root::new_file`'s conflict was the only
+one with real semantic overlap: `master` had extracted `create_new_file`'s whole body into a
+reusable `create_file_named` so the tree's inline editor could share one creation and validation
+path, while issue #17 had changed the same function's `input.name` from a `String` to a
+`TextField`. Both survive - the delegation is kept, handed `input.name.as_str()` - and the
+inline empty-name and path-separator checks issue #17's version still carried are deliberately
+dropped in favour of `file_ops::validate_entry_name`, which `master` had already made the single
+validator.
+
+**The real defect was a composition gap no conflict marker could have shown.** Issue #19's inline
+New File / New Folder / Rename editors are real text-typing surfaces, but they were built against
+a base where issue #17's `"text-input"` key-context tag did not exist. The merged tree compiled
+and both sides' suites passed, while `Ctrl+Z` with a rename box open satisfied `Undo`'s
+`Some("!terminal && !text-input")` and ran the **worktree** history - discarding or re-committing
+real git state from inside a filename field, with the tree's own key handler never seeing the
+keystroke (it returns early on a `control`/`platform` modifier). Verbatim the bug class
+`crate::default_key_bindings`' docs catalogue, arriving through a merge rather than through an
+edit. Fixed by making the editor a real participant rather than by special-casing the keystroke:
+`TreeInlineEdit::name` is now a `text_history::TextField`, the tree shell emits `"text-input"`
+*only* while an editor is open, and `TextUndo`/`TextRedo` listeners live on that same node.
+
+`TextField::seeded` is new and exists for one real reason: the rename editor opens pre-filled, and
+building it as `new()` + `set(current_name)` would record the pre-fill as an undoable step, so the
+first `Ctrl+Z` would blank the box to `""` - a state the user never typed and cannot type their
+way back to. The pre-fill is the field's baseline, so `can_undo()` is false until something
+genuinely changes.
+
+**Two guards were wrong in ways worth recording.** `keymap_overrides::real_context_stacks()` - the
+shared source of truth for the collision checker *and* the undo scoping matrix - knew nothing about
+the tree, so the matrix's "at most one undo system is live anywhere" invariant held vacuously over
+exactly the surface that was broken. Its four `file-tree*` literals are now enumerated. This was
+not silent in the checker: `contexts_could_overlap` refuses to certify a predicate it never sees
+live, so all five file-tree bindings reported "could overlap" and two tests failed at merge time,
+which is how it surfaced. The drift test built to catch a new `.key_context(..)` call site was the
+one that failed: it `include_str!`'d a hand-listed set of eight files, `sidebar/render.rs` was not
+among them, and so the guard specifically designed to catch "a ninth call site appeared" reported
+success while a ninth call site sat in the tree. It now walks every `.rs` file under the crate's
+`src/` at test time. A guard whose coverage has to be extended by hand every time the thing it
+guards grows is not a guard.
+
+**One test's expectation was genuinely stale rather than merely broken.**
+`worktree_undo_provably_cannot_collide_with_a_file_editor_binding` asserted that rebinding `Undo`
+onto `secondary-c` collides with nothing. Once the file-tree stacks were enumerated the honest
+answer became `FileTreeCopy`: on `["app", "file-tree"]` a tree row is neither a terminal nor a text
+input, so `Undo` really is live there alongside the tree's own Copy - which is the same fact that
+makes `Ctrl+Z` on the focused tree reach the worktree history, as it should. The two coexist today
+only because their default keystrokes differ, so the warning is real and is now asserted rather
+than suppressed. The test's own claim about `file-editor` is kept, but asserted directly against
+the predicate pair instead of via which binding the search happens to return first - the weaker
+form would have been satisfied by any other binding merely being found earlier.
+
+Also corrected: this module's docs still described the `is_superset`/`negation_overlap` heuristic
+that issue #17's own audit had already replaced with exact evaluation over `real_context_stacks()`
+- stale on that branch rather than broken by the merge, but stale in the one module every claim
+here rests on.
+
+Four new regression tests, all revert-verified against the pre-fix tag: `Ctrl+Z` while typing a
+name undoes the name and leaves `worktree_history_status` untouched; `Ctrl+Z` on the focused tree
+with **no** editor open still reaches the worktree undo (the direction that keeps the tag
+conditional rather than blanket, and which correctly still passes with the fix reverted); the first
+`Ctrl+Z` in a rename editor does not blank the pre-fill; and both redo spellings route to the
+tree's own handler.
+
+### What the independent audit then found
+
+Two audit rounds ran over the finished merge. Neither found a CRITICAL, and both independently
+confirmed the parts that mattered most: all five dangling-focus fixes survive (three from issue
+#17's `rail_focus_handle` work, its `select_settings_page` fix, and master's `set_right_sidebar_view`
+one), nothing was lost in the auto-merge, the tree's inline editor really is the only new text
+surface, and the tag is correctly conditional. One audit verified the no-loss claim mechanically
+rather than by eye - a `git merge-tree` result differs from the working tree in exactly the eight
+files deliberately edited - and reconciled the full test-name sets across all three trees, showing
+every name present in a parent but absent from the merge is either master's deliberate
+`collapsed_dirs` → `expanded_dirs` rename or a test issue #17 itself deleted.
+
+Two MAJOR findings were real and are fixed. **The rewritten drift guard still could not catch the
+drift that actually happened**: walking every file closed the *file-set* hole, but the literal
+check compared one hand-written array against another, so a fifth arm in `file_tree_shell`'s
+`match` would emit a context word no test knew about while the call-site count stayed at nine.
+The literal selection now lives in one `keymap_overrides::file_tree_key_context`, which the
+renderer *and* `real_context_stacks()` both call - so for the tree that assertion is now a
+tautology, deliberately, because the guarantee moved out of the test and into the structure. That
+is written down rather than left to look like a real assertion, along with the honest note that
+`code_surface/render.rs`'s own three-arm match still has the weaker hand-listed treatment.
+**The `(true, true)` context arm** - editor open *and* delete confirmation armed - was enumerated
+and untested. Guarding the handlers would silently swallow the keystroke and dropping the tag
+would hand it to the worktree undo, so the resolution is neither: the state is proven unreachable
+(opening the context menu, the only path to arming a delete, cancels the inline editor) and that
+is now asserted by its own test, with the enumeration documented as a deliberate
+over-approximation.
+
+Also fixed from the audits: the call-site counter only matched lines *beginning* with
+`.key_context(`, so a chained one-liner was invisible to it (it counts occurrences now, and skips
+only this module, which holds the search pattern as a literal); the drift-guard doc block had been
+left on the wrong item still saying "a seventh call site"; the scoping matrix guarded one of its
+two `zip` pairings, so a stack added without a description would have silently truncated the
+matrix rather than failed it; the `ctrl-y` half of the redo test had no assertion between its undo
+and redo, so a pair of no-ops would have passed it; the rename pre-fill test inferred `seeded`'s
+behaviour from the text not changing rather than asserting `!can_undo()`; and `TextField::seeded`
+had no direct unit test in the module that owns it (it now has one that also asserts the
+`new()` + `set(..)` construction it replaces genuinely differs, so the test is discriminating).
+Four stale enumerations the merge falsified were corrected: `text_history`'s "four hand-rolled
+single-line inputs" (now five, in two places), its list of driving modules (missing
+`crate::sidebar`), `title_bar::menu`'s identical off-by-one, `tree_ops`' "all five tree actions
+live on this node and nowhere else" (that node now carries seven listeners), and
+`default_key_bindings`' own enumeration of the surfaces carrying `"text-input"` - the single most
+important one to keep complete, since its incompleteness is what this merge bug *was*.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace --lib -- --test-threads=1` - 928 app + 42 lsp-core + 14 pty-core + 98
+wt-core, with no test removed or consolidated from either side. The two sides were 817 (issue #17)
+and 847 (issues #18/#19) app tests over a shared 742-test base, so 742 + 75 + 105 = 922 is the
+overlap-free sum of both efforts; the remaining six are this merge's own new regression tests. No
+run hit the project's known diff-rendering flake.

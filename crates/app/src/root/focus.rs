@@ -78,6 +78,15 @@ impl AdeApp {
         self.plus_menu_open = false;
         self.title_menu_open = None;
         self.new_file_input = None;
+        // Same reason as the three above: Settings *replaces* the workspace body, so a file-tree
+        // context menu or a half-typed inline name left open would either float over the
+        // Settings page or - worse for the editor - keep the tree's `"tree-editing"` key context
+        // alive on a node that is no longer rendered (GitHub issue #19). The armed *delete
+        // confirmation* is deliberately left alone: it is a real, window-level modal the user is
+        // mid-way through answering, and `crate::root::AdeApp::render` keeps it hidden while
+        // Settings is up rather than silently disarming it.
+        self.tree_context_menu = None;
+        self.tree_inline_edit = None;
         self.settings_open = true;
         self.settings_focus.capture(window, &self.sessions, cx);
         self.prune_confirm_armed = false;

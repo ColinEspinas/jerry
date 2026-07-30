@@ -266,9 +266,10 @@ impl AdeApp {
     ///
     /// Their sub-line says `"editor"`, not `"text"`, and that word is load-bearing: enablement
     /// comes from [`crate::code_surface::editing::AdeApp::active_edit_buffer`], which only ever
-    /// resolves to an `EditBuffer` (the File view or the merge hand-edit surface). The app's four
+    /// resolves to an `EditBuffer` (the File view or the merge hand-edit surface). The app's five
     /// single-line `crate::text_history::TextField` inputs - palette query, rail filter, Settings
-    /// keybindings filter, New file prompt - have real, working undo histories of their own that
+    /// keybindings filter, New file prompt, and the file tree's inline name editor - have real,
+    /// working undo histories of their own that
     /// this menu genuinely cannot reach, so a row labelled `"text"` would sit permanently dimmed
     /// while `mod+z` worked perfectly well inside them. Found by an independent adversarial audit.
     /// Narrowing the label is the honest fix rather than routing the menu through whatever widget

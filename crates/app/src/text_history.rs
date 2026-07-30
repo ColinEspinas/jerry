@@ -1,12 +1,13 @@
 //! Pure, GPUI-free per-widget text undo/redo (GitHub issue #17): the recorded-operation shape
 //! ([`TextEdit`]), the coalescing policy that turns a stream of real keystrokes into natural undo
 //! steps ([`EditGroup`]/[`TextHistory::record`]), and a small [`TextField`] wrapper that gives the
-//! app's four hand-rolled single-line inputs a real history of their own.
+//! app's five hand-rolled single-line inputs a real history of their own.
 //!
 //! Deliberately cross-cutting and top-level (next to `crate::keymap`/`crate::keymap_overrides`)
 //! rather than living inside one feature folder: `crate::code_surface::edit_buffer`, `crate::rail`,
-//! `crate::palette`, `crate::settings` and `crate::root::new_file` all drive the exact same
-//! mechanism, and duplicating a second, subtly-different coalescing policy per widget is precisely
+//! `crate::palette`, `crate::settings`, `crate::root::new_file` and `crate::sidebar` all drive the
+//! exact same mechanism, and duplicating a second, subtly-different coalescing policy per widget
+//! is precisely
 //! the silent-drift bug class this project's own history (Revision R5.5) already flagged once.
 //!
 //! ## Two undo systems, never one
@@ -560,9 +561,11 @@ impl TextHistory {
     }
 }
 
-/// One of the app's four hand-rolled single-line text inputs (the command-palette query, the rail
-/// session filter, the Settings › Keybindings filter, and the New file name prompt) with a real
-/// undo history attached. All four are append/backspace-only with no caret of their own - see
+/// One of the app's five hand-rolled single-line text inputs (the command-palette query, the rail
+/// session filter, the Settings › Keybindings filter, the New file name prompt, and the file
+/// tree's inline New File / New Folder / Rename editor - `crate::sidebar::tree_ops::TreeInlineEdit`,
+/// which became one of these when GitHub issue #19's tree met issue #17's undo work at a merge)
+/// with a real undo history attached. All five are append/backspace-only with no caret of their own - see
 /// `crate::rail::AdeApp::handle_filter_key_down`'s own docs for that deliberate scope decision -
 /// so every snapshot here is a collapsed caret at the end of the text.
 ///
@@ -578,6 +581,22 @@ pub struct TextField {
 impl TextField {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A field that opens *already holding* `text`, with an empty history - the file tree's
+    /// inline **rename** editor (GitHub issue #19), which pre-fills with the entry's current
+    /// name.
+    ///
+    /// Deliberately not `new()` followed by [`Self::set`]: that would record the pre-fill as a
+    /// real undoable step, so the very first `Ctrl+Z` after opening a rename would blank the
+    /// field down to `""` - a state the user never typed and cannot get back to by any other
+    /// means. The pre-fill is this widget's *baseline*, not an edit to it, so `can_undo()` is
+    /// false until the user genuinely changes something.
+    pub fn seeded(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            history: TextHistory::new(),
+        }
     }
 
     pub fn as_str(&self) -> &str {
@@ -1081,6 +1100,48 @@ mod tests {
             text, "hello",
             "a refused edit must leave the text untouched"
         );
+    }
+
+    /// [`TextField::seeded`]'s whole contract, asserted directly in the module that owns it
+    /// rather than only through the file tree's rename editor that uses it: the pre-fill is the
+    /// field's *baseline*, not an undoable edit.
+    ///
+    /// The contrast with `new()` + `set(..)` is asserted in the same test, because that is the
+    /// construction `seeded` exists to prevent and the difference is invisible from the text
+    /// alone - both hold `"README.md"` immediately after construction, and only `can_undo()`
+    /// distinguishes them until the first Ctrl+Z blanks one of them to `""`.
+    #[test]
+    fn text_field_seeded_holds_its_text_with_no_undoable_step_behind_it() {
+        let seeded = TextField::seeded("README.md");
+        assert_eq!(seeded.as_str(), "README.md");
+        assert!(
+            !seeded.can_undo(),
+            "the pre-fill must not be recorded, or the first Ctrl+Z would blank a field the user \
+             never typed into"
+        );
+        assert_eq!(seeded.history_len(), 0);
+
+        let mut via_set = TextField::new();
+        via_set.set("README.md", t0());
+        assert_eq!(
+            via_set.as_str(),
+            seeded.as_str(),
+            "same visible text - which is exactly why this bug would not show up in a text-only \
+             assertion"
+        );
+        assert!(
+            via_set.can_undo(),
+            "sanity check: the construction `seeded` replaces really does record the pre-fill, \
+             so this test is genuinely discriminating"
+        );
+
+        // A real edit on top of a seeded field undoes back to the baseline, not past it.
+        let mut field = TextField::seeded("README.md");
+        field.push_str("x", t0());
+        assert_eq!(field.as_str(), "README.mdx");
+        assert!(field.undo());
+        assert_eq!(field.as_str(), "README.md");
+        assert!(!field.undo(), "there is nothing behind the baseline");
     }
 
     #[test]

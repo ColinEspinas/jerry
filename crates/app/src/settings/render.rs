@@ -856,7 +856,7 @@ impl AdeApp {
             ],
             selected,
             cx,
-            |this, index, cx| {
+            |this, index, _window, cx| {
                 // Index into the `options` array above, not a label re-match - see
                 // `Self::render_choice_control`'s docs for why.
                 let style = match index {
@@ -933,7 +933,7 @@ impl AdeApp {
             ],
             format!("{selected_percent}%"),
             cx,
-            |this, index, cx| {
+            |this, index, _window, cx| {
                 // Index into the `options` array above, not a label re-match/parse.
                 const PERCENTS: [u16; 4] = [90, 100, 110, 125];
                 if let Some(percent) = PERCENTS.get(index).copied() {
