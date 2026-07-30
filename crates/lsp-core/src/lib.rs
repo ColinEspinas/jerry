@@ -38,13 +38,12 @@
 //! `lsp-types` defines at all (it only defines the request/notification payload shapes) - see
 //! [`transport`] for that hand-rolled piece.
 
-#[cfg(not(unix))]
-compile_error!(
-    "lsp-core's process-tree kill implementation (crate::proc) is unix-only right now \
-     (this repo targets Linux/WSL2), mirroring pty-core's own documented platform scope cut."
-);
-
 mod client;
+// Unix-only: `crate::proc`'s `/proc`-walk and `nix` signal calls are unix-specific end to
+// end (`nix` itself is only a dependency at all under `[target.'cfg(unix)'.dependencies]`
+// in `Cargo.toml`) - see that module's own doc comment for the real, functional Windows
+// equivalent `client.rs` uses instead (`std::process::Child::kill()`).
+#[cfg(unix)]
 mod proc;
 mod transport;
 

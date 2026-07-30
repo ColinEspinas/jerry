@@ -66,6 +66,7 @@ use lsp_types::{
     WorkspaceFolder,
 };
 
+#[cfg(unix)]
 use crate::proc;
 use crate::transport;
 
@@ -143,7 +144,10 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 /// giving up on a graceful reply and proceeding to terminate the process anyway.
 const SHUTDOWN_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long [`LspClient::shutdown`] waits, after signaling `SIGTERM`, for the real process (and
-/// any real descendants) to exit voluntarily before escalating to `SIGKILL`.
+/// any real descendants) to exit voluntarily before escalating to `SIGKILL`. Only read by the
+/// unix `kill_process_tree` (Windows' real equivalent is a direct, ungraceful `Child::kill()` -
+/// see that function's own docs), hence the `allow` on non-unix.
+#[cfg_attr(not(unix), allow(dead_code))]
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(800);
 /// Bound on how many un-drained "diagnostics changed" wake signals [`LspClient::drain_updates`]'s
 /// channel buffers - a slow poller just coalesces catch-up ticks into fewer wakeups (each one
@@ -272,6 +276,13 @@ pub struct LspClient {
     /// parameterized by - see [`ServerSpawnConfig::name`]'s docs.
     name: &'static str,
     child: Option<Child>,
+    /// Only genuinely read on unix (real `/proc` descendant-tree kill, see `crate::proc`) and
+    /// in this module's own tests - the real Windows kill path uses the already-held `child`
+    /// handle directly instead (`std::process::Child::kill()`), so this field would otherwise
+    /// be honestly unused on that platform; `cargo build --workspace`'s Windows CI job doesn't
+    /// fail on a dead-code *warning*, but the `allow` documents why it's expected rather than
+    /// leaving it looking like an oversight.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pid: u32,
     exited: bool,
     stdin: Arc<Mutex<ChildStdin>>,

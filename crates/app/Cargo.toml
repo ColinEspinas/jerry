@@ -77,19 +77,46 @@ regex = "1.5"
 # the exact version this workspace's `Cargo.lock` already resolves.
 unicode-segmentation = "1.13.3"
 
-# Real per-target `gpui_platform` backend selection (Revision R11). `gpui_platform`'s own
-# Cargo.toml (`vendor/zed/crates/gpui_platform/Cargo.toml`) pulls in `gpui_macos`/
-# `gpui_windows` unconditionally via its own `[target.'cfg(target_os = "...")'.dependencies]`
-# sections - there is no top-level feature to request for those two backends, they're
-# selected automatically by `target_os` alone. `wayland`/`x11` are real features of that
-# crate, but only meaningful ones: `wayland = ["gpui_linux/wayland"]` /
-# `x11 = ["gpui_linux/x11"]`, and `gpui_linux` itself is only a dependency at all under
-# `cfg(any(target_os = "linux", target_os = "freebsd"))` - so only the Linux/FreeBSD block
-# below requests either. `x11` stays disabled here, matching the original (pre-R11) decision
-# this crate's own history recorded: `libxkbcommon-x11`/`libxcb-xkb`'s `-dev` packages still
-# aren't installed on this sandbox and there's still no passwordless `sudo` to add them
-# (re-checked for this revision: `pkg-config --exists xkbcommon-x11` still fails, `sudo -n
-# true` still fails) - the reason has not gone away.
+# Real per-target `gpui_platform` backend selection (Revision R11, extended in R12 to add
+# real X11 support). `gpui_platform`'s own Cargo.toml
+# (`vendor/zed/crates/gpui_platform/Cargo.toml`) pulls in `gpui_macos`/`gpui_windows`
+# unconditionally via its own `[target.'cfg(target_os = "...")'.dependencies]` sections -
+# there is no top-level feature to request for those two backends, they're selected
+# automatically by `target_os` alone. `wayland`/`x11` are real features of that crate, but
+# only meaningful ones: `wayland = ["gpui_linux/wayland"]` / `x11 = ["gpui_linux/x11"]`, and
+# `gpui_linux` itself is only a dependency at all under `cfg(any(target_os = "linux",
+# target_os = "freebsd"))` - so only the Linux/FreeBSD block below requests either.
+#
+# Both `wayland` and `x11` are enabled together, matching `gpui_linux`'s own `default =
+# ["wayland", "x11"]` in `vendor/zed/crates/gpui_linux/Cargo.toml` - they are NOT mutually
+# exclusive at compile time. Verified directly against `gpui_linux`'s own platform-selection
+# source (`vendor/zed/crates/gpui_linux/src/linux.rs`'s `current_platform`), which calls
+# `gpui::guess_compositor()` (`vendor/zed/crates/gpui/src/platform.rs`) to pick a backend at
+# *runtime*: that function checks `$WAYLAND_DISPLAY` (only read at all when the `wayland`
+# feature is compiled in) first, falls back to checking `$DISPLAY` (only read when `x11` is
+# compiled in) if Wayland isn't present, and falls back to a headless client if neither is
+# set. So enabling only one of the two features at compile time doesn't just change a
+# default, it removes the other backend's env-var check entirely (`cfg(not(feature =
+# "wayland"))` hard-codes `wayland_display` to `None`) - real runtime auto-detection between
+# a Wayland compositor and a bare X11 display requires both features compiled in
+# simultaneously, which is exactly what Zed's own default does.
+#
+# `x11` was previously disabled here (pre-R12) because this sandbox's `libxkbcommon-x11`/
+# `libx11-xcb`/`libxcb-xkb` `-dev` packages weren't installed and there was no passwordless
+# `sudo` to add them. Re-investigated for R12: `apt-cache depends libxkbcommon-x11-dev` shows
+# it hard-`Depends:` on `libxcb-xkb-dev` (not merely `Recommends:`), and `libx11-xcb-dev`
+# hard-`Depends:` on `libx11-dev`/`libxcb1-dev` - so a real `sudo apt-get install
+# libxkbcommon-x11-dev libx11-xcb-dev` (the exact two packages already listed in this
+# project's README/CI, see those files' own comments) pulls in every X11/xkb `-dev` package
+# `gpui_linux`'s `x11` feature needs, with no additional packages required. Confirmed for
+# real in this sandbox (still no passwordless `sudo`) by downloading those same two `.deb`s
+# plus their real `libxcb-xkb-dev` dependency with `apt-get download` (which needs no root),
+# extracting them to a local prefix with `dpkg-deb -x`, and building/running this crate
+# against that prefix via `CPATH`/`LIBRARY_PATH`/`LD_LIBRARY_PATH` - see BUILD-LOG.md's R12
+# entry for the exact commands and what was visually confirmed (a real X11 window,
+# screenshotted with `scrot`) versus what remains unverified (a real system-wide `apt-get
+# install` in this sandbox, which still needs an interactive `sudo` password this session
+# does not have - CI, which runs as root, is unaffected by that limitation).
 #
 # This section's own `cfg` predicate is deliberately `cfg(any(target_os = "linux", target_os =
 # "freebsd"))`, matching `gpui_linux`'s own gate exactly, NOT a `target_os = "linux"`-only
@@ -104,6 +131,7 @@ unicode-segmentation = "1.13.3"
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 gpui_platform = { path = "../../vendor/zed/crates/gpui_platform", features = [
     "wayland",
+    "x11",
 ] }
 
 # macOS: `gpui_macos` is pulled in by `gpui_platform` itself purely from `target_os`, so no

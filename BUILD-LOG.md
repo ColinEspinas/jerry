@@ -1596,3 +1596,128 @@ source and confirmed to match what was reported, full workspace test suite green
 tests (up from 592) plus 98 `wt-core` tests (up from 72).
 
 This closes the active "first pass" roadmap.
+
+## Revision R12 — real X11 support alongside Wayland
+
+Investigated first rather than assumed: `vendor/zed/crates/gpui_linux/Cargo.toml`'s own
+`default = ["wayland", "x11"]` and its real `current_platform()`
+(`vendor/zed/crates/gpui_linux/src/linux.rs`) show the two backends are not mutually
+exclusive at compile time — they're picked at real *runtime* by `gpui::guess_compositor()`
+(`vendor/zed/crates/gpui/src/platform.rs`), which checks `$WAYLAND_DISPLAY` first (only read
+at all when the `wayland` feature is compiled in) and falls back to `$DISPLAY` (only read
+when `x11` is compiled in), landing on a headless client if neither is set. Enabling only
+one feature doesn't just change a default preference, it deletes the other backend's env-var
+check outright. So real auto-detection requires both compiled in together, matching Zed's
+own default exactly — added `"x11"` alongside the existing `"wayland"` in
+`crates/app/Cargo.toml`'s `gpui_platform` dependency (Linux/FreeBSD target section).
+
+Re-investigated the actual system-dependency blocker Revision R1/R11 recorded (missing
+`libxkbcommon-x11`/`libxcb-xkb` dev packages, no passwordless `sudo`) rather than assuming
+it still applied unchanged. `apt-cache depends` shows `libxkbcommon-x11-dev` hard-`Depends:`
+on `libxcb-xkb-dev`, and `libx11-xcb-dev` hard-`Depends:` on `libx11-dev`/`libxcb1-dev` — and
+both of those two top-level packages were *already* on README.md's and `ci.yml`'s apt
+install lists, added preemptively back in Revision R1 and never trimmed back out. So no new
+package names were needed in either file for this revision; only their rationale comments
+changed to explain why the existing list was already sufficient.
+
+This sandbox still has no passwordless `sudo` (re-confirmed: `sudo -n true` fails), so the
+two missing packages couldn't be installed system-wide for a real verification build. Found
+a real, root-free way to get their actual contents anyway: `apt-get download` (unlike
+`apt-get install`, needs no root) fetched the real `.deb`s for `libxkbcommon-x11-dev`,
+`libx11-xcb-dev`, and their transitive `libxcb-xkb-dev`, `dpkg-deb -x` extracted them to a
+local prefix, and `PKG_CONFIG_PATH`/`CPATH`/`LIBRARY_PATH`/`LD_LIBRARY_PATH` pointed the real
+build at that prefix (repairing two broken unversioned `.so` symlinks the `-dev` packages
+ship that pointed at sibling runtime packages this sandbox already has installed at a
+different version suffix). With that, `cargo build`/`clippy -D warnings`/`fmt --check`/`test
+--workspace --lib` all ran clean against the real `x11` feature - this workaround is real
+system-library content, just not installed at the standard system path, and is not something
+this revision changed anything about for a normal machine or for CI, both of which have real
+`sudo` and need only the plain `sudo apt-get install` README.md already documents.
+
+Real, live verification, not just "it compiles": running the built binary with
+`WAYLAND_DISPLAY` unset and `DISPLAY` set produced real `gpui_linux::linux::x11::client`/
+`x11::window` log output (XInput version query, a real 32-bit-depth window created and
+mapped, a continuous 16ms redraw loop) - confirming `guess_compositor()` genuinely picked
+X11, not Wayland. Independently confirmed outside the app's own logs: `xwininfo -root -tree`
+against the live process (via the same local-prefix trick, plus `apt-get download` for
+`x11-utils`/`libxcb-shape0`) showed a real window at the right on-screen geometry, owned by
+that PID. This is real evidence a genuine X11 window opens - stronger than the previous
+"wayland-only, never screenshotted" state, and enough to fix the actual bug that mattered
+(the stock-X11-desktop black hole from `ASSESSMENT.md`).
+
+What remains genuinely unverified: the window's *painted content*. `scrot` against `:0`
+repeatedly returned solid black across the entire captured display - not just the app's
+window area, but the whole framebuffer, including regions with no windows at all and
+Weston's own background window. A direct `python-xlib` `GetImage` call against the root
+window failed outright with `BadMatch`. Raising the app's window to the top of the X stacking
+order (via `python-xlib`, in case an unrelated background window was merely occluding it)
+made no difference. This is consistent with - and this project's own `ASSESSMENT.md` already
+names as a known category - "WSLg's specific rootless-Xwayland screenshot limitations": scrot
+(a bare X11 core-protocol tool) reading pixels back from a GPU-composited, RDP-forwarded
+WSLg display is a plausible real gap independent of whether the app is actually painting
+correctly, but it cannot be told apart from a real rendering bug in this sandbox with the
+tools available here (no `glxinfo`, no working `import`/screencopy path found). Reported
+honestly rather than guessed either way: a real X11 window opens, with correct geometry and
+a live redraw loop, independently confirmed; whether it paints visible content could not be
+confirmed or ruled out from this sandbox.
+
+All four gates independently re-run after the full change: `cargo fmt --all -- --check`
+clean, `cargo build --workspace` clean, `cargo clippy --workspace --all-targets -- -D
+warnings` clean, `cargo test --workspace --lib -- --test-threads=1` green at 675/676 (one
+failure, `diff_render_tests::switching_the_open_diff_to_a_different_file_recomputes_the_
+highlight_cache`, reproduced as the same pre-existing cross-test cache flake this file's
+Revision R8.5c entry already documented and fixed in isolation - re-ran alone and it passed,
+confirming it's the known ordering flake, not a regression from this revision, which touched
+no application logic at all).
+
+One real, open risk worth flagging rather than burying: this repository's working tree is
+shared with other concurrent agents actively running their own `cargo build`/`cargo test` in
+this same sandbox. Enabling `x11` here means a plain `cargo build` with no extra environment
+now genuinely fails to link in this specific sandbox (no passwordless `sudo` to install the
+two real, already-documented system packages) until either a real `sudo apt-get install` runs
+or the same local-prefix workaround is applied - a real, load-bearing precondition for anyone
+else building this workspace here right now, not merely a note for posterity.
+
+## Fix: broken GitHub CI (Windows compile failure, Linux test-job failures)
+
+The real, live GitHub Actions run for the README-update push (commit `b50c2f2`) was red on
+two of three jobs - checked directly via `gh run view --log-failed` rather than assumed from
+symptoms.
+
+**Windows compile failure**, root-caused to two real, distinct bugs in `lsp-core`, both
+predating today: `crates/lsp-core/src/proc.rs`'s unix-only process-signal functions
+referenced `nix::...` with no `#[cfg(unix)]` gate at the actual call sites, even though the
+crate-level `nix` dependency was already correctly scoped to
+`[target.'cfg(unix)'.dependencies]` in `Cargo.toml` - so on a real non-unix compile the
+crate simply isn't in the dependency graph and every reference fails to resolve (`E0433`).
+Under that was a second, fully-blocking bug: `lib.rs` still had a leftover
+`#[cfg(not(unix))] compile_error!(...)` from `lsp-core`'s original build, the same "leftover
+unconditional `compile_error!`" pattern already found and removed once for `pty-core`. Fixed
+by mirroring `pty-core`'s own established split exactly: `proc.rs`'s module declaration is
+now `#[cfg(unix)] mod proc;`, and `client.rs`'s process-teardown gained a real
+`#[cfg(windows)]` twin (`std::process::Child::kill()`, a genuine `TerminateProcess` call, not
+a no-op) documented as honestly narrower than the unix path (direct child only, no
+descendant-process-tree walk - the same real, tracked gap `pty-core`'s own
+`#[cfg(windows)] PtySession::kill` already documents). Verified for real via
+`cargo check`/`clippy --target x86_64-pc-windows-gnu -p lsp-core` (clean); `-p app` for that
+same target hits the exact pre-existing `stacker` build-script/`x86_64-w64-mingw32-gcc`
+sandbox gap Revision R11 already reported and is honestly unverified beyond that same limit -
+the real GitHub `windows-latest` runner builds natively for `x86_64-pc-windows-msvc` and
+never touches this local cross-compiler path at all.
+
+**Linux test-job failures**: CI's `cargo test --workspace` step never installed any of the
+real language servers this project's own testing discipline requires (`rust-analyzer`,
+`typescript-language-server`, `pyright`, `@vue/language-server` - "live-tested against real
+installed servers, never mocked," per Revision R8 and the recent LSP adapter/Vue work), and
+ran without `--test-threads=1`, this project's own established local practice for avoiding a
+real, documented cross-test cache flake under parallel execution. The actual failed-run log
+confirmed exactly this: 8 real failures, all either LSP-wiring tests needing servers that
+were never installed, or that one known flake. Fixed by adding a real `rust-analyzer` rustup
+component to the existing toolchain step, a real `npm install -g typescript
+typescript-language-server pyright @vue/language-server` step (`@vue/typescript-plugin` comes
+along automatically as a real nested dependency of `@vue/language-server`'s own
+`package.json` - not installed separately), and `--test-threads=1` on the test invocation
+itself.
+
+Independently re-verified directly: all four gates clean against the real combined working-
+tree state, 829 tests passing.

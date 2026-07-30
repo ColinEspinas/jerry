@@ -103,10 +103,13 @@ you deliberately bump it, expect to fix real compile errors, not just update a h
 
 ### System dependencies (Linux)
 
-GPUI's default Linux backend here is `wayland` only (see the comment on the
-`gpui_platform` dependency in `crates/app/Cargo.toml` for why `x11` isn't enabled by
-default). Building it needs real system dev packages — Wayland client headers, xkbcommon,
-Vulkan, fontconfig. On Debian/Ubuntu:
+GPUI's Linux backend here builds both `wayland` and `x11` (see the comment on the
+`gpui_platform` dependency in `crates/app/Cargo.toml` — Revision R12, `BUILD-LOG.md`'s
+entry of the same name). The two are not mutually exclusive at compile time: with both
+compiled in, `gpui::guess_compositor()` picks a backend for real at *runtime*, checking
+`$WAYLAND_DISPLAY` first and falling back to `$DISPLAY` (bare X11) if that's unset, exactly
+matching how upstream Zed itself ships. Building it needs real system dev packages —
+Wayland client headers, X11/xkbcommon headers, Vulkan, fontconfig. On Debian/Ubuntu:
 
 ```sh
 sudo apt-get install -y \
@@ -122,11 +125,25 @@ and the comment above the equivalent CI step in `.github/workflows/ci.yml` for w
 trimmed and why. `libasound2-dev`/`libssl-dev`/`libsqlite3-dev`/`libzstd-dev` were dropped
 from this list after checking `Cargo.lock`: no `alsa`/`alsa-sys`, `openssl-sys`,
 `libsqlite3-sys`/`rusqlite`, or `zstd-sys`/`libz-sys` appears anywhere in this workspace's
-resolved dependency tree, so none of them are actually needed to build it. Running the app
-itself (not just building it) additionally needs a real
-Wayland compositor available (`WAYLAND_DISPLAY` set) — this project's own development
-happened under WSLg on Windows, which provides one; a stock X11-only desktop will not open
-a window with the default build (again, see `ASSESSMENT.md`).
+resolved dependency tree, so none of them are actually needed to build it.
+
+`libxkbcommon-x11-dev` and `libx11-xcb-dev` were already on this list before `x11` was
+actually enabled (Revision R1) — they were added preemptively and never trimmed back out.
+That turned out to be exactly right: `apt-cache depends` shows `libxkbcommon-x11-dev` hard-
+`Depends:` on `libxcb-xkb-dev`, and `libx11-xcb-dev` hard-`Depends:` on `libx11-dev` and
+`libxcb1-dev` — so installing the two packages already listed above pulls in every other
+X11/xkb `-dev` package the `x11` feature actually links against, with nothing further to
+add. Verified for real (not just read off `apt-cache depends`) by building this crate
+against those exact packages' real contents — see `BUILD-LOG.md`'s Revision R12 entry for
+how, given this project's own sandbox still has no passwordless `sudo` to install them
+system-wide, and what was and wasn't visually confirmed as a result.
+
+Running the app needs a real display server it can reach — either a Wayland compositor
+(`WAYLAND_DISPLAY` set) or an X11 display (`DISPLAY` set); this project's own development
+happened under WSLg on Windows, which provides both. A stock Linux desktop running only one
+of the two now works either way, which is the entire point of this revision — see
+`BUILD-LOG.md`'s Revision R12 entry and `ASSESSMENT.md` for exactly what was and wasn't
+confirmed visually under each backend in this project's own (WSLg) sandbox.
 
 macOS and Windows are only build-tested in CI (see below) — nobody has run this app on
 those platforms yet.
