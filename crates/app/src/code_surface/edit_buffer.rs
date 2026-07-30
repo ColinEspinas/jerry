@@ -8,14 +8,39 @@
 //! real GPUI wiring (`EntityInputHandler`, keyboard actions, painting a real cursor/selection)
 //! lives in `crate::code_surface::editing`, which drives this module's methods.
 //!
-//! ## No undo/redo yet - a documented, deliberate gap
+//! ## Real multi-step undo/redo (GitHub issue #17)
 //!
-//! This buffer keeps no edit history at all - every [`Self::replace_range`]/
-//! [`Self::replace_and_mark_range`] call is destructive, with no way to step backward. That's a
-//! real, intentional scope cut for this phase (Revision R8.5a), not an oversight: a correct
-//! undo/redo stack (grouping keystrokes into coalesced edits, surviving re-highlighting, playing
-//! well with an external-change conflict) is real, substantial design work of its own, and is
-//! explicitly out of scope here per this phase's own instructions - it's Revision R10's job.
+//! Ordinary editing - typing, IME composition, Backspace/Delete/Enter, paste, cut, an accepted
+//! completion - funnels through exactly two public methods ([`Self::replace_range`] and
+//! [`Self::replace_and_mark_range`]) and one private splice ([`Self::splice_lines`]). That choke
+//! point is what makes a real history cheap to attach correctly: both public methods record the
+//! splice they just performed - the byte offset, the exact text removed, the exact text inserted,
+//! and the real selection on either side - into [`Self::history`]
+//! (`crate::text_history::TextHistory`), which owns the coalescing policy. See that module's own
+//! docs for the policy itself and for why it lives there rather than here.
+//!
+//! Two real exceptions to that funnel, both deliberate and both recording:
+//! [`Self::reload_from_disk`] replaces the whole buffer (and rebuilds the derived tables directly
+//! rather than splicing), and [`Self::content`] is a `pub` field, so the funnel is a convention
+//! this type's own methods keep, not something the type system enforces the way
+//! `crate::text_history::TextField` does for the app's single-line inputs. [`Self::undo`]/
+//! [`Self::redo`] therefore validate a group against the buffer's real current bytes before
+//! applying any of it, and refuse outright rather than half-applying - see [`Self::undo`]'s own
+//! docs.
+//!
+//! [`Self::undo`]/[`Self::redo`] replay a whole group through the same `splice_lines` every real
+//! edit already uses, so the incremental line/UTF-16 tables below stay correct by construction
+//! rather than by a second, parallel implementation. They restore the recorded caret **and**
+//! selection, never just the text.
+//!
+//! Recording is suppressed while a group is being replayed ([`Self::replaying`]) - otherwise an
+//! undo would immediately record itself as a fresh edit and the stack could never move backwards.
+//!
+//! What is deliberately *not* here: history does not survive the buffer itself. `AdeApp::
+//! edit_buffers` keeps one buffer per open file for as long as the tab lives, so switching tabs and
+//! back preserves that file's history (a real regression test covers exactly that), but closing the
+//! tab or switching worktree drops the buffer and its history with it - explicitly out of scope per
+//! GitHub issue #17's own checklist.
 //!
 //! ## Diff/Merge views stay 100% read-only
 //!
@@ -65,12 +90,13 @@
 
 use std::ops::Range;
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::code_surface::code_view;
 use crate::language::HighlighterFn;
+use crate::text_history::{self, EditKind, SelectionSnapshot, TextEdit, TextHistory};
 
 /// One open file's real, live-edited text plus real cursor/selection/IME-composition state - see
 /// this module's own docs. `selected_range`/`marked_range` are byte offsets into [`Self::content`]
@@ -145,6 +171,13 @@ pub struct EditBuffer {
     /// decision), preserved across a consecutive run of `Self::move_up`/`Self::move_down` and
     /// cleared by every other cursor-moving action - standard editor "sticky column" behavior.
     pub goal_column: Option<usize>,
+    /// This buffer's real, multi-step undo/redo history (GitHub issue #17) - see this module's own
+    /// docs. Private: every write goes through [`Self::record_edit`], so no call site can push a
+    /// group that doesn't correspond to a splice that actually happened.
+    history: TextHistory,
+    /// `true` only while [`Self::undo`]/[`Self::redo`] is replaying a group, so the splices they
+    /// perform aren't recorded as fresh edits - see this module's own docs.
+    replaying: bool,
 }
 
 impl EditBuffer {
@@ -209,6 +242,8 @@ impl EditBuffer {
             selection_reversed: false,
             marked_range: None,
             goal_column: None,
+            history: TextHistory::new(),
+            replaying: false,
         }
     }
 
@@ -664,18 +699,71 @@ impl EditBuffer {
     /// The one real splice path every text-changing action reduces to - see this module's own
     /// top docs.
     pub fn replace_range(&mut self, range: Option<Range<usize>>, new_text: &str) {
+        self.replace_range_recording(range, new_text, None, None);
+    }
+
+    /// [`Self::replace_range`] with explicit history context - the real implementation both it and
+    /// the caret-preserving deletion helpers ([`Self::backspace`]/[`Self::delete_forward`]) share.
+    ///
+    /// `before` overrides the selection recorded as "where this edit started". That override is
+    /// load-bearing, not cosmetic: `backspace` extends the selection over the grapheme it is about
+    /// to delete *before* splicing, so the selection this method would otherwise observe is
+    /// already the doomed range rather than the caret the user actually had. Recording that would
+    /// (a) restore a selection the user never made when undone, and (b) break coalescing outright,
+    /// since consecutive backspaces would each report a different `before` than the previous one's
+    /// `after` and so never group - see `crate::text_history`'s own caret-continuity rule.
+    ///
+    /// `kind` overrides the inferred [`EditKind`], for a caller that knows an edit is a paste, an
+    /// accepted completion, or an external reload rather than ordinary typing.
+    fn replace_range_recording(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        before: Option<SelectionSnapshot>,
+        kind: Option<EditKind>,
+    ) {
         let range = range
             .map(|range| self.clamp_range(range))
             .or_else(|| self.marked_range.clone())
             // Defensively clamped too - see this method's own docs on why `self.selected_range`
             // itself is never trusted blindly as a splice target, however it got here.
             .unwrap_or_else(|| self.clamp_range(self.selected_range.clone()));
+        // An edit that lands while a live IME composition is active is part of that composition's
+        // own single atomic step (the platform commits a composition by replacing the marked range
+        // through this exact path), so it must record with the composition's own kind rather than
+        // starting a fresh typing group.
+        let was_composing = self.marked_range.is_some();
+        let before = before.unwrap_or_else(|| self.selection_snapshot());
+        let removed = self
+            .content
+            .get(range.clone())
+            .map(|text| text.to_string())
+            .unwrap_or_default();
         self.splice_lines(range.clone(), new_text);
         let new_pos = range.start + new_text.len();
         self.selected_range = new_pos..new_pos;
         self.selection_reversed = false;
         self.marked_range = None;
         self.goal_column = None;
+        let kind = match (kind, was_composing) {
+            (Some(kind), _) => kind,
+            (None, true) => EditKind::Ime,
+            (None, false) => EditKind::for_replacement(new_text),
+        };
+        self.record_edit(range.start, removed, new_text.to_string(), before, kind);
+        // A composition ends here only when this edit genuinely *committed* something. A
+        // mid-composition Backspace also arrives through this path (`Self::backspace` -> here,
+        // with the composition still live) and clears `marked_range` as a side effect of the
+        // splice, but the platform routinely keeps composing afterwards and sends further
+        // `setMarkedText` updates - sealing on that would split one real composition into two undo
+        // steps, which this method did until self-review caught it. Deletions therefore leave the
+        // group open: it stays `EditKind::Ime`, so only a continuing composition can rejoin it
+        // (ordinary typing has a different kind and starts its own group regardless), and a
+        // composition that really did end is still sealed by its own commit, by `Self::unmark`, or
+        // by an emptied-out `replace_and_mark_range`.
+        if was_composing && !new_text.is_empty() {
+            self.history.seal();
+        }
     }
 
     /// The IME composition variant of [`Self::replace_range`] - splices `new_text` the same way,
@@ -718,6 +806,12 @@ impl EditBuffer {
             .or_else(|| self.marked_range.clone())
             // Defensively clamped too - see `Self::replace_range`'s own identical hardening.
             .unwrap_or_else(|| self.clamp_range(self.selected_range.clone()));
+        let before = self.selection_snapshot();
+        let removed = self
+            .content
+            .get(range.clone())
+            .map(|text| text.to_string())
+            .unwrap_or_default();
         self.splice_lines(range.clone(), new_text);
         self.marked_range = if new_text.is_empty() {
             None
@@ -750,13 +844,209 @@ impl EditBuffer {
             }
         };
         self.goal_column = None;
+        self.record_edit(
+            range.start,
+            removed,
+            new_text.to_string(),
+            before,
+            EditKind::Ime,
+        );
+        if self.marked_range.is_none() {
+            // The composition ended by being emptied out (a cancelled/cleared composing string) -
+            // a real, hard boundary, exactly like the commit path in
+            // `Self::replace_range_recording`.
+            self.history.seal();
+        }
+    }
+
+    /// The real, current caret/selection as a history snapshot.
+    fn selection_snapshot(&self) -> SelectionSnapshot {
+        SelectionSnapshot::of(&self.selected_range, self.selection_reversed)
+    }
+
+    /// Pushes one already-performed splice into [`Self::history`]. Suppressed entirely while
+    /// [`Self::replaying`] - see this module's own docs.
+    fn record_edit(
+        &mut self,
+        at: usize,
+        removed: String,
+        inserted: String,
+        before: SelectionSnapshot,
+        kind: EditKind,
+    ) {
+        if self.replaying {
+            return;
+        }
+        let after = self.selection_snapshot();
+        self.history.record(
+            TextEdit {
+                at,
+                removed,
+                inserted,
+            },
+            before,
+            after,
+            kind,
+            Instant::now(),
+        );
+    }
+
+    /// Closes the current undo group, so the next edit always starts a fresh one. The caller-driven
+    /// half of `crate::text_history`'s policy: paste, cut, an accepted completion and an external
+    /// reload are all real group boundaries this type can't infer from the splice alone.
+    pub fn seal_history(&mut self) {
+        self.history.seal();
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.history.can_undo()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.history.can_redo()
+    }
+
+    /// Steps one real undo group back: inverts every edit in it (in reverse order - the only order
+    /// that is correct once a group holds more than one edit, which is exactly what one
+    /// multi-cursor edit will be) and restores the recorded caret **and** selection.
+    ///
+    /// Returns whether anything was undone. A group whose recorded `inserted` text doesn't match
+    /// what's actually in `content` right now is refused outright, leaving both the buffer and the
+    /// history cursor exactly where they were: that can only mean the history has desynchronized
+    /// from the content, and applying it anyway would silently corrupt real, unsaved user text.
+    /// The refusal is defensive, not expected - every content mutation on this type records - and
+    /// is covered by a real test that deliberately desynchronizes the two.
+    ///
+    /// The peek/validate/apply/commit ordering is what makes "leaving the cursor exactly where it
+    /// was" true rather than merely intended - see `crate::text_history::TextHistory::peek_undo`'s
+    /// own docs for the desynchronization a combined `undo()` would have left behind on refusal.
+    pub fn undo(&mut self) -> bool {
+        let Some(group) = self.history.peek_undo() else {
+            return false;
+        };
+        if !self.replay_is_safe(&group.edits, false) {
+            return false;
+        }
+        self.replaying = true;
+        for edit in group.edits.iter().rev() {
+            self.splice_lines(edit.new_range(), &edit.removed);
+        }
+        self.replaying = false;
+        self.restore_selection(group.before);
+        self.history.commit_undo();
+        true
+    }
+
+    /// The mirror of [`Self::undo`] - replays a group forward, in order, and restores its `after`
+    /// selection.
+    pub fn redo(&mut self) -> bool {
+        let Some(group) = self.history.peek_redo() else {
+            return false;
+        };
+        if !self.replay_is_safe(&group.edits, true) {
+            return false;
+        }
+        self.replaying = true;
+        for edit in &group.edits {
+            self.splice_lines(edit.old_range(), &edit.inserted);
+        }
+        self.replaying = false;
+        self.restore_selection(group.after);
+        self.history.commit_redo();
+        true
+    }
+
+    /// Whether replaying `edits` (forward when `forward`, inverted otherwise) really describes this
+    /// buffer's current bytes at every step - checked against a scratch copy of `content` before a
+    /// single byte of the real buffer is touched, so a refusal is genuinely all-or-nothing rather
+    /// than a half-applied group.
+    fn replay_is_safe(&self, edits: &[TextEdit], forward: bool) -> bool {
+        let mut scratch = self.content.clone();
+        if forward {
+            edits
+                .iter()
+                .all(|edit| text_history::apply_forward(&mut scratch, edit))
+        } else {
+            edits
+                .iter()
+                .rev()
+                .all(|edit| text_history::apply_inverse(&mut scratch, edit))
+        }
+    }
+
+    fn restore_selection(&mut self, snapshot: SelectionSnapshot) {
+        self.selected_range = self.clamp_range(snapshot.range());
+        self.selection_reversed = snapshot.reversed;
+        self.marked_range = None;
+        self.goal_column = None;
+    }
+
+    /// Adopts `new_content` (what a real, external writer - an agent CLI, a formatter, another
+    /// editor - has just put on disk) as **one single undoable step**, rather than throwing this
+    /// buffer's history away and starting over.
+    ///
+    /// That distinction is the whole point per GitHub issue #17: an external rewrite landing
+    /// mid-session must never be a silent history wipe. It is recorded as a sealed, programmatic
+    /// group, so the step before it and the step after it are both still reachable, and Ctrl+Z
+    /// immediately after the reload really does put the pre-reload content back.
+    ///
+    /// The caret is preserved by byte offset, clamped into the new content - honest and cheap. It
+    /// is deliberately *not* re-anchored by a diff of old against new (which would be the only way
+    /// to keep it on "the same" line through a large rewrite): that is real work with real failure
+    /// modes for a case where the content under the caret may not exist at all any more.
+    ///
+    /// Returns `false` when the content is already identical, having recorded nothing at all - a
+    /// reload that changes nothing must not push an empty step the user has to press Ctrl+Z past.
+    /// (It still refreshes the real on-disk `mtime`/`len` in that case; see the branch's own
+    /// comment for why leaving those stale would re-report a change that isn't there.)
+    pub fn reload_from_disk(
+        &mut self,
+        new_content: String,
+        lines: Vec<code_view::RenderedLine>,
+        mtime: Option<SystemTime>,
+        len: u64,
+    ) -> bool {
+        if self.content == new_content {
+            // Still refresh the real on-disk identity: the bytes match, so this buffer is
+            // genuinely clean against the new file, and leaving a stale mtime/len behind would
+            // make the next freshness check re-report a change that isn't there.
+            self.saved_content = new_content;
+            self.saved_mtime = mtime;
+            self.saved_len = len;
+            return false;
+        }
+        let before = self.selection_snapshot();
+        let old_content = std::mem::replace(&mut self.content, new_content);
+        let caret = self.floor_char_boundary(before.start.min(self.content.len()));
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.goal_column = None;
+        self.line_ranges = code_view::line_ranges(&self.content);
+        self.utf16_line_starts =
+            Self::cumulative_utf16_line_starts(&self.content, &self.line_ranges);
+        self.lines = lines;
+        self.highlight_dirty = false;
+        self.saved_content = self.content.clone();
+        self.saved_mtime = mtime;
+        self.saved_len = len;
+        let after = self.selection_snapshot();
+        self.history
+            .record_replacement(&old_content, &self.content, before, after, Instant::now());
+        true
     }
 
     /// Ends an IME composition without committing it as a real edit (a cancelled/dismissed
     /// composition) - the marked text itself was already spliced into `content` by whichever
     /// [`Self::replace_and_mark_range`] call is being unmarked, so this only clears the marker.
     pub fn unmark(&mut self) {
+        let was_composing = self.marked_range.is_some();
         self.marked_range = None;
+        if was_composing {
+            // The composition is over - a real, hard undo-group boundary, so whatever the user
+            // types next is its own step rather than being absorbed into the composition's.
+            self.history.seal();
+        }
     }
 
     /// `Backspace`: deletes the grapheme before the caret, or the real selection if one exists.
@@ -771,6 +1061,10 @@ impl EditBuffer {
     /// instead of one real grapheme - wrong every time Backspace was pressed mid-composition, a
     /// real, live-reachable case for any real CJK/composed input session.
     pub fn backspace(&mut self) {
+        // Captured *before* the `select_to` below - see `Self::replace_range_recording`'s own docs
+        // for why recording the post-`select_to` selection would both restore a selection the user
+        // never made and silently defeat backspace coalescing.
+        let before = self.selection_snapshot();
         if self.selected_range.is_empty() {
             let previous = self.previous_boundary(self.cursor_offset());
             if previous == self.cursor_offset() {
@@ -778,12 +1072,14 @@ impl EditBuffer {
             }
             self.select_to(previous);
         }
-        self.replace_range(Some(self.selected_range.clone()), "");
+        self.replace_range_recording(Some(self.selected_range.clone()), "", Some(before), None);
     }
 
     /// `Delete`: the mirror of [`Self::backspace`] - see its own docs for why the real, just-
     /// computed [`Self::selected_range`] is passed explicitly rather than `None`.
     pub fn delete_forward(&mut self) {
+        // See `Self::backspace`'s own docs for why this is captured before `select_to`.
+        let before = self.selection_snapshot();
         if self.selected_range.is_empty() {
             let next = self.next_boundary(self.cursor_offset());
             if next == self.cursor_offset() {
@@ -791,7 +1087,7 @@ impl EditBuffer {
             }
             self.select_to(next);
         }
-        self.replace_range(Some(self.selected_range.clone()), "");
+        self.replace_range_recording(Some(self.selected_range.clone()), "", Some(before), None);
     }
 
     /// `Left`: collapses a real selection to its start, or moves the caret one real grapheme
@@ -1556,5 +1852,469 @@ mod tests {
              O(whole buffer) cost this fix targets",
             source.len(),
         );
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // GitHub issue #17 - real multi-step undo/redo. See this module's own top docs and
+    // `crate::text_history`'s for the recorded shape and the coalescing policy these exercise.
+    // ------------------------------------------------------------------------------------------
+
+    /// Types `text` one real character at a time through the exact path a real keystroke takes
+    /// (`EntityInputHandler::replace_text_in_range` -> `EditBuffer::replace_range`), with no
+    /// intervening caret move - i.e. a genuine typing burst.
+    fn type_text(buffer: &mut EditBuffer, text: &str) {
+        for ch in text.chars() {
+            buffer.replace_range(None, &ch.to_string());
+        }
+    }
+
+    #[test]
+    fn typing_several_characters_then_undo_restores_the_content_from_before_the_burst() {
+        let mut buffer = buffer("fn main() {}\n");
+        buffer.move_to(3);
+        type_text(&mut buffer, "hello");
+        assert_eq!(buffer.content, "fn hellomain() {}\n");
+
+        assert!(buffer.undo(), "the burst must be undoable");
+        assert_eq!(
+            buffer.content, "fn main() {}\n",
+            "five typed characters must undo as one coalesced step, not five"
+        );
+        assert!(
+            !buffer.can_undo(),
+            "and there must be nothing left behind it - proving it really was one step"
+        );
+    }
+
+    #[test]
+    fn undo_restores_the_real_caret_and_redo_restores_the_real_post_edit_caret() {
+        let mut buffer = buffer("abcdef\n");
+        buffer.move_to(3);
+        type_text(&mut buffer, "XY");
+        assert_eq!(buffer.cursor_offset(), 5);
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.content, "abcdef\n");
+        assert_eq!(
+            buffer.cursor_offset(),
+            3,
+            "undo must put the caret back where the burst started, not leave it where the edit \
+             ended"
+        );
+
+        assert!(buffer.redo());
+        assert_eq!(buffer.content, "abcXYdef\n");
+        assert_eq!(buffer.cursor_offset(), 5);
+    }
+
+    #[test]
+    fn undo_restores_a_real_selection_not_just_a_collapsed_caret() {
+        let mut buffer = buffer("abcdef\n");
+        buffer.move_to(1);
+        buffer.select_to(4);
+        assert_eq!(buffer.selected_range, 1..4);
+        // Typing over a real selection replaces it.
+        buffer.replace_range(None, "Z");
+        assert_eq!(buffer.content, "aZef\n");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.content, "abcdef\n");
+        assert_eq!(
+            buffer.selected_range,
+            1..4,
+            "undo must restore the real selection the edit replaced, not just a caret"
+        );
+    }
+
+    #[test]
+    fn a_reversed_selection_round_trips_through_undo_with_its_direction_intact() {
+        let mut buffer = buffer("abcdef\n");
+        buffer.move_to(4);
+        buffer.select_to(1);
+        assert!(buffer.selection_reversed);
+        assert_eq!(buffer.cursor_offset(), 1);
+        buffer.replace_range(None, "Z");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.selected_range, 1..4);
+        assert!(
+            buffer.selection_reversed,
+            "the visible caret sat at the selection's start - undo must restore that, or the \
+             next Shift+Arrow extends the wrong end"
+        );
+        assert_eq!(buffer.cursor_offset(), 1);
+    }
+
+    #[test]
+    fn a_real_caret_jump_between_two_bursts_makes_them_two_separate_undo_steps() {
+        let mut buffer = buffer("abcdef\n");
+        buffer.move_to(0);
+        type_text(&mut buffer, "XX");
+        // A real arrow-key caret move - no time passes, but the caret is no longer where the
+        // previous edit left it.
+        buffer.move_right();
+        buffer.move_right();
+        type_text(&mut buffer, "YY");
+        assert_eq!(buffer.content, "XXabYYcdef\n");
+
+        assert!(buffer.undo());
+        assert_eq!(
+            buffer.content, "XXabcdef\n",
+            "the second burst must undo on its own - a caret jump is a real group boundary"
+        );
+        assert!(buffer.undo());
+        assert_eq!(buffer.content, "abcdef\n");
+        assert!(!buffer.can_undo());
+    }
+
+    #[test]
+    fn a_new_edit_after_an_undo_drops_the_redo_branch() {
+        let mut buffer = buffer("abc\n");
+        buffer.move_to(3);
+        type_text(&mut buffer, "XX");
+        assert!(buffer.undo());
+        assert!(buffer.can_redo());
+
+        type_text(&mut buffer, "Y");
+        assert!(
+            !buffer.can_redo(),
+            "linear history: a fresh edit after an undo must discard the redo branch"
+        );
+        assert_eq!(buffer.content, "abcY\n");
+    }
+
+    #[test]
+    fn consecutive_backspaces_undo_as_one_step_and_restore_the_pre_deletion_caret() {
+        let mut buffer = buffer("abcdef\n");
+        buffer.move_to(6);
+        buffer.backspace();
+        buffer.backspace();
+        buffer.backspace();
+        assert_eq!(buffer.content, "abc\n");
+        assert_eq!(buffer.cursor_offset(), 3);
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.content, "abcdef\n");
+        assert_eq!(
+            buffer.cursor_offset(),
+            6,
+            "the caret must return to where the deletion run started - the real bug that would \
+             appear if `backspace` recorded the selection it extends over instead"
+        );
+        assert!(!buffer.can_undo());
+    }
+
+    #[test]
+    fn deleting_forward_repeatedly_also_undoes_as_one_step() {
+        let mut buffer = buffer("abcdef\n");
+        buffer.move_to(2);
+        buffer.delete_forward();
+        buffer.delete_forward();
+        assert_eq!(buffer.content, "abef\n");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.content, "abcdef\n");
+        assert_eq!(buffer.cursor_offset(), 2);
+        assert!(!buffer.can_undo());
+    }
+
+    #[test]
+    fn a_real_ime_composition_commits_as_exactly_one_atomic_undo_step() {
+        let mut buffer = buffer("x\n");
+        buffer.move_to(1);
+
+        // A real, multi-keystroke Japanese composition: three real `setMarkedText`-shaped updates
+        // (each one replacing the previous marked range), then a real commit through the plain
+        // `replace_text_in_range` path a platform IME uses to finish a composition. This is the
+        // real sequence `crate::code_surface::editing`'s `EntityInputHandler` receives, not an
+        // assumed one - see `replace_and_mark_range`'s own docs for the verified platform
+        // contract.
+        buffer.replace_and_mark_range(None, "\u{304b}", None);
+        assert_eq!(buffer.content, "x\u{304b}\n");
+        buffer.replace_and_mark_range(None, "\u{304b}\u{3093}", None);
+        buffer.replace_and_mark_range(None, "\u{304b}\u{3093}\u{3058}", None);
+        assert_eq!(buffer.content, "x\u{304b}\u{3093}\u{3058}\n");
+        assert!(buffer.marked_range.is_some(), "sanity: still composing");
+        buffer.replace_range(None, "\u{6f22}\u{5b57}");
+        assert_eq!(buffer.content, "x\u{6f22}\u{5b57}\n");
+        assert!(buffer.marked_range.is_none(), "sanity: composition ended");
+
+        assert!(buffer.undo());
+        assert_eq!(
+            buffer.content, "x\n",
+            "the whole composition - every intermediate update plus the commit - must be one \
+             single undo step, never four"
+        );
+        assert_eq!(buffer.cursor_offset(), 1);
+        assert!(!buffer.can_undo());
+
+        assert!(buffer.redo());
+        assert_eq!(buffer.content, "x\u{6f22}\u{5b57}\n");
+    }
+
+    /// Regression for a split found in self-review: a Backspace pressed *mid-composition* reaches
+    /// `replace_range` with the composition still live, which clears `marked_range` as a side
+    /// effect - and an earlier version sealed the group on that, so the rest of what the user
+    /// experiences as one composition became a second undo step. Real platform IMEs routinely keep
+    /// composing after a backspace inside the composing string.
+    #[test]
+    fn a_backspace_mid_composition_does_not_split_the_composition_into_two_undo_steps() {
+        let mut buffer = buffer("x\n");
+        buffer.move_to(1);
+
+        buffer.replace_and_mark_range(None, "\u{304b}\u{3093}", None);
+        assert_eq!(buffer.content, "x\u{304b}\u{3093}\n");
+        // Backspace inside the composing string. `EditBuffer::replace_range` unconditionally
+        // clears `marked_range` (Revision R8.5a behaviour, unchanged here), so as far as this
+        // buffer is concerned the composition has ended - but the user is still mid-word, and the
+        // platform carries right on sending composition updates.
+        buffer.backspace();
+        assert_eq!(buffer.content, "x\u{304b}\n");
+        buffer.replace_and_mark_range(None, "\u{304b}\u{3044}", None);
+        buffer.replace_range(None, "\u{6d77}");
+        assert_eq!(buffer.content, "x\u{304b}\u{6d77}\n");
+
+        assert!(buffer.undo());
+        assert_eq!(
+            buffer.content, "x\n",
+            "everything from the first composition update through the mid-composition backspace \
+             to the final commit must be one undo step - an earlier version sealed on the \
+             backspace and split it in two"
+        );
+        assert!(!buffer.can_undo());
+    }
+
+    #[test]
+    fn typing_after_a_composition_ends_is_a_separate_undo_step() {
+        let mut buffer = buffer("\n");
+        buffer.move_to(0);
+        buffer.replace_and_mark_range(None, "\u{304b}", None);
+        buffer.replace_range(None, "\u{6f22}");
+        type_text(&mut buffer, "ab");
+        assert_eq!(buffer.content, "\u{6f22}ab\n");
+
+        assert!(buffer.undo());
+        assert_eq!(
+            buffer.content, "\u{6f22}\n",
+            "the end of a composition is a hard boundary - the typing after it must not have \
+             been absorbed into the composition's own step"
+        );
+        assert!(buffer.undo());
+        assert_eq!(buffer.content, "\n");
+    }
+
+    /// Audit finding, reproduced end to end on a real buffer: a mid-composition Backspace
+    /// deliberately leaves the `Ime` group open (so a continuing composition rejoins it), and
+    /// `EditKind::Ime` coalescing ignores both the idle timeout and caret continuity - so an
+    /// abandoned composition's group stayed open indefinitely and a completely unrelated
+    /// composition somewhere else merged into it, one Ctrl+Z reverting both.
+    ///
+    /// The backspace deliberately removes only *part* of the preedit, so the abandoned group is
+    /// genuinely not a net no-op and can't be disposed of by `EditGroup::is_net_noop` - this is
+    /// specifically the caret-jump boundary under test, not the dead-step drop.
+    #[test]
+    fn two_unrelated_compositions_separated_by_a_caret_jump_are_two_undo_steps() {
+        let mut buffer = buffer("abcdef\n");
+        buffer.move_to(6);
+        buffer.replace_and_mark_range(None, "\u{3042}\u{3044}", None);
+        assert_eq!(buffer.content, "abcdef\u{3042}\u{3044}\n");
+        // Backspace one grapheme out of the preedit: `marked_range` clears, but real composed
+        // text is left behind, so the group is open *and* not identity.
+        buffer.backspace();
+        assert_eq!(buffer.content, "abcdef\u{3042}\n");
+        assert!(buffer.marked_range.is_none());
+
+        // A real caret jump, then a completely unrelated composition committed there.
+        buffer.move_to(0);
+        buffer.replace_and_mark_range(None, "\u{304b}", None);
+        buffer.replace_range(None, "\u{6f22}");
+        assert_eq!(buffer.content, "\u{6f22}abcdef\u{3042}\n");
+
+        assert!(buffer.undo());
+        assert_eq!(
+            buffer.content, "abcdef\u{3042}\n",
+            "undoing the second composition must revert only that composition - the abandoned \
+             first one, on the other side of a real caret jump, is its own separate step"
+        );
+        assert!(
+            buffer.can_undo(),
+            "and that first composition must still be there to undo separately"
+        );
+        assert!(buffer.undo());
+        assert_eq!(buffer.content, "abcdef\n");
+    }
+
+    #[test]
+    fn a_cancelled_composition_is_still_a_hard_boundary() {
+        let mut buffer = buffer("\n");
+        buffer.move_to(0);
+        buffer.replace_and_mark_range(None, "\u{304b}", None);
+        // A real cancelled composition: the platform calls `unmark_text` without committing.
+        buffer.unmark();
+        type_text(&mut buffer, "ab");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.content, "\u{304b}\n");
+        assert!(buffer.undo());
+        assert_eq!(buffer.content, "\n");
+    }
+
+    #[test]
+    fn seal_history_makes_a_paste_its_own_undo_step_in_both_directions() {
+        let mut buffer = buffer("\n");
+        buffer.move_to(0);
+        type_text(&mut buffer, "ab");
+        // Exactly what `AdeApp::handle_editor_paste_action` does around a real paste.
+        buffer.seal_history();
+        buffer.replace_range(None, "PASTED");
+        buffer.seal_history();
+        type_text(&mut buffer, "cd");
+        assert_eq!(buffer.content, "abPASTEDcd\n");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.content, "abPASTED\n");
+        assert!(buffer.undo());
+        assert_eq!(buffer.content, "ab\n");
+        assert!(buffer.undo());
+        assert_eq!(buffer.content, "\n");
+        assert!(!buffer.can_undo());
+    }
+
+    #[test]
+    fn an_external_reload_is_one_undoable_step_and_never_a_silent_history_wipe() {
+        let mut buffer = buffer("original\n");
+        buffer.move_to(8);
+        type_text(&mut buffer, "!");
+        assert_eq!(buffer.content, "original!\n");
+        // The user's own edit is saved, so the buffer is clean again against disk...
+        buffer.mark_saved("original!\n".to_string(), None, 10);
+        assert!(!buffer.is_dirty());
+
+        // ...and now a real external writer (an agent CLI running in this worktree) rewrites it.
+        let rewritten = "rewritten by an agent\n".to_string();
+        let lines = code_view::build_lines(&rewritten, &[]);
+        assert!(buffer.reload_from_disk(rewritten.clone(), lines, None, rewritten.len() as u64));
+        assert_eq!(buffer.content, rewritten);
+        assert!(!buffer.is_dirty(), "the reloaded buffer matches disk");
+
+        // The reload is its own real step...
+        assert!(buffer.undo());
+        assert_eq!(
+            buffer.content, "original!\n",
+            "Ctrl+Z straight after an external reload must put the pre-reload content back"
+        );
+        // ...and everything recorded before it is still reachable - not wiped.
+        assert!(
+            buffer.can_undo(),
+            "the history from before the reload must survive it - a silent wipe mid-stack is \
+             exactly what GitHub issue #17 rules out"
+        );
+        assert!(buffer.undo());
+        assert_eq!(buffer.content, "original\n");
+
+        assert!(buffer.redo());
+        assert_eq!(buffer.content, "original!\n");
+        assert!(buffer.redo());
+        assert_eq!(buffer.content, rewritten);
+    }
+
+    #[test]
+    fn a_reload_whose_content_is_identical_records_no_step_at_all() {
+        let mut buffer = buffer("same\n");
+        let lines = code_view::build_lines("same\n", &[]);
+        assert!(!buffer.reload_from_disk("same\n".to_string(), lines, None, 5));
+        assert!(
+            !buffer.can_undo(),
+            "a reload that changes nothing must not push an empty step the user has to press \
+             Ctrl+Z past"
+        );
+        assert_eq!(
+            buffer.saved_len, 5,
+            "but it must still refresh disk identity"
+        );
+    }
+
+    #[test]
+    fn a_reload_keeps_the_caret_in_bounds_when_the_new_content_is_shorter() {
+        let mut buffer = buffer("a very long first line\n");
+        buffer.move_to(20);
+        let short = "hi\n".to_string();
+        let lines = code_view::build_lines(&short, &[]);
+        assert!(buffer.reload_from_disk(short.clone(), lines, None, short.len() as u64));
+        assert!(
+            buffer.cursor_offset() <= buffer.content.len(),
+            "the caret must be clamped into the new content, never left dangling past its end"
+        );
+    }
+
+    #[test]
+    fn undo_and_redo_keep_the_incremental_line_tables_exactly_correct() {
+        // The real risk a separate replay path would introduce: `undo`/`redo` splice through the
+        // same `splice_lines` every edit uses, so the incremental `lines`/`line_ranges`/
+        // `utf16_line_starts` tables must end up byte-identical to a fresh whole-buffer rebuild.
+        let mut buffer = buffer("one\ntwo\nthree\n");
+        buffer.move_to(4);
+        type_text(&mut buffer, "X\nY");
+        buffer.move_to(0);
+        buffer.backspace();
+        type_text(&mut buffer, "Z");
+        assert!(buffer.undo());
+        assert!(buffer.undo());
+        assert!(buffer.redo());
+
+        let expected = EditBuffer::new(
+            PathBuf::from("/tmp/test.rs"),
+            buffer.content.clone(),
+            Some("rs".to_string()),
+            None,
+            buffer.content.len() as u64,
+        );
+        assert_eq!(buffer.line_ranges, expected.line_ranges);
+        assert_eq!(buffer.utf16_line_starts, expected.utf16_line_starts);
+        assert_eq!(
+            buffer.lines.len(),
+            expected.lines.len(),
+            "the same number of real rendered rows as a fresh, independent rebuild"
+        );
+        for (index, (actual, wanted)) in buffer.lines.iter().zip(expected.lines.iter()).enumerate()
+        {
+            let actual_text: String = actual.runs.iter().map(|run| run.0.to_string()).collect();
+            let wanted_text: String = wanted.runs.iter().map(|run| run.0.to_string()).collect();
+            assert_eq!(actual_text, wanted_text, "row {index}");
+        }
+    }
+
+    #[test]
+    fn undo_is_refused_rather_than_corrupting_content_a_group_no_longer_describes() {
+        let mut buffer = buffer("abc\n");
+        buffer.move_to(3);
+        type_text(&mut buffer, "XY");
+        // Deliberately desynchronize the history from the content, the way only a bug could:
+        // rewrite `content` behind the buffer's own back.
+        buffer.content = "completely different\n".to_string();
+        assert!(
+            !buffer.undo(),
+            "a group that doesn't describe the current bytes must be refused outright"
+        );
+        assert_eq!(
+            buffer.content, "completely different\n",
+            "and the content must be left exactly as it was, not half-spliced"
+        );
+        assert!(
+            buffer.can_undo() && !buffer.can_redo(),
+            "the history cursor must not have moved either - a refusal that still stepped the \
+             cursor would leave the stack silently desynchronized from the content, which is \
+             exactly what the validation exists to prevent"
+        );
+    }
+
+    #[test]
+    fn undo_and_redo_on_an_empty_history_are_honest_no_ops() {
+        let mut buffer = buffer("abc\n");
+        assert!(!buffer.can_undo());
+        assert!(!buffer.can_redo());
+        assert!(!buffer.undo());
+        assert!(!buffer.redo());
+        assert_eq!(buffer.content, "abc\n");
     }
 }

@@ -26,17 +26,12 @@ impl AdeApp {
             return;
         }
         let changed = match keystroke.key.as_str() {
-            "backspace" => self.filter_query.pop().is_some(),
-            "escape" => {
-                let had_text = !self.filter_query.is_empty();
-                self.filter_query.clear();
-                had_text
-            }
+            "backspace" => self.filter_query.pop(Instant::now()),
+            // A real, undoable step, not a silent loss: `Esc` clearing a typed filter is exactly
+            // the case Ctrl+Z should bring back. See `crate::text_history::TextField::set`.
+            "escape" => self.filter_query.clear(Instant::now()),
             _ => match keystroke.key_char.as_deref() {
-                Some(text) if !text.is_empty() => {
-                    self.filter_query.push_str(text);
-                    true
-                }
+                Some(text) if !text.is_empty() => self.filter_query.push_str(text, Instant::now()),
                 _ => false,
             },
         };
@@ -45,6 +40,31 @@ impl AdeApp {
             self.discard_confirm_armed = None;
             cx.notify();
             cx.stop_propagation();
+        }
+    }
+
+    /// `TextUndo`/`TextRedo` for the rail's filter field (GitHub issue #17) - see
+    /// `crate::default_key_bindings`' own docs for the scoping, and
+    /// `crate::text_history::TextField` for the history itself.
+    pub(in crate::rail) fn handle_filter_text_undo(
+        &mut self,
+        _: &TextUndo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.filter_query.undo() {
+            cx.notify();
+        }
+    }
+
+    pub(in crate::rail) fn handle_filter_text_redo(
+        &mut self,
+        _: &TextRedo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.filter_query.redo() {
+            cx.notify();
         }
     }
 
@@ -348,6 +368,10 @@ impl AdeApp {
     pub(crate) fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("session-rail")
+            // The app's real "nowhere else to put focus" fallback target - see
+            // `AdeApp::rail_focus_handle`'s own docs for why the fallback lives on this
+            // deliberately context-less root rather than on the filter row below it.
+            .track_focus(&self.rail_focus_handle)
             .flex()
             .flex_col()
             .size_full()
@@ -484,6 +508,11 @@ impl AdeApp {
         div()
             .id("rail-filter-row")
             .track_focus(&self.filter_focus_handle)
+            // See `crate::default_key_bindings`' `TextUndo`/`TextRedo` docs for why the tag and
+            // the listener both live on this exact node.
+            .key_context("text-input")
+            .on_action(cx.listener(Self::handle_filter_text_undo))
+            .on_action(cx.listener(Self::handle_filter_text_redo))
             .on_key_down(cx.listener(Self::handle_filter_key_down))
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                 window.focus(&this.filter_focus_handle, cx);
@@ -514,7 +543,7 @@ impl AdeApp {
                         theme::text::GHOST
                     })
                     .child(if has_query {
-                        self.filter_query.clone()
+                        self.filter_query.as_str().to_string()
                     } else {
                         "filter sessions".to_string()
                     }),
@@ -563,10 +592,11 @@ impl AdeApp {
         rows: &[WorktreeRow],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let filtered: Vec<WorktreeRow> = rail::filter_worktree_rows(rows, &self.filter_query)
-            .into_iter()
-            .cloned()
-            .collect();
+        let filtered: Vec<WorktreeRow> =
+            rail::filter_worktree_rows(rows, self.filter_query.as_str())
+                .into_iter()
+                .cloned()
+                .collect();
         let groups = rail::group_worktrees_by_urgency(&filtered);
 
         if groups.is_empty() {
@@ -636,7 +666,7 @@ impl AdeApp {
         rows: &[WorktreeRow],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let filtered = rail::filter_worktree_rows(rows, &self.filter_query);
+        let filtered = rail::filter_worktree_rows(rows, self.filter_query.as_str());
 
         if filtered.is_empty() {
             return self.render_rail_empty_message(if rows.is_empty() {

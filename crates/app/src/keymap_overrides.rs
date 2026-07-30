@@ -28,30 +28,36 @@
 //! (`crate::settings::state::tests::every_keybinding_row_is_genuinely_distinguishable_from_every_other`
 //! guards against exactly that in the default set).
 //!
-//! ## Collision detection is real but deliberately conservative
+//! ## Collision detection is exact for this app, by enumeration
 //!
 //! `vendor/zed/crates/gpui/src/keymap/context.rs`'s `KeyBindingContextPredicate` has no built-in
 //! "could these two predicates ever both be true for some real context stack" check - only
-//! `eval` (against one concrete, already-known stack) and `is_superset` (whether every context
-//! the other predicate matches, this one also matches). [`contexts_could_overlap`] uses
-//! `is_superset` in both directions as a real, sound-but-incomplete stand-in: if either predicate
-//! is a superset of the other, there is a real context stack (any one the narrower predicate
-//! matches) where both are true - a genuine collision risk (e.g. `"file-editor"` is a superset of
-//! `"file-editor && completions"`, so a binding scoped to the bare parent context really can fire
-//! at the same time as one scoped to the narrower child). Two genuinely disjoint predicates like
-//! `"file-editor"` and `"diff"` are neither a superset of the other, so they never flag - matching
-//! this project's own explicit rule that a collision across disjoint scopes is fine.
+//! `eval`/`depth_of` (against one concrete, already-known stack) and `is_superset` (whether every
+//! context the other predicate matches, this one also matches). Rather than approximate the
+//! missing check, [`contexts_could_overlap`] **evaluates both predicates against every context
+//! stack this app really produces** ([`real_context_stacks`]), through GPUI's own `depth_of` -
+//! the same function `Keymap::binding_enabled` uses to decide whether a binding is live. Two
+//! predicates "could overlap" exactly when some real stack makes both live. That is not a
+//! heuristic: it is exact over this app's real state space, and it needs no `Or`/`Not` solver
+//! because it never reasons about predicate *structure* at all.
 //!
-//! [`negation_overlap`] handles one real, necessary special case `is_superset` alone gets wrong:
-//! it has no `Not` arm at all (`match other { ... Not(_) => false, ... }`), so a bare `is_superset`
-//! check between a real `"!terminal"`-scoped binding (`Undo`/`Redo`) and `"file-editor"` would
-//! read as "never overlaps" even though a focused file editor is, in every real case, not itself a
-//! terminal - a real collision risk `contexts_could_overlap` now catches directly rather than
-//! silently missing. This still doesn't attempt full boolean satisfiability over arbitrary
-//! compound `Or`/`Not` combinations (a negated non-identifier expression conservatively reports
-//! "could overlap" rather than risk a false negative) - gpui provides no general solver, and
-//! hand-rolling one is out of scope for a settings-page rebind guard; exact string equality is
-//! checked first as the common, unambiguous case.
+//! It replaced an `is_superset`-plus-special-cases heuristic that GitHub issue #17 made newly and
+//! dangerously wrong, found by an independent adversarial audit. `is_superset` answers `false` in
+//! *both* directions for two different bare `Identifier`s, and the old code read that absence of
+//! evidence as proof of disjointness. That was survivable only while distinct identifiers really
+//! did live on distinct nodes; issue #17 put `"text-input"` on the *same* node as `"file-editor"`
+//! and `"merge-editor"`, so `"text-input"` vs `"file-editor"` reported "disjoint" when they are in
+//! fact always live together - and a user could rebind `Text: undo` onto Backspace, Ctrl+V or
+//! Escape through the real Settings UI with no warning at all.
+//!
+//! The one place it is deliberately conservative is coverage of its own enumeration: a predicate
+//! that is live on **no** stack in [`real_context_stacks`] reports "could overlap" rather than
+//! certifying a disjointness this module evidently cannot see. That is a strictly safe direction
+//! for a rebind guard - an extra warning on the Keybindings page, never a missed collision - and
+//! it earned its keep at the merge that brought GitHub issue #19's file tree into this branch:
+//! the tree's five bindings were live on no enumerated stack, so every one of them reported
+//! "could overlap" until the four `file-tree*` stacks were added, which is what surfaced the
+//! omission instead of letting it pass silently.
 
 use gpui::{KeyBinding, KeyBindingContextPredicate, Keystroke};
 
@@ -144,61 +150,157 @@ pub fn effective_key_bindings(overrides: &[KeybindingOverride]) -> Vec<KeyBindin
         .collect()
 }
 
-/// See the module docs' "Collision detection" section - `true` when a binding scoped to `a` and
-/// one scoped to `b` could realistically both be active for the same live context stack, so
-/// giving them the same keystroke would leave GPUI's own dispatch order (not this app) to decide
-/// which one actually fires.
+/// Every real key-context stack this app's own render code can actually produce, as the
+/// space-separated context literals each node contributes, ordered root-first exactly the way
+/// GPUI's own `dispatch_path` builds them.
+///
+/// This is the single source of truth for "what contexts really exist", shared by
+/// [`contexts_could_overlap`] and by `crate::undo_scoping_matrix_tests`, so the two can never
+/// disagree about the app they are both reasoning over. Derived by hand from the nine
+/// `.key_context(..)` call sites in the crate - `crate::root::AdeApp::render`'s baseline `"app"`,
+/// `crate::terminal::pane`, `crate::code_surface::render` (one call site, three literals from a
+/// `match`), `crate::merge::editing`, the four single-line inputs, which all emit the same
+/// bare `"text-input"`, and `crate::sidebar::render::AdeApp::file_tree_shell` (one call site,
+/// four literals from a `match`) - and guarded against drift by this module's own
+/// `every_real_key_context_call_site_is_covered` test, which fails the moment a tenth call site
+/// appears. (That test earned its keep immediately: this comment originally said "six", counting
+/// distinct emitted literals rather than real call sites, and the test caught it on its first
+/// run.)
+///
+/// The four `file-tree*` stacks arrived with a merge, not with an edit to this file, which is
+/// exactly why they are called out here. GitHub issue #19's file tree and issue #17's text-undo
+/// scoping were built on separate branches; this list was issue #17's and knew nothing about the
+/// tree. Omitting them was not a silent hole in the *checker* - `contexts_could_overlap` refuses
+/// to certify a predicate it never sees live and returned "could overlap" for all five file-tree
+/// bindings, which is what surfaced this at merge time. It was a real hole in every *positive*
+/// claim built on the list, including `crate::undo_scoping_matrix_tests`' "at most one undo
+/// system is live anywhere", which held vacuously over the tree's inline name editor.
+///
+/// The empty stack is deliberately included: GPUI falls back to the dispatch root with **no**
+/// context frames whenever the focused `FocusId` isn't in the last rendered frame, and
+/// `KeyBindingContextPredicate::eval_inner` short-circuits to `false` for an empty stack
+/// (`vendor/zed/crates/gpui/src/keymap/context.rs`), so *every* scoped binding is dead there. That
+/// is a real, reachable state (a dangling focus handle) and leaving it out of the enumeration
+/// would quietly make every claim built on this list unsound for exactly the case that has bitten
+/// this project repeatedly.
+pub fn real_context_stacks() -> Vec<Vec<&'static str>> {
+    vec![
+        vec![],
+        vec!["app"],
+        vec!["app", "terminal"],
+        vec!["app", "diff"],
+        vec!["app", "diff file-editor text-input"],
+        vec!["app", "diff file-editor text-input completions"],
+        vec!["app", "merge-editor text-input"],
+        vec!["app", "text-input"],
+        // The file tree (GitHub issue #19), built by calling the *same* function the renderer
+        // calls, over all four of its inputs - not by restating its literals here. See
+        // [`file_tree_key_context`] for why that indirection is load-bearing rather than tidy.
+        vec!["app", file_tree_key_context(false, false)],
+        vec!["app", file_tree_key_context(true, false)],
+        vec!["app", file_tree_key_context(false, true)],
+        vec!["app", file_tree_key_context(true, true)],
+    ]
+}
+
+/// The file tree's real key context, as a function of its two independent modal states: whether an
+/// inline name editor is open, and whether the delete confirmation is up.
+///
+/// This lives here, beside [`real_context_stacks`], rather than inline in
+/// `crate::sidebar::render::AdeApp::file_tree_shell` where it is used, because the two must never
+/// disagree and "a `match` in the renderer plus a hand-copied list of its literals here" is
+/// exactly how they would. That is not hypothetical: the merge that brought GitHub issue #19's
+/// tree onto issue #17's branch added a `.key_context(..)` call site whose literals this
+/// enumeration knew nothing about, and the drift test written to catch precisely that was blind
+/// to it. Deriving both from one function makes that class of drift structurally impossible
+/// rather than merely test-detectable - a guard that has to be extended by hand every time the
+/// thing it guards grows is not a guard.
+///
+/// `"text-input"` is emitted for both editor-open cases: an inline name editor is a real
+/// text-typing surface, and the tag is what makes `Undo`'s `"!terminal && !text-input"`
+/// unsatisfiable there, so `Ctrl+Z` mid-filename cannot reach the *worktree* history.
+///
+/// `(true, true)` is a deliberate over-approximation: no real gesture sequence reaches it, because
+/// arming a delete goes through the context menu and
+/// `crate::sidebar::tree_ops::AdeApp::open_tree_context_menu` cancels any open inline editor
+/// first (asserted by that module's own
+/// `arming_a_delete_is_not_reachable_while_an_inline_name_editor_is_open`). It is enumerated
+/// anyway: an enumeration that quietly assumes reachability is how the empty-stack hole in this
+/// list's own history happened, and over-approximating costs at worst one extra rebind warning.
+pub fn file_tree_key_context(inline_edit: bool, delete_confirm: bool) -> &'static str {
+    match (inline_edit, delete_confirm) {
+        (true, true) => "file-tree tree-editing tree-delete-confirm text-input",
+        (true, false) => "file-tree tree-editing text-input",
+        (false, true) => "file-tree tree-delete-confirm",
+        (false, false) => "file-tree",
+    }
+}
+
+fn parsed_context_stacks() -> Vec<Vec<gpui::KeyContext>> {
+    real_context_stacks()
+        .into_iter()
+        .map(|stack| {
+            stack
+                .into_iter()
+                .map(|part| {
+                    gpui::KeyContext::parse(part).expect("a real, parseable key context literal")
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// `true` when a binding scoped to `a` and one scoped to `b` could realistically both be active
+/// for the same live context stack, so giving them the same keystroke would leave GPUI's own
+/// dispatch order (not this app) to decide which one actually fires.
+///
+/// Decided by **evaluating both predicates against every stack this app really produces**
+/// ([`real_context_stacks`]) through GPUI's own `depth_of` - the exact same function
+/// `Keymap::binding_enabled` uses to decide whether a binding is live
+/// (`vendor/zed/crates/gpui/src/keymap.rs`). Exact for this app, rather than a heuristic.
+///
+/// It replaced a `is_superset`-based approximation that GitHub issue #17 made newly, dangerously
+/// wrong, found by an independent adversarial audit. `is_superset`
+/// (`vendor/zed/crates/gpui/src/keymap/context.rs`) evaluates `false` in *both* directions for two
+/// different bare `Identifier`s, and the old code read that absence of evidence as proof of
+/// disjointness. That was survivable while distinct identifiers really did live on distinct nodes
+/// (but this issue put `"text-input"` on the *same* node as `"file-editor"` and `"merge-editor"`,
+/// so `"text-input"` vs `"file-editor"` reported "disjoint" when they are in fact always live
+/// together). A user could rebind `Text: undo` onto Backspace, Ctrl+V or Escape through the real
+/// Settings UI with no warning at all, and the rebind would then silently lose to the editor's own
+/// binding on dispatch-order grounds. This module's own tests now pin exactly that case.
+///
+/// Conservative where it doesn't understand something: a predicate that isn't live on any real
+/// stack at all reports "could overlap" rather than clearing a risk this function can't actually
+/// reason about.
 fn contexts_could_overlap(
     a: Option<&KeyBindingContextPredicate>,
     b: Option<&KeyBindingContextPredicate>,
 ) -> bool {
-    match (a, b) {
-        // An unscoped (global) binding is active in every context - always a real overlap.
-        (None, _) | (_, None) => true,
-        (Some(a), Some(b)) => {
-            if a == b {
-                return true;
-            }
-            if let Some(overlap) = negation_overlap(a, b) {
-                return overlap;
-            }
-            if let Some(overlap) = negation_overlap(b, a) {
-                return overlap;
-            }
-            a.is_superset(b) || b.is_superset(a)
-        }
+    let (a, b) = match (a, b) {
+        // An unscoped (global) binding is active in every non-empty context - always a real
+        // overlap with anything else that can fire at all.
+        (None, _) | (_, None) => return true,
+        (Some(a), Some(b)) => (a, b),
+    };
+    if a == b {
+        return true;
     }
-}
-
-/// Real handling for a `Not(Identifier(_))` predicate on either side (a real, live example:
-/// `crate::default_key_bindings`'s `Undo`/`Redo`, scoped `Some("!terminal")`) -
-/// `KeyBindingContextPredicate::is_superset` (`vendor/zed/crates/gpui/src/keymap/context.rs:328`)
-/// has no case for `Not` at all: its `match other { ... Not(_) => false, ... }` arm means a bare
-/// `is_superset` check between `"!terminal"` and `"file-editor"` returns `false` in *both*
-/// directions, which [`contexts_could_overlap`] would have read as "genuinely disjoint" even
-/// though a file editor is, in every real case, not itself a terminal - the two really can be
-/// live at the same time. Returns `None` when `maybe_not` isn't a plain `Not(Identifier(_))`
-/// (e.g. a negated compound expression, which none of this app's own bindings currently use) -
-/// the caller then falls back to the plain `is_superset` check, and this function's own
-/// `Some(true)` fallback for a negated *non*-identifier expression means "not specifically
-/// understood" always resolves to "could overlap" rather than silently clearing a real risk.
-fn negation_overlap(
-    maybe_not: &KeyBindingContextPredicate,
-    other: &KeyBindingContextPredicate,
-) -> Option<bool> {
-    let KeyBindingContextPredicate::Not(inner) = maybe_not else {
-        return None;
+    let stacks = parsed_context_stacks();
+    let live = |predicate: &KeyBindingContextPredicate| {
+        stacks
+            .iter()
+            .filter(|stack| predicate.depth_of(stack).is_some())
+            .count()
     };
-    let KeyBindingContextPredicate::Identifier(name) = inner.as_ref() else {
-        return Some(true);
-    };
-    // `!x` and `other` overlap unless `other` can only ever be true when `x` is also present -
-    // i.e. unless the bare identifier `x` is a real superset of `other` (matches every context
-    // `other` matches, per `is_superset`'s own real, verified semantics - see this project's own
-    // `vendor/zed` test `test_is_superset` for the exact `Identifier` vs `And` case this reuses:
-    // `assert_is_superset("editor", "editor && vim_mode", true)`).
-    let bare = KeyBindingContextPredicate::Identifier(name.clone());
-    Some(!bare.is_superset(other))
+    if live(a) == 0 || live(b) == 0 {
+        // One of them matches nothing this function knows about - don't claim disjointness on the
+        // strength of an enumeration that evidently doesn't cover it.
+        return true;
+    }
+    stacks
+        .iter()
+        .any(|stack| a.depth_of(stack).is_some() && b.depth_of(stack).is_some())
 }
 
 /// Checks whether `candidate_keystroke` (a `gpui::Keystroke::parse`-compatible string, exactly
@@ -461,21 +563,29 @@ mod tests {
         );
     }
 
-    /// Regression for a real bug an audit caught: `negation_overlap` didn't exist yet, so a bare
-    /// `is_superset` check between `"!terminal"` (`Undo`, real default `secondary-z`) and
-    /// `"file-editor"` (a real, live-active scope whenever a file tab is focused) read as
-    /// "genuinely disjoint" in both directions - `is_superset` has no `Not` case at all - and let
-    /// `Undo` be rebound onto an already-claimed `file-editor` chord (e.g. `EditorCopy`'s
-    /// `secondary-c`) with no warning, even though both really can fire from the same live
-    /// keystroke.
+    /// The exact checker's answer for `Undo` (`"!terminal && !text-input"`) versus a
+    /// `"file-editor"`-scoped binding: **no** collision, because every real stack carrying
+    /// `"file-editor"` also carries `"text-input"` (they are emitted by the same
+    /// `crate::code_surface::render` node), so `Undo` is provably never live over a file editor.
+    ///
+    /// This assertion is the exact opposite of what it was before GitHub issue #17, and the flip
+    /// is the point. It used to warn, correctly, because `Undo` was scoped bare `"!terminal"` and
+    /// a file editor is not a terminal. Both facts changed: `Undo` gained `&& !text-input`, and
+    /// the file editor gained the `"text-input"` tag. The heuristic this replaced could not see
+    /// either change - it answered `false` for two unrelated `Identifier`s and `true` for a
+    /// negation it couldn't rule out, neither of which was ever a *proof*.
     #[test]
-    fn a_bang_terminal_binding_collides_with_a_real_file_editor_binding() {
+    fn worktree_undo_provably_cannot_collide_with_a_file_editor_binding() {
         let bindings = crate::default_key_bindings();
         let undo = bindings
             .iter()
             .find(|b| b.action().name() == "app::Undo")
             .expect("Undo should be a real default binding");
-        assert_eq!(context_label(undo.predicate().as_deref()), "!terminal");
+        assert_eq!(
+            context_label(undo.predicate().as_deref()),
+            "!terminal && !text-input",
+            "sanity check: this test is only meaningful while Undo really carries both negations"
+        );
         let editor_copy = bindings
             .iter()
             .find(|b| {
@@ -490,19 +600,51 @@ mod tests {
             undo,
             &editor_copy.keystrokes()[0].inner().unparse(),
         );
+        let collision = collision.map(|b| b.action().name());
+        // This test's own claim, asserted directly against the predicate pair rather than via
+        // *which* binding `find_colliding_binding` happens to return first - a bare
+        // `assert_ne!(collision, Some("app::EditorCopy"))` would be satisfied by any other
+        // binding merely being found earlier, which is not the same statement at all.
+        assert!(
+            !contexts_could_overlap(
+                undo.predicate().as_deref(),
+                editor_copy.predicate().as_deref(),
+            ),
+            "no real context stack carries file-editor without text-input, so Undo genuinely \
+             cannot fire alongside EditorCopy - this test's own claim, and still true"
+        );
+        // ...but `secondary-c` is not EditorCopy's alone any more, and the honest answer to
+        // "would rebinding Undo onto it collide?" is now yes, against a *different* binding.
+        //
+        // GitHub issue #19 bound `FileTreeCopy` to the same keystroke under
+        // `"file-tree && !tree-editing && !tree-delete-confirm"`, and the focused file tree with
+        // no inline editor open (`["app", "file-tree"]`) really does satisfy both that and
+        // `Undo`'s `"!terminal && !text-input"` - a tree row is not a terminal and not a text
+        // input, which is exactly why Ctrl+Z there reaches the worktree history (asserted by
+        // `crate::sidebar::tree_ops`'s own
+        // `ctrl_z_in_the_focused_tree_with_no_editor_open_still_reaches_the_worktree_undo`).
+        //
+        // So this is a real warning about a real overlap, not a false positive, and it is
+        // asserted rather than tolerated: the two actions coexist safely today only because
+        // their *default* keystrokes differ, and a user rebinding `Worktree history: undo` onto
+        // Ctrl+C through the Settings UI genuinely would leave GPUI's dispatch order to pick a
+        // winner. It became visible only when the merge that brought issue #19's tree into this
+        // branch added the four `file-tree*` stacks to `real_context_stacks()`; before that the
+        // checker had never seen a stack where `FileTreeCopy` was live at all.
         assert_eq!(
-            collision.map(|b| b.action().name()),
-            Some("app::EditorCopy"),
-            "!terminal and file-editor really can both be live at once - rebinding Undo onto \
-             EditorCopy's own keystroke must be flagged"
+            collision,
+            Some("app::FileTreeCopy"),
+            "the file tree is a real context where the worktree-level Undo is live, so a rebind \
+             onto secondary-c must be reported as colliding with the tree's own Copy binding"
         );
     }
 
-    /// The symmetric direction of the same real fix - checking a `file-editor`-scoped candidate
-    /// against a `"!terminal"`-scoped binding must also catch the collision, not just the
-    /// `!terminal`-as-`for_binding` direction above.
+    /// The direction that *must* warn, and the exact reason GitHub issue #17 needed this checker
+    /// made precise: `"file-editor"` and `"text-input"` are emitted by the **same node**, so a
+    /// `file-editor`-scoped binding rebound onto `secondary-z` really does collide - with
+    /// `TextUndo`, not with the worktree-level `Undo` the old heuristic used to name.
     #[test]
-    fn a_file_editor_binding_collides_with_a_real_bang_terminal_binding() {
+    fn a_file_editor_binding_rebound_onto_secondary_z_collides_with_text_undo() {
         let bindings = crate::default_key_bindings();
         let editor_copy = bindings
             .iter()
@@ -511,18 +653,259 @@ mod tests {
                     && context_label(b.predicate().as_deref()) == "file-editor"
             })
             .expect("a file-editor-scoped EditorCopy binding should exist");
-        let undo = bindings
+        let text_undo = bindings
             .iter()
-            .find(|b| b.action().name() == "app::Undo")
-            .expect("Undo should be a real default binding");
+            .find(|b| b.action().name() == "app::TextUndo")
+            .expect("TextUndo should be a real default binding");
 
         let collision = find_colliding_binding(
             &bindings,
             &bindings,
             editor_copy,
-            &undo.keystrokes()[0].inner().unparse(),
+            &text_undo.keystrokes()[0].inner().unparse(),
         );
-        assert_eq!(collision.map(|b| b.action().name()), Some("app::Undo"));
+        assert_eq!(
+            collision.map(|b| b.action().name()),
+            Some("app::TextUndo"),
+            "the binding actually co-resident on the same node is the one that must be named"
+        );
+    }
+
+    /// The audit's own reproduction, pinned: `"text-input"` and `"file-editor"` live on the same
+    /// node, so rebinding `Text: undo` onto a key the editor already claims must warn. The
+    /// heuristic this replaced reported no collision at all for every one of these, letting a user
+    /// silently rebind text undo onto Backspace, Ctrl+V or Escape through the real Settings UI and
+    /// then find it did nothing in the editor.
+    #[test]
+    fn rebinding_text_undo_onto_a_key_the_editor_already_claims_is_flagged() {
+        let bindings = crate::default_key_bindings();
+        let text_undo = bindings
+            .iter()
+            .find(|b| b.action().name() == "app::TextUndo")
+            .expect("TextUndo should be a real default binding");
+
+        for (keystroke, expected) in [
+            ("backspace", "app::EditorBackspace"),
+            ("escape", "app::CompletionsDismiss"),
+        ] {
+            let collision = find_colliding_binding(&bindings, &bindings, text_undo, keystroke);
+            assert_eq!(
+                collision.map(|b| b.action().name()),
+                Some(expected),
+                "rebinding Text: undo onto {keystroke} must be flagged"
+            );
+        }
+        // `secondary-v` resolves per-OS exactly the way `EditorPaste`'s own binding does.
+        let paste = bindings
+            .iter()
+            .find(|b| {
+                b.action().name() == "app::EditorPaste"
+                    && context_label(b.predicate().as_deref()) == "file-editor"
+            })
+            .expect("a file-editor-scoped EditorPaste binding should exist");
+        let collision = find_colliding_binding(
+            &bindings,
+            &bindings,
+            text_undo,
+            &paste.keystrokes()[0].inner().unparse(),
+        );
+        assert!(
+            collision.is_some(),
+            "rebinding Text: undo onto the editor's own paste key must be flagged too"
+        );
+    }
+
+    /// Counts real `.key_context(..)` call sites in **every** `.rs` file under this crate's
+    /// `src/`, by reading the real directory at test time.
+    ///
+    /// The hand-listed file set this replaced is why a merge could add a ninth call site with the
+    /// drift test still green: it named eight files and `include_str!`'d each one, and GitHub
+    /// issue #19's file tree put its `.key_context(..)` in `sidebar/render.rs`, which was not
+    /// among them - so the sum stayed at 8 and the guard built to catch "a new call site
+    /// appeared" reported success. `include_str!` needs literal paths, so the file set could not
+    /// be globbed at compile time; `std::fs` at test time can be.
+    ///
+    /// Counts occurrences within a line rather than only lines that *start* with the call, so a
+    /// chained `div().id("x").key_context("y")` is not invisible to it. Lines whose first
+    /// non-space characters are `//` are skipped, which is a real (if coarse) filter now that the
+    /// match is no longer anchored - it does not understand block comments or string literals,
+    /// and does not need to: over-counting fails loudly and safely.
+    fn key_context_call_sites() -> Vec<(String, usize)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, usize)>, root: &std::path::Path) {
+            let entries = std::fs::read_dir(dir).expect("this crate's own src/ must be readable");
+            let mut paths: Vec<std::path::PathBuf> =
+                entries.map(|e| e.expect("dir entry").path()).collect();
+            // Sorted so a failure message is stable run to run.
+            paths.sort();
+            for path in paths {
+                if path.is_dir() {
+                    walk(&path, out, root);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    // This module itself is skipped, and only this one: it holds the search
+                    // pattern as a literal and names it in assertion messages, so it would
+                    // self-match three times. It contains no renderer and therefore no real
+                    // `.key_context(..)` call - those live in the `render`/`pane` modules this
+                    // still walks in full. Excluding it by name rather than by trying to parse
+                    // string literals out of arbitrary Rust keeps the walker honest about what
+                    // it does and does not understand.
+                    if path.file_name().is_some_and(|n| n == "keymap_overrides.rs") {
+                        continue;
+                    }
+                    let text = std::fs::read_to_string(&path).expect("a readable .rs file");
+                    let count: usize = text
+                        .lines()
+                        .filter(|line| !line.trim_start().starts_with("//"))
+                        .map(|line| line.matches(".key_context(").count())
+                        .sum();
+                    if count > 0 {
+                        let name = path
+                            .strip_prefix(root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .into_owned();
+                        out.push((name, count));
+                    }
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        walk(&root, &mut out, &root);
+        out
+    }
+
+    /// Drift guard for [`real_context_stacks`], which the collision checker's exactness depends
+    /// on entirely: that list is hand-derived from this crate's `.key_context(..)` call sites, so
+    /// a tenth call site appearing without a matching entry would silently make every
+    /// disjointness answer unsound. Reads the real source rather than trusting a comment.
+    #[test]
+    fn every_real_key_context_call_site_is_covered() {
+        let sites = key_context_call_sites();
+        let call_sites: usize = sites.iter().map(|(_, count)| count).sum();
+        assert_eq!(
+            call_sites, 9,
+            "real_context_stacks() is hand-derived from exactly nine .key_context(..) call sites \
+             (four of which emit the same bare \"text-input\") - a new one means that list, and \
+             every disjointness answer built on it, needs updating. Real sites found: {sites:?}"
+        );
+
+        // The file tree's own site is named explicitly: it is the one a merge added while this
+        // test was still passing, because the old hand-listed file set didn't include it.
+        assert!(
+            sites
+                .iter()
+                .any(|(name, _)| name.replace('\\', "/") == "sidebar/render.rs"),
+            "the file tree's own .key_context(..) must be among the scanned sites - it is the \
+             call site a whitelist-based version of this test was structurally blind to. \
+             Found: {sites:?}"
+        );
+
+        // Every literal any of those sites can emit must appear verbatim in the enumeration.
+        //
+        // The file tree's four are *derived* from `file_tree_key_context`, which is also what the
+        // renderer calls - so for the tree this loop is now a tautology, and deliberately so:
+        // the guarantee moved out of the test and into the structure, where drift is impossible
+        // rather than merely detectable. Stated plainly because a tautological assertion that
+        // looked like a real one would be worse than none.
+        //
+        // The remaining literals are still hand-listed against `match`es inlined in their own
+        // render functions, and are honestly weaker for it: `code_surface/render.rs`'s three-arm
+        // one could gain a fourth arm and only the hand-edit of this array would catch it. Giving
+        // it the same treatment is the real fix and is not done here.
+        let known: Vec<&str> = real_context_stacks().into_iter().flatten().collect();
+        let tree_literals: Vec<&str> = [(false, false), (true, false), (false, true), (true, true)]
+            .into_iter()
+            .map(|(edit, confirm)| file_tree_key_context(edit, confirm))
+            .collect();
+        for literal in [
+            "app",
+            "terminal",
+            "diff",
+            "diff file-editor text-input",
+            "diff file-editor text-input completions",
+            "merge-editor text-input",
+            "text-input",
+        ]
+        .into_iter()
+        .chain(tree_literals)
+        {
+            assert!(
+                known.contains(&literal),
+                "context literal {literal:?} is emitted by real render code but missing from \
+                 real_context_stacks()"
+            );
+        }
+    }
+
+    /// GitHub issue #17's central scoping claim, checked here as pure predicate logic rather than
+    /// as a live-dispatch assertion (that half is covered by real `simulate_keystrokes` tests in
+    /// `crate::root::focus` and `crate::code_surface::editing`): the worktree-level `Undo` and the
+    /// per-widget `TextUndo` are both bound to `secondary-z`, and their context predicates are
+    /// *provably* disjoint - not merely unflagged by a checker that doesn't understand them.
+    #[test]
+    fn the_two_undo_systems_share_a_keystroke_but_are_provably_disjoint_scopes() {
+        let bindings = crate::default_key_bindings();
+        let worktree_undo = bindings
+            .iter()
+            .find(|b| b.action().name() == "app::Undo")
+            .expect("Undo should be a real default binding");
+        let text_undo = bindings
+            .iter()
+            .find(|b| b.action().name() == "app::TextUndo")
+            .expect("TextUndo should be a real default binding");
+
+        assert_eq!(
+            worktree_undo.keystrokes()[0].inner().unparse(),
+            text_undo.keystrokes()[0].inner().unparse(),
+            "sanity check: this test is only meaningful while the two really do share one \
+             physical keystroke"
+        );
+        assert!(!contexts_could_overlap(
+            worktree_undo.predicate().as_deref(),
+            text_undo.predicate().as_deref(),
+        ));
+        assert!(!contexts_could_overlap(
+            text_undo.predicate().as_deref(),
+            worktree_undo.predicate().as_deref(),
+        ));
+    }
+
+    /// The same disjointness for the redo half, including the extra `ctrl-y` binding GitHub issue
+    /// #17's checklist asks for.
+    #[test]
+    fn every_text_redo_binding_is_disjoint_from_the_worktree_level_redo() {
+        let bindings = crate::default_key_bindings();
+        let worktree_redo = bindings
+            .iter()
+            .find(|b| b.action().name() == "app::Redo")
+            .expect("Redo should be a real default binding");
+        let text_redos: Vec<&KeyBinding> = bindings
+            .iter()
+            .filter(|b| b.action().name() == "app::TextRedo")
+            .collect();
+        assert_eq!(
+            text_redos.len(),
+            2,
+            "TextRedo is bound twice by design: secondary-shift-z and ctrl-y"
+        );
+        for binding in text_redos {
+            assert!(!contexts_could_overlap(
+                worktree_redo.predicate().as_deref(),
+                binding.predicate().as_deref(),
+            ));
+        }
+    }
+
+    /// The negated-conjunct scan must still be conservative in the *other* direction: a
+    /// `"!terminal && !text-input"` binding and a plain `"diff"` one really can both be live (the
+    /// read-only Diff view is neither a terminal nor a text input), so that pair must still flag.
+    #[test]
+    fn a_conjunction_of_negations_still_flags_a_scope_it_cannot_rule_out() {
+        let undo = KeyBindingContextPredicate::parse("!terminal && !text-input")
+            .expect("a real, parseable predicate");
+        let diff = KeyBindingContextPredicate::parse("diff").expect("a real, parseable predicate");
+        assert!(contexts_could_overlap(Some(&undo), Some(&diff)));
+        assert!(contexts_could_overlap(Some(&diff), Some(&undo)));
     }
 
     /// Regression for a real bug an audit caught: rebinding an *already-overridden* row a second

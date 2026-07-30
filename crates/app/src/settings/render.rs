@@ -35,8 +35,33 @@ impl AdeApp {
     /// Selects a Settings nav page - the nav row click handler. Cancels any in-progress
     /// keybinding recording first - see [`Self::close_settings`]'s identical reasoning for why a
     /// live `App::intercept_keystrokes` subscription must never outlive the page it started on.
-    pub(crate) fn select_settings_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+    ///
+    /// Also moves real keyboard focus off the Keybindings page's own filter field when leaving it.
+    /// That field is `track_focus`'d and stops being rendered the instant the page changes, so
+    /// without this the focused `FocusId` is no longer in the rendered frame at all and GPUI falls
+    /// back to the dispatch root with an **empty** context stack
+    /// (`Window::focus_node_id_in_rendered_frame`). Every scoped binding is dead against an empty
+    /// stack - `KeyBindingContextPredicate::eval_inner` short-circuits to `false` when there is no
+    /// context to evaluate against - so `secondary-z` reached neither undo system and vanished
+    /// with no feedback at all.
+    ///
+    /// The dangling-focus mechanism itself long predates GitHub issue #17 (it is the same class
+    /// `OverlayFocus`/`restore_focus` exists for, and which `close_session`/`select_worktree`/
+    /// `cancel_new_file` already handle). What that issue changed is that this specific site
+    /// became *silent*: before the filter field carried a `"text-input"` context there was nothing
+    /// here for a stale focus to be pointing at in the first place. Found by an independent
+    /// adversarial audit - the fourth site of this shape, after the three already fixed on this
+    /// branch.
+    pub(crate) fn select_settings_page(
+        &mut self,
+        page: SettingsPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.cancel_keybinding_recording(cx);
+        if self.settings_page == SettingsPage::Keymap && page != SettingsPage::Keymap {
+            window.focus(&self.settings_focus_handle, cx);
+        }
         self.settings_page = page;
         cx.notify();
     }
@@ -268,8 +293,8 @@ impl AdeApp {
             .when(!active, |el| {
                 el.hover(|el| el.bg(theme::settings::NAV_ROW_HOVER))
             })
-            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                this.select_settings_page(page, cx);
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.select_settings_page(page, window, cx);
             }))
             .child(
                 div()
@@ -1233,7 +1258,8 @@ impl AdeApp {
         let macos = self.window_controls_style().is_macos();
         let bindings = crate::default_key_bindings();
         let rows = settings::keybinding_rows(&bindings, &self.settings.keymap.overrides);
-        let filtered = settings::filter_keybinding_rows(&rows, &self.settings_keymap_filter);
+        let filtered =
+            settings::filter_keybinding_rows(&rows, self.settings_keymap_filter.as_str());
         let last_index = filtered.len().saturating_sub(1);
         let has_overrides = !self.settings.keymap.overrides.is_empty();
 
@@ -1334,6 +1360,11 @@ impl AdeApp {
         div()
             .id("settings-keymap-filter")
             .track_focus(&self.settings_keymap_filter_focus_handle)
+            // See `crate::default_key_bindings`' `TextUndo`/`TextRedo` docs for why the tag and
+            // the listener both live on this exact node.
+            .key_context("text-input")
+            .on_action(cx.listener(Self::handle_settings_keymap_filter_text_undo))
+            .on_action(cx.listener(Self::handle_settings_keymap_filter_text_redo))
             .on_key_down(cx.listener(Self::handle_settings_keymap_filter_key_down))
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                 window.focus(&this.settings_keymap_filter_focus_handle, cx);
@@ -1364,7 +1395,7 @@ impl AdeApp {
                         theme::text::GHOST
                     })
                     .child(if has_query {
-                        self.settings_keymap_filter.clone()
+                        self.settings_keymap_filter.as_str().to_string()
                     } else {
                         format!("filter {total} bindings")
                     }),
@@ -1392,16 +1423,13 @@ impl AdeApp {
             return;
         }
         let changed = match keystroke.key.as_str() {
-            "backspace" => self.settings_keymap_filter.pop().is_some(),
-            "escape" => {
-                let had_text = !self.settings_keymap_filter.is_empty();
-                self.settings_keymap_filter.clear();
-                had_text
-            }
+            "backspace" => self.settings_keymap_filter.pop(Instant::now()),
+            // A real, undoable step - see `crate::rail::AdeApp::handle_filter_key_down`'s own
+            // identical `Esc` handling.
+            "escape" => self.settings_keymap_filter.clear(Instant::now()),
             _ => match keystroke.key_char.as_deref() {
                 Some(text) if !text.is_empty() => {
-                    self.settings_keymap_filter.push_str(text);
-                    true
+                    self.settings_keymap_filter.push_str(text, Instant::now())
                 }
                 _ => false,
             },
@@ -1409,6 +1437,30 @@ impl AdeApp {
         if changed {
             cx.notify();
             cx.stop_propagation();
+        }
+    }
+
+    /// `TextUndo`/`TextRedo` for the Keybindings page's filter field (GitHub issue #17) - see
+    /// `crate::default_key_bindings`' own docs for the scoping.
+    pub(in crate::settings) fn handle_settings_keymap_filter_text_undo(
+        &mut self,
+        _: &TextUndo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings_keymap_filter.undo() {
+            cx.notify();
+        }
+    }
+
+    pub(in crate::settings) fn handle_settings_keymap_filter_text_redo(
+        &mut self,
+        _: &TextRedo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings_keymap_filter.redo() {
+            cx.notify();
         }
     }
 
@@ -2057,8 +2109,8 @@ mod settings_keymap_filter_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(ToggleSettings);
-        app.update(cx, |app, cx| {
-            app.select_settings_page(SettingsPage::Keymap, cx);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Keymap, window, cx);
         });
         cx.run_until_parked();
 
@@ -2089,7 +2141,7 @@ mod settings_keymap_filter_tests {
         );
 
         app.update(cx, |app, cx| {
-            app.settings_keymap_filter.clear();
+            app.settings_keymap_filter.clear(Instant::now());
             cx.notify();
         });
         cx.run_until_parked();
@@ -2232,12 +2284,12 @@ mod settings_lsp_install_action_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(ToggleSettings);
-        app.update(cx, |app, cx| {
+        app.update_in(cx, |app, window, cx| {
             app.lsp_rows = vec![
                 synthetic_row("ready-binary", true),
                 synthetic_row("missing-binary", false),
             ];
-            app.select_settings_page(SettingsPage::LanguageServers, cx);
+            app.select_settings_page(SettingsPage::LanguageServers, window, cx);
             cx.notify();
         });
         cx.run_until_parked();

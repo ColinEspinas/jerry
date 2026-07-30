@@ -184,9 +184,11 @@ impl AdeApp {
     /// like the file-tab case this guard already covered).
     ///
     /// If closing `id` leaves its worktree with no session at all (and no file tab either), real
-    /// keyboard focus falls back onto [`Self::filter_focus_handle`] - the same fallback
+    /// keyboard focus falls back onto [`Self::rail_focus_handle`] - the same fallback
     /// [`Self::select_worktree`] uses for the identical "nothing left to focus" case - so
-    /// `Window::focus` never stays pointed at the just-`shutdown()`, no-longer-rendered pane.
+    /// `Window::focus` never stays pointed at the just-`shutdown()`, no-longer-rendered pane. The
+    /// rail's *root*, not its filter field (which this used to target): see
+    /// [`Self::rail_focus_handle`]'s own docs for the real keystroke-swallowing bug that was.
     pub(crate) fn close_session(
         &mut self,
         id: SessionId,
@@ -204,7 +206,7 @@ impl AdeApp {
         }
         if self.sessions.active_id().is_none() && self.open_change.is_none() && !self.settings_open
         {
-            window.focus(&self.filter_focus_handle, cx);
+            window.focus(&self.rail_focus_handle, cx);
         }
     }
 

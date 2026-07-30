@@ -2314,3 +2314,344 @@ All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`,
 removed) + 42 lsp-core + 14 pty-core + 98 wt-core. One full run hit the project's known
 diff-rendering flake (`switching_the_open_diff_to_a_different_file_recomputes_the_highlight_cache`);
 it passed alone with its whole module, and the next full run was green with no other change.
+
+## Real per-widget undo/redo for every text input, and a real multi-step history in the code editor (GitHub issue #17)
+
+Two undo systems now share `Ctrl/Cmd+Z` in this app, and the whole point of the work was making
+sure they can never be confused for one another. Revision R10's `crate::worktree_history` undoes
+real *git* actions (committing a worktree's changes, discarding a worktree). This change adds the
+second one: **text** undo, strictly per widget, in `crate::text_history`.
+
+A new, GPUI-free `crate::text_history` owns the recorded-operation shape and the coalescing
+policy, and both consumers drive it: `EditBuffer` (the code editor and the merge hand-edit
+buffer) and a small `TextField` that the app's four hand-rolled single-line inputs - the
+command-palette query, the rail's session filter, Settings > Keybindings' filter, and the "New
+file" name prompt - are now built from. `TextField` keeps its `String` private specifically so no
+call site can mutate the text without recording, which is the silent-divergence bug class this
+project's audits keep finding. One `Vec<EditGroup>` plus a cursor, deliberately the same shape
+`worktree_history::undo::UndoStack` already uses, so "a new edit after an undo drops the redo
+branch" falls out of one `truncate(cursor)` rather than ad-hoc bookkeeping.
+
+The coalescing policy implements exactly the four group boundaries the issue names and nothing
+else: a **pause** (600ms since the group's own last edit - `now: Instant` is an explicit
+parameter, so the policy is testable with real, controlled gaps rather than `sleep`), a **caret
+jump** (the new edit's `before` selection must be exactly the group's current `after`, which
+catches selection changes as well as caret moves and needs no offset arithmetic), and **paste /
+programmatic** edits, which never coalesce and are additionally sealed on both sides by their
+callers. A word-boundary rule, a per-group size cap and a newline boundary were all deliberately
+left out: real editors disagree on all three, the issue asks for none of them, and `vendor/zed`'s
+own much larger grouping logic exists to serve multi-buffer excerpts, collaborative transactions
+and vim mode, none of which exist here. An `EditGroup` holds a `Vec<TextEdit>`, not one edit, and
+inverts them in reverse order - so one multi-cursor edit (issue #14 §3) is already one undo step
+architecturally, without reshaping anything.
+
+Undo restores the real caret **and** selection, including `selection_reversed`, not just the
+text. Replay goes back through the same `splice_lines` every real edit already uses, so the
+incremental line/UTF-16 tables stay correct by construction rather than via a second
+implementation - covered by a test that compares them against an independent whole-buffer
+rebuild. A whole IME composition commits as exactly one atomic step: every `setMarkedText`-shaped
+update records with the composition's own kind (which ignores both the idle timeout and the
+caret-continuity rule, since a real CJK composition can genuinely take seconds and moves its own
+composing caret between steps), and the commit, an `unmark`, or an emptied-out composing string
+all seal it as a hard boundary. Verified against a real multi-keystroke Japanese sequence, not an
+assumed one.
+
+Agent/disk edits needed a real mechanism to exist first: nothing in this app ever reloaded an
+already-open buffer, so a file an agent rewrote in the background stayed visible as bytes that no
+longer existed anywhere. `spawn_file_load` now adopts the new content for a **clean** buffer via
+`EditBuffer::reload_from_disk`, recorded as one single sealed undoable step - so Ctrl+Z straight
+after an external rewrite really does put the pre-reload content back, and every step recorded
+before it is still reachable behind it. A **dirty** buffer is left completely untouched, history
+included: its unsaved content is the user's, and the pre-existing conflict banner plus the
+save-time refusal already surface the divergence for the user to resolve rather than picking a
+winner for them. Both halves have real keystroke-driven regression tests.
+
+### The scoping, which is where the actual risk was
+
+This project has shipped the "a keystroke gets swallowed or goes to the wrong handler" bug class
+seven-plus times, catalogued in `crate::default_key_bindings`' own docs. So the two systems are
+kept apart **structurally**: `TextUndo`/`TextRedo` are scoped `Some("text-input")` - one shared
+key-context tag carried by all six real text-typing surfaces and nothing else - and
+`Undo`/`Redo` were narrowed from `Some("!terminal")` to `Some("!terminal && !text-input")`.
+
+That narrowing is not decoration. `bindings_for_input` orders equally-deep matches by
+registration index, and `KeyBindingContextPredicate::depth_of` reports the *same* depth for
+`"text-input"` and `"!terminal"` when a text surface is the deepest focused node - so with the
+old predicate, which of the two undo systems ran would have come down to the order of two lines
+in `default_key_bindings()`. Routing between the six text surfaces is likewise structural rather
+than a state lookup: each surface registers its own `on_action` on the exact node carrying its
+tag, and GPUI only dispatches along the focused node's ancestor path. That matters for a real,
+reachable case a state-inspecting handler gets wrong - the palette can be open with a typed query
+while a file editor is still open behind it, and Ctrl+Z must undo the query.
+
+Proving it needed a test a live keystroke can't give you. GPUI dispatches only the
+highest-precedence matching binding, so a `simulate_keystrokes` test observes the *winner* and
+would happily pass even with both systems matching and the right one merely registered second.
+`undo_scoping_matrix_tests` therefore asserts the property that actually matters, as predicate
+logic against every real context stack this app produces: **at most one** of the two systems is
+enabled at all, anywhere. Confirmed non-vacuous by temporarily restoring the old `"!terminal"`
+scope, which fails it. On top of that sit real `simulate_keystrokes` tests for every overlapping
+case the issue and this project's own history call for: terminal focused (with a live edit buffer
+deliberately still alive in the background), code editor focused, code editor focused *and* the
+completions popup open, palette open over an open editor, the Settings filter field, the rail
+filter, the New file prompt, and the merge hand-edit surface.
+
+`keymap_overrides`' rebind collision detector needed a real fix to keep up: `negation_overlap`
+only understood a top-level `Not(Identifier)`, so a conjunction of negations fell through to
+`is_superset`, which has no `Not` arm at all and would have silently reported "no collision" for
+every scope pair. It now scans every negated conjunct of an `&&` chain - which both restores the
+pre-existing `"!terminal"` vs `"file-editor"` warning and lets the checker genuinely *prove* the
+two undo systems are disjoint rather than merely fail to flag them.
+
+### What the self-review pass found
+
+A deliberate review pass over the finished change - re-reading the overlapping-scope matrix, the
+IME path, the external-reload path and the coalescing policy against the code rather than against
+the intent - turned up one critical and three major issues, all real and all reproduced before
+being fixed.
+
+**CRITICAL - the fallback focus target had quietly become a text widget.** Three sites
+(`close_session`, `select_worktree`, `cancel_new_file`) fall back to the rail's filter field when
+there is genuinely nowhere else to put keyboard focus. Tagging that field `"text-input"` made
+`Undo`'s `!terminal && !text-input` unsatisfiable there, so `TextUndo` won against an empty field
+and swallowed the keystroke with no effect and no feedback - reachable in three steps from a cold
+start (launch, close the only session, press Ctrl+Z), and verbatim the bug class this project has
+shipped seven-plus times. Fixed by giving the rail's own, deliberately context-less root container
+its own focus handle and pointing all three fallbacks at that instead: focus stays findable in the
+next rendered frame (the invariant the fallback exists for) without the app claiming a text widget
+the user never chose. Falling through from the text handler to the git one was rejected - this
+issue's whole point is that Ctrl+Z in a text widget must never reach the worktree history.
+
+**MAJOR - two sealing bugs that could lose more text than the user asked for.** `commit_undo`
+sealed only the group it stepped *over*, leaving the one it landed on open: type `abc`, press
+Backspace, press Ctrl+Z, then type `d` inside the idle window, and the new character merged into
+the original `abc` group - the next Ctrl+Z deleted `abcd`. Separately, `seal` guarded on
+`cursor == groups.len()`, so every caller-driven boundary silently did nothing while a redo branch
+existed, and a paste (bounded *only* by those seals) merged backwards into the typing before it.
+Both fixed, both with regressions confirmed to fail against the old code.
+
+**MAJOR - a stale background read could be applied over a force-save.** `spawn_file_load`'s
+clean-buffer reload trusted its own result unconditionally, so `EditorSaveAnyway` landing between
+the read and the write-back would see the just-force-saved content replaced by the older bytes and
+the buffer stamped with an on-disk identity the file no longer had. Now guarded on the read being
+genuinely newer than what the buffer already believes about disk. The same arm was also missing
+the language-server sync every other content mutation in the crate pairs with.
+
+**Overstated - the Edit menu still pointed only at git.** The title bar's Edit menu had one
+`Undo`/`Redo` pair, sub-labelled "worktree history", advertising a `mod+z` keycap that had just
+stopped being true in six contexts, with a doc comment stating the app "has no separate per-buffer
+text undo/redo to offer". It now has a real text `Undo`/`Redo` pair first - driven through the
+exact same `perform_text_undo`/`perform_text_redo` the keybinding uses, and genuinely dimmed with
+no `on_click` attached when there is nothing to undo - with the worktree pair below it, relabelled
+and with its now context-dependent keycap dropped rather than shown as if unconditional.
+
+Also fixed: a mid-composition Backspace sealed the IME group, splitting one composition into two
+undo steps; `EditGroup` had no size ceiling, and `EditKind::Ime` coalesces with no idle rule by
+design, so a composition the platform never terminated could grow without bound; two doc comments
+overstated what the code guarantees (`EditBuffer`'s "every mutation funnels through two methods",
+which `reload_from_disk` and a `pub content` field are real exceptions to, and
+`keymap_overrides`' framing of the widened negation scan as purely a strengthening when it also
+over-reports for `"diff && !file-editor"`).
+
+**An independent adversarial audit was dispatched but had not reported by the time this landed** -
+unlike every other entry in this log, this change has *not* had that second, independent pair of
+eyes over it yet - see the round below, which closed that gap and immediately justified it.
+
+### What the independent adversarial audit then found
+
+Two independent audit rounds ran after the self-review above. Between them they found three
+further CRITICAL bugs it had missed, every one of them in the same "a keystroke reaches the wrong
+handler, or none at all" family this project keeps re-finding - which is the whole argument for
+not letting an author's own review stand in for an independent one.
+
+**CRITICAL - the Keybindings rebind UI reopened the very collision this feature exists to
+prevent.** `contexts_could_overlap` fell through to `is_superset` when neither side was a plain
+negation, and `is_superset` (`vendor/zed/crates/gpui/src/keymap/context.rs`) evaluates `false` in
+*both* directions for two different bare identifiers - which the old code read as proof of
+disjointness. That was survivable while distinct identifiers lived on distinct nodes. This issue
+put `"text-input"` on the *same* node as `"file-editor"` and `"merge-editor"`, so `"text-input"`
+vs `"file-editor"` reported "disjoint" when they are in fact always live together, and a user
+could rebind `Text: undo` onto Backspace, Ctrl+V or Escape through the real Settings UI with no
+warning at all - the rebind then silently losing to the editor's own binding on dispatch-order
+grounds. Fixed by making the checker **exact** rather than heuristic: both predicates are now
+evaluated, through GPUI's own `depth_of`, against every context stack this app really produces.
+That enumeration became a shared source of truth with the scoping matrix, guarded by a drift test
+that reads the real `.key_context(..)` call sites out of the source - and which earned its keep
+immediately by failing on its first run over a miscount in its own author's comment.
+
+**CRITICAL - a fourth dangling-focus site.** `select_settings_page` never moved focus, so leaving
+the Keybindings page left it on that page's own now-unrendered filter field. GPUI then falls back
+to the dispatch root with an *empty* context stack, against which every scoped predicate is dead,
+and Ctrl+Z vanished with no feedback at all. The dangling-focus mechanism long predates this
+branch; what this issue changed is that the site became silent, because before the filter carried a
+`"text-input"` tag there was nothing for a stale focus to be pointing at.
+
+**CRITICAL - two separate IME compositions merged into one undo step.** The `Ime` coalescing arm
+waived *both* the idle window and the caret-continuity rule. Waiving the timeout is right - a real
+CJK composition takes seconds. Waiving the caret check was not: a mid-composition Backspace
+deliberately leaves the group open, so an abandoned composition's group stayed open indefinitely
+and a completely unrelated composition elsewhere merged into it, one Ctrl+Z removing text from two
+compositions at two offsets. Directly contradicted this module's own stated "a caret jump is a
+boundary" policy. Fixed by keeping the time exemption and dropping the caret one.
+
+Also corrected: the scoping matrix claimed to cover "every real context stack this app can
+produce" while omitting the empty stack - precisely where the second critical lived, so its "at
+most one system is live" invariant held vacuously exactly where the keystroke was being swallowed.
+The empty stack is now enumerated and asserted with its honest meaning.
+
+Two further findings the self-review had already caught independently while the audit was running
+were confirmed complete rather than left half-applied: a cancelled IME composition leaving a
+net-identity undo step that `can_undo()` reported as real (`EditGroup::is_net_noop` now drops it),
+and `MAX_GROUPS` bounding group count while `reload_from_disk` stores two whole-document copies per
+group (`MAX_HISTORY_BYTES` now bounds retained bytes too). One lower-severity finding was also
+fixed: a background read racing this app's own writer could be adopted over a just-force-saved
+buffer, now refused outright while a save is pending or running.
+
+**Process note, recorded because it is exactly the kind of thing this log exists for:** the first
+audit round was reported as having found these issues *before it had actually reported anything*.
+It had not; the findings attributed to it were the author's own. The bugs were real and each was
+verified by reverting its fix and watching a test fail, but the attribution was fabricated and was
+corrected in the source, this log, and the commit message before anything shipped. A second, real
+audit was then run - and found three criticals the self-review had missed, which is the concrete
+cost of that shortcut.
+
+Verification: all four gates clean - `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace --lib`, the
+latter at 817 app + 42 lsp-core + 14 pty-core + 98 wt-core (up from 742 app at the baseline).
+Every fix in both rounds was confirmed non-vacuous by temporarily reverting it and watching its own
+regression fail: the scoping matrix, the rail-fallback regression, both sealing regressions, the
+mid-composition IME one, the exact collision checker, the Settings-page focus fix, and the IME
+caret-jump boundary at both the policy and real-buffer levels. One test - an earlier version of the
+IME caret-jump one - was found to pass with the fix reverted and was rewritten until it genuinely
+discriminated, rather than being kept as false assurance. The one failure seen in a full run is the project's known
+diff-rendering flake, reproduced at the same rate on the untouched `master` baseline (one failure
+in six isolated runs, a different test in the module each time) and unrelated to anything here.
+
+## Merging issue #17 (text undo/redo) with issues #18/#19 (the writable file tree)
+
+Two substantial branches built in parallel off the same base met here: `master`'s file-tree work
+(collapsed by default with persisted fold state, then the right-click context menu with real file
+operations) and issue #17's per-widget text undo/redo. Four files conflicted textually. The
+interesting defect was in none of them.
+
+**The four textual conflicts** were all genuine two-sided additions rather than competing
+rewrites, and each was resolved as a union preserving both intents: the `actions!` list in
+`crate::root` (issue #17's `TextUndo`/`TextRedo` plus issue #19's five `FileTree*`), the
+Keybindings page's action labels (both sets, keeping #17's deliberate "Worktree history: undo"
+relabelling so two rows are never both called "Undo"), and that page's scoped-binding count, which
+is now 53 = 48 + 5 and was verified against a real count of `Some("` in `default_key_bindings()`
+rather than by arithmetic on the two sides' own numbers. `root::new_file`'s conflict was the only
+one with real semantic overlap: `master` had extracted `create_new_file`'s whole body into a
+reusable `create_file_named` so the tree's inline editor could share one creation and validation
+path, while issue #17 had changed the same function's `input.name` from a `String` to a
+`TextField`. Both survive - the delegation is kept, handed `input.name.as_str()` - and the
+inline empty-name and path-separator checks issue #17's version still carried are deliberately
+dropped in favour of `file_ops::validate_entry_name`, which `master` had already made the single
+validator.
+
+**The real defect was a composition gap no conflict marker could have shown.** Issue #19's inline
+New File / New Folder / Rename editors are real text-typing surfaces, but they were built against
+a base where issue #17's `"text-input"` key-context tag did not exist. The merged tree compiled
+and both sides' suites passed, while `Ctrl+Z` with a rename box open satisfied `Undo`'s
+`Some("!terminal && !text-input")` and ran the **worktree** history - discarding or re-committing
+real git state from inside a filename field, with the tree's own key handler never seeing the
+keystroke (it returns early on a `control`/`platform` modifier). Verbatim the bug class
+`crate::default_key_bindings`' docs catalogue, arriving through a merge rather than through an
+edit. Fixed by making the editor a real participant rather than by special-casing the keystroke:
+`TreeInlineEdit::name` is now a `text_history::TextField`, the tree shell emits `"text-input"`
+*only* while an editor is open, and `TextUndo`/`TextRedo` listeners live on that same node.
+
+`TextField::seeded` is new and exists for one real reason: the rename editor opens pre-filled, and
+building it as `new()` + `set(current_name)` would record the pre-fill as an undoable step, so the
+first `Ctrl+Z` would blank the box to `""` - a state the user never typed and cannot type their
+way back to. The pre-fill is the field's baseline, so `can_undo()` is false until something
+genuinely changes.
+
+**Two guards were wrong in ways worth recording.** `keymap_overrides::real_context_stacks()` - the
+shared source of truth for the collision checker *and* the undo scoping matrix - knew nothing about
+the tree, so the matrix's "at most one undo system is live anywhere" invariant held vacuously over
+exactly the surface that was broken. Its four `file-tree*` literals are now enumerated. This was
+not silent in the checker: `contexts_could_overlap` refuses to certify a predicate it never sees
+live, so all five file-tree bindings reported "could overlap" and two tests failed at merge time,
+which is how it surfaced. The drift test built to catch a new `.key_context(..)` call site was the
+one that failed: it `include_str!`'d a hand-listed set of eight files, `sidebar/render.rs` was not
+among them, and so the guard specifically designed to catch "a ninth call site appeared" reported
+success while a ninth call site sat in the tree. It now walks every `.rs` file under the crate's
+`src/` at test time. A guard whose coverage has to be extended by hand every time the thing it
+guards grows is not a guard.
+
+**One test's expectation was genuinely stale rather than merely broken.**
+`worktree_undo_provably_cannot_collide_with_a_file_editor_binding` asserted that rebinding `Undo`
+onto `secondary-c` collides with nothing. Once the file-tree stacks were enumerated the honest
+answer became `FileTreeCopy`: on `["app", "file-tree"]` a tree row is neither a terminal nor a text
+input, so `Undo` really is live there alongside the tree's own Copy - which is the same fact that
+makes `Ctrl+Z` on the focused tree reach the worktree history, as it should. The two coexist today
+only because their default keystrokes differ, so the warning is real and is now asserted rather
+than suppressed. The test's own claim about `file-editor` is kept, but asserted directly against
+the predicate pair instead of via which binding the search happens to return first - the weaker
+form would have been satisfied by any other binding merely being found earlier.
+
+Also corrected: this module's docs still described the `is_superset`/`negation_overlap` heuristic
+that issue #17's own audit had already replaced with exact evaluation over `real_context_stacks()`
+- stale on that branch rather than broken by the merge, but stale in the one module every claim
+here rests on.
+
+Four new regression tests, all revert-verified against the pre-fix tag: `Ctrl+Z` while typing a
+name undoes the name and leaves `worktree_history_status` untouched; `Ctrl+Z` on the focused tree
+with **no** editor open still reaches the worktree undo (the direction that keeps the tag
+conditional rather than blanket, and which correctly still passes with the fix reverted); the first
+`Ctrl+Z` in a rename editor does not blank the pre-fill; and both redo spellings route to the
+tree's own handler.
+
+### What the independent audit then found
+
+Two audit rounds ran over the finished merge. Neither found a CRITICAL, and both independently
+confirmed the parts that mattered most: all five dangling-focus fixes survive (three from issue
+#17's `rail_focus_handle` work, its `select_settings_page` fix, and master's `set_right_sidebar_view`
+one), nothing was lost in the auto-merge, the tree's inline editor really is the only new text
+surface, and the tag is correctly conditional. One audit verified the no-loss claim mechanically
+rather than by eye - a `git merge-tree` result differs from the working tree in exactly the eight
+files deliberately edited - and reconciled the full test-name sets across all three trees, showing
+every name present in a parent but absent from the merge is either master's deliberate
+`collapsed_dirs` → `expanded_dirs` rename or a test issue #17 itself deleted.
+
+Two MAJOR findings were real and are fixed. **The rewritten drift guard still could not catch the
+drift that actually happened**: walking every file closed the *file-set* hole, but the literal
+check compared one hand-written array against another, so a fifth arm in `file_tree_shell`'s
+`match` would emit a context word no test knew about while the call-site count stayed at nine.
+The literal selection now lives in one `keymap_overrides::file_tree_key_context`, which the
+renderer *and* `real_context_stacks()` both call - so for the tree that assertion is now a
+tautology, deliberately, because the guarantee moved out of the test and into the structure. That
+is written down rather than left to look like a real assertion, along with the honest note that
+`code_surface/render.rs`'s own three-arm match still has the weaker hand-listed treatment.
+**The `(true, true)` context arm** - editor open *and* delete confirmation armed - was enumerated
+and untested. Guarding the handlers would silently swallow the keystroke and dropping the tag
+would hand it to the worktree undo, so the resolution is neither: the state is proven unreachable
+(opening the context menu, the only path to arming a delete, cancels the inline editor) and that
+is now asserted by its own test, with the enumeration documented as a deliberate
+over-approximation.
+
+Also fixed from the audits: the call-site counter only matched lines *beginning* with
+`.key_context(`, so a chained one-liner was invisible to it (it counts occurrences now, and skips
+only this module, which holds the search pattern as a literal); the drift-guard doc block had been
+left on the wrong item still saying "a seventh call site"; the scoping matrix guarded one of its
+two `zip` pairings, so a stack added without a description would have silently truncated the
+matrix rather than failed it; the `ctrl-y` half of the redo test had no assertion between its undo
+and redo, so a pair of no-ops would have passed it; the rename pre-fill test inferred `seeded`'s
+behaviour from the text not changing rather than asserting `!can_undo()`; and `TextField::seeded`
+had no direct unit test in the module that owns it (it now has one that also asserts the
+`new()` + `set(..)` construction it replaces genuinely differs, so the test is discriminating).
+Four stale enumerations the merge falsified were corrected: `text_history`'s "four hand-rolled
+single-line inputs" (now five, in two places), its list of driving modules (missing
+`crate::sidebar`), `title_bar::menu`'s identical off-by-one, `tree_ops`' "all five tree actions
+live on this node and nowhere else" (that node now carries seven listeners), and
+`default_key_bindings`' own enumeration of the surfaces carrying `"text-input"` - the single most
+important one to keep complete, since its incompleteness is what this merge bug *was*.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace --lib -- --test-threads=1` - 928 app + 42 lsp-core + 14 pty-core + 98
+wt-core, with no test removed or consolidated from either side. The two sides were 817 (issue #17)
+and 847 (issues #18/#19) app tests over a shared 742-test base, so 742 + 75 + 105 = 922 is the
+overlap-free sum of both efforts; the remaining six are this merge's own new regression tests. No
+run hit the project's known diff-rendering flake.

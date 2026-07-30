@@ -217,7 +217,13 @@ impl AdeApp {
 
         let (range, text) = resolve_completion_edit(buffer, item);
         let path = entry.path.clone();
+        // Accepting a completion is a programmatic, whole-token edit, not a typed character - one
+        // of GitHub issue #17's four named undo-group boundaries. Sealed on both sides so it is
+        // its own real step: the partial word typed before it doesn't absorb it, and neither does
+        // whatever is typed after. See `crate::text_history`'s own docs for the policy.
+        buffer.seal_history();
         buffer.replace_range(Some(range), &text);
+        buffer.seal_history();
         self.schedule_rehighlight(path.clone(), cx);
         self.schedule_lsp_sync(path, cx);
         self.sync_cursor_and_scroll();

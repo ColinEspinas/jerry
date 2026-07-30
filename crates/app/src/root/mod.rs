@@ -78,6 +78,7 @@ use crate::sidebar::file_tree::{self, FileTreeEntry};
 use crate::sidebar::fold_state;
 use crate::sidebar::tree_ops;
 use crate::status_bar::process_stats;
+use crate::text_history;
 use crate::theme;
 use crate::title_bar::menu as title_bar;
 use crate::work_surface::sessions::{SessionId, SessionKind, Sessions};
@@ -165,6 +166,8 @@ actions!(
         CompletionsDismiss,
         Undo,
         Redo,
+        TextUndo,
+        TextRedo,
         FileTreeContextMenu,
         FileTreeRename,
         FileTreeCopy,
@@ -523,8 +526,11 @@ pub struct AdeApp {
     pub(crate) palette_scope: palette::PaletteScope,
     /// The palette's currently typed query - the same minimal hand-rolled append/backspace text
     /// field as [`Self::filter_query`] (see [`Self::handle_filter_key_down`]'s docs for why, over
-    /// `vendor/zed/crates/gpui/examples/input.rs`'s full `EntityInputHandler`).
-    pub(crate) palette_query: String,
+    /// `vendor/zed/crates/gpui/examples/input.rs`'s full `EntityInputHandler`), with a real
+    /// per-widget undo history attached (GitHub issue #17 - see [`text_history::TextField`]).
+    /// Reset (text *and* history) on every `Self::open_palette`, which is a genuinely new widget
+    /// instance, never on close.
+    pub(crate) palette_query: text_history::TextField,
     /// The palette's currently highlighted result row - an index into
     /// `Self::build_palette_groups`' flattened (`crate::palette::state::flatten`) row order, moved by
     /// arrow keys and run by Enter.
@@ -564,9 +570,25 @@ pub struct AdeApp {
     /// [`crate::rail::state::RailMode`].
     pub(crate) rail_mode: RailMode,
     /// The rail's filter query - filters the rendered session/worktree rows in both grouping
-    /// modes (see `crate::rail::state::filter_sessions`/`filter_worktree_rows`).
-    pub(crate) filter_query: String,
+    /// modes (see `crate::rail::state::filter_sessions`/`filter_worktree_rows`). Carries a real
+    /// per-widget undo history (GitHub issue #17 - see [`text_history::TextField`]); unlike the
+    /// palette's, this widget lives for the whole session, so its history does too.
+    pub(crate) filter_query: text_history::TextField,
     pub(crate) filter_focus_handle: FocusHandle,
+    /// The rail's *root container*'s focus handle - the app's real "nowhere else to put focus"
+    /// fallback target (`Self::select_worktree`, `Self::close_session`, `Self::cancel_new_file`),
+    /// deliberately **not** [`Self::filter_focus_handle`].
+    ///
+    /// Those three sites used to fall back onto the filter field itself, which an adversarial
+    /// audit found had become a real, reachable bug once GitHub issue #17 tagged that field
+    /// `"text-input"`: closing the last session focused a text input the user never asked to type
+    /// in, and `Ctrl+Z` there resolved to `TextUndo` against an empty field - a silently swallowed
+    /// keystroke with no feedback, instead of the worktree-level `Undo` that had always handled it
+    /// (`crate::default_key_bindings` scopes that one `!terminal && !text-input`). The rail's root
+    /// div carries no key context of its own, so focusing *it* keeps the focused `FocusId`
+    /// genuinely findable in the next rendered frame - the actual invariant the fallback exists to
+    /// protect - without claiming to be a text widget.
+    pub(crate) rail_focus_handle: FocusHandle,
     /// Real `+N -M`/has-changes totals per worktree or session cwd, refreshed by the
     /// periodic background task started in `Self::new` - see `crate::rail::state::
     /// compute_status_snapshot`'s docs. Read (never written outside that task's completion
@@ -1000,8 +1022,8 @@ pub struct AdeApp {
     pub(crate) lsp_rows: Vec<settings::LspRow>,
     pub(crate) _lsp_rows_task: Option<Task<()>>,
     /// The Keybindings settings page's filter query - same minimal append/backspace shape as
-    /// [`Self::filter_query`].
-    pub(crate) settings_keymap_filter: String,
+    /// [`Self::filter_query`], and the same real per-widget undo history (GitHub issue #17).
+    pub(crate) settings_keymap_filter: text_history::TextField,
     pub(crate) settings_keymap_filter_focus_handle: FocusHandle,
     /// The identity of the Keybindings row currently capturing a new chord, if any - see
     /// [`Self::start_recording_keybinding`]'s own docs for the real `App::intercept_keystrokes`

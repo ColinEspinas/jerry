@@ -528,26 +528,34 @@ impl AdeApp {
     /// its focus target whenever a walk failed would silently disable every one of its
     /// keybindings until the next successful walk.
     ///
-    /// The context string gains a second word, `"tree-editing"`, while an inline name editor is
-    /// open. That is the real mechanism that stops `Ctrl+C`/`Ctrl+X`/`Ctrl+V`/`F2`/`Shift+F10`
-    /// from firing while the user is typing a name - see `crate::sidebar::tree_ops`'s module
-    /// docs and `crate::default_key_bindings`' own entries for why a second context word is used
-    /// rather than conditionally omitting the bindings.
+    /// While an inline name editor is open the context string gains *two* more words,
+    /// `"tree-editing"` and `"text-input"`. The first is the real mechanism that stops
+    /// `Ctrl+C`/`Ctrl+X`/`Ctrl+V`/`F2`/`Shift+F10` from firing while the user is typing a name -
+    /// see `crate::sidebar::tree_ops`'s module docs and `crate::default_key_bindings`' own
+    /// entries for why an extra context word is used rather than conditionally omitting the
+    /// bindings. The second is what keeps the *worktree* `Undo` off `Ctrl+Z` mid-filename.
+    ///
+    /// The literals themselves come from `crate::keymap_overrides::file_tree_key_context`, which
+    /// `real_context_stacks()` also calls, so the renderer and the enumeration every scoping
+    /// claim rests on cannot drift apart. That function's docs carry the reasoning.
     fn file_tree_shell(&self, body: gpui::AnyElement, cx: &mut Context<Self>) -> gpui::AnyElement {
         // Space-separated context *words*, which is what `KeyBindingContextPredicate`'s
         // identifier terms match against - so `Some("file-tree && !tree-editing")` really does
-        // stop matching the moment `"tree-editing"` is added here. Two independent modal states
-        // add a word each: an open inline name editor, and the modal delete confirmation (which
-        // would otherwise let `F2`/`Shift+F10` fire behind its own scrim).
-        let key_context = match (
+        // stop matching the moment `"tree-editing"` is added. Two independent modal states add a
+        // word each (an open inline name editor, and the modal delete confirmation, which would
+        // otherwise let `F2`/`Shift+F10` fire behind its own scrim), and an open editor adds
+        // `"text-input"` on top - GitHub issue #17's one shared tag for every real text-typing
+        // surface. That last one is not decoration and is not merely about offering undo:
+        // `Undo`/`Redo` (the *worktree* history - committing and discarding real git state) are
+        // bound `Some("!terminal && !text-input")`, and while this editor is open the tree is the
+        // deepest focused node, so without it `Ctrl+Z` in a rename box ran the worktree undo.
+        // The two features were built on separate branches and met at a merge, so nothing
+        // textual flagged it - see `crate::sidebar::tree_ops::AdeApp::handle_tree_text_undo`,
+        // the listener the tag routes to.
+        let key_context = crate::keymap_overrides::file_tree_key_context(
             self.tree_inline_edit.is_some(),
             self.tree_delete_confirm.is_some(),
-        ) {
-            (true, true) => "file-tree tree-editing tree-delete-confirm",
-            (true, false) => "file-tree tree-editing",
-            (false, true) => "file-tree tree-delete-confirm",
-            (false, false) => "file-tree",
-        };
+        );
         div()
             .id("file-tree-shell")
             .key_context(key_context)
@@ -557,6 +565,8 @@ impl AdeApp {
             .on_action(cx.listener(Self::handle_file_tree_copy_action))
             .on_action(cx.listener(Self::handle_file_tree_cut_action))
             .on_action(cx.listener(Self::handle_file_tree_paste_action))
+            .on_action(cx.listener(Self::handle_tree_text_undo))
+            .on_action(cx.listener(Self::handle_tree_text_redo))
             .on_key_down(cx.listener(Self::handle_tree_key_down))
             .flex()
             .flex_col()
@@ -668,7 +678,7 @@ impl AdeApp {
             return div().into_any_element();
         };
         let indent = px(file_tree::INDENT_STEP * depth as f32);
-        let name = edit.name.clone();
+        let name = edit.name.as_str().to_string();
         // Exactly `theme::band::TREE_ROW` tall, like every other row - a `uniform_list`'s one
         // real requirement is that every row is the same height, so the rejection hint is a
         // trailing element *inside* this row rather than a second line under it (which would

@@ -17,7 +17,7 @@
 //! things stop that here, and it is worth being precise about which one does what, because a
 //! first draft of these docs got it wrong and this project's own revert-verification caught it:
 //!
-//! 1. **The `key_context` predicate**, `Some("file-tree && !tree-editing")` (see
+//! 1. **The `key_context` predicate**, `Some("file-tree && !tree-editing && !tree-delete-confirm")` (see
 //!    `crate::default_key_bindings`). `Window::dispatch_key_event` resolves bindings against the
 //!    context stack of the *focused node's own dispatch path*, before any listener is consulted
 //!    (`vendor/zed/crates/gpui/src/window.rs`'s `dispatch_key` call). A focused terminal pane is
@@ -25,7 +25,11 @@
 //!    at all.
 //! 2. **Where the handlers are registered.** `.on_action` for all five tree actions lives on
 //!    `crate::sidebar::render::AdeApp::file_tree_shell`'s node - the tree's own container - and
-//!    nowhere else. A listener found in the dispatch path sets `cx.propagate_event = false`
+//!    nowhere else. (That node carries seven `on_action` listeners in total: these five, plus the
+//!    `TextUndo`/`TextRedo` pair the inline name editor gained when GitHub issue #17's per-widget
+//!    text undo merged in. The reasoning below is unchanged by those two - they are scoped
+//!    `Some("text-input")`, which the tree only emits while an editor is open.)
+//!    A listener found in the dispatch path sets `cx.propagate_event = false`
 //!    before running ("Actions stop propagation by default during the bubble phase", same file),
 //!    so a listener that *is* found genuinely swallows the keystroke; one that isn't leaves
 //!    `propagate_event` true and `finish_dispatch_key_event` still delivers the key to the
@@ -51,8 +55,10 @@
 use super::*;
 use crate::sidebar::context_menu::{ContextTarget, MenuAction};
 use crate::sidebar::file_ops::{self, DeleteMechanism};
+use crate::text_history;
 use gpui::{ClipboardItem, KeyDownEvent, Window};
 use std::path::Component;
+use std::time::Instant;
 
 /// An open context menu: what it targets, and the already-clamped window-space origin its
 /// popover paints at. The origin is resolved once, at open time, from the real click position
@@ -107,12 +113,19 @@ impl InlineEditKind {
 /// frame (falling back to the top of the list if the anchor has genuinely gone) rather than by a
 /// position that a re-walk can invalidate. This is the same discipline issue #18 applied to fold
 /// state, which is likewise held outside the walked tree and re-derived against it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq`: `text_history::TextField` holds a recorded history whose `Instant` timestamps have no
+// meaningful total equality, so it is deliberately `PartialEq` only.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TreeInlineEdit {
     pub(crate) kind: InlineEditKind,
-    /// The name typed so far - append/backspace only, the same minimal field shape
-    /// `crate::root::new_file`'s prompt and the rail's filter row already use.
-    pub(crate) name: String,
+    /// The name typed so far - append/backspace only, the same field shape *and now the same real
+    /// undo history* (`crate::text_history::TextField`, GitHub issue #17) that
+    /// `crate::root::new_file`'s prompt and the rail's filter row use. This editor was built in
+    /// parallel with issue #17 and originally held a bare `String`; making it a `TextField` when
+    /// the two branches merged is what gives `Ctrl+Z` while typing a name a real, per-widget
+    /// meaning instead of letting it fall through to the *worktree* history - see
+    /// `crate::sidebar::AdeApp::file_tree_shell`'s `"text-input"` context word.
+    pub(crate) name: text_history::TextField,
     /// The real rejection message shown under the field (issue #19 §2: "invalid names are
     /// rejected with a hint"), cleared on the next keystroke.
     pub(crate) error: Option<String>,
@@ -381,7 +394,7 @@ impl AdeApp {
             } else {
                 InlineEditKind::NewFile { parent }
             },
-            name: String::new(),
+            name: text_history::TextField::new(),
             error: None,
         });
         self.focus_file_tree(window, cx);
@@ -407,7 +420,9 @@ impl AdeApp {
             .unwrap_or_default();
         self.tree_inline_edit = Some(TreeInlineEdit {
             kind: InlineEditKind::Rename { path, is_dir },
-            name,
+            // `seeded`, not `new()` + `set(..)`: the current name is this field's baseline, so
+            // the first Ctrl+Z must not blank it - see `TextField::seeded`'s own docs.
+            name: text_history::TextField::seeded(&name),
             error: None,
         });
         self.focus_file_tree(window, cx);
@@ -487,7 +502,7 @@ impl AdeApp {
             }
             "backspace" => {
                 if let Some(edit) = self.tree_inline_edit.as_mut() {
-                    edit.name.pop();
+                    edit.name.pop(Instant::now());
                     edit.error = None;
                     cx.notify();
                     cx.stop_propagation();
@@ -500,12 +515,60 @@ impl AdeApp {
                     .filter(|text| !text.is_empty())
                 {
                     if let Some(edit) = self.tree_inline_edit.as_mut() {
-                        edit.name.push_str(text);
+                        edit.name.push_str(text, Instant::now());
                         edit.error = None;
                         cx.notify();
                         cx.stop_propagation();
                     }
                 }
+            }
+        }
+    }
+
+    /// `Ctrl/Cmd+Z` inside the inline name editor - the tree's half of GitHub issue #17's
+    /// per-widget text undo.
+    ///
+    /// This surface and that feature were built on two branches in parallel and only met at the
+    /// merge, which is exactly why this handler needs to exist rather than being assumed: with
+    /// the editor open the tree's own node is the deepest focused one, so without the
+    /// `"text-input"` context word `crate::sidebar::AdeApp::file_tree_shell` now emits, plain
+    /// `Ctrl+Z` while typing a filename satisfied `Undo`'s `Some("!terminal && !text-input")`
+    /// and ran the *worktree* history instead - discarding or re-committing real git state from
+    /// inside a rename box. The tag makes that predicate unsatisfiable here; this listener is
+    /// what the resulting `TextUndo` lands on. Registered on the same node that carries the tag
+    /// and the focus handle, per `crate::default_key_bindings`' own rule.
+    ///
+    /// A no-op when no editor is open: the tag is only emitted while one is, so the action
+    /// cannot normally be produced then, and an unconditional `cx.notify()` would repaint for
+    /// nothing.
+    pub(in crate::sidebar) fn handle_tree_text_undo(
+        &mut self,
+        _: &TextUndo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(edit) = self.tree_inline_edit.as_mut() {
+            if edit.name.undo() {
+                // The rejection hint described the *old* text; it is stale the moment the text
+                // moves, same as on every ordinary keystroke above.
+                edit.error = None;
+                cx.notify();
+            }
+        }
+    }
+
+    /// `Ctrl/Cmd+Shift+Z` / `Ctrl+Y` inside the inline name editor - the mirror of
+    /// [`Self::handle_tree_text_undo`].
+    pub(in crate::sidebar) fn handle_tree_text_redo(
+        &mut self,
+        _: &TextRedo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(edit) = self.tree_inline_edit.as_mut() {
+            if edit.name.redo() {
+                edit.error = None;
+                cx.notify();
             }
         }
     }
@@ -522,7 +585,7 @@ impl AdeApp {
         };
         // The same one validator `crate::root::new_file::AdeApp::create_new_file` uses - not a
         // second copy of the rules.
-        let name = match file_ops::validate_entry_name(&edit.name) {
+        let name = match file_ops::validate_entry_name(edit.name.as_str()) {
             Ok(name) => name.to_string(),
             Err(message) => {
                 if let Some(open) = self.tree_inline_edit.as_mut() {
@@ -1367,7 +1430,8 @@ mod tree_ops_regression_tests {
 
         app.update_in(cx, |app, window, cx| {
             app.start_tree_rename(old.clone(), false, window, cx);
-            app.tree_inline_edit.as_mut().expect("editor").name = "renamed.rs".to_string();
+            app.tree_inline_edit.as_mut().expect("editor").name =
+                text_history::TextField::seeded("renamed.rs");
             app.commit_tree_inline_edit(window, cx);
         });
         cx.run_until_parked();
@@ -1425,7 +1489,8 @@ mod tree_ops_regression_tests {
 
         app.update_in(cx, |app, window, cx| {
             app.start_tree_rename(repo.path().join("src"), true, window, cx);
-            app.tree_inline_edit.as_mut().expect("editor").name = "lib".to_string();
+            app.tree_inline_edit.as_mut().expect("editor").name =
+                text_history::TextField::seeded("lib");
             app.commit_tree_inline_edit(window, cx);
         });
         cx.run_until_parked();
@@ -1640,7 +1705,8 @@ mod tree_ops_regression_tests {
         app.update_in(cx, |app, window, cx| {
             app.set_dir_expanded(repo.path().join("src"), true, cx);
             app.start_tree_rename(repo.path().join("src/main.rs"), false, window, cx);
-            app.tree_inline_edit.as_mut().expect("editor").name = "half-typed".to_string();
+            app.tree_inline_edit.as_mut().expect("editor").name =
+                text_history::TextField::seeded("half-typed");
         });
         cx.run_until_parked();
         assert!(
@@ -1667,7 +1733,7 @@ mod tree_ops_regression_tests {
                 .tree_inline_edit
                 .as_ref()
                 .expect("the editor must survive a walk that replaced every row");
-            assert_eq!(edit.name, "half-typed");
+            assert_eq!(edit.name.as_str(), "half-typed");
         });
         assert!(
             cx.debug_bounds("file-tree-inline-edit").is_some(),
@@ -1774,7 +1840,8 @@ mod tree_ops_regression_tests {
         app.update_in(cx, |app, window, cx| {
             app.selected_tree_path = Some(repo.path().join("README.md"));
             app.start_tree_rename(repo.path().join("README.md"), false, window, cx);
-            app.tree_inline_edit.as_mut().expect("editor").name = "in-progress".to_string();
+            app.tree_inline_edit.as_mut().expect("editor").name =
+                text_history::TextField::seeded("in-progress");
         });
         cx.run_until_parked();
 
@@ -1785,9 +1852,289 @@ mod tree_ops_regression_tests {
                 "the `!tree-editing` half of the binding's context predicate is what stops this"
             );
             assert_eq!(
-                app.tree_inline_edit.as_ref().expect("still open").name,
+                app.tree_inline_edit
+                    .as_ref()
+                    .expect("still open")
+                    .name
+                    .as_str(),
                 "in-progress",
                 "and the editor must be untouched"
+            );
+        });
+    }
+
+    /// **The merge regression this whole group exists for.** GitHub issue #19 (this file tree)
+    /// and issue #17 (per-widget text undo) were built on two branches in parallel and only met
+    /// at a merge. Nothing about that merge conflicted textually here, and the merged tree
+    /// compiled and passed both sides' suites - but this editor was a bare `String` with no
+    /// `"text-input"` key-context word, so while typing a filename plain `Ctrl+Z` satisfied
+    /// `Undo`'s `Some("!terminal && !text-input")` and ran the **worktree** history: discarding
+    /// or re-committing real git state from inside a rename box, with the name unchanged and no
+    /// indication of what had happened. Verbatim the "a keystroke reaches the wrong handler" bug
+    /// class `crate::default_key_bindings`' own docs catalogue.
+    ///
+    /// Asserts both halves, because either alone would pass against a wrong fix: the typed name
+    /// really is undone (so `TextUndo` genuinely arrived and had a real history to act on), and
+    /// `worktree_history_status` is *still* untouched (so the worktree undo genuinely never ran
+    /// - the assertion that fails against the pre-merge-fix code, where it reads
+    /// `Some("nothing to undo")`).
+    #[gpui::test]
+    fn ctrl_z_while_typing_a_name_in_the_tree_undoes_the_name_not_the_worktree_history(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_tree_new_entry(repo.path().to_path_buf(), false, window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_input("notes.txt");
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.tree_inline_edit
+                    .as_ref()
+                    .expect("the editor must be open")
+                    .name
+                    .as_str(),
+                "notes.txt",
+                "sanity check: the editor must really be focused and receiving real keystrokes, \
+                 or everything below would pass for the wrong reason"
+            );
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
+            "sanity check: nothing has touched the worktree history yet"
+        );
+
+        cx.simulate_keystrokes(&secondary("z"));
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.tree_inline_edit
+                    .as_ref()
+                    .expect("the editor must still be open")
+                    .name
+                    .as_str(),
+                "",
+                "Ctrl+Z must undo the name typed into this field - one uninterrupted burst of \
+                 typing is one coalesced group, so a single undo clears it"
+            );
+            assert!(
+                app.worktree_history_status.is_none(),
+                "and it must never have reached the worktree-level Undo: that is what the \
+                 `\"text-input\"` word this editor's key context now carries makes impossible, \
+                 by rendering `Undo`'s own `!text-input` predicate unsatisfiable here"
+            );
+        });
+    }
+
+    /// The other direction, which is what keeps the fix above honest rather than a blanket tag:
+    /// the tree with **no** editor open is not a text surface, so `Ctrl+Z` there must still reach
+    /// the worktree history exactly as it did before issue #17 existed.
+    ///
+    /// Without this, adding `"text-input"` unconditionally to the tree shell would pass the test
+    /// above while silently killing the worktree undo for anyone whose focus happens to sit on
+    /// the file tree - a new instance of the same bug class, pointed the other way.
+    #[gpui::test]
+    fn ctrl_z_in_the_focused_tree_with_no_editor_open_still_reaches_the_worktree_undo(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.selected_tree_path = Some(repo.path().join("README.md"));
+            app.focus_file_tree(window, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.tree_inline_edit.is_none(),
+                "sanity check: no inline editor, so no `\"text-input\"` word"
+            );
+            assert!(app.worktree_history_status.is_none());
+        });
+
+        cx.simulate_keystrokes(&secondary("z"));
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.worktree_history_status.clone()),
+            Some("nothing to undo".to_string()),
+            "with the tree focused but nothing being typed, secondary-z must still reach the \
+             worktree-level Undo and produce its real, honest status"
+        );
+    }
+
+    /// The rename editor opens *pre-filled* with the entry's current name, and that pre-fill is
+    /// the field's baseline rather than an edit to it - so the first `Ctrl+Z` must do nothing at
+    /// all, not blank the box to `""`.
+    ///
+    /// This is what `crate::text_history::TextField::seeded` exists for; building the field as
+    /// `new()` + `set(current_name)` would record the pre-fill as a real undoable step and leave
+    /// the user in a state they never typed and cannot type their way back to (the name is gone
+    /// and only redo returns it). Also asserts the keystroke did not fall through to the
+    /// worktree history when the text field had nothing to give it.
+    #[gpui::test]
+    fn the_first_ctrl_z_in_a_rename_editor_does_not_blank_the_prefilled_name(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_tree_rename(repo.path().join("README.md"), false, window, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.tree_inline_edit.as_ref().expect("editor").name.as_str(),
+                "README.md",
+                "sanity check: the rename editor really does open pre-filled"
+            );
+            assert!(
+                !app.tree_inline_edit
+                    .as_ref()
+                    .expect("editor")
+                    .name
+                    .can_undo(),
+                "and the pre-fill must not itself be a recorded, undoable step - this is the \
+                 assertion that discriminates `TextField::seeded` from `new()` + `set(name)`, \
+                 rather than inferring it from the text merely not having changed"
+            );
+        });
+
+        cx.simulate_keystrokes(&secondary("z"));
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.tree_inline_edit.as_ref().expect("editor").name.as_str(),
+                "README.md",
+                "the pre-filled name is this field's baseline, not an undoable edit"
+            );
+            assert!(
+                app.worktree_history_status.is_none(),
+                "and an empty text history must not let the keystroke fall through to the \
+                 worktree undo - the two systems are disjoint by context, not by whether the \
+                 text one happens to have anything to do"
+            );
+        });
+    }
+
+    /// The redo half of the same routing, on both real spellings this app binds
+    /// (`secondary-shift-z` and `ctrl-y`).
+    #[gpui::test]
+    fn redo_in_the_tree_inline_editor_restores_the_undone_name(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_tree_new_entry(repo.path().to_path_buf(), true, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("assets");
+        cx.simulate_keystrokes(&secondary("z"));
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.tree_inline_edit.as_ref().expect("editor").name.as_str(),
+                ""
+            );
+        });
+
+        cx.simulate_keystrokes(&secondary("shift-z"));
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.tree_inline_edit.as_ref().expect("editor").name.as_str(),
+                "assets",
+                "secondary-shift-z must redo the tree editor's own text"
+            );
+            assert!(app.worktree_history_status.is_none());
+        });
+
+        // The second real spelling, which this app binds for the same action. The intermediate
+        // assertion is load-bearing: without it, a `ctrl-y` that did nothing *and* a
+        // `secondary-z` that did nothing would leave "assets" in place and pass.
+        cx.simulate_keystrokes(&secondary("z"));
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.tree_inline_edit.as_ref().expect("editor").name.as_str(),
+                "",
+                "sanity check: the undo before the ctrl-y really did take effect"
+            );
+        });
+        cx.simulate_keystrokes("ctrl-y");
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.tree_inline_edit.as_ref().expect("editor").name.as_str(),
+                "assets",
+                "ctrl-y must reach the same handler"
+            );
+            assert!(app.worktree_history_status.is_none());
+        });
+    }
+
+    /// `crate::keymap_overrides::file_tree_key_context`'s `(true, true)` arm - an inline name
+    /// editor open *and* the delete confirmation armed - is enumerated in `real_context_stacks()`
+    /// as a deliberate over-approximation. This asserts the reason it is safe to leave the
+    /// `"text-input"` word on that arm: the state has no real gesture path into it.
+    ///
+    /// Arming a delete goes through the context menu, and [`AdeApp::open_tree_context_menu`]
+    /// cancels any open inline editor first. Both audits of the merge that added the tag raised
+    /// this arm - keeping `"text-input"` there means `Ctrl+Z` behind the scrim would edit a name
+    /// field the user cannot see, but *dropping* it would hand the keystroke to the worktree
+    /// `Undo` instead, which is strictly worse (it mutates real git state), and guarding the
+    /// handlers would silently swallow the keystroke, which is this project's most-repeated bug
+    /// class. Proving the state unreachable is what makes all three concerns moot; asserting it
+    /// is what stops a later refactor from quietly making it reachable.
+    #[gpui::test]
+    fn arming_a_delete_is_not_reachable_while_an_inline_name_editor_is_open(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_tree_rename(repo.path().join("README.md"), false, window, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.tree_inline_edit.is_some(), "sanity check: editor open");
+            assert!(app.tree_delete_confirm.is_none());
+        });
+
+        // The only real way to arm a delete: open the row's context menu first.
+        app.update_in(cx, |app, window, cx| {
+            app.open_tree_context_menu(
+                ContextTarget::File(repo.path().join("README.md")),
+                10.0,
+                10.0,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.tree_inline_edit.is_none(),
+                "opening the context menu must cancel the inline editor - that is what makes the \
+                 \"editor open + delete armed\" context stack unreachable, and so makes leaving \
+                 `\"text-input\"` on that arm safe"
             );
         });
     }
@@ -1989,7 +2336,8 @@ mod tree_ops_regression_tests {
                 cx,
             );
             app.run_tree_menu_action(MenuAction::NewFolder, window, cx);
-            app.tree_inline_edit.as_mut().expect("editor").name = "nested".to_string();
+            app.tree_inline_edit.as_mut().expect("editor").name =
+                text_history::TextField::seeded("nested");
             app.commit_tree_inline_edit(window, cx);
         });
         cx.run_until_parked();
@@ -2018,7 +2366,8 @@ mod tree_ops_regression_tests {
         for bad in ["", "  ", "a/b", ".."] {
             app.update_in(cx, |app, window, cx| {
                 app.start_tree_new_entry(repo.path().to_path_buf(), true, window, cx);
-                app.tree_inline_edit.as_mut().expect("editor").name = bad.to_string();
+                app.tree_inline_edit.as_mut().expect("editor").name =
+                    text_history::TextField::seeded(bad);
                 app.commit_tree_inline_edit(window, cx);
             });
             cx.run_until_parked();
@@ -2037,7 +2386,8 @@ mod tree_ops_regression_tests {
         // A name that collides with something already there is refused the same way.
         app.update_in(cx, |app, window, cx| {
             app.start_tree_new_entry(repo.path().to_path_buf(), true, window, cx);
-            app.tree_inline_edit.as_mut().expect("editor").name = "src".to_string();
+            app.tree_inline_edit.as_mut().expect("editor").name =
+                text_history::TextField::seeded("src");
             app.commit_tree_inline_edit(window, cx);
         });
         cx.run_until_parked();
@@ -2143,7 +2493,8 @@ mod tree_ops_regression_tests {
             });
             app.update_in(cx, |app, window, cx| {
                 app.start_tree_rename(repo.path().join("src/main.rs"), false, window, cx);
-                app.tree_inline_edit.as_mut().expect("editor").name = "renamed.rs".to_string();
+                app.tree_inline_edit.as_mut().expect("editor").name =
+                    text_history::TextField::seeded("renamed.rs");
                 app.commit_tree_inline_edit(window, cx);
             });
             cx.run_until_parked();
@@ -2183,7 +2534,8 @@ mod tree_ops_regression_tests {
 
             app.update_in(cx, |app, window, cx| {
                 app.start_tree_rename(absolute.clone(), false, window, cx);
-                app.tree_inline_edit.as_mut().expect("editor").name = "renamed.rs".to_string();
+                app.tree_inline_edit.as_mut().expect("editor").name =
+                    text_history::TextField::seeded("renamed.rs");
                 app.commit_tree_inline_edit(window, cx);
             });
             cx.run_until_parked();

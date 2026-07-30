@@ -162,7 +162,7 @@ impl AdeApp {
 
         palette::build_groups(
             self.palette_scope,
-            &self.palette_query,
+            self.palette_query.as_str(),
             &sessions,
             &commands,
             &history,
@@ -358,6 +358,33 @@ impl AdeApp {
         self.close_palette(window, cx);
     }
 
+    /// `TextUndo` for the palette query (GitHub issue #17). Resets the highlighted row alongside
+    /// the text, exactly like every other real mutation of the query does - a restored query with
+    /// a stale selected index would point into a different result list than the one on screen.
+    pub(in crate::palette) fn handle_palette_text_undo(
+        &mut self,
+        _: &TextUndo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.palette_query.undo() {
+            self.palette_selected = 0;
+            cx.notify();
+        }
+    }
+
+    pub(in crate::palette) fn handle_palette_text_redo(
+        &mut self,
+        _: &TextRedo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.palette_query.redo() {
+            self.palette_selected = 0;
+            cx.notify();
+        }
+    }
+
     /// The palette's hand-rolled text field key handler - the same append/backspace shape as
     /// [`Self::handle_filter_key_down`], plus `Esc`/`⏎`/`↑`/`↓`/`⇥`. Also implements the "type
     /// the scope prefix" gesture ([`crate::palette::state::typed_scope_prefix`]) for the first
@@ -378,7 +405,7 @@ impl AdeApp {
                 cx.stop_propagation();
             }
             "backspace" => {
-                self.palette_query.pop();
+                self.palette_query.pop(Instant::now());
                 self.palette_selected = 0;
                 cx.notify();
                 cx.stop_propagation();
@@ -419,7 +446,7 @@ impl AdeApp {
                         }
                     }
                 }
-                self.palette_query.push_str(text);
+                self.palette_query.push_str(text, Instant::now());
                 self.palette_selected = 0;
                 cx.notify();
                 cx.stop_propagation();
@@ -457,6 +484,18 @@ impl AdeApp {
                 div()
                     .id("palette-panel")
                     .track_focus(&self.palette_focus_handle)
+                    // The one shared context tag every real text-typing surface in this app
+                    // carries (GitHub issue #17): it routes `secondary-z` to `TextUndo` here
+                    // rather than to `crate::worktree_history`'s worktree-level `Undo`, which is
+                    // correspondingly scoped `"!terminal && !text-input"`. Registering the
+                    // listener on *this* node - the one `palette_focus_handle` is tracked on - is
+                    // what makes the routing structural: GPUI only dispatches an action along the
+                    // focused node's own ancestor path, so a palette query typed over an open file
+                    // editor undoes the query, not the file. See `crate::default_key_bindings`'
+                    // own docs.
+                    .key_context("text-input")
+                    .on_action(cx.listener(Self::handle_palette_text_undo))
+                    .on_action(cx.listener(Self::handle_palette_text_redo))
                     .on_key_down(cx.listener(Self::handle_palette_key_down))
                     .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
                         // Stops the click from bubbling to the scrim's own `on_click`, which
@@ -559,7 +598,7 @@ impl AdeApp {
                                 theme::text::GHOST
                             })
                             .child(if has_query {
-                                self.palette_query.clone()
+                                self.palette_query.as_str().to_string()
                             } else {
                                 "Type a command, file or session\u{2026}".to_string()
                             })
@@ -980,7 +1019,11 @@ mod palette_caret_tests {
         cx.simulate_input("ab");
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
-            assert_eq!(app.palette_query, "ab", "sanity check: real typed query");
+            assert_eq!(
+                app.palette_query.as_str(),
+                "ab",
+                "sanity check: real typed query"
+            );
         });
 
         let short_caret = cx
@@ -1009,7 +1052,8 @@ mod palette_caret_tests {
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
             assert_eq!(
-                app.palette_query, "abcdefgh",
+                app.palette_query.as_str(),
+                "abcdefgh",
                 "sanity check: real longer typed query"
             );
         });
