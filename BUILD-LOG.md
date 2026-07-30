@@ -1721,3 +1721,45 @@ itself.
 
 Independently re-verified directly: all four gates clean against the real combined working-
 tree state, 829 tests passing.
+
+## Real editable keybindings, live theme swapping, and a settings-page correctness pass
+
+Three real fixes to the Settings surface, previously either non-functional or misleadingly
+duplicated. The Keybindings page was deliberately read-only ("no keymap-file-writing
+infrastructure to back one") - built real rebinding: keystroke capture, collision detection
+correctly scoped against `gpui`'s real `KeyBindingContextPredicate` (including recognizing
+`"!terminal"` and `"file-editor"` as genuinely overlapping scopes, not disjoint - a real gap
+found and fixed along the way), persistence through a new `settings.toml` section, and live
+runtime application via `App::clear_key_bindings()`/`bind_keys()` with no restart required.
+
+Selecting a theme card persisted correctly but never re-skinned the app - `crate::theme` was
+hundreds of compile-time `Rgba` constants, structurally unable to change at runtime. Rewrote
+it around a `ColorToken` newtype resolved through a `thread_local!` current-theme index (Jerry
+Dark, index 0, resolves as a complete no-op - not even a lossy round trip, preserving every
+existing exact-hex test); the other five themes resolve through a derived HSL shift computed
+from each theme's own swatch colours against Jerry Dark's. Real `Into<Rgba/Hsla/Fill/
+Background>` impls mean the hundreds of existing `.bg(theme::surface::WINDOW)`-style call
+sites keep compiling completely unchanged, now resolving live instead of statically -
+avoiding threading a theme parameter through the entire render tree. `follow_system` is real
+via `Window::observe_window_appearance`.
+
+Removed the duplicated, confusing zoom mechanism (three overlapping "how big is the editor
+text" controls) down to one persisted, genuinely global setting.
+
+This work was built in an isolated worktree, both for its own substantial scope and to avoid
+colliding with three other pieces of work landing in this same tree the same day (the
+per-worktree tabs/session rework, the real title-bar menu, and the LSP adapter/facade + Vue
+support). Integrating it required a real, hand-resolved merge: ~90 call sites needed real
+`Rgba`→`ColorToken` conversions across files the theme work never touched when it was
+originally built (the title-bar menu, the new per-worktree rail rows, the new-file prompt -
+all landed after this work started), and the zoom consolidation turned out to have been
+independently built twice (once here, once as an incidental part of the tabs/session rework
+landing the same day) - kept the already-landed version authoritative. Verified the theme
+swap genuinely reaches the brand-new surfaces it could never have been tested against when
+originally built: zero raw-hex/`Rgba`-literal bypasses of `theme::*` anywhere across the other
+three workstreams' files, and confirmed directly in source that the title bar's `.into()`
+call sites really do route through `ColorToken::resolve()` against the live-selected theme.
+
+Independently re-verified directly: all four gates clean (one run hit the documented
+diff-highlight-cache flake under full-suite parallel ordering, confirmed unrelated by two
+clean re-runs), 707 app tests passing.
