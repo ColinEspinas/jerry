@@ -33,6 +33,7 @@ pub mod terminal_grid;
 pub mod terminal_links;
 pub mod terminal_pane;
 pub mod theme;
+pub mod undo;
 pub mod work_surface;
 pub mod worktrees;
 
@@ -130,11 +131,30 @@ use gpui::{
 ///   sets can never both match the same keystroke - the same real `&&`/`!`
 ///   `KeyBindingContextPredicate` mechanism the `"]"` entry already established for this exact
 ///   bug class.
+/// - `Undo`/`Redo` (Revision R10, `crate::root::worktree_history`) back the real command-pattern
+///   undo/redo stack for "keep all changes"/"discard worktree". `"secondary-z"`/
+///   `"secondary-shift-z"` follow this list's own `"secondary-"` convention, but - unlike every
+///   other entry above except `"]"` - are **not** globally scoped (`None`): `"secondary-z"`
+///   resolves to plain `Ctrl+Z` on Linux/Windows, which `crate::terminal_pane::keystroke_to_bytes`
+///   already maps to the real `SIGTSTP` control byte (`0x1a`) - the terminal-suspend keystroke
+///   essentially every interactive terminal program relies on. A global binding here would
+///   swallow it before it ever reached a focused terminal's own key handling, the same
+///   "app-level shortcut steals terminal input" bug class this list's own `secondary-p`/`"]"`
+///   docs already cover, just for a far more disruptive keystroke to silently lose than either of
+///   those. Unlike `secondary-p` (no narrower context existed for it - the palette must be
+///   reachable from a focused terminal), a real, narrower scope *is* available here: `Undo`/
+///   `Redo` have no legitimate reason to need to fire while a terminal has keyboard focus, so
+///   they're scoped to `Some("!terminal")` - `crate::terminal_pane::TerminalPane`'s own
+///   `"terminal"` context tag (added in the same revision specifically to make this predicate
+///   possible), matching this list's own `"]"`/`"diff && !file-editor"` precedent for the same
+///   `!`-negated-context mechanism.
 pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
     vec![
         gpui::KeyBinding::new("secondary-n", root::NewSession, None),
         gpui::KeyBinding::new("secondary-k", root::TogglePalette, None),
         gpui::KeyBinding::new("secondary-,", root::ToggleSettings, None),
+        gpui::KeyBinding::new("secondary-z", root::Undo, Some("!terminal")),
+        gpui::KeyBinding::new("secondary-shift-z", root::Redo, Some("!terminal")),
         gpui::KeyBinding::new("f12", root::GotoDefinition, None),
         gpui::KeyBinding::new("ctrl-shift-t", root::NewTerminal, None),
         gpui::KeyBinding::new("secondary-shift-n", root::NewAgentPane, None),

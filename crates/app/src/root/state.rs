@@ -91,6 +91,10 @@ impl AdeApp {
             prune_status: None,
             prune_confirm_armed: false,
             prune_in_flight: false,
+            undo_stack: undo::UndoStack::new(),
+            worktree_history_op_in_flight: None,
+            worktree_history_status: None,
+            discard_confirm_armed: None,
             settings_open: false,
             settings_page: settings::SettingsPage::General,
             settings_focus_handle: cx.focus_handle(),
@@ -121,6 +125,7 @@ impl AdeApp {
             _status_poll_task: None,
             _disk_usage_task: None,
             _prune_task: None,
+            _worktree_history_task: None,
             _agent_rows_task: None,
             _merge_task: None,
             _merge_cleanup_task: None,
@@ -298,6 +303,7 @@ impl AdeApp {
         // Browsing to a different worktree disarms a pending prune confirmation - see
         // `Self::request_prune`'s docs.
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         // Reset per-worktree UI state (see `reset_per_worktree_ui_state`'s docs) so switching
         // worktrees never leaks a "reviewed" checkbox, open diff, or collapsed-dir entry from
         // the worktree just left.

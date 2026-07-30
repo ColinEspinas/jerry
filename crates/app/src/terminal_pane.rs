@@ -1251,6 +1251,18 @@ impl Render for TerminalPane {
         let mut pane = div()
             .id("terminal-pane")
             .track_focus(&self.focus_handle)
+            // Tagged `"terminal"` (Revision R10) so `crate::default_key_bindings`'s global
+            // `Undo`/`Redo` bindings can scope themselves away from a focused terminal via
+            // `Some("!terminal")` - see that function's own docs for the real conflict this
+            // closes: `"secondary-z"` resolves to plain `Ctrl+Z` on Linux/Windows
+            // (`crate::default_key_bindings`'s own `"secondary-"` docs), which
+            // `Self::keystroke_to_bytes` below already maps to the real `SIGTSTP` control byte
+            // (`0x1a`) every interactive terminal program relies on to suspend - a global,
+            // unscoped `Undo` binding would swallow that keystroke before it ever reached this
+            // pane's own `on_key_down`, the same "app-level shortcut steals terminal input" bug
+            // class `crate::default_key_bindings`'s own docs already document for `secondary-p`/
+            // Ctrl+P, just for a far more disruptive keystroke to lose silently.
+            .key_context("terminal")
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                 window.focus(&this.focus_handle, cx);
@@ -1643,6 +1655,31 @@ mod keystroke_tests {
             Some(vec![0x10]),
             "Ctrl+P must map to the real Ctrl+<letter> control code (0x10), the standard \
              readline 'previous history' byte every real shell relies on"
+        );
+    }
+
+    /// Direct proof of the control-byte mapping Revision R10's `Undo`/`Redo` scoping decision
+    /// depends on: `crate::default_key_bindings` scopes `Undo`/`Redo` to `Some("!terminal")`
+    /// rather than binding them globally, specifically because `secondary-z` resolves to plain
+    /// `Ctrl+Z` on Linux/Windows, and this mapping sends the real `SIGTSTP` terminal-suspend
+    /// control byte (`0x1a`) a focused interactive program relies on. Mirrors
+    /// `ctrl_p_maps_to_the_real_readline_previous_history_control_byte` and
+    /// `crate::root::focus::tab_strip_keybinding_tests`'s own
+    /// `secondary_z_does_not_undo_while_the_default_terminal_session_is_focused`: that test
+    /// proves the scoped dispatch doesn't intercept it; this one proves what reaches the pty
+    /// once it doesn't.
+    #[test]
+    fn ctrl_z_maps_to_the_real_sigtstp_control_byte() {
+        let modifiers = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        let ks = keystroke("z", modifiers);
+        assert_eq!(
+            keystroke_to_bytes(&ks),
+            Some(vec![0x1a]),
+            "Ctrl+Z must map to the real Ctrl+<letter> control code (0x1a), the SIGTSTP \
+             terminal-suspend byte essentially every interactive program relies on"
         );
     }
 }

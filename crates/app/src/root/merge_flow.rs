@@ -95,6 +95,7 @@ impl AdeApp {
             state: merge::MergeFlowState::Running,
         });
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         cx.notify();
 
         let task = cx.spawn(async move |this, cx| {
@@ -137,6 +138,7 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         let Some(flow) = self.merge_flow.as_mut() else {
             return;
         };
@@ -247,6 +249,7 @@ impl AdeApp {
     /// legitimately be in `merge_flow` by the time this closure runs.
     pub(super) fn complete_merge_flow(&mut self, cx: &mut Context<Self>) {
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         if self.merge_op_in_flight {
             return;
         }
@@ -317,6 +320,7 @@ impl AdeApp {
     /// the Complete-vs-Abort race this (and the matching guard there) prevents.
     pub(super) fn abort_merge_flow(&mut self, cx: &mut Context<Self>) {
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         if self.merge_op_in_flight {
             return;
         }
@@ -390,6 +394,7 @@ impl AdeApp {
         self.merge_flow = None;
         self.clear_merge_edit_state();
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         cx.notify();
     }
 

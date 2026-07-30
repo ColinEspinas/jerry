@@ -1,5 +1,5 @@
 use super::*;
-use crate::root::widgets::{render_env_chip, render_keycap_row, KeycapSize};
+use crate::root::widgets::{render_env_chip, render_keycap_row, text_tooltip, KeycapSize};
 
 /// The 28px status bar (`CHANGELOG.md`'s change 7 - height 26 -> 28, gap 12 -> 9, every value
 /// 10px mono), rebuilt from the old single `8 sessions · 2 waiting · …` summary string into a
@@ -37,6 +37,13 @@ impl AdeApp {
     /// divider · ...".
     fn render_status_bar_left(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mut segments: Vec<gpui::AnyElement> = Vec::new();
+        // Shown first, and only while genuinely set - the real, transient feedback from
+        // "keep all changes"/"discard worktree"/`Undo`/`Redo` (Revision R10). See this method's
+        // own docs for why this lives here, in the status bar, rather than the rail footer's own
+        // status slot.
+        if let Some(notice) = self.render_status_worktree_history_notice() {
+            segments.push(notice);
+        }
         if let Some(branch_cluster) = self.render_status_branch_cluster() {
             segments.push(branch_cluster);
         }
@@ -44,6 +51,39 @@ impl AdeApp {
         segments.push(self.render_status_agents_cluster(cx).into_any_element());
         segments.push(self.render_status_worktrees_cluster().into_any_element());
         render_status_segment_row(segments).into_any_element()
+    }
+
+    /// The transient "keeping all changes…"/"discarded …"/"undo failed: …" feedback from
+    /// `AdeApp::keep_all_changes`/`AdeApp::execute_discard_worktree`/`AdeApp::perform_undo`/
+    /// `AdeApp::perform_redo` (`root::worktree_history`, Revision R10) - `None` (nothing rendered
+    /// at all) whenever [`AdeApp::worktree_history_status`] is `None`.
+    ///
+    /// Deliberately shown here, in the status bar, rather than the rail footer's own status slot
+    /// (`Self::render_rail_footer`) - an audit found two real problems with that shared slot:
+    /// [`AdeApp::prune_status`] took priority there and is never cleared once set (see that
+    /// field's own docs), so a single prune click permanently hid every future worktree-history
+    /// status for the rest of the session; and the rail footer disappears entirely while Settings
+    /// is open (`AdeApp::render_workspace_body` isn't called - `root/mod.rs`'s `Render` impl
+    /// swaps it out for `Self::render_settings`), leaving *no* real status surface at all for a
+    /// keybinding-triggered `Undo`/`Redo`. The status bar is rendered as an unconditional sibling
+    /// of that swap, so it stays visible either way.
+    ///
+    /// Long, load-bearing text (`Error::DiscardRemovalFailedAfterStash`'s real stash id,
+    /// `Error::HeadMovedSinceRecorded`'s two full 40-character commit shas, ...) is truncated
+    /// with an ellipsis and carries a real tooltip ([`text_tooltip`]) with the untruncated text -
+    /// an audit found this exact text rendered with no truncation or tooltip at all before.
+    fn render_status_worktree_history_notice(&self) -> Option<gpui::AnyElement> {
+        let status = self.worktree_history_status.clone()?;
+        Some(
+            div()
+                .id("status-bar-worktree-history-notice")
+                .min_w_0()
+                .max_w(px(320.0))
+                .truncate()
+                .tooltip(text_tooltip(status.clone()))
+                .child(self.render_status_text(status))
+                .into_any_element(),
+        )
     }
 
     /// Environment chip + real LSP server/error counts, the real file/editor cluster, then the

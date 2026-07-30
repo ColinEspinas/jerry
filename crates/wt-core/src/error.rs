@@ -176,4 +176,98 @@ pub enum Error {
         paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
     )]
     MergeFilesStillConflicted { paths: Vec<PathBuf> },
+
+    /// [`crate::undo::commit_all_changes`] was called on a worktree with no uncommitted
+    /// changes at all - there is nothing real to commit.
+    #[error("worktree at {path} has no uncommitted changes; nothing to commit")]
+    NothingToCommit { path: PathBuf },
+
+    /// [`crate::undo::undo_commit_all_changes`]/[`crate::undo::redo_commit_all_changes`]'s
+    /// mandatory identity guard: `HEAD` no longer matches the commit id the guard expected -
+    /// something else (another `ade` action, or an external `git` call) moved it since the
+    /// state this undo/redo was computed from, so moving `HEAD` now would silently discard
+    /// whatever that was.
+    #[error(
+        "refusing to move HEAD in {path}: expected it to be {expected}, but it is now {actual} \
+         (something else was committed there since)"
+    )]
+    HeadMovedSinceRecorded {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
+
+    /// [`crate::undo::undo_commit_all_changes`] needs to un-make a branch that had no parent
+    /// commit (the very first commit ever made on it), but the worktree's `HEAD` isn't a real
+    /// branch (detached) - there is no ref for `git update-ref -d` to remove. Not reachable in
+    /// practice for a worktree `crate::add_worktree` created (always a real branch), kept as a
+    /// real, explicit refusal rather than an unreachable panic.
+    #[error(
+        "cannot undo the first commit on a detached-HEAD worktree at {path}: no branch ref to \
+         unmake"
+    )]
+    CommitHasNoParentAndNoBranch { path: PathBuf },
+
+    /// [`crate::undo::discard_worktree`] was called on a worktree whose `HEAD` has no commit at
+    /// all yet (a freshly initialized repository/branch that was never committed to) - there is
+    /// no real commit id to snapshot, and `git stash` itself refuses to run with no `HEAD`
+    /// commit to diff against.
+    #[error("worktree at {path} has no commits yet; nothing real to discard")]
+    DiscardSourceUnborn { path: PathBuf },
+
+    /// [`crate::undo::discard_worktree`] was called on the repository's *main* worktree.
+    /// `git worktree remove --force --force` can never remove it (git itself always refuses
+    /// outright) - live-reproduced as a real data-loss path in an earlier version of that
+    /// function (stashed real content, then failed to remove anything, with nothing left
+    /// pointing back at the stash) before this refusal was added; see that function's own docs.
+    #[error("{path} is the repository's main worktree; it cannot be discarded")]
+    DiscardSourceIsMainWorktree { path: PathBuf },
+
+    /// [`crate::undo::discard_worktree`] found the worktree dirty (real uncommitted/untracked
+    /// content) but `git stash push` either produced no real stash commit id to store, or (a
+    /// real, live-reproduced case - see [`crate::undo::push_and_capture_stash`]'s own docs)
+    /// exited successfully without actually pushing anything at all (e.g. a dirty submodule
+    /// pointer, which `git stash push` cannot capture), leaving `refs/stash` pointing at
+    /// whatever unrelated stash existed before. Refused rather than proceeding with
+    /// `remove_worktree(force: true)` uncaptured or captured-under-the-wrong-sha, which is the
+    /// entire reason this function exists over a bare force-remove.
+    #[error("failed to snapshot uncommitted changes in {path} before discarding it")]
+    DiscardSnapshotFailed { path: PathBuf },
+
+    /// [`crate::undo::discard_worktree`] took a real stash snapshot, but the worktree removal
+    /// itself then failed for some other real reason (a filesystem permission error, a lock
+    /// `--force --force` didn't override, ...). Live-reproduced: by the time this happens, `git
+    /// worktree remove` has typically already deleted the worktree's own contents and
+    /// deregistered it as a worktree entirely, failing only at the final, now-empty directory
+    /// entry's own removal - so there is no reliable way to restore the stash back into that
+    /// directory in place (it may no longer even be a valid git worktree any more). The stash
+    /// itself is still real, durable, and independently recoverable regardless: `stash` names
+    /// it, and `git stash apply <stash>`/`git stash list` from any worktree of this repository
+    /// can get it back by hand.
+    #[error(
+        "took a real snapshot of {path} (stash {stash}) but could not remove the worktree \
+         itself: {source}. The stash is safe and recoverable (`git stash apply {stash}`), but \
+         the worktree directory may now be in an inconsistent state"
+    )]
+    DiscardRemovalFailedAfterStash {
+        path: PathBuf,
+        stash: String,
+        #[source]
+        source: Box<Error>,
+    },
+
+    /// [`crate::undo::undo_discard_worktree`]'s mandatory identity guard: something already
+    /// occupies the worktree's original path.
+    #[error("cannot undo: {path} is already occupied by another worktree or directory")]
+    DiscardWorktreePathReoccupied { path: PathBuf },
+
+    /// [`crate::undo::undo_discard_worktree`]'s mandatory identity guard: the recorded branch no
+    /// longer exists, is checked out in a different worktree already, or its tip commit is no
+    /// longer what was recorded at discard time - recreating the worktree would either clobber
+    /// whatever now occupies that branch or resurrect stale content on top of real newer work.
+    #[error(
+        "cannot undo: branch {branch:?} no longer matches the state it was discarded in (moved, \
+         deleted, or checked out elsewhere since)"
+    )]
+    DiscardBranchMovedOrReoccupied { branch: String },
 }

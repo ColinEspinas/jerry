@@ -12,40 +12,25 @@
 //! command's keywords) still qualifies but ranks after every primary-label match - see
 //! [`match_against`].
 //!
-//! ## The changelog's "History" group is deliberately not built here
+//! ## The History group (Revision R10)
 //!
-//! The 2026-07-29 revision's changelog entry 9 also describes a new default-scope group,
-//! **History** - `Undo — keep all changes` (`mod+Z`) and `Redo — discard worktree`
-//! (`mod+shift+Z`), each showing the affected session as a sub-line. Despite the "Undo"/"Redo"
-//! labels, this is not asking for a command-pattern undo/redo stack (that's tracked separately
-//! as Revision R10, `BUILD-LOG.md`'s "an undo/redo command pattern"); read plainly, the two
-//! entries describe a per-session "keep everything this session's worktree changed" action and
-//! a "throw it all away" action. Investigating this app's real capabilities before building
-//! anything (`crate::root::merge_flow`, `crate::root::rail_render`,
-//! `crate::root::work_surface_render`) found neither has a real, already-existing backing that
-//! actually matches, on demand, for an arbitrary session:
+//! An earlier revision investigated the changelog's originally-proposed `Undo — keep all
+//! changes`/`Redo — discard worktree` palette entries and found this app had no real backing
+//! for either at the time: the only real commit path
+//! (`crate::root::AdeApp::complete_merge_flow`) only finalizes an already-running merge attempt,
+//! and the only real worktree-removal path (`crate::root::AdeApp::execute_prune`) always removes
+//! every prunable worktree at once and explicitly excludes any worktree with a live session -
+//! neither matches "act on this one arbitrary session, cold, in one click". That revision left
+//! the History group out entirely rather than half-build it against those mismatched
+//! primitives, deferring it to this one.
 //!
-//! - **"keep all changes"** - the only real commit path is
-//!   `crate::root::AdeApp::complete_merge_flow`, which finalizes an *already-running* merge
-//!   attempt (`AdeApp::merge_flow` must already be `Some`, in a `Clean` or fully-resolved
-//!   `Conflicted` state - reachable only after a real `Merge` click and, for conflicts, real
-//!   hunk resolution). It cannot commit an arbitrary session's changes cold, in one action,
-//!   the way a History row's `mod+Z` would need to.
-//! - **"discard worktree"** - the only real worktree-removal path is
-//!   `crate::root::AdeApp::execute_prune` (behind `request_prune`'s two-click confirmation),
-//!   which always removes every currently-prunable worktree at once and explicitly *excludes*
-//!   any worktree with a live session running in it
-//!   (`crate::rail::prunable_worktree_paths`/`is_prunable`) - see
-//!   `crate::root::settings_render`'s own "there is no prune only this one worktree code path"
-//!   doc comment. That is the opposite of what a History row names: a session that is still
-//!   running can never be one of prune's candidates.
-//!
-//! Wiring either palette entry to these real functions would either silently no-op for the
-//! named session (prune's live-session exclusion) or do something narrower/different than its
-//! own label promises (finalizing a merge attempt that was never started) - exactly the "fake
-//! functionality" this project's rules forbid. So the History group itself is left out of this
-//! revision entirely rather than half-built; it belongs in Revision R10, once that phase's real
-//! undo/redo architecture exists to back "keep all changes"/"discard worktree" for real.
+//! Revision R10 built the real primitives instead: `wt_core::undo::commit_all_changes` (a real,
+//! undoable "keep all changes" that can commit an arbitrary dirty worktree cold) and
+//! `wt_core::undo::discard_worktree` (a real, undoable worktree removal that snapshots
+//! uncommitted/untracked content into a real git stash first, unlike a bare
+//! `wt_core::remove_worktree(force: true)`). [`HistoryCandidate`]/[`HistoryDirection`] are this
+//! group's real data model over `crate::undo::UndoStack`'s live undo/redo cursor - see
+//! [`HistoryCandidate`]'s own docs for why it's at most two rows, never a full log.
 
 use std::path::PathBuf;
 
@@ -272,6 +257,43 @@ pub enum EntryTarget {
     /// resolved to repo-relative; see `crate::root::AdeApp::open_palette_file_result`'s docs
     /// for how it decides between opening a real diff and revealing the file in the real tree.
     File(PathBuf),
+    /// Runs `crate::root::AdeApp::perform_undo`/`perform_redo` (Revision R10) - see
+    /// [`HistoryDirection`]'s own docs for why this is the only real, actionable pair the
+    /// History group ever shows.
+    History(HistoryDirection),
+}
+
+/// Which end of `crate::root::AdeApp`'s real `crate::undo::UndoStack` a History palette row
+/// acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryDirection {
+    Undo,
+    Redo,
+}
+
+/// The one real undo action and/or the one real redo action currently available, if any - built
+/// by `crate::root::AdeApp::build_palette_groups` from the live `crate::undo::UndoStack`'s own
+/// [`crate::undo::UndoStack::peek_undo`]/[`crate::undo::UndoStack::peek_redo`]. Deliberately not
+/// a full history *log*: a stack only ever has one real next-undo and one real next-redo action
+/// at a time (undo/redo isn't random-access - acting on an older entry while a newer one still
+/// stands is exactly what `wt_core::undo`'s own identity guards would refuse), so those are the
+/// only two rows that could ever be genuinely clickable. Showing older entries as additional,
+/// unclickable rows was considered and rejected: this app's own rule against a control that
+/// looks actionable but silently does nothing extends to *rows* that look like every other real,
+/// runnable palette entry but aren't.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryCandidate {
+    pub direction: HistoryDirection,
+    /// The action's own human-readable description (e.g. `"Kept all changes (my-branch)"`),
+    /// straight off the live `crate::undo::UndoEntry` - never re-derived.
+    pub description: String,
+    /// The worktree this action affected (`crate::undo::UndoableAction::worktree_path`) - shown
+    /// as this row's `secondary` line. Deliberately *not* `description` again: an audit found
+    /// `secondary` set to a literal clone of `description`, so every History row visibly
+    /// duplicated its own label text (e.g. `Undo — Kept all changes (feature-a)    Kept all
+    /// changes (feature-a)`). The worktree path is real, distinct information `description`
+    /// doesn't already carry (which only names the branch, already visible in the label).
+    pub worktree_path: PathBuf,
 }
 
 /// A label split around its matched substring, for `pre`/`mid`/`post` rendering (three adjacent
@@ -457,6 +479,40 @@ fn filter_commands(commands: &[CommandCandidate], query: &str) -> Vec<PaletteEnt
     finish_group(scored)
 }
 
+/// Builds the History group's rows - at most two ([`HistoryCandidate::direction`]'s `Undo` and
+/// `Redo` entries, if present at all) - see [`HistoryCandidate`]'s own docs for why more than
+/// that is never shown.
+fn filter_history(history: &[HistoryCandidate], query: &str) -> Vec<PaletteEntry> {
+    let mut scored = Vec::new();
+    for candidate in history {
+        let verb = match candidate.direction {
+            HistoryDirection::Undo => "Undo",
+            HistoryDirection::Redo => "Redo",
+        };
+        let label = format!("{verb} \u{2014} {}", candidate.description);
+        let aux = [candidate.description.as_str()];
+        let Some((span, rank)) = match_against(&label, &aux, query) else {
+            continue;
+        };
+        scored.push((
+            rank,
+            PaletteEntry {
+                label: MatchedText::from_match(&label, span),
+                secondary: candidate.worktree_path.display().to_string(),
+                shortcut: Some(match candidate.direction {
+                    HistoryDirection::Undo => "mod+Z",
+                    HistoryDirection::Redo => "mod+shift+Z",
+                }),
+                status: None,
+                file_change: None,
+                session_kind: None,
+                target: EntryTarget::History(candidate.direction),
+            },
+        ));
+    }
+    finish_group(scored)
+}
+
 fn file_secondary(candidate: &FileCandidate) -> String {
     let has_stat = candidate.changed.is_some() || candidate.add > 0 || candidate.del > 0;
     if has_stat {
@@ -499,8 +555,8 @@ fn filter_files(files: &[FileCandidate], query: &str) -> Vec<PaletteEntry> {
 }
 
 /// Builds the palette's result groups for the current `scope`/`query`. Group order is always
-/// Sessions, Commands, Files; a group with zero matches is omitted entirely rather than shown
-/// as an empty header.
+/// Sessions, Commands, History, Files; a group with zero matches is omitted entirely rather than
+/// shown as an empty header.
 ///
 /// Sessions only appear in [`PaletteScope::All`] - there is no dedicated Sessions segment in the
 /// scope control. For an empty query in a scope that shows files, the file candidates are first
@@ -509,11 +565,16 @@ fn filter_files(files: &[FileCandidate], query: &str) -> Vec<PaletteEntry> {
 /// defined as "currently has uncommitted changes" - the one recency-adjacent signal the data
 /// model actually has. A non-empty query searches every file in the tree instead, under a plain
 /// `"Files"` label.
+///
+/// `history` (Revision R10) shares [`PaletteScope::Commands`] with `commands` - see
+/// [`HistoryCandidate`]'s own docs for why it's at most the two real Undo/Redo rows, never a
+/// full log.
 pub fn build_groups(
     scope: PaletteScope,
     query: &str,
     sessions: &[SessionCandidate],
     commands: &[CommandCandidate],
+    history: &[HistoryCandidate],
     files: &[FileCandidate],
 ) -> Vec<PaletteGroup> {
     let mut groups = Vec::new();
@@ -533,6 +594,16 @@ pub fn build_groups(
         if !entries.is_empty() {
             groups.push(PaletteGroup {
                 label: "Commands",
+                entries,
+            });
+        }
+    }
+
+    if matches!(scope, PaletteScope::All | PaletteScope::Commands) {
+        let entries = filter_history(history, query);
+        if !entries.is_empty() {
+            groups.push(PaletteGroup {
+                label: "History",
                 entries,
             });
         }
@@ -732,7 +803,7 @@ mod tests {
             file("src/unchanged.rs", None),
         ];
 
-        let groups = build_groups(PaletteScope::All, "", &sessions, &commands, &files);
+        let groups = build_groups(PaletteScope::All, "", &sessions, &commands, &[], &files);
 
         let labels: Vec<&str> = groups.iter().map(|g| g.label).collect();
         assert_eq!(
@@ -755,7 +826,7 @@ mod tests {
             .map(command_candidate)
             .collect();
 
-        let groups = build_groups(PaletteScope::Commands, "wor", &[], &commands, &[]);
+        let groups = build_groups(PaletteScope::Commands, "wor", &[], &commands, &[], &[]);
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].label, "Commands");
@@ -774,7 +845,7 @@ mod tests {
             file("src/db/query_cache.rs", None),
         ];
 
-        let groups = build_groups(PaletteScope::Files, "quer", &[], &[], &files);
+        let groups = build_groups(PaletteScope::Files, "quer", &[], &[], &[], &files);
 
         assert_eq!(groups.len(), 1);
         assert_eq!(
@@ -791,9 +862,9 @@ mod tests {
     #[test]
     fn sessions_never_appear_outside_all_scope() {
         let sessions = vec![session(1, "Fix rate limiter", None, Status::Run)];
-        let groups = build_groups(PaletteScope::Commands, "", &sessions, &[], &[]);
+        let groups = build_groups(PaletteScope::Commands, "", &sessions, &[], &[], &[]);
         assert!(groups.iter().all(|g| g.label != "Sessions"));
-        let groups = build_groups(PaletteScope::Files, "", &sessions, &[], &[]);
+        let groups = build_groups(PaletteScope::Files, "", &sessions, &[], &[], &[]);
         assert!(groups.iter().all(|g| g.label != "Sessions"));
     }
 
@@ -811,6 +882,7 @@ mod tests {
             "zzz_no_such_thing",
             &sessions,
             &commands,
+            &[],
             &files,
         );
         assert!(groups.is_empty());
@@ -821,7 +893,7 @@ mod tests {
         let files: Vec<FileCandidate> = (0..20)
             .map(|i| file(&format!("src/mod{i}/target.rs", i = i), None))
             .collect();
-        let groups = build_groups(PaletteScope::Files, "target", &[], &[], &files);
+        let groups = build_groups(PaletteScope::Files, "target", &[], &[], &[], &files);
         assert_eq!(groups.len(), 1);
         assert!(
             groups[0].entries.len() <= MAX_ENTRIES_PER_GROUP,
@@ -838,7 +910,7 @@ mod tests {
         // in reverse-of-expected order so a pass-through (no real sort) would fail this.
         let files = vec![file("src/my_logger.rs", None), file("src/logger.rs", None)];
 
-        let groups = build_groups(PaletteScope::Files, "log", &[], &[], &files);
+        let groups = build_groups(PaletteScope::Files, "log", &[], &[], &[], &files);
 
         assert_eq!(groups.len(), 1);
         let names: Vec<String> = groups[0]
@@ -898,10 +970,102 @@ mod tests {
             Some("fix/auth-token-race"),
             Status::Run,
         )];
-        let groups = build_groups(PaletteScope::All, "token", &sessions, &[], &[]);
+        let groups = build_groups(PaletteScope::All, "token", &sessions, &[], &[], &[]);
         let sessions_group = groups.iter().find(|g| g.label == "Sessions").unwrap();
         assert_eq!(sessions_group.entries.len(), 1);
         assert_eq!(sessions_group.entries[0].label.mid, "");
         assert_eq!(sessions_group.entries[0].label.pre, "Fix rate limiter");
+    }
+
+    #[test]
+    fn no_history_candidates_means_no_history_group_at_all() {
+        let groups = build_groups(PaletteScope::All, "", &[], &[], &[], &[]);
+        assert!(
+            groups.iter().all(|g| g.label != "History"),
+            "an empty undo stack must not render an empty History group header"
+        );
+    }
+
+    #[test]
+    fn history_group_shows_undo_and_redo_rows_with_the_real_direction_targets() {
+        let history = vec![
+            HistoryCandidate {
+                direction: HistoryDirection::Undo,
+                description: "Kept all changes (feature-a)".to_string(),
+                worktree_path: PathBuf::from("/repo/feature-a"),
+            },
+            HistoryCandidate {
+                direction: HistoryDirection::Redo,
+                description: "Discarded worktree (feature-b)".to_string(),
+                worktree_path: PathBuf::from("/repo/feature-b"),
+            },
+        ];
+        let groups = build_groups(PaletteScope::All, "", &[], &[], &history, &[]);
+        let group = groups
+            .iter()
+            .find(|g| g.label == "History")
+            .expect("a History group should be present");
+        assert_eq!(group.entries.len(), 2);
+
+        assert_eq!(
+            group.entries[0].target,
+            EntryTarget::History(HistoryDirection::Undo)
+        );
+        assert_eq!(
+            format!(
+                "{}{}{}",
+                group.entries[0].label.pre, group.entries[0].label.mid, group.entries[0].label.post
+            ),
+            "Undo \u{2014} Kept all changes (feature-a)"
+        );
+        // Regression coverage for a real render bug an audit caught: `secondary` used to be a
+        // literal clone of the label's own description, so every row visibly duplicated its own
+        // text. It must now carry real, distinct information (the affected worktree path).
+        assert_eq!(group.entries[0].secondary, "/repo/feature-a");
+        assert_ne!(
+            group.entries[0].secondary, "Kept all changes (feature-a)",
+            "secondary must not just duplicate the label's own description text"
+        );
+
+        assert_eq!(
+            group.entries[1].target,
+            EntryTarget::History(HistoryDirection::Redo)
+        );
+        assert_eq!(
+            format!(
+                "{}{}{}",
+                group.entries[1].label.pre, group.entries[1].label.mid, group.entries[1].label.post
+            ),
+            "Redo \u{2014} Discarded worktree (feature-b)"
+        );
+        assert_eq!(group.entries[1].secondary, "/repo/feature-b");
+    }
+
+    #[test]
+    fn history_group_only_appears_in_all_and_commands_scope_and_respects_the_query() {
+        let history = vec![HistoryCandidate {
+            direction: HistoryDirection::Undo,
+            description: "Kept all changes (feature-a)".to_string(),
+            worktree_path: PathBuf::from("/repo/feature-a"),
+        }];
+
+        let files_scope = build_groups(PaletteScope::Files, "", &[], &[], &history, &[]);
+        assert!(
+            files_scope.iter().all(|g| g.label != "History"),
+            "Files scope must never show the History group, matching Commands' own scoping"
+        );
+
+        let matching = build_groups(PaletteScope::Commands, "feature-a", &[], &[], &history, &[]);
+        assert!(matching.iter().any(|g| g.label == "History"));
+
+        let non_matching = build_groups(
+            PaletteScope::Commands,
+            "zzz_no_such_thing",
+            &[],
+            &[],
+            &history,
+            &[],
+        );
+        assert!(non_matching.iter().all(|g| g.label != "History"));
     }
 }

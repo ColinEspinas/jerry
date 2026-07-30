@@ -54,6 +54,7 @@ use crate::settings::{self, SettingsPage};
 use crate::settings_store::{self, CfgFormat, Settings};
 use crate::status::{self, Status};
 use crate::theme;
+use crate::undo;
 use crate::work_surface;
 use crate::worktrees::{self, WorktreeItem};
 
@@ -135,6 +136,8 @@ actions!(
         CompletionsDown,
         CompletionsAccept,
         CompletionsDismiss,
+        Undo,
+        Redo,
     ]
 );
 
@@ -472,6 +475,46 @@ pub struct AdeApp {
     /// [`Self::_prune_task`] and drop (cancel) the first mid-flight. Set synchronously before
     /// spawning, reset in that same task's completion handler.
     prune_in_flight: bool,
+    /// The real command-pattern undo/redo stack (Revision R10,
+    /// `crate::root::worktree_history`) - see [`undo::UndoStack`]'s own docs for the cursor
+    /// model. Only ever mutated from inside a background task's completion handler, after the
+    /// real `wt_core::undo::*` call it corresponds to has actually succeeded - never
+    /// speculatively at click time.
+    undo_stack: undo::UndoStack,
+    /// `Some(kind)` for the duration of any in-flight "keep all changes"/"discard worktree"/
+    /// `Undo`/`Redo` operation, naming *which* one - not just a bare `bool` - so
+    /// `Self::render_pty_footer`'s busy label ("keeping…"/"discarding…") can honestly reflect
+    /// what's actually running instead of guessing from which button happens to be visible (a
+    /// real, live-reproduced bug an audit caught: undoing a "keep all changes" made every
+    /// visible `Discard worktree` button across every session read "discarding…"). A single
+    /// field shared across all four, not four independent guards or a generation counter: these
+    /// are the only operations that ever mutate real git history or a worktree's own existence
+    /// for this feature, so fully serializing them (a second click of *any* of the four while
+    /// one is in flight is a no-op, mirroring [`Self::prune_in_flight`]'s own
+    /// single-flag-per-feature precedent) is sufficient, on its own, to make "a slow undo/redo
+    /// op racing a newer one" structurally impossible - there can never be a second one in
+    /// flight to race with. See `crate::root::worktree_history`'s own module docs for why this
+    /// is a deliberate simplification of - not a skip of - this project's usual
+    /// task-slot/generation-guard discipline.
+    worktree_history_op_in_flight: Option<worktree_history::WorktreeHistoryOpKind>,
+    /// Feedback from the most recent "keep all changes"/"discard worktree"/`Undo`/`Redo`
+    /// operation, shown in the status bar
+    /// (`root::status_bar::AdeApp::render_status_worktree_history_notice`) until the next one -
+    /// deliberately its own render slot, independent of [`Self::prune_status`] (see that
+    /// method's own docs for why sharing one slot with `prune_status` was a real bug: an
+    /// unrelated prune click could permanently hide every future worktree-history status for the
+    /// rest of the session).
+    worktree_history_status: Option<String>,
+    /// `Some(id)` after one click on session `id`'s "Discard worktree" footer button, cleared by
+    /// most other gestures in the meantime (mirroring [`Self::prune_confirm_armed`]'s own "most
+    /// other gestures disarm it" discipline, applied everywhere that field is - see
+    /// `crate::root::worktree_history::AdeApp::request_discard_worktree`'s own docs for why this
+    /// destructive-feeling action gets the same two-click confirmation as prune, even though it's
+    /// now genuinely undoable). Not a universal "any gesture at all clears it" guarantee, though:
+    /// arming *this* field's own sibling ([`Self::prune_confirm_armed`]'s first, arming click)
+    /// does not clear this one, and vice versa - only each field's own confirm/cancel/execute
+    /// paths, and a handful of other real navigation gestures, clear it.
+    discard_confirm_armed: Option<SessionId>,
     /// Whether the Settings surface is currently replacing the three-zone body - see
     /// [`Self::open_settings`]/[`Self::close_settings`], which use the same
     /// capture-and-restore shape as [`Self::palette_open`].
@@ -585,6 +628,10 @@ pub struct AdeApp {
     _status_poll_task: Option<Task<()>>,
     _disk_usage_task: Option<Task<()>>,
     _prune_task: Option<Task<()>>,
+    /// The single in-flight "keep all changes"/"discard worktree"/`Undo`/`Redo` background task,
+    /// guarded by [`Self::worktree_history_op_in_flight`] - see that field's own docs for why one
+    /// slot shared across all four is sufficient discipline here.
+    _worktree_history_task: Option<Task<()>>,
     _agent_rows_task: Option<Task<()>>,
     _merge_task: Option<Task<()>>,
     /// `Self::clear_merge_flow_for_closed_session`'s best-effort abort - kept separate from
@@ -938,6 +985,22 @@ impl Render for AdeApp {
             .size_full()
             .bg(theme::surface::WINDOW)
             .font(font(theme::font::SANS))
+            // A real, load-bearing baseline context tag (Revision R10) - not decorative. GPUI's
+            // own `KeyBindingContextPredicate::eval_inner`
+            // (`vendor/zed/crates/gpui/src/keymap/context.rs:277-280`) returns `false`
+            // *immediately*, before even inspecting which predicate variant it is, whenever the
+            // context stack for the current dispatch path is completely empty
+            // (`contexts.last()` is `None`) - live-reproduced while wiring up `Undo`/`Redo`'s
+            // `Some("!terminal")` scoping: with Settings open (a real focus target with no
+            // `.key_context(..)` anywhere on its own ancestor chain), the stack was genuinely
+            // empty, so `!terminal` never got a chance to evaluate "is 'terminal' absent" - it
+            // just always returned `false` (never matching) regardless of whether a terminal
+            // was anywhere in sight. `"app"` here guarantees the stack always has at least one
+            // frame, so `!terminal` (and any future negated-context predicate) evaluates its
+            // real, intended logic everywhere - confirmed by
+            // `root::focus::tab_strip_keybinding_tests::
+            // secondary_z_reaches_undo_once_real_focus_moves_off_the_terminal`.
+            .key_context("app")
             .on_action(cx.listener(Self::handle_new_session_action))
             .on_action(cx.listener(Self::handle_toggle_palette_action))
             .on_action(cx.listener(Self::handle_toggle_settings_action))
@@ -953,6 +1016,8 @@ impl Render for AdeApp {
             .on_action(cx.listener(Self::handle_jump_to_session_6_action))
             .on_action(cx.listener(Self::handle_jump_to_session_7_action))
             .on_action(cx.listener(Self::handle_jump_to_session_8_action))
+            .on_action(cx.listener(Self::handle_undo_action))
+            .on_action(cx.listener(Self::handle_redo_action))
             .child(self.render_title_bar(cx))
             // The Settings surface (`design_handoff_jerry_ade/README.md`: "a separate surface,
             // not a modal: it replaces the three zones while the title bar and status bar
@@ -1323,3 +1388,4 @@ mod task_pool;
 mod title_bar;
 mod widgets;
 mod work_surface_render;
+mod worktree_history;

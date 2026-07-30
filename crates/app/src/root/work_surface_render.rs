@@ -37,6 +37,7 @@ impl AdeApp {
         );
         self.focus_newly_spawned_session(window, cx);
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         cx.notify();
     }
 
@@ -77,6 +78,7 @@ impl AdeApp {
     ) {
         self.sessions.set_active(id);
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         if self.open_change.is_some() {
             self.open_change = None;
             self.refresh_open_diff_file_cache();
@@ -142,6 +144,7 @@ impl AdeApp {
     ) {
         self.close_session(id, window, cx);
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         cx.notify();
     }
 
@@ -210,6 +213,7 @@ impl AdeApp {
         );
         self.focus_newly_spawned_session(window, cx);
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         cx.notify();
     }
 
@@ -240,6 +244,7 @@ impl AdeApp {
                 );
                 self.focus_newly_spawned_session(window, cx);
                 self.prune_confirm_armed = false;
+                self.discard_confirm_armed = None;
                 cx.notify();
             }
         }
@@ -1274,10 +1279,48 @@ impl AdeApp {
             {
                 enabled = false;
             }
+            // `Keep all`/`Discard worktree` (Revision R10) share one in-flight guard
+            // (`Self::worktree_history_op_in_flight`) with `Undo`/`Redo` - see
+            // `crate::root::worktree_history`'s own module docs for why one flag is enough
+            // discipline here. Disabled, not just relabelled, while busy - mirrors
+            // `Self::render_rail_footer`'s own `prune_in_flight` gating.
+            let is_worktree_history_action = matches!(
+                action.kind,
+                work_surface::ActionKind::KeepAllChanges
+                    | work_surface::ActionKind::DiscardWorktree
+            );
+            if is_worktree_history_action && self.worktree_history_op_in_flight.is_some() {
+                enabled = false;
+            }
+            // Busy labels are keyed off the *specific* in-flight kind, not just "something is
+            // running" - a real, live-reproduced bug an audit caught: keying this off the bare
+            // in-flight flag alone made every visible `Discard worktree` button across every
+            // session read "discarding…" while an unrelated `Undo` of a `Keep all` was running.
+            let label = match action.kind {
+                work_surface::ActionKind::DiscardWorktree
+                    if self.worktree_history_op_in_flight
+                        == Some(worktree_history::WorktreeHistoryOpKind::Discard) =>
+                {
+                    "discarding\u{2026}".to_string()
+                }
+                work_surface::ActionKind::DiscardWorktree
+                    if self.discard_confirm_armed == Some(id) =>
+                {
+                    "confirm discard?".to_string()
+                }
+                work_surface::ActionKind::KeepAllChanges
+                    if self.worktree_history_op_in_flight
+                        == Some(worktree_history::WorktreeHistoryOpKind::Keep) =>
+                {
+                    "keeping\u{2026}".to_string()
+                }
+                _ => action.label.to_string(),
+            };
             footer = footer.child(self.render_footer_action_button(
                 id,
                 cwd.clone(),
                 action,
+                label,
                 enabled,
                 cx,
             ));
@@ -1294,15 +1337,19 @@ impl AdeApp {
         id: SessionId,
         cwd: PathBuf,
         action: work_surface::FooterAction,
+        label: String,
         enabled: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let colors = work_surface::action_button_colors(action.style);
-        let label = action.label;
         let kind = action.kind;
 
+        // Keyed off `kind`, not `label` - `label` now varies at render time (the confirm/busy
+        // text swaps above), and an element's `id` should stay stable across that, matching
+        // `Self::render_rail_footer`'s own static `"rail-prune"` id for its own label-swapping
+        // button.
         let mut button = div()
-            .id(format!("footer-action-{id}-{label}"))
+            .id(format!("footer-action-{id}-{kind:?}"))
             .h(px(23.0))
             .px(px(10.0))
             .rounded(theme::radius::BUTTON)
@@ -1360,6 +1407,10 @@ impl AdeApp {
                         }
                         work_surface::ActionKind::Respawn => this.respawn_session(id, window, cx),
                         work_surface::ActionKind::Archive => this.archive_session(id, window, cx),
+                        work_surface::ActionKind::KeepAllChanges => this.keep_all_changes(id, cx),
+                        work_surface::ActionKind::DiscardWorktree => {
+                            this.request_discard_worktree(id, window, cx)
+                        }
                         work_surface::ActionKind::Unimplemented => {}
                     }),
                 );

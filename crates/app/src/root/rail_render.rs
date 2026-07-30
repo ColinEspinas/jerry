@@ -1,10 +1,11 @@
 use super::*;
-use crate::root::widgets::{render_keycap_row, KeycapSize};
+use crate::root::widgets::{render_keycap_row, text_tooltip, KeycapSize};
 
 impl AdeApp {
     pub(super) fn toggle_rail_mode(&mut self, cx: &mut Context<Self>) {
         self.rail_mode = self.rail_mode.toggled();
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         cx.notify();
     }
 
@@ -41,6 +42,7 @@ impl AdeApp {
         };
         if changed {
             self.prune_confirm_armed = false;
+            self.discard_confirm_armed = None;
             cx.notify();
             cx.stop_propagation();
         }
@@ -249,6 +251,7 @@ impl AdeApp {
 
         if candidates.is_empty() {
             self.prune_confirm_armed = false;
+            self.discard_confirm_armed = None;
             self.prune_status = Some("nothing to prune".to_string());
             cx.notify();
             return;
@@ -265,6 +268,7 @@ impl AdeApp {
         }
 
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         self.execute_prune(candidates, cx);
     }
 
@@ -1012,17 +1016,30 @@ impl AdeApp {
             .h(theme::band::SURFACE_FOOTER)
             .border_t_1()
             .border_color(theme::border::RAIL_INNER)
-            .child(
+            .child({
+                // `Self::worktree_history_status` deliberately does *not* share this slot - an
+                // audit found `prune_status` (never cleared once set - see that field's own
+                // docs) permanently masked every future worktree-history status after a single
+                // prune click, including honest refusal messages that are the only pointer to
+                // real recoverable content (e.g. `Error::DiscardRemovalFailedAfterStash`'s stash
+                // id). It's shown instead in the status bar
+                // (`Self::render_status_worktree_history_notice`), which - unlike this rail
+                // footer - stays on screen even while Settings covers the whole workspace body.
+                let status = self
+                    .prune_status
+                    .clone()
+                    .unwrap_or_else(|| format!("{worktree_count} worktrees \u{b7} {disk_label}"));
                 div()
+                    .id("rail-footer-status")
+                    .min_w_0()
+                    .max_w(px(320.0))
+                    .truncate()
                     .font(font(theme::font::MONO))
                     .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::GHOST)
-                    .child(if let Some(status) = &self.prune_status {
-                        status.clone()
-                    } else {
-                        format!("{worktree_count} worktrees \u{b7} {disk_label}")
-                    }),
-            )
+                    .tooltip(text_tooltip(status.clone()))
+                    .child(status)
+            })
             .child(prune_button)
     }
 }

@@ -524,6 +524,8 @@ fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::CompletionsDown" => Some("Completions: select next"),
         "app::CompletionsAccept" => Some("Completions: accept selected"),
         "app::CompletionsDismiss" => Some("Completions: dismiss"),
+        "app::Undo" => Some("Undo"),
+        "app::Redo" => Some("Redo"),
         _ => None,
     }
 }
@@ -1024,6 +1026,8 @@ mod tests {
                 "New session",
                 "Command palette",
                 "Open settings",
+                "Undo",
+                "Redo",
                 "Go to definition",
                 "New terminal",
                 "New agent pane",
@@ -1116,6 +1120,12 @@ mod tests {
         // `"file-editor"` set minus `EditorSaveAnyway` (see
         // `keybinding_rows_are_derived_in_real_registration_order`'s own updated expectations
         // for exactly which).
+        // Revision R10 added 2 more real scoped bindings, `Undo`/`Redo`, each `Some("!terminal")`
+        // - a real, live-reproduced-conflict fix in the same class as `]`'s own
+        // `"diff && !file-editor"` narrowing above: `secondary-z` resolves to plain `Ctrl+Z` on
+        // Linux/Windows, which a focused terminal needs unclaimed to send the real `SIGTSTP`
+        // suspend control byte (`crate::terminal_pane::keystroke_to_bytes`) - see
+        // `crate::default_key_bindings`'s own docs for the full reasoning.
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings);
         assert!(!rows.is_empty());
@@ -1123,10 +1133,10 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            43,
+            45,
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
-             every real Completions* binding (5) plus every real merge-editor binding (18) to \
-             be scoped, not global"
+             every real Completions* binding (5) plus every real merge-editor binding (18) plus \
+             Undo/Redo (2) to be scoped, not global"
         );
         assert!(
             scoped.iter().any(|row| row.command == "Next changed file"),

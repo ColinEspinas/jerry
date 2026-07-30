@@ -203,3 +203,43 @@ fn render_action_keycap(
         .text_color(fg)
         .child(label.into())
 }
+
+/// A plain, real GPUI tooltip view - just the given text, styled to match this app's other
+/// small popovers (`theme::surface::POPOVER`/`theme::border::POPOVER`, the same tokens
+/// `root::completions`'s own completion popup uses). Backs [`text_tooltip`]; see that function's
+/// own docs for why this exists.
+struct TextTooltip {
+    text: gpui::SharedString,
+}
+
+impl gpui::Render for TextTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(420.0))
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(theme::radius::CARD_SM)
+            .bg(theme::surface::POPOVER)
+            .border_1()
+            .border_color(theme::border::POPOVER)
+            .font(font(theme::font::MONO))
+            .text_size(px(10.0))
+            .text_color(theme::text::PRIMARY)
+            .child(self.text.clone())
+    }
+}
+
+/// A real `.tooltip(...)` callback (`vendor/zed/crates/gpui/src/elements/div.rs`'s
+/// `InteractiveElement::tooltip`: `impl Fn(&mut Window, &mut App) -> AnyView`) that shows
+/// `text` verbatim, unstyled beyond [`TextTooltip`]'s own plain popover chrome - for the real,
+/// load-bearing but potentially long status text this app now truncates on screen (an audit
+/// found long undo/redo/keep/discard error text - a full stash id, two full 40-character commit
+/// shas - rendered with no truncation *or* tooltip at all, in a narrow rail-footer div). Pairs
+/// with `.truncate()` on the same element: the on-screen text is cut short with an ellipsis, and
+/// this tooltip carries the real, untruncated text on hover.
+pub(super) fn text_tooltip(
+    text: impl Into<gpui::SharedString>,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    let text = text.into();
+    move |_window, cx| cx.new(|_| TextTooltip { text: text.clone() }).into()
+}

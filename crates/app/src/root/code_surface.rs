@@ -103,6 +103,7 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         self.focus_code_surface(window, cx);
         // Clear any stale pending cursor line from an abandoned navigation;
         // `navigate_to_definition` re-sets it right after this if it has a target line.
@@ -170,6 +171,7 @@ impl AdeApp {
         self.dismiss_completions();
         self.code_cursor = None;
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         cx.notify();
     }
 
@@ -238,6 +240,7 @@ impl AdeApp {
             }
         }
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         cx.notify();
     }
 

@@ -133,11 +133,39 @@ impl AdeApp {
             },
         ];
 
+        // At most two real rows (Revision R10) - see `palette::HistoryCandidate`'s own docs for
+        // why this is never a full log. Omitted entirely while a worktree-history operation is
+        // already in flight (`Self::worktree_history_op_in_flight`) - a real, live-reproduced
+        // bug an audit caught: `Self::perform_undo`/`perform_redo` already no-op while busy
+        // (mirroring every other entry point into this feature), so leaving the rows visible and
+        // apparently clickable in that window was exactly the "looks actionable but silently
+        // does nothing" pattern this app's own rules forbid, the same discipline the footer's
+        // `Keep all`/`Discard worktree` buttons already get by being genuinely disabled while
+        // busy.
+        let mut history = Vec::new();
+        if self.worktree_history_op_in_flight.is_none() {
+            if let Some(entry) = self.undo_stack.peek_undo() {
+                history.push(palette::HistoryCandidate {
+                    direction: palette::HistoryDirection::Undo,
+                    description: entry.description.clone(),
+                    worktree_path: entry.action.worktree_path().to_path_buf(),
+                });
+            }
+            if let Some(entry) = self.undo_stack.peek_redo() {
+                history.push(palette::HistoryCandidate {
+                    direction: palette::HistoryDirection::Redo,
+                    description: entry.description.clone(),
+                    worktree_path: entry.action.worktree_path().to_path_buf(),
+                });
+            }
+        }
+
         palette::build_groups(
             self.palette_scope,
             &self.palette_query,
             &sessions,
             &commands,
+            &history,
             &self.palette_file_candidates,
         )
     }
@@ -234,6 +262,7 @@ impl AdeApp {
                 // `Self::open_palette`'s docs); the other branches already do this via the
                 // methods they call, so this one clears it explicitly.
                 self.prune_confirm_armed = false;
+                self.discard_confirm_armed = None;
                 let next = match self.right_sidebar_view {
                     RightSidebarView::Files => RightSidebarView::Changes,
                     RightSidebarView::Changes => RightSidebarView::Files,
@@ -271,6 +300,7 @@ impl AdeApp {
         // Every palette selection counts as a fresh gesture that disarms a pending prune
         // confirmation (see `Self::open_palette`'s docs).
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         let relative = path
             .strip_prefix(&self.file_tree_root)
             .map(|p| p.to_path_buf())
@@ -310,6 +340,12 @@ impl AdeApp {
                 }
                 palette::EntryTarget::Session(id) => self.select_session(id, window, cx),
                 palette::EntryTarget::File(path) => self.open_palette_file_result(path, window, cx),
+                palette::EntryTarget::History(palette::HistoryDirection::Undo) => {
+                    self.perform_undo(cx)
+                }
+                palette::EntryTarget::History(palette::HistoryDirection::Redo) => {
+                    self.perform_redo(cx)
+                }
             }
         }
         self.close_palette(window, cx);
@@ -674,6 +710,10 @@ impl AdeApp {
                     .unwrap_or_default();
                 render_palette_file_chip(file_tree::lang_chip_for_name(&name)).into_any_element()
             }
+            // History rows (Revision R10) are commands in every sense that matters to this
+            // chip (a fixed, non-file, non-session action) - reusing the same chip rather than
+            // inventing a dedicated one for two rows.
+            palette::EntryTarget::History(_) => render_palette_command_chip().into_any_element(),
         };
 
         let mut row = div()

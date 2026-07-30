@@ -214,8 +214,17 @@ pub enum ActionKind {
     /// Closes this tab (`Sessions::close`) - the same action as the context bar's own `Archive`
     /// button.
     Archive,
-    /// No backing logic exists yet (git-level review/merge/editor-surface workflows) - always
-    /// rendered disabled regardless of [`FooterAction::implemented`] (always `false` for these).
+    /// `crate::root::worktree_history::AdeApp::keep_all_changes` (Revision R10): a real,
+    /// undoable `wt_core::undo::commit_all_changes` on this session's worktree.
+    KeepAllChanges,
+    /// `crate::root::worktree_history::AdeApp::request_discard_worktree` (Revision R10): a real,
+    /// undoable `wt_core::undo::discard_worktree`, behind the same two-click confirmation as the
+    /// rail footer's `prune` button (see that method's own docs for why - this is real,
+    /// destructive-feeling, and force-removes a worktree, even though it's now recoverable via
+    /// `Undo`).
+    DiscardWorktree,
+    /// No backing logic exists yet (git-level review/editor-surface workflows) - always rendered
+    /// disabled regardless of [`FooterAction::implemented`] (always `false` for these).
     Unimplemented,
 }
 
@@ -235,19 +244,31 @@ pub struct FooterAction {
     pub implemented: bool,
 }
 
-/// The footer action strip for one [`Status`]: review gets `Keep all ⌘⏎` (green) · `Review
-/// diff` · `Open in editor` · `Discard worktree`; ask gets `Open terminal` · `Interrupt ⌃C`;
-/// fail gets `Retry ⌘R` · `Open terminal` · `Discard worktree`; run gets `Interrupt ⌃C` ·
-/// `Open terminal`; idle gets `Resume ⌘⏎` (blue) · `Archive`.
+/// The footer action strip for one [`Status`]: review gets `Keep all ⌘⏎` (green, real - Revision
+/// R10) · `Review diff` (still unimplemented) · `Open in editor` (still unimplemented) ·
+/// `Discard worktree` (real - Revision R10); ask gets `Open terminal` · `Interrupt ⌃C`; fail gets
+/// `Retry ⌘R` · `Open terminal` · `Discard worktree` (real - Revision R10); run gets
+/// `Interrupt ⌃C` · `Open terminal`; idle gets `Resume ⌘⏎` (blue) · `Archive`.
 pub fn footer_actions(status: Status) -> Vec<FooterAction> {
     match status {
         Status::Review => vec![
             FooterAction {
-                kind: ActionKind::Unimplemented,
+                kind: ActionKind::KeepAllChanges,
                 label: "Keep all",
-                keycap: Some("mod+enter"),
+                // No keycap: the original mockup shows `mod+enter`, but this app has no real
+                // global keybinding for it - see `crate::default_key_bindings`'s own docs on
+                // why a global `Ctrl+Enter`/`Cmd+Enter` isn't safe to add casually (the same
+                // "app-level shortcut steals terminal input" risk class already documented
+                // there for `secondary-p`/`Undo`/`Redo`; this app's whole domain is running
+                // agent CLIs in terminals, and Ctrl+Enter/Cmd+Enter is a plausible binding one
+                // of them could reasonably use for its own "submit" gesture). An audit caught
+                // this row still advertising the keycap after being promoted from
+                // `implemented: false` - a real keycap must never render for a keystroke that
+                // does nothing, the same rule `Self::render_pty_header`'s own `clear` hint
+                // already follows for the identical reason.
+                keycap: None,
                 style: ActionStyle::PrimaryGreen,
-                implemented: false,
+                implemented: true,
             },
             FooterAction {
                 kind: ActionKind::Unimplemented,
@@ -264,11 +285,11 @@ pub fn footer_actions(status: Status) -> Vec<FooterAction> {
                 implemented: false,
             },
             FooterAction {
-                kind: ActionKind::Unimplemented,
+                kind: ActionKind::DiscardWorktree,
                 label: "Discard worktree",
                 keycap: None,
                 style: ActionStyle::Ghost,
-                implemented: false,
+                implemented: true,
             },
         ],
         Status::Ask => vec![
@@ -303,11 +324,11 @@ pub fn footer_actions(status: Status) -> Vec<FooterAction> {
                 implemented: true,
             },
             FooterAction {
-                kind: ActionKind::Unimplemented,
+                kind: ActionKind::DiscardWorktree,
                 label: "Discard worktree",
                 keycap: None,
                 style: ActionStyle::Ghost,
-                implemented: false,
+                implemented: true,
             },
         ],
         Status::Run => vec![
@@ -463,12 +484,18 @@ mod tests {
     }
 
     #[test]
-    fn review_actions_are_all_disabled_since_no_review_workflow_exists_yet() {
-        for action in footer_actions(Status::Review) {
-            assert!(
-                !action.implemented,
-                "{} must be disabled - no real diff-review/merge backing exists this phase",
-                action.label
+    fn review_actions_keep_all_and_discard_are_real_review_diff_and_open_in_editor_are_not() {
+        let actions = footer_actions(Status::Review);
+        for action in &actions {
+            let should_be_implemented = matches!(
+                action.kind,
+                ActionKind::KeepAllChanges | ActionKind::DiscardWorktree
+            );
+            assert_eq!(
+                action.implemented, should_be_implemented,
+                "{} implemented={} - Revision R10 gave Keep all/Discard worktree real backing, \
+                 Review diff/Open in editor still have none",
+                action.label, action.implemented
             );
         }
     }
@@ -482,11 +509,12 @@ mod tests {
     }
 
     #[test]
-    fn fail_actions_include_a_real_retry_and_a_disabled_discard() {
+    fn fail_actions_include_a_real_retry_and_a_real_discard() {
         let actions = footer_actions(Status::Fail);
         assert_eq!(actions[0].kind, ActionKind::Respawn);
         assert!(actions[0].implemented);
-        assert!(!actions.last().unwrap().implemented);
+        assert_eq!(actions.last().unwrap().kind, ActionKind::DiscardWorktree);
+        assert!(actions.last().unwrap().implemented);
     }
 
     #[test]

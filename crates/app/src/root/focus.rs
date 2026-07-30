@@ -36,6 +36,7 @@ impl AdeApp {
         self.palette_query.clear();
         self.palette_selected = 0;
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         window.focus(&self.palette_focus_handle, cx);
         cx.notify();
     }
@@ -72,6 +73,7 @@ impl AdeApp {
         self.settings_open = true;
         self.settings_focus.capture(window, &self.sessions, cx);
         self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
         window.focus(&self.settings_focus_handle, cx);
         self.load_agent_rows(cx);
         self.load_lsp_rows(cx);
@@ -664,6 +666,83 @@ mod tab_strip_keybinding_tests {
             "with only a terminal focused (no real \"diff\" context anywhere in the dispatch \
              path), a real ] keystroke must not open anything - it should be free to reach the \
              focused terminal as literal input instead"
+        );
+    }
+
+    /// Revision R10's own version of the same real conflict class as the two tests above, for
+    /// `Undo`: `secondary-z` resolves to plain `Ctrl+Z` on Linux/Windows, which a focused
+    /// terminal needs unclaimed to receive the real `SIGTSTP` suspend control byte
+    /// (`terminal_pane::keystroke_tests::ctrl_z_maps_to_the_real_sigtstp_control_byte` covers
+    /// that half). `AdeApp::new_with_settings` always starts a window with one real shell
+    /// session already focused (see that function's own docs) - no extra spawn/focus needed
+    /// here, unlike the merge/palette tests elsewhere in this file.
+    #[gpui::test]
+    fn secondary_z_does_not_undo_while_the_default_terminal_session_is_focused(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        bind_real_keys(cx);
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.sessions.iter().count()),
+            1,
+            "sanity check: a fresh window always starts with one real, focused shell session"
+        );
+        assert!(app.read_with(cx, |app, _| app.worktree_history_status.is_none()));
+
+        let secondary_z = if cfg!(target_os = "macos") {
+            "cmd-z"
+        } else {
+            "ctrl-z"
+        };
+        cx.simulate_keystrokes(secondary_z);
+
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
+            "a real, simulated secondary-z keystroke must NOT reach Undo while the default, \
+             real terminal session has focus - crate::default_key_bindings scopes Undo/Redo to \
+             Some(\"!terminal\") specifically so this stays free to reach the pty as literal \
+             input instead"
+        );
+    }
+
+    /// The positive contrast to the test above: once real focus has genuinely moved off the
+    /// terminal (Settings open, its own real `track_focus`'d surface), `secondary-z` must reach
+    /// the real `Undo` action - proving `Some("!terminal")` isn't just silently swallowing the
+    /// keystroke everywhere.
+    #[gpui::test]
+    fn secondary_z_reaches_undo_once_real_focus_moves_off_the_terminal(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        bind_real_keys(cx);
+
+        app.update_in(cx, |app, window, cx| app.open_settings(window, cx));
+        // A real repaint is required before GPUI's key-dispatch tree reflects the new focus
+        // target - `simulate_keystrokes` dispatches against the *last painted* frame's tree,
+        // which (without this) would still be the terminal-showing frame from window creation,
+        // still tagged `"terminal"`.
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.settings_open),
+            "sanity check: Settings should now be open and focused"
+        );
+
+        let secondary_z = if cfg!(target_os = "macos") {
+            "cmd-z"
+        } else {
+            "ctrl-z"
+        };
+        cx.simulate_keystrokes(secondary_z);
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.worktree_history_status.clone()),
+            Some("nothing to undo".to_string()),
+            "once real focus has moved off the terminal, a real, simulated secondary-z \
+             keystroke must reach the real Undo action (Self::perform_undo's own honest \
+             \"nothing to undo\" status, since the stack is genuinely empty)"
         );
     }
 
