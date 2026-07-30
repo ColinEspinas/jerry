@@ -1994,3 +1994,50 @@ project keeps getting burned by.
 Independently re-verified directly: all four gates clean, `tick_cadence`'s EOF-forces-foreground
 guard spot-checked directly in source and confirmed to match what was reported, full workspace
 test suite green at 742 app tests (up from 721 before this fix and its predecessor).
+
+## Restructure crates/app/src into feature/domain folders (GitHub issue #9)
+
+Reorganized the app crate from a layer split (pure logic/state at the top level, all GPUI-
+rendering under one `root/` directory) into 12 feature/domain folders, each holding both its
+logic and its rendering together: `settings/`, `palette/`, `rail/`, `merge/`, `terminal/`,
+`code_surface/`, `sidebar/`, `work_surface/`, `status_bar/`, `title_bar/`, `lsp/`,
+`worktree_history/`. `root/` is now only the real app shell. Genuinely cross-cutting modules
+(`keymap.rs`, `theme.rs`, `fonts.rs`, `language.rs`, ...) stayed at the top level rather than
+being forced into a feature folder they don't belong to. The layer split was a reasonable,
+low-risk way to break up the original 10,872-line `root.rs` during Revision R1, but had stopped
+paying for itself: `root/` had grown to ~19 files (several 1000+ lines, `code_surface.rs` alone
+past 5900), with the corresponding logic in a separate, equally large flat directory. Pure
+reorganization: no behavior change, no new functionality.
+
+`code_surface.rs` (5931 lines) and `title_bar.rs` (1740 lines) - the highest-risk part of the
+move, since they're not 1:1 file renames but a single file torn apart - were further split
+internally within their new folders.
+
+Verified to the same rigor Revision R1's own original split was verified against, matched here
+with four independent structural comparisons: an item inventory (2391 of 2410 declarations
+identical, every remaining diff a real `mod` declaration from the reorg or a type-path rename),
+a line multiset (every changed line classified - visibility change, path rename, import
+bookkeeping, rustfmt rewrap, or a declared exception - zero unexplained residue), a token-level
+body comparison with comments and visibility stripped (1131 of 1136 item bodies byte-identical,
+the 5 remainder hand-verified as legitimate), and a full test-name bijection (896 tests,
+identical set before and after).
+
+This process caught two real bugs before they landed: a `use super::editing::...` that would
+have silently self-rebound to the wrong module after the move (the exact "captured/rebound
+against the wrong thing" bug class this project's discipline exists to catch), and a module
+that had gone genuinely public with nothing else in the crate's real API surface changing
+visibility. An independent adversarial audit, focused specifically on the failure modes unique
+to a move this size (shadowed re-imports, test-relocation correctness across the two internal
+splits, encapsulation loss from visibility widening), found zero critical bugs but flagged real
+polish gaps - stale doc comments still describing a file that no longer exists, doc references
+that lost file-level precision in the folder-level rename, and a compiler-driven encapsulation
+pass that narrowed 188 items back to their genuinely correct, folder-scoped visibility (found by
+attempting to narrow every candidate and keeping only what the compiler proved still crosses a
+folder boundary, not a grep-based estimate) - all closed in a follow-up round.
+
+Independently re-verified directly, twice: all four gates clean both times, several of the
+specific fixes spot-checked directly in source, full workspace test suite green at the exact
+same baseline both times - 742 app + 42 lsp-core + 14 pty-core + 98 wt-core tests, unchanged,
+confirming this added no new functionality and lost none. `git`'s own rename detection on the
+final commit independently corroborates the move: the large majority of touched files show as
+high-percentage renames, not delete+create pairs.
