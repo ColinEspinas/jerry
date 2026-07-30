@@ -1820,3 +1820,59 @@ derivation is memoized), confirmed not a performance concern.
 Independently re-verified directly: all four gates clean, the real `uniform_list` virtualization
 spot-checked directly in source, full workspace test suite green at 721 app tests (up from
 717).
+
+## Perf: terminal poll cadence, a throughput-throttling drain cap, and a real frame-rate ceiling
+
+Follow-up to the sidebar virtualization fix, after the user reported the app was "better but
+still lags," specifically on hover and scroll. Two real fixes landed, and one important
+negative result was found and is not yet resolved.
+
+`crate::terminal_pane`'s PTY poll loop had `POLL_INTERVAL = 33ms`, documented as "close to a
+30fps redraw rate" - measured, this was wrong on two counts. The loop's real period is the sleep
+plus tick work, so 33ms produced ~24 ticks/s in practice, and because `pty-core`'s output channel
+deliberately backpressures, that cadence was measurably throttling the child process itself: a
+real streaming child producing 4.3MB/s standalone was held to 0.80MB/s by the pane. Fixed by
+tightening to 8ms (costs nothing idle - an empty tick is one `try_recv` returning `Empty`) and
+replacing the old `MAX_CHUNKS_PER_TICK` (64) with an equivalent `MAX_BYTES_PER_TICK` (256KiB) -
+a chunk-count cap only bounds real work to within orders of magnitude, since a chunk is
+"whatever one real `read(2)` happened to return," and was measured hitting its cap on every
+tick while carrying a small fraction of the intended worst-case budget. `MAX_EOF_POLL_TICKS` is
+now derived from `POLL_INTERVAL` rather than a bare literal, closing a real bug the tightened
+interval would otherwise have silently introduced: cutting the real ~10s EOF-confirmation grace
+period to ~2.4s, reopening the exact premature-EOF race that constant exists to survive.
+Combined, measured effect: 2.7-3.5x delivered throughput under a real streaming firehose,
+terminal-output latency p50 improved ~20-25%.
+
+Two earlier hypotheses in the same investigation were tried, measured, and correctly reverted
+after an internal audit: lowering `OUTPUT_CHANNEL_CAPACITY` looked memory-neutral but was an
+8.5x throughput regression (channel capacity is the dominant control on delivered throughput
+under a slow/polling consumer, invisible to a fast-consumer benchmark); raising `READ_BUF_SIZE`
+to 64KiB, motivated by an unverified citation of `alacritty_terminal`'s own buffer size, measured
+as a ~2% change once actually verified against the real vendored source - real pty reads are
+governed by the line discipline, not the caller's buffer.
+
+**The real negative result**: this work does not raise the app's actual frame-rate ceiling. Two
+independent measurements (this investigation, and a parallel one into code-view scroll/hover
+behavior) found the app locked at exactly 30.0fps on a 60Hz display regardless of app-side draw
+cost - Settings (1.6ms draw) and the full workspace (3.4ms draw) both hit exactly 30.0fps, and
+raising the terminal's own notify rate from ~24/s to ~70/s left fps flat. The scroll/hover
+investigation separately, empirically ruled out syntax highlighting as a contributor (a real
+counter inside the highlighter recorded zero calls during scroll or hover - it only runs on
+background load/rehighlight) and found the code view's own virtualization already correct. It
+also confirmed a real, unaddressed gap - the session rail has no virtualization and its draw
+cost scales real and unbounded with worktree count (3.5ms -> 7.5ms at 31 seeded worktrees) - but
+declined to fix it, since the same measurements showed removing that cost would not move the
+30fps ceiling at all, and a correct fix needs `gpui::list` (rail rows are genuinely
+variable-height; `uniform_list` cannot represent that), a real refactor not worth landing against
+an already-disproven hypothesis.
+
+Initial hypothesis was that this ceiling was WSLg's own presentation/compositor path (this
+project's whole development environment) - **the user independently tested on native Kubuntu
+and confirmed the lag reproduces there too, ruling that out.** The real ceiling is therefore
+something in GPUI/wgpu's own presentation configuration (`PresentMode`, frame latency) that
+applies regardless of platform, not yet identified - flagged as the next real lead, not resolved
+here.
+
+Independently re-verified directly: all four gates clean, the `MAX_EOF_POLL_TICKS` derivation
+and the byte-vs-chunk drain cap spot-checked directly in source, full workspace test suite green
+(721 app + 42 lsp-core + 14 pty-core + 98 wt-core).
