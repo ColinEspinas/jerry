@@ -156,6 +156,23 @@ cargo test --workspace
 cargo run -p app
 ```
 
+The commands above build the **debug** profile — correct for running the test suite and for
+iterating on the app's own code (fast incremental compiles), but not representative of the
+app's real performance: debug builds carry no optimizations and pay for debug assertions on
+every frame's layout/paint/highlight work, on top of a real ~14x larger binary (roughly 680MB
+vs. 50MB here). For actually using the app day to day, or for judging whether it feels
+responsive, run the **release** profile instead:
+
+```sh
+cargo run --release -p app
+```
+
+This isn't optional polish - a debug-profile GPUI app is commonly 5-20x slower for the exact
+CPU-bound work this app does every frame (GPUI's own layout/paint, `tree-sitter` parsing,
+terminal-grid decode), and none of this project's own performance investigations or
+measurements (see BUILD-LOG.md's several perf-focused revisions) are representative of what a
+debug build feels like - they were all measured against release builds.
+
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all -- --check`
 must also pass — see [CONTRIBUTING.md](CONTRIBUTING.md) for the full set of checks and
 the project's other hard rules.
