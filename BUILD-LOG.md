@@ -1787,3 +1787,36 @@ corrected row height/corner radius/shadow opacity/padding against the real mocku
 Independently re-verified directly: all four gates clean, the invisible-selection bug
 spot-checked directly in source, full workspace test suite green at 717 app tests (up from
 707).
+
+## Fix: app-wide UI lag - unvirtualized Files/Changes sidebar
+
+The user reported the app was very laggy everywhere except Settings. Measured first with
+GPUI's own real frame profiler (`gpui::set_frame_trace_enabled`/`FrameTimingCollector`) rather
+than guessed at: the Files tree built every row - up to `MAX_RENDERED_FILE_ENTRIES` (500) - as
+real GPUI elements on every frame regardless of what was actually visible, inside an
+`overflow_y_scroll`; the Changes list did the same for up to 40. With `AdeApp` as one entity
+rendering everything, and a streaming terminal's 33ms poll dirtying the window ~20-30x/sec,
+that full cost was paid 20-30 times a second - ~6ms of it inside `render()` itself, the rest
+invisible GPUI prepaint/paint cost. The user's own clue was decisive: Settings has the same
+invalidation rate, but swaps out the entire workspace body for a ~12x cheaper tree, confirming
+the cost lived in the workspace body's element tree, not notify volume or polling cadence.
+Today's new per-directory "New file" button contributed a further real ~20ms/frame on its own.
+
+Fixed via `gpui::uniform_list` - the same real virtualization the code view's line list already
+uses - so only actually-visible rows become real elements. Release-build controlled A/B:
+20.3ms → 5.4ms mean draw time (19-20fps → 26-28fps). The app is no longer draw-bound; the
+remaining ~27fps ceiling is the terminal's own 33ms output-poll cadence.
+
+Two follow-up hypotheses were investigated with real measurements and correctly rejected or
+deferred rather than applied on assumption. Wrapping sibling panes in GPUI's real `.cached()`
+mechanism (used by `vendor/zed`'s own workspace/dock) was measured to save only ~2ms of an
+already-cheap draw, and - critically - would have been silently wrong: a background pane's
+`notify()` never registers in the ancestor chain `.cached()`'s invalidation check walks, so a
+cached rail would have silently frozen on stale session-status data. Not applied. The
+just-landed theme `ColorToken` system was measured directly rather than assumed safe: identity-
+theme vs. full-HSL-shift-theme draw cost is indistinguishable (5.50ms vs 5.25ms - the expensive
+derivation is memoized), confirmed not a performance concern.
+
+Independently re-verified directly: all four gates clean, the real `uniform_list` virtualization
+spot-checked directly in source, full workspace test suite green at 721 app tests (up from
+717).
