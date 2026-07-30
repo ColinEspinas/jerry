@@ -13,9 +13,9 @@ versus what's rough or unverified. Both are unusually detailed on purpose — tr
 the design record, not just changelog trivia, and try to keep new work consistent with the
 decisions they document rather than silently reversing them.
 
-You'll also need a local checkout of `vendor/zed` before anything builds — see the
-[README](README.md#vendorzed-required-setup) for the exact commands. It is intentionally
-gitignored, not a submodule.
+`gpui`/`gpui_platform` are plain git dependencies pinned to a specific
+zed-industries/zed commit — see the [README](README.md#gpui-version-pin) for the pinned
+revision. Cargo fetches them automatically; no manual checkout is needed.
 
 ## What "done" means here
 
@@ -71,9 +71,12 @@ This project's own build history (see BUILD-LOG.md) was built around a specific
 discipline: never guess a GPUI, `alacritty_terminal`, or `gix` API signature. Before
 writing a call to one:
 
-1. Check `vendor/zed/crates/gpui/examples/` first for real, runnable usage.
-2. Grep the rest of `vendor/zed` for the same call if the examples don't cover it.
-3. For crates `vendor/zed` doesn't use itself (`gix` is the main example — Zed wraps the
+1. Check the fetched `gpui` git dependency's own `crates/gpui/examples/` first for real,
+   runnable usage — Cargo checks it out under
+   `~/.cargo/git/checkouts/zed-*/<rev>/crates/gpui/examples/` (find the exact path with
+   `find ~/.cargo/git/checkouts -maxdepth 1 -iname 'zed-*'`).
+2. Grep the rest of that same checkout for the call if the examples don't cover it.
+3. For crates that checkout doesn't use itself (`gix` is the main example — Zed wraps the
    `git` CLI directly instead), read the actual fetched crate source under
    `~/.cargo/registry/src/` rather than trusting memory or documentation summaries.
 
@@ -102,7 +105,7 @@ UI ("Jerry") was built from. If you're working on UI:
 - Update `BUILD-LOG.md` (and, if the change is significant enough to shift the overall
   picture, `ASSESSMENT.md`) alongside real functional changes — both are meant to stay a
   living, accurate record, not a one-time snapshot.
-- Don't add a dependency that duplicates something already vendored/available (check
-  `vendor/zed`'s own dependency choices first, as several crates in this workspace
-  deliberately mirror its pinned versions — see e.g. `crates/app/Cargo.toml`'s
-  `tree-sitter`/`alacritty_terminal` comments for why).
+- Don't add a dependency that duplicates something already available (check upstream
+  Zed's own dependency choices first, as several crates in this workspace deliberately
+  mirror its pinned versions — see e.g. `crates/app/Cargo.toml`'s `tree-sitter`/
+  `alacritty_terminal` comments for why).
