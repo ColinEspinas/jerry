@@ -1361,9 +1361,19 @@ mod tests {
         // Advance the submodule's own checked-out commit inside the worktree - a real, dirty
         // submodule pointer change (`M sub` in `git status --porcelain`) that `git stash push`
         // is empirically unable to capture, with no flag that changes that.
-        fs::write(wt_path.join("sub").join("extra.txt"), "more\n").expect("write submodule file");
-        git(&wt_path.join("sub"), &["add", "extra.txt"]);
-        git(&wt_path.join("sub"), &["commit", "-m", "advance submodule"]);
+        //
+        // `git submodule update --init` above creates a genuinely new, independent git
+        // directory for the checked-out submodule (not a copy of `sub_dir`'s own local config,
+        // which only applies to that original repo) - a real CI runner with no global
+        // `user.email`/`user.name` configured (unlike a real developer's own machine, where
+        // this test always passed silently) fails the commit below with "Author identity
+        // unknown" without this, live-reproduced against a real GitHub Actions run.
+        let sub_wt = wt_path.join("sub");
+        git(&sub_wt, &["config", "user.email", "test@example.com"]);
+        git(&sub_wt, &["config", "user.name", "Test User"]);
+        fs::write(sub_wt.join("extra.txt"), "more\n").expect("write submodule file");
+        git(&sub_wt, &["add", "extra.txt"]);
+        git(&sub_wt, &["commit", "-m", "advance submodule"]);
         assert!(
             is_dirty(&wt_path).expect("is_dirty"),
             "a dirty submodule pointer must be flagged dirty"
