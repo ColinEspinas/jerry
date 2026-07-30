@@ -183,7 +183,27 @@ impl Sessions {
         });
         self.active = Some(id);
         self.active_by_cwd.insert(cwd, id);
+        self.sync_pane_cadence(cx);
         id
+    }
+
+    /// Re-derives every open pane's poll cadence from [`Self::active`]: exactly the active
+    /// session's pane is foreground (`TerminalPane::set_foreground`), every other pane is
+    /// background. Called at the end of **every** mutator that can change which session is
+    /// active ([`Self::spawn`], [`Self::set_active`], [`Self::activate_for_worktree`],
+    /// [`Self::close`]) - a full re-derivation over all panes rather than a delta update at
+    /// each site, so no future mutator can leave a pane's cadence stale by forgetting the
+    /// "demote the old one" half (this codebase's recurring stale-state bug class; a pane
+    /// wrongly left background would lag visibly, one wrongly left foreground would quietly
+    /// re-grow the multi-pane drain cost this flag exists to bound). Cheap enough for that:
+    /// one flag write per open session.
+    fn sync_pane_cadence(&self, cx: &mut Context<AdeApp>) {
+        for session in &self.sessions {
+            let foreground = Some(session.id) == self.active;
+            session
+                .pane
+                .update(cx, |pane, _| pane.set_foreground(foreground));
+        }
     }
 
     /// Applies a Settings › Appearance "Terminal font size" edit to every currently open
@@ -198,11 +218,14 @@ impl Sessions {
     }
 
     /// Makes `id` the globally active session, and remembers it as its own worktree's active
-    /// tab too - a no-op if `id` doesn't name a currently open session.
-    pub fn set_active(&mut self, id: SessionId) {
+    /// tab too - a no-op if `id` doesn't name a currently open session. Takes `cx` (unlike a
+    /// plain setter) because the active session is what drives every pane's poll cadence -
+    /// see [`Self::sync_pane_cadence`].
+    pub fn set_active(&mut self, id: SessionId, cx: &mut Context<AdeApp>) {
         if let Some(session) = self.sessions.iter().find(|session| session.id == id) {
             self.active = Some(id);
             self.active_by_cwd.insert(session.cwd.clone(), id);
+            self.sync_pane_cadence(cx);
         }
     }
 
@@ -218,7 +241,7 @@ impl Sessions {
     /// this on every switch - see that method's own docs for why it must also move real
     /// keyboard focus in the same step (the previously-active session's pane may no longer be
     /// rendered at all once the tab strip's own per-worktree filter applies).
-    pub fn activate_for_worktree(&mut self, cwd: &Path) {
+    pub fn activate_for_worktree(&mut self, cwd: &Path, cx: &mut Context<AdeApp>) {
         let remembered = self
             .active_by_cwd
             .get(cwd)
@@ -234,6 +257,7 @@ impl Sessions {
         if let Some(id) = id {
             self.active_by_cwd.insert(cwd.to_path_buf(), id);
         }
+        self.sync_pane_cadence(cx);
     }
 
     /// Moves keyboard focus onto the currently active session's terminal pane, if there is
@@ -315,6 +339,7 @@ impl Sessions {
                 self.focus_active(window, cx);
             }
         }
+        self.sync_pane_cadence(cx);
     }
 
     /// Moves session `dragged_id` to sit immediately before session `target_id` in this app's

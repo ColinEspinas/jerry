@@ -14,10 +14,11 @@
 //! below is at `:162`, same `impl BackgroundExecutor`), not on the foreground/UI thread.
 //! `PtySession::output()` is a bounded `std::sync::mpsc::Receiver<Vec<u8>>`; rather than a
 //! second dedicated OS thread to bridge it, this drains it with non-blocking `try_recv()`
-//! from inside a GPUI foreground async task that wakes every [`POLL_INTERVAL`] via
-//! `cx.background_executor().timer(..)`. `try_recv()` never blocks, but see
-//! [`MAX_BYTES_PER_TICK`] for why the drain loop itself is still bounded - "never blocks"
-//! isn't the same as "bounded work per call".
+//! from inside a GPUI foreground async task that wakes every [`POLL_INTERVAL`] (or, for a
+//! pane whose session isn't the globally active tab, every [`BACKGROUND_POLL_INTERVAL`] -
+//! see [`tick_cadence`]) via `cx.background_executor().timer(..)`. `try_recv()` never
+//! blocks, but see [`MAX_BYTES_PER_TICK`] for why the drain loop itself is still bounded -
+//! "never blocks" isn't the same as "bounded work per call".
 //!
 //! This is a *poller*, and that is a real, deliberate difference from Zed's own terminal, which
 //! is event-driven: `vendor/zed/crates/terminal/src/terminal.rs`'s event loop blocks on
@@ -75,8 +76,9 @@ use crate::terminal_grid::{GridCell, TerminalGrid, DEFAULT_BACKGROUND, DEFAULT_F
 use crate::terminal_links::{self, LinkMatch};
 use crate::theme;
 
-/// How often the foreground poll task wakes up to drain any pty output that has arrived
-/// and, if there was any, re-render.
+/// How often the poll task of the *globally active* session's pane (see
+/// [`TerminalPane::set_foreground`]; every other pane uses [`BACKGROUND_POLL_INTERVAL`]) wakes
+/// up to drain any pty output that has arrived and, if there was any, re-render.
 ///
 /// 8ms, i.e. roughly twice per 60Hz frame, so a byte that arrives from the child is decoded
 /// into the grid within the same frame it arrived in. This was 33ms ("close to a 30fps redraw
@@ -98,6 +100,22 @@ use crate::theme;
 /// so an idle pane still invalidates zero frames. `vendor/zed/crates/terminal/src/terminal.rs`
 /// uses a 4ms window for the same job (it coalesces pty events for 4ms before re-rendering).
 const POLL_INTERVAL: Duration = Duration::from_millis(8);
+
+/// [`POLL_INTERVAL`]'s counterpart for a pane whose session is *not* the globally active tab
+/// (see [`TerminalPane::set_foreground`]) - nobody can see a background pane's output live, so
+/// polling it twice per frame buys nothing. 33ms (the pre-tightening interval, ~30 drains/s)
+/// keeps a background agent's status/activity signal fresh to within a frame or two while
+/// capping how much foreground-thread work each background pane can generate.
+///
+/// This split exists because the 8ms/[`MAX_BYTES_PER_TICK`] tightening, correct for the *one*
+/// visible pane, was measured to be a real multi-pane regression: it raised every pane's
+/// drainable throughput ~5x, and this app's whole point is running many sessions at once. With
+/// 25 concurrently-firehosing panes (release build, real X11), all-panes-at-8ms measured
+/// 10-12fps with 60-70ms invalidation-to-paint latency and the foreground thread at ~80%
+/// saturation, vs 17-19fps / ~27ms before the tightening - the aggregate decode work, not the
+/// wake frequency, is what scales with pane count. Keying cadence on real tab visibility keeps
+/// the measured single-session throughput fix without paying it once per open session.
+const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(33);
 
 /// Defensive cap on how many output *bytes* a single poll tick will drain and decode on the
 /// GPUI foreground thread. Without a cap, a firehose child (`yes`, a chatty build tool) could
@@ -124,6 +142,37 @@ const POLL_INTERVAL: Duration = Duration::from_millis(8);
 /// many bytes, so one oversized chunk is always taken whole. Chunks are never split, so byte
 /// order and chunk boundaries reaching `TerminalGrid::append_bytes` are unchanged.
 const MAX_BYTES_PER_TICK: usize = 256 * 1024;
+
+/// [`MAX_BYTES_PER_TICK`]'s counterpart for a background pane (see
+/// [`BACKGROUND_POLL_INTERVAL`]'s docs for the measured multi-pane regression this split
+/// fixes). 32KiB per 33ms tick caps a background pane's *delivered* throughput at ~1MB/s -
+/// deliberately about what the pre-tightening cadence delivered (the old 64-chunk cap measured
+/// ~0.8MB/s against a real firehose), so a wall of background sessions can never generate more
+/// aggregate foreground decode work than the app handled before the tightening. The child
+/// isn't harmed: `pty-core`'s bounded channel backpressures it, exactly as it did for every
+/// pane pre-tightening, and the pane returns to the full [`MAX_BYTES_PER_TICK`] budget the
+/// moment its tab becomes active again.
+const BACKGROUND_MAX_BYTES_PER_TICK: usize = 32 * 1024;
+
+/// The poll cadence - (sleep interval, per-tick drain byte budget) - for one tick of
+/// [`TerminalPane::spawn_process`]'s loop, given whether this pane's session is the globally
+/// active tab and whether pty EOF is already pending.
+///
+/// `eof_pending` forces the foreground cadence regardless of visibility: [`MAX_EOF_POLL_TICKS`]
+/// is derived from [`POLL_INTERVAL`], so ticking the EOF grace countdown at any other interval
+/// would silently stretch the real ~10s exit-confirmation window (~41s at
+/// [`BACKGROUND_POLL_INTERVAL`]) - and an EOF-pending pane has nothing left to drain anyway, so
+/// there is no throughput cost to bound.
+///
+/// A pure function (not a method) so the cadence policy is unit-testable without a GPUI
+/// window - see this module's tests.
+fn tick_cadence(is_foreground: bool, eof_pending: bool) -> (Duration, usize) {
+    if is_foreground || eof_pending {
+        (POLL_INTERVAL, MAX_BYTES_PER_TICK)
+    } else {
+        (BACKGROUND_POLL_INTERVAL, BACKGROUND_MAX_BYTES_PER_TICK)
+    }
+}
 
 /// Initial pty size used for the spawned shell, before the first real resize (see
 /// `maybe_resize_pty`) has a chance to run during the first render.
@@ -319,6 +368,23 @@ pub struct TerminalPane {
     /// this cancels whatever the previous task was doing, stopping an old session's poll loop
     /// from racing a new one over the same struct fields.
     _task: Option<Task<()>>,
+    /// Whether this pane's session is the *globally active* tab
+    /// (`crate::sessions::Sessions::active`). Drives [`tick_cadence`]: only the active
+    /// session's pane gets the frame-accurate [`POLL_INTERVAL`]/[`MAX_BYTES_PER_TICK`]
+    /// cadence; every other pane polls at the coarser background cadence.
+    ///
+    /// Deliberately "globally active", not "actually visible on screen right now": a file tab
+    /// (`AdeApp::open_change`) or Settings can occupy the centre pane while the active
+    /// session's pane keeps its foreground cadence. That costs at most *one* full-cadence
+    /// pane - the multi-pane aggregate this flag exists to bound is unaffected - and keeps
+    /// the flag derivable from `Sessions::active` alone, rather than also tracking
+    /// `open_change`/`settings_open` transitions here (more writers, more ways to go stale -
+    /// this codebase's recurring bug class).
+    ///
+    /// Maintained solely by `crate::sessions::Sessions::sync_pane_cadence` (the single
+    /// writer, resynced on every active-session change); `true` at construction because
+    /// `Sessions::spawn` makes a new session active in the same step.
+    is_foreground: bool,
 }
 
 impl TerminalPane {
@@ -344,6 +410,7 @@ impl TerminalPane {
             cell_width_px: None,
             resize_latch: ResizeLatch::default(),
             _task: None,
+            is_foreground: true,
         };
         this.spawn_process(cx);
         this
@@ -423,6 +490,25 @@ impl TerminalPane {
     /// field docs for exactly when this becomes `Some`.
     pub fn exit_status(&self) -> Option<&ExitStatus> {
         self.exit_status.as_ref()
+    }
+
+    /// Tells this pane whether its session is the globally active tab - see
+    /// [`Self::is_foreground`]'s field docs. Called (only) by
+    /// `crate::sessions::Sessions::sync_pane_cadence` on every active-session change; the poll
+    /// loop reads the flag afresh each tick, so a change takes effect within one tick of
+    /// whichever cadence the pane was on. Deliberately no `cx.notify()`: the flag changes
+    /// polling cadence, never anything rendered.
+    pub fn set_foreground(&mut self, foreground: bool) {
+        self.is_foreground = foreground;
+    }
+
+    /// Whether this pane currently polls at the foreground cadence - see
+    /// [`Self::is_foreground`]'s field docs. Test-only observation point (this crate's
+    /// cadence tests); no production reader exists - the poll loop reads the field directly -
+    /// so this is `#[cfg(test)]` rather than shipping dead code.
+    #[cfg(test)]
+    pub(crate) fn is_foreground(&self) -> bool {
+        self.is_foreground
     }
 
     /// The error from the most recent failed spawn attempt, if any. A process that never
@@ -606,10 +692,20 @@ impl TerminalPane {
                 return; // the pane was dropped before the process finished starting
             }
 
+            // The pane starts foreground (see `Self::is_foreground`'s field docs), so the first
+            // tick uses the foreground interval; every later tick re-reads the live flag via
+            // the `tick_cadence` the previous tick returned.
+            let mut next_interval = POLL_INTERVAL;
             loop {
-                cx.background_executor().timer(POLL_INTERVAL).await;
+                cx.background_executor().timer(next_interval).await;
 
                 let poll_result = this.update(cx, |this, cx| {
+                    // Budget from the cadence at the tick's *start*; the interval returned at
+                    // the bottom is recomputed after any EOF transition this tick made, so a
+                    // background pane that just saw EOF starts its exit-confirmation grace
+                    // countdown at the foreground interval `MAX_EOF_POLL_TICKS` is derived
+                    // from immediately, not one background tick later.
+                    let (_, drain_budget) = tick_cadence(this.is_foreground, this.eof_pending);
                     let mut appended = false;
                     let mut process_ended = false;
                     // Captured inside the `this.session.as_mut()` borrow below (so it can
@@ -636,10 +732,11 @@ impl TerminalPane {
                             None => process_ended = true, // defensive; shouldn't happen
                         }
                     } else if let Some(session) = this.session.as_mut() {
-                        // Capped at `MAX_BYTES_PER_TICK`, not drained to empty - see that
-                        // constant's docs. Anything left in the channel is picked up next tick.
+                        // Capped at this tick's cadence budget (`MAX_BYTES_PER_TICK` or its
+                        // background counterpart - see those constants' docs), not drained to
+                        // empty. Anything left in the channel is picked up next tick.
                         let mut drained_bytes = 0usize;
-                        while drained_bytes < MAX_BYTES_PER_TICK {
+                        while drained_bytes < drain_budget {
                             match session.output().try_recv() {
                                 Ok(chunk) => {
                                     // `.max(1)` so the loop is bounded by its own iteration
@@ -715,13 +812,15 @@ impl TerminalPane {
                     // Keep polling while there's a live session, or while still waiting on a
                     // final exit status after EOF (`this.session` can be `Some` while
                     // `eof_pending` is `true`, so the two conditions aren't redundant).
-                    this.session.is_some() || this.eof_pending
+                    let keep_polling = this.session.is_some() || this.eof_pending;
+                    let (interval, _) = tick_cadence(this.is_foreground, this.eof_pending);
+                    (keep_polling, interval)
                 });
 
                 match poll_result {
-                    Ok(true) => continue,
-                    Ok(false) => break, // the child process exited; nothing left to poll
-                    Err(_) => break,    // the pane entity was dropped
+                    Ok((true, interval)) => next_interval = interval,
+                    Ok((false, _)) => break, // the child process exited; nothing left to poll
+                    Err(_) => break,         // the pane entity was dropped
                 }
             }
         });
@@ -1367,6 +1466,142 @@ impl Render for TerminalPane {
         }
 
         pane
+    }
+}
+
+#[cfg(test)]
+mod cadence_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// The mutation this exists to catch - this project's recurring stale-state bug class,
+    /// applied to this exact loop: hoisting the `is_foreground` read out of the poll loop
+    /// (capturing it once at spawn) instead of reading it fresh every tick. All the pure
+    /// [`tick_cadence`] tests below would still pass under that mutation; this one fails,
+    /// because a pane spawned foreground (the only way panes spawn) would then keep draining
+    /// on 8ms ticks forever, and the "nothing may drain in less than one background interval"
+    /// window asserted here would see the Ctrl-L echo arrive early.
+    ///
+    /// Deterministic despite the real pty: the *arrival* of the echo into pty-core's channel
+    /// takes real wall time (covered by a real sleep, generously sized), but the *drain* only
+    /// happens on poll ticks, and those are driven purely by the test executor's fake clock.
+    #[gpui::test]
+    fn a_background_pane_drains_on_the_background_interval_read_fresh_each_tick(
+        cx: &mut TestAppContext,
+    ) {
+        let pane = cx.new(|cx| {
+            TerminalPane::new(
+                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Fire the loop's first (foreground-armed) tick, demote the pane, then fire one more
+        // tick so the demotion is picked up and a BACKGROUND_POLL_INTERVAL sleep is armed.
+        cx.background_executor.advance_clock(POLL_INTERVAL);
+        cx.run_until_parked();
+        pane.update(cx, |pane, _| pane.set_foreground(false));
+        cx.background_executor.advance_clock(POLL_INTERVAL);
+        cx.run_until_parked();
+
+        // Ctrl-L; the pty's ECHOCTL echo ("^L", see
+        // `clear_with_a_live_session_sends_a_real_ctrl_l_the_pty_echoes_back`) lands in the
+        // output channel within real milliseconds - sleep long enough that it is certainly
+        // sitting there before any virtual time passes.
+        pane.update(cx, |pane, cx| pane.clear(cx));
+        std::thread::sleep(Duration::from_millis(400));
+
+        // Three foreground-sized steps: 24ms of virtual time, less than one 33ms background
+        // tick - a correctly-backgrounded pane must not have drained the echo yet.
+        for _ in 0..3 {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+        let lines = pane.read_with(cx, |pane, _| pane.visible_text_lines());
+        assert!(
+            !lines.iter().any(|line| line.contains("^L")),
+            "a background pane drained pty output in under one BACKGROUND_POLL_INTERVAL - \
+             the poll loop is not reading the live foreground flag each tick"
+        );
+
+        // Past the background interval the echo must drain normally (bounded tick loop, as in
+        // the ctrl-l test above, since exactly which tick isn't under test).
+        let mut saw_caret_l = false;
+        for _ in 0..50 {
+            cx.background_executor
+                .advance_clock(BACKGROUND_POLL_INTERVAL);
+            cx.run_until_parked();
+            let lines = pane.read_with(cx, |pane, _| pane.visible_text_lines());
+            if lines.iter().any(|line| line.contains("^L")) {
+                saw_caret_l = true;
+                break;
+            }
+        }
+        assert!(
+            saw_caret_l,
+            "the background cadence must still drain output - coarser, not never"
+        );
+
+        // And a promoted pane resumes draining (which tick is again not under test - only
+        // that promotion doesn't strand it).
+        pane.update(cx, |pane, cx| {
+            pane.set_foreground(true);
+            pane.clear(cx); // wipes the grid, sends a fresh Ctrl-L
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        let mut saw_caret_l_again = false;
+        for _ in 0..50 {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+            let lines = pane.read_with(cx, |pane, _| pane.visible_text_lines());
+            if lines.iter().any(|line| line.contains("^L")) {
+                saw_caret_l_again = true;
+                break;
+            }
+        }
+        assert!(
+            saw_caret_l_again,
+            "a pane promoted back to foreground must keep draining output"
+        );
+    }
+
+    #[test]
+    fn a_foreground_pane_gets_the_full_frame_accurate_cadence() {
+        assert_eq!(
+            tick_cadence(true, false),
+            (POLL_INTERVAL, MAX_BYTES_PER_TICK),
+            "the visible pane must keep the measured single-session throughput fix"
+        );
+    }
+
+    #[test]
+    fn a_background_pane_gets_a_strictly_coarser_interval_and_smaller_budget() {
+        let (interval, budget) = tick_cadence(false, false);
+        assert_eq!(interval, BACKGROUND_POLL_INTERVAL);
+        assert_eq!(budget, BACKGROUND_MAX_BYTES_PER_TICK);
+        // The relationships, not just the current literals: the whole point of the split is
+        // that a background pane generates strictly less foreground-thread work per second
+        // than the visible one (see BACKGROUND_POLL_INTERVAL's docs for the measured 25-pane
+        // regression this bounds).
+        assert!(interval > POLL_INTERVAL);
+        assert!(budget < MAX_BYTES_PER_TICK);
+    }
+
+    #[test]
+    fn eof_pending_forces_the_foreground_cadence_so_the_exit_grace_stays_ten_seconds() {
+        // MAX_EOF_POLL_TICKS is derived from POLL_INTERVAL; if a background pane ticked its
+        // EOF grace countdown at BACKGROUND_POLL_INTERVAL instead, the real ~10s
+        // exit-confirmation window would silently stretch ~4x (see tick_cadence's docs).
+        assert_eq!(
+            tick_cadence(false, true),
+            (POLL_INTERVAL, MAX_BYTES_PER_TICK)
+        );
+        assert_eq!(
+            tick_cadence(true, true),
+            (POLL_INTERVAL, MAX_BYTES_PER_TICK)
+        );
     }
 }
 

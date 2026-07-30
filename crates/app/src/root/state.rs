@@ -344,7 +344,7 @@ impl AdeApp {
         // fix this revision makes: before it, selecting a worktree never touched `self.sessions`
         // at all, so the centre pane could keep showing a completely different worktree's
         // terminal after a rail click.
-        self.sessions.activate_for_worktree(&path);
+        self.sessions.activate_for_worktree(&path, cx);
         // Browsing to a different worktree disarms a pending prune confirmation - see
         // `Self::request_prune`'s docs.
         self.prune_confirm_armed = false;

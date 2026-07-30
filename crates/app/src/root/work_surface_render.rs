@@ -81,7 +81,7 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.sessions.set_active(id);
+        self.sessions.set_active(id, cx);
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
         if self.open_change.is_some() {
@@ -2220,6 +2220,85 @@ mod tab_scoping_tests {
             after,
             vec![initial_id],
             "none of these malformed drops should have changed anything"
+        );
+    }
+
+    /// Exactly the globally active session's pane may poll at the frame-accurate foreground
+    /// cadence (`TerminalPane::is_foreground`); every other open pane must be demoted to the
+    /// background cadence - through every real mutator of "which session is active": spawn,
+    /// tab click (`select_session`), closing the active tab, and switching to a session-less
+    /// worktree. A pane wrongly left foreground silently re-grows the measured multi-pane
+    /// foreground-drain regression this flag exists to bound (see
+    /// `terminal_pane::BACKGROUND_POLL_INTERVAL`'s docs); one wrongly left background would lag
+    /// the very pane the user is watching.
+    #[gpui::test]
+    fn only_the_active_sessions_pane_polls_at_the_foreground_cadence(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_empty = tempfile::tempdir().expect("tempdir empty");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let foreground_ids =
+            |app: &gpui::Entity<AdeApp>, cx: &mut TestAppContext| -> Vec<SessionId> {
+                app.read_with(cx, |app, cx| {
+                    app.sessions
+                        .iter()
+                        .filter(|s| s.pane.read(cx).is_foreground())
+                        .map(|s| s.id)
+                        .collect()
+                })
+            };
+
+        let (first_id, second_id) = app.update_in(cx, |app, window, cx| {
+            let first_id = app.sessions.active_id().expect("initial shell session");
+            let second_id = app.sessions.spawn(
+                SessionKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            (first_id, second_id)
+        });
+
+        // Spawning made the new session active - it alone must be foreground.
+        assert_eq!(
+            foreground_ids(&app, cx),
+            vec![second_id],
+            "after spawn, only the newly active session's pane may be foreground"
+        );
+
+        // A real tab click: the clicked session's pane is promoted, the old one demoted.
+        app.update_in(cx, |app, window, cx| {
+            app.select_session(first_id, window, cx);
+        });
+        assert_eq!(
+            foreground_ids(&app, cx),
+            vec![first_id],
+            "selecting a tab must promote exactly that pane and demote the previous one"
+        );
+
+        // Closing the active tab promotes the surviving sibling.
+        app.update_in(cx, |app, window, cx| {
+            app.sessions.close(first_id, false, window, cx);
+        });
+        assert_eq!(
+            foreground_ids(&app, cx),
+            vec![second_id],
+            "closing the active tab must hand the foreground cadence to the promoted sibling"
+        );
+
+        // Switching to a worktree with no sessions: nothing is active, nothing is watchable -
+        // every pane must be background.
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt_empty.path().to_path_buf(), "empty")];
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+        });
+        assert_eq!(
+            foreground_ids(&app, cx),
+            Vec::<SessionId>::new(),
+            "with no active session, no pane may keep the foreground cadence"
         );
     }
 }
