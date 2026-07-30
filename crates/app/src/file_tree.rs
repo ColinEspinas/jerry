@@ -20,11 +20,18 @@ use crate::theme;
 /// large the real tree is.
 const MAX_ENTRIES: usize = 5000;
 
-/// Cap on how many *visible* file-tree rows `crate::root::AdeApp::render_file_tree` turns into
-/// GPUI elements, independent of [`MAX_ENTRIES`]'s much larger loaded-tree size. Laying out that
-/// many `div`s on every render caused a measured foreground-executor stall while a terminal pane
-/// streams output. A virtualized list (`uniform_list`, see `vendor/zed/crates/project_panel`)
-/// would scale further but is out of scope here. Also bounds [`visible_entries`]'s allocation.
+/// Cap on how many *visible* file-tree rows `crate::root::AdeApp::render_file_tree` will show,
+/// independent of [`MAX_ENTRIES`]'s much larger loaded-tree size. Also bounds
+/// [`visible_entries`]'s allocation.
+///
+/// This is no longer a layout-cost guard. It used to be: every one of these rows really was
+/// turned into a GPUI element on every render, and laying out that many `div`s per frame was a
+/// measured foreground stall while a terminal pane streams output - the dominant one, in fact
+/// (~145ms of a ~200ms `Window::draw` on a real tree, measured with `gpui::FrameTiming`).
+/// `render_file_tree` is a real virtualized `gpui::uniform_list` now, so only the rows genuinely
+/// on screen ever become elements and the per-frame cost no longer scales with this number at
+/// all. What survives is the honest product decision it also encodes: this list does not pretend
+/// to represent an unbounded tree, and says so with a "... and N more entries not shown" row.
 pub const MAX_RENDERED_FILE_ENTRIES: usize = 500;
 
 /// One row in the flattened file tree: a real filesystem entry, its path, and its depth
