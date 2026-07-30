@@ -1876,3 +1876,121 @@ here.
 Independently re-verified directly: all four gates clean, the `MAX_EOF_POLL_TICKS` derivation
 and the byte-vs-chunk drain cap spot-checked directly in source, full workspace test suite green
 (721 app + 42 lsp-core + 14 pty-core + 98 wt-core).
+
+## Investigation: comparing against real Zed's frame performance
+
+The user reasonably challenged the prior entry's "out of this project's reach" conclusion: Zed
+itself - a production editor built on this exact same GPUI framework - has published real blog
+posts (`zed.dev/blog/120fps`, `zed.dev/blog/videogame`) about running at 120fps, so a fixed
+GPUI-level ceiling seemed hard to square with that. Read both posts directly rather than assume:
+they are exclusively about macOS - `CAMetalLayer`'s `presentsWithTransaction`, `CVDisplayLink`,
+triple buffering, and Apple's ProMotion dynamic-refresh displays. Neither mentions Linux, X11,
+Wayland, or Windows at all. The 120fps result is real, but it's macOS-specific engineering work,
+not a property of GPUI as a cross-platform framework - the Linux backend (what this app, and
+Zed's own Linux build, both use) goes through wgpu/GL or Vulkan and a completely different,
+apparently far-less-tuned present pipeline.
+
+Settled the actual, decisive question empirically rather than by inference: built and ran real
+Zed itself from the `vendor/zed` checkout (the genuine zed-industries/zed source, pinned at the
+exact commit this workspace's GPUI dependency is verified against), on the same X11 display,
+same instrumented GPUI, same synthetic pointer workload, on an idle system. **Real Zed hits the
+same quantization ceiling in this environment, and is worse than this app**: 20 draw calls /
+~19.8fps for Zed vs. this app's 12 draw calls / ~30fps - real Zed lands one full quantization
+tick worse. This directly falsifies "Zed doesn't have this problem" as a premise; the comparative
+evidence settles the disagreement in the other direction.
+
+Also corrected the previously-stated mechanism, which was wrong on two counts: it is not the
+present path (`frame.present()` measured 1.3-5.7ms; `get_current_texture()` a genuine 0.01ms -
+no vsync back-pressure exists at all), and it is not fill-rate bound (a window shrunk to 26% of
+the pixels left encode time flat). The real cost is `queue.submit()`, where wgpu's GL backend
+synchronously replays recorded commands as real GL calls - measured linear in batch/draw-call
+count (`encode_ms ≈ 4.09 + 1.359 × batches`, fitting all four measured subjects exactly, from a
+4-batch GPUI example at 60fps up through Zed's own 20-batch scene at ~20fps) - a real, roughly
+1.36ms-per-draw-call tax specific to this sandbox's GL-over-D3D12 translation path (the only
+adapters available here are that translation and a software Vulkan implementation; there is no
+real hardware Vulkan ICD installed). GPUI's own X11 refresh-loop timer then quantizes whatever
+that draw+present cost is to whole 16.67ms ticks (`fps = 60/ceil(draw_total_ms/16.67)`), exactly
+as the prior entry found, now with a confirmed real driver of the total.
+
+No code change made - the only lever the model exposes (draw-call/batch count) is not something
+worth contorting this app's own rendering to chase: this app is already ~40% cheaper per frame
+than the production reference implementation on this exact path. The legitimate follow-up is
+raising the underlying GPUI mechanism (drawing and presenting synchronously inside a fixed-rate
+timer whose re-arm quantizes to whole ticks, removable by pipelining present off that timer)
+with zed-industries/zed upstream, not something to patch in this project.
+
+One explicit, honest limit: the specific ~1.36ms-per-draw-call figure is a property of this
+sandbox's GL-over-D3D12 translation layer, not proven universal - the user independently
+reproduced the underlying lag complaint on a native Kubuntu machine (no WSL/WSLg involved at
+all), which the quantization *mechanism* (confirmed real and platform-independent by this same
+investigation) explains, but whose exact per-draw-call cost on that different, real hardware/
+driver combination was not and could not be measured from this sandbox.
+
+## Fix: multi-pane regression from the uniform 8ms poll cadence - visibility-keyed cadence
+
+The user reported the app "super laggy, much more than before," correlating with the poll-
+cadence tightening above. Measured before guessing, with the established harness (release
+build, real X11, `gpui::set_frame_trace_enabled`/`FrameTimingCollector` logging fps/draw-ms/
+invalidation-to-paint latency plus `/proc` CPU, against a seeded scenario of 5 git worktrees
+with 1 visible + N background sessions, each running a real streaming child through the real
+`Sessions`/`TerminalPane`/pty path).
+
+Two hypotheses tested, one refuted, one confirmed:
+
+**Refuted: "8ms wakes x N panes = redraw amplification."** At 11 panes streaming at realistic
+agent-CLI token rates (~20 chunks/s each), current master (8ms), a 33ms-interval-only variant,
+and the true pre-tightening parent build are statistically identical: ~20-23fps all three, and
+an identical ~215 invalidations/s - invalidation volume is bound by *chunk arrival*, not poll
+rate (a pane only notifies on ticks that drained bytes, and chunks arrive slower than either
+interval). 8ms actually improves output latency (dirty-to-paint p50 ~19ms -> ~9-13ms). At
+realistic token loads the tightening was innocent.
+
+**Confirmed: the tightening multiplied every pane's *drainable throughput*, and that scales
+with pane count.** 4x more ticks x the 256KiB byte budget releases pty backpressure ~5x per
+pane, and the released bytes are all decoded on the foreground thread. At 25 concurrently
+heavy-streaming panes (24 background + 1 visible `yes`-firehose), quiet machine, steady state:
+master 10-12fps, invalidation-to-paint p50 60-70ms (p95 to 92ms), main thread ~80%, process
+~117%; pre-tightening parent 17.5-19.5fps, p50 ~27ms, main ~68%, process ~92%. A real, severe
+regression exactly in this app's core scenario (many agents streaming in parallel).
+
+Fixed by keying the cadence on real tab visibility instead of reverting: only the globally
+active session's pane polls at 8ms/256KiB (keeping the measured single-session throughput fix
+- which, corrected from the entry above, now applies to the *foreground pane only*); every
+other pane polls at `BACKGROUND_POLL_INTERVAL` (33ms) with a 32KiB/tick budget, i.e. ~1MB/s -
+deliberately the same delivered rate the pre-tightening cadence measured (~0.8MB/s), so a wall
+of background sessions can never exceed the aggregate foreground-thread work the app handled
+before. Nobody can watch a background pane's output live; it re-gains the full cadence within
+one tick of its tab becoming active. EOF-pending panes are forced to the foreground cadence so
+the `MAX_EOF_POLL_TICKS`-derived ~10s exit-confirmation grace stays exact instead of silently
+stretching ~4x. `Sessions::sync_pane_cadence` is the single writer - a full re-derivation from
+`Sessions::active` at the end of every mutator (`spawn`/`set_active`/`activate_for_worktree`/
+`close`), so no path can forget the "demote the old pane" half (this project's recurring
+stale-state bug class). Deliberately keyed on "globally active", not "pixel-visible": a file
+tab or Settings occluding the active session leaves at most one full-cadence pane, and avoids
+two more state transitions that could go stale.
+
+Measured after, same scenarios, quiet machine: 25-heavy-pane case 21.5-26fps / p50 14-18ms /
+main 56-60% - better than the pre-tightening build on every metric while the visible pane
+keeps full throughput; 11-pane token case 26-27fps / p50 ~8ms / main 30-34%, unchanged from
+master within noise (as predicted: token-rate invalidation volume never was cadence-bound).
+
+Coverage: pure `tick_cadence` policy tests; a GPUI end-to-end test asserting exactly one
+foreground pane through spawn/tab-click/close/switch-to-empty-worktree; and a real-pty
+regression test pinning that the loop reads the live flag *each tick* (a hoisted-once read -
+the exact stale-capture mutation this codebase keeps getting burned by - fails its
+"nothing drains in under one background interval" window).
+
+An independent adversarial audit found no critical bugs (verified: no bypass of the four active-
+session mutators, the EOF countdown stays correct on both cadences, the cadence flag is read
+fresh every tick with no hoisting, two-foreground-panes-at-once is structurally impossible) but
+flagged five real gaps, all addressed: unfalsifiable measurement claims in doc comments (now
+backed by this entry's own raw numbers), a stale claim left in the prior revision's own entry
+(corrected above to "the foreground pane only"), a doc/code invariant mismatch around what
+"visible" means when Settings or a file tab is showing (documented as the deliberate choice it
+is), an unnecessarily public test-only accessor (narrowed to `#[cfg(test)]`), and a mutation-
+verified regression test for the exact "captured once instead of read fresh" bug class this
+project keeps getting burned by.
+
+Independently re-verified directly: all four gates clean, `tick_cadence`'s EOF-forces-foreground
+guard spot-checked directly in source and confirmed to match what was reported, full workspace
+test suite green at 742 app tests (up from 721 before this fix and its predecessor).
