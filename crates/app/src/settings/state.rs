@@ -541,6 +541,11 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::CompletionsDismiss" => Some("Completions: dismiss"),
         "app::Undo" => Some("Undo"),
         "app::Redo" => Some("Redo"),
+        "app::FileTreeContextMenu" => Some("Files tree: context menu"),
+        "app::FileTreeRename" => Some("Files tree: rename"),
+        "app::FileTreeCopy" => Some("Files tree: copy"),
+        "app::FileTreeCut" => Some("Files tree: cut"),
+        "app::FileTreePaste" => Some("Files tree: paste"),
         _ => None,
     }
 }
@@ -1124,6 +1129,15 @@ mod tests {
                 "Editor: cut",
                 "Editor: paste",
                 "Editor: save file",
+                // GitHub issue #19's file-tree bindings, each scoped to
+                // `"file-tree && !tree-editing"` - see `crate::default_key_bindings`' own docs
+                // and `crate::sidebar::tree_ops`' module docs for why both halves of that
+                // predicate are load-bearing.
+                "Files tree: context menu",
+                "Files tree: rename",
+                "Files tree: copy",
+                "Files tree: cut",
+                "Files tree: paste",
             ]
         );
     }
@@ -1167,10 +1181,20 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            45,
+            50,
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
              every real Completions* binding (5) plus every real merge-editor binding (18) plus \
-             Undo/Redo (2) to be scoped, not global"
+             Undo/Redo (2) plus every real file-tree binding (5, GitHub issue #19) to be \
+             scoped, not global"
+        );
+        assert!(
+            scoped
+                .iter()
+                .filter(|row| row.command.starts_with("Files tree: "))
+                .count()
+                == 5,
+            "every file-tree binding must be reported as scoped - a globally-bound Ctrl+C would \
+             be exactly the keystroke-swallowing bug class this list's own docs catalogue"
         );
         assert!(
             scoped.iter().any(|row| row.command == "Next changed file"),

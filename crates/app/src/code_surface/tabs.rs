@@ -113,6 +113,12 @@ impl AdeApp {
         self.push_open_file(&relative);
         self.open_change = Some(relative.clone());
         self.code_view = code_view::CodeView::File;
+        // Every "this file is now the selected tree row" path reveals it (GitHub issue #18 §5).
+        // A click in the tree has its ancestors expanded already, so this is a no-op there - but
+        // go-to-definition (`Self::navigate_to_definition`) lands on files in folders nobody has
+        // expanded, and now that the tree starts collapsed, highlighting a row that isn't
+        // showing would be no highlight at all.
+        self.reveal_in_tree(&path, cx);
         self.selected_tree_path = Some(path);
         self.refresh_open_diff_file_cache();
         // See `Self::select_worktree`'s identical reset for why - and `Self::open_change_diff`'s

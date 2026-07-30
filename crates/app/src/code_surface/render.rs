@@ -263,7 +263,7 @@ impl AdeApp {
             ],
             selected.to_string(),
             cx,
-            |this, index, cx| {
+            |this, index, _window, cx| {
                 // Index 0 is `Diff`, index 1 is `File`, per the options array above.
                 this.code_view = match index {
                     0 => code_view::CodeView::Diff,

@@ -9,6 +9,7 @@
 //! machinery the File view's real text editing uses (`vendor/zed/crates/gpui/examples/input.rs`).
 
 use super::*;
+use std::path::Path;
 
 /// State for an in-progress "New file" prompt - `Some` only while the inline name field is
 /// showing. Opened by [`AdeApp::start_new_file`], closed by [`AdeApp::create_new_file`] (on
@@ -230,23 +231,38 @@ impl AdeApp {
         let Some(input) = self.new_file_input.clone() else {
             return;
         };
-        let name = input.name.trim();
-        if name.is_empty() {
-            self.new_file_error = Some("file name can't be empty".to_string());
+        if let Err(message) = self.create_file_named(&input.parent_dir, &input.name, window, cx) {
+            self.new_file_error = Some(message);
             cx.notify();
-            return;
         }
-        if name.contains('/') || name.contains('\\') {
-            self.new_file_error = Some("file name can't contain a path separator".to_string());
-            cx.notify();
-            return;
-        }
+    }
 
-        let absolute_path = input.parent_dir.join(name);
-        if absolute_path.exists() {
-            self.new_file_error = Some(format!("\"{name}\" already exists"));
-            cx.notify();
-            return;
+    /// [`Self::create_new_file`]'s real body, callable without the modal prompt's own state - the
+    /// file tree's inline "New file" editor (GitHub issue #19 §2) drives this directly, so both
+    /// affordances create a file through one implementation rather than two.
+    ///
+    /// Returns the real rejection message on failure and leaves nothing changed, so each caller
+    /// can surface it next to *its own* field. Clears [`AdeApp::new_file_input`] on success (the
+    /// modal prompt's own dismissal) - a no-op for the tree's editor, which never opened it.
+    pub(crate) fn create_file_named(
+        &mut self,
+        parent_dir: &Path,
+        raw_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        // The one shared validator (`crate::sidebar::file_ops::validate_entry_name`), not this
+        // method's own inline copy of the rules any more: the file tree's inline New File /
+        // New Folder / Rename editors (GitHub issue #19 §2) apply exactly the same ones, and two
+        // hand-maintained copies is how they drift into disagreeing about what a legal name is.
+        let name = crate::sidebar::file_ops::validate_entry_name(raw_name)?;
+
+        let absolute_path = parent_dir.join(name);
+        // `symlink_metadata`, not `exists()`: a *broken* symlink is a real directory entry that
+        // the create below would collide with, and `exists()` follows the link and reports
+        // `false` for it (the same reasoning `file_ops::unique_destination` documents).
+        if absolute_path.symlink_metadata().is_ok() {
+            return Err(format!("\"{name}\" already exists"));
         }
 
         let relative = absolute_path
@@ -273,6 +289,11 @@ impl AdeApp {
         self.open_change = Some(relative.clone());
         self.code_view = code_view::CodeView::File;
         self.selected_tree_path = Some(absolute_path.clone());
+        // Now that the tree starts collapsed (GitHub issue #18 §1), a file created inside a
+        // folder nobody has expanded yet would otherwise be highlighted on a row that isn't
+        // showing at all. Same real reveal - and same recorded expansions - as the palette's own
+        // "reveal in tree".
+        self.reveal_in_tree(&absolute_path, cx);
         self.edit_buffers.insert(
             relative,
             edit_buffer::EditBuffer::new(absolute_path, String::new(), extension, None, 0),
@@ -283,6 +304,7 @@ impl AdeApp {
         self.save_active_file(cx);
         self.load_file_tree(self.file_tree_root.clone(), cx);
         cx.notify();
+        Ok(())
     }
 }
 

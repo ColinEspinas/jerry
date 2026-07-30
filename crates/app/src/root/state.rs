@@ -26,6 +26,21 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // The fold-state file is resolved as a sibling of whatever settings path this instance
+        // was given (`crate::sidebar::fold_state::fold_state_path_for`), so a test with a
+        // temp-dir settings path gets real, isolated fold-state persistence and a test with
+        // `None` gets none at all - the same seam, one decision.
+        let fold_state_path = settings_path
+            .as_deref()
+            .map(fold_state::fold_state_path_for);
+        let fold_state = fold_state_path
+            .as_deref()
+            .map(fold_state::FoldState::load_at)
+            .unwrap_or_default();
+        // Issue #18 §1/§2: the tree opens with exactly what this worktree had expanded last
+        // time, which for a worktree this file has never seen (including a freshly created one)
+        // is nothing at all.
+
         let mut this = Self {
             file_tree_root: repo_path.clone(),
             diff_root: repo_path.clone(),
@@ -39,7 +54,31 @@ impl AdeApp {
             right_sidebar_view: RightSidebarView::Files,
             diff_state: DiffLoadState::Loading,
             diff_totals: None,
-            collapsed_dirs: HashSet::new(),
+            // Both are filled in immediately after this literal, through the same single
+            // chokepoints every later change uses (`set_file_tree_root` +
+            // `reload_expanded_dirs_from_fold_state`) - a second, constructor-only copy of that
+            // resolution is exactly how the cached key and the root it describes drift apart.
+            expanded_dirs: HashSet::new(),
+            fold_state,
+            fold_state_path,
+            fold_state_root_key: None,
+            fold_state_owned: std::collections::BTreeSet::new(),
+            _fold_state_save_task: None,
+            fold_state_save_pending: false,
+            fold_state_save_running: false,
+            file_tree_truncated: false,
+            // Nothing has been walked yet, so nothing may be pruned yet either.
+            file_tree_complete: false,
+            file_tree_limit_override: None,
+            tree_context_menu: None,
+            tree_inline_edit: None,
+            tree_clipboard: None,
+            tree_delete_confirm: None,
+            tree_op_error: None,
+            tree_focus_handle: cx.focus_handle(),
+            file_tree_bounds: gpui::Bounds::default(),
+            _tree_delete_task: None,
+            _tree_copy_task: None,
             reviewed_files: HashSet::new(),
             open_files: Vec::new(),
             open_change: None,
@@ -181,6 +220,11 @@ impl AdeApp {
             new_file_focus_handle: cx.focus_handle(),
             new_file_error: None,
         };
+        // See the `expanded_dirs`/`fold_state_root_key` note in the literal above: resolving the
+        // worktree key here, through the one function that ever resolves it, is what keeps the
+        // startup path and every later worktree switch structurally identical.
+        this.set_file_tree_root(repo_path.clone());
+        this.reload_expanded_dirs_from_fold_state();
         // Applies `this.settings.keymap.overrides` on top of `crate::default_key_bindings()` -
         // see `Self::apply_effective_key_bindings`'s own docs. Must run before this constructor
         // returns and the entity's first render, so a persisted rebind is live from the very
@@ -280,24 +324,69 @@ impl AdeApp {
         self._disk_usage_task = Some(task);
     }
 
-    pub(super) fn load_file_tree(&mut self, root: PathBuf, cx: &mut Context<Self>) {
-        self.file_tree_root = root.clone();
+    /// The **one** place [`Self::file_tree_root`] is ever assigned, so its cached
+    /// `fold_state_root_key` can never drift out of step with it - the identity-guard discipline
+    /// this codebase has been bitten by repeatedly, applied to a derived value rather than a
+    /// borrowed one. `worktree_key`'s blocking `canonicalize` therefore runs once per real
+    /// worktree change and never on a click or a render.
+    /// Re-derives [`Self::expanded_dirs`] from the persisted fold state for whatever
+    /// [`Self::file_tree_root`] currently is - the one place that mapping is made, shared by
+    /// startup and by every worktree switch.
+    pub(crate) fn reload_expanded_dirs_from_fold_state(&mut self) {
+        self.expanded_dirs = match &self.fold_state_root_key {
+            Some(key) => self
+                .fold_state
+                .expanded_dirs_with_key(key, &self.file_tree_root),
+            None => HashSet::new(),
+        };
+    }
+
+    pub(crate) fn set_file_tree_root(&mut self, root: PathBuf) {
+        if self.file_tree_root == root && self.fold_state_root_key.is_some() {
+            return;
+        }
+        self.fold_state_root_key = fold_state::worktree_key(&root);
+        self.file_tree_root = root;
+    }
+
+    pub(crate) fn load_file_tree(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        self.set_file_tree_root(root.clone());
+        // Always a real bound - see [`Self::file_tree_limit_override`] for why even the "load
+        // more" escape hatch raises the cap rather than removing it.
+        let limit = Some(
+            self.file_tree_limit_override
+                .unwrap_or(self.settings.file_tree.max_entries),
+        );
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn({
                     let root = root.clone();
-                    async move { file_tree::build_file_tree(&root) }
+                    async move { file_tree::build_file_tree(&root, limit) }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                // Identity guard: a worktree switch that lands while this walk is still running
+                // replaces `_load_file_tree_task` (cancelling it) *and* moves
+                // `file_tree_root` - but a task already past its `await` point can still reach
+                // here. Applying a stale walk would show one worktree's tree under another's
+                // root, and - far worse now - prune the *new* worktree's fold state against the
+                // *old* worktree's directory list.
+                if this.file_tree_root != root {
+                    return;
+                }
                 match result {
-                    Ok(entries) => {
-                        this.file_tree = entries;
+                    Ok(listing) => {
+                        this.file_tree_truncated = listing.truncated;
+                        this.file_tree_complete = listing.is_complete();
+                        this.file_tree = listing.entries;
                         this.file_tree_error = None;
+                        this.prune_stale_fold_state(cx);
                     }
                     Err(err) => {
                         this.file_tree = Vec::new();
+                        this.file_tree_truncated = false;
+                        this.file_tree_complete = false;
                         this.file_tree_error = Some(err.to_string());
                     }
                 }
@@ -363,10 +452,41 @@ impl AdeApp {
             &mut self.reviewed_files,
             &mut self.open_files,
             &mut self.open_change,
-            &mut self.collapsed_dirs,
+            &mut self.expanded_dirs,
             &mut self.selected_tree_path,
             &mut self.edit_buffers,
         );
+        // The tree's fold state is per-worktree *persisted* state, not merely per-worktree
+        // transient state: the reset above clears the live set, and this re-derives it from the
+        // worktree genuinely being switched *to*. A worktree with no recorded state (a freshly
+        // created one, say) gets an empty set and so opens fully collapsed - the issue's own
+        // suggested answer to "does a fresh worktree inherit anything".
+        //
+        // `file_tree_root`/`file_tree` move in the *same* step, deliberately: `load_file_tree`
+        // below sets the root too, but its walk is asynchronous, so without this the frames
+        // between here and the walk landing would render the worktree just left's rows against
+        // the new worktree's expanded set - and a click on one of those stale rows would reach
+        // `set_dir_expanded` with a path from a different worktree entirely. Clearing
+        // `file_tree` makes that window render an honestly empty tree instead.
+        self.set_file_tree_root(path.clone());
+        self.file_tree = Vec::new();
+        self.reload_expanded_dirs_from_fold_state();
+        // Every one of these holds an absolute path in the worktree being *left* (GitHub issue
+        // #19): an open context menu targeting a row that is about to stop existing, a
+        // half-typed name for a folder in the old tree, a cut/copied entry a paste here would
+        // move across worktrees, and an armed delete for a path in the old tree. Cleared
+        // together, in the same step as `file_tree`/`expanded_dirs` above and for the same
+        // reason - the window between here and the new walk landing must not leave a control
+        // pointing at the old worktree.
+        self.tree_context_menu = None;
+        self.tree_inline_edit = None;
+        self.tree_clipboard = None;
+        self.tree_delete_confirm = None;
+        self.tree_op_error = None;
+        // "Show me the whole listing" was a decision about the worktree being left.
+        self.file_tree_limit_override = None;
+        self.file_tree_truncated = false;
+        self.file_tree_complete = false;
         // `focus_newly_spawned_session` (despite its name - its body has no "newly spawned" logic
         // in it, just the shared "move focus unless a file tab/Settings is showing" guard) closes
         // the dangling-focus risk this switch creates: the previously-active session's pane may
@@ -483,22 +603,25 @@ impl AdeApp {
 /// called from [`AdeApp::select_worktree`] on every switch. `reviewed_files`/`open_files`/
 /// `open_change` are keyed by repo-relative paths with no per-worktree scoping of their own, so
 /// without this reset a file reviewed or opened in worktree A would read as already-reviewed (or
-/// reopen) in worktree B if it shares the same relative path. `collapsed_dirs` is keyed by
-/// absolute path, so it doesn't bleed the same way, but nothing else ever pruned its entries
-/// either. A free, `gpui`-free function so this is unit-testable without constructing an
+/// reopen) in worktree B if it shares the same relative path. `expanded_dirs` is keyed by
+/// absolute path, so it doesn't bleed the same way - but it must still be emptied here, because
+/// [`AdeApp::select_worktree`] re-derives it from the *new* worktree's own persisted fold state
+/// immediately afterwards, and a leftover entry from the worktree just left would otherwise
+/// survive that (its absolute path simply never matches anything in the new tree, so nothing
+/// would ever remove it). A free, `gpui`-free function so this is unit-testable without constructing an
 /// `AdeApp`.
 pub(super) fn reset_per_worktree_ui_state(
     reviewed_files: &mut HashSet<PathBuf>,
     open_files: &mut Vec<PathBuf>,
     open_change: &mut Option<PathBuf>,
-    collapsed_dirs: &mut HashSet<PathBuf>,
+    expanded_dirs: &mut HashSet<PathBuf>,
     selected_tree_path: &mut Option<PathBuf>,
     edit_buffers: &mut HashMap<PathBuf, edit_buffer::EditBuffer>,
 ) {
     reviewed_files.clear();
     open_files.clear();
     *open_change = None;
-    collapsed_dirs.clear();
+    expanded_dirs.clear();
     *selected_tree_path = None;
     // Real, live unsaved-edit state (Revision R8.5a) is just as worktree-relative-path-keyed as
     // `open_files` above - without this, a same-named file in a different worktree could
@@ -517,7 +640,7 @@ mod tests {
         reviewed_files.insert(PathBuf::from("Cargo.toml"));
         let mut open_files = Vec::new();
         let mut open_change = Some(PathBuf::from("src/main.rs"));
-        let mut collapsed_dirs = HashSet::new();
+        let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
         let mut edit_buffers = HashMap::new();
 
@@ -525,7 +648,7 @@ mod tests {
             &mut reviewed_files,
             &mut open_files,
             &mut open_change,
-            &mut collapsed_dirs,
+            &mut expanded_dirs,
             &mut selected_tree_path,
             &mut edit_buffers,
         );
@@ -544,7 +667,7 @@ mod tests {
             PathBuf::from("README.md"),
         ];
         let mut open_change = Some(PathBuf::from("Cargo.toml"));
-        let mut collapsed_dirs = HashSet::new();
+        let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
         let mut edit_buffers = HashMap::new();
 
@@ -552,7 +675,7 @@ mod tests {
             &mut reviewed_files,
             &mut open_files,
             &mut open_change,
-            &mut collapsed_dirs,
+            &mut expanded_dirs,
             &mut selected_tree_path,
             &mut edit_buffers,
         );
@@ -569,7 +692,7 @@ mod tests {
         let mut reviewed_files = HashSet::new();
         let mut open_files = Vec::new();
         let mut open_change = None;
-        let mut collapsed_dirs = HashSet::new();
+        let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
         let mut edit_buffers = HashMap::new();
 
@@ -577,37 +700,37 @@ mod tests {
             &mut reviewed_files,
             &mut open_files,
             &mut open_change,
-            &mut collapsed_dirs,
+            &mut expanded_dirs,
             &mut selected_tree_path,
             &mut edit_buffers,
         );
 
         assert!(reviewed_files.is_empty());
         assert_eq!(open_change, None);
-        assert!(collapsed_dirs.is_empty());
+        assert!(expanded_dirs.is_empty());
     }
 
     #[test]
-    fn reset_per_worktree_ui_state_clears_collapsed_dirs_too() {
+    fn reset_per_worktree_ui_state_clears_expanded_dirs_too() {
         let mut reviewed_files = HashSet::new();
         let mut open_files = Vec::new();
         let mut open_change = None;
-        let mut collapsed_dirs = HashSet::new();
+        let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
         let mut edit_buffers = HashMap::new();
-        collapsed_dirs.insert(PathBuf::from("/repo/worktree-a/src"));
-        collapsed_dirs.insert(PathBuf::from("/repo/worktree-a/tests"));
+        expanded_dirs.insert(PathBuf::from("/repo/worktree-a/src"));
+        expanded_dirs.insert(PathBuf::from("/repo/worktree-a/tests"));
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
             &mut open_files,
             &mut open_change,
-            &mut collapsed_dirs,
+            &mut expanded_dirs,
             &mut selected_tree_path,
             &mut edit_buffers,
         );
 
-        assert!(collapsed_dirs.is_empty());
+        assert!(expanded_dirs.is_empty());
     }
 
     #[test]
@@ -615,7 +738,7 @@ mod tests {
         let mut reviewed_files = HashSet::new();
         let mut open_files = Vec::new();
         let mut open_change = None;
-        let mut collapsed_dirs = HashSet::new();
+        let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = Some(PathBuf::from("/repo/worktree-a/src/main.rs"));
         let mut edit_buffers = HashMap::new();
 
@@ -623,7 +746,7 @@ mod tests {
             &mut reviewed_files,
             &mut open_files,
             &mut open_change,
-            &mut collapsed_dirs,
+            &mut expanded_dirs,
             &mut selected_tree_path,
             &mut edit_buffers,
         );
@@ -639,7 +762,7 @@ mod tests {
         let mut reviewed_files = HashSet::new();
         let mut open_files = Vec::new();
         let mut open_change = None;
-        let mut collapsed_dirs = HashSet::new();
+        let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
         let mut edit_buffers = HashMap::new();
         edit_buffers.insert(
@@ -657,7 +780,7 @@ mod tests {
             &mut reviewed_files,
             &mut open_files,
             &mut open_change,
-            &mut collapsed_dirs,
+            &mut expanded_dirs,
             &mut selected_tree_path,
             &mut edit_buffers,
         );

@@ -267,6 +267,49 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("secondary-x", root::EditorCut, Some("merge-editor")),
         gpui::KeyBinding::new("secondary-v", root::EditorPaste, Some("merge-editor")),
         gpui::KeyBinding::new("secondary-s", root::EditorSave, Some("merge-editor")),
+        // GitHub issue #19's file-tree bindings. Every one is scoped to
+        // `"file-tree && !tree-editing && !tree-delete-confirm"`, and all three terms are
+        // load-bearing - see `crate::sidebar::tree_ops`'s own module docs for the full
+        // reasoning. The short version: `secondary-c`/`secondary-x`/`secondary-v` at `None`
+        // scope would claim the control bytes `crate::terminal::pane::keystroke_to_bytes` hands
+        // a focused shell (Ctrl+C is SIGINT - binding it globally would risk making it
+        // impossible to interrupt a running agent CLI), the exact bug class this list's `"]"`
+        // and `secondary-p` entries above already document; `!tree-editing` is what keeps them
+        // from firing while one of the tree's own inline name editors has the keystroke; and
+        // `!tree-delete-confirm` the same while the modal delete confirmation is up (`F2` or
+        // `Shift+F10` firing *behind* a modal scrim was a real finding in this change's own
+        // review). Both negated terms follow the `"file-editor && !completions"` shape above.
+        //
+        // `shift-f10` is the only context-menu keystroke bound. The dedicated Menu/Application
+        // key that some keyboards also carry is deliberately *not* bound: gpui's key names come
+        // from each platform backend at runtime and nothing in the vendored tree names that key
+        // (it isn't in `vendor/zed/crates/gpui/src/platform/keystroke.rs`'s own key vocabulary),
+        // so any spelling guessed here would be a binding that silently never matches.
+        gpui::KeyBinding::new(
+            "shift-f10",
+            root::FileTreeContextMenu,
+            Some("file-tree && !tree-editing && !tree-delete-confirm"),
+        ),
+        gpui::KeyBinding::new(
+            "f2",
+            root::FileTreeRename,
+            Some("file-tree && !tree-editing && !tree-delete-confirm"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-c",
+            root::FileTreeCopy,
+            Some("file-tree && !tree-editing && !tree-delete-confirm"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-x",
+            root::FileTreeCut,
+            Some("file-tree && !tree-editing && !tree-delete-confirm"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-v",
+            root::FileTreePaste,
+            Some("file-tree && !tree-editing && !tree-delete-confirm"),
+        ),
     ]
 }
 
