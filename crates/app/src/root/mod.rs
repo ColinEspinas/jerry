@@ -75,6 +75,7 @@ use crate::settings::state::SettingsPage;
 use crate::settings::store::{self as settings_store, CfgFormat, Settings};
 use crate::sidebar::changes::{self, ChangeTag};
 use crate::sidebar::file_tree::{self, FileTreeEntry};
+use crate::sidebar::fold_state;
 use crate::status_bar::process_stats;
 use crate::theme;
 use crate::title_bar::menu as title_bar;
@@ -177,7 +178,8 @@ pub(crate) const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(3);
 pub(crate) const FILE_FRESHNESS_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Cap on how many changed files the diff view renders, independent of `wt_core::diff`'s own
-/// `MAX_FILES` cap (300) on the loaded diff. Mirrors `file_tree::MAX_RENDERED_FILE_ENTRIES`.
+/// `MAX_FILES` cap (300) on the loaded diff. The Files tree used to have a matching
+/// render cap; it no longer does (GitHub issue #18 §4), so this one now stands alone.
 pub(crate) const MAX_RENDERED_DIFF_FILES: usize = 40;
 
 /// Cap on how many hunk lines a single file's diff renders, independent of `wt_core::diff`'s
@@ -225,11 +227,60 @@ pub struct AdeApp {
     /// [`Self::current_diff`]'s docs for exactly which [`DiffLoadState`]/[`DiffBase`]
     /// combinations count).
     pub(crate) diff_totals: Option<(u32, u32)>,
-    /// Real collapse/expand state for the file tree - a directory's path is in this set iff
-    /// the user has collapsed it (see `crate::sidebar::file_tree::visible_entries`, which this set
-    /// feeds directly). Absence means expanded, so a freshly loaded tree starts fully open,
-    /// matching the design's own default screenshots.
-    pub(crate) collapsed_dirs: HashSet<PathBuf>,
+    /// Real expand/collapse state for the file tree - a directory's absolute path is in this set
+    /// iff it is expanded (see `crate::sidebar::file_tree::visible_entries`, which this set feeds
+    /// directly). **Absence means collapsed**, so a worktree opened for the first time shows only
+    /// its root-level entries (GitHub issue #18 §1).
+    ///
+    /// This is the live, in-memory mirror of one worktree's entry in [`Self::fold_state`]; every
+    /// mutation goes through `AdeApp::set_dir_expanded`/`collapse_all_dirs`/`reveal_in_tree`,
+    /// which keep the two in step and write the change to disk immediately. Re-derived from
+    /// `fold_state` on every worktree switch (`Self::select_worktree`), never carried across one.
+    pub(crate) expanded_dirs: HashSet<PathBuf>,
+    /// Every worktree's persisted fold state, loaded once at startup from
+    /// `~/.config/jerry/file-tree-state.toml` - see `crate::sidebar::fold_state`'s module docs
+    /// for the file's shape, its per-worktree-path keying, and why it is a separate file from
+    /// `settings.toml` with a genuinely atomic write path.
+    pub(crate) fold_state: fold_state::FoldState,
+    /// The resolved path [`Self::persist_fold_state`] writes to - a sibling of
+    /// [`Self::settings_path`], and `None` for exactly the same tests that get a `None` settings
+    /// path, which makes a fold-state save a real no-op rather than a special-cased test skip.
+    pub(crate) fold_state_path: Option<PathBuf>,
+    /// The `fold_state::worktree_key`s this instance has recorded anything for - what
+    /// [`Self::persist_fold_state`] hands `FoldState::save_merged_at` as "mine to overwrite".
+    /// Every other key in the file belongs to some other running instance (one `jerry` process
+    /// per repository) and is passed through untouched; see `crate::sidebar::fold_state`'s
+    /// module docs for the whole-file-clobber this exists to prevent.
+    pub(crate) fold_state_owned: std::collections::BTreeSet<String>,
+    /// The fold-state file's serial writer loop - the exact same mechanism (and the same
+    /// reasoning) as [`Self::_settings_save_task`], just for the other file. Two writes to one
+    /// path are never allowed to overlap; a change that lands while a write is in flight is
+    /// picked up by the still-running loop.
+    pub(crate) _fold_state_save_task: Option<Task<()>>,
+    /// See [`Self::settings_save_pending`] - same contract, for the fold-state file.
+    pub(crate) fold_state_save_pending: bool,
+    /// See [`Self::settings_save_running`] - same contract, for the fold-state file.
+    pub(crate) fold_state_save_running: bool,
+    /// Whether the last completed file-tree walk stopped early at its configured entry cap
+    /// (`Settings.file_tree.max_entries`, or [`Self::file_tree_limit_override`]). Drives the
+    /// sidebar's real "load more" action - the explicit replacement for the removed
+    /// "... and N more entries not shown" row.
+    pub(crate) file_tree_truncated: bool,
+    /// Whether that walk was a *complete* inventory of the worktree's directories
+    /// (`file_tree::FileTreeListing::is_complete`) - false when it was truncated, and also when
+    /// it silently skipped an unreadable or too-deep subdirectory. The only condition under
+    /// which `AdeApp::prune_stale_fold_state` may read "not in this listing" as "deleted".
+    pub(crate) file_tree_complete: bool,
+    /// Set by the sidebar's "load more" action (`Self::load_more_file_tree_entries`): the cap
+    /// this worktree's walks use instead of `Settings.file_tree.max_entries`, raised tenfold per
+    /// click. Deliberately still a cap and never `None`: a single click that re-walked a
+    /// bind-mounted `$HOME` with an unbounded budget would allocate millions of `PathBuf`s on a
+    /// background thread and then hand them all to `rebuild_palette_file_candidates`. Each click
+    /// raises the bound and the row keeps reporting where the walk stopped, so the listing is
+    /// never *silently* cut off - which is what issue #18 §4 actually asks for. Session-scoped
+    /// and per-worktree: reset on every worktree switch, since "show me more of *this* tree"
+    /// says nothing about the next one.
+    pub(crate) file_tree_limit_override: Option<usize>,
     /// Per-file "reviewed" toggle state for the Changes list - a file's path is in this set iff
     /// its checkbox is checked. No backend "review" concept exists yet; this is purely local UI
     /// state that `Self::render_changes_header`'s progress bar and count read directly.
@@ -418,7 +469,7 @@ pub struct AdeApp {
     /// [`OverlayFocus`]/[`restore_focus`].
     pub(crate) palette_focus: OverlayFocus,
     /// The palette's file-candidate list (`crate::palette::state::FileCandidate`, one per non-directory
-    /// [`Self::file_tree`] entry, up to `file_tree::MAX_ENTRIES` = 5000) - built once by
+    /// [`Self::file_tree`] entry, up to `Settings.file_tree.max_entries`) - built once by
     /// [`Self::rebuild_palette_file_candidates`] when `file_tree`/the diff reload, not rebuilt on
     /// every `Self::build_palette_groups` call (which runs on every render while the palette is
     /// open, up to ~30x/sec during a streaming session). Session/command candidates aren't
@@ -1037,6 +1088,59 @@ impl AdeApp {
     #[cfg(test)]
     pub(crate) fn set_settings_save_test_delay(&mut self, delay: Option<Duration>) {
         self.settings_save_test_delay = delay;
+    }
+
+    /// Queues a background-executor save of [`Self::fold_state`] to [`Self::fold_state_path`].
+    /// Called from every single expand/collapse - that immediacy is the point (GitHub issue #18
+    /// §2 asks for fold changes to be "recorded immediately (crash-safe), not only on clean
+    /// exit"), and `FoldState::save_at`'s write-temp-then-rename is what makes an interrupted
+    /// write a no-op rather than a corrupted file.
+    ///
+    /// Structurally identical to [`Self::persist_settings`], including the "clear the running
+    /// flag in the same synchronous step that decides to stop" trick that keeps a change landing
+    /// at exactly the wrong moment from being silently dropped - see that method's own docs for
+    /// the full reasoning. It is a genuine no-op with a `None` path (every GPUI test that hasn't
+    /// asked for a real one).
+    ///
+    /// Unlike settings, the write is a *merge* (`FoldState::save_merged_at` against
+    /// [`Self::fold_state_owned`]): a second `jerry` process browsing a different repository is
+    /// writing the same file, and a whole-file write would erase its state.
+    pub(crate) fn persist_fold_state(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.fold_state_path.clone() else {
+            return;
+        };
+        self.fold_state_save_pending = true;
+        if self.fold_state_save_running {
+            return;
+        }
+        self.fold_state_save_running = true;
+        let task = cx.spawn(async move |this, cx| loop {
+            // The state and the owned-key set are read in the *same* synchronous step, so the
+            // pair handed to `save_merged_at` can never be a mix of two different moments.
+            let step = this.update(cx, |this, _cx| {
+                if this.fold_state_save_pending {
+                    this.fold_state_save_pending = false;
+                    Some((this.fold_state.clone(), this.fold_state_owned.clone()))
+                } else {
+                    this.fold_state_save_running = false;
+                    None
+                }
+            });
+            let Ok(Some((state, owned))) = step else {
+                break;
+            };
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let path = path.clone();
+                    async move { state.save_merged_at(&path, &owned) }
+                })
+                .await;
+            if let Err(err) = result {
+                log::warn!("failed to save {}: {err}", path.display());
+            }
+        });
+        self._fold_state_save_task = Some(task);
     }
 }
 

@@ -77,6 +77,7 @@ pub struct Settings {
     pub appearance: AppearanceSettings,
     pub theme: ThemeSettings,
     pub keymap: KeymapSettings,
+    pub file_tree: FileTreeSettings,
 }
 
 /// `crate::root::AdeApp::window_controls_style`'s persisted backing - see
@@ -222,6 +223,41 @@ pub struct KeybindingOverride {
     pub keystrokes: String,
 }
 
+/// The Files tree's one real tunable (GitHub issue #18 §4): how many entries a single
+/// `crate::sidebar::file_tree::build_file_tree` walk will collect before stopping. Not backed by a
+/// settings *page* (unlike every other section here) - it's the "large, configurable" cap the
+/// issue asks any surviving safety cap to be, edited from `settings.toml` directly, and when it
+/// is hit the sidebar shows a real "load more" action naming the count it stopped at, rather
+/// than a silent cut-off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FileTreeSettings {
+    pub max_entries: usize,
+}
+
+impl Default for FileTreeSettings {
+    fn default() -> Self {
+        Self {
+            max_entries: FILE_TREE_MAX_ENTRIES_DEFAULT,
+        }
+    }
+}
+
+/// 20,000 entries - four times the old hard-coded 5,000 bound, and comfortably more than any
+/// real source tree this app is meant for once dot-directories (`.git`, and with them the vast
+/// majority of a repository's loose files) are already skipped by the walk itself.
+pub const FILE_TREE_MAX_ENTRIES_DEFAULT: usize = 20_000;
+
+/// A hand-edited `max_entries` below this can't render a useful tree at all, so it's clamped up
+/// rather than honoured - the same [`AppearanceSettings::sanitize`] discipline applied here.
+pub const FILE_TREE_MAX_ENTRIES_MIN: usize = 100;
+
+impl FileTreeSettings {
+    pub fn sanitize(&mut self) {
+        self.max_entries = self.max_entries.max(FILE_TREE_MAX_ENTRIES_MIN);
+    }
+}
+
 /// The config banner's `TOML | JSON` segment state (`CHANGELOG.md`'s change 3) - a display-only
 /// choice, not a [`Settings`] field (switching it never touches the file) - see the module docs'
 /// "TOML is the real file; JSON is a read-only alternate view" section.
@@ -281,6 +317,7 @@ impl Settings {
             Ok(contents) => match toml::from_str::<Settings>(&contents) {
                 Ok(mut settings) => {
                     settings.appearance.sanitize();
+                    settings.file_tree.sanitize();
                     settings
                 }
                 Err(err) => {
@@ -470,6 +507,28 @@ mod tests {
         assert!(
             settings.keymap.overrides.is_empty(),
             "a fresh install has no real rebinds yet"
+        );
+        assert_eq!(
+            settings.file_tree.max_entries,
+            FILE_TREE_MAX_ENTRIES_DEFAULT
+        );
+    }
+
+    #[test]
+    fn a_hand_edited_file_tree_cap_round_trips_and_an_absurd_one_is_clamped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[file_tree]\nmax_entries = 120000\n").expect("write");
+        assert_eq!(
+            Settings::load_or_init_at(&path).file_tree.max_entries,
+            120_000
+        );
+
+        std::fs::write(&path, "[file_tree]\nmax_entries = 1\n").expect("write");
+        assert_eq!(
+            Settings::load_or_init_at(&path).file_tree.max_entries,
+            FILE_TREE_MAX_ENTRIES_MIN,
+            "a cap too small to render a usable tree is clamped up, not honoured"
         );
     }
 

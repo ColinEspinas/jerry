@@ -273,6 +273,11 @@ impl AdeApp {
         self.open_change = Some(relative.clone());
         self.code_view = code_view::CodeView::File;
         self.selected_tree_path = Some(absolute_path.clone());
+        // Now that the tree starts collapsed (GitHub issue #18 §1), a file created inside a
+        // folder nobody has expanded yet would otherwise be highlighted on a row that isn't
+        // showing at all. Same real reveal - and same recorded expansions - as the palette's own
+        // "reveal in tree".
+        self.reveal_in_tree(&absolute_path, cx);
         self.edit_buffers.insert(
             relative,
             edit_buffer::EditBuffer::new(absolute_path, String::new(), extension, None, 0),

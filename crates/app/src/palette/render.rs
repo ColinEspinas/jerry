@@ -45,8 +45,8 @@ impl AdeApp {
     /// built fresh every call so what's drawn and what `⏎`/`↑`/`↓` act on can never disagree.
     ///
     /// `sessions`/`commands` are cheap (bounded by open-tab count plus 10 fixed commands) and
-    /// built fresh here. `files` is the expensive part (up to `file_tree::MAX_ENTRIES` = 5000
-    /// entries) and is *not* rebuilt here - this reads [`Self::palette_file_candidates`], which
+    /// built fresh here. `files` is the expensive part (as many entries as the whole loaded
+    /// tree has, bounded by `Settings.file_tree.max_entries`) and is *not* rebuilt here - this reads [`Self::palette_file_candidates`], which
     /// [`Self::rebuild_palette_file_candidates`] keeps current at its own two mutation points.
     pub(crate) fn build_palette_groups(&self, cx: &App) -> Vec<palette::PaletteGroup> {
         let sessions: Vec<palette::SessionCandidate> = self
@@ -295,7 +295,10 @@ impl AdeApp {
     /// a file with no diff to open instead reveals it in the Files tree - switches Zone 3 to
     /// `Files`, expands every ancestor directory, and highlights it via
     /// [`Self::selected_tree_path`].
-    pub(in crate::palette) fn open_palette_file_result(
+    // `pub(crate)`, not `pub(in crate::palette)`: `crate::sidebar::render`'s own
+    // "reveal in tree" regression test drives this real flow rather than calling
+    // `AdeApp::reveal_in_tree` directly, so that the wiring between the two is what's covered.
+    pub(crate) fn open_palette_file_result(
         &mut self,
         path: PathBuf,
         window: &mut Window,
@@ -317,9 +320,9 @@ impl AdeApp {
             self.open_change_diff(relative, window, cx);
         } else {
             self.right_sidebar_view = RightSidebarView::Files;
-            for ancestor in path.ancestors() {
-                self.collapsed_dirs.remove(ancestor);
-            }
+            // Expands every ancestor *and records those expansions on disk*, exactly like a
+            // manual click (issue #18 §5) - not a transient, this-session-only reveal.
+            self.reveal_in_tree(&path, cx);
             self.selected_tree_path = Some(path);
             cx.notify();
         }

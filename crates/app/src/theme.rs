@@ -364,6 +364,24 @@ pub mod border {
     pub const SELECTED_EDGE: ColorToken = hex(0x3f5b74); // 2px left edge on a selected row
 }
 
+/// The Files tree's own structural marks (GitHub issue #18 §3). A scope of its own rather than
+/// two more entries in [`border`]: these are painted *inside* rows as 1px quads, not the border
+/// of anything, and keeping them together makes the pair's relationship - one resting, one
+/// highlighted - obvious. Both are ordinary [`ColorToken`]s, so they re-derive under every theme
+/// exactly like the ~200 tokens around them.
+pub mod tree {
+    use super::{hex, ColorToken};
+
+    /// The resting indent guide: deliberately the same value as `border::DIVIDER`, this
+    /// palette's existing "1px vertical rule" colour, so the guides read as structure rather
+    /// than content. Subtle by design - a guide that competes with a filename is worse than none.
+    pub const INDENT_GUIDE: ColorToken = hex(0x22262a);
+    /// The guide for a level in the selected file's ancestor chain - `border::SELECTED_EDGE`'s
+    /// value, the same blue the selected-row edge already uses, so "this line leads to what's
+    /// selected" is the same visual language in both places.
+    pub const INDENT_GUIDE_ACTIVE: ColorToken = hex(0x3f5b74);
+}
+
 pub mod text {
     use super::{hex, ColorToken};
 

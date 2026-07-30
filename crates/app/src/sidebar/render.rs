@@ -20,17 +20,164 @@ impl AdeApp {
         }
     }
 
-    /// Toggles a directory's collapsed/expanded state - `crate::sidebar::file_tree::visible_entries`
-    /// does the actual hiding at render time.
-    pub(in crate::sidebar) fn toggle_dir_collapsed(
+    /// Toggles a directory's expanded state - `crate::sidebar::file_tree::visible_entries` does
+    /// the actual hiding at render time, and [`Self::set_dir_expanded`] records the change on
+    /// disk before this returns.
+    pub(crate) fn toggle_dir_expanded(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let expanded = !self.expanded_dirs.contains(&path);
+        self.set_dir_expanded(path, expanded, cx);
+    }
+
+    /// The single write path for one directory's expanded state: live set, persisted
+    /// [`AdeApp::fold_state`], and a real disk write, always together (GitHub issue #18 §2 -
+    /// "expanding or collapsing a folder is recorded immediately, not only on clean exit").
+    ///
+    /// The disk write is skipped only when `fold_state` reports that nothing actually changed -
+    /// a genuine no-op, not a debounce.
+    ///
+    /// The tree still expands when the state is *refusable* (a non-UTF-8 path, which has no
+    /// honest TOML key - see `fold_state::worktree_key`): silently declining to open a folder
+    /// because of how its name is encoded would be a far worse outcome than not remembering that
+    /// it was opened. But it says so in the log rather than leaving the live tree and the file
+    /// quietly disagreeing.
+    pub(crate) fn set_dir_expanded(
         &mut self,
         path: PathBuf,
+        expanded: bool,
         cx: &mut Context<Self>,
     ) {
-        if !self.collapsed_dirs.remove(&path) {
-            self.collapsed_dirs.insert(path);
+        if expanded {
+            self.expanded_dirs.insert(path.clone());
+        } else {
+            self.expanded_dirs.remove(&path);
+        }
+        let root = self.file_tree_root.clone();
+        match self.fold_state.set_expanded(&root, &path, expanded) {
+            fold_state::SetExpanded::Changed => {
+                self.claim_fold_state_for(&root);
+                self.persist_fold_state(cx);
+            }
+            fold_state::SetExpanded::Unchanged => {}
+            fold_state::SetExpanded::Refused => log::warn!(
+                "not recording the fold state of {} under {}: it is not a plain UTF-8 path \
+                 inside that worktree, so this expansion won't survive a restart",
+                path.display(),
+                root.display()
+            ),
         }
         cx.notify();
+    }
+
+    /// Marks this worktree as one whose fold-state entry this instance owns and may overwrite -
+    /// see [`AdeApp::fold_state_owned`] and `crate::sidebar::fold_state`'s module docs for the
+    /// second-running-instance clobber this prevents.
+    fn claim_fold_state_for(&mut self, root: &Path) {
+        if let Some(key) = fold_state::worktree_key(root) {
+            self.fold_state_owned.insert(key);
+        }
+    }
+
+    /// "Collapse all" - resets the tree *and* the saved state for this worktree in one step
+    /// (issue #18 §1), so relaunching doesn't bring the old expansions back.
+    pub(crate) fn collapse_all_dirs(&mut self, cx: &mut Context<Self>) {
+        let root = self.file_tree_root.clone();
+        self.expanded_dirs.clear();
+        if self.fold_state.clear_worktree(&root) {
+            // Claimed *because* the entry is now gone: the merge on write treats an owned key's
+            // absence as a real deletion, which is exactly what this action means.
+            self.claim_fold_state_for(&root);
+            self.persist_fold_state(cx);
+        }
+        cx.notify();
+    }
+
+    /// Reveals `path` in the tree by expanding every ancestor directory between it and the tree
+    /// root - and records each of those expansions exactly like a manual click would (issue #18
+    /// §5). The one entry point for every "reveal in tree" flow: a palette file result
+    /// (`Self::open_palette_file_result`) and a just-created file (`Self::create_new_file`),
+    /// both of which would otherwise point at a row hidden inside a collapsed parent now that
+    /// the tree starts collapsed.
+    ///
+    /// `path` itself is deliberately not expanded when it happens to be a directory: revealing
+    /// something means making it visible, not opening it.
+    pub(crate) fn reveal_in_tree(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let root = self.file_tree_root.clone();
+        let mut changed = false;
+        for ancestor in path.ancestors().skip(1) {
+            if ancestor == root {
+                break;
+            }
+            if !ancestor.starts_with(&root) {
+                // Not part of this tree at all - nothing to reveal, and certainly nothing to
+                // record under this worktree's key.
+                break;
+            }
+            self.expanded_dirs.insert(ancestor.to_path_buf());
+            // A refusal here is the same non-UTF-8 case [`Self::set_dir_expanded`] documents -
+            // the reveal still happens, it just isn't recorded - and it gets the same log line
+            // rather than leaving the live tree and the file silently disagreeing.
+            match self.fold_state.set_expanded(&root, ancestor, true) {
+                fold_state::SetExpanded::Changed => changed = true,
+                fold_state::SetExpanded::Unchanged => {}
+                fold_state::SetExpanded::Refused => log::warn!(
+                    "not recording the fold state of {} under {}: it is not a plain UTF-8 path \
+                     inside that worktree, so this expansion won't survive a restart",
+                    ancestor.display(),
+                    root.display()
+                ),
+            }
+        }
+        if changed {
+            self.claim_fold_state_for(&root);
+            self.persist_fold_state(cx);
+        }
+    }
+
+    /// Drops fold-state entries for directories that no longer exist, against the tree that has
+    /// just finished loading (issue #18 §2 - "stale entries are silently ignored and pruned,
+    /// never an error"). Called from `Self::load_file_tree`'s completion handler, which has
+    /// already checked that the walk it is applying belongs to the current root.
+    ///
+    /// Only ever prunes against a walk that is genuinely *complete*
+    /// ([`file_tree::FileTreeListing::is_complete`]). A walk that stopped at its entry cap - or
+    /// that silently skipped a directory it couldn't read, which the walk does deliberately so
+    /// one unreadable folder can't blank the whole sidebar - is not evidence that the
+    /// directories it never reached are gone. Pruning against either would permanently delete
+    /// perfectly good state, since the prune is written straight back to disk.
+    pub(crate) fn prune_stale_fold_state(&mut self, cx: &mut Context<Self>) {
+        if !self.file_tree_complete {
+            return;
+        }
+        let dirs = file_tree::directory_paths(&self.file_tree);
+        let root = self.file_tree_root.clone();
+        let mut changed = self.fold_state.prune_missing_dirs(&root, &dirs);
+        let before = self.expanded_dirs.len();
+        self.expanded_dirs.retain(|path| dirs.contains(path));
+        changed |= self.expanded_dirs.len() != before;
+        if changed {
+            self.claim_fold_state_for(&root);
+            self.persist_fold_state(cx);
+        }
+    }
+
+    /// The "load more" action's real handler - re-walks the current tree with a tenfold larger
+    /// entry budget. Genuinely reloads rather than revealing something already loaded: the
+    /// capped walk never collected those entries. Still bounded, deliberately - see
+    /// [`AdeApp::file_tree_limit_override`] for why this raises the cap instead of removing it.
+    pub(crate) fn load_more_file_tree_entries(&mut self, cx: &mut Context<Self>) {
+        let current = self
+            .file_tree_limit_override
+            .unwrap_or(self.settings.file_tree.max_entries);
+        // Ceilinged, not just `saturating_mul`: seven clicks from the 20,000 default would
+        // otherwise reach `usize::MAX`, at which point "still a real cap" would be true only
+        // literally. A million entries is already far past any tree this sidebar can usefully
+        // show, and the row keeps naming where the walk stopped either way.
+        self.file_tree_limit_override = Some(
+            current
+                .saturating_mul(10)
+                .min(file_tree::MAX_LOAD_MORE_ENTRIES),
+        );
+        self.load_file_tree(self.file_tree_root.clone(), cx);
     }
 
     /// Toggles a file's reviewed state - the Changes row checkbox's click handler.
@@ -77,7 +224,7 @@ impl AdeApp {
     /// The file tree - `design_handoff_jerry_ade/README.md`'s Zone 3 "Files (tree)" spec:
     /// rect-composed folder/language-chip icons (see [`render_folder_icon`]/
     /// [`render_lang_chip`], never emoji or an SVG pipeline), collapse/expand (see
-    /// [`Self::toggle_dir_collapsed`]/`crate::sidebar::file_tree::visible_entries`).
+    /// [`Self::toggle_dir_expanded`]/`crate::sidebar::file_tree::visible_entries`).
     ///
     /// **Scrolling lives here, not in the caller.** This list is a `gpui::uniform_list`, which
     /// sets its own `overflow.y = Scroll` and owns the scroll offset
@@ -110,25 +257,34 @@ impl AdeApp {
             );
         }
 
-        let visible_count = file_tree::visible_entries(&self.file_tree, &self.collapsed_dirs).len();
-        let rendered_count = visible_count.min(file_tree::MAX_RENDERED_FILE_ENTRIES);
+        // Every visible row is rendered - there is no render-time cap and no "... and N more
+        // entries not shown" row any more (GitHub issue #18 §4). The list below is virtualized,
+        // so this count drives `uniform_list`'s scroll extent, not how many elements get built.
+        //
+        // Resolved *once* per frame, into indices into `self.file_tree`, and shared with the
+        // row-builder closure through an `Rc`. That indirection is load-bearing: `uniform_list`
+        // invokes its closure **three** times per frame (`measure_item` from `request_layout`,
+        // again from `prepaint`, then `render_items` for the real visible range -
+        // `vendor/zed/crates/gpui/src/elements/uniform_list.rs:283`, `:359`, `:489`), so a
+        // `visible_entries` call inside it would walk the whole loaded tree four times per frame
+        // including this one. Indices rather than the borrowed `&FileTreeEntry`s the walk
+        // returns, because the closure is `'static` and cannot hold a borrow of `self` - and
+        // indices are valid for exactly as long as they need to be, since nothing can mutate
+        // `file_tree` between this line and the closure's last call within one frame. They are
+        // still bounds-checked below rather than indexed blindly.
+        let visible_indices: Rc<Vec<usize>> = Rc::new(file_tree::visible_indices(
+            &self.file_tree,
+            &self.expanded_dirs,
+        ));
+        let rendered_count = visible_indices.len();
 
-        // Built once per render, not once per row - see `Self::tree_change_marks`'s docs. Moved
-        // *into* the row-builder closure below (rather than recomputed inside it) because
-        // `uniform_list` calls that closure **three** times per frame, not once: `measure_item`
-        // from `request_layout`, `measure_item` again from `prepaint`, then `render_items` for
-        // the real visible range (`vendor/zed/crates/gpui/src/elements/uniform_list.rs:283`,
-        // `:359`, `:489`). Capturing the map keeps it at one build per frame, exactly as the
-        // previous eager loop had it. `file_tree::visible_entries` below does *not* get that
-        // treatment and genuinely does run three times per frame now where it used to run once -
-        // a real, accepted regression on that one call: it is a borrowing walk with a single
-        // `Vec` allocation, measured at well under a millisecond against the ~145ms of per-frame
-        // element layout this whole change removes, and capturing it instead would mean cloning
-        // every entry (the walk borrows from `self`, so the `'static` closure cannot hold it).
+        // Built once per render, not once per row - see `Self::tree_change_marks`'s docs, and
+        // `visible_indices` above for why anything the row-builder closure needs is captured
+        // rather than recomputed inside it.
         let marks = self.tree_change_marks();
 
         // Virtualized: only the rows genuinely on screen become real elements. Previously every
-        // one of up to `file_tree::MAX_RENDERED_FILE_ENTRIES` (500) *visible* rows was built,
+        // one of up to 500 (the since-removed `MAX_RENDERED_FILE_ENTRIES` cap) *visible* rows was built,
         // laid out and painted on every single frame - including the ~460 of them scrolled off
         // screen - which measured (real `gpui::FrameTiming` data, debug build, this repository's
         // own tree, terminal streaming) as ~145ms of a ~200ms `Window::draw`, i.e. ~72% of the
@@ -138,24 +294,24 @@ impl AdeApp {
         // `vendor/zed/crates/gpui/examples/uniform_list.rs`); every row here is exactly
         // `theme::band::TREE_ROW` tall, which is `uniform_list`'s one real requirement.
         //
-        // `MAX_RENDERED_FILE_ENTRIES` deliberately stays: it is no longer a layout-cost guard
-        // (virtualization removed that cost), but it is still the real bound on how much of a
-        // huge tree this list claims to represent, and on the scroll extent `uniform_list`
-        // derives from `item_count`. The "... and N more" trailer below keeps that honest.
+        // The former `MAX_RENDERED_FILE_ENTRIES` (500) cap is gone: virtualization already
+        // removed the per-frame cost it was originally guarding, and hiding real entries behind
+        // a "... and N more" row was the dishonesty issue #18 §4 set out to remove. The one
+        // surviving cap is a *load*-time one (`Settings.file_tree.max_entries`), and it announces
+        // itself with the real "load more" action below rather than a silent cut-off.
         let list = uniform_list(
             "file-tree-list",
             rendered_count,
             cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
-                // Recomputed from the same two fields `rendered_count` above was derived from,
-                // which cannot change between that read and this call within one frame. The
-                // range is still clamped rather than indexed blindly, so a future divergence
-                // degrades to "renders fewer rows" instead of panicking.
-                let visible = file_tree::visible_entries(&this.file_tree, &this.collapsed_dirs);
-                let start = range.start.min(visible.len());
-                let end = range.end.min(visible.len());
-                visible[start..end]
+                // Both the row range and each index into `file_tree` are clamped/checked rather
+                // than trusted, so a future divergence degrades to "renders fewer rows" instead
+                // of panicking.
+                let start = range.start.min(visible_indices.len());
+                let end = range.end.min(visible_indices.len());
+                visible_indices[start..end]
                     .iter()
-                    .map(|entry| this.render_file_tree_row(entry, &marks, cx))
+                    .filter_map(|index| this.file_tree.get(*index).cloned())
+                    .map(|entry| this.render_file_tree_row(&entry, &marks, cx))
                     .collect::<Vec<_>>()
             }),
         )
@@ -183,14 +339,38 @@ impl AdeApp {
             .min_h_0()
             .py(px(4.0))
             .child(list);
-        if visible_count > rendered_count {
-            column = column.child(render_sidebar_message(
-                format!(
-                    "... and {} more entries not shown",
-                    visible_count - rendered_count
-                ),
-                theme::text::FAINT.into(),
-            ));
+        // The explicit replacement for the old truncation row: not a message saying entries were
+        // silently dropped, but a real action that goes and loads more of them
+        // (`Self::load_more_file_tree_entries`). Only ever shown when the walk genuinely stopped
+        // early, and it names the exact count it stopped at rather than implying a total it
+        // cannot know without walking the rest.
+        if self.file_tree_truncated {
+            let loaded = self.file_tree.len();
+            column = column.child(
+                div()
+                    .id("file-tree-show-all")
+                    .debug_selector(|| "file-tree-show-all".to_string())
+                    .flex_none()
+                    .w_full()
+                    .cursor_pointer()
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(10.5))
+                    .text_color(theme::text::DIM)
+                    .hover(|el| {
+                        el.bg(theme::surface::ROW_HOVER)
+                            .text_color(theme::text::PRIMARY)
+                    })
+                    .tooltip(text_tooltip(
+                        "Re-read this worktree with a 10x larger entry limit. Set \
+                         `file_tree.max_entries` in settings.toml to raise it permanently.",
+                    ))
+                    .child(format!("Stopped at {loaded} entries \u{2013} load more"))
+                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.load_more_file_tree_entries(cx);
+                    })),
+            );
         }
 
         column.into_any_element()
@@ -198,15 +378,15 @@ impl AdeApp {
 
     /// One file-tree row: indent (13px/level, per the README), a composed icon (a folder's
     /// two-rect glyph or a file's language chip), the name, and, for a directory, a click
-    /// handler that toggles [`Self::collapsed_dirs`].
+    /// handler that toggles its membership of [`AdeApp::expanded_dirs`].
     pub(in crate::sidebar) fn render_file_tree_row(
         &self,
         entry: &FileTreeEntry,
         marks: &HashMap<PathBuf, (&'static str, gpui::Rgba)>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let indent = px(13.0 * entry.depth as f32);
-        let is_open = entry.is_dir && !self.collapsed_dirs.contains(&entry.path);
+        let indent = px(file_tree::INDENT_STEP * entry.depth as f32);
+        let is_open = entry.is_dir && self.expanded_dirs.contains(&entry.path);
         let mark = marks.get(&entry.path).copied();
         // The Files tree's row-selection highlight (README's Zone 3 "Selected row bg
         // `#1a1e21`") - set by `Self::open_file_view` (this row's own click handler, below)
@@ -229,15 +409,69 @@ impl AdeApp {
             .id(format!("file-tree-row-{}", entry.path.display()))
             .debug_selector(|| format!("file-tree-row-{}", entry.name))
             .flex()
+            // Positioning context for this row's own indent guides, below - `.absolute()` needs
+            // a `.relative()` ancestor (`vendor/zed/crates/gpui/examples/list_example.rs:118`'s
+            // own scrollbar track/thumb pair uses exactly this pairing).
+            .relative()
             .w_full()
             .items_center()
             .gap(px(6.0))
             .h(theme::band::TREE_ROW)
-            .pl(px(8.0) + indent)
+            .pl(px(file_tree::ROW_LEFT_PAD) + indent)
             .pr(px(8.0))
             .font(font(theme::font::MONO))
             .text_size(self.ui_text_size(11.5))
             .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED));
+
+        // Indent guides (issue #18 §3), one per level of nesting between this row and the root.
+        //
+        // Drawn as this row's *own* absolutely-positioned children rather than as one overlay
+        // across the list, which is what makes them correct under `uniform_list`'s
+        // virtualization for free: a guide is a pure function of the row it belongs to
+        // (`entry.depth`, plus the selected path for the active-chain highlight), so a recycled
+        // row can only ever draw the guides that genuinely belong to whatever row it now shows.
+        // An overlay would instead have to track the visible range and scroll offset itself and
+        // stay in step with them - the real source of the "gaps or misaligned segments as rows
+        // recycle" failure the issue calls out. Each guide spans the row's full 22px height with
+        // no gap or inset, so consecutive rows' segments meet exactly and read as one continuous
+        // line down the subtree.
+        let active_levels = file_tree::active_guide_levels(
+            &self.file_tree_root,
+            &entry.path,
+            self.selected_tree_path.as_deref(),
+        );
+        for level in 0..entry.depth {
+            let active = level < active_levels;
+            row = row.child(
+                div()
+                    // Test-only (a no-op outside test builds, like the row's own selector
+                    // above): the only way a real render test can prove a guide painted at the
+                    // right x, at the right height, on the right row - including after
+                    // `uniform_list` has recycled that row's element. The `active`/`idle` half
+                    // is what makes the ancestor-chain highlight testable at all: the colour
+                    // itself isn't observable from a test, but which of the two branches a given
+                    // row took is. Keyed on `entry.name` like the row selector above, so two
+                    // same-named files in different folders would collide - every test using
+                    // these gives its fixtures unique names.
+                    .debug_selector(|| {
+                        format!(
+                            "file-tree-guide-{}-{}-{level}",
+                            if active { "active" } else { "idle" },
+                            entry.name
+                        )
+                    })
+                    .absolute()
+                    .top_0()
+                    .h_full()
+                    .w(px(1.0))
+                    .left(px(file_tree::indent_guide_x(level)))
+                    .bg(if active {
+                        theme::tree::INDENT_GUIDE_ACTIVE
+                    } else {
+                        theme::tree::INDENT_GUIDE
+                    }),
+            );
+        }
 
         if entry.is_dir {
             let path = entry.path.clone();
@@ -245,7 +479,7 @@ impl AdeApp {
                 .cursor_pointer()
                 .hover(|el| el.bg(theme::surface::ROW_HOVER))
                 .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                    this.toggle_dir_collapsed(path.clone(), cx);
+                    this.toggle_dir_expanded(path.clone(), cx);
                 }));
         } else {
             // Opens the file in Surface C's File view - see `Self::open_file_view`'s docs.
@@ -386,6 +620,36 @@ impl AdeApp {
                                 .text_color(theme::diff::STAT_DEL)
                                 .child(format!("\u{2212}{del}")),
                         ),
+                )
+            })
+            // "Collapse all" (issue #18 §1) - resets the tree *and* this worktree's saved fold
+            // state in one step, so it genuinely undoes the expansions rather than hiding them
+            // until the next launch. Files view only, like the "+" beside it.
+            .when(self.right_sidebar_view == RightSidebarView::Files, |el| {
+                el.child(
+                    div()
+                        .id("file-tree-collapse-all")
+                        .debug_selector(|| "file-tree-collapse-all".to_string())
+                        .flex_none()
+                        .cursor_pointer()
+                        .px(px(5.0))
+                        .rounded(theme::radius::CHIP)
+                        .font(font(theme::font::MONO))
+                        .text_size(self.ui_text_size(12.0))
+                        .text_color(theme::text::GHOST)
+                        .hover(|el| {
+                            el.bg(theme::surface::ROW_HOVER_ALT)
+                                .text_color(theme::text::PRIMARY)
+                        })
+                        .tooltip(text_tooltip(
+                            "Collapse all folders (also clears the saved fold state)",
+                        ))
+                        // The same "\u{25be} pointing down" glyph `render_tree_caret` uses for an
+                        // open folder, since this is the action that closes every one of them.
+                        .child("\u{25be}")
+                        .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                            this.collapse_all_dirs(cx);
+                        })),
                 )
             })
             // Root-level "New file" - creates directly in the worktree root, the one location
@@ -989,7 +1253,7 @@ mod virtualization_tests {
     }
 
     /// Before this revision's fix, every one of the first
-    /// `file_tree::MAX_RENDERED_FILE_ENTRIES` (500) visible rows was built, laid out and painted
+    /// 500 (the since-removed `MAX_RENDERED_FILE_ENTRIES` cap) visible rows was built, laid out and painted
     /// on *every* frame - including all the ones below the fold - which measured, against real
     /// `gpui::FrameTiming` data on this repository's own tree, as ~145ms of a ~200ms
     /// `Window::draw`.
@@ -998,8 +1262,8 @@ mod virtualization_tests {
         let repo = TempDir::new().expect("tempdir");
         // Deliberately more rows than any plausible test viewport can show at
         // `theme::band::TREE_ROW` (22px) each, but fewer than
-        // `file_tree::MAX_RENDERED_FILE_ENTRIES`, so this measures virtualization alone and not
-        // the "... and N more entries not shown" cap.
+        // the since-removed `MAX_RENDERED_FILE_ENTRIES` cap, so this measured virtualization
+        // alone even back when that cap still existed.
         for index in 0..300 {
             fs::write(repo.path().join(format!("file-{index:03}.txt")), "x\n").expect("write");
         }
@@ -1063,18 +1327,19 @@ mod virtualization_tests {
     }
 
     /// The correctness half of the same change: virtualizing must not break the tree's real
-    /// content. A collapsed directory's children must still be genuinely absent, and expanding
-    /// it must genuinely bring them back - the state `crate::sidebar::file_tree::visible_entries` owns,
-    /// now consulted from inside `uniform_list`'s row-builder rather than from an eager loop.
+    /// content. A collapsed directory's children must be genuinely absent, and expanding it must
+    /// genuinely bring them in - the state `crate::sidebar::file_tree::visible_entries` owns, now
+    /// consulted from inside `uniform_list`'s row-builder rather than from an eager loop.
+    ///
+    /// Also the render-level proof of issue #18 §1's default: the very first assertion is that a
+    /// directory's child does *not* paint before anything has been expanded.
     ///
     /// Honest about its own reach: with only two entries this exercises no virtualization at
     /// all, and it passes identically against the pre-fix eager loop. It is a guard on the
     /// tree's *content* surviving the rewrite, not evidence that the rewrite virtualizes -
     /// that is what the two "far below the viewport" tests and the scroll test are for.
     #[gpui::test]
-    fn collapsing_a_directory_still_removes_its_children_from_the_virtualized_tree(
-        cx: &mut TestAppContext,
-    ) {
+    fn expanding_and_collapsing_a_directory_adds_and_removes_its_children(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
         fs::create_dir(repo.path().join("src")).expect("mkdir");
         fs::write(repo.path().join("src/only.rs"), "fn main() {}\n").expect("write");
@@ -1082,28 +1347,32 @@ mod virtualization_tests {
         cx.run_until_parked();
 
         assert!(
-            cx.debug_bounds("file-tree-row-only.rs").is_some(),
-            "an expanded directory's child must really paint"
+            cx.debug_bounds("file-tree-row-src").is_some(),
+            "the root-level directory row itself must paint"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-row-only.rs").is_none(),
+            "nothing is expanded on first open, so a nested child must not paint"
         );
 
         let src_dir = repo.path().join("src");
         app.update(cx, |app, cx| {
-            app.toggle_dir_collapsed(src_dir.clone(), cx);
-        });
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("file-tree-row-only.rs").is_none(),
-            "a collapsed directory's child must not paint"
-        );
-
-        app.update(cx, |app, cx| {
-            app.toggle_dir_collapsed(src_dir, cx);
+            app.toggle_dir_expanded(src_dir.clone(), cx);
         });
         cx.run_until_parked();
         assert!(
             cx.debug_bounds("file-tree-row-only.rs").is_some(),
-            "re-expanding must bring the child back - a virtualized list that caches its row \
-             set without invalidating on `collapsed_dirs` would fail exactly here"
+            "expanding must bring the child in - a virtualized list that caches its row set \
+             without invalidating on `expanded_dirs` would fail exactly here"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_dir_expanded(src_dir, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("file-tree-row-only.rs").is_none(),
+            "collapsing again must remove it"
         );
     }
 
@@ -1162,6 +1431,914 @@ mod virtualization_tests {
             cx.debug_bounds("change-row-f-39.txt").is_none(),
             "the 40th changed file's row is past any plausible viewport, so a virtualized \
              list must never build it as an element at all"
+        );
+    }
+}
+
+/// Real, end-to-end coverage for GitHub issue #18's persisted fold state: a live `AdeApp`, a
+/// real fold-state file on disk, and a second `AdeApp` constructed against that same file
+/// standing in for an app restart (the same "simulated reload" discipline
+/// `crate::settings::render`'s keybinding-rebind test already established - nothing in this
+/// codebase can restart the actual process mid-test).
+#[cfg(test)]
+mod fold_state_tests {
+    use super::*;
+    use crate::settings::store as settings_store;
+    use crate::sidebar::fold_state::FoldState;
+    use gpui::TestAppContext;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Opens an `AdeApp` with a *real*, temp-dir-scoped settings path - which is what gives it a
+    /// real fold-state file (`fold_state::fold_state_path_for`), unlike
+    /// `palette_focus_tests::open_test_app`'s deliberately unpersisted `None`.
+    fn open_app_with_state_dir(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        settings_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        open_app_with_state_dir_and_settings(
+            cx,
+            repo_path,
+            settings_path,
+            settings_store::Settings::default(),
+        )
+    }
+
+    fn open_app_with_state_dir_and_settings(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        settings_path: PathBuf,
+        settings: settings_store::Settings,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(repo_path, settings, Some(settings_path), window, cx)
+        })
+    }
+
+    /// `src/app/` + `src/lib/` + a root-level file, the shape every test below expands into.
+    fn seed_tree(repo: &TempDir) {
+        fs::create_dir_all(repo.path().join("src/app")).expect("mkdir");
+        fs::create_dir_all(repo.path().join("src/lib")).expect("mkdir");
+        fs::write(repo.path().join("src/app/main.rs"), "fn main() {}\n").expect("write");
+        fs::write(repo.path().join("src/lib/util.rs"), "pub fn u() {}\n").expect("write");
+        fs::write(repo.path().join("README.md"), "hi\n").expect("write");
+    }
+
+    fn expanded_names(app: &AdeApp) -> Vec<String> {
+        let mut names: Vec<String> = app
+            .expanded_dirs
+            .iter()
+            .filter_map(|path| path.strip_prefix(&app.file_tree_root).ok())
+            .map(|path| path.display().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// §1: nothing is expanded on the first visit to a worktree, and the tree really only shows
+    /// its root-level entries.
+    #[gpui::test]
+    fn a_worktree_opened_for_the_first_time_starts_fully_collapsed(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let state_dir = TempDir::new().expect("tempdir");
+        seed_tree(&repo);
+
+        let (app, cx) = open_app_with_state_dir(
+            cx,
+            repo.path().to_path_buf(),
+            state_dir.path().join("settings.toml"),
+        );
+        cx.run_until_parked();
+
+        assert!(app.read_with(cx, |app, _| app.expanded_dirs.is_empty()));
+        let visible = app.read_with(cx, |app, _| {
+            file_tree::visible_entries(&app.file_tree, &app.expanded_dirs)
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(visible, vec!["src".to_string(), "README.md".to_string()]);
+        assert!(cx.debug_bounds("file-tree-row-src").is_some());
+        assert!(
+            cx.debug_bounds("file-tree-row-main.rs").is_none(),
+            "a file two levels down must not be showing before anything is expanded"
+        );
+    }
+
+    /// §2's headline requirement: expand three folders, "quit", "relaunch" - the same three are
+    /// open and nothing else. The reload reads the real file this app wrote, not an in-memory
+    /// cache handed between the two instances.
+    #[gpui::test]
+    fn expanded_folders_are_restored_exactly_after_a_simulated_reload(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let state_dir = TempDir::new().expect("tempdir");
+        seed_tree(&repo);
+        let settings_path = state_dir.path().join("settings.toml");
+        let fold_path = state_dir.path().join("file-tree-state.toml");
+
+        let (app, cx) =
+            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.toggle_dir_expanded(repo.path().join("src"), cx);
+            app.toggle_dir_expanded(repo.path().join("src/app"), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            fold_path.exists(),
+            "expanding a folder must be recorded on disk immediately - not on a clean exit, \
+             which is exactly what this test never performs"
+        );
+        assert_eq!(
+            FoldState::load_at(&fold_path)
+                .expanded_dirs(repo.path())
+                .len(),
+            2
+        );
+
+        // The "relaunch": a brand-new `AdeApp` reading that same real file.
+        let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        cx.run_until_parked();
+
+        assert_eq!(
+            reloaded.read_with(cx, |app, _| expanded_names(app)),
+            vec!["src".to_string(), "src/app".to_string()],
+            "the reloaded tree must restore exactly what was left open - `src/lib` was never \
+             expanded and must stay closed"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-row-main.rs").is_some(),
+            "the restored expansion must be visible in the real rendered tree, not just in state"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-row-util.rs").is_none(),
+            "`src/lib` was never expanded, so its child must still be hidden after the reload"
+        );
+    }
+
+    /// §2's identity requirement, at the app level: two worktrees with an identically-named
+    /// `src/` share one fold-state file, and one's expansion must never open the other's.
+    #[gpui::test]
+    fn fold_state_from_one_worktree_never_leaks_into_another(cx: &mut TestAppContext) {
+        let worktree_a = TempDir::new().expect("tempdir");
+        let worktree_b = TempDir::new().expect("tempdir");
+        let state_dir = TempDir::new().expect("tempdir");
+        seed_tree(&worktree_a);
+        seed_tree(&worktree_b);
+        let settings_path = state_dir.path().join("settings.toml");
+
+        let (app_a, cx) =
+            open_app_with_state_dir(cx, worktree_a.path().to_path_buf(), settings_path.clone());
+        cx.run_until_parked();
+        app_a.update(cx, |app, cx| {
+            app.toggle_dir_expanded(worktree_a.path().join("src"), cx);
+        });
+        cx.run_until_parked();
+
+        let (app_b, cx) =
+            open_app_with_state_dir(cx, worktree_b.path().to_path_buf(), settings_path);
+        cx.run_until_parked();
+
+        assert!(
+            app_b.read_with(cx, |app, _| app.expanded_dirs.is_empty()),
+            "worktree B shares the relative path `src` with worktree A, and a fold-state entry \
+             keyed by anything less than the real worktree path would open it here"
+        );
+        // And A's own state is genuinely still there - this must fail as a leak test, never as a
+        // "nothing was ever persisted" test.
+        let fold_path = state_dir.path().join("file-tree-state.toml");
+        assert_eq!(
+            FoldState::load_at(&fold_path)
+                .expanded_dirs(worktree_a.path())
+                .len(),
+            1
+        );
+    }
+
+    /// Two `jerry` processes (one per repository) share one fold-state file, and each holds a
+    /// whole-file copy read at its own startup. A plain whole-file write would therefore make
+    /// whichever instance saved last erase the other's worktree entirely.
+    ///
+    /// The ordering here is the whole point, and is what distinguishes this from
+    /// `fold_state_from_one_worktree_never_leaks_into_another`: B starts *before* A's second
+    /// write, so B's in-memory copy can never contain A's newer entry. Only a write that
+    /// genuinely re-reads the file and merges can preserve it.
+    #[gpui::test]
+    fn a_second_instances_saves_never_erase_the_first_instances_worktree(cx: &mut TestAppContext) {
+        let repo_a = TempDir::new().expect("tempdir");
+        let repo_b = TempDir::new().expect("tempdir");
+        let state_dir = TempDir::new().expect("tempdir");
+        seed_tree(&repo_a);
+        seed_tree(&repo_b);
+        let settings_path = state_dir.path().join("settings.toml");
+        let fold_path = state_dir.path().join("file-tree-state.toml");
+
+        let (app_a, cx) =
+            open_app_with_state_dir(cx, repo_a.path().to_path_buf(), settings_path.clone());
+        cx.run_until_parked();
+
+        // Instance B starts here, snapshotting a file that knows nothing about A yet.
+        let (app_b, cx) =
+            open_app_with_state_dir(cx, repo_b.path().to_path_buf(), settings_path.clone());
+        cx.run_until_parked();
+
+        app_a.update(cx, |app, cx| {
+            app.toggle_dir_expanded(repo_a.path().join("src"), cx);
+        });
+        cx.run_until_parked();
+        // ...and now B writes, from its stale whole-file snapshot.
+        app_b.update(cx, |app, cx| {
+            app.toggle_dir_expanded(repo_b.path().join("src"), cx);
+        });
+        cx.run_until_parked();
+
+        let on_disk = FoldState::load_at(&fold_path);
+        assert_eq!(
+            on_disk.expanded_dirs(repo_a.path()).len(),
+            1,
+            "the second instance's save must merge, not clobber - repository A's fold state is \
+             gone here if the write is a plain whole-file one"
+        );
+        assert_eq!(on_disk.expanded_dirs(repo_b.path()).len(), 1);
+
+        // And a real relaunch of A sees its own state, which is what the user actually notices.
+        let (reloaded_a, cx) =
+            open_app_with_state_dir(cx, repo_a.path().to_path_buf(), settings_path);
+        cx.run_until_parked();
+        assert_eq!(
+            reloaded_a.read_with(cx, |app, _| expanded_names(app)),
+            vec!["src".to_string()]
+        );
+    }
+
+    /// §2: a folder that has since been deleted is dropped silently on the next load - no error
+    /// surfaces, and the surviving entries are untouched.
+    #[gpui::test]
+    fn a_stale_entry_for_a_deleted_folder_is_pruned_silently(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let state_dir = TempDir::new().expect("tempdir");
+        seed_tree(&repo);
+        let settings_path = state_dir.path().join("settings.toml");
+        let fold_path = state_dir.path().join("file-tree-state.toml");
+
+        let (app, cx) =
+            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.toggle_dir_expanded(repo.path().join("src"), cx);
+            app.toggle_dir_expanded(repo.path().join("src/app"), cx);
+            app.toggle_dir_expanded(repo.path().join("src/lib"), cx);
+        });
+        cx.run_until_parked();
+
+        // An agent deletes one of them from underneath the running app.
+        fs::remove_dir_all(repo.path().join("src/lib")).expect("remove");
+
+        // The "relaunch" - which is also where the prune happens, against the freshly walked
+        // tree.
+        let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        cx.run_until_parked();
+
+        assert_eq!(
+            reloaded.read_with(cx, |app, _| app.file_tree_error.clone()),
+            None,
+            "a stale fold-state entry must never surface as an error"
+        );
+        assert_eq!(
+            reloaded.read_with(cx, |app, _| expanded_names(app)),
+            vec!["src".to_string(), "src/app".to_string()]
+        );
+        let on_disk = FoldState::load_at(&fold_path);
+        assert_eq!(
+            on_disk.expanded_dirs(repo.path()).len(),
+            2,
+            "the prune must be written back to the file, not just applied in memory"
+        );
+    }
+
+    /// §2: a mid-session refresh of the same worktree (what an agent creating or deleting files
+    /// causes, via `create_new_file`'s own reload) must not reset fold state.
+    #[gpui::test]
+    fn reloading_the_same_worktrees_tree_keeps_the_fold_state(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let state_dir = TempDir::new().expect("tempdir");
+        seed_tree(&repo);
+
+        let (app, cx) = open_app_with_state_dir(
+            cx,
+            repo.path().to_path_buf(),
+            state_dir.path().join("settings.toml"),
+        );
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.toggle_dir_expanded(repo.path().join("src"), cx);
+            app.toggle_dir_expanded(repo.path().join("src/app"), cx);
+        });
+        cx.run_until_parked();
+
+        // A file appears and another disappears underneath the running app, then the tree is
+        // re-walked - neither touches any directory that was expanded.
+        fs::write(repo.path().join("src/app/new.rs"), "//\n").expect("write");
+        fs::remove_file(repo.path().join("README.md")).expect("remove");
+        app.update(cx, |app, cx| {
+            let root = app.file_tree_root.clone();
+            app.load_file_tree(root, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| expanded_names(app)),
+            vec!["src".to_string(), "src/app".to_string()],
+            "a refresh must re-render, not reset - the folders stay exactly as they were"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-row-new.rs").is_some(),
+            "and the newly created file must really appear inside the still-expanded folder"
+        );
+    }
+
+    /// §1: "collapse all" resets the tree *and* the saved state, in one step - so it survives a
+    /// reload rather than springing back open.
+    #[gpui::test]
+    fn collapse_all_clears_both_the_tree_and_the_saved_state(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let state_dir = TempDir::new().expect("tempdir");
+        seed_tree(&repo);
+        let settings_path = state_dir.path().join("settings.toml");
+
+        let (app, cx) =
+            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.toggle_dir_expanded(repo.path().join("src"), cx);
+            app.toggle_dir_expanded(repo.path().join("src/app"), cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("file-tree-row-main.rs").is_some());
+        assert!(
+            cx.debug_bounds("file-tree-collapse-all").is_some(),
+            "the collapse-all control must really be in the rendered header"
+        );
+
+        app.update(cx, |app, cx| app.collapse_all_dirs(cx));
+        cx.run_until_parked();
+
+        assert!(app.read_with(cx, |app, _| app.expanded_dirs.is_empty()));
+        assert!(cx.debug_bounds("file-tree-row-main.rs").is_none());
+
+        let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        cx.run_until_parked();
+        assert!(
+            reloaded.read_with(cx, |app, _| app.expanded_dirs.is_empty()),
+            "collapse-all must have cleared the *saved* state too, or the folders would spring \
+             back open on the next launch"
+        );
+    }
+
+    /// §5: "reveal in tree", driven through the real command-palette open-file flow, expands
+    /// every ancestor of the revealed file - and records those expansions exactly like manual
+    /// ones, so they survive a reload.
+    #[gpui::test]
+    fn revealing_a_file_expands_its_ancestors_and_records_them(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let state_dir = TempDir::new().expect("tempdir");
+        seed_tree(&repo);
+        let settings_path = state_dir.path().join("settings.toml");
+        let target = repo.path().join("src/app/main.rs");
+
+        let (app, cx) =
+            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("file-tree-row-main.rs").is_none(),
+            "precondition: the file to reveal starts hidden inside two collapsed folders"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_palette_file_result(target.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| expanded_names(app)),
+            vec!["src".to_string(), "src/app".to_string()],
+            "both ancestors - and only the ancestors - must be expanded"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-row-main.rs").is_some(),
+            "the revealed file's row must really be showing"
+        );
+
+        let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        cx.run_until_parked();
+        assert_eq!(
+            reloaded.read_with(cx, |app, _| expanded_names(app)),
+            vec!["src".to_string(), "src/app".to_string()],
+            "a reveal is recorded like a manual expansion, so it must survive a reload"
+        );
+    }
+
+    /// §5 again, through the other real entry point: opening a file directly (what
+    /// go-to-definition does when it lands in a folder nobody has expanded) reveals it too.
+    #[gpui::test]
+    fn opening_a_file_directly_reveals_it_in_the_tree(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let state_dir = TempDir::new().expect("tempdir");
+        seed_tree(&repo);
+        let target = repo.path().join("src/app/main.rs");
+
+        let (app, cx) = open_app_with_state_dir(
+            cx,
+            repo.path().to_path_buf(),
+            state_dir.path().join("settings.toml"),
+        );
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(target.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| expanded_names(app)),
+            vec!["src".to_string(), "src/app".to_string()]
+        );
+        assert!(
+            cx.debug_bounds("file-tree-row-main.rs").is_some(),
+            "the selected row must actually be showing, or its selection highlight is invisible"
+        );
+    }
+
+    /// §4: a directory with hundreds of entries renders *every* one of them - no truncation row,
+    /// no cap - while staying virtualized (the row far below the viewport is never built).
+    #[gpui::test]
+    fn a_large_directory_renders_completely_with_no_truncation_row(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let state_dir = TempDir::new().expect("tempdir");
+        fs::create_dir(repo.path().join("big")).expect("mkdir");
+        for index in 0..800 {
+            fs::write(repo.path().join(format!("big/f-{index:03}.txt")), "x\n").expect("write");
+        }
+
+        let (app, cx) = open_app_with_state_dir(
+            cx,
+            repo.path().to_path_buf(),
+            state_dir.path().join("settings.toml"),
+        );
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.toggle_dir_expanded(repo.path().join("big"), cx);
+        });
+        cx.run_until_parked();
+
+        let visible = app.read_with(cx, |app, _| {
+            file_tree::visible_entries(&app.file_tree, &app.expanded_dirs).len()
+        });
+        assert_eq!(
+            visible, 801,
+            "all 800 files plus the folder row itself are visible rows - the old 500-row cap \
+             would have silently hidden 301 of them"
+        );
+        assert!(
+            !app.read_with(cx, |app, _| app.file_tree_truncated),
+            "800 entries is far below the configured load cap, so nothing was truncated"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-show-all").is_none(),
+            "and no 'Show all entries' action may appear for a complete listing"
+        );
+
+        assert!(cx.debug_bounds("file-tree-row-f-000.txt").is_some());
+        assert!(
+            cx.debug_bounds("file-tree-row-f-799.txt").is_none(),
+            "still virtualized: the last of 800 rows is far below the viewport and must never \
+             become an element"
+        );
+
+        // The entry the old cap would have dropped entirely (#501 of 800) must be genuinely
+        // reachable, not merely counted.
+        let first_row = cx
+            .debug_bounds("file-tree-row-f-000.txt")
+            .expect("first row");
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: first_row.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-100_000.0))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("file-tree-row-f-799.txt").is_some(),
+            "scrolling to the bottom must reach the very last entry - proof the listing really \
+             is complete rather than capped"
+        );
+    }
+
+    /// §4's surviving load cap, and its honest replacement for the old silent cut-off: when the
+    /// walk really does stop early, a real action appears that goes and loads more - and the cap
+    /// it re-walks with is still a real cap, so a pathological tree can't be pulled into memory
+    /// wholesale by one click.
+    #[gpui::test]
+    fn hitting_the_load_cap_offers_a_load_more_action_that_really_loads_more(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        let state_dir = TempDir::new().expect("tempdir");
+        for index in 0..40 {
+            fs::write(repo.path().join(format!("f-{index:02}.txt")), "x\n").expect("write");
+        }
+        let mut settings = settings_store::Settings::default();
+        settings.file_tree.max_entries = 10;
+
+        let (app, cx) = open_app_with_state_dir_and_settings(
+            cx,
+            repo.path().to_path_buf(),
+            state_dir.path().join("settings.toml"),
+            settings,
+        );
+        cx.run_until_parked();
+
+        assert_eq!(app.read_with(cx, |app, _| app.file_tree.len()), 10);
+        assert!(app.read_with(cx, |app, _| app.file_tree_truncated));
+        assert!(
+            cx.debug_bounds("file-tree-show-all").is_some(),
+            "a walk that stopped early must say so with a real action, never silently"
+        );
+
+        app.update(cx, |app, cx| app.load_more_file_tree_entries(cx));
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.file_tree.len()),
+            40,
+            "the action must genuinely re-walk with a bigger budget - the capped walk never \
+             collected these entries, so nothing else could have produced them"
+        );
+        assert!(!app.read_with(cx, |app, _| app.file_tree_truncated));
+        assert!(cx.debug_bounds("file-tree-show-all").is_none());
+        assert_eq!(
+            app.read_with(cx, |app, _| app.file_tree_limit_override),
+            Some(100),
+            "the escape hatch raises the bound tenfold - it never removes it, or one click on a \
+             pathological tree would pull the whole thing into memory"
+        );
+    }
+
+    /// A truncated walk must never be used as evidence that the directories it never reached are
+    /// gone - pruning against it would silently, and permanently, destroy good state. Driven
+    /// through a walk that genuinely truncates, not by hand-setting the flag.
+    #[gpui::test]
+    fn a_truncated_walk_never_prunes_fold_state(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let state_dir = TempDir::new().expect("tempdir");
+        // Directories sort first and then alphabetically, so a 1-entry budget reaches `aaa` and
+        // stops - `zzz`, the one whose expansion is recorded, is never seen by the capped walk.
+        fs::create_dir(repo.path().join("aaa")).expect("mkdir");
+        fs::create_dir(repo.path().join("zzz")).expect("mkdir");
+        fs::write(repo.path().join("zzz/inside.txt"), "x\n").expect("write");
+        let settings_path = state_dir.path().join("settings.toml");
+        let fold_path = state_dir.path().join("file-tree-state.toml");
+
+        let (app, cx) =
+            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.toggle_dir_expanded(repo.path().join("zzz"), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            FoldState::load_at(&fold_path)
+                .expanded_dirs(repo.path())
+                .len(),
+            1
+        );
+
+        let mut capped = settings_store::Settings::default();
+        capped.file_tree.max_entries = 1;
+        let (reloaded, cx) = open_app_with_state_dir_and_settings(
+            cx,
+            repo.path().to_path_buf(),
+            settings_path,
+            capped,
+        );
+        cx.run_until_parked();
+
+        assert!(
+            reloaded.read_with(cx, |app, _| app.file_tree_truncated),
+            "precondition: the walk really must have stopped early, from the real cap - not \
+             from a flag this test set itself"
+        );
+        assert!(
+            reloaded.read_with(cx, |app, _| !app
+                .file_tree
+                .iter()
+                .any(|entry| entry.name == "zzz")),
+            "precondition: the expanded directory really must be absent from the capped listing"
+        );
+
+        assert_eq!(
+            FoldState::load_at(&fold_path)
+                .expanded_dirs(repo.path())
+                .len(),
+            1,
+            "an incomplete listing is not evidence that a folder is gone"
+        );
+    }
+}
+
+/// GitHub issue #18 §3, verified where it actually matters: against real painted geometry in a
+/// real virtualized list, not against the pure `indent_guide_x` arithmetic alone (which
+/// `crate::sidebar::file_tree`'s own unit tests already cover).
+///
+/// The failure mode the issue names - "gaps or misaligned segments as rows recycle while
+/// scrolling" - is only observable this way: every assertion below reads
+/// `VisualTestContext::debug_bounds`, i.e. the bounds GPUI genuinely laid the guide out at, and
+/// the recycling test re-asserts them *after* a real scroll event has forced `uniform_list` to
+/// rebuild its rows from a different starting index.
+#[cfg(test)]
+mod indent_guide_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn close_enough(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1.0
+    }
+
+    /// `a/b/c/deep.txt`, with the whole chain expanded, plus a sibling file at each level.
+    fn open_deep_tree<'a>(
+        cx: &'a mut TestAppContext,
+        repo: &TempDir,
+    ) -> (gpui::Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
+        fs::create_dir_all(repo.path().join("a/b/c")).expect("mkdir");
+        fs::write(repo.path().join("a/b/c/deep.txt"), "x\n").expect("write");
+        fs::write(repo.path().join("a/b/mid.txt"), "x\n").expect("write");
+        fs::write(repo.path().join("a/top.txt"), "x\n").expect("write");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.toggle_dir_expanded(repo.path().join("a"), cx);
+            app.toggle_dir_expanded(repo.path().join("a/b"), cx);
+            app.toggle_dir_expanded(repo.path().join("a/b/c"), cx);
+        });
+        cx.run_until_parked();
+        (app, cx)
+    }
+
+    /// One guide per nesting level, each at exactly its level's chevron offset from the row's
+    /// own left edge, and none at all for a root-level row.
+    #[gpui::test]
+    fn each_row_draws_one_guide_per_level_aligned_with_that_levels_chevron(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        let (_app, cx) = open_deep_tree(cx, &repo);
+
+        assert!(
+            cx.debug_bounds("file-tree-guide-idle-a-0").is_none(),
+            "a root-level row has no ancestors, so it must draw no guide at all"
+        );
+
+        let row = cx
+            .debug_bounds("file-tree-row-deep.txt")
+            .expect("the deepest row must paint");
+        // Literal selectors, not `format!`: `debug_bounds` takes a `&'static str`.
+        for (level, selector) in [
+            (0usize, "file-tree-guide-idle-deep.txt-0"),
+            (1, "file-tree-guide-idle-deep.txt-1"),
+            (2, "file-tree-guide-idle-deep.txt-2"),
+        ] {
+            let guide = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("a depth-3 row must draw a guide for level {level}"));
+            assert!(
+                close_enough(
+                    f32::from(guide.origin.x - row.origin.x),
+                    file_tree::indent_guide_x(level)
+                ),
+                "level {level}'s guide must sit under that level's expand chevron: expected \
+                 {:?} from the row's left edge, got {:?}",
+                file_tree::indent_guide_x(level),
+                f32::from(guide.origin.x - row.origin.x)
+            );
+        }
+        assert!(
+            cx.debug_bounds("file-tree-guide-idle-deep.txt-3").is_none(),
+            "a depth-3 row must not draw a fourth guide"
+        );
+    }
+
+    /// The "no gaps" half: a guide spans its row's full height, and consecutive rows' segments
+    /// for the same level meet exactly - which is what makes them read as one continuous line
+    /// rather than a dashed one.
+    #[gpui::test]
+    fn guides_on_consecutive_rows_join_with_no_gap(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let (_app, cx) = open_deep_tree(cx, &repo);
+
+        // The three consecutive rows `c`, `deep.txt`, `mid.txt` (in that render order - `c`'s
+        // own child comes between it and its sibling), all of which draw a level-1 guide.
+        let segments: Vec<gpui::Bounds<Pixels>> = [
+            "file-tree-guide-idle-c-1",
+            "file-tree-guide-idle-deep.txt-1",
+            "file-tree-guide-idle-mid.txt-1",
+        ]
+        .into_iter()
+        .map(|selector| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must paint"))
+        })
+        .collect();
+        let row = cx.debug_bounds("file-tree-row-c").expect("the `c` row");
+
+        assert!(
+            close_enough(
+                f32::from(segments[0].size.height),
+                f32::from(row.size.height)
+            ),
+            "a guide must span its row's whole height, or consecutive rows leave a visible gap"
+        );
+        for pair in segments.windows(2) {
+            let (upper, lower) = (pair[0], pair[1]);
+            assert!(
+                close_enough(f32::from(upper.origin.x), f32::from(lower.origin.x)),
+                "the same level's guide must be at the same x on every row"
+            );
+            assert!(
+                close_enough(
+                    f32::from(upper.origin.y + upper.size.height),
+                    f32::from(lower.origin.y)
+                ),
+                "one row's guide must end exactly where the next row's begins: {:?} vs {:?}",
+                f32::from(upper.origin.y + upper.size.height),
+                f32::from(lower.origin.y)
+            );
+        }
+    }
+
+    /// The real risk this whole approach was chosen to eliminate: after a scroll, `uniform_list`
+    /// rebuilds its rows from a different start index, reusing element slots. A guide drawn from
+    /// anything other than the row's own depth would land on the wrong row here.
+    #[gpui::test]
+    fn guides_stay_aligned_with_their_own_rows_after_the_list_recycles(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        fs::create_dir_all(repo.path().join("nested/inner")).expect("mkdir");
+        // Enough rows inside the nested folder to fill several viewports, so scrolling genuinely
+        // recycles row elements rather than merely translating them.
+        for index in 0..300 {
+            fs::write(
+                repo.path().join(format!("nested/inner/f-{index:03}.txt")),
+                "x\n",
+            )
+            .expect("write");
+        }
+        let (_app, cx) = {
+            let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+            cx.run_until_parked();
+            app.update(cx, |app, cx| {
+                app.toggle_dir_expanded(repo.path().join("nested"), cx);
+                app.toggle_dir_expanded(repo.path().join("nested/inner"), cx);
+            });
+            cx.run_until_parked();
+            (app, cx)
+        };
+
+        let first_row = cx
+            .debug_bounds("file-tree-row-f-000.txt")
+            .expect("the first nested row must paint");
+        assert!(
+            cx.debug_bounds("file-tree-row-f-299.txt").is_none(),
+            "precondition: the last row is below the viewport, so reaching it must recycle rows"
+        );
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: first_row.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-100_000.0))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+
+        let recycled_row = cx
+            .debug_bounds("file-tree-row-f-299.txt")
+            .expect("the last row must materialize after scrolling");
+        assert!(
+            cx.debug_bounds("file-tree-guide-idle-f-000.txt-0")
+                .is_none(),
+            "the row that scrolled out of view must take its guides with it - a leftover guide \
+             here would be a segment painted over an unrelated row"
+        );
+
+        for (level, selector) in [
+            (0usize, "file-tree-guide-idle-f-299.txt-0"),
+            (1, "file-tree-guide-idle-f-299.txt-1"),
+        ] {
+            let guide = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("recycled row must still draw its level-{level} guide"));
+            assert!(
+                close_enough(
+                    f32::from(guide.origin.x - recycled_row.origin.x),
+                    file_tree::indent_guide_x(level)
+                ),
+                "after recycling, level {level}'s guide must still be at that level's offset"
+            );
+            assert!(
+                close_enough(f32::from(guide.origin.y), f32::from(recycled_row.origin.y)),
+                "after recycling, the guide must still sit on its own row, not a neighbour's"
+            );
+            assert!(
+                close_enough(
+                    f32::from(guide.size.height),
+                    f32::from(recycled_row.size.height)
+                ),
+                "after recycling, the guide must still span its row's full height"
+            );
+        }
+    }
+
+    /// The optional half of §3: the guides along the selected file's ancestor chain are drawn in
+    /// the highlighted colour, and only those. The colour itself isn't observable from a test,
+    /// so this asserts on which of the two real branches each guide took (see the guide's own
+    /// `debug_selector`) - which is what would actually break if the condition were inverted.
+    #[gpui::test]
+    fn only_the_selected_files_ancestor_chain_is_highlighted(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        // A second branch at the same depth as `a/b`, so there is a row whose guides must stay
+        // idle while the selection's chain is active.
+        fs::create_dir_all(repo.path().join("a/other")).expect("mkdir");
+        fs::write(repo.path().join("a/other/elsewhere.txt"), "x\n").expect("write");
+        let (app, cx) = open_deep_tree(cx, &repo);
+        app.update(cx, |app, cx| {
+            app.toggle_dir_expanded(repo.path().join("a/other"), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("file-tree-guide-idle-deep.txt-0").is_some(),
+            "precondition: with nothing selected every guide is idle"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(repo.path().join("a/b/c/deep.txt"), window, cx);
+        });
+        cx.run_until_parked();
+
+        for selector in [
+            "file-tree-guide-active-deep.txt-0",
+            "file-tree-guide-active-deep.txt-1",
+            "file-tree-guide-active-deep.txt-2",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector}: every guide on the selected file's own row is part of its \
+                 ancestor chain"
+            );
+        }
+        // `a/other/elsewhere.txt` shares only `a` with the selection.
+        assert!(
+            cx.debug_bounds("file-tree-guide-active-elsewhere.txt-0")
+                .is_some(),
+            "the shared `a` ancestor is on the chain"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-guide-idle-elsewhere.txt-1")
+                .is_some(),
+            "`a/other` is not on the selected file's chain, so its guide stays idle"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-guide-active-elsewhere.txt-1")
+                .is_none(),
+            "and it must not also be drawn as active"
+        );
+    }
+
+    /// Collapsing a folder removes its children's guides along with their rows - the guides are
+    /// pure functions of the rows that are actually showing, with no independently-tracked state
+    /// that could survive them.
+    #[gpui::test]
+    fn collapsing_removes_the_hidden_rows_guides_too(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let (app, cx) = open_deep_tree(cx, &repo);
+        assert!(cx.debug_bounds("file-tree-guide-idle-deep.txt-2").is_some());
+
+        app.update(cx, |app, cx| {
+            app.toggle_dir_expanded(repo.path().join("a/b"), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("file-tree-row-deep.txt").is_none());
+        assert!(
+            cx.debug_bounds("file-tree-guide-idle-deep.txt-2").is_none(),
+            "a hidden row's guides must be gone with it"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-guide-idle-b-0").is_some(),
+            "the still-visible `b` row keeps its own level-0 guide"
         );
     }
 }

@@ -2041,3 +2041,105 @@ same baseline both times - 742 app + 42 lsp-core + 14 pty-core + 98 wt-core test
 confirming this added no new functionality and lost none. `git`'s own rename detection on the
 final commit independently corroborates the move: the large majority of touched files show as
 high-percentage renames, not delete+create pairs.
+
+## File tree: collapsed by default, persisted fold state, indent guides, complete listings (GitHub issue #18)
+
+The Files tree now opens fully collapsed and remembers exactly what was left open, per worktree,
+across restarts. `AdeApp::collapsed_dirs` became `expanded_dirs` - the inversion is the whole of
+the "collapsed by default" requirement: absence from the set means collapsed, so a worktree this
+app has never seen (a freshly created one included) opens showing only its root-level entries,
+with no separate "first open" special case anywhere in the code.
+
+**Persistence.** A new `crate::sidebar::fold_state` writes
+`~/.config/jerry/file-tree-state.toml`, resolved as a sibling of the real `settings.toml` path,
+and driven by the same serial-writer-loop mechanism `AdeApp::persist_settings` already
+established (one write in flight at a time; a change landing mid-write is picked up by the
+running loop, never raced). It is a separate file from `settings.toml` for two real reasons:
+`Settings`' own module docs are explicit that every field there is something a settings *page*
+reads and writes and the config banner renders back as hand-editable config, which machine-
+managed fold state for every worktree ever opened is not; and `Settings::save_at` is a
+deliberately non-atomic truncate-then-write, while "recorded immediately (crash-safe)" is a
+requirement here. `FoldState::save_at` writes a process-unique temp file, `sync_all`s it,
+renames it over the target, and syncs the parent directory, so neither a killed process nor a
+power loss can leave a half-written file. The map is keyed by canonicalized worktree path with
+worktree-relative paths inside, and non-UTF-8 paths are refused outright rather than
+`to_string_lossy`'d - a lossy key would map every undecodable byte to the same U+FFFD and could
+collapse two different worktrees onto one entry, which is exactly the cross-worktree leak the
+keying exists to prevent.
+
+**Indent guides** are drawn as each row's own absolutely-positioned children, not as an overlay
+across the list. That is what makes them correct under the recently-landed `uniform_list`
+virtualization for free: a guide is a pure function of the row it belongs to (`entry.depth`, plus
+the selected path for the ancestor-chain highlight), so a recycled row can only ever draw the
+guides that belong to whatever row it now shows. An overlay would have to track the visible range
+and scroll offset itself and stay in step with them - the real source of the "gaps or misaligned
+segments as rows recycle" failure the issue names. Verified against real painted geometry rather
+than assumed: tests assert each guide's `debug_bounds` x-offset equals `indent_guide_x(level)`
+from its row's left edge, that consecutive rows' segments meet with no gap, and that all of that
+still holds for a row materialized only after a real 100,000px scroll event recycled the list.
+Two new `ColorToken`s (`theme::tree::INDENT_GUIDE`/`INDENT_GUIDE_ACTIVE`) go through the same
+derived-per-theme mechanism as the ~200 tokens around them; the active/resting branch is testable
+because each guide's `debug_selector` records which one it took.
+
+**Complete listings.** The 500-row `MAX_RENDERED_FILE_ENTRIES` render cap and its
+"... and N more entries not shown" row are gone; every visible row is rendered. One cap survives
+and it is a *load* bound, not a render one: the walk is eager and synchronous (the palette's file
+search needs the whole tree, so it can't be made lazy), so it is bounded by a real, configurable
+`settings.toml` value (`file_tree.max_entries`, 20,000 by default). When it is hit the sidebar
+shows a real "Stopped at N entries - load more" action that re-walks with a tenfold larger
+budget. Deliberately still a budget rather than an unbounded re-walk: one click on a directory
+containing a vendored tree or a bind-mounted `$HOME` would otherwise allocate millions of
+`PathBuf`s and hand them all to the palette candidate list. Each click raises the bound and the
+row keeps reporting where the walk stopped, so nothing is ever *silently* cut off.
+
+Also landed while in here: "collapse all" (clears the tree and the saved state in one step);
+"reveal in tree" (the palette's open-file flow, a just-created file, and go-to-definition landing
+in an unexpanded folder) now expands ancestors and records those expansions like manual ones; and
+`render_file_tree` resolves its visible-row set once per frame into an `Rc<Vec<usize>>` shared
+with the row-builder closure, instead of re-walking the whole loaded tree on each of
+`uniform_list`'s three per-frame closure calls.
+
+An adversarial audit of the first draft found seven real problems, all fixed: `save_at` claimed
+crash-safety it didn't have (no `fsync`, so only *process* crash was covered); a fixed `.tmp`
+name meant two `jerry` processes could interleave into one torn file, and whole-file writes made
+the last saver silently erase every other repository's state (writes now merge against a set of
+owned worktree keys); a startup prune that dropped any worktree whose root `Path::exists()`
+reported gone would have permanently deleted state for a worktree on a briefly-unmounted volume
+(removed entirely - a few hundred stale bytes is cheaper than destroying real state on a false
+negative); a subdirectory the walk couldn't read looked identical to a deleted one, so pruning
+would have discarded every fold-state entry beneath it (the listing now reports `partial`, and
+pruning only ever runs against a genuinely complete walk); `select_worktree` moved `expanded_dirs`
+to the new worktree ~90 lines before `file_tree_root` followed, leaving a window in which a click
+on a still-rendered stale row recorded state against the wrong root; the live tree and the file
+could diverge silently when a path wasn't recordable (now a three-state outcome and a real log
+line, with the expansion still happening - refusing to open a folder because of how its name is
+encoded would be worse than not remembering it); and one test asserted on state it had
+hand-written itself rather than on a walk that genuinely truncated. The audit also confirmed the
+absolute-positioning assumption directly against vendored taffy: absolute insets resolve against
+the container's border box, not its padding box, so a guide's `left` really is measured from the
+row's own left edge despite the row's left padding.
+
+A second audit of those fixes then caught the worst bug of the whole change: the merged write was
+*written but never wired* - one edit had silently failed to apply, so `persist_fold_state` still
+called the whole-file `save_at`, `save_merged_at` was reachable only from its own unit test, and
+`fold_state_owned` was write-only dead state, while three doc comments and this log claimed
+otherwise. The unit test couldn't catch it (it called the unused function directly) and the
+existing app-level leak test couldn't either (its second instance started before the first ever
+wrote, so a whole-file write preserved both). The regression test added for it drives the exact
+ordering that distinguishes the two - instance B starts, *then* A writes, *then* B writes - and
+was confirmed to fail against the un-wired version before being kept. The same round also found
+two more walk paths that could report an incomplete listing as complete (a `DirEntry` that errors
+mid-iteration, and a `file_type()` failure recording a real directory as a file - either one
+would have let pruning delete good fold state), a silent `Refused` in `reveal_in_tree` that
+bypassed the log line its sibling write path already had, an orphaned-temp-file leak that
+making the temp name process-unique had turned from one reusable file into unbounded
+accumulation (now swept on save, with an hour's age threshold so it can never race another
+instance's live write), and several docs still describing the earlier unbounded "Show all
+entries" behaviour. The remaining honest gap is stated in `fold_state`'s own module docs rather
+than papered over: the merge is an unlocked read-modify-write, so two saves that genuinely
+interleave can still lose one update - it narrows the window rather than closing it.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace --lib -- --test-threads=1` - 790 app (up from 742: 48 new tests, none
+removed) + 42 lsp-core + 14 pty-core + 98 wt-core.
