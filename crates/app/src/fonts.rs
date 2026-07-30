@@ -19,7 +19,7 @@
 //!
 //! ## `IBMPlexMono-SemiBold.ttf`: bundled for ANSI bold, not a design-token weight
 //!
-//! The design only calls for Mono 400/450/500, but `crate::terminal_pane::render_row` requests
+//! The design only calls for Mono 400/450/500, but `crate::terminal::pane::render_row` requests
 //! `FontWeight::BOLD` (700) for ANSI `SGR 1` cells. Without a bundled Mono weight above 500,
 //! GPUI's weight-matching would resolve "bold" to whichever bundled weight is numerically
 //! closest to 700 - which, before this file existed, was 500 (Medium): visibly not bold. 600

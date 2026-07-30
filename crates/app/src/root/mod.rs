@@ -1,27 +1,46 @@
 //! The top-level three-pane window: a left worktree sidebar, a tabbed center pane of
 //! terminal sessions, and a right file tree, composed as GPUI entities.
 //!
+//! ## What lives here, and what doesn't
+//!
+//! This module is the *app shell*, not a grab-bag of rendering code. It owns [`AdeApp`]
+//! itself (the one state struct every subsystem reads and mutates) and its construction
+//! ([`state`]), the crate's GPUI actions, the `Render` impl that composes the zones, and
+//! the genuinely cross-zone mechanics: focus/overlay discipline ([`focus`], [`OverlayFocus`]), pane resizing
+//! ([`resize`] plus its pure width-clamp half, [`layout`]), the scoped rem-size override
+//! Surface C's zoom paints through ([`rem_scope`]), the shared keycap/chip/message widgets
+//! ([`widgets`]), the background-task slot type ([`task_pool`]), and the "New file" prompt
+//! ([`new_file`]), which is an overlay reachable from two different zones and so belongs to
+//! neither.
+//!
+//! Everything *about one subsystem* lives in that subsystem's own folder instead - both its
+//! pure, window-free logic and the `impl AdeApp` blocks that draw it: `crate::rail`,
+//! `crate::work_surface`, `crate::sidebar`, `crate::code_surface`, `crate::merge`,
+//! `crate::palette`, `crate::settings`, `crate::status_bar`, `crate::title_bar`,
+//! `crate::terminal`, `crate::lsp`, `crate::worktree_history`. So "everything about
+//! feature X" is one directory, not two unrelated ones.
+//!
 //! ## Offloading `wt-core`'s blocking calls
 //!
 //! `wt_core::list_worktrees` performs blocking I/O (`gix` object-database reads, and
 //! sometimes spawning `git`). It's never called directly from `render` or an event handler;
 //! [`AdeApp::load_worktrees`] hands it to `cx.background_executor().spawn(..)` and only
 //! touches `self` again inside a `this.update(cx, ..)` callback once the background task
-//! resolves. `crate::file_tree::build_file_tree`'s `std::fs::read_dir` walk follows the same
+//! resolves. `crate::sidebar::file_tree::build_file_tree`'s `std::fs::read_dir` walk follows the same
 //! pattern.
 //!
 //! ## One rail row per worktree; sessions are tabs scoped to it
 //!
-//! [`crate::sessions::Sessions`] holds any number of independent, simultaneously-running
+//! [`crate::work_surface::sessions::Sessions`] holds any number of independent, simultaneously-running
 //! terminal sessions (a plain shell, or an agent CLI), each pinned to the worktree it was
 //! started in. The session rail shows exactly one row per worktree
-//! (`crate::rail::WorktreeRow`, aggregating every session open in it), and the centre pane's tab
+//! (`crate::rail::state::WorktreeRow`, aggregating every session open in it), and the centre pane's tab
 //! strip (`AdeApp::render_tab_strip`) only ever shows the *currently selected* worktree's own
 //! sessions - never a flat, unscoped list of every session across every worktree.
 //!
 //! Selecting a worktree in the sidebar still never spawns or kills anything - but, unlike
 //! before this revision, it *does* change which session is "active"
-//! (`crate::sessions::Sessions::activate_for_worktree`, called from [`AdeApp::select_worktree`]):
+//! (`crate::work_surface::sessions::Sessions::activate_for_worktree`, called from [`AdeApp::select_worktree`]):
 //! the active session must always belong to the selected worktree, or the centre pane would show
 //! one worktree's terminal while the rail highlights another. [`AdeApp::selected`] itself still
 //! drives the file tree, and which worktree `active_session_cwd` resolves to for the *next* "New
@@ -29,48 +48,47 @@
 //! its own explicit action, never an implicit side effect of browsing.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    actions, div, font, prelude::*, px, rems, uniform_list, App, BoxShadow, ClickEvent, Context,
-    DragMoveEvent, Empty, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent,
-    Pixels, ScrollStrategy, Subscription, Task, UniformListScrollHandle, Window, WindowControlArea,
+    actions, div, font, prelude::*, px, App, ClickEvent, Context, DragMoveEvent, Empty,
+    FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Subscription, Task,
+    UniformListScrollHandle, Window,
 };
-use wt_core::diff::{DiffBase, DiffFile, DiffLineKind, FileChangeStatus, WorktreeDiff};
-use wt_core::merge::{ConflictHunk, ConflictSegment, ConflictedPath};
+use wt_core::diff::DiffFile;
+use wt_core::merge::ConflictHunk;
 
-use crate::changes::{self, ChangeTag};
-use crate::code_view;
-use crate::diagnostics_view;
-use crate::edit_buffer;
+use crate::code_surface::code_view;
+use crate::code_surface::edit_buffer;
 use crate::env_info;
-use crate::file_tree::{self, FileTreeEntry, LangChip};
-use crate::hover_view;
-use crate::keymap::{self, WindowControlsStyle};
+use crate::keymap::WindowControlsStyle;
 use crate::keymap_overrides;
-use crate::language;
-use crate::layout;
-use crate::merge;
-use crate::palette;
-use crate::process_stats;
-use crate::rail::{self, RailMode, SessionRow, WorktreeEntry, WorktreeNote, WorktreeRow};
-use crate::sessions::{Session, SessionId, SessionKind, Sessions};
-use crate::settings::{self, SettingsPage};
-use crate::settings_store::{self, CfgFormat, Settings};
-use crate::status::{self, Status};
+use crate::lsp::diagnostics as diagnostics_view;
+use crate::merge::state as merge;
+use crate::palette::state as palette;
+use crate::rail::state::{self as rail, RailMode};
+use crate::rail::worktrees::{self, WorktreeItem};
+use crate::settings::state as settings;
+#[cfg(test)]
+use crate::settings::state::SettingsPage;
+use crate::settings::store::{self as settings_store, CfgFormat, Settings};
+use crate::sidebar::changes::{self, ChangeTag};
+use crate::sidebar::file_tree::{self, FileTreeEntry};
+use crate::status_bar::process_stats;
 use crate::theme;
-use crate::undo;
-use crate::work_surface;
-use crate::worktrees::{self, WorktreeItem};
+use crate::title_bar::menu as title_bar;
+use crate::work_surface::sessions::{SessionId, SessionKind, Sessions};
+use crate::work_surface::state as work_surface;
+use crate::worktree_history::flow as worktree_history;
+use crate::worktree_history::undo;
 
-use crate::root::code_surface::{DiffLoadState, FileLoadState, HoverEntry};
-use crate::root::completions::CompletionsEntry;
-use crate::root::lsp::LspClientState;
+use crate::code_surface::state::{DiffLoadState, FileLoadState, HoverEntry};
+use crate::lsp::client::LspClientState;
+use crate::lsp::completion_popup::CompletionsEntry;
 use crate::root::resize::{PaneResizeDrag, ResizeTarget};
-use crate::root::sidebar_render::RightSidebarView;
 use crate::root::task_pool::TaskPool;
+use crate::sidebar::render::RightSidebarView;
 
 // Bound as GPUI actions/keybindings in `crate::default_key_bindings` (see that function's docs
 // for why each literal keystroke spec was chosen, e.g. `secondary-,` over `cmd-,`).
@@ -84,17 +102,17 @@ use crate::root::task_pool::TaskPool;
 // since a bound `KeyBinding` maps one literal keystroke to one action value and `actions!`-
 // generated unit structs carry no data a single handler could branch on by position.
 // The `Editor*` actions below (Revision R8.5a) back the File view's real text editing -
-// `crate::root::editing`'s `EntityInputHandler` impl and action handlers. Bound with a
+// `crate::code_surface::editing`'s `EntityInputHandler` impl and action handlers. Bound with a
 // `key_context` of `Some("file-editor")` in `crate::default_key_bindings`, scoped to only the
-// editable File view container (`crate::root::code_surface::render_file_view`'s inner container,
+// editable File view container (`crate::code_surface::file_view::render_file_view`'s inner container,
 // not the shared outer Diff/File surface `.key_context("diff")` also uses) - see that function's
 // own docs for why the Diff view must never receive these bindings.
 //
 // `Completions*` (Revision R8.5b) navigate/accept/dismiss the real Completions popup
-// (`crate::root::completions`). Bound with `Some("file-editor && completions")` - a real,
+// (`crate::lsp::completion_popup`). Bound with `Some("file-editor && completions")` - a real,
 // *narrower* context than the plain `Editor*` bindings above, added to the same code-surface node
-// only while `AdeApp::completions` is genuinely `Ready` (see `crate::root::code_surface::
-// AdeApp::render_code_surface`'s own docs, and `crate::root::completions::AdeApp::
+// only while `AdeApp::completions` is genuinely `Ready` (see `crate::code_surface::
+// AdeApp::render_code_surface`'s own docs, and `crate::lsp::completion_popup::AdeApp::
 // completions_open_for_active_path`'s own docs for why a merely `Loading`/`Failed` entry does
 // *not* count - a real, live-reproduced keystroke-swallowing bug this project's own audit caught,
 // see that method's docs) - and the plain `up`/`down`/`enter` `Editor*` bindings are
@@ -148,57 +166,57 @@ actions!(
     ]
 );
 
-/// How often `crate::rail::compute_status_snapshot`'s background `git` status/diff refresh
-/// re-runs. Coarser than `crate::terminal_pane`'s 8ms poll since this spawns real `git` child
+/// How often `crate::rail::state::compute_status_snapshot`'s background `git` status/diff refresh
+/// re-runs. Coarser than `crate::terminal::pane`'s 8ms poll since this spawns real `git` child
 /// processes per worktree/session path, not a cheap channel `try_recv`.
-const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(3);
+pub(crate) const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// How often [`AdeApp::render_file_view`] calls `std::fs::metadata` for its freshness check -
 /// throttled rather than unconditional-per-render (see
 /// [`AdeApp::file_view_last_freshness_check`]).
-const FILE_FRESHNESS_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+pub(crate) const FILE_FRESHNESS_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Cap on how many changed files the diff view renders, independent of `wt_core::diff`'s own
 /// `MAX_FILES` cap (300) on the loaded diff. Mirrors `file_tree::MAX_RENDERED_FILE_ENTRIES`.
-const MAX_RENDERED_DIFF_FILES: usize = 40;
+pub(crate) const MAX_RENDERED_DIFF_FILES: usize = 40;
 
 /// Cap on how many hunk lines a single file's diff renders, independent of `wt_core::diff`'s
 /// own per-file `MAX_HUNK_LINES_PER_FILE` cap (2000) on loaded data.
-const MAX_RENDERED_DIFF_LINES_PER_FILE: usize = 300;
+pub(crate) const MAX_RENDERED_DIFF_LINES_PER_FILE: usize = 300;
 
 /// The Diff view's per-hunk syntax-highlight + gutter-number cache's real shape - see
 /// [`AdeApp::diff_highlight_cache`]'s own docs for what each element means and why the `DiffFile`
 /// is a real identity guard, not decoration. A named `type` (rather than the bare tuple type
 /// inline) so `clippy::type_complexity` doesn't fire, and so `code_surface`'s own
 /// `diff_highlight_cache_for` can share the exact same shape as the field it reads.
-pub(super) type DiffHighlightCache = (
+pub(crate) type DiffHighlightCache = (
     DiffFile,
     Vec<Vec<code_view::RenderedLine>>,
     Vec<Vec<(Option<usize>, Option<usize>)>>,
 );
 
 /// How often [`AdeApp::ensure_lsp_poll_task`]'s background loop checks for a newly-arrived
-/// `publishDiagnostics` notification. Coarser than `crate::terminal_pane::POLL_INTERVAL` (8ms):
+/// `publishDiagnostics` notification. Coarser than `crate::terminal::pane::POLL_INTERVAL` (8ms):
 /// pty output is latency-sensitive, rust-analyzer's diagnostics are not.
-const LSP_DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+pub(crate) const LSP_DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How long [`AdeApp::request_hover`]/[`AdeApp::trigger_goto_definition`] wait for
 /// rust-analyzer's response before giving up. Both run against an already-`Ready`
 /// [`LspClientState`], so this budgets one query's round trip, not indexing from a cold start.
-const LSP_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const LSP_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct AdeApp {
-    repo_path: PathBuf,
-    worktrees: Vec<WorktreeItem>,
-    worktrees_error: Option<String>,
-    selected: Option<usize>,
-    sessions: Sessions,
-    file_tree: Vec<FileTreeEntry>,
-    file_tree_root: PathBuf,
-    file_tree_error: Option<String>,
-    right_sidebar_view: RightSidebarView,
-    diff_root: PathBuf,
-    diff_state: DiffLoadState,
+    pub(crate) repo_path: PathBuf,
+    pub(crate) worktrees: Vec<WorktreeItem>,
+    pub(crate) worktrees_error: Option<String>,
+    pub(crate) selected: Option<usize>,
+    pub(crate) sessions: Sessions,
+    pub(crate) file_tree: Vec<FileTreeEntry>,
+    pub(crate) file_tree_root: PathBuf,
+    pub(crate) file_tree_error: Option<String>,
+    pub(crate) right_sidebar_view: RightSidebarView,
+    pub(crate) diff_root: PathBuf,
+    pub(crate) diff_state: DiffLoadState,
     /// The real `+n`/`-n` totals across every file in [`Self::diff_state`]'s currently loaded
     /// diff (`Self::render_right_sidebar_toggle`'s header totals), computed once - off the UI
     /// thread, alongside `diff_state` itself becoming `DiffLoadState::Loaded` - rather than
@@ -206,62 +224,62 @@ pub struct AdeApp {
     /// of which Zone 3 tab is even showing. `None` whenever there's no loaded diff to sum (see
     /// [`Self::current_diff`]'s docs for exactly which [`DiffLoadState`]/[`DiffBase`]
     /// combinations count).
-    diff_totals: Option<(u32, u32)>,
+    pub(crate) diff_totals: Option<(u32, u32)>,
     /// Real collapse/expand state for the file tree - a directory's path is in this set iff
-    /// the user has collapsed it (see `crate::file_tree::visible_entries`, which this set
+    /// the user has collapsed it (see `crate::sidebar::file_tree::visible_entries`, which this set
     /// feeds directly). Absence means expanded, so a freshly loaded tree starts fully open,
     /// matching the design's own default screenshots.
-    collapsed_dirs: HashSet<PathBuf>,
+    pub(crate) collapsed_dirs: HashSet<PathBuf>,
     /// Per-file "reviewed" toggle state for the Changes list - a file's path is in this set iff
     /// its checkbox is checked. No backend "review" concept exists yet; this is purely local UI
     /// state that `Self::render_changes_header`'s progress bar and count read directly.
-    reviewed_files: HashSet<PathBuf>,
+    pub(crate) reviewed_files: HashSet<PathBuf>,
     /// Ordered list of currently-open file tabs, rendered after every session's own tab by
     /// `Self::render_tab_strip`. No duplicates: opening an already-open file just activates its
     /// existing entry (`Self::push_open_file`). Removed only on explicit tab close
     /// (`Self::close_file_tab`) or leaving the owning worktree (`reset_per_worktree_ui_state`) -
     /// these are worktree-relative paths, meaningless (or collision-prone) once the worktree
     /// changes.
-    open_files: Vec<PathBuf>,
+    pub(crate) open_files: Vec<PathBuf>,
     /// Which file tab (if any) the centre pane is showing instead of a session -
     /// `Some(path)` iff `path` is also in [`Self::open_files`]. Set by a Changes row
     /// (`Self::open_change_diff`), a Files-tree row (`Self::open_file_view`), or an already-open
     /// tab (`Self::activate_file_tab`); cleared by selecting a session tab or closing the active
     /// tab down to none left.
-    open_change: Option<PathBuf>,
+    pub(crate) open_change: Option<PathBuf>,
     /// Cached `DiffFile` for whichever path [`Self::open_change`] names (`None` if it has no
     /// diff, or nothing is open) - kept fresh by [`Self::refresh_open_diff_file_cache`] instead
     /// of re-cloning the whole diff (up to 2000 hunk lines) on every render.
     /// `Self::render_center_pane` moves it out (`Option::take`) rather than cloning it again
     /// before calling `Self::render_code_surface` (which needs `&mut self`) and moves it back
     /// afterward - an O(1) swap, not a second deep clone.
-    open_diff_file_cache: Option<DiffFile>,
+    pub(crate) open_diff_file_cache: Option<DiffFile>,
     /// File-tree path last resolved from a palette file result with no diff to open
     /// (`Self::open_palette_file_result`) - highlighted in `Self::render_file_tree_row` like a
     /// Changes row's own selection highlight.
-    selected_tree_path: Option<PathBuf>,
+    pub(crate) selected_tree_path: Option<PathBuf>,
     /// Surface C's `Diff | File` toggle for whichever file [`Self::open_change`] names - set to
     /// `Diff` by [`Self::open_change_diff`] and `File` by [`Self::open_file_view`], read by
     /// [`Self::render_code_surface`] alongside a "does this file even have a diff" check (a
     /// diff-less file always renders as `File` regardless of this field).
-    code_view: code_view::CodeView,
+    pub(crate) code_view: code_view::CodeView,
     /// Surface C's Diff/File focus target, `track_focus`'d by
     /// [`Self::render_code_surface`]'s outer container - see [`OverlayFocus`]/[`restore_focus`]
     /// for the dangling-focus invariant this and [`Self::code_focus`] exist to satisfy.
-    code_focus_handle: FocusHandle,
+    pub(crate) code_focus_handle: FocusHandle,
     /// Pre-open focus target for [`Self::code_focus_handle`] - see [`OverlayFocus`].
-    code_focus: OverlayFocus,
+    pub(crate) code_focus: OverlayFocus,
     /// The File view's `uniform_list` scroll handle (`gpui::UniformListScrollHandle`, matching
     /// `vendor/zed/crates/git_ui/src/git_panel.rs`'s `commit_history_scroll_handle` use of the
     /// same type) - driven by go-to-definition landing on a distant [`Self::code_cursor`] line,
     /// never on an ordinary click or fresh file open (no reason to fight the user's own scroll
     /// position).
-    file_view_scroll_handle: UniformListScrollHandle,
+    pub(crate) file_view_scroll_handle: UniformListScrollHandle,
     /// Cached parse/highlight of whichever file [`Self::render_file_view`] last loaded
     /// (`code_view::load_file`/`highlight_rust`) - reused unless `code_view::cache_is_fresh`
     /// says otherwise, always written from [`Self::spawn_file_load`]'s background task, never
     /// synchronously during `render()`.
-    file_view_cache: Option<code_view::ParsedFile>,
+    pub(crate) file_view_cache: Option<code_view::ParsedFile>,
     /// Cached per-hunk syntax highlighting (and per-hunk gutter line numbers, so
     /// [`Self::render_diff_file_detail`]'s render loop never recomputes
     /// [`changes::hunk_line_numbers`] itself) for whichever `DiffFile` this cache was built from,
@@ -276,34 +294,34 @@ pub struct AdeApp {
     /// on a worktree switch alongside [`Self::open_diff_file_cache`] (see
     /// [`Self::select_worktree`]) so it never retains a full file's highlighting from the
     /// worktree just left.
-    diff_highlight_cache: Option<DiffHighlightCache>,
+    pub(crate) diff_highlight_cache: Option<DiffHighlightCache>,
     /// Path and time [`Self::render_file_view`] last called `std::fs::metadata` for its
     /// freshness check, throttling that syscall to at most once per
     /// [`FILE_FRESHNESS_CHECK_INTERVAL`] instead of every render. `None` until the first check;
     /// `Self::select_worktree` doesn't need to reset this since a worktree switch always changes
     /// `file_tree_root`, forcing a path mismatch and thus a fresh check anyway.
-    file_view_last_freshness_check: Option<(PathBuf, Instant)>,
+    pub(crate) file_view_last_freshness_check: Option<(PathBuf, Instant)>,
     /// See [`FileLoadState`]'s own docs.
-    file_load_state: FileLoadState,
+    pub(crate) file_load_state: FileLoadState,
     /// Changed-line set (`code_view::changed_line_set`) for whichever `DiffFile`
     /// [`Self::open_diff_file_cache`] holds - recomputed only by
     /// [`Self::refresh_open_diff_file_cache`], never per render.
-    file_view_changed_lines: HashSet<usize>,
+    pub(crate) file_view_changed_lines: HashSet<usize>,
     /// The File view's "last click" cursor line (1-indexed), set by
     /// [`Self::render_file_view_line`]'s click handler and reset to `1` on a fresh file load.
     /// No column tracking: per-character hit-testing against a monospace run wasn't implemented
     /// this phase, so no column is shown at all rather than a fabricated `col 1`.
-    code_cursor: Option<usize>,
+    pub(crate) code_cursor: Option<usize>,
     /// Real, live per-tab text-editing state for the File view (Revision R8.5a) - keyed the same
     /// way as [`Self::open_files`] (a worktree-relative path), so switching between open file
     /// tabs never loses unsaved edits in a background tab. Created lazily the first time a file
     /// is opened in File view (see
-    /// [`crate::root::code_surface::AdeApp::render_file_view`]), seeded from the exact same
+    /// [`crate::code_surface::file_view::AdeApp::render_file_view`]), seeded from the exact same
     /// background read [`Self::spawn_file_load`] already performs. [`Self::file_view_cache`]
     /// stays the freshness-check/diagnostics/hover source of truth (the last-*saved* snapshot,
     /// per this phase's own scope); this map is what's actually on screen and what an explicit
     /// save writes. Deliberately **not** removed on an ordinary tab close
-    /// ([`crate::root::code_surface::AdeApp::close_file_tab`]) - dropping unsaved edits just
+    /// ([`crate::code_surface::tabs::AdeApp::close_file_tab`]) - dropping unsaved edits just
     /// because a tab was closed (with no "save before closing?" prompt - out of scope this
     /// phase) would be a real, silent data-loss risk; reopening the same file later restores the
     /// exact in-memory buffer. Reset alongside `open_files` in `reset_per_worktree_ui_state` so a
@@ -312,18 +330,18 @@ pub struct AdeApp {
     /// reset the same way too - see `settings_store`'s "Editor zoom is one global, persisted
     /// number now" docs for why it no longer is: it moved to `Settings.appearance.
     /// editor_zoom_percent`, a real persisted field, not per-worktree UI state.)
-    edit_buffers: HashMap<PathBuf, edit_buffer::EditBuffer>,
+    pub(crate) edit_buffers: HashMap<PathBuf, edit_buffer::EditBuffer>,
     /// Every visible File-view row's real painted bounds and shaped line, captured by
-    /// `crate::root::editing`'s per-row `gpui::canvas` paint callback each render - read back by
+    /// `crate::code_surface::editing`'s per-row `gpui::canvas` paint callback each render - read back by
     /// a row's own click handler to hit-test a click into a real byte offset
     /// (`gpui::LineLayout::closest_index_for_x`) for real click-to-place-cursor. Keyed by 1-based
     /// line number (matching [`Self::code_cursor`]'s convention). Transient/best-effort: entries
     /// for rows no longer visible are simply never refreshed again (harmless - a stale entry is
     /// only ever read for a row-click hit test, and a scrolled-away row can't be clicked), so this
     /// is cleared wholesale only on a worktree switch, not pruned every frame.
-    file_view_row_layout: HashMap<usize, (gpui::Bounds<Pixels>, gpui::ShapedLine)>,
+    pub(crate) file_view_row_layout: HashMap<usize, (gpui::Bounds<Pixels>, gpui::ShapedLine)>,
     /// The real shaped line, bounds, and 0-indexed buffer line that painted the *caret's own* row
-    /// most recently - `crate::root::editing`'s `EntityInputHandler::bounds_for_range`/
+    /// most recently - `crate::code_surface::editing`'s `EntityInputHandler::bounds_for_range`/
     /// `character_index_for_point` read these three together (never `file_view_row_layout`, which
     /// only serves click hit-testing) and honestly return `None` when the caret's row wasn't
     /// actually painted last frame (e.g. scrolled out of view) - the same real, structural
@@ -331,11 +349,11 @@ pub struct AdeApp {
     /// `vendor/zed/crates/gpui/examples/input.rs`'s own `TextInput::last_layout`/`last_bounds`
     /// have, scoped here to whichever path/line they're actually for so a stale entry from a
     /// different file/line can never be misapplied.
-    file_view_last_layout: Option<gpui::ShapedLine>,
-    file_view_last_bounds: Option<gpui::Bounds<Pixels>>,
+    pub(crate) file_view_last_layout: Option<gpui::ShapedLine>,
+    pub(crate) file_view_last_bounds: Option<gpui::Bounds<Pixels>>,
     /// The path and 0-indexed buffer line [`Self::file_view_last_layout`]/
     /// [`Self::file_view_last_bounds`] are for - `None` until the first paint of a caret row.
-    file_view_last_layout_for: Option<(PathBuf, usize)>,
+    pub(crate) file_view_last_layout_for: Option<(PathBuf, usize)>,
     /// Every in-flight debounced real re-highlight (`code_view`'s real `tree-sitter` parse) for a
     /// dirty [`Self::edit_buffers`] entry, keyed by the same relative path - see
     /// [`edit_buffer`]'s own "Re-highlighting cost" docs for why this is debounced rather than
@@ -344,23 +362,23 @@ pub struct AdeApp {
     /// re-arming the same path's entry correctly cancels (drops) whatever shorter-lived timer was
     /// still waiting - no risk of an out-of-order *write*, unlike
     /// [`Self::_file_save_tasks`]'s real disk writes, since this only ever reads
-    /// `edit_buffers`/writes back into it, gated by [`crate::edit_buffer::EditBuffer::
+    /// `edit_buffers`/writes back into it, gated by [`crate::code_surface::edit_buffer::EditBuffer::
     /// apply_highlight`]'s own real content-snapshot equality check.
-    _rehighlight_tasks: HashMap<PathBuf, Task<()>>,
-    /// Every in-flight explicit `crate::root::editing::AdeApp::save_active_file` background
+    pub(crate) _rehighlight_tasks: HashMap<PathBuf, Task<()>>,
+    /// Every in-flight explicit `crate::code_surface::editing::AdeApp::save_active_file` background
     /// write, one slot per path - see [`Self::file_save_pending`]/[`Self::file_save_running`]'s
     /// own docs for the serial-writer-loop discipline (mirroring
     /// [`Self::_settings_save_task`]'s own, per-path rather than global) that keeps two saves of
     /// the *same* file from ever racing on disk, the exact class of bug Revision R5.5 fixed once
     /// for settings.
-    _file_save_tasks: HashMap<PathBuf, Task<()>>,
+    pub(crate) _file_save_tasks: HashMap<PathBuf, Task<()>>,
     /// Paths with a save requested while that same path's serial writer loop
     /// ([`Self::_file_save_tasks`]) was already running - picked up by the loop's own next
     /// iteration rather than racing a second, independent `std::fs::write` against the same file.
-    file_save_pending: HashSet<PathBuf>,
+    pub(crate) file_save_pending: HashSet<PathBuf>,
     /// Paths whose serial writer loop is currently alive - guards against spawning a second loop
     /// for a path that already has one draining [`Self::file_save_pending`].
-    file_save_running: HashSet<PathBuf>,
+    pub(crate) file_save_running: HashSet<PathBuf>,
     /// The most recent explicit save's real failure, if any (e.g. a permission error, disk full) -
     /// surfaced honestly near the File view's tab strip rather than silently dropped. Also holds
     /// the real external-change-conflict message (see [`Self::file_external_conflict`]) sharing
@@ -372,114 +390,114 @@ pub struct AdeApp {
     /// exactly as real after the tab closes as before - silently dropping the warning just
     /// because the tab isn't visible would be the same "looks resolved, isn't" risk this whole
     /// mechanism exists to avoid.
-    file_save_error: Option<(PathBuf, String)>,
+    pub(crate) file_save_error: Option<(PathBuf, String)>,
     /// Paths currently flagged with a real, detected conflict: an unsaved (dirty) edit buffer
     /// whose underlying file has genuinely changed on disk since it was loaded/last saved (some
     /// other process - git, the agent CLI in a terminal tab, an external editor - touched it).
-    /// Set by [`crate::root::code_surface::AdeApp::render_file_view`]'s existing freshness check
+    /// Set by [`crate::code_surface::file_view::AdeApp::render_file_view`]'s existing freshness check
     /// when it fires while the buffer is dirty; cleared once the check no longer finds a mismatch.
-    /// [`crate::root::editing::AdeApp::save_active_file`] refuses to save (with its own,
+    /// [`crate::code_surface::editing::AdeApp::save_active_file`] refuses to save (with its own,
     /// authoritative fresh `std::fs::metadata` check, not just this render-throttled flag) while
     /// a path is in this set - see that method's own docs for why silently overwriting the
     /// external change, or silently discarding the user's own unsaved edits, are both wrong.
-    file_external_conflict: HashSet<PathBuf>,
+    pub(crate) file_external_conflict: HashSet<PathBuf>,
     /// Whether the command palette (⌘K) overlay is open.
-    palette_open: bool,
+    pub(crate) palette_open: bool,
     /// The palette's active scope (`All`/`Commands`/`Files`).
-    palette_scope: palette::PaletteScope,
+    pub(crate) palette_scope: palette::PaletteScope,
     /// The palette's currently typed query - the same minimal hand-rolled append/backspace text
     /// field as [`Self::filter_query`] (see [`Self::handle_filter_key_down`]'s docs for why, over
     /// `vendor/zed/crates/gpui/examples/input.rs`'s full `EntityInputHandler`).
-    palette_query: String,
+    pub(crate) palette_query: String,
     /// The palette's currently highlighted result row - an index into
-    /// `Self::build_palette_groups`' flattened (`crate::palette::flatten`) row order, moved by
+    /// `Self::build_palette_groups`' flattened (`crate::palette::state::flatten`) row order, moved by
     /// arrow keys and run by Enter.
-    palette_selected: usize,
-    palette_focus_handle: FocusHandle,
+    pub(crate) palette_selected: usize,
+    pub(crate) palette_focus_handle: FocusHandle,
     /// Pre-open focus target and active session for [`Self::palette_focus_handle`] - see
     /// [`OverlayFocus`]/[`restore_focus`].
-    palette_focus: OverlayFocus,
-    /// The palette's file-candidate list (`crate::palette::FileCandidate`, one per non-directory
+    pub(crate) palette_focus: OverlayFocus,
+    /// The palette's file-candidate list (`crate::palette::state::FileCandidate`, one per non-directory
     /// [`Self::file_tree`] entry, up to `file_tree::MAX_ENTRIES` = 5000) - built once by
     /// [`Self::rebuild_palette_file_candidates`] when `file_tree`/the diff reload, not rebuilt on
     /// every `Self::build_palette_groups` call (which runs on every render while the palette is
     /// open, up to ~30x/sec during a streaming session). Session/command candidates aren't
     /// cached the same way: they're few, and a session's status dot is genuinely live per-render
     /// data with no stable invalidation point.
-    palette_file_candidates: Vec<palette::FileCandidate>,
+    pub(crate) palette_file_candidates: Vec<palette::FileCandidate>,
     /// The session rail's user-adjustable width (240-340px), dragged via the resize handle on
-    /// the rail's right edge (see [`Self::apply_pane_resize`]/`crate::layout::rail_width_for_cursor`).
-    rail_width: Pixels,
+    /// the rail's right edge (see [`Self::apply_pane_resize`]/`crate::root::layout::rail_width_for_cursor`).
+    pub(crate) rail_width: Pixels,
     /// The files/changes panel's user-adjustable width - see [`Self::rail_width`]'s docs,
-    /// mirrored on the panel's left edge (`crate::layout::panel_width_for_cursor`).
-    panel_width: Pixels,
+    /// mirrored on the panel's left edge (`crate::root::layout::panel_width_for_cursor`).
+    pub(crate) panel_width: Pixels,
     /// The window body's current paint bounds - captured every render by a `gpui::canvas` child
     /// (see [`Self::render`]'s body child list) and read by [`Self::apply_pane_resize`] to turn
     /// a drag's cursor position into a pane width, the same pattern
     /// `vendor/zed/crates/workspace/src/workspace.rs`'s own `bounds` field uses for its dock
     /// resize. `Bounds::default()` until the first paint; harmless since nothing reads it before
     /// a resize handle can be dragged.
-    body_bounds: gpui::Bounds<Pixels>,
+    pub(crate) body_bounds: gpui::Bounds<Pixels>,
     /// Armed by a left mouse-down on the title bar's drag area, consumed by the next mouse-move
     /// to call `Window::start_window_move` - see [`Self::render_title_bar`]'s docs for why this
     /// two-step dance (verified against `vendor/zed/crates/platform_title_bar/src/
     /// platform_title_bar.rs`'s same pattern) is needed instead of starting the move on
     /// mouse-down directly.
-    title_bar_move_armed: bool,
+    pub(crate) title_bar_move_armed: bool,
     /// The session rail's grouping mode (`by urgency` / `by project`). See
-    /// [`crate::rail::RailMode`].
-    rail_mode: RailMode,
+    /// [`crate::rail::state::RailMode`].
+    pub(crate) rail_mode: RailMode,
     /// The rail's filter query - filters the rendered session/worktree rows in both grouping
-    /// modes (see `crate::rail::filter_sessions`/`filter_worktree_rows`).
-    filter_query: String,
-    filter_focus_handle: FocusHandle,
+    /// modes (see `crate::rail::state::filter_sessions`/`filter_worktree_rows`).
+    pub(crate) filter_query: String,
+    pub(crate) filter_focus_handle: FocusHandle,
     /// Real `+N -M`/has-changes totals per worktree or session cwd, refreshed by the
-    /// periodic background task started in `Self::new` - see `crate::rail::
+    /// periodic background task started in `Self::new` - see `crate::rail::state::
     /// compute_status_snapshot`'s docs. Read (never written outside that task's completion
     /// callback) by `Self::build_session_rows` each render.
-    diff_cache: HashMap<PathBuf, rail::DiffSummary>,
+    pub(crate) diff_cache: HashMap<PathBuf, rail::DiffSummary>,
     /// Real clean/merged notes per worktree path, from the same periodic refresh as
     /// [`Self::diff_cache`] - powers "by project" mode's session-less worktree rows and the
     /// rail footer's `prune` action.
-    worktree_notes: HashMap<PathBuf, rail::WorktreeNote>,
+    pub(crate) worktree_notes: HashMap<PathBuf, rail::WorktreeNote>,
     /// Real `wt_core::diff::AheadBehind` counts per worktree/session cwd, from the same
     /// periodic refresh as [`Self::diff_cache`] - the status bar's `↑2 ↓0` indicator for the
     /// active session's worktree.
-    ahead_behind_cache: HashMap<PathBuf, wt_core::diff::AheadBehind>,
+    pub(crate) ahead_behind_cache: HashMap<PathBuf, wt_core::diff::AheadBehind>,
     /// Real, live per-pid CPU%/memory samples for every currently open session's process
-    /// (`crate::process_stats`), refreshed by the same periodic background task as
+    /// (`crate::status_bar::process_stats`), refreshed by the same periodic background task as
     /// [`Self::diff_cache`] - see `Self::start_status_polling`'s docs for why this rides the
     /// same timer rather than a second, independent polling loop. Keyed by OS pid; an entry is
     /// absent for a pid not yet sampled (or already exited).
-    process_stats: HashMap<u32, process_stats::ProcessSample>,
+    pub(crate) process_stats: HashMap<u32, process_stats::ProcessSample>,
     /// Real, bounded disk-usage total across every listed worktree (see
-    /// `crate::rail::disk_usage_bytes`'s docs for the real `std::fs` walk and its cap),
+    /// `crate::rail::state::disk_usage_bytes`'s docs for the real `std::fs` walk and its cap),
     /// recomputed whenever the worktree list reloads. `None` while the very first
     /// computation is still in flight.
-    disk_usage: Option<(u64, bool)>,
+    pub(crate) disk_usage: Option<(u64, bool)>,
     /// Per-worktree half of the same computation [`Self::disk_usage`] sums
-    /// (`crate::rail::disk_usage_bytes(path)`, see [`Self::load_disk_usage`]) - kept as its own
+    /// (`crate::rail::state::disk_usage_bytes(path)`, see [`Self::load_disk_usage`]) - kept as its own
     /// field because the Settings › Worktrees page needs a per-row size, not just the rail
     /// footer's aggregate.
-    worktree_disk_usage: HashMap<PathBuf, (u64, bool)>,
+    pub(crate) worktree_disk_usage: HashMap<PathBuf, (u64, bool)>,
     /// Feedback from the most recent `prune` click (how many worktrees were removed, or an
     /// error), shown in the rail footer until the next prune attempt or worktree reload.
-    prune_status: Option<String>,
+    pub(crate) prune_status: Option<String>,
     /// `true` after one click on the footer `prune` button, cleared after the confirming click
     /// or by any other rail interaction in the meantime - see [`Self::request_prune`]'s docs for
     /// why prune is a two-click confirmation.
-    prune_confirm_armed: bool,
+    pub(crate) prune_confirm_armed: bool,
     /// `true` for the duration of an in-flight [`Self::execute_prune`] batch - guards against a
     /// second confirming click spawning a second, racing batch that would overwrite
     /// [`Self::_prune_task`] and drop (cancel) the first mid-flight. Set synchronously before
     /// spawning, reset in that same task's completion handler.
-    prune_in_flight: bool,
+    pub(crate) prune_in_flight: bool,
     /// The real command-pattern undo/redo stack (Revision R10,
-    /// `crate::root::worktree_history`) - see [`undo::UndoStack`]'s own docs for the cursor
+    /// `crate::worktree_history::flow`) - see [`undo::UndoStack`]'s own docs for the cursor
     /// model. Only ever mutated from inside a background task's completion handler, after the
     /// real `wt_core::undo::*` call it corresponds to has actually succeeded - never
     /// speculatively at click time.
-    undo_stack: undo::UndoStack,
+    pub(crate) undo_stack: undo::UndoStack,
     /// `Some(kind)` for the duration of any in-flight "keep all changes"/"discard worktree"/
     /// `Undo`/`Redo` operation, naming *which* one - not just a bare `bool` - so
     /// `Self::render_pty_footer`'s busy label ("keeping…"/"discarding…") can honestly reflect
@@ -492,52 +510,52 @@ pub struct AdeApp {
     /// one is in flight is a no-op, mirroring [`Self::prune_in_flight`]'s own
     /// single-flag-per-feature precedent) is sufficient, on its own, to make "a slow undo/redo
     /// op racing a newer one" structurally impossible - there can never be a second one in
-    /// flight to race with. See `crate::root::worktree_history`'s own module docs for why this
+    /// flight to race with. See `crate::worktree_history::flow`'s own module docs for why this
     /// is a deliberate simplification of - not a skip of - this project's usual
     /// task-slot/generation-guard discipline.
-    worktree_history_op_in_flight: Option<worktree_history::WorktreeHistoryOpKind>,
+    pub(crate) worktree_history_op_in_flight: Option<worktree_history::WorktreeHistoryOpKind>,
     /// Feedback from the most recent "keep all changes"/"discard worktree"/`Undo`/`Redo`
     /// operation, shown in the status bar
-    /// (`root::status_bar::AdeApp::render_status_worktree_history_notice`) until the next one -
+    /// (`status_bar::render::AdeApp::render_status_worktree_history_notice`) until the next one -
     /// deliberately its own render slot, independent of [`Self::prune_status`] (see that
     /// method's own docs for why sharing one slot with `prune_status` was a real bug: an
     /// unrelated prune click could permanently hide every future worktree-history status for the
     /// rest of the session).
-    worktree_history_status: Option<String>,
+    pub(crate) worktree_history_status: Option<String>,
     /// `Some(id)` after one click on session `id`'s "Discard worktree" footer button, cleared by
     /// most other gestures in the meantime (mirroring [`Self::prune_confirm_armed`]'s own "most
     /// other gestures disarm it" discipline, applied everywhere that field is - see
-    /// `crate::root::worktree_history::AdeApp::request_discard_worktree`'s own docs for why this
+    /// `crate::worktree_history::flow::AdeApp::request_discard_worktree`'s own docs for why this
     /// destructive-feeling action gets the same two-click confirmation as prune, even though it's
     /// now genuinely undoable). Not a universal "any gesture at all clears it" guarantee, though:
     /// arming *this* field's own sibling ([`Self::prune_confirm_armed`]'s first, arming click)
     /// does not clear this one, and vice versa - only each field's own confirm/cancel/execute
     /// paths, and a handful of other real navigation gestures, clear it.
-    discard_confirm_armed: Option<SessionId>,
+    pub(crate) discard_confirm_armed: Option<SessionId>,
     /// Whether the Settings surface is currently replacing the three-zone body - see
     /// [`Self::open_settings`]/[`Self::close_settings`], which use the same
     /// capture-and-restore shape as [`Self::palette_open`].
-    settings_open: bool,
+    pub(crate) settings_open: bool,
     /// Which Settings nav page is selected - persists across opens/closes (unlike the palette's
     /// query/scope, which resets every time).
-    settings_page: settings::SettingsPage,
-    settings_focus_handle: FocusHandle,
+    pub(crate) settings_page: settings::SettingsPage,
+    pub(crate) settings_focus_handle: FocusHandle,
     /// Pre-open focus target for [`Self::settings_focus_handle`] - see [`OverlayFocus`].
-    settings_focus: OverlayFocus,
-    /// The Settings › Agents page's rows (`crate::settings::detect_agent_rows`, via
+    pub(crate) settings_focus: OverlayFocus,
+    /// The Settings › Agents page's rows (`crate::settings::state::detect_agent_rows`, via
     /// `pty_core::resolve_on_path`), computed off the foreground thread and cached here (see
     /// [`Self::load_agent_rows`]) rather than recomputed inline - a `$PATH` search for a
     /// not-found binary measures ~30ms, which would cap the whole Settings surface's frame rate
     /// if run inline. `Vec::new()` until the first load completes.
-    agent_rows: Vec<settings::AgentRow>,
+    pub(crate) agent_rows: Vec<settings::AgentRow>,
     /// The context bar's `Merge` action and Surface D's conflict-resolution flow - see
-    /// [`crate::merge::MergeFlow`]'s docs. `None` when no session has an in-flight merge or
+    /// [`crate::merge::state::MergeFlow`]'s docs. `None` when no session has an in-flight merge or
     /// unresolved conflict.
-    merge_flow: Option<merge::MergeFlow>,
+    pub(crate) merge_flow: Option<merge::MergeFlow>,
     /// `true` for the duration of an in-flight `Complete merge`/`Abort merge` git operation -
     /// guards against a fast Abort-after-Complete double-click letting `git merge --abort` race
     /// an in-flight `git commit` and discard already-resolved conflict work.
-    merge_op_in_flight: bool,
+    pub(crate) merge_op_in_flight: bool,
     /// Cached per-side syntax highlighting for whichever conflict hunk is currently active in
     /// [`Self::merge_flow`] - recomputed only at the real points that can change (`start_merge`
     /// finding a `Conflicted` state, `resolve_active_hunk` advancing to the next hunk), never
@@ -546,7 +564,7 @@ pub struct AdeApp {
     /// lines) but different extensions, which would otherwise incorrectly reuse one file's
     /// highlighting for the other - `ConflictHunk` already derives `PartialEq`, `PathBuf`'s own
     /// is a plain path compare.
-    merge_highlight_cache: Option<(
+    pub(crate) merge_highlight_cache: Option<(
         PathBuf,
         ConflictHunk,
         Vec<code_view::RenderedLine>,
@@ -556,59 +574,59 @@ pub struct AdeApp {
     /// R8.5c) - see [`merge::MergeEditState`]'s own docs for why this is separate from
     /// [`Self::edit_buffers`]. `None` whenever no hand-edit is in progress, including while a
     /// merge conflict is showing but the user hasn't toggled hand-edit mode on for the active
-    /// file. Torn down (`crate::root::merge_flow::AdeApp::clear_merge_edit_state`) at every real
+    /// file. Torn down (`crate::merge::flow::AdeApp::clear_merge_edit_state`) at every real
     /// merge-flow-ending point (abort/complete/dismiss/session-close) and by a fresh
     /// [`Self::start_merge`], and whenever the flow's own active file (matched by path) advances
     /// past whatever file this hand-edit is for.
-    merge_edit: Option<merge::MergeEditState>,
+    pub(crate) merge_edit: Option<merge::MergeEditState>,
     /// Focus target for the merge hand-edit whole-file editor's outer container
-    /// (`crate::root::merge_editing::render_merge_edit_view`) - `track_focus`'d there, the same
+    /// (`crate::merge::editing::render_merge_edit_view`) - `track_focus`'d there, the same
     /// "must be the exact focused node the real key-context/`on_action` dispatch walks up from"
     /// discipline [`Self::code_focus_handle`] already establishes (see
-    /// `crate::root::code_surface::AdeApp::render_code_surface`'s own docs for the real,
+    /// `crate::code_surface::render::AdeApp::render_code_surface`'s own docs for the real,
     /// live-reproduced bug getting that wrong once already caused).
-    merge_edit_focus_handle: FocusHandle,
-    merge_edit_scroll_handle: UniformListScrollHandle,
+    pub(crate) merge_edit_focus_handle: FocusHandle,
+    pub(crate) merge_edit_scroll_handle: UniformListScrollHandle,
     /// The merge hand-edit whole-file view's own, dedicated equivalent of
     /// [`Self::file_view_row_layout`] - deliberately never shared with the File view's own map,
     /// so the two virtualized lists' click/cursor hit-testing caches can never cross-contaminate
     /// (the exact class of bug this project's own audits - e.g. BUILD-LOG's Revision R9a
     /// diff-highlight-cache finding - keep finding when two independent surfaces share one
     /// cache).
-    merge_edit_row_layout: HashMap<usize, (gpui::Bounds<Pixels>, gpui::ShapedLine)>,
+    pub(crate) merge_edit_row_layout: HashMap<usize, (gpui::Bounds<Pixels>, gpui::ShapedLine)>,
     /// See [`Self::file_view_last_layout`]/[`Self::file_view_last_bounds`]/
     /// [`Self::file_view_last_layout_for`]'s own docs - the merge hand-edit view's own dedicated
     /// equivalents, read by the generalized `EntityInputHandler::bounds_for_range`/
     /// `character_index_for_point` impls when the merge buffer (not the File view's) is the
     /// active edit target.
-    merge_edit_last_layout: Option<gpui::ShapedLine>,
-    merge_edit_last_bounds: Option<gpui::Bounds<Pixels>>,
-    merge_edit_last_layout_for: Option<(PathBuf, usize)>,
+    pub(crate) merge_edit_last_layout: Option<gpui::ShapedLine>,
+    pub(crate) merge_edit_last_bounds: Option<gpui::Bounds<Pixels>>,
+    pub(crate) merge_edit_last_layout_for: Option<(PathBuf, usize)>,
     /// Mirrors [`Self::file_save_pending`]/[`Self::file_save_running`]'s serial-writer-loop
-    /// discipline (see `crate::root::merge_flow::AdeApp::save_merge_edit`'s own docs), scoped to
+    /// discipline (see `crate::merge::flow::AdeApp::save_merge_edit`'s own docs), scoped to
     /// the single [`Self::merge_edit`] slot rather than per-path - only one hand-edit buffer can
     /// ever exist at once.
-    merge_edit_save_pending: bool,
-    merge_edit_save_running: bool,
+    pub(crate) merge_edit_save_pending: bool,
+    pub(crate) merge_edit_save_running: bool,
     /// The most recent hand-edit save's real failure, if any - surfaced next to the hand-edit
     /// editor's own Save button, mirroring [`Self::file_save_error`]'s convention. Cleared by
     /// the next successful save, or by leaving hand-edit mode
-    /// (`crate::root::merge_flow::AdeApp::clear_merge_edit_state`).
-    merge_edit_save_error: Option<String>,
-    _merge_edit_save_task: Option<Task<()>>,
+    /// (`crate::merge::flow::AdeApp::clear_merge_edit_state`).
+    pub(crate) merge_edit_save_error: Option<String>,
+    pub(crate) _merge_edit_save_task: Option<Task<()>>,
     /// A real, monotonically-increasing counter bumped by every [`Self::start_merge`] call - the
     /// source of [`merge::MergeFlow::generation`], mirroring [`Self::completions_generation`]'s
     /// own "stamp a background operation at dispatch time, compare it at completion time before
     /// applying a result" convention.
-    merge_generation: u64,
-    /// A real, monotonic counter bumped by every `crate::root::merge_flow::AdeApp::
+    pub(crate) merge_generation: u64,
+    /// A real, monotonic counter bumped by every `crate::merge::flow::AdeApp::
     /// start_merge_hand_edit` call that actually seeds a *fresh* `EditBuffer` - the source of
     /// [`merge::MergeEditState::buffer_id`], mirroring [`Self::merge_generation`]'s own "stamp a
     /// background operation at dispatch time, compare it at completion time" convention, but at
     /// per-*buffer* granularity rather than per-merge-*attempt* granularity - see that field's
     /// own docs for the real race this closes that `merge_generation` alone cannot.
-    merge_edit_buffer_id: u64,
-    /// Test-only seam: an artificial delay [`crate::root::merge_flow::AdeApp::
+    pub(crate) merge_edit_buffer_id: u64,
+    /// Test-only seam: an artificial delay [`crate::merge::flow::AdeApp::
     /// spawn_merge_edit_save_loop`] awaits (via the GPUI test clock) before each real write -
     /// mirrors [`Self::settings_save_test_delay`]'s own identical, established pattern for the
     /// same real reason: letting a test deterministically hold one save pending while it
@@ -616,35 +634,35 @@ pub struct AdeApp {
     /// [`merge::MergeEditState::buffer_id`]'s own docs describe. `#[cfg(test)]`-gated end to
     /// end, so no test-only state exists in a production build.
     #[cfg(test)]
-    merge_edit_save_test_delay: Option<Duration>,
-    _load_worktrees_task: Option<Task<()>>,
-    _load_file_tree_task: Option<Task<()>>,
-    _load_diff_task: Option<Task<()>>,
+    pub(crate) merge_edit_save_test_delay: Option<Duration>,
+    pub(crate) _load_worktrees_task: Option<Task<()>>,
+    pub(crate) _load_file_tree_task: Option<Task<()>>,
+    pub(crate) _load_diff_task: Option<Task<()>>,
     /// The in-flight `code_view::load_file` task for whichever path [`FileLoadState::Loading`]
     /// names - dropping it (a fresh assignment, or `Self::select_worktree`'s reset) cancels that
     /// load immediately, per GPUI's `Task`-drop-cancels semantics.
-    _file_load_task: Option<Task<()>>,
-    _status_poll_task: Option<Task<()>>,
-    _disk_usage_task: Option<Task<()>>,
-    _prune_task: Option<Task<()>>,
+    pub(crate) _file_load_task: Option<Task<()>>,
+    pub(crate) _status_poll_task: Option<Task<()>>,
+    pub(crate) _disk_usage_task: Option<Task<()>>,
+    pub(crate) _prune_task: Option<Task<()>>,
     /// The single in-flight "keep all changes"/"discard worktree"/`Undo`/`Redo` background task,
     /// guarded by [`Self::worktree_history_op_in_flight`] - see that field's own docs for why one
     /// slot shared across all four is sufficient discipline here.
-    _worktree_history_task: Option<Task<()>>,
-    _agent_rows_task: Option<Task<()>>,
-    _merge_task: Option<Task<()>>,
+    pub(crate) _worktree_history_task: Option<Task<()>>,
+    pub(crate) _agent_rows_task: Option<Task<()>>,
+    pub(crate) _merge_task: Option<Task<()>>,
     /// `Self::clear_merge_flow_for_closed_session`'s best-effort abort - kept separate from
     /// [`Self::_merge_task`] so a cleanup-triggered abort can never overwrite (and thus cancel)
     /// an in-flight `complete_merge_flow`/`abort_merge_flow` commit, which would strand
     /// [`Self::merge_op_in_flight`] at `true` and let `git merge --abort` race an in-flight
     /// `git commit`.
-    _merge_cleanup_task: Option<Task<()>>,
+    pub(crate) _merge_cleanup_task: Option<Task<()>>,
     /// Every in-flight [`Self::resolve_active_hunk`] background write
     /// (`wt_core::merge::write_resolved_file`) - a [`TaskPool`], not a single slot, since
     /// resolving one file's hunk while a different file's write is still in flight must not
     /// cancel that earlier write (dropping a `Task` cancels it immediately) and leave real
     /// conflict markers on disk while the in-memory model reports it resolved.
-    _merge_write_tasks: TaskPool,
+    pub(crate) _merge_write_tasks: TaskPool,
     /// A `lsp_core::LspClient` per `(repository root, server binary)` pair - widened from a
     /// bare `PathBuf` key (Revision R8) so more than one language's server can run
     /// simultaneously under the same repo root without colliding in this map: opening a `.rs`
@@ -672,14 +690,14 @@ pub struct AdeApp {
     /// companion then goes through 100% of the same already-proven spawn/poll/evict machinery as
     /// any other client, and its distinct key means a Vue-flavored `typescript-language-server`
     /// (carrying an extra real plugin) can never collide with, or be silently reused as, the
-    /// plain one a `.ts` file in the same repo spawns. `crate::root::lsp::LspConnection` is what
+    /// plain one a `.ts` file in the same repo spawns. `crate::lsp::client::LspConnection` is what
     /// presents a matched pair as one thing to callers.
-    lsp_clients: HashMap<(PathBuf, &'static str), LspClientState>,
+    pub(crate) lsp_clients: HashMap<(PathBuf, &'static str), LspClientState>,
     /// Absolute paths that have already had `textDocument/didOpen` sent for their owning
     /// [`Self::lsp_clients`] entry - checked by [`Self::render_file_view`] so a re-render never
     /// re-sends `didOpen` with a stale version. Never removed on file close: this viewer
     /// deliberately doesn't send a matching `didClose` (see [`Self::dispatch_did_open`]).
-    lsp_opened_files: HashSet<PathBuf>,
+    pub(crate) lsp_opened_files: HashSet<PathBuf>,
     /// Real, monotonically-increasing `textDocument/didChange` document versions (Revision
     /// R8.5b), keyed by absolute path - matching [`Self::lsp_opened_files`]'s own key convention,
     /// since both track per-*file* (not per-worktree-relative-path) LSP document identity. Seeded
@@ -687,7 +705,7 @@ pub struct AdeApp {
     /// time a real sync is sent for a path, and bumped by [`Self::prepare_lsp_sync`] on every real
     /// `didChange` it plans to send - never on a tick that skips sending one (unchanged content,
     /// or no ready client), so a version is never "spent" without a matching real notification.
-    lsp_document_versions: HashMap<PathBuf, i32>,
+    pub(crate) lsp_document_versions: HashMap<PathBuf, i32>,
     /// The real buffer content last *successfully* sent via a `didChange` notification for each
     /// open, dirty file - keyed by worktree-relative path, matching [`Self::edit_buffers`]'s own
     /// convention (unlike [`Self::lsp_document_versions`] above, this only ever needs to answer
@@ -700,7 +718,7 @@ pub struct AdeApp {
     /// genuinely returned `Ok` (Revision R8.5b audit finding 6's fix) - never at *plan* time in
     /// [`Self::prepare_lsp_sync`], which would confidently record content as "sent" before the
     /// send was even attempted, let alone known to have succeeded.
-    lsp_last_synced_content: HashMap<PathBuf, String>,
+    pub(crate) lsp_last_synced_content: HashMap<PathBuf, String>,
     /// The real document version (see [`Self::lsp_document_versions`]) whose content was most
     /// recently *successfully* sent via a real `didChange`, keyed the same worktree-relative way
     /// as [`Self::lsp_last_synced_content`] (written alongside it, same real "the send genuinely
@@ -708,7 +726,7 @@ pub struct AdeApp {
     /// lsp_diagnostics_confirmed_version`] by [`Self::render_file_view`]'s own `sync_pending`
     /// banner to answer a stronger question than "was the content sent": "has the server actually
     /// *answered* for it yet".
-    lsp_synced_version: HashMap<PathBuf, i32>,
+    pub(crate) lsp_synced_version: HashMap<PathBuf, i32>,
     /// The highest real document version [`Self::schedule_lsp_sync`]'s diagnostics-pull sequence
     /// (or, for a server with no real pull support, the send itself) has *confirmed* an actual
     /// answer for - keyed the same worktree-relative way as [`Self::lsp_last_synced_content`]
@@ -719,7 +737,7 @@ pub struct AdeApp {
     /// bare overwrite, so a real, late-arriving confirmation for an older version (the same
     /// reordering [`lsp_core::LspClient::pull_diagnostics`]'s own version guard protects against
     /// for the diagnostics map itself) can never regress this back down.
-    lsp_diagnostics_confirmed_version: HashMap<PathBuf, i32>,
+    pub(crate) lsp_diagnostics_confirmed_version: HashMap<PathBuf, i32>,
     /// A real, per-absolute-path cache of [`lsp_core::LspClient::uri_for_path`]'s own result
     /// (Revision R8.5b audit finding 8's fix for a real hard-rule violation) - populated exactly
     /// once per path, off the GPUI foreground thread, by [`Self::dispatch_did_open`]'s own
@@ -733,7 +751,7 @@ pub struct AdeApp {
     /// existed. Pruned alongside [`Self::lsp_document_versions`] by [`Self::
     /// evict_stale_lsp_clients`]'s own root-scoped retain pass (same absolute-path-keyed
     /// convention, same reasoning for why a blanket per-worktree-switch reset isn't needed).
-    lsp_uri_cache: HashMap<PathBuf, lsp_core::lsp_types::Uri>,
+    pub(crate) lsp_uri_cache: HashMap<PathBuf, lsp_core::lsp_types::Uri>,
     /// Every in-flight debounced real `textDocument/didChange` sync (Revision R8.5b), one slot
     /// per worktree-relative path - see [`Self::schedule_lsp_sync`]'s own docs for why a single
     /// slot (not a [`TaskPool`]) is the real, correct discipline here: a fresh edit to the same
@@ -742,10 +760,10 @@ pub struct AdeApp {
     /// [`Self::_rehighlight_tasks`] already establishes for re-highlighting - the real mechanism
     /// this project's own history (Revision R3, R5.5) keeps needing for exactly this "a fast
     /// typist must never produce out-of-order server state" shape. Also explicitly cleared by
-    /// [`crate::root::code_surface::AdeApp::close_file_tab`] for whichever path's tab just closed
+    /// [`crate::code_surface::tabs::AdeApp::close_file_tab`] for whichever path's tab just closed
     /// (Revision R8.5b audit finding 3), so an in-flight sync for a file that's no longer open
     /// can't keep running.
-    _lsp_sync_tasks: HashMap<PathBuf, Task<()>>,
+    pub(crate) _lsp_sync_tasks: HashMap<PathBuf, Task<()>>,
     /// The single, real in-flight `textDocument/completion` request task, if any (Revision
     /// R8.5b audit finding 2) - a single slot, not a [`TaskPool`], mirroring [`Self::
     /// _hover_request_task`]'s own reasoning: [`Self::completions`] shows only one popup at a
@@ -756,13 +774,13 @@ pub struct AdeApp {
     /// sequence (up to a real, measured ~8s) finished. [`Self::completions_generation`]'s own
     /// staleness check still independently guards against a stale result ever being applied, the
     /// same defense-in-depth this module already establishes elsewhere.
-    _completions_request_task: Option<Task<()>>,
+    pub(crate) _completions_request_task: Option<Task<()>>,
     /// Surface C's real Completions popup state (Revision R8.5b) - `None` when no popup is
     /// showing. Keyed implicitly to whichever [`Self::edit_buffers`] path
     /// [`CompletionsEntry::path`] names; a stale entry for a file that's no
     /// longer open simply never matches [`Self::active_editable_path`] and is treated as absent
     /// by every render/keybinding site that reads it.
-    completions: Option<CompletionsEntry>,
+    pub(crate) completions: Option<CompletionsEntry>,
     /// A real generation counter bumped every time a completions request is dispatched or the
     /// popup is dismissed (`Self::dismiss_completions`) - see [`Self::schedule_lsp_sync`]'s own
     /// docs for the real, live race this closes: an in-flight `textDocument/completion` request
@@ -770,15 +788,15 @@ pub struct AdeApp {
     /// [`Self::_completions_request_task`]) must not resurrect a popup the user already dismissed
     /// once its slow response finally arrives. A request's completion handler only ever applies
     /// its result if the generation it captured at dispatch time still matches this field.
-    completions_generation: u64,
-    /// Per-line diagnostic index (`crate::diagnostics_view::index_diagnostics_by_line`) for
+    pub(crate) completions_generation: u64,
+    /// Per-line diagnostic index (`crate::lsp::diagnostics::index_diagnostics_by_line`) for
     /// whichever Rust file [`Self::render_file_view`] last rendered - recomputed at the start of
     /// every render for a Rust file, cleared for a non-Rust file so diagnostics can't bleed
     /// across files.
-    file_view_diagnostics: HashMap<usize, Vec<diagnostics_view::LineDiagnostic>>,
+    pub(crate) file_view_diagnostics: HashMap<usize, Vec<diagnostics_view::LineDiagnostic>>,
     /// The real error-severity diagnostic count for whichever file [`Self::render_file_view`]
     /// most recently rendered a `rust-analyzer` status for - exactly the same
-    /// `lsp::LspFileStatus::Analyzed { errors, .. }` value `code_surface::render_file_status_bar`
+    /// `lsp::LspFileStatus::Analyzed { errors, .. }` value `code_surface::file_view::render_file_status_bar`
     /// itself displays for that same file, in the same frame (set right alongside
     /// [`Self::file_view_diagnostics`], from the same `lsp_status` computation). `None` whenever
     /// that render didn't produce a real `Analyzed` status (non-Rust file, or the LSP client is
@@ -787,31 +805,31 @@ pub struct AdeApp {
     /// [`Self::file_view_diagnostics`]'s own per-line index (whose per-line shape would
     /// over-count any diagnostic spanning multiple lines), so the two real error counts shown in
     /// the same frame - this one and the File view's own footer - can never disagree.
-    file_view_error_count: Option<usize>,
+    pub(crate) file_view_error_count: Option<usize>,
     /// Every in-flight `lsp_core::LspClient::spawn`/`did_open` background task - a [`TaskPool`]
     /// for the same "independent operations" reason as [`Self::_merge_write_tasks`].
-    _lsp_tasks: TaskPool,
+    pub(crate) _lsp_tasks: TaskPool,
     /// The single, long-lived background poll loop watching every ready [`Self::lsp_clients`]
     /// entry's wake channel and calling `cx.notify()` on a new `publishDiagnostics`. Started
     /// lazily (see [`Self::ensure_lsp_poll_task`]), then deliberately never reset to `None` -
     /// one poll loop serves however many clients exist.
-    _lsp_poll_task: Option<Task<()>>,
+    pub(crate) _lsp_poll_task: Option<Task<()>>,
     /// Surface C's hover-state cache - the outcome of the most recent click-triggered
     /// `textDocument/hover` request (see [`Self::request_hover`]), `None` before the first click
     /// or after switching files. Also doubles as [`Self::trigger_goto_definition`]'s target:
     /// there's no separately-tracked "symbol under consideration" in this read-only viewer.
-    hover: Option<HoverEntry>,
+    pub(crate) hover: Option<HoverEntry>,
     /// The single in-flight [`Self::request_hover`] background task, if any - a single slot
     /// (not a [`TaskPool`]) because hover requests are never independent: [`Self::hover`] shows
     /// only one entry at a time, so a new click always supersedes an in-flight one. Assigning a
     /// fresh task here drops the previous one immediately, closing the bug where rapid clicking
     /// during rust-analyzer's initial indexing (each hover request can block a worker thread for
     /// up to [`LSP_QUERY_TIMEOUT`]) let unbounded concurrent requests pin the shared executor.
-    _hover_request_task: Option<Task<()>>,
+    pub(crate) _hover_request_task: Option<Task<()>>,
     /// Every in-flight [`Self::trigger_goto_definition`] background task - a [`TaskPool`], unlike
     /// [`Self::_hover_request_task`]'s single slot, since F12 has no `still_current`
     /// short-circuit tying it to one live UI slot the way hover does.
-    _goto_definition_tasks: TaskPool,
+    pub(crate) _goto_definition_tasks: TaskPool,
     /// One-shot "the next completed load of this exact file should land the cursor on this
     /// line, not line 1" instruction for [`Self::spawn_file_load`]'s completion handler, set by
     /// [`Self::navigate_to_definition`] when a go-to-definition result names a file that isn't
@@ -820,17 +838,17 @@ pub struct AdeApp {
     /// file. Consumed via `Option::take` (only when the path matches) by whichever of
     /// [`Self::render_file_view`] or `spawn_file_load`'s completion handler applies it first;
     /// explicitly cleared by [`Self::open_file_view`] on every fresh open and by a failed load.
-    pending_cursor_line: Option<(PathBuf, usize)>,
+    pub(crate) pending_cursor_line: Option<(PathBuf, usize)>,
     /// The config-file-backed settings struct - loaded once from `~/.config/jerry/
     /// settings.toml` at startup ([`Self::new`], via `Settings::load_or_init`) and re-saved
     /// ([`Self::persist_settings`]) on every change from the settings pages or the palette's
-    /// `Window controls: …` entries. See `crate::settings_store`'s module docs for which fields
+    /// `Window controls: …` entries. See `crate::settings::store`'s module docs for which fields
     /// are persisted-only vs. also applied.
-    settings: Settings,
+    pub(crate) settings: Settings,
     /// The resolved path [`Self::persist_settings`] writes to - `Some(~/.config/jerry/
     /// settings.toml)` in production, `None` for every GPUI test (`Self::new_with_settings`),
     /// which makes a save a genuine no-op rather than a special-cased test skip.
-    settings_path: Option<PathBuf>,
+    pub(crate) settings_path: Option<PathBuf>,
     /// The single in-flight [`Self::persist_settings`] serial-writer-loop task. Settings saves
     /// are never independent of each other (there is only one `settings.toml`), so this is a
     /// single slot rather than a [`TaskPool`]: a second edit while a save is running is picked
@@ -840,85 +858,85 @@ pub struct AdeApp {
     /// writes to the same path can never be concurrent - closing a real out-of-order-write bug a
     /// simpler "drop the previous task" approach could not, since dropping a `Task` cannot stop
     /// a disk write that has already started on a worker thread.
-    _settings_save_task: Option<Task<()>>,
+    pub(crate) _settings_save_task: Option<Task<()>>,
     /// `true` whenever there's a settings edit newer than the last write the serial writer loop
     /// started - a single flag, not a queue, since only the latest value at write time ever
     /// matters. Cleared only by the loop itself, in the same step that reads [`Self::settings`]
     /// fresh to write it.
-    settings_save_pending: bool,
+    pub(crate) settings_save_pending: bool,
     /// `true` for as long as the serial writer loop ([`Self::_settings_save_task`]) is alive -
     /// guards [`Self::persist_settings`] against spawning a second loop while one is already
     /// draining [`Self::settings_save_pending`].
-    settings_save_running: bool,
+    pub(crate) settings_save_running: bool,
     /// Test-only seam: an artificial delay the serial writer loop awaits (via the GPUI test
     /// clock) before each `Settings::save_at` call, letting a test deterministically hold one
     /// edit's write pending while a later edit queues behind it. `#[cfg(test)]`-gated end to
     /// end, so no test-only state exists in a production build. Set via
     /// [`Self::set_settings_save_test_delay`].
     #[cfg(test)]
-    settings_save_test_delay: Option<Duration>,
+    pub(crate) settings_save_test_delay: Option<Duration>,
     /// The config banner's `TOML | JSON` display segment - not itself a [`Settings`] field; see
-    /// `crate::settings_store`'s "TOML is the real file; JSON is a read-only alternate view"
+    /// `crate::settings::store`'s "TOML is the real file; JSON is a read-only alternate view"
     /// docs.
-    settings_cfg_format: CfgFormat,
-    /// The Settings › Language servers page's rows (`crate::settings::detect_lsp_rows`), cached
+    pub(crate) settings_cfg_format: CfgFormat,
+    /// The Settings › Language servers page's rows (`crate::settings::state::detect_lsp_rows`), cached
     /// the same way [`Self::agent_rows`] is.
-    lsp_rows: Vec<settings::LspRow>,
-    _lsp_rows_task: Option<Task<()>>,
+    pub(crate) lsp_rows: Vec<settings::LspRow>,
+    pub(crate) _lsp_rows_task: Option<Task<()>>,
     /// The Keybindings settings page's filter query - same minimal append/backspace shape as
     /// [`Self::filter_query`].
-    settings_keymap_filter: String,
-    settings_keymap_filter_focus_handle: FocusHandle,
+    pub(crate) settings_keymap_filter: String,
+    pub(crate) settings_keymap_filter_focus_handle: FocusHandle,
     /// The identity of the Keybindings row currently capturing a new chord, if any - see
     /// [`Self::start_recording_keybinding`]'s own docs for the real `App::intercept_keystrokes`
     /// mechanism this drives.
-    keymap_recording: Option<keymap_overrides::BindingIdentity>,
+    pub(crate) keymap_recording: Option<keymap_overrides::BindingIdentity>,
     /// The live `App::intercept_keystrokes` subscription backing [`Self::keymap_recording`] -
     /// `Some` for exactly as long as a row is recording, dropped by
     /// [`Self::cancel_keybinding_recording`]/[`Self::finish_recording_keybinding`].
-    _keymap_intercept: Option<Subscription>,
+    pub(crate) _keymap_intercept: Option<Subscription>,
     /// A real, just-rejected rebind collision - `(identity of the row being recorded, message)` -
     /// shown inline under that row by [`Self::render_settings_keymap_page`] until the next
     /// recording attempt (successful or not) clears it.
-    keymap_rebind_error: Option<(keymap_overrides::BindingIdentity, String)>,
+    pub(crate) keymap_rebind_error: Option<(keymap_overrides::BindingIdentity, String)>,
     /// The live `Window::observe_window_appearance` subscription backing
     /// [`Self::sync_theme_to_system_appearance`] - held for the entity's whole lifetime, set up
     /// once at construction regardless of whether `Settings.theme.follow_system` starts on (see
     /// that method's own docs for why).
-    _window_appearance_subscription: Subscription,
+    pub(crate) _window_appearance_subscription: Subscription,
     /// Whether the tab strip's `+` menu popover is open - see [`Self::render_plus_menu`].
     /// Closed by its own scrim click, by picking a row, and defensively by
     /// [`Self::open_palette`]/[`Self::open_settings`] (it's rendered as an unconditional sibling
     /// of both, so it would otherwise paint over a surface it no longer makes sense above).
-    plus_menu_open: bool,
+    pub(crate) plus_menu_open: bool,
     /// The tab strip's `+` button's painted bounds, captured every render (same `gpui::canvas`
     /// pattern as [`Self::body_bounds`]). [`Self::render_plus_menu`] positions the popover
     /// directly off this rather than a second, independently-computed offset that could drift
     /// once the rail's adjustable width shifts the button. `Bounds::default()` until first paint.
-    plus_button_bounds: gpui::Bounds<Pixels>,
-    /// Which of the Windows/Linux title bar's five menu labels ([`title_bar::TitleMenu::ALL`])
-    /// has its real dropdown open right now, if any - see [`title_bar::render_title_menu`]'s own
+    pub(crate) plus_button_bounds: gpui::Bounds<Pixels>,
+    /// Which of the Windows/Linux title bar's five menu labels ([`crate::title_bar::menu::TitleMenu::ALL`])
+    /// has its real dropdown open right now, if any - see [`crate::title_bar::menu::render_title_menu`]'s own
     /// docs. Closed the same way [`Self::plus_menu_open`] is: its own scrim click, picking a row,
     /// and defensively by [`Self::open_palette`]/[`Self::open_settings`].
-    title_menu_open: Option<title_bar::TitleMenu>,
+    pub(crate) title_menu_open: Option<title_bar::TitleMenu>,
     /// Each of the five title-bar menu labels' painted bounds, captured every render the same
     /// `gpui::canvas` way [`Self::plus_button_bounds`] is - indexed by
-    /// [`title_bar::TitleMenu::index`]. [`title_bar::render_title_menu`] positions the open
+    /// [`crate::title_bar::menu::TitleMenu::index`]. [`crate::title_bar::menu::render_title_menu`] positions the open
     /// menu's popover directly off the matching entry. `Bounds::default()` until first paint.
-    title_menu_button_bounds: [gpui::Bounds<Pixels>; title_bar::TitleMenu::ALL.len()],
+    pub(crate) title_menu_button_bounds: [gpui::Bounds<Pixels>; title_bar::TitleMenu::ALL.len()],
     /// Every in-flight [`Self::new_agent_pane`] background `$PATH` detection - a [`TaskPool`]
     /// rather than a single slot, so two rapid "New agent pane" clicks each produce their own
     /// session instead of the second cancelling the first's still-in-flight search.
-    _new_agent_pane_task: TaskPool,
+    pub(crate) _new_agent_pane_task: TaskPool,
     /// Real "New file" creation state (`crate::root::new_file`) - `Some` only while the inline
     /// name prompt is showing. See [`new_file::NewFileInputState`]'s own docs.
-    new_file_input: Option<new_file::NewFileInputState>,
-    new_file_focus_handle: FocusHandle,
+    pub(crate) new_file_input: Option<new_file::NewFileInputState>,
+    pub(crate) new_file_focus_handle: FocusHandle,
     /// The most recent "New file" attempt's real refusal (name already exists, empty name, a
     /// path separator) - shown next to the inline prompt, mirroring [`Self::file_save_error`]'s
     /// convention. Cleared by [`Self::start_new_file`]/[`Self::create_new_file`]'s own success
     /// path.
-    new_file_error: Option<String>,
+    pub(crate) new_file_error: Option<String>,
 }
 
 impl AdeApp {
@@ -926,21 +944,21 @@ impl AdeApp {
     /// [`Self::settings`]`.window.controls` is the persisted backing; the General settings page
     /// and the palette's `Window controls: …` entries both read/write it through this accessor
     /// and [`Self::set_window_controls_style`], never a second copy.
-    pub(super) fn window_controls_style(&self) -> WindowControlsStyle {
+    pub(crate) fn window_controls_style(&self) -> WindowControlsStyle {
         self.settings.window.controls
     }
 
     /// Shared entry point for `Settings.appearance.interface_scale_percent` text scaling -
     /// scales only the text size passed to `.text_size(...)`, nothing else (padding/spacing/
     /// icon/fixed-chrome dimensions are out of scope).
-    pub(super) fn ui_text_size(&self, base_px: f32) -> Pixels {
+    pub(crate) fn ui_text_size(&self, base_px: f32) -> Pixels {
         theme::ui_scale::scaled_px(base_px, self.settings.appearance.interface_scale_percent)
     }
 
     /// Sets [`Self::window_controls_style`] and persists it. The one write path both the
     /// General settings page and the palette's `Window controls: …` entries call, so they can
     /// never disagree about which override is active.
-    pub(super) fn set_window_controls_style(
+    pub(crate) fn set_window_controls_style(
         &mut self,
         style: WindowControlsStyle,
         cx: &mut Context<Self>,
@@ -957,7 +975,7 @@ impl AdeApp {
     /// Marks [`Self::settings_save_pending`] and starts the serial writer loop
     /// ([`Self::_settings_save_task`]) if it isn't already running - see that field's docs for
     /// why writes are serialized rather than raced.
-    pub(super) fn persist_settings(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn persist_settings(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.settings_path.clone() else {
             return;
         };
@@ -1183,7 +1201,7 @@ impl AdeApp {
 /// and [`restore_focus`] are the single consolidated fix - every overlay's open/close pair
 /// should route through them rather than hand-rolling capture/restore again.
 #[derive(Default)]
-pub(super) struct OverlayFocus {
+pub(crate) struct OverlayFocus {
     /// The focus target in place immediately before this overlay opened (`window.focused(cx)`,
     /// `None` on a fresh window) - restored by [`restore_focus`] on close.
     return_focus: Option<FocusHandle>,
@@ -1198,7 +1216,7 @@ impl OverlayFocus {
     /// a genuine closed-to-open transition (not every subsequent navigation while already open -
     /// see [`AdeApp::focus_code_surface`]) guard the call themselves; this always captures
     /// unconditionally when called.
-    pub(super) fn capture(&mut self, window: &Window, sessions: &Sessions, cx: &App) {
+    pub(crate) fn capture(&mut self, window: &Window, sessions: &Sessions, cx: &App) {
         self.return_focus = window.focused(cx);
         self.opened_session = sessions.active_id();
     }
@@ -1206,7 +1224,7 @@ impl OverlayFocus {
     /// Discards captured state without restoring it - used only by
     /// [`AdeApp::close_palette`]'s Settings-showing-underneath branch, which moves focus onto
     /// `settings_focus_handle` directly instead of through [`restore_focus`].
-    pub(super) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.return_focus = None;
         self.opened_session = None;
     }
@@ -1223,7 +1241,7 @@ impl OverlayFocus {
 /// pass `&mut self.some_field` alongside it. Deliberately doesn't call `cx.notify()` - every
 /// caller has its own surface-specific state change around this call and issues its own single
 /// `cx.notify()` once everything, this restore included, is done.
-fn restore_focus(
+pub(crate) fn restore_focus(
     sessions: &Sessions,
     overlay_focus: &mut OverlayFocus,
     window: &mut Window,
@@ -1419,26 +1437,11 @@ mod settings_persist_tests {
     }
 }
 
-mod code_surface;
-mod completions;
-mod editing;
-mod focus;
-mod lsp;
-mod merge_editing;
-mod merge_flow;
-mod merge_flow_render;
-mod new_file;
-mod palette_render;
-mod rail_render;
-mod rem_scope;
-mod resize;
-mod settings_render;
-mod settings_widgets;
-mod sidebar_render;
-mod state;
-mod status_bar;
-mod task_pool;
-mod title_bar;
-mod widgets;
-mod work_surface_render;
-mod worktree_history;
+pub(crate) mod focus;
+pub mod layout;
+pub(crate) mod new_file;
+pub(crate) mod rem_scope;
+pub(crate) mod resize;
+pub(crate) mod state;
+pub(crate) mod task_pool;
+pub(crate) mod widgets;

@@ -1,6 +1,6 @@
 use super::*;
-use crate::root::code_surface::{DiffLoadState, FileLoadState};
-use crate::root::sidebar_render::RightSidebarView;
+use crate::code_surface::state::{DiffLoadState, FileLoadState};
+use crate::sidebar::render::RightSidebarView;
 
 impl AdeApp {
     /// Production entry point - loads `~/.config/jerry/settings.toml` (`Settings::load_or_init`)
@@ -19,7 +19,7 @@ impl AdeApp {
     /// can each supply their own. Test instances get in-memory-only defaults and a `None` path,
     /// so [`Self::persist_settings`] is a genuine no-op for them, never a write to whatever
     /// machine happens to run `cargo test`.
-    pub(super) fn new_with_settings(
+    pub(crate) fn new_with_settings(
         repo_path: PathBuf,
         settings: settings_store::Settings,
         settings_path: Option<PathBuf>,
@@ -217,7 +217,7 @@ impl AdeApp {
         this
     }
 
-    pub(super) fn load_worktrees(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn load_worktrees(&mut self, cx: &mut Context<Self>) {
         let repo_path = self.repo_path.clone();
         let task = cx.spawn(async move |this, cx| {
             let result = cx
@@ -243,7 +243,7 @@ impl AdeApp {
     }
 
     /// Recomputes [`Self::disk_usage`] and [`Self::worktree_disk_usage`] from the current
-    /// worktree list, offloaded to the background executor (`crate::rail::disk_usage_bytes`).
+    /// worktree list, offloaded to the background executor (`crate::rail::state::disk_usage_bytes`).
     /// Run once per worktree-list load, not on the 3s status-poll cadence - a `std::fs` walk per
     /// worktree every 3s would be needless cost for numbers that rarely change.
     ///
@@ -316,14 +316,14 @@ impl AdeApp {
     /// path if one is selected and readable, otherwise the repo root - see the module docs'
     /// "Sessions/tabs" section for why this is resolved at spawn time rather than tracked as
     /// a per-tab "current worktree".
-    pub(super) fn active_session_cwd(&self) -> PathBuf {
+    pub(crate) fn active_session_cwd(&self) -> PathBuf {
         match self.selected.and_then(|index| self.worktrees.get(index)) {
             Some(item) if item.error.is_none() => item.path.clone(),
             _ => self.repo_path.clone(),
         }
     }
 
-    pub(super) fn select_worktree(
+    pub(crate) fn select_worktree(
         &mut self,
         index: usize,
         window: &mut Window,
@@ -467,7 +467,7 @@ impl AdeApp {
     /// [`Self::worktrees`], which project-mode rows don't carry) - used by a plain worktree
     /// row's click handler in "by project" mode. Falls back to doing nothing if the path
     /// isn't currently in the loaded worktree list (e.g. a stale click racing a reload).
-    pub(super) fn select_worktree_by_path(
+    pub(crate) fn select_worktree_by_path(
         &mut self,
         path: &std::path::Path,
         window: &mut Window,

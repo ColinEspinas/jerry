@@ -12,7 +12,7 @@ use gpui::Task;
 /// nothing removes a finished task's slot on its own - [`TaskPool::push`] prunes before adding so
 /// every one of the 6 call sites gets that for free.
 #[derive(Default)]
-pub(super) struct TaskPool(Vec<Task<()>>);
+pub(crate) struct TaskPool(Vec<Task<()>>);
 
 impl TaskPool {
     pub(super) fn new() -> Self {
@@ -20,7 +20,7 @@ impl TaskPool {
     }
 
     /// Prunes every already-finished task, then adds `task`.
-    pub(super) fn push(&mut self, task: Task<()>) {
+    pub(crate) fn push(&mut self, task: Task<()>) {
         self.0.retain(|task| !task.is_ready());
         self.0.push(task);
     }

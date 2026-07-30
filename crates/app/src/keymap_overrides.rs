@@ -5,7 +5,7 @@
 //! defaults plus overrides, and checking whether a candidate new keystroke would collide with
 //! another binding that could realistically be active at the same time. Deliberately its own
 //! module rather than folded into `crate::keymap` (which stays GPUI-free by design - see that
-//! module's own docs) or `crate::settings` (which only *reads* already-registered
+//! module's own docs) or `crate::settings::state` (which only *reads* already-registered
 //! `gpui::KeyBinding`s, never constructs new ones).
 //!
 //! None of this needs a live `gpui::Window`/`App` - `gpui::KeyBinding`, `gpui::Keystroke`, and
@@ -19,13 +19,13 @@
 //! command label across disjoint contexts (`Editor::copy` under `"file-editor"` and again under
 //! `"merge-editor"`). [`BindingIdentity`] is the real, unique key this module uses instead: the
 //! action's real [`gpui::Action::name`], its real registered context predicate's `Display` string
-//! (`"global"` when `None`, matching `crate::settings::KeybindingRow::context`'s own convention),
+//! (`"global"` when `None`, matching `crate::settings::state::KeybindingRow::context`'s own convention),
 //! and the real *default* keystroke(s) it originally shipped with, joined the same
 //! space-separated way `gpui::KeyBinding::load` itself splits a multi-keystroke chord string
 //! (each part `gpui::Keystroke::unparse()`'d). Two default bindings can only collide under this
 //! identity if they share all three - command, context, *and* default keystroke - which would
 //! already make them indistinguishable rows on the Keybindings page itself
-//! (`crate::settings::tests::every_keybinding_row_is_genuinely_distinguishable_from_every_other`
+//! (`crate::settings::state::tests::every_keybinding_row_is_genuinely_distinguishable_from_every_other`
 //! guards against exactly that in the default set).
 //!
 //! ## Collision detection is real but deliberately conservative
@@ -55,7 +55,7 @@
 
 use gpui::{KeyBinding, KeyBindingContextPredicate, Keystroke};
 
-use crate::settings_store::KeybindingOverride;
+use crate::settings::store::KeybindingOverride;
 
 /// The real, stable identity of one default keybinding - see the module docs' "Identity" section.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -88,7 +88,7 @@ impl BindingIdentity {
 }
 
 /// `"global"` for an unscoped binding, else the predicate's real `Display` string - the same
-/// convention `crate::settings::KeybindingRow::context` already uses, so a `BindingIdentity`'s
+/// convention `crate::settings::state::KeybindingRow::context` already uses, so a `BindingIdentity`'s
 /// `context` field always matches what the Keybindings page itself shows for that row.
 fn context_label(predicate: Option<&KeyBindingContextPredicate>) -> String {
     match predicate {

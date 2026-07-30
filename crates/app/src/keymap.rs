@@ -1,8 +1,8 @@
 //! One shared platform-style setting driving two related pieces of chrome: which title-bar
-//! variant `crate::root::title_bar` renders, and which glyphs a keybinding spec string (e.g.
+//! variant `crate::title_bar` renders, and which glyphs a keybinding spec string (e.g.
 //! `"mod+shift+K"`) resolves to for `crate::root::widgets`'s keycap renderers.
 //!
-//! Deliberately GPUI-free, mirroring `crate::palette`/`crate::work_surface`'s own split: this
+//! Deliberately GPUI-free, mirroring `crate::palette::state`/`crate::work_surface::state`'s own split: this
 //! module only maps a platform choice onto plain strings, so that mapping is directly
 //! unit-testable without a live GPUI window - turning a resolved combo into `gpui::Div` keycap
 //! trees happens one layer up, in `crate::root::widgets`. [`resolve_keystroke`] is the one real
@@ -41,7 +41,7 @@
 //!
 //! ## Persisted (R3)
 //!
-//! [`WindowControlsStyle`] is a real field of `crate::settings_store::Settings`
+//! [`WindowControlsStyle`] is a real field of `crate::settings::store::Settings`
 //! (`WindowSettings::controls`), loaded from and saved to `~/.config/jerry/settings.toml`.
 //! `crate::root::AdeApp::window_controls_style` reads/writes that field directly, so the General
 //! settings page's `Window controls` row and the command palette's three `Window controls: …`
@@ -57,7 +57,7 @@
 /// real OS - see this module's own docs, above, for why that's a deliberate limitation.
 ///
 /// `#[derive(Serialize, Deserialize)]` with per-variant `#[serde(rename = ...)]`
-/// (`"system"`/`"macos"`/`"windows"`) backs `crate::settings_store::WindowSettings::controls` -
+/// (`"system"`/`"macos"`/`"windows"`) backs `crate::settings::store::WindowSettings::controls` -
 /// see this module's "Persisted (R3)" docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum WindowControlsStyle {
@@ -171,7 +171,7 @@ pub fn resolve_combo(spec: &str, macos: bool) -> Vec<String> {
 /// Resolves a real, already-registered `gpui::Keystroke` (`crate::default_key_bindings`'s live
 /// `gpui::KeyBinding`s, not a hand-transcribed spec string) into the same per-platform glyphs
 /// [`resolve_combo`] produces - the Settings › Keybindings page's input
-/// (`crate::settings::keybinding_rows`), so its rows read directly off what's really bound and
+/// (`crate::settings::state::keybinding_rows`), so its rows read directly off what's really bound and
 /// can't drift the way a hand-copied list once did (R3: a wrong `context` label, a stale order).
 ///
 /// `modifiers.secondary()` maps to the cross-platform `modifier` glyph. A literal `control` held

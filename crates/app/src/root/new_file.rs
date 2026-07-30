@@ -1,5 +1,5 @@
 //! Real "New file" creation - the tab-strip `+` menu's "New file" row and the file tree's own
-//! hover-revealed "+" affordance (`crate::root::sidebar_render`) both funnel into this module.
+//! hover-revealed "+" affordance (`crate::sidebar::render`) both funnel into this module.
 //!
 //! Naming UI: a small, hand-rolled append/backspace-only inline text field
 //! (`Self::handle_new_file_key_down`), the same minimal shape `Self::handle_filter_key_down`
@@ -14,7 +14,7 @@ use super::*;
 /// showing. Opened by [`AdeApp::start_new_file`], closed by [`AdeApp::create_new_file`] (on
 /// success) or [`AdeApp::cancel_new_file`] (Escape, or the scrim).
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct NewFileInputState {
+pub(crate) struct NewFileInputState {
     /// The real directory the new file will be created in - the selected worktree's root (the
     /// `+` menu row) or the specific directory row the file tree's own hover "+" was clicked on.
     pub(super) parent_dir: PathBuf,
@@ -24,7 +24,7 @@ pub(super) struct NewFileInputState {
 
 impl AdeApp {
     /// Opens the inline "New file" name prompt, scoped to `parent_dir`.
-    pub(super) fn start_new_file(
+    pub(crate) fn start_new_file(
         &mut self,
         parent_dir: PathBuf,
         window: &mut Window,
@@ -215,7 +215,7 @@ impl AdeApp {
 
     /// Creates the real, empty file the "New file" prompt named and opens it in the File view,
     /// the same real end state a Files-tree row click on an existing file reaches
-    /// (`crate::root::code_surface::AdeApp::open_file_view`) - inlined here rather than reused
+    /// (`crate::code_surface::tabs::AdeApp::open_file_view`) - inlined here rather than reused
     /// as-is since there's no on-disk file yet for that method's own load path to read.
     ///
     /// Refuses - a real, visible error, with the prompt left open so the name can be corrected -
@@ -328,7 +328,7 @@ mod tests {
     /// Real, live-reproduced coverage for the case [`super::AdeApp::cancel_new_file`] didn't
     /// handle before this revision's own self-audit: no file tab open *and* no active session at
     /// all (every session in the worktree already closed) - a real, reachable state under the
-    /// tabs rework (`crate::sessions::Sessions::active_id`'s own docs, and
+    /// tabs rework (`crate::work_surface::sessions::Sessions::active_id`'s own docs, and
     /// `crate::root::AdeApp::select_worktree`'s identical fallback for the same case). Before the
     /// fix, `Sessions::focus_active` was a genuine no-op here, leaving `Window::focus` dangling
     /// on the just-closed prompt field.

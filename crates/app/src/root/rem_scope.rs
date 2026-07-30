@@ -28,20 +28,21 @@ use gpui::{
 };
 
 /// An element that sets a particular rem size for its children - see the module docs.
-/// `code_surface::render_file_view`/`render_diff_file_detail` wrap their code-row content in one
-/// of these, sized from the effective zoom (`code_surface::effective_code_rem_px`), so
+/// `code_surface::file_view::render_file_view`/`code_surface::diff_view::render_diff_file_detail`
+/// wrap their code-row content in one
+/// of these, sized from the effective zoom (`code_surface::zoom::effective_code_rem_px`), so
 /// `.text_size(rems(1.0))`/`.line_height(rems(1.6))` on the code rows inside scale with it, while
 /// anything in the same subtree still expressed in `px()` (the gutter, the diff-sign column)
 /// does not - GPUI's own `AbsoluteLength::to_pixels` split (`vendor/zed/crates/gpui/src/
 /// geometry.rs`: the `Pixels` arm returns its value unchanged, the `Rems` arm multiplies by the
 /// active rem size).
-pub(super) struct WithRemSize {
+pub(crate) struct WithRemSize {
     div: Div,
     rem_size: Pixels,
 }
 
 impl WithRemSize {
-    pub(super) fn new(rem_size: impl Into<Pixels>) -> Self {
+    pub(crate) fn new(rem_size: impl Into<Pixels>) -> Self {
         Self {
             div: div(),
             rem_size: rem_size.into(),

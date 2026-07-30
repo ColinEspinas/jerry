@@ -14,7 +14,7 @@ impl AdeApp {
     /// (`Self::open_change` was `None`) - a second file opened while one is already showing must
     /// not overwrite the real original target with `Self::code_focus_handle` itself (already
     /// focused by then). Always moves focus onto [`Self::code_focus_handle`] regardless.
-    pub(super) fn focus_code_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_code_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.open_change.is_none() {
             self.code_focus.capture(window, &self.sessions, cx);
         }
@@ -26,7 +26,7 @@ impl AdeApp {
     /// moves focus onto [`Self::palette_focus_handle`]. Also disarms a pending rail prune
     /// confirmation ([`Self::prune_confirm_armed`]) - opening the palette counts as "did
     /// something else".
-    pub(super) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = true;
         // The tab strip's `+` menu, the title bar's File/Edit/View/Session/Help dropdown, and
         // the "New file" prompt are all unconditional siblings of the palette - see
@@ -46,7 +46,7 @@ impl AdeApp {
 
     /// Closes the palette overlay (scrim click, Esc, or running a result) and restores focus via
     /// [`restore_focus`].
-    pub(super) fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = false;
         if self.settings_open {
             // Settings is showing underneath (either `OpenSettings` just opened it, or the
@@ -68,7 +68,7 @@ impl AdeApp {
     /// showing persists across opens, matching ordinary settings-window UX. Closes the palette
     /// first (via [`Self::close_palette`], run while `settings_open` is still `false` so that
     /// call takes its normal, non-Settings-aware restore path) if it happened to be open too.
-    pub(super) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette_open {
             self.close_palette(window, cx);
         }
@@ -87,7 +87,7 @@ impl AdeApp {
 
     /// Closes the Settings surface (the nav header's Esc keycap, or a real Esc keystroke via
     /// [`Self::handle_settings_key_down`]) and restores focus via [`restore_focus`].
-    pub(super) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = false;
         // A live keybinding-recording intercept (`Self::_keymap_intercept`) is a real, global
         // `App::intercept_keystrokes` subscription - it must never survive leaving the Settings
@@ -103,16 +103,16 @@ impl AdeApp {
 /// and keystroke simulation). A plain unit test can't catch this bug class: it requires a real
 /// window with real GPUI dispatch to reproduce a dangling `Window::focus`.
 #[cfg(test)]
-pub(in crate::root) mod palette_focus_tests {
+pub(crate) mod palette_focus_tests {
     use super::*;
     use gpui::{Entity, TestAppContext};
 
     /// Opens an `AdeApp` in a test GPUI window against a throwaway temp directory (not a real
     /// git repo, so `worktrees`/`diff_state` end up empty/errored - irrelevant to what these
-    /// tests check). `pub(in crate::root)` since `settings_focus_tests` and others reuse this
+    /// tests check). `pub(crate)` since `settings_focus_tests` and others reuse this
     /// same setup. Uses `AdeApp::new_with_settings` (in-memory `Settings::default()`, `None`
     /// path), not `AdeApp::new`, so tests never read or write a real `settings.toml`.
-    pub(in crate::root) fn open_test_app(
+    pub(crate) fn open_test_app(
         cx: &mut TestAppContext,
         repo_path: PathBuf,
     ) -> (Entity<AdeApp>, &mut gpui::VisualTestContext) {
@@ -403,7 +403,7 @@ mod tab_strip_keybinding_tests {
     /// `crate::default_key_bindings`'s docs: GPUI dispatches a matched `KeyBinding` before a
     /// focused element's own `on_key_down`, so a global binding would swallow readline's Ctrl+P
     /// out of every focused terminal). This only proves the palette didn't open;
-    /// `terminal_pane`'s `keystroke_tests` covers the pty-forwarding half.
+    /// `crate::terminal::pane`'s `keystroke_tests` covers the pty-forwarding half.
     #[gpui::test]
     fn ctrl_p_does_not_open_the_palette_while_a_terminal_is_focused(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -636,7 +636,7 @@ mod tab_strip_keybinding_tests {
     }
 
     /// The other half of the scoping above: with no file tab focused, `]` must not reach
-    /// [`NextChangedFile`] at all (`terminal_pane`'s `keystroke_tests` covers the pty-forwarding
+    /// [`NextChangedFile`] at all (`crate::terminal::pane`'s `keystroke_tests` covers the pty-forwarding
     /// half). Asserts a diff with at least one file actually loaded first, so this can't go
     /// vacuous if the fixture ever stops producing a diff - `open_change` would stay `None`
     /// before and after `]` for an uninteresting reason instead of proving the scoping works.
@@ -681,7 +681,8 @@ mod tab_strip_keybinding_tests {
     /// Revision R10's own version of the same real conflict class as the two tests above, for
     /// `Undo`: `secondary-z` resolves to plain `Ctrl+Z` on Linux/Windows, which a focused
     /// terminal needs unclaimed to receive the real `SIGTSTP` suspend control byte
-    /// (`terminal_pane::keystroke_tests::ctrl_z_maps_to_the_real_sigtstp_control_byte` covers
+    /// (`crate::terminal::pane::keystroke_tests::ctrl_z_maps_to_the_real_sigtstp_control_byte`
+    /// covers
     /// that half). `AdeApp::new_with_settings` always starts a window with one real shell
     /// session already focused (see that function's own docs) - no extra spawn/focus needed
     /// here, unlike the merge/palette tests elsewhere in this file.
@@ -1136,8 +1137,8 @@ mod settings_focus_tests {
 
     /// The General page's `Window controls` row is wired live, not decorative:
     /// `AdeApp::set_window_controls_style` is the method its click handler
-    /// (`crate::root::settings_render::render_settings_general_page`) calls - the same accessor
-    /// `root::title_bar::caption_button_tests` proves actually changes which title-bar variant
+    /// (`crate::settings::render::render_settings_general_page`) calls - the same accessor
+    /// `title_bar::render::caption_button_tests` proves actually changes which title-bar variant
     /// renders.
     #[gpui::test]
     fn window_controls_style_change_updates_the_real_persisted_settings_field(

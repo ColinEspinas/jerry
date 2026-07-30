@@ -1,9 +1,9 @@
 //! The single, canonical per-extension language registry - Revision R8's consolidation of what
 //! used to be four independently-maintained tables that could silently drift against each other:
-//! `crate::settings::LSP_LANGUAGES` (the Language servers settings page),
-//! `crate::file_tree::lang_chip_for_name` (file-tree chip colors), `crate::code_view`'s
+//! `crate::settings::state::LSP_LANGUAGES` (the Language servers settings page),
+//! `crate::sidebar::file_tree::lang_chip_for_name` (file-tree chip colors), `crate::code_surface::code_view`'s
 //! `language_name_for_extension` (the File view's status-bar language label), and
-//! `crate::root::code_surface`'s old `is_rust` boolean gate (whether to spawn/talk to an LSP
+//! `crate::code_surface`'s old `is_rust` boolean gate (whether to spawn/talk to an LSP
 //! client at all). All four now read from [`entry_for_extension`]/[`EXTENSIONS`] below - matching
 //! this codebase's Revision R5.5-established preference for one real table over several that can
 //! drift, not a forced abstraction (each entry is still just a few plain fields, no trait
@@ -13,7 +13,7 @@
 //!
 //! `lsp: Some(..)` for Rust/TypeScript-family/Python/**Vue** - all real, live-tested end to end
 //! (see `lsp_core::client`'s own tests for Rust, and this crate's `language::tests` /
-//! `root::lsp`-adjacent integration tests for the rest). `lsp: None` for TOML/Markdown/SQL (never
+//! `lsp::client`-adjacent integration tests for the rest). `lsp: None` for TOML/Markdown/SQL (never
 //! had a server) and Go (the user's explicit ask named TypeScript/Vue/Python, not Go; `gopls`
 //! stays PATH-detection-only on the Settings page, matching its pre-existing "not installed" real
 //! state there).
@@ -22,7 +22,7 @@
 //!
 //! Vue was deferred through Revision R8 rather than faked, and the investigation narrative is kept
 //! here because it's what the eventual design is justified by - the deferral itself is now
-//! resolved (this module's [`VUE_LSP`] and [`CompanionServer`], plus `crate::root::lsp`'s own
+//! resolved (this module's [`VUE_LSP`] and [`CompanionServer`], plus `crate::lsp::client`'s own
 //! `LspConnection` facade, are that resolution).
 //!
 //! Live-probing the sandbox's actual installed `@vue/language-server@3.3.8` (`vue-language-server
@@ -52,7 +52,7 @@
 //! relay a query to a companion `typescript-language-server` running `@vue/typescript-plugin`, and
 //! to notify the answer back as `tsserver/response`. [`CompanionServer`] is this registry's half
 //! of that (which companion, how to configure it, which methods carry the relay);
-//! `crate::root::lsp`'s `LspConnection` is the half that actually performs it.
+//! `crate::lsp::client`'s `LspConnection` is the half that actually performs it.
 //!
 //! One live-verified consequence shapes the whole design, and is worth stating plainly because it
 //! looks like a bug otherwise: in hybrid mode the *split is the point*. The primary
@@ -115,7 +115,7 @@ pub struct LspIdentity {
 
 /// A second, coordinated LSP server process some languages need alongside the primary one - see
 /// this module's own top-level docs for the real, concrete reason (Vue's hybrid mode) and
-/// `crate::root::lsp`'s `LspConnection` for the facade that actually drives both.
+/// `crate::lsp::client`'s `LspConnection` for the facade that actually drives both.
 ///
 /// Deliberately concrete to that one real, verified protocol rather than a speculative N-server
 /// framework: the relay is one request-shaped notification in, one response-shaped notification
@@ -145,7 +145,7 @@ pub struct CompanionServer {
     /// knowing it can't do its job.
     pub initialization_options: fn() -> Result<Option<serde_json::Value>, String>,
     /// The custom notification method the **primary** sends to ask its client to relay a query to
-    /// this companion. Named here, in the registry, rather than in `crate::root::lsp`, so the
+    /// this companion. Named here, in the registry, rather than in `crate::lsp::client`, so the
     /// forwarding code stays free of any particular server's protocol vocabulary.
     pub relay_request_method: &'static str,
     /// The custom notification method the client sends **back to the primary** carrying the
@@ -157,7 +157,7 @@ pub struct CompanionServer {
     /// reading its own `lib/cli.mjs`).
     pub relay_command: &'static str,
     /// The real `lsp_types::request::Request::METHOD` strings whose *empty* primary answer should
-    /// be retried against this companion - see `crate::root::lsp::LspConnection::request`, which
+    /// be retried against this companion - see `crate::lsp::client::LspConnection::request`, which
     /// reads exactly this list instead of hardcoding any method of its own.
     ///
     /// Lives here, in the registry, because "which questions does the primary genuinely not answer
@@ -167,10 +167,10 @@ pub struct CompanionServer {
     pub fallback_methods: &'static [&'static str],
 }
 
-/// Which of `crate::code_view`'s real `tree-sitter`-backed syntax highlighters applies to an
+/// Which of `crate::code_surface::code_view`'s real `tree-sitter`-backed syntax highlighters applies to an
 /// extension, if any - see [`ExtensionEntry::highlighter`]'s own docs for why this lives on the
 /// registry itself rather than in a second, independent table.
-pub type HighlighterFn = fn(&str) -> Vec<crate::code_view::HighlightSpan>;
+pub type HighlighterFn = fn(&str) -> Vec<crate::code_surface::code_view::HighlightSpan>;
 
 /// One real file extension's language identity - see this module's top-level docs.
 #[derive(Debug, Clone, Copy)]
@@ -202,14 +202,14 @@ pub struct ExtensionEntry {
     /// [`CompanionServer`]), which the page deliberately doesn't show a separate row for - it is
     /// an implementation detail of Vue support, not a language the user picks.
     pub settings_row: Option<SettingsLspRow>,
-    /// Which real `crate::code_view` highlighter function parses this extension's real syntax -
+    /// Which real `crate::code_surface::code_view` highlighter function parses this extension's real syntax -
     /// `None` for an extension with no `tree-sitter` grammar wired at all (TOML/Markdown/SQL, and
     /// Vue - there is no `.vue` grammar dependency in this workspace, which is entirely unrelated
-    /// to and independent of whether [`Self::lsp`] spawns a real server for it, and it does). Previously `crate::code_view::load_file` maintained its own
+    /// to and independent of whether [`Self::lsp`] spawns a real server for it, and it does). Previously `crate::code_surface::code_view::load_file` maintained its own
     /// second, independent extension -> highlighter `match` that this same registry knew nothing
     /// about - a real, live gap where a new registered language could silently render as plain
     /// text with no compile error or test failure to catch it. This field, plus
-    /// `crate::code_view::highlighter_for_extension` reading from it, is that gap closed: one
+    /// `crate::code_surface::code_view::highlighter_for_extension` reading from it, is that gap closed: one
     /// real table, not two that can drift.
     pub highlighter: Option<HighlighterFn>,
 }
@@ -218,13 +218,13 @@ pub struct ExtensionEntry {
 #[derive(Debug, Clone, Copy)]
 pub struct SettingsLspRow {
     pub binary: &'static str,
-    /// Generic descriptive copy, not a live count - see `crate::settings::LspLanguage::note`'s
-    /// own docs (this struct is `crate::settings::LSP_LANGUAGES`' one real source now).
+    /// Generic descriptive copy, not a live count - see `crate::settings::state::LspLanguage::note`'s
+    /// own docs (this struct is `crate::settings::state::LSP_LANGUAGES`' one real source now).
     pub note: &'static str,
     /// The real, official install/docs page for this server - what the Settings -> Language
     /// servers page's "Install" action (a genuinely `not installed` row only, see
-    /// `crate::settings::LspRow::is_ready`) opens in the user's default browser via
-    /// `crate::root::settings_widgets::open_command_for`. Deliberately the server's own official
+    /// `crate::settings::state::LspRow::is_ready`) opens in the user's default browser via
+    /// `crate::settings::widgets::open_command_for`. Deliberately the server's own official
     /// repo/README or docs site, not a third-party aggregator - each one was checked against the
     /// real, current page before being added here (see this app's task tracker for the real
     /// per-server verification: `rust-analyzer`'s own manual's binary-install chapter,
@@ -361,7 +361,7 @@ fn vue_companion_initialization_options() -> Result<Option<serde_json::Value>, S
 /// Pyright expects a real, non-empty `initializationOptions` block up front (unlike
 /// rust-analyzer/typescript-language-server, which behave fine with none) - see this crate's
 /// `lsp-core` generalization docs. Real `pythonPath` detection via `pty_core::resolve_on_path`
-/// (the same real `$PATH` search `crate::settings::detect_lsp_rows` already uses), not a
+/// (the same real `$PATH` search `crate::settings::state::detect_lsp_rows` already uses), not a
 /// hardcoded guess; `None` (omitted from the JSON entirely, not a fabricated empty string) if no
 /// real `python3`/`python` is found, so Pyright falls back to its own default resolution instead
 /// of being pointed at an interpreter that doesn't exist.
@@ -488,12 +488,12 @@ const VUE_TYPESCRIPT_COMPANION: CompanionServer = CompanionServer {
 /// | `textDocument/completion`   | `items: []`           | `["alpha", "beta"]`                   |
 ///
 /// Note the three different *shapes* of "nothing here" in that middle column - only hover's is a
-/// wire `null`. That's why `crate::root::lsp::lsp_result_is_empty`, not a plain null check, is
+/// wire `null`. That's why `crate::lsp::client::lsp_result_is_empty`, not a plain null check, is
 /// what decides when to actually replay one of these against the companion.
 ///
 /// Deliberately not "every method": a request the primary answers correctly must keep going to the
 /// primary alone, so the companion can never quietly substitute a different answer for a real one
-/// (`crate::root::lsp::lsp_connection_facade_tests::a_request_outside_the_fallback_list_never_consults_the_companion`).
+/// (`crate::lsp::client::lsp_connection_facade_tests::a_request_outside_the_fallback_list_never_consults_the_companion`).
 const VUE_FALLBACK_METHODS: &[&str] = &[
     HoverRequest::METHOD,
     GotoDefinition::METHOD,
@@ -528,7 +528,7 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
             note: "starts when a .rs file opens",
             install_url: "https://rust-analyzer.github.io/book/rust_analyzer_binary.html",
         }),
-        highlighter: Some(crate::code_view::highlight_rust),
+        highlighter: Some(crate::code_surface::code_view::highlight_rust),
     },
     ExtensionEntry {
         extension: "toml",
@@ -572,7 +572,7 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
             note: "starts when a .ts file opens",
             install_url: "https://github.com/typescript-language-server/typescript-language-server",
         }),
-        highlighter: Some(crate::code_view::highlight_ts),
+        highlighter: Some(crate::code_surface::code_view::highlight_ts),
     },
     ExtensionEntry {
         extension: "tsx",
@@ -582,7 +582,7 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
         chip_colors: theme::lang::TS,
         lsp: Some(TYPESCRIPT_LSP),
         settings_row: None,
-        highlighter: Some(crate::code_view::highlight_tsx),
+        highlighter: Some(crate::code_surface::code_view::highlight_tsx),
     },
     ExtensionEntry {
         extension: "js",
@@ -593,9 +593,9 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
         lsp: Some(TYPESCRIPT_LSP),
         settings_row: None,
         // `.js` deliberately reuses the plain TypeScript grammar (a real syntactic superset of
-        // JavaScript) rather than `highlight_tsx` - see `crate::code_view::highlight_typescript`'s
+        // JavaScript) rather than `highlight_tsx` - see `crate::code_surface::code_view::highlight_typescript`'s
         // own docs.
-        highlighter: Some(crate::code_view::highlight_ts),
+        highlighter: Some(crate::code_surface::code_view::highlight_ts),
     },
     ExtensionEntry {
         extension: "jsx",
@@ -605,7 +605,7 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
         chip_colors: theme::lang::TS,
         lsp: Some(TYPESCRIPT_LSP),
         settings_row: None,
-        highlighter: Some(crate::code_view::highlight_tsx),
+        highlighter: Some(crate::code_surface::code_view::highlight_tsx),
     },
     ExtensionEntry {
         extension: "vue",
@@ -641,7 +641,7 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
             note: "starts when a .py file opens",
             install_url: "https://github.com/microsoft/pyright/blob/main/docs/installation.md",
         }),
-        highlighter: Some(crate::code_view::highlight_python),
+        highlighter: Some(crate::code_surface::code_view::highlight_python),
     },
     ExtensionEntry {
         extension: "go",
@@ -662,7 +662,7 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
     },
 ];
 
-/// The real, canonical source for `crate::settings::LSP_LANGUAGES` - every [`ExtensionEntry`]
+/// The real, canonical source for `crate::settings::state::LSP_LANGUAGES` - every [`ExtensionEntry`]
 /// with a real [`ExtensionEntry::settings_row`], in [`EXTENSIONS`]' own order.
 pub fn settings_lsp_entries() -> impl Iterator<Item = &'static ExtensionEntry> {
     EXTENSIONS
@@ -711,7 +711,7 @@ pub fn chip_for_extension(extension: Option<&str>) -> (&'static str, Rgba, Rgba)
 /// The real `textDocument/didOpen` `language_id` for `extension`, if this crate would spawn an
 /// LSP client for it at all (`None` for an extension with no [`ExtensionEntry::lsp`], e.g.
 /// `.go`, or one absent from [`EXTENSIONS`] entirely) - the replacement for the old
-/// `is_rust` boolean gate in `crate::root::code_surface`: "is there an `lsp_language_id` for this
+/// `is_rust` boolean gate in `crate::code_surface`: "is there an `lsp_language_id` for this
 /// extension" now answers "should this app try to talk to a language server for this file" for
 /// every supported language, not just Rust.
 pub fn lsp_language_id_for_extension(extension: Option<&str>) -> Option<&'static str> {
@@ -777,7 +777,7 @@ pub fn companion_for_extension(extension: Option<&str>) -> Option<CompanionServe
 }
 
 /// The [`CompanionServer`] belonging to whichever registry entry spawns `binary` as its *primary*
-/// server - the real, honest way for `crate::root::lsp`'s poll loop to ask "is this specific
+/// server - the real, honest way for `crate::lsp::client`'s poll loop to ask "is this specific
 /// client the kind that can send a relay notification, and if so where do its relays go?" without
 /// naming any particular server, and without blanket-handling a method for every client.
 pub fn companion_for_primary_binary(binary: &str) -> Option<CompanionServer> {
@@ -917,7 +917,7 @@ mod tests {
     /// `lib/typescript.js` present - the exact real file [`vue_dynamic_args`] existence-checks.
     /// A genuine `npm install typescript` would produce a ~9 MB one; this writes a tiny stand-in
     /// because what's under test here is only this crate's own resolution/refusal logic, which
-    /// looks at nothing but the path. The real, live end-to-end Vue test in `crate::root::lsp`
+    /// looks at nothing but the path. The real, live end-to-end Vue test in `crate::lsp::client`
     /// uses a genuine `npm install typescript` instead, since *that* one hands the path to a real
     /// server that really does load it.
     fn scratch_root_with_local_typescript() -> tempfile::TempDir {
@@ -1187,7 +1187,7 @@ mod tests {
 
     /// The real drift guard for finding 5's fix: every extension this crate genuinely has a real
     /// `tree-sitter` grammar for has a real [`ExtensionEntry::highlighter`] wired in this same
-    /// registry - not a second, independent table `crate::code_view::load_file` used to maintain
+    /// registry - not a second, independent table `crate::code_surface::code_view::load_file` used to maintain
     /// on its own, invisible to this one. Pinning the exact real set (rather than just "some are
     /// Some") means a future extension added here with a real grammar but a forgotten
     /// `highlighter` wiring changes this set and fails this test, rather than silently rendering
@@ -1227,7 +1227,7 @@ mod tests {
 
     /// Every real Settings-page row must carry a real, non-empty `https://` install URL - not a
     /// placeholder, and not a bare label that would fail to open anything real via
-    /// `crate::root::settings_widgets::open_command_for`. Pins the exact real, current five URLs
+    /// `crate::settings::widgets::open_command_for`. Pins the exact real, current five URLs
     /// (each individually verified against its own official source - see [`SettingsLspRow::
     /// install_url`]'s own docs) so a future edit that swaps one out is a deliberate, visible test
     /// diff rather than a silent drift to something unverified.
@@ -1269,7 +1269,7 @@ mod tests {
     }
 
     /// `.tsx`/`.jsx` genuinely need the TSX grammar variant, `.ts`/`.js` the plain one - proves
-    /// the registry wires the *correct* one of the two real `crate::code_view` wrapper fns per
+    /// the registry wires the *correct* one of the two real `crate::code_surface::code_view` wrapper fns per
     /// extension, not just "some highlighter or other".
     #[test]
     fn typescript_family_extensions_wire_the_correct_real_grammar_variant() {
@@ -1289,9 +1289,25 @@ mod tests {
                 "{label} is wired to the wrong real highlighter variant"
             );
         }
-        assert_same_fn(ts.highlighter, crate::code_view::highlight_ts, "ts");
-        assert_same_fn(js.highlighter, crate::code_view::highlight_ts, "js");
-        assert_same_fn(tsx.highlighter, crate::code_view::highlight_tsx, "tsx");
-        assert_same_fn(jsx.highlighter, crate::code_view::highlight_tsx, "jsx");
+        assert_same_fn(
+            ts.highlighter,
+            crate::code_surface::code_view::highlight_ts,
+            "ts",
+        );
+        assert_same_fn(
+            js.highlighter,
+            crate::code_surface::code_view::highlight_ts,
+            "js",
+        );
+        assert_same_fn(
+            tsx.highlighter,
+            crate::code_surface::code_view::highlight_tsx,
+            "tsx",
+        );
+        assert_same_fn(
+            jsx.highlighter,
+            crate::code_surface::code_view::highlight_tsx,
+            "jsx",
+        );
     }
 }

@@ -3,7 +3,7 @@ use super::*;
 impl AdeApp {
     /// Applies one `on_drag_move` tick for `target`'s pane, deriving the new width directly from
     /// the drag's current absolute cursor x position and [`Self::body_bounds`] via
-    /// `crate::layout`'s clamp math - no "armed" drag-start baseline is carried between ticks.
+    /// `crate::root::layout`'s clamp math - no "armed" drag-start baseline is carried between ticks.
     /// `target` comes straight from the `PaneResizeDrag` payload the event itself carries, so
     /// there's no separate "which drag is active" state that could disagree with it.
     pub(super) fn apply_pane_resize(
@@ -72,7 +72,7 @@ impl AdeApp {
 }
 
 /// Which of the two drag-to-resize splitters (rail or panel) is being dragged - see
-/// [`AdeApp::apply_pane_resize`] and `crate::layout`'s clamp math.
+/// [`AdeApp::apply_pane_resize`] and `crate::root::layout`'s clamp math.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ResizeTarget {
     Rail,

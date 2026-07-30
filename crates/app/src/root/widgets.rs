@@ -3,7 +3,7 @@ use super::*;
 /// The two keycap sizes: `Standard` (primary shortcuts - the rail's `+`/⌘N, the status bar's
 /// `⌘K`) and `Hint` (smaller, for hint-row contexts like footers and empty-state hint lists).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum KeycapSize {
+pub(crate) enum KeycapSize {
     Standard,
     Hint,
 }
@@ -53,7 +53,7 @@ fn render_keycap_sized(label: impl Into<gpui::SharedString>, size: KeycapSize) -
 /// platform-resolved glyphs (`crate::keymap::resolve_combo`'s output) - this function only lays
 /// them out, it never does glyph substitution itself, so it can never be the place a literal `⌘`
 /// sneaks back into calling code.
-pub(super) fn render_keycap_row(parts: &[String], size: KeycapSize) -> impl IntoElement {
+pub(crate) fn render_keycap_row(parts: &[String], size: KeycapSize) -> impl IntoElement {
     let gap = match size {
         KeycapSize::Standard => px(3.0),
         KeycapSize::Hint => px(2.0),
@@ -67,7 +67,7 @@ pub(super) fn render_keycap_row(parts: &[String], size: KeycapSize) -> impl Into
 
 /// One `[keycaps] label` hint pair. `keys` is `&[]` for a hint with no real binding behind it
 /// (e.g. a plain result count) - in that case only the label renders, no empty keycap row.
-pub(super) fn render_hint_pair(
+pub(crate) fn render_hint_pair(
     keys: &[String],
     label: impl Into<gpui::SharedString>,
 ) -> impl IntoElement {
@@ -85,7 +85,7 @@ pub(super) fn render_hint_pair(
 }
 
 /// A hint row: several [`render_hint_pair`]s laid out with an 11px gap.
-pub(super) fn render_hint_row(
+pub(crate) fn render_hint_row(
     pairs: impl IntoIterator<Item = impl IntoElement>,
 ) -> impl IntoElement {
     div().flex().items_center().gap(px(11.0)).children(pairs)
@@ -95,7 +95,7 @@ pub(super) fn render_hint_row(
 /// (`crate::env_info::is_wsl`), else `local · <arch>` (`crate::env_info::local_arch`). A
 /// parameterless, real-environment-reading widget so future call sites (status bar, Settings)
 /// can reuse it rather than hand-copying a second chip.
-pub(super) fn render_env_chip() -> impl IntoElement {
+pub(crate) fn render_env_chip() -> impl IntoElement {
     let (label, fg, bg, border): (String, gpui::Rgba, gpui::Rgba, gpui::Rgba) =
         if env_info::is_wsl() {
             let distro = env_info::wsl_distro_name().unwrap_or("WSL");
@@ -133,7 +133,7 @@ pub(super) fn render_env_chip() -> impl IntoElement {
 /// A themed, single-line message used for every Zone 3 empty/loading/error state (the file
 /// tree's and the Changes list's alike) - one real, consistent look instead of each call site
 /// improvising its own.
-pub(super) fn render_sidebar_message(text: String, color: gpui::Rgba) -> gpui::AnyElement {
+pub(crate) fn render_sidebar_message(text: String, color: gpui::Rgba) -> gpui::AnyElement {
     div()
         .p(px(10.0))
         .font(font(theme::font::MONO))
@@ -144,7 +144,7 @@ pub(super) fn render_sidebar_message(text: String, color: gpui::Rgba) -> gpui::A
 }
 
 /// The Changes row / diff toolbar's optional `new`/`del` tag pill.
-pub(super) fn render_tag_pill(tag: ChangeTag) -> impl IntoElement {
+pub(crate) fn render_tag_pill(tag: ChangeTag) -> impl IntoElement {
     let style = changes::tag_style(tag);
     div()
         .flex_none()
@@ -162,15 +162,15 @@ pub(super) fn render_tag_pill(tag: ChangeTag) -> impl IntoElement {
 /// (anything that could contain a `mod`/`alt`/`ctrl`/`shift`/`enter`/`esc`/`tab`/`bksp` token),
 /// use [`render_keycap_row`] with `crate::keymap::resolve_combo`'s output instead - this helper
 /// is only for call sites that render one already-final, platform-invariant literal (`"F12"`).
-pub(super) fn render_keycap(label: &'static str) -> impl IntoElement {
+pub(crate) fn render_keycap(label: &'static str) -> impl IntoElement {
     render_keycap_sized(label, KeycapSize::Standard)
 }
 
 /// A themed row of already-resolved keycaps with the *button's own* tint - the colored-button
-/// counterpart to [`render_keycap_row`], used by `crate::work_surface::FooterAction`'s
+/// counterpart to [`render_keycap_row`], used by `crate::work_surface::state::FooterAction`'s
 /// per-status action buttons (`Keep all ⌘⏎`, `Interrupt ⌃C`, ...), whose colours vary per
-/// `crate::work_surface::ActionStyle`.
-pub(super) fn render_action_keycap_row(
+/// `crate::work_surface::state::ActionStyle`.
+pub(crate) fn render_action_keycap_row(
     parts: &[String],
     fg: gpui::Rgba,
     border: gpui::Rgba,
@@ -207,7 +207,7 @@ fn render_action_keycap(
 
 /// A plain, real GPUI tooltip view - just the given text, styled to match this app's other
 /// small popovers (`theme::surface::POPOVER`/`theme::border::POPOVER`, the same tokens
-/// `root::completions`'s own completion popup uses). Backs [`text_tooltip`]; see that function's
+/// `lsp::completion_popup`'s own completion popup uses). Backs [`text_tooltip`]; see that function's
 /// own docs for why this exists.
 struct TextTooltip {
     text: gpui::SharedString,
@@ -238,7 +238,7 @@ impl gpui::Render for TextTooltip {
 /// shas - rendered with no truncation *or* tooltip at all, in a narrow rail-footer div). Pairs
 /// with `.truncate()` on the same element: the on-screen text is cut short with an ellipsis, and
 /// this tooltip carries the real, untruncated text on hover.
-pub(super) fn text_tooltip(
+pub(crate) fn text_tooltip(
     text: impl Into<gpui::SharedString>,
 ) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
     let text = text.into();

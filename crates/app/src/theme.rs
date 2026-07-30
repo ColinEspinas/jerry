@@ -17,7 +17,7 @@
 //!
 //! The other five themes' full palettes are *derived*, not hand-authored - see
 //! [`derive_shift`]'s own docs for the real, systematic HSL transform, computed from each
-//! theme's own five `crate::settings::THEME_DEFS` swatches compared against Jerry Dark's.
+//! theme's own five `crate::settings::state::THEME_DEFS` swatches compared against Jerry Dark's.
 //!
 //! [`hex`] still reimplements `gpui::rgb`'s byte-extraction formula as a real `const fn`
 //! (GPUI's own `rgb()`/`Into<Hsla>` conversions aren't `const fn` -
@@ -106,13 +106,13 @@ impl From<ColorToken> for gpui::Background {
 }
 
 thread_local! {
-    /// The live-selected theme's index into `crate::settings::THEME_DEFS` (`0` = Jerry Dark, the
+    /// The live-selected theme's index into `crate::settings::state::THEME_DEFS` (`0` = Jerry Dark, the
     /// real default and identity case - see [`ColorToken::resolve`]). A [`std::thread_local`],
     /// not a value threaded through every render call's parameters, by deliberate design: every
     /// one of this module's ~200 colour tokens is a bare, freestanding `const` read from dozens
     /// of files across the whole app (`theme::surface::WINDOW`, `theme::text::BODY`, ...), the
     /// overwhelming majority several layers deep inside plain, `gpui`-context-free helper
-    /// functions (`crate::changes::stat_segment_color`, `crate::status::Status::color`, ...) that
+    /// functions (`crate::sidebar::changes::stat_segment_color`, `crate::rail::status::Status::color`, ...) that
     /// have no `AdeApp`/`Context`/theme parameter to receive a selection through, and adding one
     /// to every such signature across the codebase (the exact churn `crate::root::AdeApp::
     /// ui_text_size`'s own narrower, opt-in scaling mechanism was deliberately kept away from,
@@ -144,7 +144,7 @@ pub fn current_theme_index() -> usize {
 }
 
 /// Sets the live-selected theme index - the one real place `crate::root::AdeApp`'s theme
-/// selection (`crate::settings::THEME_DEFS`'s row click, or a real `follow_system` OS-appearance
+/// selection (`crate::settings::state::THEME_DEFS`'s row click, or a real `follow_system` OS-appearance
 /// change) writes through. Callers must also force a real repaint (`App::refresh_windows`,
 /// `vendor/zed/crates/gpui/src/app.rs:1025`) afterward - this function only flips the thread-local
 /// index; nothing here can reach into GPUI's own render loop to schedule one.
@@ -199,8 +199,8 @@ fn apply_shift(base: Rgba, shift: HslShift) -> Rgba {
 }
 
 /// Derives a real, systematic [`HslShift`] for a non-Jerry-Dark theme from the two themes' own
-/// five `crate::settings::THEME_DEFS` swatches (`[background, panel, green-ish, amber-ish,
-/// blue-ish]`, `crate::settings::ThemeDef::swatches`'s own real, transcribed values) - not a
+/// five `crate::settings::state::THEME_DEFS` swatches (`[background, panel, green-ish, amber-ish,
+/// blue-ish]`, `crate::settings::state::ThemeDef::swatches`'s own real, transcribed values) - not a
 /// hand-picked palette per theme. This is the whole mechanism the module docs' "derived, not
 /// hand-authored" claim rests on:
 ///
@@ -284,7 +284,7 @@ fn derive_shift(base_swatches: [u32; 5], target_swatches: [u32; 5]) -> HslShift 
     }
 }
 
-/// The real, once-computed shift table for `crate::settings::THEME_DEFS`' six themes - index 0
+/// The real, once-computed shift table for `crate::settings::state::THEME_DEFS`' six themes - index 0
 /// (Jerry Dark) is always [`IDENTITY_SHIFT`] ([`ColorToken::resolve`] special-cases it anyway,
 /// never actually calling through here for it, but a real identity entry keeps this table
 /// honestly total over every real theme index rather than silently relying on that short
@@ -293,7 +293,7 @@ fn derive_shift(base_swatches: [u32; 5], target_swatches: [u32; 5]) -> HslShift 
 fn theme_shift(index: usize) -> HslShift {
     static SHIFTS: std::sync::OnceLock<[HslShift; 6]> = std::sync::OnceLock::new();
     let shifts = SHIFTS.get_or_init(|| {
-        let defs = crate::settings::THEME_DEFS;
+        let defs = crate::settings::state::THEME_DEFS;
         let base = defs[0].swatches;
         std::array::from_fn(|i| {
             if i == 0 {
@@ -725,19 +725,19 @@ pub mod shadow {
 ///
 /// ## Which real surfaces read this
 ///
-/// Scaled: the session rail (`crate::root::rail_render`); the title bar/status bar
-/// (`crate::root::status_bar`); the command palette's row labels/hints
-/// (`crate::root::palette_render`); the Files/Changes sidebar's row labels, footer hint, and
-/// tree caret (`crate::root::sidebar_render`); the file/session tab strip's tab labels
-/// (`crate::root::work_surface_render`); and every Settings row's label/hint *and* control
+/// Scaled: the session rail (`crate::rail::render`); the title bar/status bar
+/// (`crate::status_bar::render`); the command palette's row labels/hints
+/// (`crate::palette::render`); the Files/Changes sidebar's row labels, footer hint, and
+/// tree caret (`crate::sidebar::render`); the file/session tab strip's tab labels
+/// (`crate::work_surface::render`); and every Settings row's label/hint *and* control
 /// (stepper value, choice-segment labels, config banner text, snippet block text - all in
-/// `crate::root::settings_widgets`).
+/// `crate::settings::widgets`).
 ///
 /// Deliberately not scaled, each for its own reason: the code surface and terminal panes have
 /// their own dedicated font-size mechanisms (`AdeApp::effective_code_rem_px`,
 /// `Settings.appearance.terminal_font_size`) that a second multiplier would compound with;
 /// chips/badges/keycaps/close-tab glyphs app-wide are small, fixed-size shapes the design treats
-/// as part of a component rather than running text; and the rest of `work_surface_render`'s own
+/// as part of a component rather than running text; and the rest of `crate::work_surface::render`'s own
 /// chrome (session context bar, toolbar buttons, `+` menu, footer action buttons) is real,
 /// currently out of scope.
 pub mod ui_scale {
@@ -802,7 +802,7 @@ mod lang_token_tests {
 
     // `Rgba` derives `PartialEq` but not `Debug` (`vendor/zed/crates/gpui/src/color.rs:37`), so
     // `assert_eq!`/`assert_ne!` can't be used directly - same reason
-    // `crate::file_tree::tests::same` exists.
+    // `crate::sidebar::file_tree::tests::same` exists.
     fn same(a: Rgba, b: Rgba) -> bool {
         a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a
     }
@@ -1006,12 +1006,12 @@ mod theme_runtime_tests {
                 "theme index {index} ({}) only changed {changed}/5 real tokens spanning \
                  surface/text/syntax/status/diff - a genuine full-palette derivation should move \
                  nearly all of them, not leave most still reading Jerry Dark's own values",
-                crate::settings::THEME_DEFS[index].name
+                crate::settings::state::THEME_DEFS[index].name
             );
         }
     }
 
-    /// "Paper" (`crate::settings::THEME_DEFS[5]`) is the one real light theme - its own swatches
+    /// "Paper" (`crate::settings::state::THEME_DEFS[5]`) is the one real light theme - its own swatches
     /// are genuinely light hex values, so the derived lightness fit
     /// ([`derive_shift`]'s own docs) must actually produce a *lighter* window background than
     /// Jerry Dark's near-black original, not just a differently-hued dark colour.

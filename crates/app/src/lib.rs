@@ -4,39 +4,32 @@
 //! worktrees (via `wt-core`) with session/tab controls for spawning agent CLIs or shells
 //! into them, a tabbed center pane of real terminal sessions (via `pty-core` +
 //! `alacritty_terminal`), and a right sidebar showing the active worktree's real file tree
-//! (via `std::fs::read_dir`). See `crate::root`, `crate::sessions`, `crate::terminal_pane`,
-//! and `crate::terminal_grid` for the interesting design decisions (entity/state model,
+//! (via `std::fs::read_dir`). See `crate::root`, `crate::work_surface::sessions`, `crate::terminal::pane`,
+//! and `crate::terminal::grid` for the interesting design decisions (entity/state model,
 //! blocking-call offloading, terminal grid rendering).
 
-pub mod changes;
-pub mod code_view;
-pub mod completion_view;
-pub mod diagnostics_view;
-pub mod edit_buffer;
+pub mod code_surface;
 pub mod env_info;
-pub mod file_tree;
 pub mod fonts;
-pub mod hover_view;
 pub mod keymap;
 pub mod keymap_overrides;
 pub mod language;
-pub mod layout;
+pub mod lsp;
 pub mod merge;
 pub mod palette;
-pub mod process_stats;
 pub mod rail;
 pub mod root;
-pub mod sessions;
 pub mod settings;
-pub mod settings_store;
-pub mod status;
-pub mod terminal_grid;
-pub mod terminal_links;
-pub mod terminal_pane;
+pub mod sidebar;
+pub mod status_bar;
+pub mod terminal;
 pub mod theme;
-pub mod undo;
+// `pub(crate)`, unlike every other feature folder above: this one exposes no public item at
+// all (both its files are `pub(crate) mod`), and `root::title_bar` was a private module before
+// the split - so making it `pub` would widen this crate's external surface for no reason.
+pub(crate) mod title_bar;
 pub mod work_surface;
-pub mod worktrees;
+pub mod worktree_history;
 
 use std::path::PathBuf;
 
@@ -75,7 +68,7 @@ use gpui::{
 ///   including macOS, matching the mockup's own `ctrl+shift+T` spec - unlike every other binding
 ///   here, which uses `"secondary-"`.
 /// - The `+` menu's "Open file…" row has **no** global keybinding, despite the mockup's own
-///   `mod+P` spec - a real conflict found in audit: `crate::terminal_pane::keystroke_to_bytes`
+///   `mod+P` spec - a real conflict found in audit: `crate::terminal::pane::keystroke_to_bytes`
 ///   maps an unmodified `Ctrl+<letter>` to the terminal control byte a focused shell expects, and
 ///   Ctrl+P (`0x10`) is a standard readline binding (`previous-history`) shells rely on. GPUI
 ///   dispatches a matched `KeyBinding`'s action before a focused element's own `on_key_down`, so
@@ -88,7 +81,7 @@ use gpui::{
 ///   rather than global - the only one of this app's bindings with a non-`'rail'`/`'session'`
 ///   context. A global `"]"` would swallow a literal `]` typed into any focused terminal/agent
 ///   session (closing a bracket, an array literal, a regex class) - the same bug class as above.
-///   Scoping to `"diff"` (`crate::root::code_surface`'s `.key_context("diff")` on the Surface C
+///   Scoping to `"diff"` (`crate::code_surface`'s `.key_context("diff")` on the Surface C
 ///   container) means it only fires while a file tab already has focus, matching the design's
 ///   intent: `]` cycles *through an already-open review*, not a global "jump into reviewing"
 ///   shortcut. The `&& !file-editor` half is a real, live-reproduced fix (not part of the
@@ -104,7 +97,7 @@ use gpui::{
 ///   individually bound keystrokes since GPUI has no "N" wildcard keystroke component.
 /// - The `Editor*` entries (Revision R8.5a's real File view text editing) are scoped to
 ///   `Some("file-editor")`, a real *additional* context alongside `"diff"` above - both live on
-///   the *same* focused "code-surface" container (`root::code_surface::AdeApp::
+///   the *same* focused "code-surface" container (`code_surface::render::AdeApp::
 ///   render_code_surface`'s outer div, the one `code_focus_handle` is actually `track_focus`'d
 ///   on), with `"file-editor"` only added to that node's own context string (space-separated:
 ///   `"diff file-editor"`) while the editable File view - not the read-only Diff view - is
@@ -120,23 +113,23 @@ use gpui::{
 ///   they're ever active in. `EditorSave` is `"secondary-s"`, following this list's own
 ///   `"secondary-"` convention (verified against this same list: no other entry already claims
 ///   it). `EditorSaveAnyway` (`"secondary-shift-s"`) is the real, explicit, opt-in override for
-///   an `AdeApp::file_external_conflict` - see `root::editing::AdeApp::force_save_active_file`'s
+///   an `AdeApp::file_external_conflict` - see `code_surface::editing::AdeApp::force_save_active_file`'s
 ///   own docs for the real permanent-deadlock bug (a conflict that, once flagged, could never
 ///   clear again through the ordinary save path) this exists to let the user deliberately break
 ///   out of.
 /// - The `Completions*` entries (Revision R8.5b) back the real Completions popup
-///   (`crate::root::completions`), scoped to `Some("file-editor && completions")` - a real,
+///   (`crate::lsp::completion_popup`), scoped to `Some("file-editor && completions")` - a real,
 ///   narrower sibling context added to the same node only while the popup is genuinely open (see
-///   `crate::root::code_surface::AdeApp::render_code_surface`'s own docs). `enter`/`up`/`down`
+///   `crate::code_surface::render::AdeApp::render_code_surface`'s own docs). `enter`/`up`/`down`
 ///   above are correspondingly narrowed to `!completions` so the two mutually-exclusive predicate
 ///   sets can never both match the same keystroke - the same real `&&`/`!`
 ///   `KeyBindingContextPredicate` mechanism the `"]"` entry already established for this exact
 ///   bug class.
-/// - `Undo`/`Redo` (Revision R10, `crate::root::worktree_history`) back the real command-pattern
+/// - `Undo`/`Redo` (Revision R10, `crate::worktree_history::flow`) back the real command-pattern
 ///   undo/redo stack for "keep all changes"/"discard worktree". `"secondary-z"`/
 ///   `"secondary-shift-z"` follow this list's own `"secondary-"` convention, but - unlike every
 ///   other entry above except `"]"` - are **not** globally scoped (`None`): `"secondary-z"`
-///   resolves to plain `Ctrl+Z` on Linux/Windows, which `crate::terminal_pane::keystroke_to_bytes`
+///   resolves to plain `Ctrl+Z` on Linux/Windows, which `crate::terminal::pane::keystroke_to_bytes`
 ///   already maps to the real `SIGTSTP` control byte (`0x1a`) - the terminal-suspend keystroke
 ///   essentially every interactive terminal program relies on. A global binding here would
 ///   swallow it before it ever reached a focused terminal's own key handling, the same
@@ -145,7 +138,7 @@ use gpui::{
 ///   those. Unlike `secondary-p` (no narrower context existed for it - the palette must be
 ///   reachable from a focused terminal), a real, narrower scope *is* available here: `Undo`/
 ///   `Redo` have no legitimate reason to need to fire while a terminal has keyboard focus, so
-///   they're scoped to `Some("!terminal")` - `crate::terminal_pane::TerminalPane`'s own
+///   they're scoped to `Some("!terminal")` - `crate::terminal::pane::TerminalPane`'s own
 ///   `"terminal"` context tag (added in the same revision specifically to make this predicate
 ///   possible), matching this list's own `"]"`/`"diff && !file-editor"` precedent for the same
 ///   `!`-negated-context mechanism.
@@ -207,15 +200,15 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         // `"file-editor && completions"`, the real *narrower* mirror of the `!completions`
         // narrowing on `enter`/`up`/`down` above, added to the same code-surface node only while
         // `AdeApp::completions` is genuinely, actionably `Ready` for the active file (see
-        // `crate::root::code_surface::AdeApp::render_code_surface`'s own docs for exactly where
-        // that context tag comes from, and `crate::root::completions::AdeApp::
+        // `crate::code_surface::render::AdeApp::render_code_surface`'s own docs for exactly where
+        // that context tag comes from, and `crate::lsp::completion_popup::AdeApp::
         // completions_open_for_active_path`'s own docs for why `Loading`/`Failed` don't count).
         // `Tab` has no competing plain-`Editor*` *action* binding anywhere in this list - but the
         // real, live-verified reason scoping it only to `"file-editor && completions"` is safe
         // isn't "nothing else claims it": a real, live keystroke test confirms that with the
         // popup closed, an unbound `tab` keystroke still reaches the real edit buffer and inserts
         // a literal `\t`, the same way any other unbound printable character does - GPUI falls
-        // through to the platform's ordinary text-input/IME path (`crate::root::editing`'s
+        // through to the platform's ordinary text-input/IME path (`crate::code_surface::editing`'s
         // `EntityInputHandler::replace_text_in_range`) for any keystroke with no matching
         // `KeyBinding` in the currently active context, rather than dropping it. So `Tab` is
         // never actually *unhandled* outside this narrow context; it's handled by a different,
@@ -246,16 +239,16 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
             Some("file-editor && completions"),
         ),
         // Surface D's merge hand-edit whole-file editor (Revision R8.5c,
-        // `crate::root::merge_editing`) - a distinct `"merge-editor"` context, deliberately never
+        // `crate::merge::editing`) - a distinct `"merge-editor"` context, deliberately never
         // `"file-editor"` itself: the same real `Editor*` action *types*/handler bodies are
-        // reused (see `crate::root::editing::AdeApp::active_edit_target`'s own docs for how a
+        // reused (see `crate::code_surface::editing::AdeApp::active_edit_target`'s own docs for how a
         // handler routes to whichever buffer is actually the current target), but reusing
         // `"file-editor"` verbatim would also pull in the `"... && completions"`/
         // `"... && !completions"` narrowing above, which makes no sense for a merge buffer - no
-        // completions popup is ever wired up for it (see `crate::root::merge_editing`'s own top
+        // completions popup is ever wired up for it (see `crate::merge::editing`'s own top
         // docs). `EditorSaveAnyway` (`secondary-shift-s`) is deliberately *not* bound here either:
         // there is no external-change-conflict concept for a merge hand-edit buffer (see
-        // `crate::root::merge_flow::AdeApp::save_merge_edit`'s own docs).
+        // `crate::merge::flow::AdeApp::save_merge_edit`'s own docs).
         gpui::KeyBinding::new("backspace", root::EditorBackspace, Some("merge-editor")),
         gpui::KeyBinding::new("delete", root::EditorDelete, Some("merge-editor")),
         gpui::KeyBinding::new("enter", root::EditorEnter, Some("merge-editor")),
@@ -300,7 +293,7 @@ pub fn run(repo_path: PathBuf) {
             let opened = cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    // The design's title-bar band (`crate::root::title_bar`) draws its own
+                    // The design's title-bar band (`crate::title_bar`) draws its own
                     // close/minimize/maximize controls, so the OS/compositor shouldn't also
                     // draw a native titlebar - matching `vendor/zed/crates/zed/src/zed.rs`'s
                     // own `titlebar`/`window_decorations` combination.

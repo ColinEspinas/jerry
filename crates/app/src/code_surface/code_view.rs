@@ -1,0 +1,2208 @@
+//! Pure logic for Surface C's File view (`design_handoff_jerry_ade/README.md`'s "File view"
+//! subsection): reads a file off disk, detects its line-ending style, picks a language label
+//! from its extension, and - for a real subset of extensions - produces syntax-colored spans by
+//! parsing with `tree-sitter` and walking the resulting AST. Deliberately `gpui`-window-free
+//! (only [`gpui::Rgba`] is used, for plain colour data), mirroring this crate's split between
+//! pure logic modules and `crate::root`'s `Div` construction.
+//!
+//! `.rs`/`.ts`/`.tsx`/`.js`/`.jsx`/`.py` get real syntax spans; other extensions (including
+//! `.vue` - see `crate::language`'s docs for why this phase doesn't spawn an LSP client for it,
+//! unrelated to highlighting) render as plain monospace text.
+//!
+//! ## How highlighting actually works here
+//!
+//! Classification is done by the official `tree-sitter-highlight` crate, driving each grammar
+//! crate's **own published `queries/highlights.scm`** (exposed by all three as a `&'static str`
+//! constant, so no query file is vendored or read from disk). This replaced a hand-rolled
+//! recursive AST walk matching node kinds against per-language node-kind tables maintained here -
+//! see [`HIGHLIGHT_NAMES`] and [`HIGHLIGHT_KINDS`] for how the standard capture vocabulary those
+//! real query files emit (`keyword`, `function.method`, `constant.builtin`, `punctuation.bracket`,
+//! ...) is folded down into the six buckets `design_handoff_jerry_ade/README.md`'s File view
+//! colour table actually defines, and [`highlight_query_for`] for the one genuinely surprising
+//! part (TypeScript's own query file is a supplement, not a whole query).
+//!
+//! Adding a further grammar is now a [`Grammar`] variant plus a thin wrapper - no node-kind table.
+//!
+//! ## API verification
+//!
+//! `tree-sitter-highlight` is not used anywhere in `vendor/zed`, so there is no in-tree call site
+//! to check this against. Every non-obvious behavioural claim made in the docs below was instead
+//! verified by reading the real crate source on disk
+//! (`~/.cargo/registry/src/*/tree-sitter-highlight-0.26.9/src/highlight.rs`) and is cited to the
+//! exact lines there - specifically the recognized-name matching rule
+//! (`configure`, lines 458-484), the last-pattern-wins rule for two patterns capturing one node
+//! (lines 1043-1066), and the fact that the engine's internal parse passes `None` as its old tree
+//! with no way for a caller to supply one (lines 531-541).
+//!
+//! ## Why there is no incremental reparse here
+//!
+//! There is a real, measured ~55% win available from incremental reparsing, and it is
+//! nevertheless deliberately not taken. Both halves of that are worth recording, because the
+//! numbers say "obviously do it" and the API says "you cannot".
+//!
+//! Measured on this repository's own largest file at the time (`root/code_surface.rs`, 5931
+//! lines, since split into `crate::code_surface`'s several files), release
+//! build, median of five runs on an idle machine: one full `highlight_rust` call costs ~31.4ms, of
+//! which the bare `tree_sitter::Parser::parse` is ~16.6ms (53%) and the query walk is the rest.
+//! Reparsing the same file after a real one-character edit, via `Tree::edit` +
+//! `parse(.., Some(&old_tree))`, costs **0.21ms** - a ~79x reduction, verified in the same run to
+//! produce a tree identical (compared as s-expressions) to a fresh parse of the edited text.
+//!
+//! For scale, the same call under the replaced hand-rolled walker cost ~21.5ms: the real query
+//! walk is genuinely more work than the old node-kind table lookup, and buys the accuracy gains
+//! this migration is for.
+//!
+//! It cannot be reached from here. `tree_sitter_highlight::Highlighter::highlight` owns its parse
+//! entirely and hard-codes `None` as the old-tree argument
+//! (`tree-sitter-highlight-0.26.9/src/highlight.rs:531-541`); there is no parameter, no builder
+//! and no callback to supply a previous tree, and the crate's newest release at time of writing
+//! (0.26.11) is identical in that respect - so this is an API limitation, not a version to
+//! upgrade past. The only way to have both would be to stop using the official highlight iterator
+//! and drive `config.query` by hand against a self-parsed tree, which would mean reimplementing
+//! its capture-precedence rules *and* its `#match?` predicate evaluation - and every one of these
+//! three grammars leans on `#match?` for its "identifier starting with a capital letter" rules.
+//! That is precisely the bespoke engine this module exists to have deleted, so it is not done.
+//!
+//! What makes that an acceptable trade rather than a swallowed regression is where the cost lands
+//! - which differs by caller, so it is worth being precise rather than sweeping:
+//!
+//! - **The File view's live re-highlight**, the one path that runs repeatedly while typing, is
+//!   already off the foreground thread: `crate::code_surface::editing::AdeApp::schedule_rehighlight` runs
+//!   it on the background executor 150ms after the last keystroke, and the view keeps rendering
+//!   the previous highlighting until it lands. Not having incremental reparse costs that path a
+//!   background thread for ~31ms instead of ~15ms on the largest file here; it is not frame time.
+//! - **[`highlight_block`]'s Diff and Merge callers** (`crate::code_surface`'s
+//!   `ensure_diff_highlight_cache`, `crate::merge::render`'s
+//!   `ensure_merge_highlight_cache`) do run synchronously on the main thread, by their own
+//!   deliberate design - but they are called only when the content actually changes, never per
+//!   frame, and each caps the work at a real per-file line budget rather than highlighting a whole
+//!   file. Incremental reparse would not have helped them regardless: each hunk is highlighted as
+//!   its own isolated source unit, so there is no previous tree of the *same* text to reuse.
+
+use std::sync::OnceLock;
+
+use tree_sitter_highlight::{Highlight, HighlightConfiguration, HighlightEvent, Highlighter};
+
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use gpui::{Rgba, SharedString};
+
+use crate::sidebar::changes;
+use crate::theme;
+use wt_core::diff::{DiffFile, DiffLineKind};
+
+/// Cap on how many bytes of a file [`load_file`] will actually read and highlight, matching
+/// `wt_core::diff`'s `MAX_DIFF_OUTPUT_BYTES` (`crates/wt-core/src/diff.rs:87`) so both caps stay
+/// consistent rather than picking a second, arbitrary number.
+pub const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Which of Surface C's two views is showing - `design_handoff_jerry_ade/README.md`'s
+/// `code_view` state field (`Diff | File`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodeView {
+    #[default]
+    Diff,
+    File,
+}
+
+/// A file's detected line-ending style, read directly from its bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+impl LineEnding {
+    pub fn label(self) -> &'static str {
+        match self {
+            LineEnding::Lf => "LF",
+            LineEnding::Crlf => "CRLF",
+        }
+    }
+}
+
+/// Detects `bytes`' line-ending style from the byte immediately before its first `\n` - `Crlf`
+/// if that byte is `\r`, `Lf` otherwise (including a file with no newline at all).
+pub fn detect_line_ending(bytes: &[u8]) -> LineEnding {
+    if let Some(newline_index) = bytes.iter().position(|&byte| byte == b'\n') {
+        if newline_index > 0 && bytes[newline_index - 1] == b'\r' {
+            return LineEnding::Crlf;
+        }
+    }
+    LineEnding::Lf
+}
+
+/// How many of [`ParsedFile::lines`]' leading lines [`detect_indent_width`] scans before giving
+/// up - bounded the same way `wt_core::diff::MAX_HUNK_LINES_PER_FILE`-style caps are, so a huge
+/// file with no early space-indented line doesn't make this walk the whole thing.
+const INDENT_DETECTION_LINE_SCAN_CAP: usize = 200;
+
+/// A simple, honest heuristic for the file's real indent width, for the status bar's `N spaces`
+/// item: scans up to [`INDENT_DETECTION_LINE_SCAN_CAP`] lines, tallies the leading-space count of
+/// every line that starts with one or more spaces followed by real (non-whitespace-only)
+/// content, and returns the *modal* (most common) count among them - not just the first one
+/// found. Tab-indented lines are skipped entirely (a tab-indented file has no single "N spaces"
+/// answer to report); a whitespace-only line is skipped too (it says nothing about the file's
+/// real indent unit). Ties are broken by the smaller width, since a real single-width indent unit
+/// is the more common convention than an arbitrary larger one.
+///
+/// Taking the modal count rather than the first match matters for two real, unremarkable file
+/// shapes: a C-style block-comment header (` * Copyright ...`, a single leading space) and a
+/// one-off hanging-indent continuation line, either of which would otherwise get naively picked
+/// as "the" indent width just for appearing before any of the file's real, repeated body indent.
+///
+/// `None` if no space-indented line is found within the scanned window - an honestly-omitted
+/// value, not a fabricated default like `4`.
+pub fn detect_indent_width(lines: &[RenderedLine]) -> Option<usize> {
+    let mut counts: HashMap<usize, usize> = HashMap::new();
+    for line in lines.iter().take(INDENT_DETECTION_LINE_SCAN_CAP) {
+        let text = line.text.as_str();
+        if text.starts_with('\t') {
+            continue;
+        }
+        let leading_spaces = text.chars().take_while(|&ch| ch == ' ').count();
+        if leading_spaces > 0 && leading_spaces < text.len() {
+            *counts.entry(leading_spaces).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by(|(width_a, count_a), (width_b, count_b)| {
+            count_a.cmp(count_b).then(width_b.cmp(width_a))
+        })
+        .map(|(width, _)| width)
+}
+
+/// The status bar's language label, derived from `path`'s extension - reads
+/// `crate::language::display_name_for_extension`, the one canonical registry every
+/// extension-keyed lookup in this crate now shares (case-insensitive; `"Plain Text"` for
+/// anything not in it).
+pub fn language_name_for_extension(extension: Option<&str>) -> &'static str {
+    crate::language::display_name_for_extension(extension)
+}
+
+/// The real highlighter function `extension` should be parsed with, read straight off
+/// `crate::language`'s canonical registry - the single real source of truth
+/// `crate::language::ExtensionEntry::highlighter`'s own docs describe (Revision R8's
+/// consolidation of what used to be a second, independent extension -> highlighter `match`
+/// statement `load_file` maintained on its own, invisible to that registry). `None` for an
+/// extension absent from the registry, or present with no real grammar wired
+/// ([`crate::language::ExtensionEntry::highlighter`] itself `None` - TOML/Markdown/SQL/Vue/Go).
+pub fn highlighter_for_extension(
+    extension: Option<&str>,
+) -> Option<crate::language::HighlighterFn> {
+    crate::language::entry_for_extension(extension)?.highlighter
+}
+
+/// A syntax span's classification - `design_handoff_jerry_ade/README.md`'s File view
+/// syntax-colour table ("keyword ... function ... type ... literal/self ... comment ...
+/// punctuation/text").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HighlightKind {
+    Keyword,
+    Function,
+    Type,
+    Literal,
+    Comment,
+    Text,
+}
+
+/// Maps a [`HighlightKind`] to its real `theme::syntax::*` colour, per
+/// `design_handoff_jerry_ade/README.md`'s File view table.
+pub fn color_for_kind(kind: HighlightKind) -> Rgba {
+    match kind {
+        HighlightKind::Keyword => theme::syntax::KEYWORD.into(),
+        HighlightKind::Function => theme::syntax::FUNCTION.into(),
+        HighlightKind::Type => theme::syntax::TYPE.into(),
+        HighlightKind::Literal => theme::syntax::LITERAL.into(),
+        HighlightKind::Comment => theme::syntax::COMMENT.into(),
+        HighlightKind::Text => theme::syntax::TEXT.into(),
+    }
+}
+
+/// One classified leaf token from a `tree-sitter` parse - byte offsets into the whole-file
+/// source [`highlight_rust`] parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HighlightSpan {
+    pub start: usize,
+    pub end: usize,
+    pub kind: HighlightKind,
+}
+/// Which real grammar a piece of source is parsed and queried with. `TypeScript` and `Tsx` are
+/// two genuinely different grammars in `tree-sitter-typescript` (not one grammar with a flag), and
+/// they need two different composed query strings - see [`highlight_query_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grammar {
+    Rust,
+    TypeScript,
+    Tsx,
+    Python,
+}
+
+impl Grammar {
+    /// Every real grammar, in [`Grammar::index`] order - the single list both
+    /// [`HIGHLIGHT_CONFIGS`]' slot count and this module's own coverage tests are derived from, so
+    /// adding a grammar cannot leave either behind.
+    const ALL: [Grammar; 4] = [
+        Grammar::Rust,
+        Grammar::TypeScript,
+        Grammar::Tsx,
+        Grammar::Python,
+    ];
+
+    const COUNT: usize = Self::ALL.len();
+
+    /// This grammar's slot in [`HIGHLIGHT_CONFIGS`]. Kept in step with [`Grammar::ALL`] by
+    /// `grammar_indices_match_their_position_in_all`, which is what makes indexing that array
+    /// without a bounds concern honest rather than assumed.
+    const fn index(self) -> usize {
+        match self {
+            Grammar::Rust => 0,
+            Grammar::TypeScript => 1,
+            Grammar::Tsx => 2,
+            Grammar::Python => 3,
+        }
+    }
+
+    fn language(self) -> tree_sitter::Language {
+        match self {
+            Grammar::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Grammar::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Grammar::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Grammar::Python => tree_sitter_python::LANGUAGE.into(),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Grammar::Rust => "rust",
+            Grammar::TypeScript => "typescript",
+            Grammar::Tsx => "tsx",
+            Grammar::Python => "python",
+        }
+    }
+}
+
+/// The ordered "recognized highlight names" list every [`HighlightConfiguration`] below is
+/// [`HighlightConfiguration::configure`]d with. `tree-sitter-highlight` resolves each of a query's
+/// own capture names against this list and hands back a [`tree_sitter_highlight::Highlight`]
+/// holding **an index into this exact slice**, so [`HIGHLIGHT_KINDS`] below is a positional
+/// parallel array: entry `i` here is classified as entry `i` there. The two are length-checked
+/// against each other at compile time (see [`HIGHLIGHT_KINDS`]) so they can never silently drift.
+///
+/// ## Why these names, and why so few
+///
+/// The real matching rule is not a prefix match, and this is the single most important thing to
+/// understand before editing this list. `HighlightConfiguration::configure`
+/// (`tree-sitter-highlight-0.26.9/src/highlight.rs:458-484`, read directly) splits both the
+/// query's capture name and each recognized name on `.`, and a recognized name matches when
+/// **every one of its own dot-parts is present among the capture's dot-parts**; among all
+/// matches, the one with the *most* parts wins, ties going to the earliest entry here. So the
+/// single entry `"function"` already claims the real captures `function`, `function.method`,
+/// `function.builtin` and `function.macro` that the three grammars' own bundled queries actually
+/// emit - there is no need to enumerate them, and enumerating them would not change the outcome.
+///
+/// Deliberately absent (each falls through to no match at all, i.e. [`HighlightKind::Text`]):
+/// `operator`, `punctuation.bracket`, `punctuation.delimiter`, `punctuation.special`, `property`,
+/// `attribute`, `label`, `embedded`, `variable`, `variable.parameter`. That is not an oversight -
+/// `design_handoff_jerry_ade/README.md`'s File view colour table has exactly six buckets and puts
+/// punctuation and plain identifiers in the `Text` one, so a capture with no bucket of its own
+/// must resolve to `Text` rather than being forced into a bucket it doesn't belong in.
+const HIGHLIGHT_NAMES: &[&str] = &[
+    "keyword",
+    "function",
+    "type",
+    "constructor",
+    "tag",
+    "string",
+    "escape",
+    "number",
+    "constant",
+    "variable.builtin",
+    "comment",
+];
+
+/// [`HIGHLIGHT_NAMES`]' positional parallel array: which of this app's six real buckets each
+/// recognized highlight name renders as. See [`HIGHLIGHT_NAMES`] for the indexing contract.
+///
+/// The non-obvious mappings, each a real judgement call rather than a mechanical rename:
+///
+/// - **`constructor` -> `Type`.** All three grammars use `@constructor` for their own
+///   "identifier that starts with a capital letter" heuristic (`tree-sitter-rust`'s own comment
+///   calls these "enum constructors ... either that, or struct names"). Those name a *type* or one
+///   of its variants, so `Type` is where they belong. Note this is *not* what makes Python's
+///   `class Foo:` come out right - `@constructor`'s `^[A-Z]` guard makes it unreliable for exactly
+///   that, which is [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]'s fourth rule's whole reason for existing.
+/// - **`tag` -> `Type`.** `tree-sitter-javascript`'s JSX query captures a *lowercase* JSX element
+///   name (`<div>`) as `@tag`, while an uppercase one (`<Foo>`) is already `@constructor`/`@type`.
+///   Sending both to `Type` is what makes the two read as the same kind of thing on screen, which
+///   is what they are.
+/// - **`variable.builtin` -> `Literal`.** This is the bucket the design table itself names
+///   "literal/self". Rust's `self` reached it in the replaced implementation through a dedicated
+///   `literal_kinds` entry, and Python's `self` through an even more special-cased
+///   leaf-*text* comparison; `tree-sitter-rust`'s own query emits `(self) @variable.builtin`
+///   directly, so Rust now gets it from the real grammar rather than from a local table.
+///   TypeScript's `this`/`super` move here too, which is a real, deliberate *change*: the
+///   replaced code classified them `Keyword` and its own comment recorded that as arbitrary
+///   ("purely for simplicity - no test or real-world distinction depends on which bucket they
+///   land in"). They now match Rust's and Python's `self`, which is the consistency the design
+///   table's own "literal/self" label asks for.
+/// - **`escape` -> `Literal`.** An escape sequence is captured *inside* an already-captured
+///   string, so it must land in the same bucket as the string or every `\n` in the file would
+///   punch a `Text`-coloured hole through a `Literal`-coloured string.
+/// - **`number`/`constant`/`constant.builtin` -> `Literal`.** Rust routes integer/float/boolean
+///   literals through `@constant.builtin` where Python and JavaScript use `@number`; both are the
+///   same bucket here, so the three languages stay consistent regardless of which capture name
+///   their own grammar happens to prefer.
+const HIGHLIGHT_KINDS: [HighlightKind; HIGHLIGHT_NAMES.len()] = [
+    HighlightKind::Keyword,
+    HighlightKind::Function,
+    HighlightKind::Type,
+    HighlightKind::Type,
+    HighlightKind::Type,
+    HighlightKind::Literal,
+    HighlightKind::Literal,
+    HighlightKind::Literal,
+    HighlightKind::Literal,
+    HighlightKind::Literal,
+    HighlightKind::Comment,
+];
+
+/// Real supplement appended after `tree-sitter-python`'s own bundled `queries/highlights.scm`,
+/// covering two genuine gaps that would otherwise be visible *regressions* against the hand-rolled
+/// implementation this module replaced. Appending (rather than prepending) is what makes these
+/// win: for two patterns capturing the same node, `tree-sitter-highlight` keeps iterating and
+/// takes the **last** one ("keep iterating over any later highlighting patterns that also match
+/// this node and set the match to it", `tree-sitter-highlight-0.26.9/src/highlight.rs:1043-1066`,
+/// read directly - not assumed).
+///
+/// 1. **Python's word operators.** `tree-sitter-python`'s bundled query puts `and`/`or`/`not`/
+///    `in`/`is` (and the two-word `not in`/`is not`) in its big `@operator` list, alongside `+`,
+///    `==` and friends. This app has no operator bucket - `@operator` is deliberately unrecognized
+///    and resolves to `Text` - so without this they would render as plain text, while the replaced
+///    `PYTHON_KEYWORDS` table listed all five as real keywords. Promoting only the *word*
+///    operators (never the symbolic ones, which really are punctuation by this app's colour table)
+///    keeps Python's keyword colouring exactly as complete as it was.
+/// 2. **`self`/`cls`.** `tree-sitter-python`'s bundled query has no rule for either; both arrive
+///    as a plain `(identifier) @variable`, indistinguishable from any other name. The replaced
+///    implementation carried a whole `Lexicon::literal_identifier_texts` field, and a long comment
+///    justifying it, for the single purpose of giving Python's `self` the same treatment Rust's
+///    gets. `@variable.builtin` is the real capture name Rust's own bundled query uses for exactly
+///    this, so matching it here keeps the two languages consistent through the standard
+///    vocabulary instead of a bespoke side table. `cls` is included because it plays the identical
+///    role in a `@classmethod`, and the replaced code's omission of it was an accident of only
+///    ever having been written with `self` in mind.
+/// 3. **Compound type annotations.** `tree-sitter-python`'s bundled rule is
+///    `(type (identifier) @type)` - it only fires when the annotation is a bare identifier that is
+///    a *direct* child of the `type` node. A real annotation usually is not: `dict[str, int]`
+///    parses as `(type (generic_type ...))`, `str | None` as `(type (binary_operator ...))`, and
+///    `pathlib.Path` as `(type (attribute ...))` (all three shapes read off real parses, not
+///    assumed). Every one of those rendered as plain text, where the replaced implementation
+///    classified the whole `type` node as `Type` - a real, measured regression across ~620 bytes
+///    of the Python files checked. Capturing `(type)` itself restores exactly the replaced
+///    behaviour. Note this does *not* drag literals inside an annotation along with it: a `None`
+///    return type is an inner `(none) @constant.builtin` node, and nesting means the inner capture
+///    still wins, so `None` renders as `Literal`. That is a deliberate improvement rather than a
+///    leftover - the replaced code rendered `None` as `Type` inside an annotation but `Literal`
+///    everywhere else in the same file, and it is now consistently `Literal` in both places.
+/// 4. **Class names.** `tree-sitter-python` has no `class_definition name:` rule; a class name
+///    reaches a bucket only via the query's two casing heuristics, and *neither is reliable*.
+///    `@constructor` requires `^[A-Z]`, so `class _Pickler:` and `class socket:` - a leading
+///    underscore and a lowercase name, both pervasive real Python - matched nothing and rendered
+///    as plain text. Worse, the `@constant` rule (`^[A-Z][A-Z_]*$`) fires *later* than
+///    `@constructor` and therefore wins, so an all-caps class like `class FTP:` came out
+///    `Literal`. The replaced implementation classified all four shapes `Type` via a dedicated
+///    table field. Capturing the name node directly restores that unconditionally, independent of
+///    casing. (Found by an adversarial re-audit against the CPython standard library after an
+///    earlier corpus, which happened to contain only conventionally-capitalised class names,
+///    showed nothing.)
+/// 5. **Method calls, and `cls(...)`.** Two ordering casualties, both fixed by these rules coming
+///    last. `tree-sitter-python` captures `(call function: (attribute attribute: (identifier)
+///    @function.method))` *before* its blanket `(attribute attribute: (identifier) @property)`,
+///    and last-pattern-wins means `@property` - which this app does not recognise - takes the
+///    node, so `obj.method()` rendered as plain text while Rust and TypeScript both coloured the
+///    equivalent call. Restating the method-call rule last genuinely closes that gap rather than
+///    just claiming to. Separately, rule 2's `self`/`cls` match is itself a later pattern than the
+///    bundled `(call function: (identifier) @function)`, so it had captured the *callee* of a real
+///    `cls(...)` construction and turned it from `Function` into `Literal`; restating the plain
+///    call rule after it puts that back.
+const PYTHON_HIGHLIGHTS_SUPPLEMENT: &str = r#"
+[
+  "and"
+  "or"
+  "not"
+  "in"
+  "is"
+  "not in"
+  "is not"
+] @keyword
+
+(type) @type
+
+(class_definition name: (identifier) @type)
+
+((identifier) @variable.builtin
+ (#match? @variable.builtin "^(self|cls)$"))
+
+(call function: (identifier) @function)
+(call function: (attribute attribute: (identifier) @function.method))
+"#;
+
+/// Real supplement appended after the composed JavaScript + TypeScript query (see
+/// [`highlight_query_for`]), repairing two regressions that a live old-vs-new diff over real
+/// TypeScript caught. Both come from the same root cause: `tree-sitter-typescript`'s own
+/// `((identifier) @type (#match? @type "^[A-Z]"))` heuristic and `tree-sitter-javascript`'s
+/// keyword list are each individually reasonable, but the concatenation order that makes
+/// TypeScript's type rules win over JavaScript's blanket `(identifier) @variable` also lets them
+/// win over two JavaScript rules that were actually right.
+///
+/// 1. **A capitalised function declaration, and a capitalised call.** `function Badge(...)` is a
+///    real function and `String(value)` is a real call, and JavaScript's query says so for both -
+///    but TypeScript's capital-letter heuristic runs later and reclassifies the name as a type.
+///    Restating the declaration and call rules last puts them back. This is a pure restoration:
+///    the replaced implementation classified both as `Function` too. Note this deliberately does
+///    *not* disturb the far more common capitalised identifier that is **not** being declared or
+///    called (`const x: SchemaObject`, `new Widget()` - a `new_expression`, not a
+///    `call_expression`), which keeps the real, large `Type` gain this migration brings.
+/// 2. **`void`.** In `(): void`, `void` is a `predefined_type`, which TypeScript's query captures
+///    as `@type.builtin`. But `void` is *also* a real JavaScript operator keyword, and the
+///    anonymous `"void"` token that JavaScript's `@keyword` list matches is a **child node** of
+///    that `predefined_type`. Nesting, not pattern order, decides that case - the inner node's
+///    highlight wins over the enclosing one - so no amount of reordering whole-node patterns fixes
+///    it; the inner token has to be captured directly. Without this, `void` was the only one of
+///    TypeScript's seven `predefined_type` keywords (`number`/`string`/`boolean`/`void`/`any`/
+///    `unknown`/`never`) not rendering as a type, which is an inconsistency a reader would notice.
+const TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT: &str = r#"
+(function_declaration name: (identifier) @function)
+(function_signature name: (identifier) @function)
+(call_expression function: (identifier) @function)
+(predefined_type "void" @type.builtin)
+"#;
+
+/// The real, composed highlights query source for `grammar`, built from the grammar crates' own
+/// published `queries/*.scm` files (exposed by each crate as a `&'static str` constant, so nothing
+/// here reads from disk or vendors a copy of a query file).
+///
+/// Rust and Python are one file each. **TypeScript and TSX are not**, and this is the single
+/// least obvious fact in this module: `tree-sitter-typescript`'s own `HIGHLIGHTS_QUERY` is a
+/// 35-line *supplement*, not a whole highlighting query - it defines types, type-argument
+/// brackets, parameters and the TypeScript-only keywords, and nothing else. It contains no rule
+/// for strings, comments, numbers, function calls or any of the JavaScript keywords, because
+/// upstream expects it to be concatenated onto `tree-sitter-javascript`'s query the way the
+/// `tree-sitter` CLI's own language inheritance does. Using it alone would compile and run
+/// perfectly happily while silently rendering every TypeScript comment, string and function call
+/// as plain text - which is exactly why `tree-sitter-javascript` is a real dependency of this
+/// crate despite this app never opening a `.js` file with a JavaScript-only grammar.
+///
+/// Order matters and is deliberate, per the "last matching pattern wins" rule cited on
+/// [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]: JavaScript's base rules go first so that TypeScript's own
+/// `(type_identifier) @type` and its capitalised-identifier rule can override JavaScript's
+/// blanket `(identifier) @variable` for the same node. The JSX query sits between them, and only
+/// for [`Grammar::Tsx`] - it references `jsx_opening_element` and friends, which genuinely do not
+/// exist in the plain TypeScript grammar, so including it there would fail query compilation
+/// outright rather than degrade quietly.
+fn highlight_query_for(grammar: Grammar) -> String {
+    match grammar {
+        Grammar::Rust => tree_sitter_rust::HIGHLIGHTS_QUERY.to_string(),
+        Grammar::Python => {
+            format!(
+                "{}\n{PYTHON_HIGHLIGHTS_SUPPLEMENT}",
+                tree_sitter_python::HIGHLIGHTS_QUERY
+            )
+        }
+        Grammar::TypeScript => format!(
+            "{}\n{}\n{TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT}",
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_typescript::HIGHLIGHTS_QUERY
+        ),
+        Grammar::Tsx => format!(
+            "{}\n{}\n{}\n{TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT}",
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
+            tree_sitter_typescript::HIGHLIGHTS_QUERY
+        ),
+    }
+}
+
+/// Builds `grammar`'s real [`HighlightConfiguration`], already
+/// [`HighlightConfiguration::configure`]d against [`HIGHLIGHT_NAMES`].
+///
+/// Both the injection and the locals query are deliberately empty, and both omissions are real
+/// decisions rather than gaps left to fill in later:
+///
+/// - **Injections.** None of this app's four grammars need one. TSX parses JSX as part of its own
+///   single grammar rather than as an injected language, and the only injections the Rust and
+///   Python query files describe are things like SQL-in-a-string-literal, which this app has no
+///   second grammar to inject *into* anyway. Passing the injection query without a real
+///   `injection_callback` able to supply those grammars would add machinery that could never fire.
+/// - **Locals.** `tree-sitter-typescript` ships a `locals.scm`, and feeding it would switch on
+///   `tree-sitter-highlight`'s local-variable tracking, which exists to let a query colour a
+///   variable *reference* like its *definition*. This app's six buckets do not distinguish
+///   variables at all - every plain identifier is `Text` - so that machinery has nothing to
+///   express here, and enabling it would only add per-parse scope-tracking cost for an outcome
+///   that cannot differ.
+fn build_highlight_config(
+    grammar: Grammar,
+) -> Result<HighlightConfiguration, tree_sitter::QueryError> {
+    let mut config = HighlightConfiguration::new(
+        grammar.language(),
+        grammar.name(),
+        &highlight_query_for(grammar),
+        "",
+        "",
+    )?;
+    config.configure(HIGHLIGHT_NAMES);
+    Ok(config)
+}
+
+/// Process-wide cache of the real [`HighlightConfiguration`]s - **one independent slot per
+/// grammar**, each built at most once, and only if that grammar is ever actually asked for.
+///
+/// Caching at all is not a micro-optimisation: building one configuration means compiling a
+/// several-hundred-pattern `tree_sitter::Query` from source text, which costs far more than
+/// parsing a whole file (tens of milliseconds each, measured) and would otherwise be paid again on
+/// every keystroke's debounced re-highlight.
+///
+/// Caching them *separately* is the part that was gotten wrong first and is worth recording. A
+/// single `OnceLock<HashMap<..>>` populated in one pass reads naturally and is what this started
+/// as - but it makes the first request for *any* grammar compile *all four*. That cost is not
+/// hypothetical and it does not always land on a background thread: `CodeView::Diff` is the
+/// default view, and `crate::code_surface`'s `ensure_diff_highlight_cache` calls into here
+/// synchronously on the main thread, so opening the first `.rs` diff of a session paid the
+/// TypeScript, TSX *and* Python query-compile cost for grammars that diff would never use. Per-
+/// grammar slots mean a `.rs` file pays for Rust only.
+///
+/// A `HighlightConfiguration` is immutable once configured, so a shared `&'static` reference is
+/// all any caller needs; the per-call mutable state lives in [`tree_sitter_highlight::Highlighter`],
+/// which is cheap to construct and is created fresh per call.
+static HIGHLIGHT_CONFIGS: [OnceLock<Option<HighlightConfiguration>>; Grammar::COUNT] =
+    [const { OnceLock::new() }; Grammar::COUNT];
+
+/// `grammar`'s real, shared [`HighlightConfiguration`], compiling it on first use, or `None` if
+/// its query failed to compile.
+///
+/// A compile failure here is not expected and is not silently tolerated as an acceptable state:
+/// the query sources are compile-time constants, so a failure is fully deterministic and is caught
+/// by this module's own `every_real_grammar_config_compiles` test. `None` exists so that a
+/// hypothetical failure degrades to honest uncoloured text at runtime instead of panicking a
+/// running editor, and it is logged at `error` level rather than passing quietly. It is also
+/// cached like any other outcome, so a failing grammar is not re-compiled on every keystroke.
+fn highlight_config(grammar: Grammar) -> Option<&'static HighlightConfiguration> {
+    HIGHLIGHT_CONFIGS[grammar.index()]
+        .get_or_init(|| match build_highlight_config(grammar) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                log::error!(
+                    "syntax highlighting disabled for {}: its highlights query failed to \
+                     compile: {error}",
+                    grammar.name()
+                );
+                None
+            }
+        })
+        .as_ref()
+}
+
+/// Parses `source` with `tree-sitter-rust` and classifies it through the real, official
+/// `tree-sitter-highlight` engine driving `tree-sitter-rust`'s own bundled
+/// `queries/highlights.scm` - see [`highlight_with`]. Returns an empty `Vec` (rather than
+/// panicking) if the grammar's query failed to compile or the parse produced no tree, neither
+/// expected in practice.
+pub fn highlight_rust(source: &str) -> Vec<HighlightSpan> {
+    highlight_with(source, Grammar::Rust)
+}
+
+/// Parses `source` with `tree-sitter-typescript` and classifies it the same way [`highlight_rust`]
+/// does. `is_tsx` selects the real TSX grammar variant (used for `.tsx`/`.jsx` - TSX's grammar is
+/// a superset that also parses plain JSX-free TypeScript/JavaScript correctly, and there is no
+/// separate JSX-only grammar in `tree-sitter-typescript`) over the plain TypeScript one (used for
+/// `.ts`/`.js` - TypeScript's grammar is itself a real syntactic superset of JavaScript, so `.js`
+/// deliberately reuses it rather than adding a third grammar dependency for plain JavaScript).
+///
+/// Note that `tree-sitter-javascript` *is* nonetheless a real dependency of this crate - for its
+/// query file, not its grammar. See [`highlight_query_for`] for why.
+pub fn highlight_typescript(source: &str, is_tsx: bool) -> Vec<HighlightSpan> {
+    highlight_with(
+        source,
+        if is_tsx {
+            Grammar::Tsx
+        } else {
+            Grammar::TypeScript
+        },
+    )
+}
+
+/// A real `fn(&str) -> Vec<HighlightSpan>` wrapper over [`highlight_typescript`] with `is_tsx:
+/// false` bound in - `crate::language::HighlighterFn`'s shape has no room for a second `bool`
+/// argument, and this is the plain `.ts`/`.js` half of [`highlight_typescript`]'s two real grammar
+/// variants (see [`crate::language::EXTENSIONS`]'s `ts`/`js` entries, which wire this in as their
+/// real [`crate::language::ExtensionEntry::highlighter`]).
+pub fn highlight_ts(source: &str) -> Vec<HighlightSpan> {
+    highlight_typescript(source, false)
+}
+
+/// The TSX/JSX half of [`highlight_typescript`] - see [`highlight_ts`]'s own docs.
+pub fn highlight_tsx(source: &str) -> Vec<HighlightSpan> {
+    highlight_typescript(source, true)
+}
+
+/// Parses `source` with `tree-sitter-python` and classifies it the same way [`highlight_rust`]
+/// does - plus [`PYTHON_HIGHLIGHTS_SUPPLEMENT`], see there.
+pub fn highlight_python(source: &str) -> Vec<HighlightSpan> {
+    highlight_with(source, Grammar::Python)
+}
+
+/// The one real highlighting path every language wrapper above funnels into: run the official
+/// [`tree_sitter_highlight::Highlighter`] over `source` with `grammar`'s real
+/// [`HighlightConfiguration`], and fold the [`HighlightEvent`] stream it emits down into this
+/// app's six [`HighlightKind`] buckets.
+///
+/// The event stream is a flat, in-order sequence of `HighlightStart`/`Source`/`HighlightEnd`, and
+/// `HighlightStart`s **nest** - a Rust `\n` escape inside a string literal arrives as a real
+/// `escape` highlight opened while the enclosing `string` one is still open. The innermost open
+/// highlight is therefore the one that wins, which is what the stack below tracks; the engine has
+/// already split the `Source` events at every boundary, so each one falls entirely under exactly
+/// one innermost highlight and no span produced here can ever overlap another.
+///
+/// Every byte of `source` is covered, including whitespace between tokens (as explicit
+/// [`HighlightKind::Text`]). That is a real difference from the hand-rolled walker this replaced,
+/// which emitted spans only for leaf nodes and left the gaps to [`build_lines`]; the rendered
+/// result is identical either way, since `build_lines` fills any gap with exactly that same
+/// `Text`, but it means the span list here is gapless by construction rather than by downstream
+/// repair.
+///
+/// Errors are not expected to be reachable: `Error::Cancelled` requires the cancellation flag this
+/// passes `None` for, and `Error::InvalidLanguage` requires a language the config was not built
+/// with. If one does occur mid-stream, the spans accumulated so far are returned rather than
+/// discarded - partial real highlighting of a file's earlier lines is strictly better for the
+/// reader than dropping the whole file back to plain text, and matches the same best-effort
+/// posture [`highlight_block`] already documents for partial input.
+fn highlight_with(source: &str, grammar: Grammar) -> Vec<HighlightSpan> {
+    let Some(config) = highlight_config(grammar) else {
+        return Vec::new();
+    };
+    let mut highlighter = Highlighter::new();
+    let Ok(events) = highlighter.highlight(config, source.as_bytes(), None, |_| None) else {
+        return Vec::new();
+    };
+
+    let mut spans: Vec<HighlightSpan> = Vec::new();
+    let mut open: Vec<HighlightKind> = Vec::new();
+    for event in events {
+        let Ok(event) = event else {
+            break;
+        };
+        match event {
+            HighlightEvent::HighlightStart(Highlight(index)) => {
+                // `index` is an index into `HIGHLIGHT_NAMES`, which `HIGHLIGHT_KINDS` is a
+                // compile-time-length-checked parallel array of - so this cannot be out of range.
+                open.push(HIGHLIGHT_KINDS[index]);
+            }
+            HighlightEvent::HighlightEnd => {
+                open.pop();
+            }
+            HighlightEvent::Source { start, end } => {
+                if start >= end {
+                    continue;
+                }
+                let kind = open.last().copied().unwrap_or(HighlightKind::Text);
+                // Coalesce with the previous span when it is both adjacent and the same bucket.
+                // Real, not cosmetic: the engine splits `Source` at every highlight boundary, so a
+                // string containing escapes arrives as several separate `Literal` runs that render
+                // identically to one. Merging here keeps `build_lines`' per-line run lists (and
+                // the `SharedString` allocation each run costs at render time) proportional to
+                // what is actually visually distinct.
+                match spans.last_mut() {
+                    Some(previous) if previous.end == start && previous.kind == kind => {
+                        previous.end = end;
+                    }
+                    _ => spans.push(HighlightSpan { start, end, kind }),
+                }
+            }
+        }
+    }
+    spans
+}
+
+/// One already-highlighted display line: its text (never including line-ending bytes) plus a
+/// gapless run list covering every byte of it (unhighlighted stretches are explicit
+/// [`HighlightKind::Text`] runs) - computed once by [`build_lines`] and cached in [`ParsedFile`],
+/// never recomputed per render.
+///
+/// Each run's text is a pre-allocated [`SharedString`], not a byte [`Range`] re-sliced on every
+/// render - `Arc`-backed, so cloning it at render time is cheap, avoiding a per-frame allocation
+/// per run per visible row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderedLine {
+    pub text: String,
+    pub runs: Vec<(SharedString, HighlightKind)>,
+}
+
+/// Splits `source`'s line boundaries (LF or CRLF alike - the trailing `\r`, if any, is excluded)
+/// into byte ranges, then clips `spans` against each one to build a gapless [`RenderedLine`]
+/// list. A trailing range past the last `\n` is always included (a file with no trailing
+/// newline), and an empty `source` still yields one empty line, matching how an editor shows an
+/// empty file.
+pub(crate) fn build_lines(source: &str, spans: &[HighlightSpan]) -> Vec<RenderedLine> {
+    let line_ranges = line_ranges(source);
+
+    let mut sorted_spans = spans.to_vec();
+    sorted_spans.sort_by_key(|span| span.start);
+
+    let mut lines = Vec::with_capacity(line_ranges.len());
+    let mut span_index = 0usize;
+
+    for range in &line_ranges {
+        while span_index < sorted_spans.len() && sorted_spans[span_index].end <= range.start {
+            span_index += 1;
+        }
+
+        let mut runs: Vec<(Range<usize>, HighlightKind)> = Vec::new();
+        let mut cursor = range.start;
+        let mut index = span_index;
+        while index < sorted_spans.len() && sorted_spans[index].start < range.end {
+            let span = sorted_spans[index];
+            let clipped_start = span.start.max(range.start);
+            let clipped_end = span.end.min(range.end);
+            if clipped_start > cursor {
+                runs.push((
+                    cursor - range.start..clipped_start - range.start,
+                    HighlightKind::Text,
+                ));
+            }
+            if clipped_end > clipped_start {
+                runs.push((
+                    clipped_start - range.start..clipped_end - range.start,
+                    span.kind,
+                ));
+                cursor = clipped_end;
+            }
+            index += 1;
+        }
+        if cursor < range.end {
+            runs.push((
+                cursor - range.start..range.end - range.start,
+                HighlightKind::Text,
+            ));
+        }
+
+        let line_text = source[range.clone()].to_string();
+        // Sliced from `line_text` (relative to the line's own start) once here, not re-sliced by
+        // `crate::code_surface::file_view::render_file_view_line` on every render - see `RenderedLine`'s docs.
+        let owned_runs = runs
+            .into_iter()
+            .map(|(relative_range, kind)| (SharedString::new(&line_text[relative_range]), kind))
+            .collect();
+
+        lines.push(RenderedLine {
+            text: line_text,
+            runs: owned_runs,
+        });
+    }
+
+    lines
+}
+
+/// Real line-boundary byte ranges within `source`, excluding line-ending bytes (`\n`, and a
+/// preceding `\r` for a CRLF line) - the same ranges [`build_lines`] slices `RenderedLine::text`
+/// from. `pub(crate)` (not private) so `crate::code_surface::edit_buffer::EditBuffer` can derive its own
+/// byte-offset<->line/column mapping from exactly this function rather than a second,
+/// independently-maintained line-splitting implementation that could silently disagree with what
+/// [`build_lines`] actually displays (a real CRLF off-by-one bug class this sharing avoids).
+pub(crate) fn line_ranges(source: &str) -> Vec<Range<usize>> {
+    let bytes = source.as_bytes();
+    let mut ranges = Vec::new();
+    let mut line_start = 0usize;
+
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte == b'\n' {
+            let mut line_end = index;
+            if line_end > line_start && bytes[line_end - 1] == b'\r' {
+                line_end -= 1;
+            }
+            ranges.push(line_start..line_end);
+            line_start = index + 1;
+        }
+    }
+    ranges.push(line_start..bytes.len());
+    ranges
+}
+
+/// Highlights an isolated block of lines - a diff hunk's interleaved add/remove/context lines,
+/// or one side of a merge conflict hunk - as its own real source unit: joins `lines` with `\n`,
+/// runs `extension`'s real highlighter (if any), and re-splits via [`build_lines`]. Shared by
+/// `crate::code_surface`'s Diff view and `crate::merge::render`'s Merge view so
+/// both highlight the same way [`load_file`] does, rather than each re-deriving the
+/// join-highlight-split recipe.
+///
+/// This is a deliberate, honest simplification: a hunk/conflict side is highlighted on its own,
+/// not as part of the true old- or new-file content, since neither is fully available from a
+/// hunk/conflict block alone. `tree-sitter`'s own best-effort recovery on imperfect/partial input
+/// (this module's `highlighting_invalid_rust_still_returns_a_real_non_empty_span_list`-style
+/// tests) is what makes this reasonable, not a claim of perfect semantic accuracy.
+///
+/// Zero input lines yields an empty `Vec`, *not* [`build_lines`]'s own one-empty-line convention:
+/// that convention is correct for [`load_file`] (a genuinely empty *file* still has one real,
+/// empty line to show), but wrong here - a diff hunk/merge-conflict side with zero lines has zero
+/// real content, and a caller driving row count off this `Vec`'s length (`crate::root::
+/// merge_flow_render::AdeApp::render_conflict_columns`) must render zero rows for it, not one
+/// fabricated blank row.
+pub(crate) fn highlight_block<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    extension: Option<&str>,
+) -> Vec<RenderedLine> {
+    let lines: Vec<&str> = lines.into_iter().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let source = lines.join("\n");
+    let spans = match highlighter_for_extension(extension) {
+        Some(highlighter) => highlighter(&source),
+        None => Vec::new(),
+    };
+    build_lines(&source, &spans)
+}
+
+/// A file's parsed-and-highlighted content, cached in `crate::root::AdeApp::file_view_cache` so
+/// [`load_file`]/[`highlight_rust`] run at most once per file-content change - see
+/// [`cache_is_fresh`] for the staleness check.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedFile {
+    pub path: PathBuf,
+    pub mtime: Option<SystemTime>,
+    pub len: u64,
+    pub language: &'static str,
+    pub line_ending: LineEnding,
+    /// `true` if the file on disk was larger than [`MAX_FILE_BYTES`] and this is only a prefix
+    /// of it (cut back to the last line boundary within the cap - see [`load_file`]).
+    pub truncated: bool,
+    /// `true` if the file's real raw bytes (up to the [`MAX_FILE_BYTES`] cap) were genuinely
+    /// valid UTF-8 - a real `std::str::from_utf8` check at load time, not assumed. `false` means
+    /// [`load_file`]'s `String::from_utf8_lossy` decode silently replaced at least one invalid
+    /// byte sequence with a `U+FFFD` replacement character (a Latin-1/UTF-16/binary-ish file),
+    /// so what's on screen is no longer a faithful rendering of the file's real bytes. The status
+    /// bar's `UTF-8` label reads this rather than assuming every loaded file is what it claims to
+    /// be.
+    pub is_valid_utf8: bool,
+    pub lines: Vec<RenderedLine>,
+}
+
+/// Reads a file from disk, caps it at [`MAX_FILE_BYTES`], detects its line-ending style and
+/// language, and - for a `.rs` file - runs it through [`highlight_rust`]. The `io::Error` is
+/// propagated rather than swallowed; the caller renders it as an honest error message.
+pub fn load_file(path: &Path) -> io::Result<ParsedFile> {
+    Ok(load_file_with_source(path)?.0)
+}
+
+/// [`load_file`]'s real implementation, also handing back the decoded source text - used by
+/// `crate::root::AdeApp::spawn_file_load` to lazily seed a `crate::code_surface::edit_buffer::EditBuffer` from
+/// the exact same background read/decode this already does, rather than a second, independent
+/// disk read of the same file. `load_file` itself is now a thin wrapper that discards the source,
+/// kept as the public entry point every other existing caller (and this module's own tests)
+/// already uses unchanged.
+pub fn load_file_with_source(path: &Path) -> io::Result<(ParsedFile, String)> {
+    let metadata = fs::metadata(path)?;
+    let len = metadata.len();
+    let mtime = metadata.modified().ok();
+
+    let mut bytes = fs::read(path)?;
+    let truncated = bytes.len() > MAX_FILE_BYTES;
+    if truncated {
+        bytes.truncate(MAX_FILE_BYTES);
+        if let Some(last_newline) = bytes.iter().rposition(|&byte| byte == b'\n') {
+            bytes.truncate(last_newline + 1);
+        }
+    }
+
+    let line_ending = detect_line_ending(&bytes);
+    // Checked before the lossy decode below (which borrows `bytes`, so this doesn't need to run
+    // first, but conceptually it's answering "were the real bytes valid" before they get
+    // silently repaired) - a real, cheap validity check, not a hardcoded assumption.
+    let is_valid_utf8 = std::str::from_utf8(&bytes).is_ok();
+    let source = String::from_utf8_lossy(&bytes).into_owned();
+
+    let extension = path.extension().and_then(|ext| ext.to_str());
+    let language = language_name_for_extension(extension);
+    let spans = match highlighter_for_extension(extension) {
+        Some(highlighter) => highlighter(&source),
+        None => Vec::new(),
+    };
+    let lines = build_lines(&source, &spans);
+
+    let parsed = ParsedFile {
+        path: path.to_path_buf(),
+        mtime,
+        len,
+        language,
+        line_ending,
+        truncated,
+        is_valid_utf8,
+        lines,
+    };
+    Ok((parsed, source))
+}
+
+/// Whether `cached` is still an up-to-date parse of `path` - true iff the path matches and both
+/// the freshly-read `mtime`/`len` are unchanged from what produced `cached`. Used by
+/// `crate::root::AdeApp::render_file_view` to decide whether to reuse `cached` or call
+/// [`load_file`] again.
+pub fn cache_is_fresh(
+    cached: &ParsedFile,
+    path: &Path,
+    mtime: Option<SystemTime>,
+    len: u64,
+) -> bool {
+    cached.path == path && cached.mtime == mtime && cached.len == len
+}
+
+/// The File view breadcrumb's path segments (`design_handoff_jerry_ade/README.md`: "`src ›
+/// db › query_builder.rs`") - every `Normal` path component of `path`, in order. Root/prefix/
+/// `.`/`..` components are skipped.
+pub fn breadcrumb_segments(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(segment) => Some(segment.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The File view's 3px git-gutter marker set (`design_handoff_jerry_ade/README.md`: "a 3px git
+/// gutter (`#2c6244` for agent-touched lines, transparent otherwise)") - the new-file line
+/// numbers (1-indexed) a hunk actually *added*, derived from `file`'s hunks via
+/// `crate::sidebar::changes::parse_hunk_new_range`. Context lines advance the new-file line counter
+/// without being marked; removed lines don't exist in the new file, so they never advance it.
+pub fn changed_line_set(file: &DiffFile) -> HashSet<usize> {
+    let mut changed = HashSet::new();
+    for hunk in &file.hunks {
+        let Some((mut new_line, _)) = changes::parse_hunk_new_range(&hunk.header) else {
+            continue;
+        };
+        for line in &hunk.lines {
+            match line.kind {
+                DiffLineKind::Added => {
+                    changed.insert(new_line);
+                    new_line += 1;
+                }
+                DiffLineKind::Context => {
+                    new_line += 1;
+                }
+                DiffLineKind::Removed => {}
+            }
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use wt_core::diff::{DiffHunk, DiffLine, FileChangeStatus};
+
+    #[test]
+    fn detects_lf_from_real_bytes() {
+        assert_eq!(detect_line_ending(b"fn main() {\n}\n"), LineEnding::Lf);
+    }
+
+    #[test]
+    fn detects_crlf_from_real_bytes() {
+        assert_eq!(
+            detect_line_ending(b"fn main() {\r\n}\r\n"),
+            LineEnding::Crlf
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_newline_at_all_defaults_to_lf() {
+        assert_eq!(detect_line_ending(b"no newline here"), LineEnding::Lf);
+    }
+
+    fn plain_line(text: &str) -> RenderedLine {
+        RenderedLine {
+            text: text.to_string(),
+            runs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn detect_indent_width_finds_the_first_real_space_indented_line() {
+        let lines: Vec<RenderedLine> = ["fn main() {", "    let x = 1;", "}"]
+            .iter()
+            .map(|text| plain_line(text))
+            .collect();
+        assert_eq!(detect_indent_width(&lines), Some(4));
+    }
+
+    #[test]
+    fn detect_indent_width_skips_tab_indented_lines() {
+        let lines: Vec<RenderedLine> = ["fn main() {", "\tlet x = 1;", "  let y = 2;"]
+            .iter()
+            .map(|text| plain_line(text))
+            .collect();
+        assert_eq!(
+            detect_indent_width(&lines),
+            Some(2),
+            "a tab-indented line has no single \"N spaces\" answer - keep scanning for a real \
+             space-indented one"
+        );
+    }
+
+    #[test]
+    fn detect_indent_width_skips_whitespace_only_lines() {
+        let lines: Vec<RenderedLine> = ["fn main() {", "    ", "      let x = 1;"]
+            .iter()
+            .map(|text| plain_line(text))
+            .collect();
+        assert_eq!(
+            detect_indent_width(&lines),
+            Some(6),
+            "a blank/whitespace-only line says nothing about the real indent unit"
+        );
+    }
+
+    #[test]
+    fn detect_indent_width_with_no_indentation_anywhere_is_none() {
+        let lines: Vec<RenderedLine> = ["fn main() {", "}"]
+            .iter()
+            .map(|text| plain_line(text))
+            .collect();
+        assert_eq!(detect_indent_width(&lines), None);
+    }
+
+    #[test]
+    fn detect_indent_width_on_an_empty_file_is_none() {
+        assert_eq!(detect_indent_width(&[]), None);
+    }
+
+    /// The audit's exact reproduction: a C-style block-comment header's single leading space
+    /// must not be naively picked as "the" indent width just for appearing before the file's
+    /// real, repeated 4-space body indent.
+    #[test]
+    fn detect_indent_width_is_not_fooled_by_a_single_block_comment_header_line() {
+        let lines: Vec<RenderedLine> = [
+            "/**",
+            " * Copyright 2024 Example Corp.",
+            " */",
+            "fn main() {",
+            "    let x = 1;",
+            "    let y = 2;",
+            "    let z = 3;",
+            "}",
+        ]
+        .iter()
+        .map(|text| plain_line(text))
+        .collect();
+        assert_eq!(
+            detect_indent_width(&lines),
+            Some(4),
+            "the real, repeated 4-space body indent should win over a one-off single leading \
+             space from a C-style block comment header"
+        );
+    }
+
+    /// The audit's other exact reproduction: a one-off hanging-indent continuation line must not
+    /// out-vote the file's real, repeated indent unit.
+    #[test]
+    fn detect_indent_width_is_not_fooled_by_a_single_hanging_indent_continuation_line() {
+        let lines: Vec<RenderedLine> = [
+            "let long_name =",
+            "  some_call(a, b);",
+            "fn main() {",
+            "    let x = 1;",
+            "    let y = 2;",
+            "}",
+        ]
+        .iter()
+        .map(|text| plain_line(text))
+        .collect();
+        assert_eq!(
+            detect_indent_width(&lines),
+            Some(4),
+            "a one-off 2-space hanging-indent continuation line must not out-vote the file's \
+             real, repeated 4-space indent"
+        );
+    }
+
+    #[test]
+    fn detect_indent_width_breaks_a_tie_toward_the_smaller_width() {
+        let lines: Vec<RenderedLine> = ["  two spaces", "    four spaces"]
+            .iter()
+            .map(|text| plain_line(text))
+            .collect();
+        assert_eq!(
+            detect_indent_width(&lines),
+            Some(2),
+            "an exact tie in occurrence count should prefer the smaller, more conventional width"
+        );
+    }
+
+    #[test]
+    fn language_name_covers_every_documented_extension() {
+        assert_eq!(language_name_for_extension(Some("rs")), "Rust");
+        assert_eq!(language_name_for_extension(Some("RS")), "Rust");
+        assert_eq!(language_name_for_extension(Some("toml")), "TOML");
+        assert_eq!(language_name_for_extension(Some("md")), "Markdown");
+        assert_eq!(language_name_for_extension(Some("sql")), "SQL");
+        assert_eq!(language_name_for_extension(Some("png")), "Plain Text");
+        assert_eq!(language_name_for_extension(None), "Plain Text");
+    }
+
+    /// Finds the span whose byte range is *exactly* `text`'s first occurrence in `source`.
+    ///
+    /// This works for any token the highlighter actually classifies, because a classified token is
+    /// bounded on both sides by differently-classified neighbours. It deliberately does **not**
+    /// work for a token that comes out as plain [`HighlightKind::Text`]: [`highlight_with`]
+    /// coalesces adjacent same-kind spans, so an unclassified identifier is merged into one
+    /// wider `Text` run covering the surrounding whitespace and punctuation too, and has no span
+    /// of its own to find. Use [`kind_at`] for those - asserting on the kind covering a byte is
+    /// the meaningful question there, and it is the one the renderer itself asks.
+    fn find_span<'a>(
+        spans: &'a [HighlightSpan],
+        source: &str,
+        text: &str,
+    ) -> Option<&'a HighlightSpan> {
+        let start = source.find(text)?;
+        let end = start + text.len();
+        spans
+            .iter()
+            .find(|span| span.start == start && span.end == end)
+    }
+
+    /// The [`HighlightKind`] covering the first byte of `text`'s first occurrence in `source` -
+    /// i.e. exactly the colour the File view would paint that token's first character. Falls back
+    /// to [`HighlightKind::Text`] for a byte no span covers, matching [`build_lines`]' own
+    /// gap-filling rule, so this always answers the same question the renderer does.
+    fn kind_at(spans: &[HighlightSpan], source: &str, text: &str) -> HighlightKind {
+        let start = source.find(text).expect("substring present in source");
+        spans
+            .iter()
+            .find(|span| span.start <= start && start < span.end)
+            .map_or(HighlightKind::Text, |span| span.kind)
+    }
+
+    const SAMPLE_RUST: &str =
+        "/// Adds one.\nfn add(left: i32) -> i32 {\n    let name = \"x\";\n    left + 1\n}\n";
+
+    #[test]
+    fn fn_keyword_is_classified_as_keyword() {
+        let spans = highlight_rust(SAMPLE_RUST);
+        let span = find_span(&spans, SAMPLE_RUST, "fn").expect("fn span");
+        assert_eq!(span.kind, HighlightKind::Keyword);
+    }
+
+    #[test]
+    fn a_string_literal_is_classified_as_literal() {
+        let spans = highlight_rust(SAMPLE_RUST);
+        let span = find_span(&spans, SAMPLE_RUST, "\"x\"").expect("string literal span");
+        assert_eq!(span.kind, HighlightKind::Literal);
+    }
+
+    #[test]
+    fn a_function_name_is_classified_as_function() {
+        let spans = highlight_rust(SAMPLE_RUST);
+        let span = find_span(&spans, SAMPLE_RUST, "add").expect("function name span");
+        assert_eq!(span.kind, HighlightKind::Function);
+    }
+
+    #[test]
+    fn a_type_identifier_is_classified_as_type() {
+        let spans = highlight_rust(SAMPLE_RUST);
+        // "i32" appears twice (parameter type, return type); just confirm at least one
+        // occurrence was classified as Type.
+        let type_spans: Vec<_> = spans
+            .iter()
+            .filter(|span| SAMPLE_RUST[span.start..span.end] == *"i32")
+            .collect();
+        assert!(!type_spans.is_empty());
+        assert!(type_spans
+            .iter()
+            .all(|span| span.kind == HighlightKind::Type));
+    }
+
+    #[test]
+    fn a_doc_comment_is_classified_as_comment() {
+        let spans = highlight_rust(SAMPLE_RUST);
+        // The `line_comment` node's byte range includes its trailing newline; it's treated as
+        // one span rather than recursed into, since its children are just lexical pieces, not
+        // separately-colourable syntax.
+        let span = find_span(&spans, SAMPLE_RUST, "/// Adds one.\n").expect("doc comment span");
+        assert_eq!(span.kind, HighlightKind::Comment);
+    }
+
+    #[test]
+    fn self_is_classified_as_literal_not_keyword() {
+        let source = "impl Foo {\n    fn bar(&self) -> i32 {\n        self.value\n    }\n}\n";
+        let spans = highlight_rust(source);
+        let span = find_span(&spans, source, "self").expect("self span");
+        assert_eq!(span.kind, HighlightKind::Literal);
+    }
+
+    #[test]
+    fn highlighting_invalid_rust_still_returns_a_real_non_empty_span_list() {
+        // Tree-sitter produces a best-effort tree for malformed input rather than failing
+        // outright - confirm this doesn't panic and still classifies the keyword token present.
+        let spans = highlight_rust("fn (((( broken");
+        assert!(spans.iter().any(|span| span.kind == HighlightKind::Keyword));
+    }
+
+    // Real TypeScript highlighting coverage - mirrors `highlight_rust`'s own test shape above.
+    // Before this fix, none of `highlight_typescript`'s real, common-case behavior had any test
+    // coverage at all.
+
+    const SAMPLE_TYPESCRIPT: &str = "/** Adds one. */\nfunction add(left: number): number {\n    const name = \"x\";\n    return left + 1;\n}\n";
+
+    #[test]
+    fn typescript_function_keyword_is_classified_as_keyword() {
+        let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
+        let span = find_span(&spans, SAMPLE_TYPESCRIPT, "function").expect("function span");
+        assert_eq!(span.kind, HighlightKind::Keyword);
+    }
+
+    #[test]
+    fn typescript_string_literal_is_classified_as_literal() {
+        let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
+        let span = find_span(&spans, SAMPLE_TYPESCRIPT, "\"x\"").expect("string literal span");
+        assert_eq!(span.kind, HighlightKind::Literal);
+    }
+
+    #[test]
+    fn typescript_function_declaration_name_is_classified_as_function() {
+        let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
+        let span = find_span(&spans, SAMPLE_TYPESCRIPT, "add").expect("function name span");
+        assert_eq!(span.kind, HighlightKind::Function);
+    }
+
+    #[test]
+    fn typescript_predefined_type_is_classified_as_type() {
+        let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
+        let type_spans: Vec<_> = spans
+            .iter()
+            .filter(|span| SAMPLE_TYPESCRIPT[span.start..span.end] == *"number")
+            .collect();
+        assert!(!type_spans.is_empty());
+        assert!(type_spans
+            .iter()
+            .all(|span| span.kind == HighlightKind::Type));
+    }
+
+    #[test]
+    fn typescript_doc_comment_is_classified_as_comment() {
+        let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
+        let span =
+            find_span(&spans, SAMPLE_TYPESCRIPT, "/** Adds one. */").expect("doc comment span");
+        assert_eq!(span.kind, HighlightKind::Comment);
+    }
+
+    /// The real, live-verified regression this fix addresses: a `variable_declarator`'s own
+    /// `name` field collides with `function_declaration`'s `name` field in
+    /// `tree-sitter-typescript`'s real grammar, and the old, parent-kind-unaware matching
+    /// misclassified every `const`/`let`/`var` binding's name as a Function. `s` here must be
+    /// plain `Text` (a use/declaration of a variable, not a function).
+    #[test]
+    fn typescript_const_variable_name_is_not_misclassified_as_a_function() {
+        // The audit's exact reproduction. `find_span`'s plain substring search would otherwise
+        // match the embedded "s" inside "const" itself, so the real declared variable's own byte
+        // offset (right after "const ") is computed explicitly instead.
+        let source = "const s: string = \"hi\";\n";
+        let variable_start = source.find("const ").expect("const") + "const ".len();
+        let spans = highlight_typescript(source, false);
+        let kind = spans
+            .iter()
+            .find(|span| span.start <= variable_start && variable_start < span.end)
+            .map_or(HighlightKind::Text, |span| span.kind);
+        assert_eq!(
+            kind,
+            HighlightKind::Text,
+            "a const/let/var binding's own name must never be classified as a function"
+        );
+    }
+
+    /// The same real collision, for an `interface` member name (`property_signature`'s `name`
+    /// field) - must not be classified as a function either.
+    #[test]
+    fn typescript_interface_member_name_is_not_misclassified_as_a_function() {
+        let source = "interface Point { x: number }\n";
+        let spans = highlight_typescript(source, false);
+        assert_eq!(kind_at(&spans, source, "x: number"), HighlightKind::Text);
+    }
+
+    /// The same real collision, for a class method's own name (`method_definition`'s `name`
+    /// field, a `property_identifier`) - this one, unlike the two above, genuinely *should* be
+    /// classified as a function.
+    #[test]
+    fn typescript_class_method_name_is_classified_as_a_function() {
+        let source = "class Point {\n    length() {\n        return 0;\n    }\n}\n";
+        let spans = highlight_typescript(source, false);
+        let span = find_span(&spans, source, "length").expect("method name span");
+        assert_eq!(span.kind, HighlightKind::Function);
+    }
+
+    /// The same real collision, for a real function call's callee (`call_expression`'s
+    /// `function` field) - genuinely a function, and must stay classified as one.
+    #[test]
+    fn typescript_call_expression_callee_is_classified_as_a_function() {
+        let source = "function top() {}\ntop();\n";
+        let spans = highlight_typescript(source, false);
+        let function_spans: Vec<_> = spans
+            .iter()
+            .filter(|span| source[span.start..span.end] == *"top")
+            .collect();
+        assert_eq!(function_spans.len(), 2, "the declaration and the call site");
+        assert!(function_spans
+            .iter()
+            .all(|span| span.kind == HighlightKind::Function));
+    }
+
+    /// A real TSX tag name (`jsx_self_closing_element`'s own `name` field) is the same real
+    /// collision one more time - must not render as a Function either.
+    #[test]
+    fn tsx_tag_name_is_not_misclassified_as_a_function() {
+        let source = "const el = <div />;\n";
+        let spans = highlight_typescript(source, true);
+        let span = find_span(&spans, source, "div").expect("tag name span");
+        assert_ne!(span.kind, HighlightKind::Function);
+    }
+
+    #[test]
+    fn highlighting_invalid_typescript_still_returns_a_real_non_empty_span_list() {
+        let spans = highlight_typescript("function (((( broken", false);
+        assert!(spans.iter().any(|span| span.kind == HighlightKind::Keyword));
+    }
+
+    // Real Python highlighting coverage - mirrors `highlight_rust`'s own test shape above.
+    // Before this fix, none of `highlight_python`'s real, common-case behavior had any test
+    // coverage at all.
+
+    const SAMPLE_PYTHON: &str =
+        "def add(left: int) -> int:\n    name = \"x\"\n    return left + 1\n";
+
+    #[test]
+    fn python_def_keyword_is_classified_as_keyword() {
+        let spans = highlight_python(SAMPLE_PYTHON);
+        let span = find_span(&spans, SAMPLE_PYTHON, "def").expect("def span");
+        assert_eq!(span.kind, HighlightKind::Keyword);
+    }
+
+    #[test]
+    fn python_string_literal_is_classified_as_literal() {
+        let spans = highlight_python(SAMPLE_PYTHON);
+        let span = find_span(&spans, SAMPLE_PYTHON, "\"x\"").expect("string literal span");
+        assert_eq!(span.kind, HighlightKind::Literal);
+    }
+
+    #[test]
+    fn python_function_definition_name_is_classified_as_function() {
+        let spans = highlight_python(SAMPLE_PYTHON);
+        let span = find_span(&spans, SAMPLE_PYTHON, "add").expect("function name span");
+        assert_eq!(span.kind, HighlightKind::Function);
+    }
+
+    #[test]
+    fn python_type_annotation_is_classified_as_type() {
+        let spans = highlight_python(SAMPLE_PYTHON);
+        let type_spans: Vec<_> = spans
+            .iter()
+            .filter(|span| SAMPLE_PYTHON[span.start..span.end] == *"int")
+            .collect();
+        assert!(!type_spans.is_empty());
+        assert!(type_spans
+            .iter()
+            .all(|span| span.kind == HighlightKind::Type));
+    }
+
+    #[test]
+    fn python_comment_is_classified_as_comment() {
+        let source = "# a real comment\nx = 1\n";
+        let spans = highlight_python(source);
+        let span = find_span(&spans, source, "# a real comment").expect("comment span");
+        assert_eq!(span.kind, HighlightKind::Comment);
+    }
+
+    /// Matches Rust's own `self_is_classified_as_literal_not_keyword` test - a deliberate,
+    /// documented choice that Python's `self` gets the same Literal treatment Rust's does. Rust
+    /// gets it from its grammar's own `(self) @variable.builtin` rule; Python's grammar has no
+    /// rule for `self` at all, so it comes from [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]'s second rule -
+    /// see there.
+    #[test]
+    fn python_self_is_classified_as_literal_not_a_plain_identifier() {
+        let source = "class Foo:\n    def bar(self):\n        return self.value\n";
+        let spans = highlight_python(source);
+        let self_spans: Vec<_> = spans
+            .iter()
+            .filter(|span| source[span.start..span.end] == *"self")
+            .collect();
+        assert!(!self_spans.is_empty());
+        assert!(self_spans
+            .iter()
+            .all(|span| span.kind == HighlightKind::Literal));
+    }
+
+    /// The real, live-verified regression this fix addresses: `class_definition`'s own `name`
+    /// field is a plain `identifier` in `tree-sitter-python`'s real grammar (unlike Rust/
+    /// TypeScript, where it's a distinct `type_identifier` node), and the old, parent-kind-
+    /// unaware matching misclassified every class name as a Function instead of a Type.
+    #[test]
+    fn python_class_name_is_classified_as_type_not_function() {
+        let source = "class Foo:\n    pass\n";
+        let spans = highlight_python(source);
+        let span = find_span(&spans, source, "Foo").expect("class name span");
+        assert_eq!(
+            span.kind,
+            HighlightKind::Type,
+            "a class's own declared name should be a Type, not a Function"
+        );
+    }
+
+    /// The same fixture's `def`, to prove the two real, colliding `"name"`-field cases (function
+    /// vs. class) are correctly told apart within one real, combined parse - not just correct in
+    /// isolation.
+    #[test]
+    fn python_method_name_inside_a_class_is_still_classified_as_function() {
+        let source = "class Foo:\n    def bar(self):\n        pass\n";
+        let spans = highlight_python(source);
+        let span = find_span(&spans, source, "bar").expect("method name span");
+        assert_eq!(span.kind, HighlightKind::Function);
+    }
+
+    /// The real call-expression collision one more time, for Python's own `call` node kind
+    /// (distinct from Rust/TypeScript's `call_expression`).
+    #[test]
+    fn python_call_callee_is_classified_as_a_function() {
+        let source = "def top():\n    pass\n\ntop()\n";
+        let spans = highlight_python(source);
+        let function_spans: Vec<_> = spans
+            .iter()
+            .filter(|span| source[span.start..span.end] == *"top")
+            .collect();
+        assert_eq!(function_spans.len(), 2, "the definition and the call site");
+        assert!(function_spans
+            .iter()
+            .all(|span| span.kind == HighlightKind::Function));
+    }
+
+    #[test]
+    fn highlighting_invalid_python_still_returns_a_real_non_empty_span_list() {
+        let spans = highlight_python("def (((( broken");
+        assert!(spans.iter().any(|span| span.kind == HighlightKind::Keyword));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // `tree-sitter-highlight` migration coverage.
+    //
+    // These assert on specific real tokens, and each one exists because an old-vs-new span diff
+    // over real source files in this repository actually showed that token changing (or, for the
+    // "still" cases, showed a way it could plausibly have changed and did not). They are the
+    // executable form of that diff, not a generic "renders something" smoke test.
+    // ---------------------------------------------------------------------------------------
+
+    /// The migration's load-bearing precondition: all four real grammar configurations - including
+    /// the two *composed* TypeScript ones - actually compile. `highlight_config` degrades to
+    /// `None` (i.e. silently unhighlighted text) if a query fails to compile, so without this
+    /// test a broken composition would show up only as a file rendering flat, with every other
+    /// test in this module still passing.
+    #[test]
+    fn every_real_grammar_config_compiles() {
+        let grammars = Grammar::ALL;
+        for grammar in grammars {
+            build_highlight_config(grammar)
+                .unwrap_or_else(|error| panic!("{}'s highlights query: {error}", grammar.name()));
+        }
+
+        // `highlight_config` keys its process-wide cache on `Grammar::name`, so two grammars
+        // sharing a name would silently hand one grammar's configuration to the other - a
+        // wrong-language parse rendering as plausible-looking garbage rather than as an error.
+        // Nothing in the type system prevents that, so it is asserted here instead.
+        let mut names: Vec<&str> = grammars.iter().map(|grammar| grammar.name()).collect();
+        names.sort_unstable();
+        let distinct = names.len();
+        names.dedup();
+        assert_eq!(names.len(), distinct, "every Grammar needs a distinct name");
+
+        // And every one of those names must really resolve to a live configuration, or that
+        // grammar silently renders as plain text.
+        for grammar in grammars {
+            assert!(
+                highlight_config(grammar).is_some(),
+                "{} has no live highlight configuration",
+                grammar.name()
+            );
+        }
+    }
+
+    /// [`HIGHLIGHT_NAMES`] and [`HIGHLIGHT_KINDS`] are a positional parallel array pair, and the
+    /// whole classification mapping is wrong-but-compiling if they ever drift. The array length is
+    /// already tied together at compile time; this pins the *content* of the two mappings whose
+    /// index positions are easiest to get silently wrong.
+    #[test]
+    fn recognized_highlight_names_map_to_the_intended_buckets() {
+        let bucket = |name: &str| {
+            let index = HIGHLIGHT_NAMES
+                .iter()
+                .position(|candidate| *candidate == name)
+                .unwrap_or_else(|| panic!("{name} missing from HIGHLIGHT_NAMES"));
+            HIGHLIGHT_KINDS[index]
+        };
+        assert_eq!(bucket("keyword"), HighlightKind::Keyword);
+        assert_eq!(bucket("function"), HighlightKind::Function);
+        assert_eq!(bucket("comment"), HighlightKind::Comment);
+        // The three non-obvious ones, each argued for in `HIGHLIGHT_KINDS`' own docs.
+        assert_eq!(bucket("constructor"), HighlightKind::Type);
+        assert_eq!(bucket("tag"), HighlightKind::Type);
+        assert_eq!(bucket("variable.builtin"), HighlightKind::Literal);
+    }
+
+    /// Real gains the replaced implementation genuinely did not have. Its own docs called the
+    /// method-call gap "an intentionally narrow, documented gap" it did not cover; the real
+    /// grammar queries do.
+    #[test]
+    fn rust_method_calls_and_macros_are_now_classified_as_functions() {
+        let source = "fn main() {\n    let x = value.clone();\n    println!(\"{x}\");\n}\n";
+        let spans = highlight_rust(source);
+        assert_eq!(kind_at(&spans, source, "clone"), HighlightKind::Function);
+        assert_eq!(kind_at(&spans, source, "println"), HighlightKind::Function);
+    }
+
+    /// `mut` was listed in the replaced implementation's own Rust keyword table and never actually
+    /// matched: that table compared a leaf's `kind()`, and `mut`'s real node kind is
+    /// `mutable_specifier`, not `"mut"` - so it silently rendered as plain text the whole time.
+    /// The real grammar query captures `(mutable_specifier) @keyword` directly.
+    #[test]
+    fn rust_mut_is_now_really_classified_as_a_keyword() {
+        let source = "fn main() { let mut count = 0; }\n";
+        let spans = highlight_rust(source);
+        assert_eq!(kind_at(&spans, source, "mut "), HighlightKind::Keyword);
+    }
+
+    /// Rust's `self` stays `Literal`, now via the real grammar's own `(self) @variable.builtin`
+    /// rather than the replaced implementation's bespoke node-kind table entry - and TypeScript's
+    /// `this` *joins* it, which is the one deliberate cross-language reclassification in this
+    /// migration (see [`HIGHLIGHT_KINDS`]' docs).
+    #[test]
+    fn self_and_this_share_the_literal_self_bucket_across_languages() {
+        let rust = "impl T { fn get(&self) -> u8 { self.value } }\n";
+        assert_eq!(
+            kind_at(&highlight_rust(rust), rust, "self.value"),
+            HighlightKind::Literal
+        );
+        let python = "class T:\n    def get(self):\n        return self.value\n";
+        assert_eq!(
+            kind_at(&highlight_python(python), python, "self.value"),
+            HighlightKind::Literal
+        );
+        let typescript = "class T { get() { return this.value; } }\n";
+        assert_eq!(
+            kind_at(&highlight_typescript(typescript, false), typescript, "this"),
+            HighlightKind::Literal
+        );
+    }
+
+    /// Python's `and`/`or`/`not`/`in`/`is` live in `tree-sitter-python`'s `@operator` list, not
+    /// its `@keyword` list, and this app has no operator bucket - so without
+    /// [`PYTHON_HIGHLIGHTS_SUPPLEMENT`] they would render as plain text where the replaced
+    /// implementation made them real keywords. Symbolic operators must stay `Text`, which is what
+    /// the replaced implementation did with them and what the design colour table asks for.
+    #[test]
+    fn python_word_operators_are_keywords_but_symbolic_ones_stay_text() {
+        let source = "if a is not b and c in d or not e:\n    total = a + b\n";
+        let spans = highlight_python(source);
+        for word in ["is not", "and ", "in ", "or ", "not e"] {
+            assert_eq!(
+                kind_at(&spans, source, word),
+                HighlightKind::Keyword,
+                "python word operator {word:?}"
+            );
+        }
+        assert_eq!(kind_at(&spans, source, "+ b"), HighlightKind::Text);
+    }
+
+    /// A compound Python type annotation. `tree-sitter-python`'s own rule only fires for a bare
+    /// identifier directly under the `type` node, so all three of these real shapes rendered as
+    /// plain text until [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]'s `(type) @type` restored the replaced
+    /// implementation's whole-node behaviour - a regression a real old-vs-new diff caught.
+    #[test]
+    fn python_compound_type_annotations_are_classified_as_types() {
+        let source = "def f(a: dict[str, int], b: pathlib.Path) -> list[int]:\n    pass\n";
+        let spans = highlight_python(source);
+        assert_eq!(kind_at(&spans, source, "dict[str"), HighlightKind::Type);
+        assert_eq!(kind_at(&spans, source, "pathlib.Path"), HighlightKind::Type);
+        assert_eq!(kind_at(&spans, source, "list[int]"), HighlightKind::Type);
+    }
+
+    /// [`HIGHLIGHT_CONFIGS`] is indexed by [`Grammar::index`], so that mapping has to stay in step
+    /// with [`Grammar::ALL`] or one grammar silently reads another's cache slot.
+    #[test]
+    fn grammar_indices_match_their_position_in_all() {
+        for (position, grammar) in Grammar::ALL.into_iter().enumerate() {
+            assert_eq!(grammar.index(), position, "{}", grammar.name());
+        }
+        assert_eq!(Grammar::COUNT, HIGHLIGHT_CONFIGS.len());
+    }
+
+    /// Python's `class Foo:` name, across all four real casing shapes.
+    ///
+    /// The casing matters and is the entire point of this test. `tree-sitter-python` has no
+    /// `class_definition name:` rule, so before [`PYTHON_HIGHLIGHTS_SUPPLEMENT`] gained one this
+    /// depended on the query's casing heuristics and got three of these four wrong - a leading
+    /// underscore or a lowercase name matched nothing and fell to `Text`, and an all-caps name was
+    /// captured by the `@constant` rule and came out `Literal`. An earlier version of this test
+    /// used only `Widget`, the one shape that happened to work, and so passed against a genuinely
+    /// broken implementation. All four are pinned now.
+    #[test]
+    fn python_class_names_are_classified_as_types_whatever_their_casing() {
+        let source = "class Widget:\n    pass\nclass _Pickler:\n    pass\nclass socket:\n    pass\nclass FTP:\n    pass\n";
+        let spans = highlight_python(source);
+        for name in ["Widget", "_Pickler", "socket", "FTP"] {
+            assert_eq!(
+                kind_at(&spans, source, name),
+                HighlightKind::Type,
+                "class {name}"
+            );
+        }
+    }
+
+    /// Python method calls, which the replaced implementation left as plain text and which
+    /// `tree-sitter-python`'s own bundled query *also* leaves as plain text - its blanket
+    /// `@property` rule outranks its own method-call rule. Rust and TypeScript both colour the
+    /// equivalent call, so this is the rule that makes the claim of closing the method-call gap
+    /// true for all three languages rather than two.
+    #[test]
+    fn python_method_calls_match_rust_and_typescript() {
+        let source = "value = obj.method()\nother = cls(name)\n";
+        let spans = highlight_python(source);
+        assert_eq!(kind_at(&spans, source, "method"), HighlightKind::Function);
+        assert_eq!(
+            kind_at(&spans, source, "cls("),
+            HighlightKind::Function,
+            "a real `cls(...)` construction is a call, not the `cls` self-reference"
+        );
+        // ...while a bare `cls`/`self` reference stays in the literal/self bucket.
+        let reference = "def f(cls):\n    return cls\n";
+        assert_eq!(
+            kind_at(&highlight_python(reference), reference, "cls\n"),
+            HighlightKind::Literal
+        );
+    }
+
+    /// Both halves of the TypeScript query composition, which is the single most breakable part of
+    /// this migration: `tree-sitter-typescript`'s own query file defines none of these, so if the
+    /// JavaScript query ever stopped being concatenated in, every one of them would silently
+    /// collapse to plain text while the TypeScript-only assertions elsewhere kept passing.
+    #[test]
+    fn typescript_highlighting_covers_the_javascript_half_of_the_composed_query() {
+        let source = "// note\nasync function load() {\n  const url = \"/api\";\n  return fetch(url, 3);\n}\n";
+        let spans = highlight_typescript(source, false);
+        assert_eq!(kind_at(&spans, source, "// note"), HighlightKind::Comment);
+        assert_eq!(kind_at(&spans, source, "async"), HighlightKind::Keyword);
+        assert_eq!(kind_at(&spans, source, "\"/api\""), HighlightKind::Literal);
+        assert_eq!(kind_at(&spans, source, "3"), HighlightKind::Literal);
+        assert_eq!(kind_at(&spans, source, "fetch"), HighlightKind::Function);
+    }
+
+    /// The real TypeScript regressions [`TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT`] exists to repair, all
+    /// found by diffing old against new over real source rather than by inspection.
+    #[test]
+    fn typescript_supplement_repairs_capitalised_functions_and_void() {
+        let source = "function Badge(x: string): void {}\nconst s = String(x);\nconst w: Widget = new Widget();\n";
+        let spans = highlight_typescript(source, false);
+        assert_eq!(
+            kind_at(&spans, source, "Badge"),
+            HighlightKind::Function,
+            "a capitalised function declaration is still a function, not a type"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "String("),
+            HighlightKind::Function,
+            "a capitalised call is still a call, not a type"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "Widget = "),
+            HighlightKind::Type,
+            "a capitalised identifier that is neither declared nor called stays a type"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "void"),
+            HighlightKind::Type,
+            "`void` must classify like every other predefined_type keyword"
+        );
+        // The sibling predefined types it has to stay consistent with.
+        assert_eq!(kind_at(&spans, source, "string"), HighlightKind::Type);
+    }
+
+    /// Real TSX. The JSX query is only composed in for the TSX grammar (it references node kinds
+    /// the plain TypeScript grammar does not have), so this is the only place element-name
+    /// classification is exercised at all.
+    #[test]
+    fn tsx_jsx_element_names_are_classified_as_types() {
+        let source = "const view = <div className=\"row\"><Badge label={name} /></div>;\n";
+        let spans = highlight_tsx(source);
+        assert_eq!(
+            kind_at(&spans, source, "div"),
+            HighlightKind::Type,
+            "a lowercase JSX element name arrives as @tag"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "Badge"),
+            HighlightKind::Type,
+            "a capitalised JSX component name must match the lowercase case"
+        );
+        assert_eq!(kind_at(&spans, source, "\"row\""), HighlightKind::Literal);
+    }
+
+    /// Interpolated code inside a template literal / f-string is now classified as the real code
+    /// it is, instead of being swallowed whole by the enclosing string literal. Verified against
+    /// real occurrences in this repository's own vendored sources before being pinned here.
+    #[test]
+    fn interpolated_code_inside_strings_is_classified_as_code() {
+        let typescript = "const msg = `n=${count.toFixed(1)}`;\n";
+        let ts_spans = highlight_typescript(typescript, false);
+        assert_eq!(
+            kind_at(&ts_spans, typescript, "n=$"),
+            HighlightKind::Literal,
+            "the literal text of the template string is still a string"
+        );
+        assert_eq!(
+            kind_at(&ts_spans, typescript, "toFixed"),
+            HighlightKind::Function
+        );
+
+        let python = "msg = f\"n={value if value else other}\"\n";
+        let py_spans = highlight_python(python);
+        assert_eq!(kind_at(&py_spans, python, "n="), HighlightKind::Literal);
+        assert_eq!(
+            kind_at(&py_spans, python, "if value"),
+            HighlightKind::Keyword
+        );
+    }
+
+    /// The span list [`highlight_with`] produces must be sorted, non-overlapping and gapless, with
+    /// no empty spans - `build_lines` clips against it positionally and would mis-render if any of
+    /// that were violated. The replaced implementation emitted leaf-only spans with real gaps, so
+    /// this is a genuinely new invariant worth pinning rather than an inherited one.
+    #[test]
+    fn produced_spans_tile_the_whole_source_exactly_once() {
+        for (label, spans, len) in [
+            ("rust", highlight_rust(SAMPLE_RUST), SAMPLE_RUST.len()),
+            (
+                "python",
+                highlight_python(SAMPLE_PYTHON),
+                SAMPLE_PYTHON.len(),
+            ),
+            (
+                "tsx",
+                highlight_tsx(SAMPLE_TYPESCRIPT),
+                SAMPLE_TYPESCRIPT.len(),
+            ),
+        ] {
+            let mut cursor = 0usize;
+            for span in &spans {
+                assert!(span.start < span.end, "{label}: empty span {span:?}");
+                assert_eq!(span.start, cursor, "{label}: gap or overlap at {span:?}");
+                cursor = span.end;
+            }
+            assert_eq!(cursor, len, "{label}: spans must cover the whole source");
+        }
+    }
+
+    /// Adjacent same-kind spans are coalesced, so a string containing escape sequences renders as
+    /// one continuous `Literal` run rather than several - and, critically, the escape does not
+    /// punch a `Text`-coloured hole through the middle of the string the way an unrecognised
+    /// capture name would.
+    #[test]
+    fn escapes_inside_a_string_stay_one_continuous_literal_run() {
+        let source = "fn main() { let s = \"a\\nb\\tc\"; }\n";
+        let spans = highlight_rust(source);
+        let literal_start = source.find('"').expect("string start");
+        let span = spans
+            .iter()
+            .find(|span| span.start <= literal_start && literal_start < span.end)
+            .expect("string span");
+        assert_eq!(span.kind, HighlightKind::Literal);
+        assert!(
+            span.end >= source.find("c\"").expect("string end") + 2,
+            "the whole string literal, escapes included, must be one Literal run"
+        );
+    }
+
+    // Coverage for finding 5's fix: `highlighter_for_extension` reads from the real registry,
+    // not a second, independent table.
+
+    #[test]
+    fn highlighter_for_extension_reads_from_the_real_language_registry() {
+        assert!(highlighter_for_extension(Some("rs")).is_some());
+        assert!(highlighter_for_extension(Some("ts")).is_some());
+        assert!(highlighter_for_extension(Some("tsx")).is_some());
+        assert!(highlighter_for_extension(Some("js")).is_some());
+        assert!(highlighter_for_extension(Some("jsx")).is_some());
+        assert!(highlighter_for_extension(Some("py")).is_some());
+        assert!(highlighter_for_extension(Some("toml")).is_none());
+        assert!(highlighter_for_extension(Some("md")).is_none());
+        assert!(highlighter_for_extension(Some("vue")).is_none());
+        assert!(highlighter_for_extension(None).is_none());
+    }
+
+    #[test]
+    fn load_file_highlights_a_real_typescript_file_via_the_registry_dispatch() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("sample.ts");
+        fs::write(
+            &path,
+            "function add(x: number): number {\n    return x;\n}\n",
+        )
+        .expect("write");
+
+        let parsed = load_file(&path).expect("load_file");
+        assert_eq!(parsed.language, "TypeScript");
+        let has_keyword_run = parsed
+            .lines
+            .iter()
+            .flat_map(|line| &line.runs)
+            .any(|(_, kind)| *kind == HighlightKind::Keyword);
+        assert!(
+            has_keyword_run,
+            "load_file should dispatch through the registry to a real TypeScript highlighter"
+        );
+    }
+
+    #[test]
+    fn load_file_highlights_a_real_python_file_via_the_registry_dispatch() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("sample.py");
+        fs::write(&path, "def add(x):\n    return x\n").expect("write");
+
+        let parsed = load_file(&path).expect("load_file");
+        assert_eq!(parsed.language, "Python");
+        let has_keyword_run = parsed
+            .lines
+            .iter()
+            .flat_map(|line| &line.runs)
+            .any(|(_, kind)| *kind == HighlightKind::Keyword);
+        assert!(
+            has_keyword_run,
+            "load_file should dispatch through the registry to a real Python highlighter"
+        );
+    }
+
+    #[test]
+    fn build_lines_covers_every_byte_of_every_line_with_no_gaps() {
+        let source = "let x = 1;\nlet y = 2;\n";
+        let spans = highlight_rust(source);
+        let lines = build_lines(source, &spans);
+        assert_eq!(lines.len(), 3, "two real lines plus the trailing empty one");
+        for line in &lines {
+            // Every run's text, concatenated in order, must reconstruct the line's text exactly
+            // - no gap, overlap, or out-of-order run.
+            let reconstructed: String = line.runs.iter().map(|(text, _)| text.as_ref()).collect();
+            assert_eq!(reconstructed, line.text);
+            assert!(
+                line.runs.iter().all(|(text, _)| !text.is_empty()),
+                "a real run should never be an empty string - that would be a zero-width byte \
+                 range that never should have been pushed in the first place"
+            );
+        }
+    }
+
+    #[test]
+    fn build_lines_on_a_non_rust_file_is_all_plain_text() {
+        let source = "key = \"value\"\n";
+        let lines = build_lines(source, &[]);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].runs.len(), 1);
+        assert_eq!(lines[0].runs[0].1, HighlightKind::Text);
+    }
+
+    #[test]
+    fn an_empty_source_still_yields_one_empty_line() {
+        let lines = build_lines("", &[]);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "");
+    }
+
+    #[test]
+    fn breadcrumb_segments_splits_a_real_nested_path() {
+        let segments = breadcrumb_segments(Path::new("src/db/query_builder.rs"));
+        assert_eq!(segments, vec!["src", "db", "query_builder.rs"]);
+    }
+
+    #[test]
+    fn breadcrumb_segments_on_a_root_level_file_is_a_single_segment() {
+        let segments = breadcrumb_segments(Path::new("Cargo.toml"));
+        assert_eq!(segments, vec!["Cargo.toml"]);
+    }
+
+    fn hunk(header: &str, lines: Vec<(DiffLineKind, &str)>) -> DiffHunk {
+        DiffHunk {
+            header: header.to_string(),
+            lines: lines
+                .into_iter()
+                .map(|(kind, text)| DiffLine {
+                    kind,
+                    content: text.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn changed_line_set_marks_only_real_added_new_file_lines() {
+        let file = DiffFile {
+            path: PathBuf::from("src/main.rs"),
+            old_path: None,
+            status: FileChangeStatus::Modified,
+            is_binary: false,
+            hunks: vec![hunk(
+                "@@ -10,3 +10,4 @@",
+                vec![
+                    (DiffLineKind::Context, "fn main() {"),
+                    (DiffLineKind::Added, "    println!(\"new\");"),
+                    (DiffLineKind::Removed, "    println!(\"old\");"),
+                    (DiffLineKind::Context, "}"),
+                ],
+            )],
+            truncated: false,
+        };
+        // new-file line numbering starting at 10: 10 = context "fn main() {", 11 = the real
+        // added line, 12 = "}" (the removed line never occupies a new-file line number).
+        let changed = changed_line_set(&file);
+        assert_eq!(changed, HashSet::from([11]));
+    }
+
+    #[test]
+    fn changed_line_set_is_empty_for_a_file_with_no_hunks() {
+        let file = DiffFile {
+            path: PathBuf::from("src/main.rs"),
+            old_path: None,
+            status: FileChangeStatus::Renamed,
+            is_binary: false,
+            hunks: Vec::new(),
+            truncated: false,
+        };
+        assert!(changed_line_set(&file).is_empty());
+    }
+
+    #[test]
+    fn cache_is_fresh_requires_matching_path_mtime_and_len() {
+        let cached = ParsedFile {
+            path: PathBuf::from("src/main.rs"),
+            mtime: None,
+            len: 42,
+            language: "Rust",
+            line_ending: LineEnding::Lf,
+            truncated: false,
+            is_valid_utf8: true,
+            lines: Vec::new(),
+        };
+        assert!(cache_is_fresh(&cached, Path::new("src/main.rs"), None, 42));
+        assert!(!cache_is_fresh(
+            &cached,
+            Path::new("src/other.rs"),
+            None,
+            42
+        ));
+        assert!(!cache_is_fresh(&cached, Path::new("src/main.rs"), None, 43));
+    }
+
+    #[test]
+    fn load_file_reads_a_real_temp_file_and_detects_its_real_properties() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("sample.rs");
+        fs::write(&path, "fn main() {\r\n    let x = 1;\r\n}\r\n").expect("write");
+
+        let parsed = load_file(&path).expect("load_file");
+        assert_eq!(parsed.language, "Rust");
+        assert_eq!(parsed.line_ending, LineEnding::Crlf);
+        assert!(!parsed.truncated);
+        assert!(
+            parsed.is_valid_utf8,
+            "a genuinely valid UTF-8 file must be reported as such"
+        );
+        assert_eq!(parsed.lines.len(), 4);
+        assert_eq!(parsed.lines[0].text, "fn main() {");
+        let has_keyword_run = parsed.lines[0]
+            .runs
+            .iter()
+            .any(|(_, kind)| *kind == HighlightKind::Keyword);
+        assert!(
+            has_keyword_run,
+            "the real \"fn\" token should be highlighted"
+        );
+    }
+
+    #[test]
+    fn load_file_on_a_missing_path_returns_a_real_io_error() {
+        let missing = PathBuf::from("/definitely/not/a/real/path/for/ade/code-view-test.rs");
+        assert!(load_file(&missing).is_err());
+    }
+
+    /// The audit's exact reproduction: a file whose real raw bytes are not valid UTF-8 (here,
+    /// Latin-1-encoded, containing a byte sequence that isn't valid UTF-8 at all) must be
+    /// reported as such, not silently labeled `UTF-8` after `String::from_utf8_lossy` quietly
+    /// replaces the invalid bytes with `U+FFFD`.
+    #[test]
+    fn load_file_detects_a_real_non_utf8_file_as_lossily_decoded() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("latin1.txt");
+        // 0xE9 alone (Latin-1 for "é") is not a valid UTF-8 byte sequence in this position.
+        let mut bytes = b"caf".to_vec();
+        bytes.push(0xE9);
+        bytes.extend_from_slice(b" latin-1\n");
+        fs::write(&path, &bytes).expect("write");
+
+        let parsed = load_file(&path).expect("load_file");
+        assert!(
+            !parsed.is_valid_utf8,
+            "a real non-UTF-8 file must not be reported as valid UTF-8"
+        );
+    }
+
+    #[test]
+    fn load_file_detects_a_real_ascii_file_as_valid_utf8() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("ascii.txt");
+        fs::write(&path, "plain ascii content\n").expect("write");
+
+        let parsed = load_file(&path).expect("load_file");
+        assert!(parsed.is_valid_utf8);
+    }
+
+    #[test]
+    fn load_file_truncates_a_file_larger_than_the_cap_at_a_real_line_boundary() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("big.rs");
+        let line = "let value = 1;\n";
+        let mut content = String::new();
+        while content.len() < MAX_FILE_BYTES + line.len() * 10 {
+            content.push_str(line);
+        }
+        fs::write(&path, &content).expect("write");
+
+        let parsed = load_file(&path).expect("load_file");
+        assert!(parsed.truncated);
+        // Every real line kept is a complete, real line - never a partial one.
+        for rendered in &parsed.lines {
+            assert!(rendered.text.is_empty() || rendered.text == "let value = 1;");
+        }
+    }
+
+    // `highlight_block` coverage (Revision R9a's Diff/Merge highlighting helper) - proves real,
+    // non-flat classification on realistic diff-hunk-/merge-hunk-shaped multi-line source, for
+    // two different real languages, not just "doesn't panic".
+
+    #[test]
+    fn highlight_block_on_a_real_rust_diff_hunk_produces_real_non_flat_color_runs() {
+        // Shaped like a real diff hunk's interleaved lines, lifted from this very crate's own
+        // `highlighter_for_extension` - not a synthetic one-liner.
+        let lines = [
+            "pub fn highlighter_for_extension(",
+            "    extension: Option<&str>,",
+            ") -> Option<crate::language::HighlighterFn> {",
+            "    crate::language::entry_for_extension(extension)?.highlighter",
+            "}",
+        ];
+        let rendered = highlight_block(lines.iter().copied(), Some("rs"));
+        let kinds: HashSet<HighlightKind> = rendered
+            .iter()
+            .flat_map(|line| &line.runs)
+            .map(|(_, kind)| *kind)
+            .collect();
+        assert!(
+            kinds.len() > 1,
+            "a real multi-line Rust block must produce more than one distinct HighlightKind, \
+             got {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&HighlightKind::Keyword),
+            "pub/fn should be classified as keywords"
+        );
+        let has_fn_name = rendered
+            .iter()
+            .flat_map(|line| &line.runs)
+            .any(|(text, kind)| {
+                text.as_ref() == "highlighter_for_extension" && *kind == HighlightKind::Function
+            });
+        assert!(
+            has_fn_name,
+            "the real fn name should be classified as a function"
+        );
+    }
+
+    #[test]
+    fn highlight_block_on_a_real_python_merge_hunk_produces_real_non_flat_color_runs() {
+        let lines = [
+            "def resolve(choice):",
+            "    if choice == \"left\":",
+            "        return ours",
+            "    return theirs",
+        ];
+        let rendered = highlight_block(lines.iter().copied(), Some("py"));
+        let kinds: HashSet<HighlightKind> = rendered
+            .iter()
+            .flat_map(|line| &line.runs)
+            .map(|(_, kind)| *kind)
+            .collect();
+        assert!(
+            kinds.len() > 1,
+            "a real multi-line Python block must produce more than one distinct HighlightKind, \
+             got {kinds:?}"
+        );
+        let has_def_keyword = rendered
+            .iter()
+            .flat_map(|line| &line.runs)
+            .any(|(text, kind)| text.as_ref() == "def" && *kind == HighlightKind::Keyword);
+        assert!(has_def_keyword, "def should be classified as a keyword");
+        let has_string_literal = rendered
+            .iter()
+            .flat_map(|line| &line.runs)
+            .any(|(text, kind)| text.as_ref() == "\"left\"" && *kind == HighlightKind::Literal);
+        assert!(
+            has_string_literal,
+            "the real string literal should be classified as Literal"
+        );
+    }
+
+    #[test]
+    fn highlight_block_on_an_unregistered_extension_is_all_plain_text() {
+        let rendered = highlight_block(["key = \"value\"", "other = 1"], Some("toml"));
+        let kinds: HashSet<HighlightKind> = rendered
+            .iter()
+            .flat_map(|line| &line.runs)
+            .map(|(_, kind)| *kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            HashSet::from([HighlightKind::Text]),
+            "an extension with no wired grammar must render as plain text, matching load_file's \
+             own 'unlisted extensions render as plain monospace text' precedent"
+        );
+    }
+
+    /// Regression: a genuinely empty side (zero real lines - e.g. a merge conflict hunk where
+    /// one side deletes everything) must produce zero `RenderedLine`s, not one fabricated blank
+    /// line via `build_lines`' own "an empty file still has one empty line" convention. A caller
+    /// driving row/gutter-number count off this `Vec`'s length must never render a phantom row
+    /// for content that was never real.
+    #[test]
+    fn highlight_block_on_zero_input_lines_returns_zero_rendered_lines() {
+        let rendered = highlight_block(std::iter::empty(), Some("rs"));
+        assert!(
+            rendered.is_empty(),
+            "zero real input lines must produce zero RenderedLines, not build_lines' one-empty-\
+             line-for-an-empty-file convention: got {rendered:?}"
+        );
+    }
+
+    /// Distinct from the zero-lines case above: one real, genuinely blank line (e.g. a real
+    /// blank line inside a conflict hunk's content) must still render as one real empty line -
+    /// the fix must not overcorrect into dropping real blank lines too.
+    #[test]
+    fn highlight_block_on_one_real_blank_line_still_returns_one_rendered_line() {
+        let rendered = highlight_block([""], Some("rs"));
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0].text, "");
+    }
+}
