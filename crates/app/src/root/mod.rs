@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use gpui::{
     actions, div, font, prelude::*, px, rems, uniform_list, App, BoxShadow, ClickEvent, Context,
     DragMoveEvent, Empty, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent,
-    Pixels, ScrollStrategy, Task, UniformListScrollHandle, Window, WindowControlArea,
+    Pixels, ScrollStrategy, Subscription, Task, UniformListScrollHandle, Window, WindowControlArea,
 };
 use wt_core::diff::{DiffBase, DiffFile, DiffLineKind, FileChangeStatus, WorktreeDiff};
 use wt_core::merge::{ConflictHunk, ConflictSegment, ConflictedPath};
@@ -49,6 +49,7 @@ use crate::env_info;
 use crate::file_tree::{self, FileTreeEntry, LangChip};
 use crate::hover_view;
 use crate::keymap::{self, WindowControlsStyle};
+use crate::keymap_overrides;
 use crate::language;
 use crate::layout;
 use crate::merge;
@@ -868,6 +869,23 @@ pub struct AdeApp {
     /// [`Self::filter_query`].
     settings_keymap_filter: String,
     settings_keymap_filter_focus_handle: FocusHandle,
+    /// The identity of the Keybindings row currently capturing a new chord, if any - see
+    /// [`Self::start_recording_keybinding`]'s own docs for the real `App::intercept_keystrokes`
+    /// mechanism this drives.
+    keymap_recording: Option<keymap_overrides::BindingIdentity>,
+    /// The live `App::intercept_keystrokes` subscription backing [`Self::keymap_recording`] -
+    /// `Some` for exactly as long as a row is recording, dropped by
+    /// [`Self::cancel_keybinding_recording`]/[`Self::finish_recording_keybinding`].
+    _keymap_intercept: Option<Subscription>,
+    /// A real, just-rejected rebind collision - `(identity of the row being recorded, message)` -
+    /// shown inline under that row by [`Self::render_settings_keymap_page`] until the next
+    /// recording attempt (successful or not) clears it.
+    keymap_rebind_error: Option<(keymap_overrides::BindingIdentity, String)>,
+    /// The live `Window::observe_window_appearance` subscription backing
+    /// [`Self::sync_theme_to_system_appearance`] - held for the entity's whole lifetime, set up
+    /// once at construction regardless of whether `Settings.theme.follow_system` starts on (see
+    /// that method's own docs for why).
+    _window_appearance_subscription: Subscription,
     /// Whether the tab strip's `+` menu popover is open - see [`Self::render_plus_menu`].
     /// Closed by its own scrim click, by picking a row, and defensively by
     /// [`Self::open_palette`]/[`Self::open_settings`] (it's rendered as an unconditional sibling

@@ -158,12 +158,12 @@ pub enum HighlightKind {
 /// `design_handoff_jerry_ade/README.md`'s File view table.
 pub fn color_for_kind(kind: HighlightKind) -> Rgba {
     match kind {
-        HighlightKind::Keyword => theme::syntax::KEYWORD,
-        HighlightKind::Function => theme::syntax::FUNCTION,
-        HighlightKind::Type => theme::syntax::TYPE,
-        HighlightKind::Literal => theme::syntax::LITERAL,
-        HighlightKind::Comment => theme::syntax::COMMENT,
-        HighlightKind::Text => theme::syntax::TEXT,
+        HighlightKind::Keyword => theme::syntax::KEYWORD.into(),
+        HighlightKind::Function => theme::syntax::FUNCTION.into(),
+        HighlightKind::Type => theme::syntax::TYPE.into(),
+        HighlightKind::Literal => theme::syntax::LITERAL.into(),
+        HighlightKind::Comment => theme::syntax::COMMENT.into(),
+        HighlightKind::Text => theme::syntax::TEXT.into(),
     }
 }
 

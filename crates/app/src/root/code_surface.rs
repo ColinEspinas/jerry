@@ -698,7 +698,7 @@ impl AdeApp {
             // so a future `DiffBase` variant isn't silently swallowed by a wildcard.
             DiffLoadState::Loaded(DiffBase::Diff(_)) => (String::new(), theme::text::FAINT),
         };
-        render_sidebar_message(text, color)
+        render_sidebar_message(text, color.into())
     }
 
     /// The centre's single-file Surface C, opened by a Changes-row click (`diff_file` always
@@ -1117,7 +1117,7 @@ impl AdeApp {
                 rem_px,
                 container.child(render_sidebar_message(
                     "binary file (contents not diffed)".to_string(),
-                    theme::text::FAINT,
+                    theme::text::FAINT.into(),
                 )),
             );
         }
@@ -1131,7 +1131,7 @@ impl AdeApp {
                 rem_px,
                 container.child(render_sidebar_message(
                     changes::empty_hunks_message(file.status).to_string(),
-                    theme::text::FAINT,
+                    theme::text::FAINT.into(),
                 )),
             );
         }
@@ -1185,7 +1185,7 @@ impl AdeApp {
         if file.truncated || hunks_truncated {
             container = container.child(render_sidebar_message(
                 "... diff truncated for this file".to_string(),
-                theme::text::FAINT,
+                theme::text::FAINT.into(),
             ));
         }
 
@@ -1310,12 +1310,12 @@ impl AdeApp {
                 FileLoadState::Error(error_path, message) if error_path == &absolute_path => {
                     render_sidebar_message(
                         format!("failed to read {}: {message}", absolute_path.display()),
-                        theme::status::FAIL,
+                        theme::status::FAIL.into(),
                     )
                 }
                 _ => render_sidebar_message(
                     format!("loading {}...", absolute_path.display()),
-                    theme::text::FAINT,
+                    theme::text::FAINT.into(),
                 ),
             };
         }
@@ -1458,7 +1458,7 @@ impl AdeApp {
         };
 
         let Some(parsed) = self.file_view_cache.as_ref() else {
-            return render_sidebar_message("no file loaded".to_string(), theme::text::FAINT);
+            return render_sidebar_message("no file loaded".to_string(), theme::text::FAINT.into());
         };
 
         let cursor = self.code_cursor;
@@ -1709,7 +1709,7 @@ impl AdeApp {
                          hover may briefly lag behind your very latest keystroke (change markers \
                          still reflect only the saved file until you save)"
                             .to_string(),
-                        theme::text::FAINT,
+                        theme::text::FAINT.into(),
                     )),
             );
         }
@@ -1719,7 +1719,7 @@ impl AdeApp {
         if truncated {
             body = body.child(render_sidebar_message(
                 "... file truncated (larger than 2 MiB) - read-only".to_string(),
-                theme::text::FAINT,
+                theme::text::FAINT.into(),
             ));
         }
         if conflict {
@@ -1728,10 +1728,10 @@ impl AdeApp {
                  edits - secondary-s is blocked; press secondary-shift-s to overwrite the \
                  external change with your edits anyway"
                     .to_string(),
-                theme::status::FAIL,
+                theme::status::FAIL.into(),
             ));
         } else if let Some(message) = save_error {
-            body = body.child(render_sidebar_message(message, theme::status::FAIL));
+            body = body.child(render_sidebar_message(message, theme::status::FAIL.into()));
         }
         if let Some(card) = diagnostics_card {
             body = body.child(card);
@@ -2152,7 +2152,7 @@ pub(super) fn render_diff_line(
             // git-gutter marker so consecutive added/removed rows read as one continuous strip
             // rather than leaving gaps at higher zoom.
             .self_stretch()
-            .bg(accent.unwrap_or(work_surface::TRANSPARENT)),
+            .bg(accent.unwrap_or(theme::ColorToken(work_surface::TRANSPARENT))),
     );
 
     let mut text_row = div().flex().flex_1().min_w_0();
@@ -2220,8 +2220,8 @@ pub(super) fn render_accept_file_button(macos: bool) -> impl IntoElement {
         )
         .child(render_action_keycap_row(
             &parts,
-            theme::text::GHOSTER,
-            theme::border::BUTTON_DISABLED,
+            theme::text::GHOSTER.into(),
+            theme::border::BUTTON_DISABLED.into(),
         ))
 }
 
@@ -2283,10 +2283,10 @@ pub(super) fn render_file_breadcrumb(relative_path: &Path) -> impl IntoElement {
 /// LSP hints are the least severe/most subtle diagnostic kind.
 pub(super) fn diagnostic_underline_color(severity: diagnostics_view::Severity) -> gpui::Rgba {
     match severity {
-        diagnostics_view::Severity::Error => theme::syntax::ERROR_UNDERLINE,
-        diagnostics_view::Severity::Warning => theme::term::WARN,
-        diagnostics_view::Severity::Information => theme::text::DIM,
-        diagnostics_view::Severity::Hint => theme::text::FAINT,
+        diagnostics_view::Severity::Error => theme::syntax::ERROR_UNDERLINE.into(),
+        diagnostics_view::Severity::Warning => theme::term::WARN.into(),
+        diagnostics_view::Severity::Information => theme::text::DIM.into(),
+        diagnostics_view::Severity::Hint => theme::text::FAINT.into(),
     }
 }
 
@@ -2296,7 +2296,7 @@ pub(super) fn diagnostic_underline_color(severity: diagnostics_view::Severity) -
 /// severity visibly less alarming than an error.
 pub(super) fn diagnostic_row_bg(severity: diagnostics_view::Severity) -> Option<gpui::Rgba> {
     match severity {
-        diagnostics_view::Severity::Error => Some(theme::syntax::DIAGNOSTIC_ROW_BG),
+        diagnostics_view::Severity::Error => Some(theme::syntax::DIAGNOSTIC_ROW_BG.into()),
         _ => None,
     }
 }
@@ -2306,8 +2306,8 @@ pub(super) fn diagnostic_row_bg(severity: diagnostics_view::Severity) -> Option<
 /// [`theme::text::FAINT`].
 pub(super) fn diagnostic_inline_message_color(severity: diagnostics_view::Severity) -> gpui::Rgba {
     match severity {
-        diagnostics_view::Severity::Error => theme::syntax::DIAGNOSTIC_INLINE_MESSAGE,
-        _ => theme::text::FAINT,
+        diagnostics_view::Severity::Error => theme::syntax::DIAGNOSTIC_INLINE_MESSAGE.into(),
+        _ => theme::text::FAINT.into(),
     }
 }
 
@@ -2428,7 +2428,7 @@ pub(super) fn render_file_view_line(
             // is always `Some` here; `unwrap_or` is a fallback, not a reachable default.
             let underline_color = worst_severity
                 .map(diagnostic_underline_color)
-                .unwrap_or(theme::syntax::ERROR_UNDERLINE);
+                .unwrap_or(theme::syntax::ERROR_UNDERLINE.into());
             run = run
                 .border_b_2()
                 .border_color(underline_color)
@@ -2534,7 +2534,7 @@ pub(super) fn render_file_view_line(
                 .bg(if is_changed {
                     theme::diff::GIT_GUTTER
                 } else {
-                    work_surface::TRANSPARENT
+                    theme::ColorToken(work_surface::TRANSPARENT)
                 }),
         )
         .child(
@@ -2570,9 +2570,9 @@ pub(super) fn render_file_view_line(
 fn lsp_status_label(status: &LspFileStatus, binary: Option<&str>) -> (gpui::Rgba, String) {
     let binary = binary.unwrap_or("language server");
     match status {
-        LspFileStatus::Spawning => (theme::text::GHOST, format!("starting {binary}...")),
-        LspFileStatus::Failed(message) => (theme::status::FAIL, message.clone()),
-        LspFileStatus::Indexing => (theme::status::ASK, format!("{binary}: indexing...")),
+        LspFileStatus::Spawning => (theme::text::GHOST.into(), format!("starting {binary}...")),
+        LspFileStatus::Failed(message) => (theme::status::FAIL.into(), message.clone()),
+        LspFileStatus::Indexing => (theme::status::ASK.into(), format!("{binary}: indexing...")),
         LspFileStatus::Analyzed { errors, warnings } => {
             let color = if *errors > 0 {
                 theme::status::FAIL
@@ -2584,7 +2584,7 @@ fn lsp_status_label(status: &LspFileStatus, binary: Option<&str>) -> (gpui::Rgba
             } else {
                 format!("{binary}: {errors} errors, {warnings} warnings")
             };
-            (color, label)
+            (color.into(), label)
         }
     }
 }

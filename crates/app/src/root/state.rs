@@ -159,6 +159,19 @@ impl AdeApp {
             _lsp_rows_task: None,
             settings_keymap_filter: String::new(),
             settings_keymap_filter_focus_handle: cx.focus_handle(),
+            keymap_recording: None,
+            _keymap_intercept: None,
+            keymap_rebind_error: None,
+            // Set up once, regardless of whether `follow_system` starts on - see
+            // `Self::sync_theme_to_system_appearance`'s own docs for why the callback checks the
+            // live setting itself on every real fire rather than this subscription being
+            // conditionally created.
+            _window_appearance_subscription: cx.observe_window_appearance(
+                window,
+                |this, window, cx| {
+                    this.sync_theme_to_system_appearance(window, cx);
+                },
+            ),
             plus_menu_open: false,
             plus_button_bounds: gpui::Bounds::default(),
             title_menu_open: None,
@@ -168,6 +181,23 @@ impl AdeApp {
             new_file_focus_handle: cx.focus_handle(),
             new_file_error: None,
         };
+        // Applies `this.settings.keymap.overrides` on top of `crate::default_key_bindings()` -
+        // see `Self::apply_effective_key_bindings`'s own docs. Must run before this constructor
+        // returns and the entity's first render, so a persisted rebind is live from the very
+        // first frame, not just after the next settings change - real "apply overrides at
+        // startup", not only "apply overrides when later edited".
+        this.apply_effective_key_bindings(cx);
+        // Applies the real, persisted theme selection at startup (`Self::apply_theme_selection`)
+        // - if `follow_system` is also on, the real, current OS appearance takes priority over
+        // whatever `theme.name` was last persisted as, matching `Self::sync_theme_to_system_
+        // appearance`'s own live behavior (see that method's docs); `apply_theme_selection`'s own
+        // call at the end is always run regardless, since `apply_follow_system_appearance` is a
+        // no-op (and doesn't itself apply anything) when the resolved name already matches.
+        if this.settings.theme.follow_system {
+            let appearance = window.appearance();
+            this.apply_follow_system_appearance(appearance, cx);
+        }
+        this.apply_theme_selection(cx);
         // A fresh window starts with one shell in the repo root, as a tab like any other.
         // `focus_active` below moves real keyboard focus onto it - see `Sessions::focus_active`'s
         // docs and this crate's `OverlayFocus`/`restore_focus` docs for why a fresh window must

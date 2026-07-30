@@ -530,7 +530,7 @@ impl AdeApp {
             .px(px(10.0))
             .cursor_pointer()
             .bg(if is_open {
-                theme::surface::SEGMENT_TRACK
+                theme::surface::SEGMENT_TRACK.into()
             } else {
                 work_surface::TRANSPARENT
             })
@@ -629,8 +629,8 @@ impl AdeApp {
                     .child(
                         render_dropdown_menu_row(
                             "\u{276f}",
-                            theme::text::DIM,
-                            theme::surface::CHIP_NEUTRAL,
+                            theme::text::DIM.into(),
+                            theme::surface::CHIP_NEUTRAL.into(),
                             "New terminal",
                             "in this worktree".to_string(),
                             keymap::resolve_combo("ctrl+shift+T", macos),
@@ -647,8 +647,8 @@ impl AdeApp {
                     .child(
                         render_dropdown_menu_row(
                             "+",
-                            theme::text::DIM,
-                            theme::surface::CHIP_NEUTRAL,
+                            theme::text::DIM.into(),
+                            theme::surface::CHIP_NEUTRAL.into(),
                             "New file",
                             "in this worktree".to_string(),
                             // No keycap: same reasoning as the "Open file…" row below - no
@@ -686,8 +686,8 @@ impl AdeApp {
                     .child(
                         render_dropdown_menu_row(
                             "@",
-                            theme::palette::COMMAND_CHIP.0,
-                            theme::palette::COMMAND_CHIP.1,
+                            theme::palette::COMMAND_CHIP.0.into(),
+                            theme::palette::COMMAND_CHIP.1.into(),
                             "Open file\u{2026}",
                             "search this worktree".to_string(),
                             // No keycap: this row has no global keybinding (see the function
@@ -710,8 +710,8 @@ impl AdeApp {
                     .child(
                         render_dropdown_menu_row(
                             "]",
-                            theme::text::DIM,
-                            theme::surface::CHIP_NEUTRAL,
+                            theme::text::DIM.into(),
+                            theme::surface::CHIP_NEUTRAL.into(),
                             "Next changed file",
                             format!("{changed_count} changed"),
                             keymap::resolve_combo("]", macos),
@@ -1482,7 +1482,7 @@ impl AdeApp {
             .border_color(if enabled {
                 colors.border
             } else {
-                theme::border::BUTTON_DISABLED
+                theme::border::BUTTON_DISABLED.into()
             })
             .child(
                 div()
@@ -1492,7 +1492,7 @@ impl AdeApp {
                     .text_color(if enabled {
                         colors.fg
                     } else {
-                        theme::text::GHOSTER
+                        theme::text::GHOSTER.into()
                     })
                     .child(label),
             );
@@ -1501,7 +1501,10 @@ impl AdeApp {
             let (keycap_fg, keycap_border) = if enabled {
                 (colors.keycap_fg, colors.keycap_border)
             } else {
-                (theme::text::GHOSTER, theme::border::BUTTON_DISABLED)
+                (
+                    theme::text::GHOSTER.into(),
+                    theme::border::BUTTON_DISABLED.into(),
+                )
             };
             let parts = keymap::resolve_combo(spec, self.window_controls_style().is_macos());
             button = button.child(render_action_keycap_row(&parts, keycap_fg, keycap_border));
@@ -1659,13 +1662,13 @@ pub(super) fn render_dropdown_menu_row(
     keys: Vec<String>,
     enabled: bool,
 ) -> gpui::Stateful<gpui::Div> {
-    let (chip_fg, chip_bg, label_color) = if enabled {
-        (chip_fg, chip_bg, theme::text::HEADING)
+    let (chip_fg, chip_bg, label_color): (gpui::Rgba, gpui::Rgba, gpui::Rgba) = if enabled {
+        (chip_fg, chip_bg, theme::text::HEADING.into())
     } else {
         (
-            theme::text::GHOSTER,
-            theme::surface::CHIP_NEUTRAL,
-            theme::text::GHOSTER,
+            theme::text::GHOSTER.into(),
+            theme::surface::CHIP_NEUTRAL.into(),
+            theme::text::GHOSTER.into(),
         )
     };
     let mut row = div()

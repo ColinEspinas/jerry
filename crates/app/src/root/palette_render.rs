@@ -438,7 +438,7 @@ impl AdeApp {
             .left(px(0.0))
             .right(px(0.0))
             .bottom(px(0.0))
-            .bg(theme::surface::SCRIM.opacity(0.62))
+            .bg(theme::surface::SCRIM.resolve().opacity(0.62))
             .flex()
             .justify_center()
             .items_start()
@@ -729,14 +729,14 @@ impl AdeApp {
             .border_color(if selected {
                 theme::border::SELECTED_EDGE
             } else {
-                work_surface::TRANSPARENT
+                theme::ColorToken(work_surface::TRANSPARENT)
             })
             .when(selected, |el| el.bg(theme::surface::ROW_SELECTED))
             .when(!selected, |el| {
                 el.hover(|el| el.bg(theme::palette::ROW_HOVER))
             })
             .child(chip)
-            .child(render_palette_label(&entry.label, mono, label_fg))
+            .child(render_palette_label(&entry.label, mono, label_fg.into()))
             .child(
                 div()
                     .flex_1()

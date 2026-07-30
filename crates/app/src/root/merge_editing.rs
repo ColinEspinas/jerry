@@ -335,7 +335,7 @@ fn render_merge_edit_line(
                             bounds.bottom(),
                         ),
                     ),
-                    theme::syntax::CARET.opacity(0.28),
+                    theme::syntax::CARET.resolve().opacity(0.28),
                 )
             });
             let cursor_quad = cursor_local.map(|offset| {

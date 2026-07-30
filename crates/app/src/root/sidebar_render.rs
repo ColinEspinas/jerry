@@ -53,9 +53,9 @@ impl AdeApp {
             .iter()
             .filter_map(|file| {
                 let mark = match file.status {
-                    FileChangeStatus::Added => ("A", theme::tag::TREE_ADDED),
+                    FileChangeStatus::Added => ("A", theme::tag::TREE_ADDED.into()),
                     FileChangeStatus::Modified | FileChangeStatus::Renamed => {
-                        ("M", theme::tag::TREE_MODIFIED)
+                        ("M", theme::tag::TREE_MODIFIED.into())
                     }
                     FileChangeStatus::Deleted => return None,
                 };
@@ -77,11 +77,14 @@ impl AdeApp {
         if let Some(error) = &self.file_tree_error {
             return render_sidebar_message(
                 format!("failed to read directory: {error}"),
-                theme::status::FAIL,
+                theme::status::FAIL.into(),
             );
         }
         if self.file_tree.is_empty() {
-            return render_sidebar_message("(empty directory)".to_string(), theme::text::FAINT);
+            return render_sidebar_message(
+                "(empty directory)".to_string(),
+                theme::text::FAINT.into(),
+            );
         }
 
         let visible = file_tree::visible_entries(&self.file_tree, &self.collapsed_dirs);
@@ -107,7 +110,7 @@ impl AdeApp {
                     "... and {} more entries not shown",
                     visible.len() - rendered_count
                 ),
-                theme::text::FAINT,
+                theme::text::FAINT.into(),
             ));
         }
 
@@ -433,7 +436,7 @@ impl AdeApp {
             return self.render_diff_state_message();
         };
         if diff.files.is_empty() {
-            return render_sidebar_message("no changes".to_string(), theme::text::FAINT);
+            return render_sidebar_message("no changes".to_string(), theme::text::FAINT.into());
         }
 
         let rendered_count = diff.files.len().min(MAX_RENDERED_DIFF_FILES);
@@ -448,7 +451,7 @@ impl AdeApp {
                 "diff truncated: this worktree's real changes exceeded wt_core::diff's own \
                  load limits, so some files or lines are missing from this list"
                     .to_string(),
-                theme::status::ASK,
+                theme::status::ASK.into(),
             ));
         }
         for file in &diff.files[..rendered_count] {
@@ -460,7 +463,7 @@ impl AdeApp {
                     "... and {} more changed files not shown",
                     diff.files.len() - rendered_count
                 ),
-                theme::text::FAINT,
+                theme::text::FAINT.into(),
             ));
         }
         list.into_any_element()
@@ -662,10 +665,13 @@ pub(super) fn render_tree_caret(is_dir: bool, open: bool, text_size: Pixels) -> 
 /// version gave the tab the same hollow-when-collapsed treatment as the body; the mockup's
 /// collapsed-folder tab is solid, not outlined.
 pub(super) fn render_folder_icon(open: bool) -> impl IntoElement {
-    let (fill, border) = if open {
-        (theme::surface::CHIP_NEUTRAL, theme::text::FAINT)
+    let (fill, border): (gpui::Rgba, gpui::Rgba) = if open {
+        (
+            theme::surface::CHIP_NEUTRAL.into(),
+            theme::text::FAINT.into(),
+        )
     } else {
-        (work_surface::TRANSPARENT, theme::text::GHOST)
+        (work_surface::TRANSPARENT, theme::text::GHOST.into())
     };
 
     div()

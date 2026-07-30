@@ -89,6 +89,10 @@ impl AdeApp {
     /// [`Self::handle_settings_key_down`]) and restores focus via [`restore_focus`].
     pub(super) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = false;
+        // A live keybinding-recording intercept (`Self::_keymap_intercept`) is a real, global
+        // `App::intercept_keystrokes` subscription - it must never survive leaving the Settings
+        // surface, or every keystroke in the whole app would keep being silently swallowed.
+        self.cancel_keybinding_recording(cx);
         restore_focus(&self.sessions, &mut self.settings_focus, window, cx);
         cx.notify();
     }

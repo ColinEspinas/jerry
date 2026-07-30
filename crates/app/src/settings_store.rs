@@ -52,9 +52,12 @@
 //! already was. `per_tab_zoom`, `AdeApp::file_zoom_percent`, and the worktree-reset are gone
 //! entirely - see `crate::root::code_surface`'s zoom methods for the surviving mechanism.
 //!
-//! [`ThemeSettings`] round-trips correctly but nothing in the render pipeline reads it yet to
-//! re-skin colours - `crate::theme` is a set of compile-time `const` colour tokens, not yet a
-//! runtime-swappable resource; a theme-swap engine is separately tracked follow-up work.
+//! [`ThemeSettings`] round-trips **and** really re-skins the running app: `crate::root::AdeApp::
+//! apply_theme_selection` applies `name` against `crate::theme::set_current_theme_index` (see
+//! that module's own docs for the runtime colour-token mechanism this drives), and `follow_system`
+//! is real too (`crate::root::AdeApp::sync_theme_to_system_appearance`, a live
+//! `Window::observe_window_appearance` subscription). `high_contrast_diff` stays persisted-only -
+//! no real diff-colour-intensity mechanism exists yet to apply it through.
 
 use std::path::{Path, PathBuf};
 
@@ -73,6 +76,7 @@ pub struct Settings {
     pub window: WindowSettings,
     pub appearance: AppearanceSettings,
     pub theme: ThemeSettings,
+    pub keymap: KeymapSettings,
 }
 
 /// `crate::root::AdeApp::window_controls_style`'s persisted backing - see
@@ -155,13 +159,22 @@ impl AppearanceSettings {
 }
 
 /// The Themes settings page's persisted fields - `name` is the currently-selected
-/// [`crate::settings::THEME_DEFS`] entry's name (`"Jerry Dark"` by default). See the module
-/// docs for why selecting anything else persists correctly without yet re-skinning the app.
+/// [`crate::settings::THEME_DEFS`] entry's name (`"Jerry Dark"` by default).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeSettings {
     pub name: String,
     pub follow_system: bool,
+    /// The most recent *dark* theme `name` was ever explicitly set to (defaults to `"Jerry
+    /// Dark"`) - real, persisted memory for `follow_system`'s own real OS-dark-signal handling
+    /// (`crate::root::AdeApp::apply_follow_system_appearance`): without this, a user on e.g.
+    /// "Slate" who turns `follow_system` on and later has their OS switch to light-then-dark
+    /// again would land back on the hardcoded default "Jerry Dark" rather than their own real,
+    /// previously-chosen dark theme - a real, reported data-loss gap an audit caught. Updated by
+    /// `crate::root::AdeApp::set_theme_name` every time a real, non-"Paper" (i.e. not the one
+    /// light theme) selection is made, so it always reflects the last dark theme a user actually
+    /// picked, whether or not `follow_system` was on at the time.
+    pub last_dark_theme: String,
     pub high_contrast_diff: bool,
 }
 
@@ -170,9 +183,43 @@ impl Default for ThemeSettings {
         Self {
             name: "Jerry Dark".to_string(),
             follow_system: false,
+            last_dark_theme: "Jerry Dark".to_string(),
             high_contrast_diff: false,
         }
     }
+}
+
+/// The Keybindings settings page's persisted rebinds - see `crate::keymap_overrides`'s own
+/// module docs for the real mechanism this backs (identity, collision detection, and how
+/// `overrides` is turned into a real, effective `Vec<gpui::KeyBinding>` on top of
+/// `crate::default_key_bindings()`). A flat `Vec`, not a table keyed by some derived id:
+/// [`KeybindingOverride`]'s own three identity fields already are the real, stable identity
+/// (`keymap_overrides::BindingIdentity`), and a list round-trips through TOML more simply than a
+/// table keyed by a composite string would.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeymapSettings {
+    pub overrides: Vec<KeybindingOverride>,
+}
+
+/// One real, persisted keybinding rebind - see [`KeymapSettings::overrides`]'s own docs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeybindingOverride {
+    /// The rebound action's real `gpui::Action::name()` (e.g. `"app::TogglePalette"`).
+    pub action: String,
+    /// The rebound binding's real registered context predicate's `Display` string, or the
+    /// literal `"global"` when unscoped - matches `crate::settings::KeybindingRow::context`'s own
+    /// convention exactly, so the two never need reconciling.
+    pub context: String,
+    /// The *default* keystroke(s) this override replaces, space-joined via
+    /// `gpui::Keystroke::unparse()` - part of the real identity (see `keymap_overrides`'s module
+    /// docs), not just informational: needed to disambiguate two default bindings that already
+    /// share the same action/context (e.g. `CompletionsAccept` is bound to both `tab` and
+    /// `enter`, both under `"file-editor && completions"`).
+    pub default_keystrokes: String,
+    /// The new keystroke chord, in the same `gpui::Keystroke::parse`-compatible, space-joined
+    /// `unparse()` form as [`Self::default_keystrokes`].
+    pub keystrokes: String,
 }
 
 /// The config banner's `TOML | JSON` segment state (`CHANGELOG.md`'s change 3) - a display-only
@@ -418,7 +465,47 @@ mod tests {
         assert_eq!(settings.appearance.editor_zoom_percent, 100);
         assert_eq!(settings.theme.name, "Jerry Dark");
         assert!(!settings.theme.follow_system);
+        assert_eq!(settings.theme.last_dark_theme, "Jerry Dark");
         assert!(!settings.theme.high_contrast_diff);
+        assert!(
+            settings.keymap.overrides.is_empty(),
+            "a fresh install has no real rebinds yet"
+        );
+    }
+
+    /// An old `settings.toml` written before keybinding rebinding existed has no `[keymap]`
+    /// section at all - `#[serde(default)]` on [`Settings`] must fall back to an empty
+    /// `overrides` list rather than failing the whole parse.
+    #[test]
+    fn an_old_settings_toml_missing_the_keymap_section_entirely_still_loads_cleanly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[window]\ncontrols = \"system\"\n").expect("write old file");
+
+        let loaded = Settings::load_or_init_at(&path);
+
+        assert!(loaded.keymap.overrides.is_empty());
+    }
+
+    #[test]
+    fn a_real_keybinding_override_round_trips_through_toml_save_and_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+
+        let mut settings = Settings::default();
+        settings.keymap.overrides.push(KeybindingOverride {
+            action: "app::TogglePalette".to_string(),
+            context: "global".to_string(),
+            default_keystrokes: "ctrl-k".to_string(),
+            keystrokes: "ctrl-shift-p".to_string(),
+        });
+
+        settings.save_at(&path).expect("save should succeed");
+        let loaded = Settings::load_or_init_at(&path);
+
+        assert_eq!(settings, loaded);
+        assert_eq!(loaded.keymap.overrides.len(), 1);
+        assert_eq!(loaded.keymap.overrides[0].keystrokes, "ctrl-shift-p");
     }
 
     #[test]

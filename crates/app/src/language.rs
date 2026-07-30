@@ -184,8 +184,11 @@ pub struct ExtensionEntry {
     /// [`LspIdentity`].
     pub lsp_language_id: &'static str,
     pub chip_label: &'static str,
-    /// `(fg, bg)`, straight from `crate::theme::lang`.
-    pub chip_colors: (Rgba, Rgba),
+    /// `(fg, bg)`, straight from `crate::theme::lang`. Kept as the real, still-`const`-usable
+    /// [`crate::theme::ColorToken`] (this whole struct lives inside the real compile-time
+    /// `const` array [`EXTENSIONS`], which a runtime-resolved `Rgba` couldn't) - resolved to a
+    /// concrete `Rgba` only where actually consumed (`chip_for_extension`).
+    pub chip_colors: (theme::ColorToken, theme::ColorToken),
     pub lsp: Option<LspIdentity>,
     /// The Settings "Language servers" page's own real row for this language - `Some` for
     /// exactly the five extensions that page shows one row per (`rs`/`ts`/`vue`/`py`/`go`, one
@@ -692,8 +695,16 @@ pub fn display_name_for_extension(extension: Option<&str>) -> &'static str {
 /// every file row still gets *some* chip.
 pub fn chip_for_extension(extension: Option<&str>) -> (&'static str, Rgba, Rgba) {
     match entry_for_extension(extension) {
-        Some(entry) => (entry.chip_label, entry.chip_colors.0, entry.chip_colors.1),
-        None => (".", theme::lang::UNKNOWN.0, theme::lang::UNKNOWN.1),
+        Some(entry) => (
+            entry.chip_label,
+            entry.chip_colors.0.into(),
+            entry.chip_colors.1.into(),
+        ),
+        None => (
+            ".",
+            theme::lang::UNKNOWN.0.into(),
+            theme::lang::UNKNOWN.1.into(),
+        ),
     }
 }
 
@@ -865,11 +876,17 @@ mod tests {
     fn chip_for_extension_falls_back_to_the_neutral_unknown_chip() {
         let (label, fg, bg) = chip_for_extension(Some("rs"));
         assert_eq!(label, "rs");
-        assert_eq!((fg, bg), theme::lang::RS);
+        assert_eq!(
+            (fg, bg),
+            (theme::lang::RS.0.into(), theme::lang::RS.1.into())
+        );
 
         let (label, fg, bg) = chip_for_extension(Some("xyz"));
         assert_eq!(label, ".");
-        assert_eq!((fg, bg), theme::lang::UNKNOWN);
+        assert_eq!(
+            (fg, bg),
+            (theme::lang::UNKNOWN.0.into(), theme::lang::UNKNOWN.1.into())
+        );
     }
 
     #[test]

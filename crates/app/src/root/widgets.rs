@@ -96,22 +96,23 @@ pub(super) fn render_hint_row(
 /// parameterless, real-environment-reading widget so future call sites (status bar, Settings)
 /// can reuse it rather than hand-copying a second chip.
 pub(super) fn render_env_chip() -> impl IntoElement {
-    let (label, fg, bg, border) = if env_info::is_wsl() {
-        let distro = env_info::wsl_distro_name().unwrap_or("WSL");
-        (
-            format!("WSL \u{b7} {distro}"),
-            theme::env::WSL_FG,
-            theme::env::WSL_BG,
-            theme::env::WSL_BORDER,
-        )
-    } else {
-        (
-            format!("local \u{b7} {}", env_info::local_arch()),
-            theme::env::LOCAL_FG,
-            work_surface::TRANSPARENT,
-            theme::env::LOCAL_BORDER,
-        )
-    };
+    let (label, fg, bg, border): (String, gpui::Rgba, gpui::Rgba, gpui::Rgba) =
+        if env_info::is_wsl() {
+            let distro = env_info::wsl_distro_name().unwrap_or("WSL");
+            (
+                format!("WSL \u{b7} {distro}"),
+                theme::env::WSL_FG.into(),
+                theme::env::WSL_BG.into(),
+                theme::env::WSL_BORDER.into(),
+            )
+        } else {
+            (
+                format!("local \u{b7} {}", env_info::local_arch()),
+                theme::env::LOCAL_FG.into(),
+                work_surface::TRANSPARENT,
+                theme::env::LOCAL_BORDER.into(),
+            )
+        };
 
     div()
         .flex_none()

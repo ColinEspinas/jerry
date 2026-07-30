@@ -1089,7 +1089,7 @@ pub(super) fn render_editable_file_view_line(
                             bounds.bottom(),
                         ),
                     ),
-                    theme::syntax::CARET.opacity(0.28),
+                    theme::syntax::CARET.resolve().opacity(0.28),
                 )
             });
             let cursor_quad = cursor_local.map(|offset| {
@@ -1250,7 +1250,7 @@ pub(super) fn render_editable_file_view_line(
                 .bg(if is_changed {
                     theme::diff::GIT_GUTTER
                 } else {
-                    crate::work_surface::TRANSPARENT
+                    theme::ColorToken(crate::work_surface::TRANSPARENT)
                 }),
         )
         .child(
@@ -1301,7 +1301,7 @@ fn build_text_runs(
         let underline = if is_diagnostic {
             let color = worst_severity
                 .map(diagnostic_underline_color)
-                .unwrap_or(theme::syntax::ERROR_UNDERLINE);
+                .unwrap_or(theme::syntax::ERROR_UNDERLINE.into());
             Some(UnderlineStyle {
                 color: Some(color.into()),
                 thickness: gpui::px(1.0),
@@ -1431,7 +1431,7 @@ fn text_run_div(
         // piece, matching the read-only path's own precedence.
         let underline_color = worst_severity
             .map(diagnostic_underline_color)
-            .unwrap_or(theme::syntax::ERROR_UNDERLINE);
+            .unwrap_or(theme::syntax::ERROR_UNDERLINE.into());
         run = run
             .border_b_2()
             .border_color(underline_color)

@@ -32,8 +32,11 @@ impl AdeApp {
         }
     }
 
-    /// Selects a Settings nav page - the nav row click handler.
+    /// Selects a Settings nav page - the nav row click handler. Cancels any in-progress
+    /// keybinding recording first - see [`Self::close_settings`]'s identical reasoning for why a
+    /// live `App::intercept_keystrokes` subscription must never outlive the page it started on.
     pub(super) fn select_settings_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        self.cancel_keybinding_recording(cx);
         self.settings_page = page;
         cx.notify();
     }
@@ -219,9 +222,12 @@ impl AdeApp {
                 // `crate::settings::keybinding_rows`'s own docs).
                 SettingsPage::Theme => Some(settings::THEME_DEFS.len().to_string()),
                 SettingsPage::Keymap => Some(
-                    settings::keybinding_rows(&crate::default_key_bindings())
-                        .len()
-                        .to_string(),
+                    settings::keybinding_rows(
+                        &crate::default_key_bindings(),
+                        &self.settings.keymap.overrides,
+                    )
+                    .len()
+                    .to_string(),
                 ),
                 SettingsPage::LanguageServers => Some(settings::lsp_languages().len().to_string()),
                 // Every other page has nothing real to count - omitted rather than invented.
@@ -251,7 +257,7 @@ impl AdeApp {
             .gap(px(8.0))
             .border_l(px(2.0))
             .border_color(if active {
-                theme::border::SELECTED_EDGE
+                theme::border::SELECTED_EDGE.into()
             } else {
                 work_surface::TRANSPARENT
             })
@@ -1042,12 +1048,15 @@ impl AdeApp {
     }
 
     /// *Themes* - the six cards from `crate::settings::THEME_DEFS`, with persisted selection.
-    /// Selecting a card other than "Jerry Dark" persists correctly (`Self::settings.theme.name`
-    /// round-trips through `settings.toml`) but does **not** yet re-skin the running app -
-    /// `crate::theme` is hundreds of compile-time `const` colour tokens, not a runtime-swappable
-    /// resource. A live theme-swap engine is substantial follow-up work, named and deliberately
-    /// deferred rather than faked with something like a global colour-multiplier hack (see
-    /// `BUILD-LOG.md`'s Revision R1 background-task-dispatch note for the same pattern).
+    /// Selecting a card persists (`Self::settings.theme.name` round-trips through
+    /// `settings.toml`) **and** really re-skins the running app: `crate::theme`'s ~200 colour
+    /// tokens are each a `crate::theme::ColorToken`, resolved against a real, live-selected
+    /// index (`crate::theme::current_theme_index`) rather than a plain compile-time constant -
+    /// see that module's own docs for the runtime mechanism and how the five non-Jerry-Dark
+    /// palettes are derived. `Self::set_theme_name` is the one real place a selection is applied:
+    /// it updates the shared index and forces a real full repaint
+    /// (`App::refresh_windows`) so every already-rendered surface picks up the new colours on the
+    /// very next frame, not just newly-mounted ones.
     pub(super) fn render_settings_theme_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let cards = div().flex().flex_wrap().gap(px(8.0)).children(
             settings::THEME_DEFS
@@ -1190,31 +1199,60 @@ impl AdeApp {
     }
 
     /// *Keybindings* - every row is derived at render time from
-    /// `crate::default_key_bindings()`'s live-registered `gpui::KeyBinding`s
-    /// (`crate::settings::keybinding_rows` - see that function's docs for why this replaced a
-    /// hand-maintained parallel list). No config banner/snippet here - these rows aren't
-    /// `settings.toml` keys, they're derived from compiled-in code
-    /// (`crate::settings_store::ConfigPage` has no `Keymap` variant). Read-only: no rebind UI,
-    /// since this app has no keymap-file-writing infrastructure to back one.
+    /// `crate::default_key_bindings()`'s live-registered `gpui::KeyBinding`s plus any real,
+    /// persisted `Settings.keymap.overrides` (`crate::settings::keybinding_rows` - see that
+    /// function's docs for why this replaced a hand-maintained parallel list). No config
+    /// banner/snippet here - these rows aren't a single flat `settings.toml` table the way
+    /// `crate::settings_store::ConfigPage`'s other pages are, since each one carries its own
+    /// per-row identity (see `crate::keymap_overrides::BindingIdentity`'s own docs).
+    ///
+    /// Real rebind UI: clicking a row's keycap starts recording (`Self::start_recording_
+    /// keybinding`), the next real physical key chord replaces it (or reports a real collision -
+    /// `Self::keymap_rebind_error`), and an overridden row gets a "Reset" affordance
+    /// (`Self::reset_one_keybinding`). "Reset all" (`Self::reset_all_keybindings`) clears every
+    /// override at once, shown only when at least one exists.
     pub(super) fn render_settings_keymap_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let macos = self.window_controls_style().is_macos();
         let bindings = crate::default_key_bindings();
-        let rows = settings::keybinding_rows(&bindings);
+        let rows = settings::keybinding_rows(&bindings, &self.settings.keymap.overrides);
         let filtered = settings::filter_keybinding_rows(&rows, &self.settings_keymap_filter);
         let last_index = filtered.len().saturating_sub(1);
+        let has_overrides = !self.settings.keymap.overrides.is_empty();
 
         div()
             .flex()
             .flex_col()
             .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
                     .pt(px(16.0))
                     .pb(px(6.0))
-                    .font(font(theme::font::SANS))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_size(px(9.5))
-                    .text_color(theme::palette::GROUP_HEADER)
-                    .child("Bindings"),
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_size(px(9.5))
+                            .text_color(theme::palette::GROUP_HEADER)
+                            .child("Bindings"),
+                    )
+                    .when(has_overrides, |el| {
+                        el.child(
+                            div()
+                                .id("settings-keymap-reset-all")
+                                .cursor_pointer()
+                                .font(font(theme::font::SANS))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_size(px(10.0))
+                                .text_color(theme::button::DANGER_FG)
+                                .hover(|el| el.text_color(theme::button::DANGER_FG_HOVER))
+                                .child("Reset all")
+                                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                    this.reset_all_keybindings(cx);
+                                })),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -1223,10 +1261,48 @@ impl AdeApp {
                     .border_color(theme::border::CARD)
                     .overflow_hidden()
                     .child(self.render_settings_keymap_filter_row(filtered.len(), rows.len(), cx))
-                    .children(filtered.iter().enumerate().map(|(index, row)| {
-                        self.render_settings_keybinding_row(row, index == last_index, macos)
+                    .children(filtered.iter().enumerate().flat_map(|(index, row)| {
+                        let mut elements = vec![self
+                            .render_settings_keybinding_row(row, index == last_index, macos, cx)
+                            .into_any_element()];
+                        if let Some((_, message)) = self
+                            .keymap_rebind_error
+                            .as_ref()
+                            .filter(|(identity, _)| identity == &row.identity)
+                        {
+                            elements.push(
+                                self.render_settings_keybinding_error_row(
+                                    message,
+                                    index == last_index,
+                                )
+                                .into_any_element(),
+                            );
+                        }
+                        elements
                     })),
             )
+    }
+
+    /// The inline collision-error banner directly under whichever row
+    /// [`Self::keymap_rebind_error`] is for - see [`Self::render_settings_keymap_page`]'s own
+    /// docs.
+    fn render_settings_keybinding_error_row(
+        &self,
+        message: &str,
+        is_last: bool,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .px(px(11.0))
+            .py(px(6.0))
+            .bg(theme::status::FAIL_BG)
+            .when(!is_last, |el| {
+                el.border_b_1().border_color(theme::settings::CARD_ROW_SEP)
+            })
+            .font(font(theme::font::SANS))
+            .text_size(px(10.0))
+            .text_color(theme::status::FAIL)
+            .child(message.to_string())
     }
 
     fn render_settings_keymap_filter_row(
@@ -1323,12 +1399,23 @@ impl AdeApp {
         row: &settings::KeybindingRow,
         is_last: bool,
         macos: bool,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let is_recording = self.keymap_recording.as_ref() == Some(&row.identity);
         let glyphs: Vec<String> = row
             .keystrokes
             .iter()
             .flat_map(|keystroke| keymap::resolve_keystroke(keystroke, macos))
             .collect();
+        let identity_for_record = row.identity.clone();
+        let identity_for_reset = row.identity.clone();
+        // The row's own full identity, not just `identity.action` - two rows can share an action
+        // (`CompletionsAccept` is bound twice, to `tab` and to `enter`), so `action` alone isn't
+        // a unique element id.
+        let row_key = format!(
+            "{}-{}-{}",
+            row.identity.action, row.identity.context, row.identity.default_keystrokes
+        );
         div()
             .id(format!("settings-keybinding-row-{}", row.command))
             // Test-only, no-op in release builds - lets `VisualTestContext::debug_bounds`
@@ -1378,18 +1465,226 @@ impl AdeApp {
                     .w(px(96.0))
                     .flex()
                     .justify_end()
-                    .child(render_keycap_row(&glyphs, KeycapSize::Standard)),
+                    .when(is_recording, |el| {
+                        el.child(
+                            div()
+                                .font(font(theme::font::MONO))
+                                .text_size(px(9.5))
+                                .text_color(theme::status::ASK)
+                                .child("press a key\u{2026}"),
+                        )
+                    })
+                    .when(!is_recording, |el| {
+                        el.child(render_keycap_row(&glyphs, KeycapSize::Standard))
+                    }),
             )
             .child(
                 div()
+                    .id(format!("settings-keybinding-record-{row_key}"))
                     .flex_none()
-                    .w(px(36.0))
+                    .w(px(46.0))
                     .text_right()
+                    .cursor_pointer()
                     .font(font(theme::font::MONO))
                     .text_size(px(9.5))
-                    .text_color(theme::text::FAINTER)
-                    .child("base"),
+                    .text_color(if is_recording {
+                        theme::status::ASK
+                    } else {
+                        theme::text::FAINTER
+                    })
+                    .hover(|el| el.text_color(theme::text::SELECTED))
+                    .child(if is_recording { "esc" } else { "rebind" })
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                        if this.keymap_recording.as_ref() == Some(&identity_for_record) {
+                            this.cancel_keybinding_recording(cx);
+                        } else {
+                            this.start_recording_keybinding(identity_for_record.clone(), cx);
+                        }
+                    })),
             )
+            .when(row.is_overridden, |el| {
+                el.child(
+                    div()
+                        .id(format!("settings-keybinding-reset-{row_key}"))
+                        .flex_none()
+                        .w(px(40.0))
+                        .text_right()
+                        .cursor_pointer()
+                        .font(font(theme::font::MONO))
+                        .text_size(px(9.5))
+                        .text_color(theme::button::DANGER_FG)
+                        .hover(|el| el.text_color(theme::button::DANGER_FG_HOVER))
+                        .child("reset")
+                        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                            this.reset_one_keybinding(identity_for_reset.clone(), cx);
+                        })),
+                )
+            })
+    }
+
+    /// Starts capturing a new chord for `identity` (the row's own "rebind" click) - see
+    /// [`Self::keymap_recording`]/[`Self::_keymap_intercept`]'s own docs for the real capture
+    /// mechanism (`App::intercept_keystrokes`, the same real API `vendor/zed/crates/
+    /// keymap_editor/src/ui_components/keystroke_input.rs`'s own keybinding-editor UI uses).
+    /// Clears any stale collision error first - a fresh recording attempt starts clean.
+    pub(super) fn start_recording_keybinding(
+        &mut self,
+        identity: keymap_overrides::BindingIdentity,
+        cx: &mut Context<Self>,
+    ) {
+        self.keymap_rebind_error = None;
+        self.keymap_recording = Some(identity);
+        let listener = cx.listener(|this, event: &gpui::KeystrokeEvent, _window, cx| {
+            this.handle_keymap_recording_keystroke(&event.keystroke, cx);
+        });
+        self._keymap_intercept = Some(cx.intercept_keystrokes(listener));
+        cx.notify();
+    }
+
+    /// Cancels an in-progress recording (clicking the row's own "esc" affordance, a real Esc
+    /// keystroke while recording, or leaving the Keybindings page/Settings entirely) without
+    /// changing anything - drops [`Self::_keymap_intercept`], the real, global subscription that
+    /// must never outlive the recording it belongs to.
+    pub(super) fn cancel_keybinding_recording(&mut self, cx: &mut Context<Self>) {
+        if self.keymap_recording.is_none() && self._keymap_intercept.is_none() {
+            return;
+        }
+        self.keymap_recording = None;
+        self._keymap_intercept = None;
+        cx.notify();
+    }
+
+    /// The real `App::intercept_keystrokes` callback while a row is recording -
+    /// `KeystrokeEvent::keystroke` is the real, physical chord (`vendor/zed/crates/gpui/src/
+    /// app.rs`'s own `KeystrokeEvent` struct). `cx.stop_propagation()` unconditionally swallows
+    /// every intercepted keystroke while recording, matching the task's own "without it being
+    /// consumed as a normal keystroke or dispatched to an existing action" requirement - a
+    /// modifier-only press (an empty `key`) keeps recording rather than being treated as the
+    /// captured chord, and a bare `Escape` (no modifiers) cancels instead of binding `Escape`
+    /// itself, matching this project's other Esc-cancels-an-overlay conventions.
+    fn handle_keymap_recording_keystroke(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(identity) = self.keymap_recording.clone() else {
+            self._keymap_intercept = None;
+            return;
+        };
+        cx.stop_propagation();
+        if keystroke.key.is_empty() {
+            // A modifier-only press (e.g. just holding Shift) - keep listening for the real key.
+            return;
+        }
+        if keystroke.key == "escape" && !keystroke.modifiers.modified() {
+            self.cancel_keybinding_recording(cx);
+            return;
+        }
+        self.finish_recording_keybinding(identity, keystroke.clone(), cx);
+    }
+
+    /// Real collision check (`keymap_overrides::find_colliding_binding`) plus, if the candidate
+    /// is safe, a real, persisted rebind - see `keymap_overrides`'s own module docs for both
+    /// mechanisms. Always ends the recording (successful or not); a genuine collision leaves
+    /// [`Self::keymap_rebind_error`] set for [`Self::render_settings_keymap_page`] to show inline
+    /// on the row that was being recorded, without touching `Settings.keymap.overrides` at all.
+    fn finish_recording_keybinding(
+        &mut self,
+        identity: keymap_overrides::BindingIdentity,
+        keystroke: gpui::Keystroke,
+        cx: &mut Context<Self>,
+    ) {
+        self.keymap_recording = None;
+        self._keymap_intercept = None;
+        let candidate = keystroke.unparse();
+        let defaults = crate::default_key_bindings();
+        let Some(for_binding) = defaults
+            .iter()
+            .find(|binding| keymap_overrides::BindingIdentity::of(binding) == identity)
+        else {
+            // Every real identity offered to `Self::start_recording_keybinding` is read straight
+            // off `crate::default_key_bindings()` at render time, so this can't happen from the
+            // UI - degrading honestly (no-op) rather than panicking if it somehow ever does.
+            cx.notify();
+            return;
+        };
+        let effective = keymap_overrides::effective_key_bindings(&self.settings.keymap.overrides);
+        if let Some(colliding) =
+            keymap_overrides::find_colliding_binding(&defaults, &effective, for_binding, &candidate)
+        {
+            let label = settings::action_label(colliding.action()).unwrap_or("another binding");
+            self.keymap_rebind_error = Some((
+                identity,
+                format!("{candidate} is already used by \u{201c}{label}\u{201d} in an overlapping scope"),
+            ));
+            cx.notify();
+            return;
+        }
+        self.settings
+            .keymap
+            .overrides
+            .retain(|entry| !identity.matches_override(entry));
+        self.settings
+            .keymap
+            .overrides
+            .push(settings_store::KeybindingOverride {
+                action: identity.action,
+                context: identity.context,
+                default_keystrokes: identity.default_keystrokes,
+                keystrokes: candidate,
+            });
+        self.apply_effective_key_bindings(cx);
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// Removes `identity`'s real override, if one exists, falling back to the compiled-in
+    /// default (the row's own "reset" click).
+    pub(super) fn reset_one_keybinding(
+        &mut self,
+        identity: keymap_overrides::BindingIdentity,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.settings.keymap.overrides.len();
+        self.settings
+            .keymap
+            .overrides
+            .retain(|entry| !identity.matches_override(entry));
+        if self.settings.keymap.overrides.len() == before {
+            return;
+        }
+        self.apply_effective_key_bindings(cx);
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// Clears every real, persisted override at once (the page header's "Reset all").
+    pub(super) fn reset_all_keybindings(&mut self, cx: &mut Context<Self>) {
+        if self.settings.keymap.overrides.is_empty() {
+            return;
+        }
+        self.settings.keymap.overrides.clear();
+        self.apply_effective_key_bindings(cx);
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// Re-registers the app's real, effective keybinding set - `crate::default_key_bindings()`
+    /// with every persisted `Settings.keymap.overrides` entry applied on top
+    /// (`keymap_overrides::effective_key_bindings`) - via the real, verified runtime API
+    /// (`App::clear_key_bindings` + `App::bind_keys`, `vendor/zed/crates/gpui/src/app.rs`), so a
+    /// rebind takes effect live, in this same running process, with no restart. Called once at
+    /// startup (`Self::new_with_settings`) and again every time `Settings.keymap.overrides`
+    /// changes. Clears first rather than a second `bind_keys` merge on top of whatever was
+    /// already registered - `App::bind_keys`'s own docs say it *merges*, so without the clear, a
+    /// rebind would leave the old default binding still registered alongside the new override,
+    /// both matching the same action and genuinely colliding under GPUI's own real dispatch, not
+    /// just this app's own UI-level collision guard.
+    pub(super) fn apply_effective_key_bindings(&self, cx: &mut Context<Self>) {
+        cx.clear_key_bindings();
+        cx.bind_keys(keymap_overrides::effective_key_bindings(
+            &self.settings.keymap.overrides,
+        ));
     }
 
     /// *Language servers* - PATH-detection rows, following the same pattern as
@@ -1600,14 +1895,32 @@ impl AdeApp {
         cx.notify();
     }
 
+    /// A real theme card click - persists the name *and* actually re-skins the running app (see
+    /// [`Self::render_settings_theme_page`]'s own docs). Also updates
+    /// `Settings.theme.last_dark_theme` whenever `name` isn't `"Paper"` (the one real light
+    /// theme) - see that field's own docs for the real data-loss bug this fixes for
+    /// `follow_system`.
     fn set_theme_name(&mut self, name: String, cx: &mut Context<Self>) {
+        if name != "Paper" {
+            self.settings.theme.last_dark_theme = name.clone();
+        }
         self.settings.theme.name = name;
+        self.apply_theme_selection(cx);
         self.persist_settings(cx);
         cx.notify();
     }
 
+    /// Turning this on immediately syncs to the real, current OS appearance
+    /// (`App::window_appearance`) rather than waiting for the next real OS change to fire the
+    /// live subscription (`Self::sync_theme_to_system_appearance`, subscribed once at startup in
+    /// `Self::new_with_settings`) - a user who turns this on while already in light mode expects
+    /// an immediate effect, not silence until they also happen to toggle their OS theme.
     fn toggle_theme_follow_system(&mut self, cx: &mut Context<Self>) {
         self.settings.theme.follow_system = !self.settings.theme.follow_system;
+        if self.settings.theme.follow_system {
+            let appearance = cx.window_appearance();
+            self.apply_follow_system_appearance(appearance, cx);
+        }
         self.persist_settings(cx);
         cx.notify();
     }
@@ -1615,6 +1928,75 @@ impl AdeApp {
     fn toggle_high_contrast_diff(&mut self, cx: &mut Context<Self>) {
         self.settings.theme.high_contrast_diff = !self.settings.theme.high_contrast_diff;
         self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// Applies `self.settings.theme.name` as the real, live-selected theme
+    /// (`crate::theme::set_current_theme_index`) and forces a real full repaint
+    /// (`App::refresh_windows`, `vendor/zed/crates/gpui/src/app.rs:1025`) so every
+    /// already-rendered surface - not just ones that happen to re-render for some other reason -
+    /// picks up the new colours on the very next frame. An unrecognized `theme.name` (only
+    /// reachable via a hand-edited `settings.toml`) falls back to index `0` (Jerry Dark) rather
+    /// than leaving the previous theme's index in place unnoticed.
+    pub(super) fn apply_theme_selection(&self, cx: &mut Context<Self>) {
+        let index = settings::THEME_DEFS
+            .iter()
+            .position(|def| def.name == self.settings.theme.name)
+            .unwrap_or(0);
+        theme::set_current_theme_index(index);
+        cx.refresh_windows();
+    }
+
+    /// The real, shared "follow system" logic both [`Self::toggle_theme_follow_system`] (a
+    /// one-shot sync using `App::window_appearance`, no live `Window` needed) and
+    /// [`Self::sync_theme_to_system_appearance`] (the live `observe_window_appearance`
+    /// subscription, which does have one) apply `appearance` through - see this app's own
+    /// "Themes" settings row copy, "Switch to the light theme when the OS does": a real OS-light
+    /// signal selects `"Paper"` (the only real light theme in `crate::settings::THEME_DEFS`); a
+    /// real OS-dark signal selects `Settings.theme.last_dark_theme` - the user's own most
+    /// recently chosen dark theme (defaults to `"Jerry Dark"` - see that field's own docs), not a
+    /// hardcoded default, so a user on e.g. "Slate" who round-trips through light and back to
+    /// dark lands back on "Slate", not silently loses their choice. A no-op if the resolved name
+    /// is already current, so this can be called freely without spuriously re-persisting/
+    /// repainting.
+    pub(super) fn apply_follow_system_appearance(
+        &mut self,
+        appearance: gpui::WindowAppearance,
+        cx: &mut Context<Self>,
+    ) {
+        let target = match appearance {
+            gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight => {
+                "Paper".to_string()
+            }
+            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark => {
+                self.settings.theme.last_dark_theme.clone()
+            }
+        };
+        if self.settings.theme.name == target {
+            return;
+        }
+        self.settings.theme.name = target;
+        self.apply_theme_selection(cx);
+        self.persist_settings(cx);
+    }
+
+    /// The live `Window::observe_window_appearance`/`Context::observe_window_appearance`
+    /// subscription callback (`vendor/zed/crates/gpui/src/window.rs:1946`,
+    /// `vendor/zed/crates/gpui/src/app/context.rs:462` - real, verified APIs, the same real
+    /// mechanism `vendor/zed/crates/workspace/src/workspace.rs:1802` uses for its own theme
+    /// following), subscribed once in `Self::new_with_settings` regardless of whether
+    /// `follow_system` starts on - it checks the flag itself on every real fire, so turning the
+    /// setting on later doesn't require re-subscribing. A no-op whenever `follow_system` is off.
+    pub(super) fn sync_theme_to_system_appearance(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.settings.theme.follow_system {
+            return;
+        }
+        let appearance = window.appearance();
+        self.apply_follow_system_appearance(appearance, cx);
         cx.notify();
     }
 }
@@ -1844,6 +2226,407 @@ mod settings_lsp_install_action_tests {
             cx.debug_bounds("settings-lsp-install-ready-binary")
                 .is_none(),
             "a ready row has already live-found its binary and should show no Install action"
+        );
+    }
+}
+
+/// End-to-end regression coverage for the real keybinding rebind mechanism - driven through
+/// GPUI's real dispatch (`VisualTestContext::simulate_keystrokes`), a real `App::
+/// intercept_keystrokes` capture, and a real `settings.toml` file, mirroring
+/// `root::focus::palette_focus_tests::secondary_keystroke_opens_the_palette_through_the_real_key_
+/// bindings`'s own "test through real dispatch, not a direct method call" discipline - a plain
+/// unit test of `keymap_overrides::effective_key_bindings` alone couldn't catch a wiring bug in
+/// `Self::apply_effective_key_bindings`'s own call sites (e.g. forgetting to call it after a
+/// rebind, or at startup).
+#[cfg(test)]
+mod keybinding_rebind_tests {
+    use super::*;
+    use crate::keymap_overrides::BindingIdentity;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    fn open_test_app_with_real_settings_path(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        settings: settings_store::Settings,
+        settings_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(repo_path, settings, Some(settings_path), window, cx)
+        })
+    }
+
+    /// The real, live-dispatched proof this whole mechanism actually works: recording a new
+    /// chord for `TogglePalette` through the same `App::intercept_keystrokes` path a real click
+    /// on the Keybindings page's "rebind" affordance uses, confirming the *old* keystroke stops
+    /// opening the palette and the *new* one does, that the override round-trips through a real
+    /// `settings.toml` write, and that a freshly constructed `AdeApp` loading that same file -
+    /// standing in for a real app restart, since nothing in this codebase can restart the actual
+    /// process mid-test - applies the override again at startup with no further action needed.
+    #[gpui::test]
+    fn a_real_rebind_persists_across_a_simulated_reload_and_the_old_chord_stops_working(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path.clone(),
+        );
+
+        let old_chord = if cfg!(target_os = "macos") {
+            "cmd-k"
+        } else {
+            "ctrl-k"
+        };
+        let new_chord = "ctrl-shift-p";
+
+        // Sanity check: the real, unmodified default binding opens the palette before any
+        // rebind - this test's whole premise depends on this being true first.
+        cx.simulate_keystrokes(old_chord);
+        assert!(
+            app.read_with(cx, |app, _| app.palette_open),
+            "the real default {old_chord} chord must open the palette before any rebind"
+        );
+        cx.dispatch_action(TogglePalette);
+
+        let toggle_palette_identity = app.read_with(cx, |_, _| {
+            let defaults = crate::default_key_bindings();
+            let binding = defaults
+                .iter()
+                .find(|binding| binding.action().name() == "app::TogglePalette")
+                .expect("TogglePalette should be a real default binding")
+                .clone();
+            BindingIdentity::of(&binding)
+        });
+
+        app.update(cx, |app, cx| {
+            app.start_recording_keybinding(toggle_palette_identity, cx);
+        });
+        cx.simulate_keystrokes(new_chord);
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.keymap_recording.is_none()),
+            "capturing a real keystroke must end the recording"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.keymap_rebind_error.is_none()),
+            "rebinding TogglePalette onto an unused chord must not report a real collision"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.keymap.overrides.len()),
+            1
+        );
+
+        // The *old* chord must no longer do anything - `apply_effective_key_bindings` really
+        // cleared and rebuilt the live keymap, not just recorded the override in `Settings`.
+        cx.simulate_keystrokes(old_chord);
+        assert!(
+            !app.read_with(cx, |app, _| app.palette_open),
+            "the old default chord must genuinely stop opening the palette after a real rebind"
+        );
+
+        // The *new* chord must now open it.
+        cx.simulate_keystrokes(new_chord);
+        assert!(
+            app.read_with(cx, |app, _| app.palette_open),
+            "the newly recorded chord must genuinely open the palette"
+        );
+        cx.dispatch_action(TogglePalette);
+
+        // Let the real serial settings-save writer loop actually reach disk before reading it
+        // back - the same real, already-tested mechanism `root::settings_persist_tests` covers.
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.settings_save_pending),
+            "the override must have actually been queued and written, not left pending"
+        );
+
+        let reloaded_settings = settings_store::Settings::load_or_init_at(&settings_path);
+        assert_eq!(
+            reloaded_settings.keymap.overrides.len(),
+            1,
+            "the real override must round-trip through the real settings.toml file"
+        );
+
+        // "Simulated reload": a second, independent `AdeApp` loading the same real file, standing
+        // in for an actual app restart - see this test's own docs.
+        let (reloaded_app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            reloaded_settings,
+            settings_path,
+        );
+
+        cx.simulate_keystrokes(old_chord);
+        assert!(
+            !reloaded_app.read_with(cx, |app, _| app.palette_open),
+            "a fresh app instance must apply the persisted override at startup - the old chord \
+             must not work here either, with no further action taken"
+        );
+        cx.simulate_keystrokes(new_chord);
+        assert!(
+            reloaded_app.read_with(cx, |app, _| app.palette_open),
+            "a fresh app instance must apply the persisted override at startup - the new chord \
+             must already work"
+        );
+    }
+
+    /// A real, live-dispatched collision: recording `EditorLeft` (scoped `"file-editor"`) onto
+    /// `secondary-k` - the real, currently-global `TogglePalette` chord - must be rejected with a
+    /// real, visible error, and must leave both bindings' real dispatch behavior completely
+    /// unchanged.
+    #[gpui::test]
+    fn recording_a_chord_that_collides_with_a_real_global_binding_is_rejected(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("main.rs");
+        std::fs::write(&file_path, "fn main() {}\n").expect("write main.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path, window, cx);
+        });
+        cx.run_until_parked();
+
+        let editor_left_identity = app.read_with(cx, |_, _| {
+            let defaults = crate::default_key_bindings();
+            let binding = defaults
+                .iter()
+                .find(|binding| {
+                    binding.action().name() == "app::EditorLeft"
+                        && BindingIdentity::of(binding).context == "file-editor"
+                })
+                .expect("a file-editor-scoped EditorLeft binding should exist")
+                .clone();
+            BindingIdentity::of(&binding)
+        });
+
+        app.update(cx, |app, cx| {
+            app.start_recording_keybinding(editor_left_identity.clone(), cx);
+        });
+        let secondary_k = if cfg!(target_os = "macos") {
+            "cmd-k"
+        } else {
+            "ctrl-k"
+        };
+        cx.simulate_keystrokes(secondary_k);
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.keymap_recording.is_none()),
+            "recording must end even when the candidate is rejected"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.settings.keymap.overrides.is_empty()),
+            "a genuine collision must never be persisted as a real override"
+        );
+        let error = app.read_with(cx, |app, _| app.keymap_rebind_error.clone());
+        let (error_identity, message) = error.expect("a real collision must set a visible error");
+        assert_eq!(error_identity, editor_left_identity);
+        assert!(
+            message.contains("Command palette"),
+            "the error should name the real command it collides with, got: {message:?}"
+        );
+
+        // The real, original TogglePalette binding must still work, completely undisturbed.
+        cx.simulate_keystrokes(secondary_k);
+        assert!(app.read_with(cx, |app, _| app.palette_open));
+    }
+}
+
+/// End-to-end regression coverage for the real theme-swap mechanism, driven through the same
+/// `AdeApp` methods a real theme-card click invokes (`Self::set_theme_name`), not a direct call
+/// into `crate::theme`'s own already-tested pure mechanism (`theme::theme_runtime_tests`) - this
+/// module proves the *wiring* (persistence, the live `crate::theme::current_theme_index` write,
+/// and that a representative real render call genuinely reads the new value), which a pure unit
+/// test of `crate::theme` alone can't catch (e.g. forgetting to call `apply_theme_selection` from
+/// `Self::set_theme_name` would still pass every `crate::theme` test).
+#[cfg(test)]
+mod theme_swap_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    /// `crate::theme::CURRENT_THEME_INDEX` is real, process-global, mutable state - reset it
+    /// after this test regardless of outcome, matching `crate::theme::theme_runtime_tests`'s own
+    /// discipline (see that module's docs for why a leaked non-default index would corrupt other
+    /// tests in this binary). In practice any *other* test that goes on to construct a fresh
+    /// `AdeApp` already self-heals this via `Self::apply_theme_selection` running in `Self::
+    /// new_with_settings`, but this test doesn't rely on that - it cleans up its own real global
+    /// write directly.
+    struct ResetThemeIndexOnDrop;
+    impl Drop for ResetThemeIndexOnDrop {
+        fn drop(&mut self) {
+            theme::set_current_theme_index(0);
+        }
+    }
+
+    #[gpui::test]
+    fn selecting_a_real_theme_card_changes_the_live_selected_index_and_a_representative_color(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = ResetThemeIndexOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        assert_eq!(
+            theme::current_theme_index(),
+            0,
+            "a fresh app defaults to Jerry Dark (index 0)"
+        );
+        let jerry_dark_window_bg = theme::surface::WINDOW.resolve();
+
+        let slate_index = settings::THEME_DEFS
+            .iter()
+            .position(|def| def.name == "Slate")
+            .expect("Slate should be a real theme");
+
+        app.update(cx, |app, cx| {
+            app.set_theme_name("Slate".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.name.clone()),
+            "Slate",
+            "the selection must really persist in Settings"
+        );
+        assert_eq!(
+            theme::current_theme_index(),
+            slate_index,
+            "selecting a theme card must really update the live-selected index, not just the \
+             persisted setting"
+        );
+        assert!(
+            theme::surface::WINDOW.resolve() != jerry_dark_window_bg,
+            "a representative real colour token must actually resolve differently once Slate is \
+             selected - this is the real proof a theme swap changes what gets rendered, not just \
+             what's saved"
+        );
+
+        // Selecting back to Jerry Dark must restore the exact original value.
+        app.update(cx, |app, cx| {
+            app.set_theme_name("Jerry Dark".to_string(), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(theme::current_theme_index(), 0);
+        assert_eq!(theme::surface::WINDOW.resolve(), jerry_dark_window_bg);
+    }
+
+    /// Real `follow_system` behavior - `Self::apply_follow_system_appearance` is the shared real
+    /// logic both the live OS-appearance subscription and turning the toggle on both go through
+    /// (see that method's own docs); this drives it directly with real `gpui::WindowAppearance`
+    /// values, the same real enum `Window::appearance()`/`App::window_appearance()` return.
+    #[gpui::test]
+    fn follow_system_selects_paper_on_light_and_jerry_dark_on_dark(cx: &mut TestAppContext) {
+        let _guard = ResetThemeIndexOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, cx| {
+            app.apply_follow_system_appearance(gpui::WindowAppearance::Light, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.name.clone()),
+            "Paper",
+            "a real OS-light signal must select the one real light theme"
+        );
+        let paper_index = settings::THEME_DEFS
+            .iter()
+            .position(|def| def.name == "Paper")
+            .expect("Paper should be a real theme");
+        assert_eq!(theme::current_theme_index(), paper_index);
+
+        app.update(cx, |app, cx| {
+            app.apply_follow_system_appearance(gpui::WindowAppearance::Dark, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.name.clone()),
+            "Jerry Dark",
+            "a real OS-dark signal must switch back to the real last-chosen dark theme, which \
+             for a fresh install is the documented default"
+        );
+        assert_eq!(theme::current_theme_index(), 0);
+    }
+
+    /// Regression for a real data-loss bug an audit caught: before `Settings.theme.
+    /// last_dark_theme` existed, an OS-dark signal always hardcoded `"Jerry Dark"`, silently
+    /// discarding whichever dark theme a user had actually chosen (e.g. "Slate") the moment their
+    /// OS round-tripped through light and back to dark.
+    #[gpui::test]
+    fn follow_system_restores_the_users_own_last_chosen_dark_theme_not_a_hardcoded_default(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = ResetThemeIndexOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, cx| {
+            app.set_theme_name("Slate".to_string(), cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.last_dark_theme.clone()),
+            "Slate"
+        );
+
+        app.update(cx, |app, cx| {
+            app.apply_follow_system_appearance(gpui::WindowAppearance::Light, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.name.clone()),
+            "Paper"
+        );
+        // Selecting "Paper" itself must not overwrite the real remembered dark theme.
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.last_dark_theme.clone()),
+            "Slate"
+        );
+
+        app.update(cx, |app, cx| {
+            app.apply_follow_system_appearance(gpui::WindowAppearance::Dark, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.name.clone()),
+            "Slate",
+            "a real OS-dark signal must restore the user's own last-chosen dark theme, not \
+             silently reset to Jerry Dark"
+        );
+    }
+
+    /// Turning `follow_system` on while the real (test-environment) OS appearance is already
+    /// known must apply it immediately, not wait for a later change - see `Self::
+    /// toggle_theme_follow_system`'s own docs for why an immediate sync matters.
+    #[gpui::test]
+    fn turning_follow_system_on_immediately_syncs_to_the_real_current_appearance(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = ResetThemeIndexOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        assert!(!app.read_with(cx, |app, _| app.settings.theme.follow_system));
+
+        let appearance_before = app.read_with(cx, |_, cx| cx.window_appearance());
+
+        app.update(cx, |app, cx| {
+            app.toggle_theme_follow_system(cx);
+        });
+        cx.run_until_parked();
+
+        assert!(app.read_with(cx, |app, _| app.settings.theme.follow_system));
+        let expected_name = match appearance_before {
+            gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight => "Paper",
+            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark => "Jerry Dark",
+        };
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.name.clone()),
+            expected_name,
+            "turning follow_system on must immediately apply the real current OS appearance"
         );
     }
 }

@@ -217,28 +217,28 @@ mod tests {
     fn each_documented_extension_gets_its_own_chip() {
         let rs = lang_chip_for_name("main.rs");
         assert_eq!(rs.label, "rs");
-        assert!(same(rs.fg, theme::lang::RS.0));
-        assert!(same(rs.bg, theme::lang::RS.1));
+        assert!(same(rs.fg, theme::lang::RS.0.into()));
+        assert!(same(rs.bg, theme::lang::RS.1.into()));
 
         let toml = lang_chip_for_name("Cargo.toml");
         assert_eq!(toml.label, "to");
-        assert!(same(toml.fg, theme::lang::TOML.0));
+        assert!(same(toml.fg, theme::lang::TOML.0.into()));
 
         let md = lang_chip_for_name("README.md");
         assert_eq!(md.label, "md");
-        assert!(same(md.fg, theme::lang::MD.0));
+        assert!(same(md.fg, theme::lang::MD.0.into()));
 
         let sql = lang_chip_for_name("schema.sql");
         assert_eq!(sql.label, "sq");
-        assert!(same(sql.fg, theme::lang::SQL.0));
+        assert!(same(sql.fg, theme::lang::SQL.0.into()));
     }
 
     #[test]
     fn an_unrecognized_extension_gets_the_neutral_fallback_chip() {
         let chip = lang_chip_for_name("image.png");
         assert_eq!(chip.label, ".");
-        assert!(same(chip.fg, theme::lang::UNKNOWN.0));
-        assert!(same(chip.bg, theme::lang::UNKNOWN.1));
+        assert!(same(chip.fg, theme::lang::UNKNOWN.0.into()));
+        assert!(same(chip.bg, theme::lang::UNKNOWN.1.into()));
     }
 
     #[test]

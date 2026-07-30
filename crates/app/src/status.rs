@@ -95,11 +95,11 @@ impl Status {
     /// The status dot / left-edge colour, from `crate::theme::status`.
     pub fn color(self) -> gpui::Rgba {
         match self {
-            Status::Ask => crate::theme::status::ASK,
-            Status::Fail => crate::theme::status::FAIL,
-            Status::Review => crate::theme::status::REVIEW,
-            Status::Run => crate::theme::status::RUN,
-            Status::Idle => crate::theme::status::IDLE,
+            Status::Ask => crate::theme::status::ASK.into(),
+            Status::Fail => crate::theme::status::FAIL.into(),
+            Status::Review => crate::theme::status::REVIEW.into(),
+            Status::Run => crate::theme::status::RUN.into(),
+            Status::Idle => crate::theme::status::IDLE.into(),
         }
     }
 
@@ -107,11 +107,11 @@ impl Status {
     /// context bar" spec) - `crate::theme::status::*_BG`, one per [`Status`].
     pub fn pill_bg(self) -> gpui::Rgba {
         match self {
-            Status::Ask => crate::theme::status::ASK_BG,
-            Status::Fail => crate::theme::status::FAIL_BG,
-            Status::Review => crate::theme::status::REVIEW_BG,
-            Status::Run => crate::theme::status::RUN_BG,
-            Status::Idle => crate::theme::status::IDLE_BG,
+            Status::Ask => crate::theme::status::ASK_BG.into(),
+            Status::Fail => crate::theme::status::FAIL_BG.into(),
+            Status::Review => crate::theme::status::REVIEW_BG.into(),
+            Status::Run => crate::theme::status::RUN_BG.into(),
+            Status::Idle => crate::theme::status::IDLE_BG.into(),
         }
     }
 

@@ -761,7 +761,10 @@ impl AdeApp {
         let has_sessions = !row.sessions.is_empty();
         let (badge_fg, badge_bg) = match row.sessions.first() {
             Some(session) => work_surface::agent_tint(session.kind),
-            None => (theme::text::GHOST, theme::surface::CHIP_NEUTRAL),
+            None => (
+                theme::text::GHOST.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
         };
         let badge_glyph = match row.sessions.first() {
             Some(session) => work_surface::agent_initial(session.kind),
@@ -833,7 +836,7 @@ impl AdeApp {
             .border_color(if has_sessions {
                 status.color()
             } else {
-                theme::border::ZONE
+                theme::border::ZONE.into()
             })
             .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED))
             .when(!is_selected, |el| {
@@ -891,7 +894,7 @@ impl AdeApp {
                     .child(div().w(px(4.0)).h(px(4.0)).bg(if has_sessions {
                         status.color()
                     } else {
-                        theme::border::ZONE
+                        theme::border::ZONE.into()
                     }))
                     .child(
                         div()

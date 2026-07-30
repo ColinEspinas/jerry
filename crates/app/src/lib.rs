@@ -18,6 +18,7 @@ pub mod file_tree;
 pub mod fonts;
 pub mod hover_view;
 pub mod keymap;
+pub mod keymap_overrides;
 pub mod language;
 pub mod layout;
 pub mod merge;

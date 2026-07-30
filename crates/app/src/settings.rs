@@ -129,10 +129,10 @@ impl SettingsPage {
                 "These sizes and scale are saved for real, but nothing in the interface renders at them yet."
             }
             SettingsPage::Theme => {
-                "Dark-first. Picking a theme other than Jerry Dark is saved for real, but the app doesn't change its colors to match yet."
+                "Dark-first. Picking a theme really re-skins the app - saved for real and applied live, no restart needed."
             }
             SettingsPage::Keymap => {
-                "Every real, globally-bound shortcut this build actually dispatches. The same commands bind to Ctrl and Alt on Windows and Linux."
+                "Every real, globally-bound shortcut this build actually dispatches - click a keycap to record a new one. The same commands bind to Ctrl and Alt on Windows and Linux."
             }
             SettingsPage::LanguageServers => {
                 "One row per language server this app knows how to spawn, detected live on PATH - not configured."
@@ -469,9 +469,19 @@ pub struct KeybindingRow {
     /// page, and the filter field couldn't tell them apart either (both matched the same
     /// `"scoped"` substring). Showing the real predicate string fixes both.
     pub context: String,
-    /// The registered keystroke(s) for this binding (almost always exactly one), resolved to
-    /// per-platform keycaps via `crate::keymap::resolve_keystroke` at the render call site.
+    /// The *effective* keystroke(s) for this row (the real override's, if one applies - else the
+    /// real default's) - resolved to per-platform keycaps via `crate::keymap::resolve_keystroke`
+    /// at the render call site. Always what's actually registered right now, matching this
+    /// struct's own "never describe a binding differently than what's actually registered" rule.
     pub keystrokes: Vec<gpui::Keystroke>,
+    /// This row's real, stable identity - see `crate::keymap_overrides::BindingIdentity`'s own
+    /// docs. The render layer uses this (not `command`/`context` alone, which aren't always
+    /// unique - see this struct's own docs) to know which override a "record new shortcut" or
+    /// "reset" click on this row should read/write.
+    pub identity: crate::keymap_overrides::BindingIdentity,
+    /// Whether a real, persisted override currently applies to this row (i.e. [`Self::keystrokes`]
+    /// differs from the compiled-in default) - drives the Keybindings page's "reset" affordance.
+    pub is_overridden: bool,
 }
 
 /// Maps this app's globally-bound `gpui::Action` types to the Keybindings page's human command
@@ -484,7 +494,12 @@ pub struct KeybindingRow {
 /// the drift guard: it asserts every binding in `crate::default_key_bindings()` resolves to
 /// `Some` here, so a new global binding without a matching label fails a test rather than
 /// silently rendering blank on the Keybindings page.
-fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
+///
+/// `pub(crate)`, not private - `crate::root::settings_render`'s real collision-message renderer
+/// (`keymap_overrides::find_colliding_binding` returns a raw `gpui::KeyBinding`, not a
+/// `KeybindingRow`) needs the same label this module's own rows already use, rather than showing
+/// a raw `gpui::Action::name()` compiler identifier in a user-facing error.
+pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
     match action.name() {
         "app::NewSession" => Some("New session"),
         "app::TogglePalette" => Some("Command palette"),
@@ -530,31 +545,50 @@ fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
     }
 }
 
-/// Builds the Keybindings page's rows straight from `bindings` (in production,
-/// `crate::default_key_bindings()`) - row order is registration order, so there is no separate
-/// order to drift. `context` is `"global"` when the `KeyBinding` has no context predicate, else
-/// the real predicate's own `Display` string (see [`KeybindingRow::context`]'s own docs for why
-/// this - not a constant `"scoped"` - is load-bearing). A binding whose action has no
-/// [`action_label`] entry is skipped rather than shown with a blank label - see that function's
-/// docs for the test guarding against that.
-pub fn keybinding_rows(bindings: &[gpui::KeyBinding]) -> Vec<KeybindingRow> {
-    bindings
+/// Builds the Keybindings page's rows straight from `default_bindings` (in production,
+/// `crate::default_key_bindings()`) plus `overrides` (in production,
+/// `Settings.keymap.overrides`) - row order is default registration order, so there is no
+/// separate order to drift, and identity/context always come from the real *default* binding
+/// (stable even while a row is overridden). `context` is `"global"` when the `KeyBinding` has no
+/// context predicate, else the real predicate's own `Display` string (see
+/// [`KeybindingRow::context`]'s own docs for why this - not a constant `"scoped"` - is
+/// load-bearing). A binding whose action has no [`action_label`] entry is skipped rather than
+/// shown with a blank label - see that function's docs for the test guarding against that.
+pub fn keybinding_rows(
+    default_bindings: &[gpui::KeyBinding],
+    overrides: &[crate::settings_store::KeybindingOverride],
+) -> Vec<KeybindingRow> {
+    default_bindings
         .iter()
         .filter_map(|binding| {
             let command = action_label(binding.action())?;
-            let context = match binding.predicate() {
-                Some(predicate) => predicate.to_string(),
-                None => "global".to_string(),
-            };
-            let keystrokes = binding
+            let identity = crate::keymap_overrides::BindingIdentity::of(binding);
+            let context = identity.context.clone();
+            let default_keystrokes: Vec<gpui::Keystroke> = binding
                 .keystrokes()
                 .iter()
                 .map(|keystroke| keystroke.inner().clone())
                 .collect();
+            let override_entry = overrides
+                .iter()
+                .find(|entry| identity.matches_override(entry));
+            let (keystrokes, is_overridden) = match override_entry {
+                // A malformed persisted override (only reachable via a hand-edited
+                // `settings.toml`) falls back to the real default here too, matching
+                // `keymap_overrides::effective_key_bindings`'s own fallback - the Keybindings
+                // page must never show a keystroke that isn't actually registered.
+                Some(entry) => match gpui::Keystroke::parse(&entry.keystrokes) {
+                    Ok(keystroke) => (vec![keystroke], true),
+                    Err(_) => (default_keystrokes, false),
+                },
+                None => (default_keystrokes, false),
+            };
             Some(KeybindingRow {
                 command,
                 context,
                 keystrokes,
+                identity,
+                is_overridden,
             })
         })
         .collect()
@@ -973,7 +1007,7 @@ mod tests {
     fn every_registered_global_keybinding_has_a_real_keybindings_page_label() {
         // The drift guard `action_label`'s docs describe.
         let bindings = crate::default_key_bindings();
-        let rows = keybinding_rows(&bindings);
+        let rows = keybinding_rows(&bindings, &[]);
         assert_eq!(
             rows.len(),
             bindings.len(),
@@ -998,7 +1032,7 @@ mod tests {
     #[test]
     fn every_keybinding_row_is_genuinely_distinguishable_from_every_other() {
         let bindings = crate::default_key_bindings();
-        let rows = keybinding_rows(&bindings);
+        let rows = keybinding_rows(&bindings, &[]);
         let mut seen: Vec<(&str, &str, Vec<gpui::Keystroke>)> = Vec::new();
         for row in &rows {
             let identity = (row.command, row.context.as_str(), row.keystrokes.clone());
@@ -1018,7 +1052,7 @@ mod tests {
     #[test]
     fn keybinding_rows_are_derived_in_real_registration_order() {
         let bindings = crate::default_key_bindings();
-        let rows = keybinding_rows(&bindings);
+        let rows = keybinding_rows(&bindings, &[]);
         let commands: Vec<&str> = rows.iter().map(|row| row.command).collect();
         assert_eq!(
             commands,
@@ -1127,7 +1161,7 @@ mod tests {
         // suspend control byte (`crate::terminal_pane::keystroke_to_bytes`) - see
         // `crate::default_key_bindings`'s own docs for the full reasoning.
         let bindings = crate::default_key_bindings();
-        let rows = keybinding_rows(&bindings);
+        let rows = keybinding_rows(&bindings, &[]);
         assert!(!rows.is_empty());
         let scoped: Vec<&KeybindingRow> =
             rows.iter().filter(|row| row.context != "global").collect();
@@ -1152,7 +1186,7 @@ mod tests {
     #[test]
     fn keybinding_rows_carry_the_real_registered_keystroke() {
         let bindings = crate::default_key_bindings();
-        let rows = keybinding_rows(&bindings);
+        let rows = keybinding_rows(&bindings, &[]);
         let go_to_definition = rows
             .iter()
             .find(|row| row.command == "Go to definition")
@@ -1161,8 +1195,90 @@ mod tests {
         assert_eq!(go_to_definition.keystrokes[0].key, "f12");
     }
 
+    #[test]
+    fn keybinding_rows_with_no_overrides_report_every_row_as_not_overridden() {
+        let rows = keymap_page_rows();
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| !row.is_overridden));
+    }
+
+    #[test]
+    fn a_real_override_replaces_the_row_keystroke_and_marks_it_overridden() {
+        let bindings = crate::default_key_bindings();
+        let go_to_definition = bindings
+            .iter()
+            .find(|b| b.action().name() == "app::GotoDefinition")
+            .expect("GotoDefinition should be a real default binding");
+        let identity = crate::keymap_overrides::BindingIdentity::of(go_to_definition);
+        let override_entry = crate::settings_store::KeybindingOverride {
+            action: identity.action,
+            context: identity.context,
+            default_keystrokes: identity.default_keystrokes,
+            keystrokes: "ctrl-shift-g".to_string(),
+        };
+
+        let rows = keybinding_rows(&bindings, std::slice::from_ref(&override_entry));
+        let row = rows
+            .iter()
+            .find(|row| row.command == "Go to definition")
+            .expect("a Go to definition row should exist");
+
+        assert!(row.is_overridden);
+        assert_eq!(row.keystrokes.len(), 1);
+        assert_eq!(
+            row.keystrokes[0],
+            gpui::Keystroke::parse("ctrl-shift-g").unwrap()
+        );
+
+        // Every other row must be completely untouched by an override that isn't theirs.
+        for other in &rows {
+            if other.command == "Go to definition" {
+                continue;
+            }
+            assert!(!other.is_overridden);
+        }
+    }
+
+    /// A malformed persisted override (only reachable via a hand-edited `settings.toml`) must
+    /// fall back to the real default keystroke, mirroring
+    /// `keymap_overrides::effective_key_bindings`'s own fallback - the page must never claim a
+    /// keystroke is registered when it genuinely isn't.
+    #[test]
+    fn a_malformed_override_keystroke_falls_back_to_the_real_default_and_is_not_marked_overridden()
+    {
+        let bindings = crate::default_key_bindings();
+        let go_to_definition = bindings
+            .iter()
+            .find(|b| b.action().name() == "app::GotoDefinition")
+            .expect("GotoDefinition should be a real default binding");
+        let identity = crate::keymap_overrides::BindingIdentity::of(go_to_definition);
+        let override_entry = crate::settings_store::KeybindingOverride {
+            action: identity.action,
+            context: identity.context,
+            default_keystrokes: identity.default_keystrokes,
+            // Three plain, non-modifier dash-separated segments - `gpui::Keystroke::parse` only
+            // ever accepts a *single* trailing key after its recognized modifier prefixes, so
+            // this is a real, guaranteed `Err`, not just an unusual-looking string.
+            keystrokes: "one-two-three".to_string(),
+        };
+        assert!(
+            gpui::Keystroke::parse(&override_entry.keystrokes).is_err(),
+            "sanity check: this test's whole premise depends on this string genuinely failing \
+             to parse"
+        );
+
+        let rows = keybinding_rows(&bindings, std::slice::from_ref(&override_entry));
+        let row = rows
+            .iter()
+            .find(|row| row.command == "Go to definition")
+            .expect("a Go to definition row should exist");
+
+        assert!(!row.is_overridden);
+        assert_eq!(row.keystrokes[0].key, "f12");
+    }
+
     fn keymap_page_rows() -> Vec<KeybindingRow> {
-        keybinding_rows(&crate::default_key_bindings())
+        keybinding_rows(&crate::default_key_bindings(), &[])
     }
 
     #[test]

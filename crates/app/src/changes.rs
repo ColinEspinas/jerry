@@ -63,16 +63,16 @@ pub fn tag_style(tag: ChangeTag) -> TagStyle {
             let (fg, bg) = theme::tag::NEW;
             TagStyle {
                 label: "new",
-                fg,
-                bg,
+                fg: fg.into(),
+                bg: bg.into(),
             }
         }
         ChangeTag::Deleted => {
             let (fg, bg) = theme::tag::DELETED;
             TagStyle {
                 label: "del",
-                fg,
-                bg,
+                fg: fg.into(),
+                bg: bg.into(),
             }
         }
     }
@@ -88,9 +88,9 @@ pub enum StatSegment {
 
 pub fn stat_segment_color(segment: StatSegment) -> Rgba {
     match segment {
-        StatSegment::Add => theme::diff::ADD_SIGN,
-        StatSegment::Del => theme::diff::DEL_SIGN,
-        StatSegment::Empty => theme::diff::STAT_EMPTY,
+        StatSegment::Add => theme::diff::ADD_SIGN.into(),
+        StatSegment::Del => theme::diff::DEL_SIGN.into(),
+        StatSegment::Empty => theme::diff::STAT_EMPTY.into(),
     }
 }
 

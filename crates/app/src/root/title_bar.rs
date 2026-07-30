@@ -297,8 +297,8 @@ impl AdeApp {
         let can_save = self.active_edit_buffer().is_some();
         let mut save_row = render_dropdown_menu_row(
             "S",
-            theme::text::DIM,
-            theme::surface::CHIP_NEUTRAL,
+            theme::text::DIM.into(),
+            theme::surface::CHIP_NEUTRAL.into(),
             "Save",
             "active file".to_string(),
             keymap::resolve_combo("mod+s", macos),
@@ -315,8 +315,8 @@ impl AdeApp {
         vec![
             render_dropdown_menu_row(
                 "@",
-                theme::palette::COMMAND_CHIP.0,
-                theme::palette::COMMAND_CHIP.1,
+                theme::palette::COMMAND_CHIP.0.into(),
+                theme::palette::COMMAND_CHIP.1.into(),
                 "Open File\u{2026}",
                 "search this worktree".to_string(),
                 Vec::new(),
@@ -337,8 +337,8 @@ impl AdeApp {
             Self::render_title_menu_divider(),
             render_dropdown_menu_row(
                 "P",
-                theme::text::DIM,
-                theme::surface::CHIP_NEUTRAL,
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
                 "Settings\u{2026}",
                 "preferences".to_string(),
                 keymap::resolve_combo("mod+,", macos),
@@ -351,8 +351,8 @@ impl AdeApp {
             .into_any_element(),
             render_dropdown_menu_row(
                 "\u{d7}",
-                theme::text::DIM,
-                theme::surface::CHIP_NEUTRAL,
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
                 "Quit",
                 "close window".to_string(),
                 Vec::new(),
@@ -380,8 +380,8 @@ impl AdeApp {
         let mut rows = vec![
             render_dropdown_menu_row(
                 "U",
-                theme::text::DIM,
-                theme::surface::CHIP_NEUTRAL,
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
                 "Undo",
                 "worktree history".to_string(),
                 keymap::resolve_combo("mod+z", macos),
@@ -394,8 +394,8 @@ impl AdeApp {
             .into_any_element(),
             render_dropdown_menu_row(
                 "R",
-                theme::text::DIM,
-                theme::surface::CHIP_NEUTRAL,
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
                 "Redo",
                 "worktree history".to_string(),
                 keymap::resolve_combo("mod+shift+z", macos),
@@ -413,8 +413,8 @@ impl AdeApp {
             ($chip:expr, $label:expr, $sub:expr, $spec:expr, $handler:ident, $action:expr) => {{
                 let mut row = render_dropdown_menu_row(
                     $chip,
-                    theme::text::DIM,
-                    theme::surface::CHIP_NEUTRAL,
+                    theme::text::DIM.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
                     $label,
                     $sub.to_string(),
                     keymap::resolve_combo($spec, macos),
@@ -478,8 +478,8 @@ impl AdeApp {
         let mut rows = vec![
             render_dropdown_menu_row(
                 "K",
-                theme::palette::COMMAND_CHIP.0,
-                theme::palette::COMMAND_CHIP.1,
+                theme::palette::COMMAND_CHIP.0.into(),
+                theme::palette::COMMAND_CHIP.1.into(),
                 "Command Palette",
                 "search everything".to_string(),
                 keymap::resolve_combo("mod+K", self.window_controls_style().is_macos()),
@@ -497,8 +497,8 @@ impl AdeApp {
             ($chip:expr, $label:expr, $sub:expr, $method:ident) => {{
                 let mut row = render_dropdown_menu_row(
                     $chip,
-                    theme::text::DIM,
-                    theme::surface::CHIP_NEUTRAL,
+                    theme::text::DIM.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
                     $label,
                     $sub,
                     Vec::new(),
@@ -552,8 +552,8 @@ impl AdeApp {
         let mut rows = vec![
             render_dropdown_menu_row(
                 "\u{276f}",
-                theme::text::DIM,
-                theme::surface::CHIP_NEUTRAL,
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
                 "New Terminal",
                 "in this worktree".to_string(),
                 keymap::resolve_combo("ctrl+shift+T", macos),
@@ -585,8 +585,8 @@ impl AdeApp {
             ($chip:expr, $label:expr, $delta:expr) => {{
                 let mut row = render_dropdown_menu_row(
                     $chip,
-                    theme::text::DIM,
-                    theme::surface::CHIP_NEUTRAL,
+                    theme::text::DIM.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
                     $label,
                     "cycle tabs".to_string(),
                     Vec::new(),
@@ -607,8 +607,8 @@ impl AdeApp {
 
         let mut archive_row = render_dropdown_menu_row(
             "A",
-            theme::text::DIM,
-            theme::surface::CHIP_NEUTRAL,
+            theme::text::DIM.into(),
+            theme::surface::CHIP_NEUTRAL.into(),
             "Archive Session",
             "close the active tab".to_string(),
             Vec::new(),
@@ -632,8 +632,8 @@ impl AdeApp {
         };
         let mut keep_row = render_dropdown_menu_row(
             "K",
-            theme::text::DIM,
-            theme::surface::CHIP_NEUTRAL,
+            theme::text::DIM.into(),
+            theme::surface::CHIP_NEUTRAL.into(),
             keep_label,
             "commit the active worktree".to_string(),
             Vec::new(),
@@ -663,8 +663,8 @@ impl AdeApp {
         };
         let mut discard_row = render_dropdown_menu_row(
             "D",
-            theme::diff::STAT_DEL,
-            theme::surface::CHIP_NEUTRAL,
+            theme::diff::STAT_DEL.into(),
+            theme::surface::CHIP_NEUTRAL.into(),
             discard_label,
             "force-remove uncommitted content".to_string(),
             Vec::new(),
@@ -706,8 +706,8 @@ impl AdeApp {
         vec![
             render_dropdown_menu_row(
                 "?",
-                theme::text::DIM,
-                theme::surface::CHIP_NEUTRAL,
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
                 "Documentation",
                 "README on GitHub".to_string(),
                 Vec::new(),
@@ -721,8 +721,8 @@ impl AdeApp {
             .into_any_element(),
             render_dropdown_menu_row(
                 "!",
-                theme::text::DIM,
-                theme::surface::CHIP_NEUTRAL,
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
                 "Report an Issue",
                 "GitHub issues".to_string(),
                 Vec::new(),
@@ -737,8 +737,8 @@ impl AdeApp {
             Self::render_title_menu_divider(),
             render_dropdown_menu_row(
                 "i",
-                theme::text::DIM,
-                theme::surface::CHIP_NEUTRAL,
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
                 "About",
                 "Jerry".to_string(),
                 Vec::new(),
@@ -773,20 +773,20 @@ impl AdeApp {
             })
             .child(render_caption_button(
                 "title-bar-caption-minimize",
-                theme::surface::ROW_HOVER_ALT,
+                theme::surface::ROW_HOVER_ALT.into(),
                 render_minimize_glyph(),
                 |window, _cx| window.minimize_window(),
             ))
             .child(render_caption_button(
                 "title-bar-caption-maximize",
-                theme::surface::ROW_HOVER_ALT,
+                theme::surface::ROW_HOVER_ALT.into(),
                 render_maximize_glyph(),
                 |window, _cx| window.zoom_window(),
             ))
             .child(render_caption_button(
                 "title-bar-caption-close",
-                theme::surface::TITLE_BAR_CLOSE_HOVER,
-                render_close_glyph(theme::text::SECONDARY),
+                theme::surface::TITLE_BAR_CLOSE_HOVER.into(),
+                render_close_glyph(theme::text::SECONDARY.into()),
                 |window, _cx| window.remove_window(),
             ))
     }

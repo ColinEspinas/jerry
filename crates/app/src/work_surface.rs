@@ -30,9 +30,9 @@ pub const TRANSPARENT: Rgba = Rgba {
 /// so it gets a neutral chip instead of an invented tint.
 pub fn agent_tint(kind: SessionKind) -> (Rgba, Rgba) {
     match kind {
-        SessionKind::Claude => theme::agent::SONNET,
-        SessionKind::Codex => theme::agent::CODEX,
-        SessionKind::Shell => (theme::text::DIM, theme::surface::CHIP_NEUTRAL),
+        SessionKind::Claude => (theme::agent::SONNET.0.into(), theme::agent::SONNET.1.into()),
+        SessionKind::Codex => (theme::agent::CODEX.0.into(), theme::agent::CODEX.1.into()),
+        SessionKind::Shell => (theme::text::DIM.into(), theme::surface::CHIP_NEUTRAL.into()),
     }
 }
 
@@ -74,8 +74,8 @@ pub fn tab_chip_colors(kind: SessionKind, active: bool) -> ChipColors {
         ChipColors { bg, fg }
     } else {
         ChipColors {
-            bg: theme::border::ZONE,
-            fg: theme::text::FAINTER,
+            bg: theme::border::ZONE.into(),
+            fg: theme::text::FAINTER.into(),
         }
     }
 }
@@ -90,8 +90,8 @@ pub fn file_tab_chip_colors(lang: LangChip, active: bool) -> ChipColors {
         }
     } else {
         ChipColors {
-            bg: theme::border::ZONE,
-            fg: theme::text::FAINTER,
+            bg: theme::border::ZONE.into(),
+            fg: theme::text::FAINTER.into(),
         }
     }
 }
@@ -109,15 +109,15 @@ pub struct TabColors {
 pub fn tab_colors(active: bool) -> TabColors {
     if active {
         TabColors {
-            bg: theme::surface::CENTER,
-            underline: theme::surface::CENTER,
-            label: theme::text::PRIMARY,
+            bg: theme::surface::CENTER.into(),
+            underline: theme::surface::CENTER.into(),
+            label: theme::text::PRIMARY.into(),
         }
     } else {
         TabColors {
             bg: TRANSPARENT,
-            underline: theme::border::ZONE,
-            label: theme::text::DIMMER,
+            underline: theme::border::ZONE.into(),
+            label: theme::text::DIMMER.into(),
         }
     }
 }
@@ -166,33 +166,33 @@ pub struct ActionColors {
 pub fn action_button_colors(style: ActionStyle) -> ActionColors {
     match style {
         ActionStyle::PrimaryGreen => ActionColors {
-            bg: theme::button::GREEN_BG,
-            border: theme::button::GREEN_BG,
-            fg: theme::button::GREEN_FG,
-            keycap_fg: theme::button::GREEN_KEYCAP_FG,
-            keycap_border: theme::button::GREEN_KEYCAP,
+            bg: theme::button::GREEN_BG.into(),
+            border: theme::button::GREEN_BG.into(),
+            fg: theme::button::GREEN_FG.into(),
+            keycap_fg: theme::button::GREEN_KEYCAP_FG.into(),
+            keycap_border: theme::button::GREEN_KEYCAP.into(),
         },
         ActionStyle::PrimaryBlue => ActionColors {
-            bg: theme::button::BLUE_BG,
-            border: theme::button::BLUE_BG,
-            fg: theme::button::BLUE_FG,
+            bg: theme::button::BLUE_BG.into(),
+            border: theme::button::BLUE_BG.into(),
+            fg: theme::button::BLUE_FG.into(),
             // Same blue (`#8fbde6`) as `term::PROMPT`, reused rather than duplicated.
-            keycap_fg: theme::term::PROMPT,
-            keycap_border: theme::button::BLUE_KEYCAP,
+            keycap_fg: theme::term::PROMPT.into(),
+            keycap_border: theme::button::BLUE_KEYCAP.into(),
         },
         ActionStyle::Outline => ActionColors {
             bg: TRANSPARENT,
-            border: theme::border::BUTTON,
-            fg: theme::text::SECONDARY,
-            keycap_fg: theme::text::DIMMER,
-            keycap_border: theme::border::BUTTON,
+            border: theme::border::BUTTON.into(),
+            fg: theme::text::SECONDARY.into(),
+            keycap_fg: theme::text::DIMMER.into(),
+            keycap_border: theme::border::BUTTON.into(),
         },
         ActionStyle::Ghost => ActionColors {
             bg: TRANSPARENT,
             border: TRANSPARENT,
-            fg: theme::text::DIMMER,
-            keycap_fg: theme::text::FAINT,
-            keycap_border: theme::border::KEYCAP,
+            fg: theme::text::DIMMER.into(),
+            keycap_fg: theme::text::FAINT.into(),
+            keycap_border: theme::border::KEYCAP.into(),
         },
     }
 }
@@ -390,28 +390,28 @@ mod tests {
             "two different agents must not share a tab chip colour"
         );
         let (claude_fg, claude_bg) = theme::agent::SONNET;
-        assert!(same(claude.fg, claude_fg));
-        assert!(same(claude.bg, claude_bg));
+        assert!(same(claude.fg, claude_fg.into()));
+        assert!(same(claude.bg, claude_bg.into()));
     }
 
     #[test]
     fn an_active_file_tab_chip_is_tinted_with_its_own_language_colour() {
         let rs = LangChip {
             label: "rs",
-            fg: theme::lang::RS.0,
-            bg: theme::lang::RS.1,
+            fg: theme::lang::RS.0.into(),
+            bg: theme::lang::RS.1.into(),
         };
         let colors = file_tab_chip_colors(rs, true);
-        assert!(same(colors.fg, theme::lang::RS.0));
-        assert!(same(colors.bg, theme::lang::RS.1));
+        assert!(same(colors.fg, theme::lang::RS.0.into()));
+        assert!(same(colors.bg, theme::lang::RS.1.into()));
     }
 
     #[test]
     fn an_inactive_file_tab_chip_is_dimmed_to_the_same_neutral_a_session_tab_chip_uses() {
         let rs = LangChip {
             label: "rs",
-            fg: theme::lang::RS.0,
-            bg: theme::lang::RS.1,
+            fg: theme::lang::RS.0.into(),
+            bg: theme::lang::RS.1.into(),
         };
         let file_colors = file_tab_chip_colors(rs, false);
         let session_colors = tab_chip_colors(SessionKind::Shell, false);
@@ -425,7 +425,7 @@ mod tests {
         let shell = tab_chip_colors(SessionKind::Shell, false);
         assert!(same(claude.bg, shell.bg));
         assert!(same(claude.fg, shell.fg));
-        assert!(same(claude.bg, theme::border::ZONE));
+        assert!(same(claude.bg, theme::border::ZONE.into()));
     }
 
     #[test]
