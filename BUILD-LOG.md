@@ -1484,3 +1484,47 @@ banner already existed to prevent.
 
 This closes Revision R8.5b. Next: R8.5c (real editing in the Diff and Merge views, plus
 `wt-core`'s first real arbitrary-content file-write path), then R10 (undo/redo).
+
+## Revision R8.5c — real hand-editing for merge conflicts
+
+Closes Revision R8.5's final sub-phase. Merge conflicts can now be resolved by hand-editing
+the raw conflict-marker text directly, reusing the same real `EditBuffer`/
+`EntityInputHandler` machinery R8.5a built for the File view, instead of only the existing
+structural per-hunk accept/reject flow. A new `AdeApp::merge_edit` slot holds this mode's
+buffer, deliberately kept separate from the File view's `edit_buffers` map, since that map
+is wiped on sidebar worktree switches independent of which merge flow is active. Saving
+writes the real bytes to disk, then re-parses via `wt_core::merge::load_conflicted_file`; a
+fully-resolved file gets staged via `wt_core::merge::write_resolved_file`. A malformed
+re-parse still leaves the on-disk write and the buffer's dirty flag correctly reflecting
+what actually got saved, without touching `MergeFlow::files[]` — hand-edit mode stays open
+until the markers are fixed and saved again cleanly.
+
+The builder's own internally-dispatched checker found three real correctness bugs and three
+minor ones, all fixed in one round. The most notable was the exact "a keystroke gets
+swallowed" class this project has now shipped seven times: `active_edit_target()`'s guard
+for routing keystrokes to hand-edit mode used a too-weak `open_change.is_some()` check,
+live-reproduced to incorrectly claim hand-edit keystrokes even when the merge view wasn't
+actually showing the editing surface. Fixed by mirroring the real rendering predicate
+exactly instead of approximating it. A second real bug: the save pipeline could desync
+in-memory state from what was genuinely on disk when conflict markers were left malformed
+after an edit — split the write and re-parse outcomes apart so the dirty flag always clears
+on a successful write regardless of whether the re-parse succeeds. A third: the Settings
+page's keybinding-context column had regressed to reporting a constant placeholder string
+instead of the real scoping predicate, producing 18 duplicate, indistinguishable rows — and
+the drift-guard test meant to catch exactly this had itself been weakened to accept it
+rather than fail on it. Also found and fixed: a stale-save-after-discard race, where a
+background save landing after hand-edit mode was discarded (or the same file's edit mode
+was reopened fresh) could resurrect a torn-down edit session or silently clobber a new
+buffer's state — reproduced deterministically with a test-only delay seam mirroring the
+settings-save code's own established pattern, closed with a buffer identity check layered
+on top of the existing session/generation/path checks.
+
+Independently re-verified directly rather than relying solely on the fix round's own report:
+fmt/build/clippy clean, both the keystroke-routing and stale-save-race fixes spot-checked
+directly in the source and confirmed to match what was reported, full workspace test suite
+green at 592 app tests (up from 588 before this revision), with the one known pre-existing
+`diff_render_tests` cache flake confirmed unrelated by an isolated re-run.
+
+This closes Revision R8.5 overall: R8.5a (real File-view editing), R8.5b (live LSP sync and
+the Completions popup), R8.5c (this — real Merge-view hand-editing). Next: R10 (undo/redo
+command pattern).
