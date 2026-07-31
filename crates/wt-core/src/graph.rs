@@ -120,11 +120,33 @@ pub struct LaneSegment {
     pub dashed: bool,
 }
 
-/// A branch point or merge, connecting this row's own lane to another lane, drawn as an elbow.
+/// Which of the two elbow shapes an [`Elbow`] draws - they are geometric mirrors of each other,
+/// occupying opposite halves of the row box (design spec §2's single "elbow" concept actually
+/// covers two distinct real cases; see [`layout_lanes`]'s Step 2 vs. Step 4 docs for why a row can
+/// need either, or both, kinds at once).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElbowKind {
+    /// This row is itself a real merge commit: `from_lane` is this row's own dot (top of the
+    /// row's bottom half), curving down into `to_lane`, which continues in the row below. Drawn
+    /// in the row's *bottom* half.
+    Diverging,
+    /// This row's commit is also the next expected commit for some *other*, unrelated lane (two
+    /// branches sharing an ancestor with no merge commit involved) - `from_lane` is that other,
+    /// *ending* lane (its line arriving from the row above, at the row's top edge), curving over
+    /// to join `to_lane`, which is this row's own dot. Drawn in the row's *top* half - the mirror
+    /// image of [`Self::Diverging`].
+    Converging,
+}
+
+/// A branch point, merge, or shared-ancestor join, connecting two lanes at this row, drawn as an
+/// elbow. See [`ElbowKind`] for what `from_lane`/`to_lane` mean for each kind - they are not
+/// symmetric (a `Diverging` elbow's `from_lane` is this row's own dot; a `Converging` elbow's
+/// `from_lane` is the *other*, ending lane).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Elbow {
     pub from_lane: usize,
     pub to_lane: usize,
+    pub kind: ElbowKind,
 }
 
 /// One row of the graph, in commit order (newest first).
@@ -579,6 +601,23 @@ fn layout_lanes<Id: Clone + Eq + std::hash::Hash>(commits: &[(Id, Vec<Id>)]) -> 
 
     for (id, parents) in commits {
         seen.insert(id.clone());
+        // Lanes free *before* this row makes any changes - Step 4's new-lane allocation below
+        // must only ever reuse one of these, never a lane this very row just freed itself (via
+        // Step 2's `Converging` collapse, or Step 3 freeing `own_lane` when this row's own first
+        // parent turns out to already have been seen). Reusing a same-row-freed lane produces
+        // either a bogus `Elbow { from_lane: N, to_lane: N }` self-loop (when the freed lane was
+        // `own_lane`) or two `LaneSegment`s for one lane index in one row - an `ends_here` one
+        // from Step 2 and a `starts_here` one from Step 4 - which paints as a single unbroken
+        // pass-through line for what are really two unrelated branches (when the freed lane was
+        // one of Step 2's `ends_here_lanes`). Both are real regressions an adversarial audit
+        // found in this fix; see `allocate_fresh_lane`'s own docs and `mod tests` below.
+        let free_before_row: std::collections::HashSet<usize> = lanes
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.is_none())
+            .map(|(index, _)| index)
+            .collect();
+
         // Step 1: find (or allocate) this commit's own lane.
         let mut own_lane = lanes.iter().position(|slot| slot.as_ref() == Some(id));
         let own_lane_is_new = own_lane.is_none();
@@ -586,8 +625,19 @@ fn layout_lanes<Id: Clone + Eq + std::hash::Hash>(commits: &[(Id, Vec<Id>)]) -> 
 
         // Step 2: any *other* lane also expecting this same commit (multiple branches
         // converging on a shared ancestor without this row itself being a merge) collapses into
-        // `own_lane` and ends here.
+        // `own_lane` and ends here. Each one gets a real `Converging` elbow connecting its line
+        // (arriving from the row above) to `own_lane`'s dot - without it, the ending lane's
+        // top-half stub (drawn separately, per-`LaneSegment`) has nothing joining it to this
+        // row's own dot, which is the real bug this case exists to fix (see the module docs).
+        //
+        // No extra out-of-order filtering is needed here beyond what already exists: a lane's
+        // slot can only ever be set to expect `id` (by Step 3/4 of some *earlier* row) while `id`
+        // itself had not yet been seen - Step 3/4's own `seen.contains(parent)` check already
+        // refuses to point a lane at an id that's already been emitted. So by construction, every
+        // lane found here really was validly waiting for `id`, and `id`'s own row (this
+        // iteration) always renders - it is unconditionally pushed to `out` below.
         let mut ends_here_lanes: Vec<usize> = Vec::new();
+        let mut elbows = Vec::new();
         for (index, slot) in lanes.iter_mut().enumerate() {
             if index == own_lane {
                 continue;
@@ -595,6 +645,11 @@ fn layout_lanes<Id: Clone + Eq + std::hash::Hash>(commits: &[(Id, Vec<Id>)]) -> 
             if slot.as_ref() == Some(id) {
                 *slot = None;
                 ends_here_lanes.push(index);
+                elbows.push(Elbow {
+                    from_lane: index,
+                    to_lane: own_lane,
+                    kind: ElbowKind::Converging,
+                });
             }
         }
 
@@ -620,7 +675,6 @@ fn layout_lanes<Id: Clone + Eq + std::hash::Hash>(commits: &[(Id, Vec<Id>)]) -> 
         // Step 4: additional parents (merges) either reuse an already-tracked lane (an elbow with
         // no new lane) or open a new one (an elbow plus a freshly started lane). A parent already
         // emitted earlier out of order is skipped entirely - see the out-of-order note above.
-        let mut elbows = Vec::new();
         let mut new_lane_segments = Vec::new();
         for parent in parents.iter().skip(1) {
             if seen.contains(parent) {
@@ -634,12 +688,15 @@ fn layout_lanes<Id: Clone + Eq + std::hash::Hash>(commits: &[(Id, Vec<Id>)]) -> 
                 elbows.push(Elbow {
                     from_lane: own_lane,
                     to_lane: existing,
+                    kind: ElbowKind::Diverging,
                 });
             } else {
-                let new_lane = allocate_lane(&mut lanes, parent.clone());
+                let new_lane =
+                    allocate_fresh_lane(&mut lanes, &free_before_row, own_lane, parent.clone());
                 elbows.push(Elbow {
                     from_lane: own_lane,
                     to_lane: new_lane,
+                    kind: ElbowKind::Diverging,
                 });
                 new_lane_segments.push(LaneSegment {
                     lane: new_lane,
@@ -689,6 +746,29 @@ fn layout_lanes<Id: Clone + Eq + std::hash::Hash>(commits: &[(Id, Vec<Id>)]) -> 
 /// after a branch merges").
 fn allocate_lane<Id>(lanes: &mut Vec<Option<Id>>, expecting: Id) -> usize {
     if let Some(index) = lanes.iter().position(|slot| slot.is_none()) {
+        lanes[index] = Some(expecting);
+        index
+    } else {
+        lanes.push(Some(expecting));
+        lanes.len() - 1
+    }
+}
+
+/// Like [`allocate_lane`], but for Step 4's *new*-lane case only: reuses a free lane slot only if
+/// it was already free *before this row began* (`free_before_row`) and isn't `own_lane` - never a
+/// lane this same row just freed itself (Step 2's `Converging` collapse or Step 3 freeing
+/// `own_lane`). Reusing a same-row-freed lane there produces a bogus self-loop elbow or a
+/// duplicate `LaneSegment` for one lane in one row - see the call site's own comment and
+/// `layout_lanes`' `free_before_row` docs for the two real regressions this exists to prevent.
+fn allocate_fresh_lane<Id>(
+    lanes: &mut Vec<Option<Id>>,
+    free_before_row: &std::collections::HashSet<usize>,
+    own_lane: usize,
+    expecting: Id,
+) -> usize {
+    if let Some(index) = lanes.iter().enumerate().position(|(index, slot)| {
+        slot.is_none() && free_before_row.contains(&index) && index != own_lane
+    }) {
         lanes[index] = Some(expecting);
         index
     } else {
@@ -827,6 +907,19 @@ mod tests {
             base_row.segments.iter().filter(|s| s.ends_here).count() >= 1,
             "at least the row's own lane must end at the root commit"
         );
+        // `merge`'s lane (still open, waiting for `base` as its first parent) genuinely reaches
+        // `base` here (unlike the skipped `feature` edge above) - it must get a real Converging
+        // elbow into `base_row`'s own lane, not just an ends_here stub with nothing connecting it.
+        assert!(
+            base_row
+                .elbows
+                .iter()
+                .any(|e| e.kind == ElbowKind::Converging
+                    && e.to_lane == base_row.lane
+                    && e.from_lane != base_row.lane),
+            "the merge lane reaching the shared root must get a real connecting elbow: {:?}",
+            base_row.elbows
+        );
     }
 
     #[test]
@@ -844,7 +937,8 @@ mod tests {
             layout[0].elbows,
             vec![Elbow {
                 from_lane: 0,
-                to_lane: 1
+                to_lane: 1,
+                kind: ElbowKind::Diverging,
             }],
             "merge commit opens an elbow onto a new lane for its second parent"
         );
@@ -862,6 +956,170 @@ mod tests {
                 .iter()
                 .any(|s| s.lane == 1 && s.ends_here),
             "the feature lane must end where it rejoins the trunk"
+        );
+        assert_eq!(
+            layout[3].elbows,
+            vec![Elbow {
+                from_lane: 1,
+                to_lane: 0,
+                kind: ElbowKind::Converging,
+            }],
+            "the ending feature lane must get a real elbow connecting it to c1's own dot, not \
+             just a dangling stub"
+        );
+    }
+
+    #[test]
+    fn two_independent_tips_sharing_an_ancestor_both_get_converging_elbows() {
+        // Regression test for the real bug found in this repository's own history (row 9,
+        // commit `ac8e6cd`): two entirely independent branch tips (walked as separate DAG roots
+        // by `GraphScope::All`, exactly like `d` and `e` below) share a common ancestor `shared`
+        // as their *own* first parent - `shared` is not itself a merge commit (one parent, no
+        // `Diverging` elbow of its own), but two other, unrelated lanes both end there. Every
+        // ending lane must get a real `Converging` elbow into `shared`'s own lane, not an empty
+        // `elbows` vec with a dangling stub (the bug this branch fixes).
+        let commits: Vec<(&str, Vec<&str>)> = vec![
+            ("d", vec!["shared"]),
+            ("e", vec!["shared"]),
+            ("shared", vec![]),
+        ];
+        let layout = layout_lanes(&commits);
+        assert_eq!(layout[0].lane, 0, "d opens lane 0");
+        assert_eq!(layout[1].lane, 1, "e opens lane 1 (unrelated to d's lane)");
+        assert!(
+            layout[0].elbows.is_empty() && layout[1].elbows.is_empty(),
+            "neither d nor e is itself a merge, so neither row gets its own elbow"
+        );
+
+        let shared_row = &layout[2];
+        // `shared`'s own lane reuses whichever of lane 0/1 it's found on first (lane 0, since d
+        // was processed first) - the *other* lane (1) must end here and get a real Converging
+        // elbow into `shared`'s own lane, exactly like this repo's real row 9.
+        assert_eq!(shared_row.lane, 0);
+        assert!(
+            shared_row
+                .segments
+                .iter()
+                .any(|s| s.lane == 1 && s.ends_here),
+            "lane 1 must end at the shared ancestor"
+        );
+        assert_eq!(
+            shared_row.elbows,
+            vec![Elbow {
+                from_lane: 1,
+                to_lane: 0,
+                kind: ElbowKind::Converging,
+            }],
+            "the ending lane must get a real connecting elbow, not an empty elbows vec with a \
+             dangling stub - this is the exact bug found in this repository's own row 9"
+        );
+    }
+
+    #[test]
+    fn a_merge_row_that_is_also_a_shared_ancestor_gets_both_elbow_kinds() {
+        // Regression test for the real bug's second confirmed instance (row 14, "Merge pull
+        // request #23"): a row can be a genuine merge commit (its own real Diverging elbow) *and*
+        // simultaneously the shared ancestor an unrelated, independent lane converges on - the
+        // two must coexist correctly, each in its own kind, without one clobbering the other.
+        //
+        // `m` merges `c1` and `c2`; independently, *two* unrelated tips (`other1`, `other2`) each
+        // have `m` as their own first parent - so two separate lanes both end exactly at `m`'s
+        // row (own_lane reuses one of them; the other must collapse in via a real Converging
+        // elbow), at the very same time `m`'s own second parent opens a real Diverging elbow -
+        // exactly the shape found in this repository's real row 14 (a real merge commit whose
+        // `lane_segments` *also* showed an unrelated lane ending there with no elbow at all).
+        let commits: Vec<(&str, Vec<&str>)> = vec![
+            ("other1", vec!["m"]),
+            ("other2", vec!["m"]),
+            ("m", vec!["c1", "c2"]),
+            ("c1", vec![]),
+            ("c2", vec![]),
+        ];
+        let layout = layout_lanes(&commits);
+        assert_eq!(layout[0].lane, 0, "other1 opens lane 0");
+        assert_eq!(layout[1].lane, 1, "other2 opens lane 1");
+
+        let m_row = &layout[2];
+        assert_eq!(m_row.lane, 0, "m reuses other1's now-ending lane 0");
+        assert_eq!(
+            m_row.elbows.len(),
+            2,
+            "m must have both its own real Diverging merge elbow and a Converging elbow for \
+             other2's ending lane: {:?}",
+            m_row.elbows
+        );
+        assert!(
+            m_row.elbows.iter().any(|e| e.kind == ElbowKind::Converging
+                && e.from_lane == 1
+                && e.to_lane == m_row.lane),
+            "other2's ending lane must get a real Converging elbow into m's own dot, not a \
+             dangling stub: {:?}",
+            m_row.elbows
+        );
+        assert!(
+            m_row.elbows.iter().any(|e| e.kind == ElbowKind::Diverging
+                && e.from_lane == m_row.lane
+                && e.to_lane != m_row.lane),
+            "m's own second parent must still get its real Diverging elbow into a genuinely \
+             different lane, unaffected by the converging case (a self-loop elbow, from_lane == \
+             to_lane, would be exactly as broken as no elbow at all): {:?}",
+            m_row.elbows
+        );
+        // Regression for a real gap an adversarial audit found in this fix: Step 4's own
+        // "allocate a new lane" search must never reuse the very lane Step 2 just freed on this
+        // same row (`other2`'s ending lane 1) - doing so would give lane 1 *two* `LaneSegment`s
+        // in the same row (an `ends_here` one from Step 2, a `starts_here` one from Step 4),
+        // which paints as one unbroken pass-through line for what are really two unrelated
+        // branches. Every lane index in a single row's `segments` must be unique.
+        let mut lanes_seen_this_row = std::collections::HashSet::new();
+        for segment in &m_row.segments {
+            assert!(
+                lanes_seen_this_row.insert(segment.lane),
+                "lane {} has more than one LaneSegment in the same row: {:?}",
+                segment.lane,
+                m_row.segments
+            );
+        }
+    }
+
+    #[test]
+    fn a_merge_whose_first_parent_was_already_seen_never_self_loops_its_second_parent() {
+        // Regression for a real bug an adversarial audit found: when a merge row's *first*
+        // parent has already been seen (an out-of-order history - see `layout_lanes`'s own
+        // "Out-of-order input" docs), Step 3 frees `own_lane` in the very same row Step 4 then
+        // needs to open a *new*, genuinely different lane for the second parent `g`. Before the
+        // fix, Step 4's `allocate_lane` call happily reused `own_lane`'s own just-freed slot,
+        // producing a nonsensical `Elbow { from_lane: N, to_lane: N }` self-loop instead of a
+        // real elbow into a distinct lane.
+        //
+        // `f` renders first (lane 0, still expecting `base`); `m` merges `f` (already seen - out
+        // of order relative to `base`) and `g` (not yet seen) - `m`'s own lane is brand new
+        // (nothing was expecting `m`), and freed again immediately by Step 3 since `f` is
+        // already in `seen`.
+        let commits: Vec<(&str, Vec<&str>)> = vec![
+            ("f", vec!["base"]),
+            ("m", vec!["f", "g"]),
+            ("base", vec![]),
+            ("g", vec![]),
+        ];
+        let layout = layout_lanes(&commits);
+        let m_row = &layout[1];
+        assert_eq!(
+            m_row.elbows.len(),
+            1,
+            "m must get exactly one real elbow: {:?}",
+            m_row.elbows
+        );
+        let elbow = m_row.elbows[0];
+        assert_ne!(
+            elbow.from_lane, elbow.to_lane,
+            "m's second parent must open a genuinely different lane, never a self-loop back \
+             onto m's own just-freed lane: {elbow:?}"
+        );
+        assert_eq!(
+            elbow.kind,
+            ElbowKind::Diverging,
+            "m's second parent is a real, new merge elbow: {elbow:?}"
         );
     }
 
