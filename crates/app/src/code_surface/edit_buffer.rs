@@ -60,9 +60,9 @@
 //! own primary [`Self::selected_range`]/[`Self::selection_reversed`] pair. It has no way to
 //! represent [`Self::secondary_cursors`]. So undoing/redoing a multi-cursor edit correctly restores
 //! **all of the text** as one atomic step (every cursor's own edit reverses/replays together,
-//! genuinely one Ctrl+Z), but only restores the **primary** cursor's own caret/selection precisely
-//! - every secondary cursor from that edit is not reconstructed by undo/redo, and the buffer is
-//! left in ordinary single-cursor state afterward. Extending `SelectionSnapshot` to a real
+//! genuinely one Ctrl+Z), but only restores the **primary** cursor's own caret/selection
+//! precisely; every secondary cursor from that edit is not reconstructed by undo/redo, and the
+//! buffer is left in ordinary single-cursor state afterward. Extending `SelectionSnapshot` to a real
 //! multi-cursor shape would touch every one of `crate::text_history`'s own consumers (`rail`,
 //! `palette`, `settings`, `root::new_file`), not just this buffer - real, separate, cross-cutting
 //! work outside this one sub-issue's scope, left as a documented gap rather than guessed at.
@@ -850,9 +850,10 @@ impl EditBuffer {
         // takes the single-cursor path unconditionally (the documented IME/completion gap).
         if range.is_none() && !self.secondary_cursors.is_empty() {
             let new_text = new_text.to_string();
-            self.apply_at_every_cursor(EditKind::for_replacement(&new_text), |buffer, cursor_range| {
-                (buffer.clamp_range(cursor_range), new_text.clone())
-            });
+            self.apply_at_every_cursor(
+                EditKind::for_replacement(&new_text),
+                |buffer, cursor_range| (buffer.clamp_range(cursor_range), new_text.clone()),
+            );
             return;
         }
         self.replace_range_recording(range, new_text, None, None);
@@ -3597,6 +3598,118 @@ mod tests {
         buf.select_all();
         assert_eq!(buf.cursor_count(), 1);
         assert_eq!(buf.selected_range, 0..buf.content.len());
+    }
+
+    // ---- Multi-cursor edits recorded as one real undo step (issue #28, on top of issue #17) ----
+
+    #[test]
+    fn typing_at_multiple_cursors_then_undo_restores_all_of_them_as_one_step() {
+        let mut buf = buffer("value + value\n");
+        buf.move_to(1);
+        buf.select_word_or_add_next_occurrence();
+        buf.select_word_or_add_next_occurrence();
+        assert_eq!(buf.cursor_count(), 2);
+
+        buf.replace_range(None, "x");
+        assert_eq!(buf.content, "x + x\n");
+
+        assert!(buf.undo(), "a multi-cursor edit must be undoable");
+        assert_eq!(
+            buf.content, "value + value\n",
+            "undo must restore the text at every cursor's own edit, not just one"
+        );
+        assert!(
+            !buf.can_undo(),
+            "the whole multi-cursor edit must have been exactly one undo step, not two"
+        );
+    }
+
+    #[test]
+    fn redo_after_undoing_a_multi_cursor_edit_reapplies_every_cursors_own_edit() {
+        let mut buf = buffer("value + value\n");
+        buf.move_to(1);
+        buf.select_word_or_add_next_occurrence();
+        buf.select_word_or_add_next_occurrence();
+        buf.replace_range(None, "x");
+        assert!(buf.undo());
+        assert_eq!(buf.content, "value + value\n");
+
+        assert!(buf.redo());
+        assert_eq!(
+            buf.content, "x + x\n",
+            "redo must reapply every cursor's own edit together, not just one"
+        );
+    }
+
+    #[test]
+    fn undo_after_a_multi_cursor_edit_leaves_the_buffer_in_ordinary_single_cursor_state() {
+        // A real, documented limitation - see `EditBuffer`'s own "Multi-cursor edits are one real
+        // undo step" docs: `text_history::SelectionSnapshot` has no way to represent more than one
+        // cursor, so undo restores the text at every cursor but only the *primary*'s own
+        // caret/selection - every secondary is dropped, not left stale.
+        let mut buf = buffer("value + value\n");
+        buf.move_to(1);
+        buf.select_word_or_add_next_occurrence();
+        buf.select_word_or_add_next_occurrence();
+        buf.replace_range(None, "x");
+        assert_eq!(
+            buf.cursor_count(),
+            2,
+            "typing collapses each real cursor to its own empty caret, not down to a single \
+             global one - there are still two real cursors here, one per edit"
+        );
+
+        assert!(buf.undo());
+        assert_eq!(
+            buf.cursor_count(),
+            1,
+            "undo must leave the buffer in ordinary single-cursor state, not a stale secondary"
+        );
+    }
+
+    #[test]
+    fn backspace_at_multiple_cursors_then_undo_restores_the_deleted_text_at_every_cursor() {
+        let mut buf = buffer("aXbXc\n");
+        buf.selected_range = 2..2; // right after the first X
+        buf.secondary_cursors = vec![SecondaryCursor {
+            range: 4..4, // right after the second X
+            reversed: false,
+        }];
+        buf.backspace();
+        assert_eq!(buf.content, "abc\n");
+
+        assert!(buf.undo());
+        assert_eq!(
+            buf.content, "aXbXc\n",
+            "undo must restore both deleted characters, not just one"
+        );
+    }
+
+    #[test]
+    fn consecutive_multi_cursor_keystrokes_coalesce_into_one_undo_group() {
+        let original = "v + v\n";
+        let mut buf = buffer(original);
+        buf.move_to(0);
+        buf.add_cursor_at(4);
+        assert_eq!(buf.cursor_count(), 2);
+
+        // Three real keystrokes in a row, no intervening caret move - a genuine typing burst
+        // across both cursors, exactly like this module's own single-cursor `type_text` helper
+        // drives for the plain coalescing tests above.
+        buf.replace_range(None, "a");
+        buf.replace_range(None, "b");
+        buf.replace_range(None, "c");
+        assert_ne!(buf.content, original);
+
+        assert!(buf.undo(), "the whole burst must be undoable");
+        assert_eq!(
+            buf.content, original,
+            "three keystrokes across two cursors must undo as one coalesced step, not six"
+        );
+        assert!(
+            !buf.can_undo(),
+            "and there must be nothing left behind it - proving it really was one group"
+        );
     }
 }
 

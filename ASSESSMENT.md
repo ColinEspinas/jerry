@@ -239,26 +239,35 @@ active cursor as one atomic edit, collision merging, and multi-cursor arrow-key 
 genuinely wired end to end — driven through the same real key-binding table and
 `EntityInputHandler` path every other editing feature in this app uses, not a parallel or
 special-cased mechanism, and painted with real per-cursor selection fills/caret bars, not a data
-model with nothing visible backing it. 30 new tests, including four that drive the real bound
-keystrokes rather than calling `EditBuffer` methods directly.
+model with nothing visible backing it. This was rebased mid-implementation onto a separately-landed
+branch (GitHub issue #17) that added this editor's first real text undo/redo, and the two are
+genuinely integrated, not just made to compile side by side: a multi-cursor edit now really is one
+`Ctrl+Z` step (`EditBuffer::apply_at_every_cursor` records every cursor's own splice into the same
+history group), with one honest, documented exception — undo/redo restores all of the affected text
+correctly, but only the *primary* cursor's own caret/selection precisely, since the shared
+`SelectionSnapshot` type (used by every text-input widget in this app, not just the File view) has
+no way to represent more than one cursor. 25 new tests, including four that drive the real bound
+keystrokes rather than calling `EditBuffer` methods directly, and five covering the undo/redo
+integration specifically (one-step coalescing, redo, the documented single-cursor-after-undo
+outcome, and a multi-keystroke burst still coalescing to one group).
 
-**What's genuinely not there**: undo/redo, for *any* edit in this editor, single- or
-multi-cursor — a pre-existing gap since Revision R8.5a, not something this work was asked to
-fix, but worth stating plainly since the issue's own checklist named it. Alt+Shift+drag column
-selection is absent because ordinary mouse-drag-to-select doesn't exist in this editor at all
-yet, for any selection, single- or multi-cursor. Multi-cursor support does not extend to the
-separate merge hand-edit surface (`crate::merge::editing`) — a deliberate scope narrowing to the
-File view only, documented in BUILD-LOG.md's own entry for this work.
+**What's genuinely not there**: Alt+Shift+drag column selection is absent because ordinary
+mouse-drag-to-select doesn't exist in this editor at all yet, for any selection, single- or
+multi-cursor. Multi-cursor support does not extend to the separate merge hand-edit surface
+(`crate::merge::editing`) — a deliberate scope narrowing to the File view only, documented in
+BUILD-LOG.md's own entry for this work. Undo/redo's own single-selection limitation above is a
+real, live gap for the specific case of undoing a multi-cursor edit, not a hypothetical one.
 
 **Independent verification note**: this work was built from a Windows sandbox instead of this
-project's usual Linux/WSL2 environment, and could not run this crate's own real-language-server
-integration tests (`lsp_hover_wiring_tests`, `lsp_diagnostics_wiring_tests`,
-`vue_two_server_wiring_tests`) locally — `rust-analyzer` is not installed for the pinned
-toolchain on this machine, and the crash pattern (the whole test binary aborting rather than one
-test failing cleanly) is consistent with a real, unhandled server-spawn failure, not a logic bug
-in this change (none of those three modules were touched). Every test this change actually added
-or could reach was run and passed; the workspace-wide clippy/test gates this project requires
-could only be confirmed scoped to the `app` crate, with two known, pre-existing, platform-only
-gaps (unrelated Windows-only unused-import warning, unrelated Windows-only `lsp-core` test
-compile failure) both identified and excluded rather than silently ignored — see BUILD-LOG.md's
-own entry for the detail.
+project's usual Linux/WSL2 environment. `lsp-core`'s own test target does not compile on Windows
+at all (a pre-existing, unrelated `#[cfg(unix)]` gap, confirmed unaffected by this change by
+reproducing it against a clean stash of the base commit too), which blocks a literal
+`cargo test --workspace`/`cargo clippy --workspace --all-targets` run on this machine outright;
+verified instead with `--workspace --exclude lsp-core` (clean) plus `-p app` on its own. Three of
+this crate's own real-language-server-spawning test modules
+(`lsp_hover_wiring_tests`/`lsp_diagnostics_wiring_tests`/`vue_two_server_wiring_tests`) also
+couldn't run - `rust-analyzer` is not installed for the pinned toolchain here - and one real,
+timing-sensitive fake-LSP-server test flaked under this sandbox's own resource constraints; none of
+the four are anywhere near this change's own files. Every test this change actually added was run
+and passed, and the rest of the `app` crate's suite passed in full alongside it - see BUILD-LOG.md's
+own entry for the exact numbers and commands.

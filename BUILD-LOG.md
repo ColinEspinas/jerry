@@ -3524,19 +3524,44 @@ multi-cursor state would be real logic bound to nothing a user could ever see, w
 cursor - wired into the File view's existing mouse-down handler ahead of the shift-click branch, so
 Alt+Shift+click still adds a cursor rather than extending the primary's selection.
 
+**Undo/redo grouping a multi-cursor edit as one step - landed after all, via a rebase onto issue
+#17.** This was originally built and documented as a deliberate gap (this editor had no text
+undo/redo at all when this work started - Revision R8.5a). Mid-implementation, a separate branch
+building real per-widget text undo/redo (`crate::text_history`, GitHub issue #17) landed on
+`master`; rebasing onto it found that its own `EditGroup` was *designed* for exactly this
+("Forward-compatible with multi-cursor" is a section in that module's own docs, from before this
+work rebased onto it) - it holds a `Vec<TextEdit>`, not one edit, specifically so N simultaneous
+splices can become one undo step. `EditBuffer::apply_at_every_cursor` now calls
+`TextHistory::record` once per cursor's own splice, chaining each call's `before` snapshot to the
+previous call's `after` so the history's own caret-continuity coalescing rule merges every one of
+them into a single group rather than starting a fresh one per cursor - no changes to
+`crate::text_history` itself were needed. A genuine multi-cursor `Ctrl+Z` now reverses every
+cursor's own edit together, as one keystroke.
+
+One real, honest limitation remains, documented in `edit_buffer.rs`'s own docs rather than
+papered over: `SelectionSnapshot` (shared by every real text widget in this app - `TextField` for
+the palette/rail/settings/new-file inputs, not just this buffer) holds exactly one caret/selection,
+so it has no way to represent a whole multi-cursor state. Undo/redo therefore restores **all of the
+text** correctly as one atomic step, but only the **primary** cursor's own caret/selection precisely
+- every secondary cursor from that edit is not reconstructed, and the buffer lands in ordinary
+single-cursor state afterward (`EditBuffer::restore_selection` now clears `secondary_cursors`
+explicitly, so this is a real, verified outcome, not an unspecified one). Extending
+`SelectionSnapshot` to a real multi-cursor shape would touch every one of `crate::text_history`'s
+own consumers, not just this buffer - real, separate, cross-cutting work outside this one
+sub-issue's scope.
+
+The regression test written for that exact outcome (`undo_after_a_multi_cursor_edit_leaves_the_
+buffer_in_ordinary_single_cursor_state`) caught a real mistake in its own first draft, not in the
+implementation: it asserted `cursor_count() == 1` immediately after typing at two cursors, before
+undo even ran - wrong on its own terms, since typing collapses *each* cursor to its own caret, not
+every cursor down to one shared caret (there are still genuinely two cursors, one per edit, right
+after a multi-cursor keystroke). Fixed by asserting the real pre-undo count (2) and only then
+asserting the post-undo count (1), which is what actually exercises `restore_selection`'s new
+clearing behavior.
+
 **What was deliberately cut, and why**, each flagged in the issue itself as more peripheral than
 the core behavior above:
 
-- **Undo/redo grouping a multi-cursor edit as one step.** This editor has **no text undo/redo at
-  all** today - a documented gap since Revision R8.5a, unrelated to and unaffected by this work.
-  The `Undo`/`Redo` actions that do exist (Revision R10, `secondary-z`/`secondary-shift-z`) are a
-  completely different, unrelated command-pattern stack scoped to `crate::worktree_history` ("keep
-  all changes"/"discard worktree") - they have never touched text edits. Building a real text-undo
-  subsystem from scratch is substantial, separate design work well beyond one sub-issue; every
-  multi-cursor edit here is still a single, real, atomic mutation of the buffer's content
-  (`apply_at_every_cursor`'s own right-to-left splice discipline), so the moment a real text-undo
-  stack exists, grouping one multi-cursor edit as one entry is a small addition on top of it, not a
-  redesign - documented at the top of `edit_buffer.rs`, not silently dropped.
 - **Alt+Shift+drag column selection.** This editor has no mouse-drag-to-select *of any kind* yet -
   only click and shift-click (confirmed by grep: no `on_mouse_move`/`on_drag` anywhere in
   `editing.rs` before this change). A column-selection variant of a feature that doesn't exist yet
@@ -3553,13 +3578,16 @@ the core behavior above:
   the secondaries stale relative to that one edit - a narrow, documented edge case (composing
   CJK/accented input, or accepting a completion, mid multi-cursor selection is rare in practice).
 
-**Testing**: 30 new tests, all but 4 pure `EditBuffer` unit tests requiring no GPUI window at all -
+**Testing**: 25 new tests, all but 4 pure `EditBuffer` unit tests requiring no GPUI window at all -
 word-boundary detection (mid-word, touching-one-side, no-adjacent-word-character), the two-step
 `Ctrl+D` flow (select word, add next occurrence, wraparound, case-sensitivity), `Ctrl+Shift+L`,
 `Ctrl+K Ctrl+D`, Esc, Alt+click's `add_cursor_at`, simultaneous typing/paste/backspace/delete
 (including a per-cursor no-op at the start of the buffer not blocking a sibling cursor's own real
 deletion), collision merging (both the merge and the deliberate non-merge of touching selections),
-and multi-cursor arrow movement. The remaining 4 drive the real, bound keystrokes
+multi-cursor arrow movement, and the undo/redo integration (one-step coalescing across cursors,
+redo, the documented single-cursor-after-undo outcome, and a multi-keystroke burst across two
+cursors still coalescing into one group - see the undo/redo section above for what these caught).
+The remaining 4 drive the real, bound keystrokes
 (`cx.simulate_keystrokes("ctrl-d")`, `"ctrl-shift-l"`, `"ctrl-k ctrl-d"` - a real, verified
 space-separated chord binding, not invented here (this repo now depends on `gpui` as a pinned git
 dependency rather than the old vendored checkout - verified against that dependency's own cached
