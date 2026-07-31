@@ -4174,3 +4174,98 @@ test in the module each time. Because this change touches `open_change_diff`, th
 the flakiest test was run 55 times on this branch and 55 times on the untouched base, interleaved,
 giving 3/55 here against 4/55 there - the same rate, and load-dependent rather than
 change-dependent.
+## Custom theme support (GitHub issue #5)
+
+User-authored themes, loaded from `~/.config/jerry/themes/*.toml`, layered on top of the six
+built-in `settings::THEME_DEFS` rather than replacing them. A hand-written file supplies exactly
+the same five swatches (`background`, `panel`, `accent_green`, `accent_amber`, `accent_blue`) a
+built-in `ThemeDef` does, and is run through the exact same `derive_shift`/`apply_shift` machinery
+every built-in non-Jerry-Dark theme already goes through - a new thread-local,
+`CURRENT_CUSTOM_SHIFT`, overrides the existing `CURRENT_THEME_INDEX` mechanism in `ColorToken::
+resolve` whenever a custom theme is the live selection, and `AdeApp::apply_theme_selection` is the
+one place that ever writes both together. Icon colours ride along for free: this app's "icons"
+(`sidebar::render::render_folder_icon`/`render_lang_chip`) are `div`-composed rectangles and
+letter chips coloured entirely by ordinary `ColorToken`s, not a separate image/glyph-pack system,
+so no second mechanism was needed for them.
+
+The Themes settings page gained a "Custom themes" section - built-in and custom themes render as
+the same card (`render_theme_card`, now taking raw name/subtitle/swatches instead of a
+`&ThemeDef`), with real `Import theme…`/`Export current theme…` actions via genuine native file
+dialogs (`gpui::App::prompt_for_paths`/`prompt_for_new_path`, verified against
+`vendor/zed/crates/agent_ui/src/threads_archive_view.rs` and `miniprofiler_ui` before writing this)
+and a `Remove` action per custom card.
+
+### What the independent adversarial audit found, and what was fixed
+
+One audit round ran over the finished feature, reading the code directly rather than trusting a
+summary, and ran clippy/tests itself. It found two CRITICAL issues, both real:
+
+**Import could silently destroy an unrelated file.** `import_theme_file` joined the destination
+directory with the incoming theme's own slug unconditionally, so importing a theme whose slug
+happened to collide with an existing, differently-named file on disk (a real, reachable case - a
+hand-authored `themes/my-theme.toml` holding `"Ocean"`, then importing something that also
+slugifies to `my-theme`) silently overwrote it, with the in-memory list left holding two entries
+pointing at the same now-wrong file. Fixed with `non_colliding_dest_path`: the plain slug path is
+used when free or when it already holds *this same* theme (the intentional "re-import to update"
+case), otherwise `{slug}-2.toml`, `{slug}-3.toml`, … until a free or matching path is found -
+proven by a regression test that imports over a pre-existing, differently-named file and asserts
+it survives untouched.
+
+**"Remove" deleted the user's file on a single click**, unlike every other destructive action in
+this app (`prune_confirm_armed`, `discard_confirm_armed`, `tree_delete_confirm`). Fixed with a real
+two-click confirmation (`custom_theme_remove_armed`/`request_remove_custom_theme`), mirroring
+`request_discard_worktree`'s identical shape, disarmed on leaving the Themes page or reopening
+Settings. The same audit had flagged the *first* version of this as hiding the Remove affordance
+whenever the theme was currently selected, making the active theme's own file permanently
+undeletable from the UI - dropped that gate too, since the two-click confirm is itself the guard
+against an accidental click.
+
+Four MAJOR findings, also fixed: re-importing the theme currently in use didn't re-skin the app
+until restart (`apply_custom_theme_import_result` now calls `apply_theme_selection` when the
+imported name matches the active one); removing a theme could leave `Settings.theme.
+last_dark_theme` dangling, which a later real OS-dark `follow_system` signal would have written
+straight back into `theme.name`, resolving to nothing (now reset alongside `theme.name` in the
+same fallback); exporting a built-in theme under its own bare name produced a file
+`CustomThemeFile::validate` unconditionally rejects on import - `crate::settings::render::
+export_theme_name_for` (a pure, directly-tested function) now renames it to `"<name> (copy)"` so
+the exported file is actually importable; and `custom_theme_load_errors`/`custom_themes` were
+manually spliced after import/remove instead of re-read from disk, so a stale load error (e.g. a
+since-fixed duplicate-name warning) stayed pinned on screen forever - both actions now reload the
+registry wholesale from what's actually on disk.
+
+Six MINOR findings, also fixed: import/remove ran blocking filesystem I/O on the foreground thread
+(moved to the background executor, matching `start_export_custom_theme`'s own existing
+convention); `CustomTheme::to_toml_string`'s `unwrap_or_default()` would have silently written a
+zero-byte file on a hypothetical serialization failure (now `expect`s, since a plain struct of
+`String` fields cannot genuinely fail to serialize - a real failure should panic loudly, not ship
+an empty theme file); `load_custom_themes_from_dir` had no size cap on a theme file (added a 64
+KiB defensive limit, since this read runs on the foreground thread at `AdeApp` construction);
+the `.toml` extension match was case-sensitive (now `eq_ignore_ascii_case`); the export dialog's
+suggested filename re-implemented slugify by hand and could disagree with the real one (now reuses
+`custom_theme::slugify`, made `pub(crate)`); and the empty-state hint hardcoded
+`~/.config/jerry/themes/` instead of the real, `settings_path`-derived directory.
+
+The audit also verified several suspected issues were *not* bugs by reading real source rather than
+guessing: no path traversal via a crafted theme name (`slugify` maps every non-alphanumeric
+character to `-`); no arbitrary-file delete via a symlinked theme file (`remove_file` unlinks the
+symlink, not its target); no stale `CURRENT_CUSTOM_SHIFT` leak between selections or across test
+instances (`apply_theme_selection` always writes both thread-locals together, in all three
+branches); and - read directly from `vendor/zed/crates/gpui/src/{elements/div.rs,window.rs}` -
+that a nested "Remove" button's `cx.stop_propagation()` genuinely does suppress the card's own
+`on_click` during GPUI's bubble-phase dispatch, not just in theory. That last one was re-verified
+with a real, click-driven test (`cx.simulate_click` against the button's own painted bounds, not
+just calling the method directly) rather than left as a source-reading conclusion, alongside
+similar real-click tests for the Import/Export buttons - the audit had separately noted that
+nothing exercised those three buttons as rendered, clickable elements, only as directly-invoked
+methods.
+
+38 new tests, all in the touched modules (`settings::custom_theme`, `settings::render::
+custom_theme_settings_tests`, `settings::render::export_theme_name_tests`, `theme::
+theme_runtime_tests`). All four gates clean: `cargo fmt --all -- --check`, `cargo build
+--workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace
+--lib -- --test-threads=1` run twice end-to-end (969 app + 42 lsp-core + 14 pty-core + 98 wt-core,
+0 failed, both times). One single-threaded run separately hit
+`code_surface::diff_view::diff_render_tests::opening_a_real_diff_renders_real_syntax_highlighted_rows`
+- confirmed pre-existing and unrelated: that file has zero diff on this branch, and the same test
+run three times in complete isolation with nothing else running failed once on its own, an
+already-known timing flake in that module, not a regression from this work.

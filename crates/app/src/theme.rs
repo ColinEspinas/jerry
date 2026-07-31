@@ -58,11 +58,17 @@ const fn hex(v: u32) -> ColorToken {
 pub struct ColorToken(pub Rgba);
 
 impl ColorToken {
-    /// Resolves this token against [`current_theme_index`]'s real, live-selected theme. Jerry
-    /// Dark (`index == 0`) returns [`Self`]'s own original value completely unchanged, not even
-    /// a lossy `Rgba -> Hsla -> Rgba` round trip - see the module docs for why this matters for
-    /// existing exact-hex tests.
+    /// Resolves this token against whichever theme is really live-selected right now. A live
+    /// custom (disk-loaded) theme - [`CURRENT_CUSTOM_SHIFT`], set by
+    /// [`set_current_custom_theme`] - always wins over [`current_theme_index`]'s built-in
+    /// selection when one is set (see that function's own docs for why the two are never left to
+    /// drift independently). Otherwise, Jerry Dark (`index == 0`) returns [`Self`]'s own original
+    /// value completely unchanged, not even a lossy `Rgba -> Hsla -> Rgba` round trip - see the
+    /// module docs for why this matters for existing exact-hex tests.
     pub fn resolve(self) -> Rgba {
+        if let Some(shift) = CURRENT_CUSTOM_SHIFT.with(|cell| cell.get()) {
+            return apply_shift(self.0, shift);
+        }
         let index = current_theme_index();
         if index == 0 {
             return self.0;
@@ -150,6 +156,55 @@ pub fn current_theme_index() -> usize {
 /// index; nothing here can reach into GPUI's own render loop to schedule one.
 pub fn set_current_theme_index(index: usize) {
     CURRENT_THEME_INDEX.with(|cell| cell.set(index));
+}
+
+thread_local! {
+    /// A live-selected *custom* (disk-loaded) theme's already-derived shift, if any - see
+    /// `crate::settings::custom_theme`'s own module docs for the real on-disk file format this is
+    /// computed from (GitHub issue #5). `Some` overrides [`CURRENT_THEME_INDEX`] entirely in
+    /// [`ColorToken::resolve`] - `crate::settings::render::AdeApp::apply_theme_selection` is the
+    /// one real place both are ever written, always together (never one without the other), so
+    /// this can never point at a shift for a theme that isn't `Settings.theme.name` any more.
+    /// Same `thread_local!`-not-global reasoning as [`CURRENT_THEME_INDEX`] itself: `cargo test`'s
+    /// default parallel mode runs each `#[gpui::test]` on its own OS thread, and a shared global
+    /// here would let one test's custom-theme selection corrupt another's colour assertions.
+    static CURRENT_CUSTOM_SHIFT: std::cell::Cell<Option<HslShift>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Selects (`Some`) or clears (`None`) the live custom-theme override - see
+/// [`CURRENT_CUSTOM_SHIFT`]'s own docs. `swatches` is a custom theme's own
+/// `crate::settings::custom_theme::CustomTheme::swatches` (the same `[background, panel,
+/// green-ish, amber-ish, blue-ish]` shape `crate::settings::state::THEME_DEFS`' own swatches use),
+/// derived against Jerry Dark's own swatches through the exact same [`derive_shift`] every
+/// built-in non-Jerry-Dark theme already goes through - a custom theme is not a second-class
+/// palette that only gets a few re-tinted preview swatches.
+pub fn set_current_custom_theme(swatches: Option<[u32; 5]>) {
+    CURRENT_CUSTOM_SHIFT.with(|cell| {
+        cell.set(swatches.map(|target| {
+            let base = crate::settings::state::THEME_DEFS[0].swatches;
+            derive_shift(base, target)
+        }));
+    });
+}
+
+/// Real, general "is this swatch set a light theme" check - the background swatch (index 0)'s
+/// HSL lightness alone, `> 0.5`. Generalizes the old hardcoded `name == "Paper"` special case
+/// (`crate::settings::render::AdeApp::set_theme_name`'s `last_dark_theme` bookkeeping used to
+/// compare literal theme names) so a disk-loaded custom theme's own light/dark status can be
+/// determined the same real way a built-in one's already is - `crate::settings::state::
+/// THEME_DEFS[5]`, "Paper", is the one built-in example: its background swatch `0xf4f1ea` is
+/// genuinely light (`l` well above `0.5`), every other built-in's background swatch is near-black
+/// (`l` well below it).
+pub fn theme_is_light(swatches: [u32; 5]) -> bool {
+    let hsla: Hsla = Rgba {
+        r: ((swatches[0] >> 16) & 0xff) as f32 / 255.0,
+        g: ((swatches[0] >> 8) & 0xff) as f32 / 255.0,
+        b: (swatches[0] & 0xff) as f32 / 255.0,
+        a: 1.0,
+    }
+    .into();
+    hsla.l > 0.5
 }
 
 /// A real, systematic HSL transform - see [`derive_shift`]'s own docs for how one is computed,
@@ -1180,6 +1235,21 @@ mod theme_runtime_tests {
         ResetThemeIndexOnDrop
     }
 
+    /// Same real-global-leak concern as [`ResetThemeIndexOnDrop`], for
+    /// [`CURRENT_CUSTOM_SHIFT`]/[`set_current_custom_theme`].
+    struct ResetCustomThemeOnDrop;
+
+    impl Drop for ResetCustomThemeOnDrop {
+        fn drop(&mut self) {
+            set_current_custom_theme(None);
+        }
+    }
+
+    fn with_custom_theme(swatches: [u32; 5]) -> ResetCustomThemeOnDrop {
+        set_current_custom_theme(Some(swatches));
+        ResetCustomThemeOnDrop
+    }
+
     fn same(a: Rgba, b: Rgba) -> bool {
         a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a
     }
@@ -1358,6 +1428,101 @@ mod theme_runtime_tests {
         assert!(shift.lightness_offset.is_finite());
         assert!(shift.hue.is_finite());
         assert!(shift.saturation_scale.is_finite());
+    }
+
+    /// A live custom theme actually changes what a representative token resolves to - the same
+    /// real "not a two-token cosmetic re-tint" proof
+    /// [`every_non_jerry_dark_theme_changes_tokens_across_multiple_unrelated_modules`] gives the
+    /// built-in themes, now for a disk-loaded one.
+    #[test]
+    fn a_custom_theme_changes_tokens_across_multiple_unrelated_modules() {
+        let jerry_dark = (
+            surface::WINDOW.0,
+            text::BODY.0,
+            syntax::KEYWORD.0,
+            status::ASK.0,
+            diff::ADD_BG.0,
+        );
+        // A genuinely different, light custom palette - deliberately unlike any built-in theme's
+        // own swatches, so this can't coincidentally pass by reusing one of their shifts.
+        let _guard = with_custom_theme([0xf0e6da, 0xe0d2c0, 0x3a8f5c, 0xa8622a, 0x2c5f8f]);
+        let resolved = (
+            surface::WINDOW.resolve(),
+            text::BODY.resolve(),
+            syntax::KEYWORD.resolve(),
+            status::ASK.resolve(),
+            diff::ADD_BG.resolve(),
+        );
+        let mut changed = 0;
+        if !same(resolved.0, jerry_dark.0) {
+            changed += 1;
+        }
+        if !same(resolved.1, jerry_dark.1) {
+            changed += 1;
+        }
+        if !same(resolved.2, jerry_dark.2) {
+            changed += 1;
+        }
+        if !same(resolved.3, jerry_dark.3) {
+            changed += 1;
+        }
+        if !same(resolved.4, jerry_dark.4) {
+            changed += 1;
+        }
+        assert!(
+            changed >= 4,
+            "a real custom theme should move nearly every token, not leave most still reading \
+             Jerry Dark's own values (only {changed}/5 changed)"
+        );
+    }
+
+    /// A live custom theme overrides whatever built-in [`CURRENT_THEME_INDEX`] happens to still
+    /// be set to - `crate::settings::render::AdeApp::apply_theme_selection` always writes both
+    /// together, but this proves [`ColorToken::resolve`] itself gives the custom shift priority
+    /// rather than relying on the caller to have zeroed the index first.
+    #[test]
+    fn a_custom_theme_overrides_a_stale_built_in_index() {
+        let _index_guard = with_theme_index(2); // "Slate" - deliberately left non-zero.
+        let _custom_guard = with_custom_theme([0xf0e6da, 0xe0d2c0, 0x3a8f5c, 0xa8622a, 0x2c5f8f]);
+        let custom = surface::WINDOW.resolve();
+        let slate_only = {
+            set_current_custom_theme(None);
+            let value = surface::WINDOW.resolve();
+            set_current_custom_theme(Some([0xf0e6da, 0xe0d2c0, 0x3a8f5c, 0xa8622a, 0x2c5f8f]));
+            value
+        };
+        assert!(
+            !same(custom, slate_only),
+            "the live custom theme must win over the stale built-in index, not the reverse"
+        );
+    }
+
+    /// Clearing the custom override (`set_current_custom_theme(None)`) falls back to the
+    /// built-in index mechanism exactly as if no custom theme had ever been selected.
+    #[test]
+    fn clearing_the_custom_theme_restores_the_built_in_index_mechanism() {
+        let jerry_dark = surface::WINDOW.resolve();
+        {
+            let _guard = with_custom_theme([0xf0e6da, 0xe0d2c0, 0x3a8f5c, 0xa8622a, 0x2c5f8f]);
+            assert!(!same(surface::WINDOW.resolve(), jerry_dark));
+        }
+        // The guard above already cleared it on drop.
+        assert!(same(surface::WINDOW.resolve(), jerry_dark));
+    }
+
+    #[test]
+    fn theme_is_light_matches_paper_and_rejects_every_dark_built_in() {
+        assert!(
+            theme_is_light(crate::settings::state::THEME_DEFS[5].swatches),
+            "\"Paper\" (index 5) is the one real light built-in theme"
+        );
+        for index in 0..5 {
+            assert!(
+                !theme_is_light(crate::settings::state::THEME_DEFS[index].swatches),
+                "built-in theme index {index} ({}) should read as dark",
+                crate::settings::state::THEME_DEFS[index].name
+            );
+        }
     }
 }
 

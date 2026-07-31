@@ -69,6 +69,7 @@ use crate::merge::state as merge;
 use crate::palette::state as palette;
 use crate::rail::state::{self as rail, RailMode};
 use crate::rail::worktrees::{self, WorktreeItem};
+use crate::settings::custom_theme;
 use crate::settings::state as settings;
 #[cfg(test)]
 use crate::settings::state::SettingsPage;
@@ -1192,6 +1193,42 @@ pub struct AdeApp {
     /// outside any drop target) can't leave a stale caret painted on a tab no drag is over
     /// anymore.
     pub(crate) tab_drag_insertion: Option<(work_surface::TabRef, bool)>,
+    /// User-authored themes loaded from `~/.config/jerry/themes/*.toml` at construction time
+    /// (GitHub issue #5) - real, additional `crate::settings::custom_theme::CustomTheme` entries
+    /// layered on top of the six built-in `settings::THEME_DEFS`, not a replacement for them. See
+    /// `crate::settings::custom_theme`'s own module docs for the file format, and
+    /// `Self::apply_theme_selection`/`Self::render_settings_theme_page` for the two real
+    /// consumers.
+    pub(crate) custom_themes: Vec<custom_theme::CustomTheme>,
+    /// Real, honestly-reported parse/validation failures from the last time `custom_themes` was
+    /// (re)loaded - one entry per file that didn't make it in, shown on the Themes settings page
+    /// rather than a bad hand-edit silently vanishing.
+    pub(crate) custom_theme_load_errors: Vec<String>,
+    /// The Themes page's most recent import/export/remove action result (`Ok` message or a real,
+    /// honest `Err` one) - shown as an inline status line until the next action replaces it.
+    pub(crate) custom_theme_status: Option<Result<String, String>>,
+    /// The in-flight "Import theme..." real native file-picker task
+    /// (`Self::start_import_custom_theme`) - a single slot, since only one file-open dialog can
+    /// meaningfully be in flight at a time.
+    pub(crate) _custom_theme_import_task: Option<Task<()>>,
+    /// The in-flight "Export theme..." real native save-file-picker task
+    /// (`Self::start_export_custom_theme`) - same one-slot reasoning as
+    /// [`Self::_custom_theme_import_task`].
+    pub(crate) _custom_theme_export_task: Option<Task<()>>,
+    /// The in-flight, already-confirmed "Remove" background delete-and-reload task
+    /// (`Self::execute_remove_custom_theme`) - same one-slot reasoning as
+    /// [`Self::_custom_theme_import_task`].
+    pub(crate) _custom_theme_remove_task: Option<Task<()>>,
+    /// A real, just-armed "Remove" click on a custom theme card, by name - an adversarial audit
+    /// caught the first version of this action deleting the user's file on a single click, unlike
+    /// every other destructive action in this app (`Self::prune_confirm_armed`,
+    /// `Self::discard_confirm_armed`, `Self::tree_delete_confirm`). `Self::request_remove_custom_theme`
+    /// is the one real place this is armed/consumed - a first click on a given name arms it, a
+    /// second click on the *same* name actually deletes. Disarmed by leaving the Themes settings
+    /// page or reopening Settings (`Self::select_settings_page`/`Self::open_settings`), the same
+    /// "most other gestures clear it" discipline `Self::discard_confirm_armed`'s own docs
+    /// describe, scoped to this control's own page since nothing else in the app can arm it.
+    pub(crate) custom_theme_remove_armed: Option<String>,
 }
 
 impl AdeApp {
