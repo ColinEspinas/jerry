@@ -3440,3 +3440,147 @@ several more pre-existing failures of the same two kinds plus real LSP-server-de
 machine) and `gio trash`-dependent worktree-discard tests (Linux/FreeBSD-only by this codebase's own
 documented design) - none in a file this phase changed either, confirmed by cross-referencing every
 failing test's own module path against this diff's file list.
+## Multi-cursor and multi-select for the File view (GitHub issue #28)
+
+VS Code-style `Ctrl+D`/`Ctrl+Shift+L`/`Ctrl+K Ctrl+D`/Alt+click/Esc multi-cursor editing, scoped
+entirely to the File view's `EditBuffer` (`crate::code_surface::edit_buffer`) and its GPUI wiring
+(`crate::code_surface::editing`) - the parent umbrella (#14) flagged this as its largest item and
+suggested it might deserve its own issue, which #28 is. It does not touch the merge hand-edit
+surface (`crate::merge::editing`) at all - see "What was deliberately cut" below.
+
+**The data-model decision, and why not `Vec<Selection>` everywhere.** `EditBuffer` already had a
+single `selected_range: Range<usize>` + `selection_reversed: bool` pair as its primary cursor,
+threaded through roughly 2900 lines of `editing.rs` and every one of `edit_buffer.rs`'s own
+already-tested single-cursor methods (`move_left`, `replace_range`, `backspace`, ...). The
+textbook multi-cursor design replaces that pair with `Vec<Selection>` uniformly and rewrites every
+call site to index into it. Rejected here, deliberately: that rewrite would have meant touching
+every one of those methods and every call site across two feature folders, for a behavior
+(multiple cursors) that's still the *uncommon* case even once this ships - single-cursor editing
+stays the overwhelming majority of real usage. Instead, the primary cursor keeps its own plain
+fields exactly as before, and a new `secondary_cursors: Vec<SecondaryCursor>` field (empty by
+default - the only state a freshly constructed buffer is ever in) holds every cursor beyond it.
+Every existing single-cursor method keeps its exact prior behavior, byte-for-byte, whenever
+`secondary_cursors` is empty; multi-cursor behavior is layered on top as new, additive code paths
+that only activate once a second cursor actually exists:
+
+- **Simultaneous edits** (`EditBuffer::apply_at_every_cursor`, threaded into `replace_range`/
+  `backspace`/`delete_forward` - the three methods every keystroke, paste, and IME commit already
+  funneled through, unchanged): applies one real edit per cursor as a single atomic operation,
+  processed **right-to-left by original position**, the standard multi-cursor discipline - splicing
+  the rightmost cursor's own edit first never invalidates the still-unprocessed byte ranges of any
+  cursor further left. The first working version of this got the position bookkeeping wrong in a
+  way three of its own new unit tests caught immediately: it recorded each cursor's *own* new
+  caret position right after its own splice, but never re-adjusted an *already-recorded* position
+  when a later (further-left) splice shifted everything after it - so typing at two cursors in
+  `"value + value"` landed the second caret at byte 9 in a 6-byte result string. Fixed by shifting
+  every already-recorded position by each subsequent edit's own real byte delta as it lands, not
+  just recording positions once and trusting them. A second, related bug the tests caught: two
+  cursors sitting at the *exact same* offset (an artificial state a real merge should always
+  prevent, but exercised directly in a test) each independently computed a delete against content
+  the other had already spliced, deleting the wrong character. Fixed with a defensive
+  `merge_colliding_cursors()` call at the very start of `apply_at_every_cursor`, rather than relying
+  purely on every caller keeping cursors merge-clean.
+- **Cursor movement** (`EditBuffer::move_every_cursor`, threaded into `move_left`/`move_right`/
+  `move_up`/`move_down`/`move_home`/`move_end`/`select_left`/`select_right`/`select_up`/
+  `select_down`): moves every real cursor together for a plain arrow key, so `Ctrl+D` adding a
+  second cursor doesn't leave it stranded the moment the user presses an arrow. One honest, narrow
+  scope cut here: each secondary cursor's own vertical-move "sticky goal column" resets every press
+  rather than persisting across a consecutive run the way the primary's already does (a per-cursor
+  goal-column field would be real, separate design work) - cosmetic only (every cursor still lands
+  on a real, valid position every press), documented in the method's own doc comment, not hidden.
+- **Occurrence search** (`select_word_or_add_next_occurrence` for `Ctrl+D`, `select_all_occurrences`
+  for `Ctrl+Shift+L`, `skip_current_occurrence` for `Ctrl+K Ctrl+D`): word-boundary matching is a
+  real Unicode-aware `char::is_alphanumeric() || '_'` scan (matching VS Code's own default word
+  separators - punctuation/whitespace all separate words), independent of this file's syntax
+  highlighter (so it works identically on unhighlighted/plain-text files). Occurrence matching
+  itself is case-sensitive, plain-substring `str::match_indices`, matching VS Code's own default -
+  verified with a dedicated test (`Value`/`value` in the same buffer don't cross-match). `Ctrl+D`
+  wraps around the buffer once it reaches the end with no further un-selected match; `Ctrl+K Ctrl+D`
+  moves the primary without keeping the skipped occurrence, leaving every other cursor untouched -
+  both match VS Code's own real behavior, not a guessed approximation.
+- **Collision merging** (`merge_colliding_cursors`): true overlap, or two empty carets at the exact
+  same offset, merge into one; two selections that merely *touch* (`0..3` next to `3..6`) stay
+  distinct - "touching is not colliding," and a dedicated test asserts both directions.
+- **A plain, unmodified click always collapses back to one cursor**: `move_to`/`select_to` (the
+  real target of every ordinary/shift-click, and the same primitives every single-cursor keyboard
+  method already funneled through) now clear `secondary_cursors` as their own first step, matching
+  every real multi-cursor editor's "clicking without a modifier means one cursor" rule. `Esc`
+  (`EditorCollapseCursors`, a new action) does the same thing explicitly, and is wired to be a
+  genuine no-op (no re-render, no dismissed completions) while only one cursor is active, so it
+  never claims a keystroke that had nothing multi-cursor-related to do.
+
+**Rendering**: `EditableLineContext` gained `secondary_selections_local`/`secondary_cursors_local`
+(the multi-cursor mirror of its existing `selection_local`/`cursor_local`), and
+`render_editable_file_view_line`'s canvas overlay paints one additional selection fill/caret bar per
+secondary cursor per row it touches, using the exact same `theme::syntax::CARET` token the primary
+already uses - `theme.rs` has no separate "secondary cursor" color and inventing one with no
+`design_handoff_jerry_ade` spec to back it would be an unjustified guess, so a real multi-cursor
+session shows several identically-styled real carets/selections rather than a fabricated visual
+distinction. This was a deliberate inclusion, not an afterthought: a data model with no visible
+multi-cursor state would be real logic bound to nothing a user could ever see, which is exactly the
+"looks done, isn't" shape this project's own rules exist to rule out.
+
+**Alt+click** adds a cursor at the click point (`EditBuffer::add_cursor_at`), keeping every existing
+cursor - wired into the File view's existing mouse-down handler ahead of the shift-click branch, so
+Alt+Shift+click still adds a cursor rather than extending the primary's selection.
+
+**What was deliberately cut, and why**, each flagged in the issue itself as more peripheral than
+the core behavior above:
+
+- **Undo/redo grouping a multi-cursor edit as one step.** This editor has **no text undo/redo at
+  all** today - a documented gap since Revision R8.5a, unrelated to and unaffected by this work.
+  The `Undo`/`Redo` actions that do exist (Revision R10, `secondary-z`/`secondary-shift-z`) are a
+  completely different, unrelated command-pattern stack scoped to `crate::worktree_history` ("keep
+  all changes"/"discard worktree") - they have never touched text edits. Building a real text-undo
+  subsystem from scratch is substantial, separate design work well beyond one sub-issue; every
+  multi-cursor edit here is still a single, real, atomic mutation of the buffer's content
+  (`apply_at_every_cursor`'s own right-to-left splice discipline), so the moment a real text-undo
+  stack exists, grouping one multi-cursor edit as one entry is a small addition on top of it, not a
+  redesign - documented at the top of `edit_buffer.rs`, not silently dropped.
+- **Alt+Shift+drag column selection.** This editor has no mouse-drag-to-select *of any kind* yet -
+  only click and shift-click (confirmed by grep: no `on_mouse_move`/`on_drag` anywhere in
+  `editing.rs` before this change). A column-selection variant of a feature that doesn't exist yet
+  is out of reach without first building ordinary drag-select, itself separate, real work.
+- **Merge hand-edit editor (`crate::merge::editing`).** Multi-cursor bindings are registered only on
+  the File view's own `"file-editor"` key context, not `"merge-editor"` - a deliberate scope
+  narrowing (the merge hand-edit surface is secondary and less-used), not an oversight. Since the
+  underlying `EditBuffer` methods are shared, this costs nothing in risk: a merge-edit buffer's own
+  `secondary_cursors` simply never gets populated, so its single-cursor behavior is provably
+  unaffected.
+- **IME composition and explicit-range edits while multiple cursors are active.**
+  `replace_and_mark_range` and any *explicit*-range call to `replace_range` (a completion's own
+  text-edit application) only ever affect the primary cursor even with secondaries active, leaving
+  the secondaries stale relative to that one edit - a narrow, documented edge case (composing
+  CJK/accented input, or accepting a completion, mid multi-cursor selection is rare in practice).
+
+**Testing**: 30 new tests, all but 4 pure `EditBuffer` unit tests requiring no GPUI window at all -
+word-boundary detection (mid-word, touching-one-side, no-adjacent-word-character), the two-step
+`Ctrl+D` flow (select word, add next occurrence, wraparound, case-sensitivity), `Ctrl+Shift+L`,
+`Ctrl+K Ctrl+D`, Esc, Alt+click's `add_cursor_at`, simultaneous typing/paste/backspace/delete
+(including a per-cursor no-op at the start of the buffer not blocking a sibling cursor's own real
+deletion), collision merging (both the merge and the deliberate non-merge of touching selections),
+and multi-cursor arrow movement. The remaining 4 drive the real, bound keystrokes
+(`cx.simulate_keystrokes("ctrl-d")`, `"ctrl-shift-l"`, `"ctrl-k ctrl-d"` - a real, verified
+space-separated chord binding, not invented here (this repo now depends on `gpui` as a pinned git
+dependency rather than the old vendored checkout - verified against that dependency's own cached
+checkout, `crates/gpui/src/keymap/binding.rs`, which splits a keybinding's keystroke string on
+whitespace into an ordered chord sequence) - and `"escape"`) through the real key-binding table end to end,
+including proving typed text lands at both cursors through the real
+`EntityInputHandler::replace_text_in_range` path, not a direct `EditBuffer` call. No test simulates
+an actual mouse click on the editable file view - this codebase had no precedent for that already
+(the existing click-to-place-caret/shift-click-to-select logic has no automated click-simulation
+test either, for the same reason: the canvas-based hit-testing only has real painted bounds/shaped
+lines after a real paint pass), so Alt+click's own wiring follows the same established precedent and
+relies on the `add_cursor_at` unit test plus code review.
+
+**Environment note**: this work was done from a Windows sandbox, not this project's usual
+Linux/WSL2 environment (see README.md/BUILD-LOG.md's own repeated notes on this). Two pre-existing,
+platform-specific gaps blocked a full, clean local `cargo clippy --workspace --all-targets -- -D
+warnings`/`cargo test --workspace` run identical to CI's own Linux-only gate (`.github/workflows/
+ci.yml` only runs clippy/tests on Linux; macOS/Windows are build-only jobs) - neither caused by, or
+touched by, this change: `status_bar/mod.rs` imports `Session` only for a `#[cfg(target_os =
+"linux")]` function, an unused-import warning on Windows only; and `lsp-core`'s own test target
+fails to compile on Windows because a `#[cfg(unix)]`-gated `proc` module is referenced
+unconditionally from a Unix-only code path. Verified against both `cargo build --workspace`
+(clean) and `cargo clippy -p app --all-targets -- -D warnings`/`cargo test -p app --lib` scoped to
+this crate (clean except those two pre-existing issues), plus every test above passing.

@@ -234,6 +234,18 @@ impl AdeApp {
             .on_action(cx.listener(Self::handle_editor_home_action))
             .on_action(cx.listener(Self::handle_editor_end_action))
             .on_action(cx.listener(Self::handle_editor_select_all_action))
+            // Multi-cursor (Revision R13, issue #28) - `crate::code_surface::edit_buffer`'s own
+            // "Multi-cursor" docs for the overall design. File-view-only, like every other
+            // `Editor*` binding above: `crate::merge::editing`'s own `"merge-editor"` context
+            // deliberately does not register these - a real, documented scope narrowing (the
+            // merge hand-edit surface is secondary and less-used), not an oversight, and the
+            // underlying `EditBuffer::secondary_cursors` field simply stays empty forever for a
+            // merge-edit buffer as a result, leaving its own single-cursor behavior provably
+            // unaffected.
+            .on_action(cx.listener(Self::handle_editor_select_next_occurrence_action))
+            .on_action(cx.listener(Self::handle_editor_select_all_occurrences_action))
+            .on_action(cx.listener(Self::handle_editor_skip_occurrence_action))
+            .on_action(cx.listener(Self::handle_editor_collapse_cursors_action))
             .on_action(cx.listener(Self::handle_editor_copy_action))
             .on_action(cx.listener(Self::handle_editor_cut_action))
             .on_action(cx.listener(Self::handle_editor_paste_action))

@@ -269,6 +269,46 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
             root::EditorSaveAnyway,
             Some("file-editor"),
         ),
+        // Multi-cursor (Revision R13, issue #28) - `crate::code_surface::edit_buffer`'s own
+        // "Multi-cursor" docs for the overall design; each handler's own docs
+        // (`crate::code_surface::editing::AdeApp::handle_editor_select_next_occurrence_action` and
+        // its three siblings) for exactly what each keystroke does. File-view-only, like the rest
+        // of this list's plain `Editor*` entries - `crate::merge::editing`'s `"merge-editor"`
+        // context deliberately does not get these (see `crate::code_surface::render::AdeApp::
+        // render_code_surface`'s own docs for why). `"ctrl-d"`/`"ctrl-shift-l"` are deliberately
+        // literal `ctrl-`, not `"secondary-"`, matching the mockup-independent, cross-editor VS
+        // Code convention issue #28 itself names (`Ctrl+D`/`Ctrl+Shift+L`/`Ctrl+K Ctrl+D` are the
+        // same physical keys on every OS in VS Code itself, including macOS, unlike this list's
+        // other `secondary-` bindings which intentionally follow the *platform* modifier
+        // instead) - `"secondary-d"` would also collide with `EditorSelectAllOccurrences`'s own
+        // real `Cmd+Shift+L`-independent behavior on macOS anyway (VS Code never rebinds `Ctrl+D`
+        // to `Cmd+D` there either; `Cmd+D` is already the macOS-only system-wide "bookmark this
+        // page" shortcut in every browser, a real, live conflict `"ctrl-d"` avoids by staying
+        // literal). `"ctrl-k ctrl-d"` is a real, supported space-separated chord binding (verified
+        // against the pinned `gpui` dependency's own `crates/gpui/src/keymap/binding.rs`, which
+        // splits a keybinding's own keystroke string on whitespace into an ordered chord sequence
+        // - not invented here), matching VS Code's own two-keystroke default for "skip current,
+        // find next".
+        gpui::KeyBinding::new(
+            "ctrl-d",
+            root::EditorSelectNextOccurrence,
+            Some("file-editor"),
+        ),
+        gpui::KeyBinding::new(
+            "ctrl-shift-l",
+            root::EditorSelectAllOccurrences,
+            Some("file-editor"),
+        ),
+        gpui::KeyBinding::new(
+            "ctrl-k ctrl-d",
+            root::EditorSkipOccurrence,
+            Some("file-editor"),
+        ),
+        gpui::KeyBinding::new(
+            "escape",
+            root::EditorCollapseCursors,
+            Some("file-editor && !completions"),
+        ),
         // Real Completions popup navigation/accept/dismiss (Revision R8.5b) - scoped to
         // `"file-editor && completions"`, the real *narrower* mirror of the `!completions`
         // narrowing on `enter`/`up`/`down` above, added to the same code-surface node only while

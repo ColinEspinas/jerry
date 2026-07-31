@@ -221,3 +221,44 @@ working three-zone layout showing sample data and a shell that echoes text back 
 exactly the kind of result this project's own rules ("no fake functionality," "mark it
 stubbed instead") were written to rule out as a stopping point, not to reach as a finish
 line.
+
+## Addendum: multi-cursor editing (GitHub issue #28)
+
+This file otherwise reflects only the original five-step build session and was never kept
+current through the many revisions BUILD-LOG.md records afterward (R1–R12, the feature-folder
+restructure, the file tree work) — checked directly: `git log -- ASSESSMENT.md` shows exactly
+one commit, its own creation. This one paragraph is added because the multi-cursor work is a
+real new subsystem, not because the rest of the file has been re-audited against everything
+that shipped since; treat the sections above as a snapshot of the original build, not of the
+project as it stands today.
+
+**What's real**: the core data model (a primary cursor plus a `Vec` of secondary cursors on
+`EditBuffer`), `Ctrl+D`'s two-step select-word/add-next-occurrence flow, `Ctrl+Shift+L`,
+`Ctrl+K Ctrl+D`, Alt+click, Esc, simultaneous typing/pasting/backspacing/deleting across every
+active cursor as one atomic edit, collision merging, and multi-cursor arrow-key movement are all
+genuinely wired end to end — driven through the same real key-binding table and
+`EntityInputHandler` path every other editing feature in this app uses, not a parallel or
+special-cased mechanism, and painted with real per-cursor selection fills/caret bars, not a data
+model with nothing visible backing it. 30 new tests, including four that drive the real bound
+keystrokes rather than calling `EditBuffer` methods directly.
+
+**What's genuinely not there**: undo/redo, for *any* edit in this editor, single- or
+multi-cursor — a pre-existing gap since Revision R8.5a, not something this work was asked to
+fix, but worth stating plainly since the issue's own checklist named it. Alt+Shift+drag column
+selection is absent because ordinary mouse-drag-to-select doesn't exist in this editor at all
+yet, for any selection, single- or multi-cursor. Multi-cursor support does not extend to the
+separate merge hand-edit surface (`crate::merge::editing`) — a deliberate scope narrowing to the
+File view only, documented in BUILD-LOG.md's own entry for this work.
+
+**Independent verification note**: this work was built from a Windows sandbox instead of this
+project's usual Linux/WSL2 environment, and could not run this crate's own real-language-server
+integration tests (`lsp_hover_wiring_tests`, `lsp_diagnostics_wiring_tests`,
+`vue_two_server_wiring_tests`) locally — `rust-analyzer` is not installed for the pinned
+toolchain on this machine, and the crash pattern (the whole test binary aborting rather than one
+test failing cleanly) is consistent with a real, unhandled server-spawn failure, not a logic bug
+in this change (none of those three modules were touched). Every test this change actually added
+or could reach was run and passed; the workspace-wide clippy/test gates this project requires
+could only be confirmed scoped to the `app` crate, with two known, pre-existing, platform-only
+gaps (unrelated Windows-only unused-import warning, unrelated Windows-only `lsp-core` test
+compile failure) both identified and excluded rather than silently ignored — see BUILD-LOG.md's
+own entry for the detail.

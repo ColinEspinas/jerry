@@ -449,6 +449,13 @@ impl AdeApp {
                         let selection_local = buffer.selection_within_line(index);
                         let cursor_local = buffer.cursor_within_line(index);
                         let marked_local = buffer.marked_within_line(index);
+                        // Multi-cursor (Revision R13, issue #28) - empty `Vec`s in ordinary
+                        // single-cursor use, so this changes nothing about how an unaffected row
+                        // paints; see `EditBuffer::secondary_selections_within_line`/
+                        // `EditBuffer::secondary_cursors_within_line`'s own docs.
+                        let secondary_selections_local =
+                            buffer.secondary_selections_within_line(index);
+                        let secondary_cursors_local = buffer.secondary_cursors_within_line(index);
                         let context = crate::code_surface::editing::EditableLineContext {
                             entity: entity.clone(),
                             focus_handle: code_focus_handle.clone(),
@@ -462,6 +469,8 @@ impl AdeApp {
                             selection_local,
                             cursor_local,
                             marked_local,
+                            secondary_selections_local,
+                            secondary_cursors_local,
                             diagnostics: &line_diagnostics,
                             hovered_byte_range,
                             hover_target: hover_target.as_deref(),
