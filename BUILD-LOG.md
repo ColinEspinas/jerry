@@ -5978,3 +5978,36 @@ All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `
 --workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
 975 app + 42 lsp-core + 14 pty-core + 118 wt-core, 0 failed - counts unchanged from the prior entry
 since this fix corrected two existing tests' expectations rather than adding new ones.
+
+## Two more real fixes: doubled-up lane lines, and a fixed-width lane canvas
+
+Two more pieces of direct user feedback on the git graph tab.
+
+**"The vertical lines are going too far at the end and at the start."** Real root cause: a lane
+that both starts (or ends) at a given row *and* has a real elbow there was getting **two**
+elements painted over the exact same pixels - the plain `starts_here`/`ends_here` stub
+(`render_graph_lane_canvas`'s own segment loop) *and* the elbow's own vertical stroke
+(`elbow_geometry`, now correctly anchored at that same lane's x after the fix above) - not
+visually distinguishable from one line simply running further than it should. Fixed by skipping
+the plain stub whenever a real elbow of the matching kind (`Converging` for `ends_here`,
+`Diverging` for `starts_here`) already covers that exact lane in that row - the elbow becomes the
+sole visual representation for that half, instead of two overlapping ones. Added a real,
+paint-based regression test (`a_lane_with_a_diverging_elbow_does_not_also_paint_a_plain_starts_here_stub`)
+reusing the existing real-merge fixture, confirmed non-vacuous by temporarily disabling the new
+skip condition and watching it fail first.
+
+**"The width reserved for the graph is static... with a lot of branches it overlaps the lines
+text."** `theme::graph::LANE_CANVAS`'s fixed 100px only fits up to 6 concurrent lanes
+(`lane_x(5) + 9 == 88`); a 7th lane's own dot/elbow already painted at `x >= 93`, past the
+canvas's own right edge, directly overlapping the ref chips and subject text columns next to it.
+Added `graph_lane_canvas_width(lane_count)` (`graph_view/state.rs`): grows past the fixed default
+exactly as far as the real `lane_count` needs, never shrinks below it. `render_graph_lane_canvas`
+already receives `lane_count` from the graph's own real global max (not a per-row value), so every
+row's canvas width stays consistently aligned regardless of how many lanes any *individual* row
+happens to use. Two new pure unit tests pin the boundary (still-fits counts stay at the default;
+counts past it grow to actually cover the rightmost lane's real x position).
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+978 app + 42 lsp-core + 14 pty-core + 118 wt-core, 0 failed (+3 app tests: the new segment-overlap
+regression, plus two `graph_lane_canvas_width` unit tests).
