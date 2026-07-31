@@ -19,6 +19,7 @@
 //! exists to back one) must offload calls to a background thread/executor rather than
 //! invoking them from a UI main thread.
 
+pub mod blame;
 pub mod diff;
 mod error;
 pub mod merge;
