@@ -9,6 +9,8 @@
 //!   real tree-sitter syntax spans for it.
 //! - [`edit_buffer`] - one open file's live edited text, cursor, selection and IME state,
 //!   and every mutation that can happen to them.
+//! - [`blame`] - turning a `wt_core::blame::BlameLine` into the inline label/tooltip text
+//!   shown for the current line (GitHub issue #29).
 //!
 //! GPUI-facing:
 //! - [`state`] - the load-state enums the surface's own fields are typed with.
@@ -18,6 +20,7 @@
 //! - [`diff_view`] - the read-only Diff view's rows, gutter, fold markers and highlight
 //!   cache.
 //! - [`file_view`] - the editable File view's rows, breadcrumb and status bar.
+//! - [`blame_view`] - the off-thread, cached inline git blame load/render (GitHub issue #29).
 //! - [`zoom`] - the editor zoom level and the rem-scoped subtree it applies through.
 //! - [`lsp_ui`] - the language-server UI drawn *over* the surface: hover card, diagnostics
 //!   card, and go-to-definition. (The client itself lives in `crate::lsp`.)
@@ -29,7 +32,10 @@
 //! the same convention `crate::root` established for its own submodules. [`editing`] is the
 //! exception: it arrived with its own explicit import block and kept it.
 
-use crate::code_surface::state::{DiffLoadState, FileLoadState, HoverEntry, HoverStatus};
+use crate::code_surface::state::{
+    BlameCacheEntry, BlameLoadState, CommitMessageState, DiffLoadState, FileLoadState, HoverEntry,
+    HoverStatus,
+};
 use crate::keymap::{self};
 use crate::language;
 use crate::lsp::client::LspClientState;
@@ -52,9 +58,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use wt_core::diff::{DiffBase, DiffFile, DiffLineKind, WorktreeDiff};
 
+pub mod blame;
 pub mod code_view;
 pub mod edit_buffer;
 
+pub(crate) mod blame_view;
 pub(crate) mod diff_view;
 pub(crate) mod editing;
 pub(crate) mod file_view;

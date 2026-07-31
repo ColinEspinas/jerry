@@ -94,6 +94,12 @@ impl AdeApp {
             file_load_state: FileLoadState::Idle,
             file_view_changed_lines: HashSet::new(),
             code_cursor: None,
+            blame_cache: HashMap::new(),
+            blame_state: HashMap::new(),
+            _blame_tasks: HashMap::new(),
+            blame_last_freshness_check: None,
+            blame_commit_messages: HashMap::new(),
+            _blame_message_tasks: HashMap::new(),
             edit_buffers: HashMap::new(),
             file_view_row_layout: HashMap::new(),
             file_view_last_layout: None,
@@ -578,6 +584,19 @@ impl AdeApp {
         self.hover = None;
         self.dismiss_completions();
         self.pending_cursor_line = None;
+        // Real blame state (GitHub issue #29) is absolute-path-keyed - cleared alongside the
+        // hover cache above for the identical reason: without this, a same-named file's blame
+        // from the worktree just left could reappear (wrongly attributed) the instant a
+        // same-named file opens in the new one, and a stale `Loading`/in-flight task from the
+        // old worktree has no reason to keep running once its own worktree is no longer active.
+        self.blame_cache.clear();
+        self.blame_state.clear();
+        self._blame_tasks.clear();
+        self.blame_last_freshness_check = None;
+        // Commit messages are sha-keyed, not path-keyed - a sha means the same real commit
+        // regardless of which worktree it's viewed from, so this cache deliberately survives a
+        // worktree switch (the same "safe to keep, sha is a real global identity" reasoning
+        // `AdeApp::lsp_uri_cache`'s own root-scoped-only pruning already applies elsewhere).
         self.load_file_tree(path.clone(), cx);
         // `load_file_tree` above already set `self.file_tree_root = path` synchronously, so
         // `path` is the active root by the time eviction runs.

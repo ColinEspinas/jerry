@@ -49,6 +49,8 @@ use gpui::{
     Window,
 };
 
+use crate::code_surface::blame;
+use crate::code_surface::blame_view::render_inline_blame_span;
 use crate::code_surface::code_view;
 use crate::code_surface::edit_buffer::EditBuffer;
 use crate::code_surface::lsp_ui::{
@@ -783,6 +785,11 @@ impl AdeApp {
                     let Ok(Some((real_path, content))) = step else {
                         break;
                     };
+                    // Cloned before `real_path` moves into the background write task below - the
+                    // real blame refresh this save should trigger (`force_refresh_blame_for_save`,
+                    // see this file's own docs above) needs the file's absolute path *after* the
+                    // write settles, once `real_path` itself is no longer available here.
+                    let blame_refresh_path = real_path.clone();
                     let write_result = cx
                         .background_executor()
                         .spawn(async move {
@@ -811,6 +818,12 @@ impl AdeApp {
                                 // be resolved by an immediate reload, not misread as an external
                                 // change on the next throttled tick.
                                 this.file_view_last_freshness_check = None;
+                                // GitHub issue #29: a save is one of the three real triggers
+                                // inline blame must recompute on - force it now rather than
+                                // waiting up to `BLAME_FRESHNESS_CHECK_INTERVAL` for the generic
+                                // poll to notice the new mtime (see `force_refresh_blame_for_
+                                // save`'s own docs).
+                                this.force_refresh_blame_for_save(&blame_refresh_path, cx);
                             }
                             Err(err) => {
                                 this.file_save_error = Some((path.clone(), err.to_string()));
@@ -1078,6 +1091,11 @@ pub(in crate::code_surface) struct EditableLineContext<'a> {
     pub diagnostics: &'a [diagnostics_view::LineDiagnostic],
     pub hovered_byte_range: Option<Range<usize>>,
     pub hover_target: Option<&'a Path>,
+    /// GitHub issue #29's real, already-computed inline blame label for *this* line - `Some`
+    /// only when `is_current` (only the current line ever shows it); see
+    /// `crate::code_surface::blame_view::AdeApp::inline_blame_render_model`'s own docs for how
+    /// it's built.
+    pub inline_blame: Option<&'a blame::InlineBlameLabel>,
 }
 
 /// The real, editable File view's per-row renderer - the `"real cursor/selection needs real
@@ -1124,6 +1142,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
         diagnostics,
         hovered_byte_range,
         hover_target,
+        inline_blame,
     } = context;
 
     let gutter_color = if is_current {
@@ -1386,6 +1405,13 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 .text_color(diagnostic_inline_message_color(first.severity))
                 .child(first_line.to_string()),
         );
+    }
+
+    // GitHub issue #29: the current line's real inline git blame, dimmed, at the very end of
+    // the row - `inline_blame` is only ever `Some` on the current line (see
+    // `EditableLineContext::inline_blame`'s own docs), so this never appears on any other row.
+    if let Some(label) = inline_blame {
+        row = row.child(render_inline_blame_span(label, line_number));
     }
 
     row.into_any_element()

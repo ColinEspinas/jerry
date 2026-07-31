@@ -86,7 +86,9 @@ use crate::work_surface::state as work_surface;
 use crate::worktree_history::flow as worktree_history;
 use crate::worktree_history::undo;
 
-use crate::code_surface::state::{DiffLoadState, FileLoadState, HoverEntry};
+use crate::code_surface::state::{
+    BlameCacheEntry, BlameLoadState, CommitMessageState, DiffLoadState, FileLoadState, HoverEntry,
+};
 use crate::lsp::client::LspClientState;
 use crate::lsp::completion_popup::CompletionsEntry;
 use crate::root::resize::{PaneResizeDrag, ResizeTarget};
@@ -431,6 +433,27 @@ pub struct AdeApp {
     /// No column tracking: per-character hit-testing against a monospace run wasn't implemented
     /// this phase, so no column is shown at all rather than a fabricated `col 1`.
     pub(crate) code_cursor: Option<usize>,
+    /// Real, cached `wt_core::blame::blame_file` results (GitHub issue #29), keyed by absolute
+    /// path - see `crate::code_surface::blame_view`'s own module docs for the threading/caching
+    /// design and what "revision" means for freshness here.
+    pub(crate) blame_cache: HashMap<PathBuf, BlameCacheEntry>,
+    /// In-flight/settled state per absolute path, mirroring [`Self::file_load_state`]'s own
+    /// single-flight discipline so [`Self::maybe_refresh_blame`] never dispatches a second
+    /// background `git blame` for a path that already has one running.
+    pub(crate) blame_state: HashMap<PathBuf, BlameLoadState>,
+    pub(crate) _blame_tasks: HashMap<PathBuf, Task<()>>,
+    /// Path and time [`Self::maybe_refresh_blame`] last rechecked blame freshness for, throttling
+    /// that (potentially real-`git`-spawning) recheck the same way
+    /// [`Self::file_view_last_freshness_check`] throttles the syntax-highlight one - see
+    /// [`crate::code_surface::blame_view::BLAME_FRESHNESS_CHECK_INTERVAL`]'s own docs.
+    pub(crate) blame_last_freshness_check: Option<(PathBuf, Instant)>,
+    /// Real, full commit-message bodies (`wt_core::blame::commit_message`), keyed by commit sha
+    /// rather than by file/line - a sha's message is the same regardless of which file/line
+    /// referenced it, so this is shared across every open file. Populated lazily, only for a sha
+    /// the current line's hover tooltip actually needs (see
+    /// [`Self::ensure_blame_commit_message`]), off-thread.
+    pub(crate) blame_commit_messages: HashMap<String, CommitMessageState>,
+    pub(crate) _blame_message_tasks: HashMap<String, Task<()>>,
     /// Real, live per-tab text-editing state for the File view (Revision R8.5a) - keyed the same
     /// way as [`Self::open_files`] (a worktree-relative path), so switching between open file
     /// tabs never loses unsaved edits in a background tab. Created lazily the first time a file
@@ -1102,6 +1125,17 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         self.settings.window.controls = style;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// Sets `Settings.blame.show_inline` and persists it - GitHub issue #29's own "user setting
+    /// to hide it entirely" requirement. `crate::code_surface::blame_view::AdeApp::
+    /// maybe_refresh_blame`/`current_line_blame` both check this field directly (not a cached
+    /// copy), so flipping it off here also stops the real background `git blame` work, not just
+    /// the rendering - a genuine off switch, not merely a visual one.
+    pub(crate) fn set_show_inline_blame(&mut self, show: bool, cx: &mut Context<Self>) {
+        self.settings.blame.show_inline = show;
         self.persist_settings(cx);
         cx.notify();
     }

@@ -109,6 +109,12 @@ impl AdeApp {
             }
         }
 
+        // GitHub issue #29: real, off-thread, cached inline git blame - a no-op call whenever
+        // the setting is off or a fresh-enough cache entry already exists (see
+        // `Self::maybe_refresh_blame`'s own docs), so this costs nothing extra on the common
+        // "nothing changed since last render" path.
+        self.maybe_refresh_blame(&absolute_path, cx);
+
         if !cache_fresh {
             // A load already in flight, or a previous read failure, for this exact path must not
             // respawn another load on every render. Without also checking `FileLoadState::Error`
@@ -315,6 +321,11 @@ impl AdeApp {
             .edit_buffers
             .get(&relative_path_buf)
             .is_some_and(|buffer| buffer.is_dirty());
+        // GitHub issue #29: the current line's real, already-cached inline git blame label -
+        // `None` while the buffer is dirty, while the setting is off, or while no fresh cache
+        // entry exists yet for this file (see `Self::current_line_blame`'s own docs). Computed
+        // once here, not per row: only the current line ever shows it.
+        let inline_blame = self.inline_blame_render_model(&absolute_path, cursor, buffer_dirty, cx);
         // `true` while a dirty buffer's own content hasn't reached the language server yet, *or*
         // has reached it but the server hasn't genuinely answered for it yet (the real debounce
         // in `Self::schedule_lsp_sync` hasn't fired, there's no ready client at all, or a real
@@ -452,6 +463,7 @@ impl AdeApp {
                             diagnostics: &line_diagnostics,
                             hovered_byte_range,
                             hover_target: hover_target.as_deref(),
+                            inline_blame: is_current.then_some(inline_blame.as_ref()).flatten(),
                         };
                         rows.push(
                             crate::code_surface::editing::render_editable_file_view_line(
@@ -492,6 +504,7 @@ impl AdeApp {
                         HoverRenderContext {
                             target: hover_target.as_deref(),
                             entry: hover_entry.as_ref(),
+                            inline_blame: is_current.then_some(inline_blame.as_ref()).flatten(),
                         },
                         cx,
                     ));
@@ -660,6 +673,12 @@ pub(in crate::code_surface) struct HoverRenderContext<'a> {
     target: Option<&'a Path>,
     /// [`AdeApp::hover`]'s current entry, if any.
     entry: Option<&'a HoverEntry>,
+    /// GitHub issue #29's real, already-computed inline blame label for *this* line - `Some`
+    /// only on whichever line is `is_current`; every other row is always `None` (only the
+    /// current line ever shows it). Bundled in here rather than as a ninth positional parameter
+    /// on [`render_file_view_line`], for the same `too_many_arguments` reason this struct
+    /// already exists.
+    inline_blame: Option<&'a blame::InlineBlameLabel>,
 }
 
 pub(in crate::code_surface) fn render_file_view_line(
@@ -674,6 +693,7 @@ pub(in crate::code_surface) fn render_file_view_line(
     let HoverRenderContext {
         target: hover_target,
         entry: hover_entry,
+        inline_blame,
     } = hover;
     let gutter_color = if is_current {
         theme::text::DIM
@@ -761,6 +781,12 @@ pub(in crate::code_surface) fn render_file_view_line(
                 .text_color(diagnostic_inline_message_color(first.severity))
                 .child(first_line.to_string()),
         );
+    }
+    // GitHub issue #29: the current line's real inline git blame, dimmed, at the end of the
+    // row - `inline_blame` is only ever `Some` on the current line (see
+    // `HoverRenderContext::inline_blame`'s own docs).
+    if let Some(label) = inline_blame {
+        text_row = text_row.child(blame_view::render_inline_blame_span(label, line_number));
     }
 
     div()

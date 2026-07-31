@@ -2737,3 +2737,117 @@ more than this fix to fully spawn end-to-end. `rust-analyzer` similarly now gets
 progress, not a regression, but not chased further here since it's a distinct failure mode from the
 one reported and reproduced. Both are called out explicitly rather than left to look like this fix
 did more than it verifiably did.
+
+### Step: inline git blame (GitHub issue #29, part of the umbrella issue #14 "Editor polish")
+
+Built as a new subsystem, prioritized per the issue's own scope guidance: a correct,
+off-thread, gracefully-absent current-line inline blame to full quality, over a half-built
+gutter/full-file mode. Two new files plus wiring into six existing ones.
+
+**`wt_core::blame`** (`crates/wt-core/src/blame.rs`, 9 tests, all against real git repos in
+tempdirs): `blame_file(worktree_path, relative_path)` shells out to `git blame
+--line-porcelain` via a real argument vector (`std::process::Command`, `&[OsString]`, never
+an interpolated string) - `gix` (this workspace's pinned 0.68) has no public blame API, so
+this mirrors `wt_core::diff`'s own established "gix for reads, `git` CLI for what gix can't
+do" split, not a new pattern. `--line-porcelain` (repeats every commit's header on every
+line, not just the first) makes the parser stateless across lines at the cost of a larger
+stdout to parse - accepted, since this app already caps opened files at 2MB
+(`code_view::MAX_FILE_BYTES`) regardless. Returns a real three-way `BlameOutcome` (`Blame`,
+`NotARepo`, `NotTracked`) rather than folding "nothing to show" into `Err`, so the app layer
+never has to sniff a generic error message to tell a real failure apart from an expected,
+non-error absence - the same "no fabricated answer, no fabricated error either" discipline
+`wt_core::diff::DiffBase` already established. A shallow clone needed no special-casing at
+all: `git blame` itself degrades gracefully there (attributes lines past the shallow
+boundary to the boundary commit it does have), so nothing in this module has to know a
+clone is shallow. Uncommitted local modifications are git's own synthetic all-zero sha
+(`BlameLine::is_uncommitted`), detected structurally, not by string-matching the author
+name. `commit_message(worktree_path, sha)` fetches the real full body (`git log -1
+--format=%B`) lazily, one commit at a time, for the hover tooltip - a hex-digit validation
+on `sha` before it's handed to `git` as an argument mirrors `diff_against_base`'s own
+defensive check on a merge-base sha, so a future caller can't turn this into an argument
+injection by construction.
+
+**Threading and caching** (`crates/app/src/code_surface/blame_view.rs`): mirrors this
+crate's existing background-load shape exactly - `AdeApp::spawn_blame_load` hands the
+blocking `blame_file` call to `cx.background_executor().spawn(..)` and only touches `self`
+again inside `this.update(cx, ..)` once it resolves, the same pattern
+`AdeApp::spawn_file_load` (syntax highlighting) and `Self::schedule_lsp_sync` (LSP) already
+use - no new concurrency model invented. The real result is cached per file **and
+revision** in `AdeApp::blame_cache`, keyed by absolute path, fingerprinted by
+`(mtime, len)` (the resolved `HEAD` commit id also travels inside the cached
+`wt_core::blame::FileBlame` itself). Recompute triggers (save, commit, branch/HEAD change)
+are deliberately **not** three separate hooks into every code path that can move history -
+that risks silently missing one (an external `git commit` run in this app's own terminal
+pane, say). Instead, `AdeApp::maybe_refresh_blame` reruns the same throttled-freshness-check
+shape `Self::render_file_view` already uses for the syntax-highlight cache
+(`FILE_FRESHNESS_CHECK_INTERVAL`), on its own coarser `BLAME_FRESHNESS_CHECK_INTERVAL` (2s,
+vs. the highlight check's 500ms - a stale hit here spawns a real `git blame` child process,
+meaningfully more expensive than a `std::fs::metadata` call, so it's checked less often).
+Called only from `render_file_view` itself, never a free-running loop enumerating every open
+tab - the same "scope polling to the visible pane, not every pane" lesson this project's own
+history already paid for once, for the terminal poll cadence (see the fix immediately
+preceding this entry in this log). `AdeApp::force_refresh_blame_for_save` additionally
+forces an immediate recompute right after a save's write succeeds, since that one trigger is
+this module's own write and there's no reason to make it wait out the generic poll.
+
+**Graceful absence**: `spawn_blame_load` maps `NotARepo`/`NotTracked` (and any real `Err`,
+logged at `debug`, never surfaced) to `BlameLoadState::Unavailable`/`Error` - the inline
+span simply doesn't render in either case, no toast, no `panic!`. Verified this is
+structural, not just documented: `BlameLoadState`'s three non-`Ready` variants are all
+handled the same way at every render call site.
+
+**Rendering**: the current line's real, already-computed `blame::InlineBlameLabel` (author,
+relative date via a hand-rolled bucketed formatter - no new date/time dependency, this
+workspace has none - and summary, or `"You, uncommitted changes"` for the synthetic
+all-zero-sha case) is appended as a dimmed span at the end of the row, in both the editable
+(`editing::render_editable_file_view_line`) and read-only (`file_view::render_file_view_line`)
+row renderers, reusing the exact div-append idiom each already uses for its own inline
+diagnostic message. Hover shows the full sha and commit message via
+`root::widgets::text_tooltip` - a real, already-proven GPUI `.tooltip(...)` callback this
+codebase already uses for `rail`/`sidebar`/`status_bar`'s own truncated-text tooltips, not a
+new hover mechanism. The full commit message itself is fetched lazily
+(`AdeApp::ensure_blame_commit_message`), off-thread, cached by sha (shared across every
+file/line referencing the same commit, and deliberately *not* cleared on a worktree switch,
+unlike the path-keyed blame cache - a sha names the same real commit everywhere). While that
+fetch is in flight, the tooltip falls back to the one-line summary rather than blocking or
+showing nothing.
+
+Suppressed while the buffer has unsaved edits (`buffer_dirty`), for the identical documented
+reason `file_view_changed_lines` (the git-gutter changed-line stripe) already is: the cached
+blame reflects on-disk content, and a dirty buffer's own line numbering can have already
+diverged from it - showing it anyway risks attributing the wrong line.
+
+**Settings**: `Settings.blame.show_inline` (default `true`, per the issue's own suggested
+default), a real toggle on the General settings page wired through `set_show_inline_blame`
+- `persist_settings` plus a genuine off switch: `maybe_refresh_blame`/`current_line_blame`
+both check the live setting directly, so turning it off stops the background `git blame`
+work too, not just the rendering.
+
+**Scope cut, stated rather than hidden**: the issue's secondary "gutter blame / full-file
+blame view" mode is **not implemented**. The data it would need already exists (`FileBlame`
+holds every line, not just the current one), but the rendering - a real toolbar-toggled
+secondary gutter mode - is real UI work this phase deliberately left out to keep the
+current-line inline path correct rather than shipping two half-finished things. No
+`show_gutter` setting field exists, and no UI control claims to offer it - a setting bound
+to nothing would be exactly the "looks wired up but isn't" this project's own conventions
+forbid, so it was left out entirely rather than stubbed. "Recomputes on commit"/"on
+branch/HEAD change" are real but indirect, via the freshness-poll design above, not verified
+against every individual git-history-mutating code path in this app by name - documented as
+a deliberate design choice, not an oversight.
+
+15 new tests (9 `wt-core`, 6 `app`), all passing; `cargo build --workspace` and
+`cargo clippy -p app -p wt-core --all-targets -- -D warnings` clean. (A pre-existing
+`status_bar/mod.rs` unused-`Session`-import warning, hit before rebasing onto the CI-fix
+commit that already resolves it properly with a `#[cfg(target_os = "linux")]` gate, needed
+no further action once that commit landed underneath this one.) `cargo test --workspace`/
+`cargo clippy --workspace --all-targets` could not be run to a clean, complete pass
+end-to-end in this session's Windows sandbox: a large, pre-existing set of failures
+unrelated to this change (real `/proc`-file reads, real PTY behavior, real
+`rust-analyzer`/`pyright`/`typescript-language-server`/`vue-language-server` process spawns,
+and at least one hardcoded-Unix-path-separator assertion in the recently-rebased file-tree
+fold-state tests) reproduce identically with this change's own files stashed out, confirming
+they predate it - consistent with the CI-simplification commit immediately below this one in
+history, which narrowed every platform's job (including Linux) to build-only for the same
+class of reason. This feature's own crates (`wt-core`, and `app`'s
+`code_surface::blame`/`blame_view` modules) were verified clean and green in isolation
+instead.

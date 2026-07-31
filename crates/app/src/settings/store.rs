@@ -85,6 +85,7 @@ pub struct Settings {
     pub theme: ThemeSettings,
     pub keymap: KeymapSettings,
     pub file_tree: FileTreeSettings,
+    pub blame: BlameSettings,
 }
 
 /// `crate::root::AdeApp::window_controls_style`'s persisted backing - see
@@ -247,6 +248,32 @@ impl Default for FileTreeSettings {
         Self {
             max_entries: FILE_TREE_MAX_ENTRIES_DEFAULT,
         }
+    }
+}
+
+/// Inline git blame (GitHub issue #29): whether Surface C's File view shows the current line's
+/// author/relative-date/summary, dimmed, at the end of the line - see
+/// `crate::code_surface::blame_view`'s own module docs for the real off-thread/caching mechanism
+/// this gates, and `crate::settings::render`'s General page for the one real, wired toggle row
+/// backing this field (`Self::show_inline`).
+///
+/// There is deliberately no `show_gutter` field here: GitHub issue #29 also asks for a secondary
+/// gutter/full-file blame view, which this phase does not implement (see
+/// `crate::code_surface::blame_view`'s own "Scope" docs) - a persisted setting with no real
+/// feature behind it would be exactly the "looks wired up but isn't" this project's conventions
+/// forbid, so it isn't added until the feature it would gate actually exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BlameSettings {
+    /// Defaults to `true` (issue #29's own suggested default: "inline blame on, full gutter
+    /// off") - most users reviewing code want to see who last touched the current line without
+    /// an extra keystroke; it can be turned off entirely from the General settings page.
+    pub show_inline: bool,
+}
+
+impl Default for BlameSettings {
+    fn default() -> Self {
+        Self { show_inline: true }
     }
 }
 

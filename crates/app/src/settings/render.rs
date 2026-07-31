@@ -879,6 +879,17 @@ impl AdeApp {
              elsewhere. The same chip shown in the status bar and terminal footer.",
             render_env_chip(),
         );
+        let inline_blame_row = self.render_settings_row(
+            "Inline git blame",
+            "Show who last changed the current line, and when, dimmed at the end of it. Off \
+             stops the background lookup entirely, not just the display.",
+            self.render_toggle_control(
+                "settings-inline-blame",
+                self.settings.blame.show_inline,
+                cx,
+                |this, cx| this.set_show_inline_blame(!this.settings.blame.show_inline, cx),
+            ),
+        );
 
         div()
             .flex()
@@ -896,6 +907,17 @@ impl AdeApp {
             )
             .child(window_controls_row)
             .child(environment_row)
+            .child(
+                div()
+                    .pt(px(20.0))
+                    .pb(px(4.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Editor"),
+            )
+            .child(inline_blame_row)
             .child(self.render_snippet_block(settings_store::ConfigPage::General))
     }
 

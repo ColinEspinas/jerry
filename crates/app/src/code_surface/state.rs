@@ -58,3 +58,49 @@ pub(in crate::code_surface) enum HoverStatus {
     Ready(Option<hover_view::HoverRenderModel>),
     Failed(String),
 }
+
+/// The outcome of the most recent (or in-flight) `wt_core::blame::blame_file` call for one
+/// absolute path - see `crate::code_surface::blame_view`'s own module docs for the background/
+/// caching design this backs. Kept separate from `AdeApp::blame_cache` (mirroring
+/// [`FileLoadState`]/[`AdeApp::file_view_cache`]'s own split) so "still loading" and "genuinely
+/// unavailable" are both real, renderable states rather than either being confused with a blank
+/// cache entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BlameLoadState {
+    Loading,
+    /// A real blame is cached in `AdeApp::blame_cache` for this path.
+    Ready,
+    /// Not a git repository, or the file has no history in `HEAD` (untracked, or new) - a real,
+    /// expected outcome per `wt_core::blame`'s own "graceful absence" contract, never shown as
+    /// an error.
+    Unavailable,
+    /// A genuine, unexpected failure (e.g. `git` not on `$PATH`) - still never surfaced as an
+    /// error toast (GitHub issue #29's own requirement), but logged and kept distinct from
+    /// [`Self::Unavailable`] so a future diagnostics surface could tell the two apart.
+    Error(String),
+}
+
+/// One file's cached, real blame result plus the on-disk fingerprint it was computed from - see
+/// `crate::code_surface::blame`'s own module docs ("What 'revision' means for the cache this
+/// backs") for why both the commit id embedded in `blame` and this `(mtime, len)` pair together
+/// form the real cache key, and `crate::code_surface::blame_view::AdeApp::spawn_blame_load` for
+/// where this is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlameCacheEntry {
+    pub(in crate::code_surface) mtime: Option<std::time::SystemTime>,
+    pub(in crate::code_surface) len: u64,
+    pub(in crate::code_surface) blame: wt_core::blame::FileBlame,
+}
+
+/// The outcome of the most recent (or in-flight) `wt_core::blame::commit_message` call for one
+/// commit sha - see `AdeApp::blame_commit_messages`' own docs for why this is keyed by sha
+/// (shared across every file/line that references the same commit) rather than per-path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommitMessageState {
+    Loading,
+    Ready(String),
+    /// A genuine fetch failure - never surfaced as an error toast; the hover tooltip just falls
+    /// back to the one-line blame summary it already has (see
+    /// `crate::code_surface::blame::inline_blame_label`'s own `full_message` fallback).
+    Failed(String),
+}
