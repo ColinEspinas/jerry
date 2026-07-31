@@ -1,16 +1,46 @@
 use super::*;
 use crate::root::widgets::{render_keycap_row, text_tooltip, KeycapSize};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-impl AdeApp {
-    pub(crate) fn toggle_rail_mode(&mut self, cx: &mut Context<Self>) {
-        self.rail_mode = self.rail_mode.toggled();
-        self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
-        cx.notify();
+/// The agent row's line-2 state word (§2.3) - deliberately distinct from [`Status::label`]
+/// (`"Idle"`, used everywhere else this enum shows text, e.g. the work-surface context bar):
+/// only the rail agent row uses `"paused"` for [`Status::Idle`], since that's the one place the
+/// design gives it a different word ("needs input / failed / running / review ready / paused" -
+/// no "idle" appears in that list at all). Changing [`Status::label`] itself to match would have
+/// renamed it everywhere else in the app too.
+fn agent_state_word(status: Status) -> &'static str {
+    match status {
+        Status::Ask => "needs input",
+        Status::Fail => "failed",
+        Status::Review => "review ready",
+        Status::Run => "running",
+        Status::Idle => "paused",
     }
+}
 
+/// The agent row's line-2 trailing text (§2.3's exact per-status table): empty for `needs
+/// input` (the dot and state word are the whole message), the live activity for `running`, the
+/// exit code for `failed`, the review's file count for `review ready`, and `resumable · Nh` for
+/// `paused`.
+fn agent_trailing_text(session: &SessionRow) -> String {
+    match session.status {
+        Status::Ask => String::new(),
+        Status::Run => session.activity.clone().unwrap_or_default(),
+        Status::Fail => session
+            .exit_code
+            .map(|code| format!("exit {code}"))
+            .unwrap_or_default(),
+        Status::Review => session
+            .review_file_count
+            .map(|count| format!("{count} file{}", if count == 1 { "" } else { "s" }))
+            .unwrap_or_default(),
+        Status::Idle => format!("resumable \u{b7} {}", rail::format_elapsed(session.elapsed)),
+    }
+}
+
+impl AdeApp {
     /// Types (or backspaces/clears) into [`Self::filter_query`] - a small, hand-rolled text
     /// field (append/backspace only, no cursor positioning or selection) rather than
     /// `vendor/zed/crates/gpui/examples/input.rs`'s full `EntityInputHandler`, judged out of
@@ -106,6 +136,22 @@ impl AdeApp {
                     None => session.cwd.display().to_string(),
                 };
 
+                // See `SessionRow::review_file_count`'s own docs: `Self::file_authorship` is
+                // scoped to whichever single diff is currently loaded in Zone 3
+                // (`Self::diff_root`), not tracked per-worktree yet - so a review-ready session
+                // outside that one worktree has no real data to report and stays `None` rather
+                // than a fabricated count.
+                let review_file_count = if status_value == Status::Review
+                    && session.cwd == self.diff_root
+                {
+                    self.current_diff().map(|diff| {
+                        self.file_authorship
+                            .file_count_for(session.id, diff.files.iter().map(|f| f.path.as_path()))
+                    })
+                } else {
+                    None
+                };
+
                 SessionRow {
                     id: session.id,
                     kind: session.kind,
@@ -120,6 +166,8 @@ impl AdeApp {
                     // See `SessionRow::activity`'s own docs: no real PTY-activity heuristic is
                     // wired up yet, so every row threads `None` through for now.
                     activity: None,
+                    elapsed: session.spawned_at.elapsed(),
+                    review_file_count,
                 }
             })
             .collect()
@@ -553,30 +601,8 @@ impl AdeApp {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
-                    .child(self.render_rail_mode_toggle(cx))
                     .child(self.render_new_session_button(cx)),
             )
-    }
-
-    /// The `by urgency ▾ / by project ▾` control.
-    pub(in crate::rail) fn render_rail_mode_toggle(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .id("rail-mode-toggle")
-            .cursor_pointer()
-            .px(px(6.0))
-            .py(px(2.0))
-            .rounded(theme::radius::CHIP)
-            .font(font(theme::font::MONO))
-            .text_size(self.ui_text_size(10.0))
-            .text_color(theme::text::DIM)
-            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
-            .child(format!("{} \u{25be}", self.rail_mode.label()))
-            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                this.toggle_rail_mode(cx);
-            }))
     }
 
     /// The `+` control with its real, platform-resolved `mod+N` keycap pair (`⌘N` on macOS,
@@ -673,18 +699,49 @@ impl AdeApp {
             )
     }
 
-    /// Dispatches to the real urgency- or project-grouped worktree list, per [`Self::rail_mode`].
-    /// Builds [`rail::WorktreeRow`]s fresh from live state every render (cheap: no I/O, just
-    /// field reads plus the cached [`Self::diff_cache`]/[`Self::worktree_notes`] snapshots) -
-    /// see [`Self::build_worktree_rows`]'s docs. One row per worktree either way now - see the
-    /// module docs on `crate::root::mod`'s "One rail row per worktree" section for why this
-    /// replaced the old per-*session* row model.
+    /// The rail's one real structure (`design_handoff_jerry_ade/revision 3/
+    /// REVISION-2026-07-31.md` §2.1: "Two levels, always: **repo group → worktree → agents**.
+    /// There is **no rail mode toggle**"). Builds [`rail::WorktreeRow`]s fresh from live state
+    /// every render (cheap: no I/O, just field reads plus the cached
+    /// [`Self::diff_cache`]/[`Self::worktree_notes`] snapshots) - see [`Self::build_worktree_rows`]'s
+    /// docs - filters them, then groups the result by repo (see [`rail::group_worktrees_by_repo`]'s
+    /// own docs for why every repo but [`Self::focused_repo`] renders with zero rows today).
     pub(in crate::rail) fn render_rail_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let rows = self.build_worktree_rows(cx);
-        match self.rail_mode {
-            RailMode::Urgency => self.render_urgency_worktree_list(&rows, cx),
-            RailMode::Project => self.render_project_worktree_list(&rows, cx),
+        let filtered: Vec<WorktreeRow> =
+            rail::filter_worktree_rows(&rows, self.filter_query.as_str())
+                .into_iter()
+                .cloned()
+                .collect();
+
+        if filtered.is_empty() {
+            return self.render_rail_empty_message(if rows.is_empty() {
+                "no worktrees found"
+            } else {
+                "no worktrees match this filter"
+            });
         }
+
+        let repo_inputs: Vec<RepoWorktrees> = self
+            .repos
+            .iter()
+            .map(|repo| RepoWorktrees {
+                repo_id: repo.id,
+                repo_name: repo.name.clone(),
+                rows: if Some(repo.id) == self.focused_repo {
+                    filtered.clone()
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect();
+        let groups = rail::group_worktrees_by_repo(repo_inputs);
+
+        let mut list = div().id("rail-repo-groups").flex().flex_col();
+        for group in &groups {
+            list = list.child(self.render_repo_group(group, cx));
+        }
+        list.into_any_element()
     }
 
     pub(in crate::rail) fn render_rail_empty_message(
@@ -705,72 +762,55 @@ impl AdeApp {
             .into_any_element()
     }
 
-    /// "By urgency" mode: every worktree row grouped by its own [`rail::WorktreeRow::
-    /// aggregate_status`] (the most urgent of its open sessions', or `Idle` if it has none) -
-    /// see [`rail::group_worktrees_by_urgency`]'s own docs for why this is the sensible
-    /// adaptation of the old per-session urgency sort now that a row represents a whole
-    /// worktree's tabs.
-    pub(in crate::rail) fn render_urgency_worktree_list(
+    /// One repo group (§2.0-2.1): the header (name, `N wt` count, and the amber `N worktrees
+    /// waiting` when non-zero), then every worktree row already ranked most-urgent-first by
+    /// [`rail::group_worktrees_by_repo`].
+    pub(in crate::rail) fn render_repo_group(
         &self,
-        rows: &[WorktreeRow],
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let filtered: Vec<WorktreeRow> =
-            rail::filter_worktree_rows(rows, self.filter_query.as_str())
-                .into_iter()
-                .cloned()
-                .collect();
-        let groups = rail::group_worktrees_by_urgency(&filtered);
-
-        if groups.is_empty() {
-            return self.render_rail_empty_message(if rows.is_empty() {
-                "no worktrees found"
-            } else {
-                "no worktrees match this filter"
-            });
-        }
-
-        let mut list = div().id("rail-urgency-groups").flex().flex_col();
-        for group in &groups {
-            list = list.child(self.render_urgency_worktree_group(group, cx));
-        }
-        list.into_any_element()
-    }
-
-    /// One urgency group: the 5×5 status-colour square + uppercase label + count header
-    /// row, then every worktree row aggregating to that status.
-    pub(in crate::rail) fn render_urgency_worktree_group(
-        &self,
-        group: &rail::UrgencyWorktreeGroup,
+        group: &RepoGroup,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let waiting = group.waiting_count();
+
         div()
-            .id(("status-group", group.status.urgency_rank() as u64))
+            .id(("repo-group", group.repo_id.0))
             .flex()
             .flex_col()
             .child(
+                // Padding `8 12 4` (§2.1).
                 div()
                     .flex()
                     .items_center()
                     .gap(px(6.0))
+                    .pt(px(8.0))
                     .px(px(12.0))
-                    .py(px(5.0))
-                    .child(div().w(px(5.0)).h(px(5.0)).bg(group.status.color()))
+                    .pb(px(4.0))
                     .child(
                         div()
                             .font(font(theme::font::SANS))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_size(self.ui_text_size(9.5))
-                            .text_color(theme::text::FAINT)
-                            .child(group.status.label().to_uppercase()),
+                            .text_color(theme::rail::REPO_HEADER_NAME)
+                            .child(group.repo_name.to_uppercase()),
                     )
                     .child(
                         div()
                             .font(font(theme::font::MONO))
                             .text_size(self.ui_text_size(9.5))
-                            .text_color(theme::text::GHOST)
-                            .child(group.rows.len().to_string()),
-                    ),
+                            .text_color(theme::text::PATH)
+                            .child(format!("{} wt", group.rows.len())),
+                    )
+                    .child(div().flex_1())
+                    .when(waiting > 0, |el| {
+                        el.child(
+                            div()
+                                .font(font(theme::font::SANS))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_size(self.ui_text_size(9.5))
+                                .text_color(theme::status::ASK_CARD_FG)
+                                .child(format!("{waiting} worktrees waiting")),
+                        )
+                    }),
             )
             .children(
                 group
@@ -781,112 +821,58 @@ impl AdeApp {
             )
     }
 
-    /// "By project" mode: a single project header (this app manages exactly one repository -
-    /// see the module docs on why multi-project support is out of scope) followed by every
-    /// worktree as an indented child row.
-    pub(in crate::rail) fn render_project_worktree_list(
-        &self,
-        rows: &[WorktreeRow],
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let filtered = rail::filter_worktree_rows(rows, self.filter_query.as_str());
-
-        if filtered.is_empty() {
-            return self.render_rail_empty_message(if rows.is_empty() {
-                "no worktrees found"
-            } else {
-                "no worktrees match this filter"
-            });
+    /// Whether `row`'s agent rows are currently shown - an explicit per-worktree override in
+    /// [`Self::rail_collapse_overrides`] if the caret has ever been clicked for this path,
+    /// otherwise the real default (§2.2: "Worktrees whose most urgent agent is idle start
+    /// collapsed"). A session-less row has no caret at all, so this is only ever consulted
+    /// (via [`Self::render_worktree_row`]) when `row.sessions` is non-empty.
+    pub(in crate::rail) fn worktree_is_expanded(&self, row: &WorktreeRow) -> bool {
+        match self.rail_collapse_overrides.get(&row.path) {
+            Some(expanded) => *expanded,
+            None => row.aggregate_status() != Status::Idle,
         }
-
-        let project_name = self
-            .focused_repo()
-            .map(|repo| repo.name.clone())
-            .unwrap_or_else(|| self.focused_repo_path().display().to_string());
-        let project_branch = self
-            .worktrees
-            .iter()
-            .find(|item| item.is_main)
-            .and_then(|item| item.branch.clone());
-        // Aggregate status summary across every worktree row, sorted most-urgent-first -
-        // the same real per-session urgency ranking `rail::WorktreeRow::aggregate_status`
-        // itself uses, just one dot per worktree rather than per session.
-        let mut dots: Vec<Status> = rows.iter().map(|row| row.aggregate_status()).collect();
-        dots.sort_by_key(|status| status.urgency_rank());
-        let worktree_count = rows.len();
-
-        let mut list = div().id("rail-project").flex().flex_col();
-        list = list.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .px(px(12.0))
-                .h(px(27.0))
-                .child(
-                    div()
-                        .font(font(theme::font::MONO))
-                        .text_size(self.ui_text_size(11.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme::text::STRONG)
-                        .child(project_name),
-                )
-                .when_some(project_branch, |el, branch| {
-                    el.child(
-                        div()
-                            .font(font(theme::font::MONO))
-                            .text_size(self.ui_text_size(10.0))
-                            .text_color(theme::text::GHOST)
-                            .child(branch),
-                    )
-                })
-                .child(div().flex_1())
-                .child(
-                    // 5×5 dots, same size as `Self::render_urgency_worktree_group`'s header
-                    // marker - deliberately larger than a worktree row's own 4×4 dot.
-                    div().flex().items_center().gap(px(3.0)).children(
-                        dots.into_iter()
-                            .map(|status| div().w(px(5.0)).h(px(5.0)).bg(status.color())),
-                    ),
-                )
-                .child(
-                    div()
-                        .font(font(theme::font::MONO))
-                        .text_size(self.ui_text_size(9.5))
-                        .text_color(theme::text::GHOST)
-                        .child(format!("{worktree_count} wt")),
-                ),
-        );
-
-        for (index, row) in filtered.into_iter().enumerate() {
-            list = list.child(
-                div()
-                    .flex()
-                    .pl(px(16.0))
-                    .border_l_1()
-                    .border_color(theme::border::ZONE)
-                    .child(self.render_worktree_row(row, index, cx)),
-            );
-        }
-
-        list.into_any_element()
     }
 
-    /// One rail row: a whole worktree, with every open session folded in as a tab (see
-    /// [`rail::WorktreeRow`]'s own docs) - agent badge (the first open session's kind, or a
-    /// neutral placeholder for a session-less worktree), label, aggregate status meta, then a
-    /// second line with the aggregate status dot, branch, and either a real tab count/diff stat
-    /// (a worktree with open sessions) or the real clean/prunable note (one without) - and a
-    /// question-preview card for whichever open session is the most urgently waiting, if any.
+    /// The worktree row caret's click handler - flips whatever [`Self::worktree_is_expanded`]
+    /// just reported for this path into an explicit, remembered override.
+    pub(in crate::rail) fn toggle_worktree_collapsed(
+        &mut self,
+        worktree_path: PathBuf,
+        currently_expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.rail_collapse_overrides
+            .insert(worktree_path, !currently_expanded);
+        cx.notify();
+    }
+
+    /// The worktree row's `⚠ N` shared-file flag (§2.2's trailing slot, §4's "files two agents
+    /// both wrote") - real, but only for whichever worktree's diff is currently loaded in
+    /// Zone 3 ([`Self::diff_root`]): [`Self::file_authorship`] is scoped to that one diff (see
+    /// its own docs), not tracked per-worktree yet, so every other row has no data to report and
+    /// gets a real `0` (hidden by the render side's own "only when ≥1" gate) rather than a
+    /// fabricated count.
+    pub(in crate::rail) fn worktree_shared_file_count(&self, worktree_path: &Path) -> usize {
+        if worktree_path != self.diff_root {
+            return 0;
+        }
+        let Some(diff) = self.current_diff() else {
+            return 0;
+        };
+        self.file_authorship
+            .shared_file_count(diff.files.iter().map(|f| f.path.as_path()))
+    }
+
+    /// One worktree row (§2.2: 27 high, padding `0 10 0 6`, gap 6) plus, when expanded, its
+    /// agent rows (§2.3) - the rail's real "worktree owns N agents" structure. `index` (unique
+    /// within its repo group) disambiguates element ids for the real degenerate case
+    /// `crate::rail::worktrees::WorktreeItem`'s docs call out: more than one unreadable worktree
+    /// entry shares the same (empty) `path`, which alone would collide.
     ///
-    /// Clicking selects this worktree (`Self::select_worktree_by_path`) - switching tabs within
-    /// it happens in the centre pane's own tab strip, not here; the rail no longer exposes
-    /// individual session rows at all now that a row represents the whole worktree.
-    ///
-    /// `index` (unique within whichever list is currently being rendered - a status group in
-    /// Urgency mode, or the flat filtered list in Project mode) disambiguates element ids for the
-    /// real degenerate case `crate::rail::worktrees::WorktreeItem`'s docs call out: more than one
-    /// unreadable worktree entry shares the same (empty) `path`, which alone would collide.
+    /// Clicking the row selects this worktree (`Self::select_worktree_by_path`), restoring
+    /// whatever tab it was left on (§2.3: "Clicking a worktree header restores whatever tab it
+    /// was left on") - switching tabs within it happens in the centre pane's own tab strip, or
+    /// by clicking one of the agent rows below directly (see [`Self::render_agent_row`]).
     pub(in crate::rail) fn render_worktree_row(
         &self,
         row: &WorktreeRow,
@@ -925,171 +911,149 @@ impl AdeApp {
         }
 
         let is_selected = self.active_session_cwd() == row.path;
+        let has_agents = !row.sessions.is_empty();
+        let is_expanded = has_agents && self.worktree_is_expanded(row);
         let status = row.aggregate_status();
-        let has_sessions = !row.sessions.is_empty();
-        let (badge_fg, badge_bg) = match row.sessions.first() {
-            Some(session) => work_surface::agent_tint(session.kind),
-            None => (
-                theme::text::GHOST.into(),
-                theme::surface::CHIP_NEUTRAL.into(),
-            ),
-        };
-        let badge_glyph = match row.sessions.first() {
-            Some(session) => work_surface::agent_initial(session.kind),
-            None => "\u{2014}",
-        };
 
-        let title_color = if is_selected {
-            theme::text::SELECTED
-        } else if status == Status::Idle {
-            theme::text::DIMMER
+        // 2px left edge = the colour of the worktree's most urgent agent - bare/prunable get
+        // their own dedicated colours (§2.2).
+        let edge_color: gpui::Rgba = if has_agents {
+            status.color()
+        } else if row.note.is_prunable() {
+            theme::rail::PRUNABLE_EDGE.into()
         } else {
-            theme::text::BODY
+            theme::status::IDLE_BG.into()
         };
 
-        let meta_text = if has_sessions {
-            match status {
-                Status::Ask => "waiting".to_string(),
-                Status::Fail => "failed".to_string(),
-                Status::Review => "ready".to_string(),
-                Status::Run => "running".to_string(),
-                Status::Idle => "idle".to_string(),
+        // `#dde2e7` active / `#c2c7cc` with agents / `#8b9197` bare (§2.2).
+        let branch_color: gpui::Rgba = if is_selected {
+            theme::text::SELECTED.into()
+        } else if has_agents {
+            theme::text::STRONG.into()
+        } else {
+            theme::text::DIM.into()
+        };
+
+        let shared_count = self.worktree_shared_file_count(&row.path);
+
+        let caret = if has_agents {
+            let worktree_path = row.path.clone();
+            Some(
+                div()
+                    .id(("worktree-caret", index as u64))
+                    .flex_none()
+                    .w(px(11.0))
+                    .h(px(11.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(8.0))
+                    .text_color(theme::text::FAINT)
+                    .child(if is_expanded { "\u{25be}" } else { "\u{25b8}" })
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        this.toggle_worktree_collapsed(worktree_path.clone(), is_expanded, cx);
+                    })),
+            )
+        } else {
+            None
+        };
+
+        let branch_div = div()
+            .min_w_0()
+            .flex_shrink_1()
+            .truncate()
+            .font(font(theme::font::MONO))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(self.ui_text_size(11.0))
+            .text_color(branch_color)
+            .child(row.branch.clone().unwrap_or_else(|| row.label.clone()));
+
+        let mut trailing = div().flex().flex_none().items_center().gap(px(4.0));
+        if has_agents {
+            if !is_expanded {
+                let mut dot_statuses: Vec<Status> =
+                    row.sessions.iter().map(|session| session.status).collect();
+                dot_statuses.sort_by_key(|status| status.urgency_rank());
+                trailing = trailing.child(div().flex().items_center().gap(px(3.0)).children(
+                    dot_statuses.into_iter().map(|status| {
+                        div()
+                            .w(px(4.0))
+                            .h(px(4.0))
+                            .rounded_full()
+                            .bg(status.color())
+                    }),
+                ));
             }
-        } else {
-            String::new()
-        };
-        let meta_color = if status == Status::Ask {
-            theme::status::ASK_CARD_FG
-        } else {
-            theme::text::GHOST
-        };
-
-        let (add, del) = row.diff_totals();
-        let failed_exit_code = row
-            .sessions
-            .iter()
-            .find(|session| session.status == Status::Fail)
-            .and_then(|session| session.exit_code);
-        let stat_text = if !has_sessions {
-            row.note.label()
-        } else if status == Status::Fail {
-            failed_exit_code
-                .map(|code| format!("exit {code}"))
-                .unwrap_or_else(|| "failed".to_string())
-        } else if add > 0 || del > 0 {
-            format!("+{add} \u{2212}{del}")
-        } else {
-            let count = row.sessions.len();
-            format!("{count} tab{}", if count == 1 { "" } else { "s" })
-        };
-        let stat_color = if has_sessions && status == Status::Fail {
-            theme::button::DANGER_FG
-        } else {
-            theme::text::GHOST
-        };
+            let (add, del) = row.diff_totals();
+            if add > 0 || del > 0 {
+                trailing = trailing.child(
+                    div()
+                        .font(font(theme::font::MONO))
+                        .text_size(self.ui_text_size(9.5))
+                        .text_color(theme::text::GHOST)
+                        .child(format!("+{add} \u{2212}{del}")),
+                );
+            }
+        }
 
         let path = row.path.clone();
-        let mut container = div()
+        let header = div()
             .id(id)
             .cursor_pointer()
             .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .pl(px(12.0))
+            .items_center()
+            .h(px(27.0))
+            .pl(px(6.0))
             .pr(px(10.0))
-            .pt(px(6.0))
-            .pb(px(7.0))
+            .gap(px(6.0))
             .border_l(px(2.0))
-            .border_color(if has_sessions {
-                status.color()
-            } else {
-                theme::border::ZONE.into()
-            })
-            .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED))
+            .border_color(edge_color)
+            .when(is_selected, |el| el.bg(theme::rail::WORKTREE_ACTIVE_BG))
             .when(!is_selected, |el| {
-                el.hover(|el| el.bg(theme::surface::ROW_HOVER))
+                el.hover(|el| el.bg(theme::rail::WORKTREE_HOVER_BG))
             })
             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                 this.select_worktree_by_path(&path, window, cx);
             }))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(
-                        div()
-                            .w(px(16.0))
-                            .h(px(16.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(theme::radius::CHIP)
-                            .bg(badge_bg)
-                            .font(font(theme::font::MONO))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(self.ui_text_size(9.0))
-                            .text_color(badge_fg)
-                            .child(badge_glyph),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .font(font(theme::font::SANS))
-                            .text_size(self.ui_text_size(12.0))
-                            .text_color(title_color)
-                            .child(row.label.clone()),
-                    )
-                    .child(
-                        div()
-                            .font(font(theme::font::MONO))
-                            .text_size(self.ui_text_size(9.5))
-                            .text_color(meta_color)
-                            .child(meta_text),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(5.0))
-                    .pt(px(2.0))
-                    // 4×4, smaller than the group-header/project-summary dots (5×5) - matches
-                    // the mockup's `s.dot`/`r.dot` fixtures.
-                    .child(div().w(px(4.0)).h(px(4.0)).bg(if has_sessions {
-                        status.color()
-                    } else {
-                        theme::border::ZONE.into()
-                    }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .font(font(theme::font::MONO))
-                            .text_size(self.ui_text_size(10.5))
-                            .text_color(if is_selected {
-                                theme::text::DIM
-                            } else {
-                                theme::text::FAINTER
-                            })
-                            .child(
-                                row.branch
-                                    .clone()
-                                    .unwrap_or_else(|| "(detached)".to_string()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .font(font(theme::font::MONO))
-                            .text_size(self.ui_text_size(10.0))
-                            .text_color(stat_color)
-                            .child(stat_text),
-                    ),
-            );
+            .children(caret)
+            .child(branch_div)
+            .when(!has_agents, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .font(font(theme::font::MONO))
+                        .text_size(self.ui_text_size(9.5))
+                        .text_color(theme::text::GHOSTER)
+                        .child(format!("\u{b7} {}", row.note.label())),
+                )
+            })
+            .child(div().flex_1().min_w(px(2.0)))
+            .when(shared_count > 0, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .font(font(theme::font::MONO))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_size(self.ui_text_size(9.0))
+                        .text_color(theme::status::ASK_CARD_FG)
+                        .child(format!("\u{26a0} {shared_count}")),
+                )
+            })
+            .child(trailing);
+
+        let mut container = div()
+            .id(("worktree-group", index as u64))
+            .flex()
+            .flex_col()
+            .child(header);
+        if is_expanded {
+            for session in &row.sessions {
+                container = container.child(self.render_agent_row(session, cx));
+            }
+        }
 
         // GitHub issue #12's "locked worktrees are visually marked, with the lock reason
         // surfaced (tooltip is fine)" - `row.note.is_locked` alone (already threaded through
@@ -1140,6 +1104,144 @@ impl AdeApp {
         }
 
         container.into_any_element()
+    }
+
+    /// One agent row (§2.3): indented 13, a 1px spine (2px and status-coloured when this is the
+    /// globally active session - `Self::sessions::active_id`), exactly two lines - chip/title/
+    /// elapsed, then status dot/state word/trailing text/model. Clicking it selects this
+    /// session's tab *and* its worktree (`Self::select_session` - already does both: it's the
+    /// same real entry point the palette/tab-strip use to jump straight to one session).
+    pub(in crate::rail) fn render_agent_row(
+        &self,
+        session: &SessionRow,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_selected = self.sessions.active_id() == Some(session.id);
+        let status = session.status;
+        let (chip_fg, chip_bg) = work_surface::agent_tint(session.kind);
+        let chip_glyph = work_surface::agent_initial(session.kind);
+        let state_color: gpui::Rgba = match status {
+            Status::Ask | Status::Fail => status.color(),
+            _ => theme::text::FAINT.into(),
+        };
+        let trailing_text = agent_trailing_text(session);
+        let trailing_color: gpui::Rgba = if status == Status::Fail {
+            theme::button::DANGER_FG.into()
+        } else {
+            theme::text::FAINT.into()
+        };
+        let id = session.id;
+
+        div()
+            .id(("agent-row", id))
+            .cursor_pointer()
+            .flex()
+            .flex_col()
+            .pl(px(13.0))
+            .pr(px(10.0))
+            .py(px(4.0))
+            .gap(px(2.0))
+            .border_l(if is_selected { px(2.0) } else { px(1.0) })
+            .border_color(if is_selected {
+                status.color()
+            } else {
+                theme::border::ZONE.into()
+            })
+            .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED))
+            .when(!is_selected, |el| {
+                el.hover(|el| el.bg(theme::rail::WORKTREE_HOVER_BG))
+            })
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.select_session(id, window, cx);
+            }))
+            .child(
+                // Line 1: chip · task title · elapsed.
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(15.0))
+                            .h(px(15.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(theme::radius::CHIP)
+                            .bg(chip_bg)
+                            .font(font(theme::font::MONO))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_size(self.ui_text_size(9.0))
+                            .text_color(chip_fg)
+                            .child(chip_glyph),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font(font(theme::font::SANS))
+                            .text_size(self.ui_text_size(11.5))
+                            .text_color(if is_selected {
+                                theme::text::SELECTED
+                            } else {
+                                theme::text::BODY
+                            })
+                            .child(session.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font(font(theme::font::MONO))
+                            .text_size(self.ui_text_size(9.5))
+                            .text_color(theme::text::GHOST)
+                            .child(rail::format_elapsed(session.elapsed)),
+                    ),
+            )
+            .child(
+                // Line 2, indented 21 to the text column (chip width 15 + gap 6): status dot ·
+                // state word · trailing text · model.
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .pl(px(21.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(4.0))
+                            .h(px(4.0))
+                            .rounded_full()
+                            .bg(status.color()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font(font(theme::font::SANS))
+                            .text_size(self.ui_text_size(9.5))
+                            .text_color(state_color)
+                            .child(agent_state_word(status)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font(font(theme::font::SANS))
+                            .text_size(self.ui_text_size(9.5))
+                            .text_color(trailing_color)
+                            .child(trailing_text),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font(font(theme::font::MONO))
+                            .text_size(self.ui_text_size(9.5))
+                            .text_color(theme::text::PATH)
+                            .child(session.kind.label()),
+                    ),
+            )
     }
 
     /// The real `Y GB` (`+` suffixed if [`Self::disk_usage`] was truncated) disk-usage label, or
@@ -1416,5 +1518,245 @@ mod prune_regression_tests {
              `Self::prune_in_flight` did not actually prevent a second prune batch from \
              spawning and racing the first"
         );
+    }
+}
+
+/// Real, `Context<AdeApp>`-driven coverage for Revision R12's rail rewrite: the repo-group →
+/// worktree-row → agent-row structure (`design_handoff_jerry_ade/revision 3/
+/// REVISION-2026-07-31.md` §2), the per-worktree collapse memory, and the agent row's "select
+/// the worktree and raise this session's tab" click behaviour.
+#[cfg(test)]
+mod rail_row_tests {
+    use super::*;
+    use crate::rail::worktrees::WorktreeItem;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    fn worktree_item(path: PathBuf, label: &str) -> WorktreeItem {
+        WorktreeItem {
+            path,
+            label: label.to_string(),
+            branch: Some(label.to_string()),
+            is_main: false,
+            is_locked: false,
+            error: None,
+        }
+    }
+
+    /// §2.2: "Worktrees whose most urgent agent is idle start collapsed" - proven here against
+    /// a real running session (never collapsed by default) and a real idle one (collapsed by
+    /// default), through `Self::worktree_is_expanded`, the single real place that default lives.
+    #[gpui::test]
+    fn worktree_is_expanded_defaults_to_the_real_idle_rooted_rule(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt = tempfile::tempdir().expect("tempdir wt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt.path().to_path_buf(), "wt")];
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            app.sessions.spawn(
+                SessionKind::Shell,
+                wt.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+        });
+        // The pty spawn itself is async (`TerminalPane::spawn_process`), so the process isn't
+        // observably running yet the instant `spawn` returns - let it actually start before
+        // reading a live `Status` off it.
+        cx.run_until_parked();
+
+        let running_row = app.read_with(cx, |app, cx| {
+            app.build_worktree_rows(cx)
+                .into_iter()
+                .find(|row| row.path == wt.path())
+                .expect("the seeded worktree must produce a row")
+        });
+        assert_eq!(
+            running_row.aggregate_status(),
+            Status::Run,
+            "sanity check: a just-spawned shell is Run, not Idle, within the recent-output window"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_is_expanded(&running_row)),
+            "a worktree whose most urgent agent is running must default to expanded"
+        );
+
+        // Force the same row into Idle without waiting on a real clock: a session-less
+        // `WorktreeRow` (same path, no sessions) aggregates to `Status::Idle` exactly the way a
+        // real shell does once it goes quiet past `status::RUN_RECENT_OUTPUT_WINDOW` - the same
+        // `aggregate_status` code path `Self::worktree_is_expanded` itself reads.
+        let idle_row = rail::WorktreeRow {
+            sessions: Vec::new(),
+            ..running_row
+        };
+        assert_eq!(idle_row.aggregate_status(), Status::Idle, "sanity check");
+        assert!(
+            !app.read_with(cx, |app, _| app.worktree_is_expanded(&idle_row)),
+            "an idle-rooted worktree must default to collapsed"
+        );
+    }
+
+    /// The caret's real click behaviour: flips whatever the current expanded state is into an
+    /// explicit, remembered override - and a second toggle flips it right back, proving this is
+    /// a real per-worktree memory, not a write-only flag.
+    #[gpui::test]
+    fn toggle_worktree_collapsed_flips_and_remembers_the_override(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt = tempfile::tempdir().expect("tempdir wt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt.path().to_path_buf(), "wt")];
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            app.sessions.spawn(
+                SessionKind::Shell,
+                wt.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+        });
+        // See the identical `run_until_parked` call/comment in
+        // `worktree_is_expanded_defaults_to_the_real_idle_rooted_rule` just above.
+        cx.run_until_parked();
+
+        let row = app.read_with(cx, |app, cx| {
+            app.build_worktree_rows(cx)
+                .into_iter()
+                .find(|row| row.path == wt.path())
+                .expect("row")
+        });
+        let expanded_before = app.read_with(cx, |app, _| app.worktree_is_expanded(&row));
+        assert!(
+            expanded_before,
+            "sanity check: a running row starts expanded"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_worktree_collapsed(wt.path().to_path_buf(), expanded_before, cx);
+        });
+        assert!(
+            !app.read_with(cx, |app, _| app.worktree_is_expanded(&row)),
+            "one toggle must collapse an expanded-by-default row"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_worktree_collapsed(wt.path().to_path_buf(), false, cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_is_expanded(&row)),
+            "a second toggle must restore the expanded state - a real remembered override, not \
+             a one-shot flag"
+        );
+    }
+
+    /// §2.3: "Clicking an agent selects its worktree **and** raises that agent's tab." -
+    /// `Self::render_agent_row`'s own click handler calls exactly `Self::select_session`, so this
+    /// exercises that same real call: starting from worktree A selected/focused, selecting a
+    /// session that lives in worktree B must move the rail's selection to B *and* make that
+    /// exact session the active tab - not just one half of the pair.
+    #[gpui::test]
+    fn selecting_an_agent_session_selects_its_worktree_and_raises_its_tab(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_a = tempfile::tempdir().expect("tempdir a");
+        let wt_b = tempfile::tempdir().expect("tempdir b");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![
+                worktree_item(wt_a.path().to_path_buf(), "wt-a"),
+                worktree_item(wt_b.path().to_path_buf(), "wt-b"),
+            ];
+        });
+        let session_in_b = app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            app.sessions.spawn(
+                SessionKind::Shell,
+                wt_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            app.select_worktree(0, window, cx);
+            app.sessions.spawn(
+                SessionKind::Shell,
+                wt_b.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            )
+        });
+
+        // Land back on worktree A before the click under test, so a passing assertion proves
+        // the click itself moved the selection rather than it already pointing at B.
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+        });
+        assert_eq!(app.read_with(cx, |app, _| app.selected), Some(0));
+
+        app.update_in(cx, |app, window, cx| {
+            app.select_session(session_in_b, window, cx);
+        });
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.selected),
+            Some(1),
+            "selecting a session in worktree B must select worktree B in the rail"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.sessions.active_id()),
+            Some(session_in_b),
+            "and that exact session must become the active tab"
+        );
+    }
+
+    /// A broader smoke test through the real repo-group → worktree-row → agent-row pipeline
+    /// (`Self::render_rail_list`) with a bare worktree (no caret/agents) alongside a busy one
+    /// with two agent rows - the same trees `AdeApp::render` composes every frame. Only asserts
+    /// it completes without panicking; the exact pixel spec is covered by the pure per-field
+    /// logic tests in `crate::rail::state` and this module's other tests.
+    #[gpui::test]
+    fn render_rail_list_does_not_panic_across_bare_and_multi_agent_worktrees(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let bare_wt = tempfile::tempdir().expect("tempdir bare");
+        let busy_wt = tempfile::tempdir().expect("tempdir busy");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![
+                worktree_item(bare_wt.path().to_path_buf(), "bare-wt"),
+                worktree_item(busy_wt.path().to_path_buf(), "busy-wt"),
+            ];
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(1, window, cx);
+            app.sessions.spawn(
+                SessionKind::Claude,
+                busy_wt.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            app.sessions.spawn(
+                SessionKind::Codex,
+                busy_wt.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+        });
+
+        app.update(cx, |app, cx| {
+            let _ = app.render_rail_list(cx);
+        });
     }
 }
