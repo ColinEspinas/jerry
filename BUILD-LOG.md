@@ -4523,3 +4523,49 @@ already-tested primitives: `open_command_for`/`spawn_open_command` already have 
 was added for the folder-open action itself, since actually invoking `xdg-open` from a test would
 risk real flakiness in this sandbox with no established precedent elsewhere in the codebase for
 doing so).
+## Removed the File view's sync-pending banner (GitHub issue #49)
+
+Real user report: "The file not saved header makes the whole editor move when editing a file and
+serves no purpose." `AdeApp::render_file_view` inserted a `div` (`debug_selector`'d
+`"file-view-sync-pending-banner"`) into the File view's `body` flex column, above the code list,
+any time `sync_pending` was true - which, per Revision R8.5b's own gate, covered essentially the
+entire span of typing in an LSP-backed file: any keystroke leaves the live buffer's content ahead
+of `AdeApp::lsp_last_synced_content` until the next debounced `didChange` fires *and* a
+version-matched diagnostics answer confirms for it. Because the banner was a sibling of the code
+list inside the same `flex_col` container, its own appearance/disappearance pushed every row of
+code up or down by its own height on practically every keystroke - exactly the reported "makes the
+whole editor move" bug, not a cosmetic nit.
+
+Removed the banner `div` and its `sync_pending` boolean computation from `render_file_view` in
+`crates/app/src/code_surface/file_view.rs`, along with its two dedicated regression-test modules
+(`dirty_buffer_stale_decoration_tests::
+the_honest_sync_pending_banner_tracks_real_sync_state_not_just_raw_dirtiness` and
+`sync_pending_diagnostics_confirmation_tests::
+the_banner_stays_pending_until_a_version_matched_diagnostics_answer_lands`) - both existed purely
+to assert on the banner's own `debug_selector`'d presence/absence, so neither had anything left to
+cover once the banner was gone. A `#[cfg(test)]` import
+(`crate::root::focus::palette_focus_tests`) that only those two removed tests used became an
+unused-import clippy error and was removed too.
+
+Grepped the whole `crates/app` tree for `sync_pending` and `sync-pending-banner` before touching
+anything: no status-bar indicator, tooltip, or test elsewhere referenced the selector or depended
+on the banner's presence - the only real consumer was `render_file_view` itself. The underlying
+sync-state bookkeeping this banner read from -
+`lsp_last_synced_content`/`lsp_synced_version`/`lsp_diagnostics_confirmed_version`, maintained by
+`Self::schedule_lsp_sync` in `editing.rs` - was left untouched per the task's own explicit
+instruction: `lsp_last_synced_content` still gates `Self::prepare_lsp_sync`'s real "is there
+anything new to sync" dedup check (`lsp/client.rs`), and all three fields still get cleared on
+worktree switch (`root/state.rs`) and pruned on rename/delete (`sidebar/tree_ops.rs`) - real
+consumers unrelated to this banner that must keep working. Five doc comments across
+`root/mod.rs`, `lsp/client.rs`, and `code_surface/editing.rs` that specifically described these
+fields' purpose in terms of "`Self::render_file_view`'s own `sync_pending` banner" were reworded
+in place (not removed) so they no longer point at deleted code, without changing what they
+document about the underlying bookkeeping itself.
+
+Verification, from this Linux sandbox with the usual `LIBRARY_PATH` X11 workaround:
+`cargo fmt --all -- --check`, `cargo build --workspace`, and
+`cargo clippy --workspace --all-targets -- -D warnings` all clean; `cargo test --workspace --lib
+--test-threads=1`: **1219 passed, 0 failed** across all four crates (`app` 1054, `lsp-core` 44,
+`pty-core` 14, `wt-core` 107) - including no reappearance of the known
+`diff_render_tests::opening_a_real_diff_renders_real_syntax_highlighted_rows` flake this run at
+all.

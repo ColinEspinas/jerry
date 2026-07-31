@@ -1761,8 +1761,9 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 // *live* buffer's own line text (see `EditableLineContext::line`'s docs), and the
                 // language server now genuinely tracks that same live content via
                 // `Self::schedule_lsp_sync`'s real `didChange` sync, not just the last-saved
-                // snapshot (see `crate::code_surface`'s own `sync_pending` docs for the
-                // one, honest remaining latency-window caveat this doesn't try to hide).
+                // snapshot (a real, honest latency window still exists between an edit landing
+                // and the server's diagnostics answering for it - see `Self::schedule_lsp_sync`'s
+                // own docs).
                 let absolute_offset = line_range.start + local_offset;
 
                 window.focus(&this.code_focus_handle, cx);
