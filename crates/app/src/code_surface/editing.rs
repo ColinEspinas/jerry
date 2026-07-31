@@ -2213,16 +2213,17 @@ mod editing_tests {
             "sanity check: the real selection should be visible on line 1 before any scrolling"
         );
 
-        // Force line 1's own row out of the painted range - moving the real caret to a distant
-        // line and calling `Self::sync_cursor_and_scroll` (this app's own real scroll-into-view
-        // mechanism, not a hand-set `code_cursor`) is exactly what a real user's cursor-moving
-        // keystroke/click does; a real user scrolling with the mouse wheel instead would drive
-        // `file_view_scroll_handle` the same way, just through a different real trigger.
+        // Force line 1's own row out of the painted range by scrolling
+        // `file_view_scroll_handle` directly - the real, underlying mechanism
+        // `Self::sync_cursor_and_scroll` itself drives (`UniformListScrollHandle::
+        // scroll_to_item`), used directly here rather than through a cursor move: a real mouse-
+        // wheel scroll doesn't touch the caret/selection at all, and going through `EditBuffer::
+        // move_to` here would collapse the very selection this test exists to prove survives -
+        // `move_to`'s own docs are explicit that it clears the selection, which is real,
+        // correct behavior for a cursor move, just not what this test is about.
         app.update(cx, |app, cx| {
-            let buffer = app.edit_buffers.get_mut(&relative).unwrap();
-            let offset = buffer.offset_for_line_col(400, 0);
-            buffer.move_to(offset);
-            app.sync_cursor_and_scroll();
+            app.file_view_scroll_handle
+                .scroll_to_item(400, gpui::ScrollStrategy::Top);
             cx.notify();
         });
         app.update(cx, |app, cx| app.render_center_pane(cx));
@@ -2237,9 +2238,8 @@ mod editing_tests {
 
         // Scroll back - line 1 is repainted (a real, freshly-built row, not reused state).
         app.update(cx, |app, cx| {
-            let buffer = app.edit_buffers.get_mut(&relative).unwrap();
-            buffer.move_to(0);
-            app.sync_cursor_and_scroll();
+            app.file_view_scroll_handle
+                .scroll_to_item(0, gpui::ScrollStrategy::Top);
             cx.notify();
         });
         app.update(cx, |app, cx| app.render_center_pane(cx));

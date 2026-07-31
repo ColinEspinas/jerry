@@ -2543,7 +2543,6 @@ mod settings_lsp_install_action_tests {
 /// actually persisted and applied" discipline.
 #[cfg(test)]
 mod caret_settings_tests {
-    use super::*;
     use crate::root::focus::palette_focus_tests;
     use crate::settings::store::CaretStyle;
     use gpui::TestAppContext;

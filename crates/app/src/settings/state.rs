@@ -1113,6 +1113,11 @@ mod tests {
                 "Editor: extend selection right",
                 "Editor: extend selection up",
                 "Editor: extend selection down",
+                // GitHub issue #27's "Ctrl+Shift+arrows (word-wise)".
+                "Editor: move left one word",
+                "Editor: move right one word",
+                "Editor: extend selection left one word",
+                "Editor: extend selection right one word",
                 "Editor: go to line start",
                 "Editor: go to line end",
                 "Editor: select all",
@@ -1145,6 +1150,10 @@ mod tests {
                 "Editor: extend selection right",
                 "Editor: extend selection up",
                 "Editor: extend selection down",
+                "Editor: move left one word",
+                "Editor: move right one word",
+                "Editor: extend selection left one word",
+                "Editor: extend selection right one word",
                 "Editor: go to line start",
                 "Editor: go to line end",
                 "Editor: select all",
@@ -1203,6 +1212,10 @@ mod tests {
         // `Some("!terminal && !text-input")` - still scoped either way, so only the count of
         // scoped rows moves. See `crate::default_key_bindings`'s own docs for why the two undo
         // systems are kept disjoint structurally rather than by dispatch order.
+        // GitHub issue #27 added 8 more real scoped bindings: `EditorWordLeft`/`EditorWordRight`/
+        // `EditorSelectWordLeft`/`EditorSelectWordRight`, each bound once under `"file-editor"`
+        // and once under `"merge-editor"` - the same word-wise-caret-navigation set both real
+        // editors share, matching every other `Editor*` action's own dual registration.
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings, &[]);
         assert!(!rows.is_empty());
@@ -1210,11 +1223,12 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            53,
+            61,
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
              every real Completions* binding (5) plus every real merge-editor binding (18) plus \
              Undo/Redo (2) plus TextUndo/TextRedo (3, GitHub issue #17) plus every real \
-             file-tree binding (5, GitHub issue #19) to be scoped, not global"
+             file-tree binding (5, GitHub issue #19) plus every real word-wise Editor* binding \
+             (8, GitHub issue #27) to be scoped, not global"
         );
         assert!(
             scoped
