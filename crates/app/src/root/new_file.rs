@@ -176,14 +176,27 @@ impl AdeApp {
         div()
             .id("new-file-scrim")
             .absolute()
-            .top(px(0.0))
+            // Starts *below* the title bar, exactly like `crate::palette::render`'s own scrim
+            // does and for the same reason - now a real one, since this layer `.occlude()`s.
+            // A full-window occluding scrim swallows the window's own close/minimise/maximise
+            // caption buttons and the title bar's drag region, so the window could not be closed
+            // or moved while it was up. Reproduced against the real caption button by this
+            // change's own adversarial audit.
+            .top(theme::band::TITLE_BAR)
             .left(px(0.0))
             .right(px(0.0))
             .bottom(px(0.0))
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::black().opacity(0.35))
+            // The same real modal layer the file tree's delete confirmation is - a transparent-
+            // to-the-mouse scrim would let the workspace behind it keep taking clicks and
+            // painting hover states while a modal is up. See
+            // `crate::sidebar::render::AdeApp::render_tree_context_menu`'s own docs for what
+            // `.occlude()` actually does, and `crate::root::widgets::modal_scrim_bg` for why the
+            // fill is a token rather than the raw `gpui::black()` that used to be here.
+            .occlude()
+            .bg(widgets::modal_scrim_bg())
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                 this.cancel_new_file(window, cx);
             }))

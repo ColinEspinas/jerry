@@ -232,13 +232,17 @@ impl AdeApp {
         if self.tree_inline_edit.is_some() {
             self.cancel_tree_inline_edit(window, cx);
         }
-        let rows = context_menu::menu_items(&target, self.tree_clipboard.is_some()).len();
+        // The exact rows `crate::sidebar::render::AdeApp::render_tree_context_menu` will paint,
+        // group dividers included - measuring the action rows alone would leave the popover 9px
+        // per group boundary taller than the clamp believed, so a menu opened near the bottom
+        // edge would overhang it.
+        let rows = context_menu::menu_rows(&target, self.tree_clipboard.is_some());
         let viewport = window.bounds().size;
         let (origin_x, origin_y) = context_menu::clamp_menu_origin(
             click_x,
             click_y,
             context_menu::MENU_WIDTH,
-            context_menu::menu_height(rows),
+            context_menu::menu_height(&rows),
             f32::from(viewport.width),
             f32::from(viewport.height),
         );
@@ -2288,7 +2292,7 @@ mod tree_ops_regression_tests {
                 ContextTarget::Folder(repo.path().join("src")),
                 "the row's own handler must win over the container's empty-area one"
             );
-            let rows = context_menu::menu_items(&menu.target, false).len();
+            let rows = context_menu::menu_rows(&menu.target, false);
             assert!(
                 menu.origin_x >= 0.0
                     && menu.origin_x + context_menu::MENU_WIDTH <= f32::from(viewport.width),
@@ -2296,14 +2300,27 @@ mod tree_ops_regression_tests {
             );
             assert!(
                 menu.origin_y >= 0.0
-                    && menu.origin_y + context_menu::menu_height(rows)
+                    && menu.origin_y + context_menu::menu_height(&rows)
                         <= f32::from(viewport.height)
             );
         });
-        assert!(
-            cx.debug_bounds("tree-context-menu").is_some(),
-            "and it must genuinely paint"
-        );
+        let painted = cx
+            .debug_bounds("tree-context-menu")
+            .expect("and it must genuinely paint");
+        // The clamp works in window space; the panel is positioned inside a scrim that starts
+        // below the title bar. A menu that paints anywhere other than where the clamp put it is
+        // a menu whose edge-flip math is about a different rectangle than the one on screen.
+        app.read_with(cx, |app, _| {
+            let menu = app.tree_context_menu.as_ref().expect("menu");
+            assert_eq!(
+                (
+                    f32::from(painted.origin.x).round(),
+                    f32::from(painted.origin.y).round()
+                ),
+                (menu.origin_x.round(), menu.origin_y.round()),
+                "the popover must paint at exactly its clamped window-space origin"
+            );
+        });
     }
 
     /// §1's dismissal requirement, driven through the real key handler.
@@ -2755,6 +2772,224 @@ mod tree_ops_regression_tests {
             assert!(app.tree_delete_confirm.is_none());
         });
         assert!(repo.path().join("README.md").exists());
+    }
+
+    /// The reported "the context menu still lets you hover and select the rows underneath it"
+    /// bug, driven as a real click at a real row's real painted bounds.
+    ///
+    /// The reported symptom had two halves with two different causes, and only one of them is
+    /// observable from a test: the click must not reach the row's own `on_click` (asserted here,
+    /// via `open_change`), and the row must not paint its hover fill or its tooltip (not
+    /// observable - GPUI resolves both inside `Interactivity::paint` from
+    /// `Hitbox::is_hovered`, with no app state to read back). Both come from the same one-line
+    /// cause and the same one-line fix, which is why this test is honest coverage of the pair
+    /// rather than of only the half it names: `Window::hit_test` stops walking hitboxes at the
+    /// first `HitboxBehavior::BlockMouse` one, so with `.occlude()` on the scrim the row's
+    /// hitbox is not in the hit test's ids at all - which is exactly what both the click
+    /// dispatch and `is_hovered` consult. Note a `cx.stop_propagation()` in the scrim's own
+    /// handler would have fixed only the click half; hover styling is not an event.
+    #[gpui::test]
+    fn a_click_on_a_tree_row_under_an_open_context_menu_does_not_reach_that_row(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        // Open the menu from the empty area, so the menu's own panel is nowhere near the row
+        // this test clicks and cannot be what absorbs the click.
+        app.update_in(cx, |app, window, cx| {
+            app.open_tree_context_menu(ContextTarget::Empty, 4.0, 4.0, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.tree_context_menu.is_some()),
+            "premise: the menu must be open"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.open_change.is_none()),
+            "premise: no file is open yet"
+        );
+
+        let row = cx
+            .debug_bounds("file-tree-row-README.md")
+            .expect("the file row must be painted underneath the menu");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.open_change.is_none(),
+                "the click must have been absorbed by the menu's scrim - a click that dismisses \
+                 a context menu must not also run whatever was underneath it"
+            );
+            assert!(
+                app.tree_context_menu.is_none(),
+                "and it must still have dismissed the menu"
+            );
+        });
+    }
+
+    /// The positive half of the same pair, so the `.occlude()` above can't pass by making the
+    /// tree permanently unclickable: with no menu open, the identical click really does open the
+    /// file.
+    #[gpui::test]
+    fn the_same_click_with_no_menu_open_really_does_open_the_file(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let row = cx
+            .debug_bounds("file-tree-row-README.md")
+            .expect("the file row must be painted");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(PathBuf::from("README.md")),
+            "with no menu in the way, a row click must open its file"
+        );
+    }
+
+    /// `Shift+F10` must reach the tree only when the tree is really the focused surface. With the
+    /// command palette open - a real, focused text-input surface - it must do nothing at all, and
+    /// the palette must keep taking the keystrokes that follow.
+    ///
+    /// Honest framing: this covers *pre-existing* scoping (`"file-tree && ..."`), not anything
+    /// this branch changed - it passes against the untouched base too. It is here because the
+    /// same branch makes `Shift+F10` more discoverable (the Files-tree footer hint strip and the
+    /// Keybindings-page relabel), and "more people will now press it" is exactly the moment to
+    /// pin down that pressing it in the wrong place costs nothing.
+    #[gpui::test]
+    fn shift_f10_with_the_palette_focused_neither_opens_the_menu_nor_eats_the_next_keystroke(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| app.open_palette(window, cx));
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("shift-f10");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.tree_context_menu.is_none(),
+                "the binding is scoped to the `file-tree` context precisely so a focused text \
+                 input keeps its own keystrokes"
+            );
+            assert!(app.palette_open, "and the palette must still be open");
+        });
+
+        cx.simulate_input("ab");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.palette_query.as_str().to_string()),
+            "ab",
+            "and the keystrokes after it must still land in the palette's own query"
+        );
+    }
+
+    /// `menu_height` is what the window-edge flip is computed from, so it has to equal what the
+    /// popover *actually paints* - not just what its own formula restates. Asserted against real
+    /// painted bounds for all three targets, which is the only form of this assertion that can
+    /// catch a term going missing (an earlier version of `menu_height` omitted the panel's own
+    /// 2px border, making every edge flip 2px optimistic, and a formula-only test could not see
+    /// it).
+    #[gpui::test]
+    fn the_context_menu_paints_exactly_the_height_it_measures(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        for target in [
+            ContextTarget::File(repo.path().join("README.md")),
+            ContextTarget::Folder(repo.path().join("src")),
+            ContextTarget::Empty,
+        ] {
+            let expected = context_menu::menu_height(&context_menu::menu_rows(&target, false));
+            app.update_in(cx, |app, window, cx| {
+                app.tree_clipboard = None;
+                app.open_tree_context_menu(target.clone(), 40.0, 80.0, window, cx);
+            });
+            cx.run_until_parked();
+            let painted = cx
+                .debug_bounds("tree-context-menu")
+                .expect("the popover must paint");
+            assert_eq!(
+                f32::from(painted.size.height).round(),
+                expected.round(),
+                "measured and painted height disagree for {target:?} - the edge clamp is \
+                 solving for a rectangle that isn't on screen"
+            );
+            app.update(cx, |app, cx| app.close_tree_context_menu(cx));
+            cx.run_until_parked();
+        }
+    }
+
+    /// The Files tree's footer hint strip advertises real keystrokes or none at all: each spec it
+    /// prints must resolve to a keystroke some real, registered binding actually carries. A hint
+    /// that named a keystroke nothing dispatches would be worse than no hint.
+    #[test]
+    fn the_file_tree_footer_only_advertises_real_registered_bindings() {
+        use crate::sidebar::render::{FILE_TREE_CONTEXT_MENU_SPEC, FILE_TREE_RENAME_SPEC};
+
+        let bindings = crate::default_key_bindings();
+        for (spec, action) in [
+            (FILE_TREE_CONTEXT_MENU_SPEC, "app::FileTreeContextMenu"),
+            (FILE_TREE_RENAME_SPEC, "app::FileTreeRename"),
+        ] {
+            let binding = bindings
+                .iter()
+                .find(|binding| binding.action().name() == action)
+                .unwrap_or_else(|| panic!("{action} must have a real registered binding"));
+            let printed = crate::keymap::resolve_combo(spec, false);
+            let real: Vec<String> = binding
+                .keystrokes()
+                .iter()
+                .flat_map(|keystroke| {
+                    // Every modifier, not just `shift` - a binding that silently gained a Ctrl or
+                    // Alt would otherwise still match, and the footer would keep printing a
+                    // keycap nobody can trigger.
+                    let modifiers = keystroke.modifiers();
+                    let mut parts: Vec<String> = Vec::new();
+                    if modifiers.control {
+                        parts.push("ctrl".to_string());
+                    }
+                    if modifiers.alt {
+                        parts.push("alt".to_string());
+                    }
+                    if modifiers.platform {
+                        parts.push("cmd".to_string());
+                    }
+                    if modifiers.shift {
+                        parts.push("shift".to_string());
+                    }
+                    parts.push(keystroke.key().to_string());
+                    parts
+                })
+                .map(|part| crate::keymap::resolve_combo(&part, false).join(""))
+                .collect();
+            // Case-insensitively: `gpui::Keystroke` normalises `key` to lowercase (`"f10"`),
+            // while the spec - and so the keycap the user reads - carries the conventional
+            // uppercase `"F10"`. The glyph, not its case, is what has to match.
+            let lower = |parts: &[String]| -> Vec<String> {
+                parts.iter().map(|part| part.to_lowercase()).collect()
+            };
+            assert_eq!(
+                lower(&printed),
+                lower(&real),
+                "the footer prints {spec:?} for {action}, which is not what that action is \
+                 actually bound to"
+            );
+        }
     }
 }
 

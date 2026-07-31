@@ -179,7 +179,7 @@ impl AdeApp {
 
     /// Navigates to a go-to-definition result. `absolute_target_path` may be under
     /// [`Self::file_tree_root`] or entirely outside it (e.g. another crate `rust-analyzer` sees);
-    /// either way `Self::open_file_view`'s `strip_prefix` handles it, since `PathBuf::join` with
+    /// either way `Self::open_file_view`'s own `strip_prefix` handles it, since `PathBuf::join` with
     /// an already-absolute path just becomes that path.
     ///
     /// ## Avoiding a cursor-line race

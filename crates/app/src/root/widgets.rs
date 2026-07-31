@@ -270,3 +270,87 @@ impl AdeApp {
             .when(self.caret_blink_visible, |el| el.bg(theme::term::CURSOR))
     }
 }
+
+/// The fill behind a centered modal panel - the file tree's delete confirmation
+/// (`crate::sidebar::render::AdeApp::render_tree_delete_confirm`) and the New file prompt
+/// (`crate::root::new_file::AdeApp::render_new_file_prompt`), this app's only two.
+///
+/// Derived from `theme::surface::SCRIM`, the design handoff's own scrim colour
+/// (`design_handoff_jerry_ade/revision/README.md`: "Scrim rgba(6,7,8,.62)"), rather than the raw
+/// `gpui::black()` both modals used to hard-code - a literal colour rather than a token, which is
+/// exactly what this app's theming discipline exists to keep out. The alpha stays at the 0.35
+/// both modals already used: a small centered dialog does not dim as hard as the palette, which
+/// replaces the entire workspace and uses the designed 0.62.
+pub(crate) fn modal_scrim_bg() -> gpui::Rgba {
+    theme::surface::SCRIM.resolve().opacity(0.35)
+}
+
+/// One button in a centered modal's action row - `label`, tinted `theme::button::DANGER_FG` when
+/// `destructive` (with `DANGER_FG_HOVER` on hover, this app's established destructive-control
+/// pair) and `theme::text::BODY` otherwise.
+///
+/// Shape is `crate::work_surface::render::render_footer_action_button`'s: `h(23)`, `px(10)`,
+/// `theme::radius::BUTTON` - the 4px "buttons" radius the design handoff calls for, not the 3px
+/// `radius::CHIP` meant for chips and keycaps. Carries a real hover fill; the delete
+/// confirmation's two buttons shipped with none at all, so the only clickable controls in that
+/// dialog were also the only ones in the app that gave no feedback under the pointer. The caller
+/// attaches its own `.on_click`.
+pub(crate) fn render_modal_button(
+    id: &'static str,
+    label: impl Into<gpui::SharedString>,
+    destructive: bool,
+) -> gpui::Stateful<gpui::Div> {
+    let (color, hover_color) = if destructive {
+        (theme::button::DANGER_FG, theme::button::DANGER_FG_HOVER)
+    } else {
+        (theme::text::BODY, theme::text::PRIMARY)
+    };
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .h(px(23.0))
+        .px(px(10.0))
+        .rounded(theme::radius::BUTTON)
+        .bg(theme::surface::SEGMENT_TRACK)
+        .hover(move |el| el.bg(theme::surface::ROW_HOVER_ALT).text_color(hover_color))
+        .font(font(theme::font::SANS))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_size(px(10.5))
+        .text_color(color)
+        .child(label.into())
+}
+
+/// One group divider's whole vertical footprint, in px: the 1px rule of
+/// [`render_menu_group_divider`] plus its 4px margins top and bottom. Exported because the two
+/// menus that have to *measure* themselves - `crate::title_bar::menu`'s row-index math and
+/// `crate::sidebar::context_menu::menu_height`'s window-edge clamp - both read the real number
+/// rather than each restating `1 + 4 + 4`.
+pub(crate) const MENU_GROUP_DIVIDER_HEIGHT: Pixels = px(9.0);
+
+/// A thin 1px rule between two groups of rows inside a dropdown or context popover -
+/// [`theme::border::DIVIDER`], the same token the title bar's own left-cluster rule uses, inset
+/// `mx(10.0)` so it lines up flush with a menu row's own `px(10.0)` label column.
+///
+/// The app's one in-menu divider, shared by the title bar's File/Edit/View/Session/Help menus
+/// (where it was first built, as `title_bar::menu`'s `render_title_menu_divider`) and the file
+/// tree's right-click context menu, whose groups (GitHub issue #19 §1) shipped with no visual
+/// separation at all. See [`MENU_GROUP_DIVIDER_HEIGHT`] for the height both of those menus
+/// measure against.
+pub(crate) fn render_menu_group_divider() -> gpui::AnyElement {
+    // The margins are *derived* from the total rather than written alongside it, so the constant
+    // the two menus measure themselves against and the element they are measuring cannot
+    // disagree - which is the whole reason the constant is public in the first place.
+    let margin = (MENU_GROUP_DIVIDER_HEIGHT - MENU_GROUP_DIVIDER_RULE) / 2.0;
+    div()
+        .h(MENU_GROUP_DIVIDER_RULE)
+        .mx(px(10.0))
+        .my(margin)
+        .bg(theme::border::DIVIDER)
+        .into_any_element()
+}
+
+/// The divider's own rule thickness - the rest of [`MENU_GROUP_DIVIDER_HEIGHT`] is its margins.
+const MENU_GROUP_DIVIDER_RULE: Pixels = px(1.0);
