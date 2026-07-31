@@ -5,7 +5,12 @@
 //!
 //! - [`state`] - the pure row model: one row per worktree, aggregating every session open
 //!   in it, plus the filter/grouping rules. No `gpui::Window`.
-//! - [`worktrees`] - maps `wt-core`'s raw worktree list into that row model's input shape.
+//! - [`worktrees`] - maps `wt-core`'s raw worktree list into that row model's input shape, plus
+//!   the pure selection-recovery state machine (GitHub issue #12).
+//! - [`worktree_watch`] - the real `notify`-backed filesystem watcher behind the worktree
+//!   panel's live refresh (GitHub issue #12). No `gpui` dependency either - it hands back a
+//!   plain `AtomicBool` flag; `render::AdeApp::start_worktree_watch` is the `gpui`-side loop
+//!   that reads it.
 //! - [`status`] - derives a session's `Status` ("who needs me") from already-read process
 //!   signals; the rail's whole reason for existing, and shared with the tab strip and
 //!   status bar that surface the same answer.
@@ -37,6 +42,7 @@ use std::time::Instant;
 
 pub mod state;
 pub mod status;
+pub mod worktree_watch;
 pub mod worktrees;
 
 pub(crate) mod render;

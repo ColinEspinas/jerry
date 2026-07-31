@@ -100,6 +100,19 @@ tree-sitter-highlight = "=0.26.9"
 # really does compile against both the TypeScript and the TSX grammars is not assumed either -
 # `crate::code_view`'s `every_real_grammar_config_compiles` test asserts it.
 tree-sitter-javascript = "0.23.1"
+# Real OS-level filesystem watching for the worktree sidebar's live refresh (GitHub issue #12,
+# `crate::rail::worktree_watch`) - `crate::rail::render::AdeApp::start_worktree_watch` keeps a
+# `notify::RecommendedWatcher` alive on `$GIT_COMMON_DIR/worktrees` (recursive) and
+# `$GIT_COMMON_DIR/HEAD`, so `git worktree add/remove/lock` and branch switches inside any
+# worktree are noticed within about a second, without falling back solely to the 5s poll that
+# backstops the (rarer, event-less) case of a worktree's own directory being deleted out from
+# under it. The default feature set is kept (no `--no-default-features`): on Linux this pulls in
+# `inotify`, matching every other platform-selection convention in this file (`gpui_platform`'s
+# own per-target sections above) rather than hand-picking a narrower backend per OS. Plain
+# `crates.io`, unpinned beyond the major version `cargo add` resolved (`8.2.0`) - a generic OS
+# API wrapper with no GPUI/vendor/zed call site to verify against, the same "just a version pin"
+# treatment `regex`/`unicode-segmentation` already get above.
+notify = "8.2.0"
 
 # Real per-target `gpui_platform` backend selection (Revision R11, extended in R12 to add
 # real X11 support). `gpui_platform`'s own Cargo.toml

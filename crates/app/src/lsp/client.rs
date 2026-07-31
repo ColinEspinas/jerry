@@ -1961,7 +1961,13 @@ mod lsp_client_eviction_tests {
             label: "wt".to_string(),
             branch: None,
             is_main: false,
+            is_bare: false,
+            is_detached: false,
+            short_sha: None,
             is_locked: false,
+            lock_reason: None,
+            is_broken: false,
+            broken_reason: None,
             error: None,
         }
     }

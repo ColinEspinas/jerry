@@ -194,6 +194,26 @@ actions!(
 /// processes per worktree/session path, not a cheap channel `try_recv`.
 pub(crate) const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
+/// GitHub issue #12's "keep a low-frequency polling fallback" - the worktree list is re-parsed
+/// at least this often even if [`AdeApp::_worktree_watcher`] never fires at all (watcher setup
+/// failed, or the specific change has no filesystem-watchable signature at all - deleting a
+/// worktree's own directory by hand touches nothing under `$GIT_COMMON_DIR`). See
+/// `crate::rail::render::AdeApp::start_worktree_watch`'s docs for how this combines with the
+/// watcher's own near-instant path.
+pub(crate) const WORKTREE_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often [`AdeApp::start_worktree_watch`]'s loop checks
+/// [`crate::rail::worktree_watch::DirtyFlag`] between [`WORKTREE_WATCH_POLL_INTERVAL`] ticks -
+/// short enough that a real watcher event reaches [`AdeApp::load_worktrees`] within "roughly a
+/// second" (the issue's own latency target) rather than waiting for the next 5s poll.
+pub(crate) const WORKTREE_WATCH_TICK: Duration = Duration::from_millis(300);
+
+/// After the dirty flag is first observed set, how long [`AdeApp::start_worktree_watch`] waits
+/// before actually refreshing - the issue's "a single `git worktree add` touches several files;
+/// collapse to one refresh" debounce: a burst of events within this settle window collapses into
+/// the one refresh that follows it, rather than each one triggering its own.
+pub(crate) const WORKTREE_WATCH_SETTLE: Duration = Duration::from_millis(200);
+
 /// How often [`AdeApp::render_file_view`] calls `std::fs::metadata` for its freshness check -
 /// throttled rather than unconditional-per-render (see
 /// [`AdeApp::file_view_last_freshness_check`]).
@@ -242,6 +262,18 @@ pub struct AdeApp {
     pub(crate) repo_path: PathBuf,
     pub(crate) worktrees: Vec<WorktreeItem>,
     pub(crate) worktrees_error: Option<String>,
+    /// GitHub issue #12's "the user is notified" half of selection recovery - set by
+    /// [`AdeApp::load_worktrees`] (via `crate::rail::worktrees::recover_selection`) when a
+    /// refresh finds the previously selected worktree gone (or newly
+    /// [`crate::rail::worktrees::WorktreeItem::is_broken`]) and falls [`Self::selected`] back to
+    /// the main worktree. Rendered as a dismissible banner
+    /// (`crate::rail::render::AdeApp::render_worktree_selection_notice_banner`), mirroring
+    /// [`Self::tree_op_error`]'s own "small, visible, honest error surface" convention. Cleared
+    /// either by that click-to-dismiss, or implicitly the next time the user makes a real
+    /// selection ([`AdeApp::select_worktree`]/[`AdeApp::select_worktree_by_path`]) - never by a
+    /// later refresh on its own, since refreshes happen every few seconds and a notice that
+    /// vanished before it could be read would defeat the point of showing it.
+    pub(crate) worktree_selection_notice: Option<String>,
     /// The session rail's own real overlay scrollbar handle (GitHub issue #30) - a plain
     /// `gpui::ScrollHandle`: `crate::rail::render::AdeApp::render_rail_list` renders every row
     /// eagerly, not through a `uniform_list`.
@@ -862,6 +894,17 @@ pub struct AdeApp {
     #[cfg(test)]
     pub(crate) merge_edit_save_test_delay: Option<Duration>,
     pub(crate) _load_worktrees_task: Option<Task<()>>,
+    /// The live `notify` filesystem watcher on `$GIT_COMMON_DIR/worktrees` and
+    /// `$GIT_COMMON_DIR/HEAD` (GitHub issue #12, `crate::rail::worktree_watch`). Must be kept
+    /// alive for as long as the app runs one - dropping it silently stops every OS-level
+    /// notification, leaving only [`Self::_worktree_watch_task`]'s 5s poll fallback. `None` in
+    /// the (rare, honestly-reported) case `wt_core::git_common_dir`/`notify::recommended_watcher`
+    /// themselves failed, e.g. a repo-less `repo_path` - the poll fallback still runs either way.
+    pub(crate) _worktree_watcher: Option<notify::RecommendedWatcher>,
+    /// The debounced-watcher-plus-poll-fallback refresh loop
+    /// (`crate::rail::render::AdeApp::start_worktree_watch`) that calls
+    /// [`Self::load_worktrees`] - see that method's own docs.
+    pub(crate) _worktree_watch_task: Option<Task<()>>,
     pub(crate) _load_file_tree_task: Option<Task<()>>,
     pub(crate) _load_diff_task: Option<Task<()>>,
     /// The in-flight `code_view::load_file` task for whichever path [`FileLoadState::Loading`]
