@@ -6393,3 +6393,20 @@ All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `
 --workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
 1119 app + 44 lsp-core + 14 pty-core + 127 wt-core, 0 failed (+3 app tests net: six new, three
 positional tests folded into the painted-column ones that supersede them).
+
+## Fix: Mod+Shift+G didn't open the git graph tab
+
+`default_key_bindings` already bound the keystroke to `root::NewGitGraph`, but nothing in
+`AdeApp::render` ever registered an `.on_action` handler for it - the action dispatched and went
+nowhere, silently. The command palette's own "Open git graph" row masked the gap the whole time,
+since it calls `open_git_graph` directly rather than going through the action, so this only showed
+up once someone tried the keystroke itself. Registered the missing handler alongside the palette's
+own dispatch path and added a real regression test exercising the keystroke end-to-end (not just
+the direct method call the existing tests already covered).
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+1120 app + 44 lsp-core + 14 pty-core + 127 wt-core, 0 failed (+1 app test: the keystroke
+regression). One unrelated test in `code_surface::diff_view` (async-highlighting-cache timing)
+flaked once under full-suite load and passed cleanly in isolation on rerun - a pre-existing flake,
+not touched by this change.
