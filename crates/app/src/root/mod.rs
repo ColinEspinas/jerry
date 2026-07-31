@@ -1806,12 +1806,21 @@ impl Render for AdeApp {
             // direct child of this root element (a real, adversarial-audit-found bug when they
             // were nested inside `crate::graph_view::render::AdeApp::render_graph_view`'s own
             // container - see that method's docs).
+            //
+            // Also gated on `!self.settings_open`, the same belt-to-`Self::open_settings`'s-
+            // braces reasoning the tree context menu gate below documents: opening Settings does
+            // not clear `graph_tab_active` (the graph tab underneath is still "active"), and
+            // `open_settings` already clears both `graph_state.row_menu_open`/`push_menu_open`
+            // itself now (an adversarial-audit-found gap, fixed there) - this is defensive
+            // padding against that invariant ever drifting, not the primary fix.
             .when(
-                self.graph_tab_active && self.graph_state.push_menu_open,
+                self.graph_tab_active && !self.settings_open && self.graph_state.push_menu_open,
                 |el| el.child(self.render_graph_push_menu(cx)),
             )
             .when(
-                self.graph_tab_active && self.graph_state.row_menu_open.is_some(),
+                self.graph_tab_active
+                    && !self.settings_open
+                    && self.graph_state.row_menu_open.is_some(),
                 |el| el.child(self.render_graph_row_menu(cx)),
             )
             .when_some(self.title_menu_open, |el, menu| {

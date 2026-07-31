@@ -35,4 +35,4 @@ pub(crate) mod render;
 pub(crate) mod state;
 
 pub(crate) use state::{lane_color, lane_x, local_branch_dim_bg, relative_time};
-pub(crate) use state::{GraphLoadState, GraphRightPanel};
+pub(crate) use state::{GraphLoadState, GraphRightPanel, GraphRowMenu};

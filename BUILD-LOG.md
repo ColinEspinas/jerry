@@ -5776,3 +5776,82 @@ judged an acceptable simplification for this phase rather than a correctness gap
 per-frame cost at that size); the design spec's branch-row ahead/behind counts and `merged` mark are
 not rendered in the Branches panel, which currently shows only the branch name, lane dot, and `HEAD`
 mark.
+
+## Git graph tab: real right-click on the row `⋯` menu, and click/button-anchored positioning (GitHub issue #1, phase (a) follow-up)
+
+A follow-up refinement to the git graph tab above, not new scope: the row `⋯` context menu opened
+only via its small trigger button, and wherever it opened was computed from a fixed per-row formula
+(`left(px(140.0))`, `top(bounds.origin.y - bounds.size.height)`) rather than any real position. Two
+real user reports fixed: a real right-click anywhere on a commit row now opens the same menu
+(`AdeApp::render_graph_row`'s new `on_mouse_down(gpui::MouseButton::Right, ..)`, mirroring the file
+tree's own real right-click pattern from GitHub issue #19 - `crate::sidebar::tree_ops::
+open_tree_context_menu`), and both that path and the `⋯` button's own click now anchor the popover
+at a real, captured position (`GraphRowMenu { row_index, origin_x, origin_y }`, replacing the old
+bare `Option<usize>`) rather than a formula - resolved once at open time in the new
+`AdeApp::open_graph_row_menu_at`, clamped inside the window with the same `context_menu::
+clamp_menu_origin` the file tree menu uses (`theme::graph::ROW_MENU_HEIGHT` is a new hand-measured
+constant this needed, pinned by its own test).
+
+### Self-review and the independent adversarial check
+
+A self-review before dispatching the audit confirmed the three things the coordinator's own
+instructions asked about directly: a right-click on a scrolled row anchors correctly (the fix
+reads the real `event.position`/captured bounds, never row index, so scroll was never actually
+reachable as a bug once the formula was gone); right-clicking a different row while another row's
+menu is open replaces it at the new position, not two menus at once (`row_menu_open` is a single
+`Option`, unconditionally overwritten); and `cx.stop_propagation()` on the row's right-click handler
+does prevent its other handlers from firing (though for `on_click` specifically this turned out to
+be structurally guaranteed by `gpui` itself, which only tracks `MouseButton::Left` for `on_click` -
+documented in the test that covers it rather than assumed). The menu's own entries/content were
+confirmed untouched - this is a pure positioning/input-handling change.
+
+A genuinely independent adversarial checker sub-agent was then dispatched with no access to this
+session's own reasoning, asked to verify those same three things plus the "content unchanged" claim
+directly against the code. It passed all four, but traced two real bugs while reading the
+surrounding code that the self-review missed, both pre-existing (present before this change, not
+introduced by it, but real and adjacent enough to fix here rather than leave for later):
+
+- The row `⋯`/right-click menu and the Push `▾` menu are independent state with nothing stopping
+  both from being open at once - opening one left the other's own full-window scrim painted
+  underneath it, silently eating the next click aimed at dismissing it. Fixed: `open_graph_row_menu_at`
+  now clears `push_menu_open`, and `toggle_graph_push_menu` now clears `row_menu_open`.
+- `AdeApp::open_git_graph` only calls `load_graph` (the thing that actually clears `row_menu_open`)
+  while the graph is still `NotLoaded` - so switching away from an already-loaded graph tab with a
+  row menu open, then back, left the stale menu reappear the instant the tab became active again,
+  with no click at all, since `crate::root::AdeApp::render`'s overlay gate only checks
+  `graph_tab_active`. `leave_graph_tab` now clears both `row_menu_open`/`push_menu_open` itself,
+  the same way `close_git_graph_tab` already did for an outright close. A related instance of the
+  same class the checker also flagged - opening Settings doesn't clear `graph_tab_active` either,
+  so an open row/Push menu kept painting over the Settings surface - is fixed the same way in
+  `AdeApp::open_settings`, plus a defensive `!self.settings_open` added to the overlay gate in
+  `crate::root::AdeApp::render` itself (belt to that fix's braces, matching the tree context menu's
+  own identical guard one hunk below it).
+
+The checker also flagged one doc-comment inaccuracy (an early claim that `MouseDownEvent::
+is_focusing()` gates `gpui`'s auto-focus-on-click by mouse button - it doesn't; the real reason a
+right-click needed an explicit `window.focus` call is that the row's own `cx.stop_propagation()`
+preempts the container's auto-focus listener) and one overstated doc claim (`ROW_MENU_HEIGHT` being
+"measured from a real paint" when it's actually measured under the test harness's synthetic text
+metrics, which can differ slightly from a real build's). Both comments are corrected in place rather
+than left misleading.
+
+Every fix above was confirmed non-vacuous the same way this project's prior entries have: each was
+reverted in turn and its own regression test (a new `switching_away_from_the_graph_tab_and_back_does_
+not_resurrect_a_stale_row_menu`, `opening_settings_dismisses_an_open_row_menu`, and the two
+`opening_the_{row,push}_menu_closes_an_open_{push,row}_menu` tests) was watched fail before being
+restored. The stale-menu-on-reactivation test specifically calls `leave_graph_tab` directly rather
+than through `select_session`, since `select_session` can also route through `Self::select_worktree`
+(which reloads the graph unconditionally on its own) - an early draft of that test went through
+`select_session` and passed even with the fix reverted, for that confounding reason, before being
+corrected to isolate what it actually meant to prove.
+
+Verification: all four gates clean - `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace --lib -- --test-threads=1` at 967 app + 42 lsp-core + 14 pty-core + 115
+wt-core, up from 954/42/14/115 at the prior entry's own baseline (+13 app tests: 9 real-dispatch
+`graph_row_menu_tests` covering right-click/anchoring/replacement/occlusion/focus, plus 4 more from
+this pass's own review). One `lsp_diagnostics_wiring_tests` failure (a real-`rust-analyzer`,
+timing-dependent test, not the project's previously-documented `diff_render_tests` flake) appeared on
+one full-workspace run under test-thread contention and was confirmed a pre-existing, unrelated flake
+by re-running it alone (passes immediately in isolation) - this diff touches no LSP code at all. A
+clean full re-run afterward showed zero failures.
