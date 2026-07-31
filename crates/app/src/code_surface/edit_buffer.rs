@@ -1347,7 +1347,6 @@ impl EditBuffer {
         self.select_to(self.content.len());
     }
 
-
     /// `Tab` (GitHub issue #26): with no selection, splices `indent_unit` in at the caret exactly
     /// like an ordinary keystroke (via [`Self::replace_range`]) - the caret ends up right after
     /// it, same as typing any other text. With a real selection (single- or multi-line),
