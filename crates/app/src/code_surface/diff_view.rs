@@ -507,9 +507,10 @@ mod diff_render_tests {
             );
             assert!(
                 all_runs.iter().any(|(text, kind)| text.as_ref() == "2"
-                    && *kind == code_view::HighlightKind::Literal),
-                "the real added integer literal '2' should be classified as Literal - got \
-                 {all_runs:?}"
+                    && *kind == code_view::HighlightKind::ConstantBuiltin),
+                "the real added integer literal '2' should be classified as ConstantBuiltin (a \
+                 real `@constant.builtin` capture - `tree-sitter-rust` has no separate `number` \
+                 capture) - got {all_runs:?}"
             );
         });
     }
