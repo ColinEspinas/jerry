@@ -276,6 +276,7 @@ impl AdeApp {
             palette::PaletteCommand::ToggleRailGrouping => self.toggle_rail_mode(cx),
             palette::PaletteCommand::PruneWorktrees => self.request_prune(cx),
             palette::PaletteCommand::OpenSettings => self.open_settings(window, cx),
+            palette::PaletteCommand::RestartLanguageServers => self.restart_lsp_clients(cx),
             // Also reachable from the Settings "General" page - both entry points call
             // `Self::set_window_controls_style`, never two independent copies.
             palette::PaletteCommand::WindowControlsSystem => {

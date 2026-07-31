@@ -136,6 +136,13 @@ pub enum PaletteCommand {
     PruneWorktrees,
     /// `crate::root::AdeApp::open_settings`.
     OpenSettings,
+    /// `crate::root::AdeApp::restart_lsp_clients` - the real, discoverable recovery for a
+    /// language server that has died (see that method's own docs for why recovery is a user
+    /// action here rather than an automatic respawn). Deliberately always listed, not hidden
+    /// until something is broken: a user whose diagnostics have gone quiet is looking for this
+    /// *before* they know which server died, and a command that appears only once the app has
+    /// already diagnosed the problem is not a recovery path they can find.
+    RestartLanguageServers,
     /// Pins `crate::keymap::WindowControlsStyle::System`. These three variants and the
     /// Settings "General" page's `Window controls` row both call
     /// `crate::root::AdeApp::set_window_controls_style`, which mutates and persists the same
@@ -149,7 +156,7 @@ pub enum PaletteCommand {
 }
 
 impl PaletteCommand {
-    pub const ALL: [PaletteCommand; 10] = [
+    pub const ALL: [PaletteCommand; 11] = [
         PaletteCommand::NewShell,
         PaletteCommand::NewClaudeSession,
         PaletteCommand::NewCodexSession,
@@ -157,6 +164,7 @@ impl PaletteCommand {
         PaletteCommand::ToggleRailGrouping,
         PaletteCommand::PruneWorktrees,
         PaletteCommand::OpenSettings,
+        PaletteCommand::RestartLanguageServers,
         PaletteCommand::WindowControlsSystem,
         PaletteCommand::WindowControlsMacos,
         PaletteCommand::WindowControlsWindowsLinux,
@@ -171,6 +179,7 @@ impl PaletteCommand {
             PaletteCommand::ToggleRailGrouping => "Toggle Rail Grouping",
             PaletteCommand::PruneWorktrees => "Prune Worktrees",
             PaletteCommand::OpenSettings => "Open Settings",
+            PaletteCommand::RestartLanguageServers => "Restart Language Servers",
             PaletteCommand::WindowControlsSystem => "Window Controls: System Default",
             PaletteCommand::WindowControlsMacos => "Window Controls: macOS Style",
             PaletteCommand::WindowControlsWindowsLinux => "Window Controls: Windows/Linux Style",
@@ -188,6 +197,10 @@ impl PaletteCommand {
             PaletteCommand::ToggleRailGrouping => "rail grouping urgency project sessions",
             PaletteCommand::PruneWorktrees => "prune worktree remove delete cleanup merged",
             PaletteCommand::OpenSettings => "settings preferences agents worktrees config",
+            PaletteCommand::RestartLanguageServers => {
+                "lsp language server restart reconnect reload crashed died dead disconnected \
+                 hung stuck diagnostics hover completions rust-analyzer typescript pyright vue"
+            }
             PaletteCommand::WindowControlsSystem => {
                 "window controls title bar caption buttons dots platform override reset"
             }

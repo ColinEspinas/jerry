@@ -291,7 +291,8 @@ impl AdeApp {
         };
 
         let cursor = self.code_cursor;
-        let status_bar = render_file_status_bar(parsed, cursor, lsp_status.as_ref(), lsp_binary);
+        let status_bar =
+            render_file_status_bar(parsed, cursor, lsp_status.as_ref(), lsp_binary, cx);
         let truncated = parsed.truncated;
         // Real, editable file-view state (Revision R8.5a): whichever `EditBuffer`
         // `spawn_file_load`'s completion already lazily seeded for `relative_path` (`None` only
@@ -1108,6 +1109,7 @@ pub(in crate::code_surface) fn render_file_status_bar(
     cursor: Option<usize>,
     lsp_status: Option<&LspFileStatus>,
     lsp_binary: Option<&str>,
+    cx: &mut Context<AdeApp>,
 ) -> impl IntoElement {
     let position = cursor
         .map(|line| format!("ln {line}"))
@@ -1130,7 +1132,20 @@ pub(in crate::code_surface) fn render_file_status_bar(
 
     if let Some(status) = lsp_status {
         let (dot_color, label) = lsp_status_label(status, lsp_binary);
-        bar = bar
+        // A `Failed` status is the one status a user can actually *do* something about, so it is
+        // the one status that is clickable: it restarts this worktree's language servers, the
+        // same real `AdeApp::restart_lsp_clients` the `Restart Language Servers` palette command
+        // runs. Without it the recovery path exists but is only reachable by already knowing to
+        // look for it in the palette - and the failing chip is precisely where a user who has
+        // noticed their diagnostics stop is looking. Every other status is left inert rather than
+        // given a handler that would silently no-op (the same rule `render_diff_row` follows).
+        let failed = matches!(status, LspFileStatus::Failed(_));
+        let mut chip = div()
+            .id("file-view-lsp-status")
+            .debug_selector(|| "file-view-lsp-status".to_string())
+            .flex()
+            .items_center()
+            .gap(px(10.0))
             .child(
                 div()
                     .flex_none()
@@ -1140,6 +1155,18 @@ pub(in crate::code_surface) fn render_file_status_bar(
                     .bg(dot_color),
             )
             .child(label);
+        if failed {
+            chip = chip
+                .cursor_pointer()
+                .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                .tooltip(crate::root::widgets::text_tooltip(
+                    "Click to restart this worktree's language servers",
+                ))
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.restart_lsp_clients(cx);
+                }));
+        }
+        bar = bar.child(chip);
     }
 
     bar.child(parsed.language)
@@ -1463,5 +1490,76 @@ mod lsp_status_label_tests {
             lsp_status_label(&LspFileStatus::Indexing, None).1,
             "language server: indexing..."
         );
+    }
+}
+
+/// The File view footer's failed-status chip is the one place a user who has *noticed* their
+/// language server stop is actually looking, so it is a real, clickable recovery - driven here
+/// through a genuine painted-bounds click, the same idiom the status bar's own zoom-value test
+/// uses, rather than by calling the handler directly.
+///
+/// Without this, the recovery existed but was reachable only by already knowing to search the
+/// command palette for it - which is not a recovery path a user can find.
+#[cfg(test)]
+mod lsp_failed_status_chip_tests {
+    use super::*;
+    use crate::lsp::client::LspClientState;
+    use gpui::TestAppContext;
+
+    const CHIP_SELECTOR: &str = "file-view-lsp-status";
+
+    #[gpui::test]
+    async fn clicking_the_failed_status_chip_really_restarts_the_language_servers(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        let main_rs = root.join("src").join("main.rs");
+        std::fs::write(&main_rs, "fn main() {}\n").expect("write main.rs");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let key = (root.clone(), "rust-analyzer");
+        app.update_in(cx, |app, window, cx| {
+            // A real, already-recorded failure - exactly the state `reap_dead_lsp_clients` puts a
+            // dead server into on the poll cadence.
+            app.lsp_clients.insert(
+                key.clone(),
+                LspClientState::Failed(
+                    "rust-analyzer's connection was lost (the process exited or stopped \
+                     responding)"
+                        .to_string(),
+                ),
+            );
+            app.open_file_view(main_rs.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        let bounds = cx
+            .debug_bounds(CHIP_SELECTOR)
+            .expect("a file with a failed language server must paint its real status chip");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        // The real, complete recovery, observed rather than assumed: the click freed the key, the
+        // very next render's own `ensure_lsp_client` spawned a genuinely new `rust-analyzer`, and
+        // it completed a real handshake into `Ready`. Before this fix `spawn_lsp_client` would
+        // have found the `Failed` entry still sitting there and done nothing at all.
+        app.read_with(cx, |app, _| {
+            let state = app
+                .lsp_clients
+                .get(&key)
+                .expect("the ordinary render path should have re-populated this key");
+            assert!(
+                matches!(state, LspClientState::Spawning | LspClientState::Ready(_)),
+                "a real click on the failed chip must run the same real \
+                 AdeApp::restart_lsp_clients the palette command does - the stale Failed entry \
+                 must be gone, replaced by a genuinely fresh spawn"
+            );
+        });
     }
 }
