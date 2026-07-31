@@ -127,6 +127,10 @@ impl AdeApp {
                     WindowControlsStyle::WindowsLinuxStyle,
                 ),
             },
+            palette::CommandCandidate {
+                command: palette::PaletteCommand::OpenGitGraph,
+                secondary: "commit history, branches, lanes".to_string(),
+            },
         ];
 
         // At most two real rows (Revision R10) - see `palette::HistoryCandidate`'s own docs for
@@ -280,6 +284,7 @@ impl AdeApp {
             palette::PaletteCommand::WindowControlsWindowsLinux => {
                 self.set_window_controls_style(WindowControlsStyle::WindowsLinuxStyle, cx);
             }
+            palette::PaletteCommand::OpenGitGraph => self.open_git_graph(window, cx),
         }
     }
 

@@ -1299,7 +1299,15 @@ impl AdeApp {
     /// silently undo the virtualization. Only the two *message-only* arms (no list at all) are
     /// scrollers in their own right; [`scrollable_sidebar_message`] covers the equivalent cases
     /// inside [`Self::render_file_tree`].
-    pub(crate) fn render_right_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_right_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // The git graph tab (GitHub issue #1, phase (a)) replaces this whole panel with Commit/
+        // Branches while it's focused - design spec §5 ("Files/Changes is replaced by Commit |
+        // Branches"). `Self::right_sidebar_view` (Files/Changes) is left untouched underneath, so
+        // switching back to an agent or file tab shows exactly what was there before.
+        if self.graph_tab_active {
+            return self.render_graph_right_panel(cx);
+        }
+
         let container = div()
             .flex()
             .flex_col()
@@ -1360,6 +1368,7 @@ impl AdeApp {
                 ),
             },
         }
+        .into_any_element()
     }
 
     /// The Changes header: file count, a staged-progress bar, and `N staged` count, both

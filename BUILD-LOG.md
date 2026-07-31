@@ -4590,3 +4590,141 @@ test in the module each time. Because this change touches `open_change_diff`, th
 the flakiest test was run 55 times on this branch and 55 times on the untouched base, interleaved,
 giving 3/55 here against 4/55 there - the same rate, and load-dependent rather than
 change-dependent.
+
+## Git graph tab, phase (a) (GitHub issue #1)
+
+A new read-only "git graph" tab - the first of a deliberate three-phase split of issue #1 (session-
+to-commit correlation is phase (b); every destructive git operation the design spec's row menu and
+Push menu reference is phase (c)). Built against `design_handoff_jerry_ade/revision 2/CHANGELOG.md`'s
+2026-07-31 entry, which exists only as an untracked directory in the main worktree (not yet committed
+to this repo) - copied into this branch's own worktree for reference but deliberately left out of
+this commit, the same way the coordinator's own instructions treated it.
+
+**The data layer** (`wt_core::graph`, new module) is the part with no shortcuts taken. `build_graph`
+walks the real object database via `gix::Repository::rev_walk` (`Sorting::ByCommitTime(NewestFirst)`,
+`first_parent_only` for the `Current` scope), and a small, independently-tested pure function -
+`layout_lanes` - assigns each commit a lane and describes per-row lane segments and elbows, knowing
+nothing about `gix` at all (tested with plain `&str` ids). Building it surfaced a real edge case
+before it ever reached review: feeding `GraphScope::All`'s multiple tips (an unmerged feature branch
+plus `main`) into a single time-sorted walk can hand back a parent before one of its own children
+when two tips' commits share (or clock-skew past) a timestamp - a real, occasionally-observed `git
+log` phenomenon, reproduced here by the test harness's own fast successive commits. `layout_lanes`
+now tracks which ids it has already emitted and skips wiring an edge to one of them rather than
+leaving a lane permanently dangling - a real, tested degradation (the affected row's elbow is simply
+omitted), not a guess. `ahead_behind_against_upstream` and `commit_changed_files` (`git show
+--name-status`, hex-validated shas only) round out the module, both real, both read-only. Nothing in
+`wt_core::graph` mutates a repository; that is the deliberate, hard scope boundary for this phase.
+
+**The UI** (`crate::graph_view`, new module) mirrors this project's existing "two independently-
+shaped parallel collections" tab-strip pattern rather than forcing a unified `Tab` enum: the graph
+tab is a third slot (`AdeApp::graph_tab_open`/`graph_tab_active`), not a new enum variant threaded
+through `open_files`/`sessions`. The row `⋯` menu's Branch/Apply/Reset groups and the toolbar's Push
+menu are real, visible, grouped rows using the existing `render_dropdown_menu_row` helper - but every
+one of them that would mutate the repo is rendered with `enabled: false` and no `.on_click` at all,
+since none of those operations exist in `wt_core` yet. Only Copy SHA/Copy subject (real
+`cx.write_to_clipboard`) and the read-only scope segment are wired. Fetch/Pull are honest no-ops
+("not implemented yet" plus a real reload) rather than fake successes. The session column is
+honestly empty (session-to-commit correlation is phase (b)); the "note" column is a reserved, empty
+spacer, not a guess at data the spec names but this phase has none of.
+
+### What the self-review pass found
+
+Before dispatching the audit, a re-read of the row `⋯` menu's own bounds-capture caught a real bug:
+its `gpui::canvas` wrote a *single* `AdeApp::graph_state.row_menu_bounds` field from *every* row's
+trigger simultaneously (up to 500 of them, unvirtualized), so by the time a frame finished painting
+the field held whichever row happened to paint last - not necessarily the open one. Fixed before the
+audit ran: `row_menu_bounds` is now a `HashMap<usize, Bounds<Pixels>>` keyed by row index, cleared on
+every reload since a reload can renumber which commit sits at which index.
+
+### What the independent adversarial audit then found
+
+A real adversarial review sub-agent was dispatched over the finished branch and really reported;
+everything below is its own work, reproduced by tracing real call chains rather than reasoning from
+this change's own comments. It found six CRITICALs, five of them dangling-focus bugs this project has
+hit before in exactly this shape - and, correctly, observed that the feature shipped with no focus
+regression test at all even though every sibling overlay in this crate (`palette_focus_tests`,
+`settings_focus_tests`, `code_focus_tests`) has one.
+
+**Five real dangling-focus paths**, all through `AdeApp::open_git_graph`/`leave_graph_tab`:
+
+- `leave_graph_tab` swept `graph_focus_handle` but not the Branches panel's own real text-input
+  surface, `graph_state.branches_filter_focus_handle` - focusing the filter box then switching to a
+  session tab left `Window::focus` on a handle that had just stopped being rendered.
+- `open_git_graph` cleared `open_change` (unrendering the code surface) but only swept
+  `tree_focus_handle`, not `code_focus_handle` - opening the graph tab with a file focused could
+  capture `graph_focus`'s own return target as a handle already unrendered by the time it was
+  captured, and a second file tab opened afterward could even capture it a second time as *its own*
+  return target, deferring the dangle to whenever that tab closed. It also skipped
+  `refresh_open_diff_file_cache()`, which every other site clearing `open_change` calls.
+- `close_session`'s `skip_focus_move` guard checked `open_change`/`settings_open` but not
+  `graph_tab_active`, so closing a session tab while the graph tab was showing pointed focus at a
+  pane `render_center_pane` wasn't drawing. The sibling guard in `focus_newly_spawned_session` had
+  been updated for this; this one hadn't.
+- `cancel_new_file` (Escape from the `+` menu's "New file" prompt) and `create_file_named` (Enter)
+  both had the same gap - real "open a file"/"leave a prompt" paths that don't go through
+  `code_surface::tabs::open_and_focus_file`, this project's own documented single chokepoint for
+  opening a file, so the graph-tab sweep added there never covered them.
+
+All five are fixed at their real sites (`leave_graph_tab` now sweeps both handles and is called from
+`create_file_named` too; `open_git_graph` sweeps `code_focus_handle` the same way it already swept
+`tree_focus_handle`; `close_session` and `cancel_new_file` both gained the `graph_tab_active` guard
+the audit named as missing), and a new `graph_focus_tests` module (four tests, in
+`graph_view::render`, the same place `code_focus_tests` lives beside the code it exercises) now
+covers the first two paths end to end with real `AdeApp` instances and positive `assert_eq!` checks
+against the real handle focus should land on - not just `assert_ne!` against the one that shouldn't,
+which the audit's own module doc note calls out as a false-negative shape that would still pass on a
+genuinely dangling `Window::focus`.
+
+**The sixth CRITICAL**: `render_graph_commit_panel` called `wt_core::graph::commit_changed_files`
+- a function whose own docs say it spawns a real `git show` child process - directly inside a render
+method, on every frame the Commit panel was visible. `load_graph` already had the correct
+`cx.background_executor()` pattern for the graph itself; this one bypassed it. Fixed with a real
+cache (`GraphTabState::commit_files_cache`, keyed by sha, loaded via `AdeApp::load_commit_files`
+exactly like `load_graph`), which also fixed a smaller issue the same finding named: a real load
+failure was being silently swallowed into an empty-looking file list via `.unwrap_or_default()`
+instead of shown as the real error it was.
+
+**Also found and fixed**: both the Push `▾` menu and the row `⋯` menu anchored themselves using
+window-space `gpui::canvas` bounds while being rendered *nested inside* the graph view's own
+container - correct for `render_plus_menu`'s identical mechanism only because that one is a direct
+child of the window's root element. Nested here, both popovers painted double-offset (roughly the
+rail's width and the title bar's height) and their scrims only covered the container, not the
+window, so clicking outside the centre pane didn't dismiss either one. Both are now rendered from
+`AdeApp::render` as siblings of `render_plus_menu`, gated on `graph_tab_active`. Switching worktrees
+while the graph tab was open left it silently showing the previous repository's data (`select_worktree`
+now reloads it, same as it already reloads the diff). The Push button showed a fabricated `↑0` when
+the real upstream count was unknown rather than loading; it now renders a bare "Push" in that state,
+matching `ahead_behind_against_upstream`'s own "no entry rather than a fabricated value" contract. A
+`.expect()` in `wt_core::graph::build_graph` that could only ever fire on a `gix` behavior change, not
+a real input, is now a silent, honest skip instead of a library panic. The Branches filter's real
+undo history is now reset (not merely cleared) when the tab closes, matching `open_palette`'s own
+documented reasoning for why a reopened widget must not see its predecessor's history.
+
+**Checked and cleared** by the audit, not just asserted by the author: every `wt_core::graph`
+function really is read-only (no checkout/cherry-pick/revert/rebase/reset/push anywhere in it, argv-
+only git invocation, sha hex-validated before reaching one); all ten Branch/Apply/Reset rows and all
+three Push-menu rows really do pass `enabled: false` with no `.on_click`, and only the two Copy rows
+are genuinely wired; the `"text-input"` tag on the Branches filter box matches the other three
+existing sites exactly; `layout_lanes`' branch/merge/recycling behavior and its out-of-order handling
+were hand-traced against the fixtures and genuinely match what the tests claim; the session and
+"note" columns really are honestly empty, not fabricated.
+
+Verification: all four gates clean - `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace --lib -- --test-threads=1` at 954 app + 42 lsp-core + 14 pty-core + 115
+wt-core, up from 946/42/14/98 at the last recorded baseline (BUILD-LOG.md's own prior entry) - +8
+app tests (four real `graph_focus_tests`, four pure `graph_view::state` unit tests) and +17 wt-core
+tests (`wt_core::graph`'s own suite, including the out-of-order-timestamp regression and the merge/
+non-merge/root-commit `commit_changed_files` cases). A single `diff_render_tests`-named failure
+appeared on one full run and was confirmed a pre-existing flake by re-running it alone (passes
+every time in isolation) before being treated as unrelated, per this project's own established
+practice for that specific test.
+
+Not done in this pass, left honest rather than papered over: the row `⋯` menu's vertical anchor uses
+its own captured button bounds rather than the design spec's literal `top = 39 + row × 26 + 20`
+formula (a real, working popover, just not pixel-identical to the spec's math); the row list is not
+virtualized (`wt_core::graph::DEFAULT_MAX_COMMITS` already caps loaded data at 500 rows, which was
+judged an acceptable simplification for this phase rather than a correctness gap, but it is a real
+per-frame cost at that size); the design spec's branch-row ahead/behind counts and `merged` mark are
+not rendered in the Branches panel, which currently shows only the branch name, lane dot, and `HEAD`
+mark.

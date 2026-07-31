@@ -156,16 +156,18 @@ pub fn effective_key_bindings(overrides: &[KeybindingOverride]) -> Vec<KeyBindin
 ///
 /// This is the single source of truth for "what contexts really exist", shared by
 /// [`contexts_could_overlap`] and by `crate::undo_scoping_matrix_tests`, so the two can never
-/// disagree about the app they are both reasoning over. Derived by hand from the nine
+/// disagree about the app they are both reasoning over. Derived by hand from the ten
 /// `.key_context(..)` call sites in the crate - `crate::root::AdeApp::render`'s baseline `"app"`,
 /// `crate::terminal::pane`, `crate::code_surface::render` (one call site, three literals from a
-/// `match`), `crate::merge::editing`, the four single-line inputs, which all emit the same
-/// bare `"text-input"`, and `crate::sidebar::render::AdeApp::file_tree_shell` (one call site,
-/// four literals from a `match`) - and guarded against drift by this module's own
-/// `every_real_key_context_call_site_is_covered` test, which fails the moment a tenth call site
-/// appears. (That test earned its keep immediately: this comment originally said "six", counting
-/// distinct emitted literals rather than real call sites, and the test caught it on its first
-/// run.)
+/// `match`), `crate::merge::editing`, the five single-line inputs (the rail's agent filter,
+/// Settings' keymap filter, the palette's own query field, `root::new_file`'s inline name editor,
+/// and `crate::graph_view::render`'s Branches filter box), which all emit the same bare
+/// `"text-input"`, and `crate::sidebar::render::AdeApp::file_tree_shell` (one call site, four
+/// literals from a `match`) - and guarded against drift by this module's own
+/// `every_real_key_context_call_site_is_covered` test, which fails the moment an eleventh call
+/// site appears. (That test earned its keep immediately: this comment originally said "six",
+/// counting distinct emitted literals rather than real call sites, and the test caught it on its
+/// first run.)
 ///
 /// The four `file-tree*` stacks arrived with a merge, not with an edit to this file, which is
 /// exactly why they are called out here. GitHub issue #19's file tree and issue #17's text-undo
@@ -800,10 +802,11 @@ mod tests {
         let sites = key_context_call_sites();
         let call_sites: usize = sites.iter().map(|(_, count)| count).sum();
         assert_eq!(
-            call_sites, 9,
-            "real_context_stacks() is hand-derived from exactly nine .key_context(..) call sites \
-             (four of which emit the same bare \"text-input\") - a new one means that list, and \
-             every disjointness answer built on it, needs updating. Real sites found: {sites:?}"
+            call_sites, 10,
+            "real_context_stacks() is hand-derived from exactly ten .key_context(..) call sites \
+             (five of which emit the same bare \"text-input\", `graph_view/render.rs`'s Branches \
+             filter box being the newest) - a new one means that list, and every disjointness \
+             answer built on it, needs updating. Real sites found: {sites:?}"
         );
 
         // The file tree's own site is named explicitly: it is the one a merge added while this

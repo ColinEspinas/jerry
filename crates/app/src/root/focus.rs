@@ -23,7 +23,7 @@ impl AdeApp {
     /// [`OverlayFocus`]). Reproduced by this branch's own adversarial audit: opening a file from
     /// the palette with no tab yet captured `palette_focus_handle`, and closing that tab then
     /// focused it. Each overlay already holds the real pre-overlay target in its own
-    /// `OverlayFocus`; declining to capture here leaves `restore_focus`'s active-session-pane
+    /// `OverlayFocus`; declining to capture here leaves `restore_focus`'s active-agent-pane
     /// fallback as the honest answer instead of a handle that is certain to be wrong.
     pub(crate) fn focus_code_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.open_change.is_none() && !self.focus_is_on_an_overlay(window, cx) {
@@ -35,7 +35,13 @@ impl AdeApp {
     /// Whether keyboard focus is currently on one of this app's overlay handles - the palette,
     /// Settings, or the "New file" prompt. See [`Self::focus_code_surface`] for why capturing one
     /// as a return target is always wrong.
-    fn focus_is_on_an_overlay(&self, window: &Window, cx: &App) -> bool {
+    ///
+    /// `pub(crate)`, not private: `crate::graph_view::render::AdeApp::open_git_graph` reuses this
+    /// exact check for its own pre-open focus capture (the git graph tab is real tab-strip
+    /// content, the same shape as [`Self::code_focus_handle`] - not a fourth entry in this list -
+    /// but it still must never capture the palette/Settings/new-file handles as its own return
+    /// target, for the same reason [`Self::focus_code_surface`] mustn't).
+    pub(crate) fn focus_is_on_an_overlay(&self, window: &Window, cx: &App) -> bool {
         window.focused(cx).is_some_and(|focused| {
             focused == self.palette_focus_handle
                 || focused == self.settings_focus_handle
@@ -97,7 +103,7 @@ impl AdeApp {
     /// two closing paths are chosen between.
     ///
     /// Deliberately *not* `restore_focus` with a pre-cleared [`OverlayFocus`]: that function
-    /// falls back to the active session's terminal pane when it has no captured target, so
+    /// falls back to the active agent's terminal pane when it has no captured target, so
     /// clearing first would have moved focus off the file that was just opened and into the
     /// terminal - the same class of wrong-place focus this whole mechanism exists to stop. The
     /// captured target is discarded via [`OverlayFocus::clear`] instead, which is exactly what
@@ -1888,9 +1894,9 @@ mod palette_result_focus_tests {
                 Some(relative.as_path()),
                 "the palette must have opened the file's tab"
             );
-            assert_eq!(app.open_files, vec![relative.clone()]);
+            assert_eq!(app.open_files(), vec![relative.clone()]);
             assert!(
-                app.edit_buffers.contains_key(&relative),
+                app.edit_buffer_contains(&relative),
                 "and a real edit buffer must be backing it"
             );
         });
@@ -1923,8 +1929,7 @@ mod palette_result_focus_tests {
 
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .expect("buffer")
                 .content
                 .clone()),
@@ -1945,8 +1950,7 @@ mod palette_result_focus_tests {
 
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .expect("buffer")
                 .cursor_offset()),
             0,
@@ -1958,8 +1962,7 @@ mod palette_result_focus_tests {
 
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .expect("buffer")
                 .cursor_offset()),
             1,
@@ -1992,7 +1995,7 @@ mod palette_result_focus_tests {
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
             assert_eq!(
-                app.edit_buffers.get(&relative).expect("buffer").content,
+                app.edit_buffer(&relative).expect("buffer").content,
                 "Afn main() {}\n",
                 "premise: with the tree focused, a keystroke must not reach the buffer"
             );
@@ -2004,12 +2007,12 @@ mod palette_result_focus_tests {
 
         app.read_with(cx, |app, _| {
             assert_eq!(
-                app.open_files,
+                app.open_files(),
                 vec![relative.clone()],
                 "reopening the same file must reuse its tab, never append a second one"
             );
             assert_eq!(
-                app.edit_buffers.get(&relative).expect("buffer").content,
+                app.edit_buffer(&relative).expect("buffer").content,
                 "ABfn main() {}\n",
                 "both keystrokes must have landed in the same real buffer - and `B` lands \
                  *after* `A` because the buffer kept its own caret (offset 1) across the \
@@ -2043,8 +2046,7 @@ mod palette_result_focus_tests {
         cx.run_until_parked();
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .expect("buffer")
                 .content
                 .clone()),
@@ -2092,8 +2094,7 @@ mod palette_result_focus_tests {
         cx.run_until_parked();
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .expect("buffer")
                 .content
                 .clone()),
@@ -2194,8 +2195,8 @@ mod palette_result_focus_tests {
 
     /// The other direction of the same rule, and the reason it is *observed* rather than
     /// declared: an entry that opens nothing must leave focus exactly where it was.
-    /// `ToggleRailGrouping` is the smallest real such entry - it flips one rail field and
-    /// touches no focus handle at all.
+    /// `WindowControlsSystem` is the smallest real such entry - it pins one settings field
+    /// (`Self::set_window_controls_style`) and touches no focus handle at all.
     #[gpui::test]
     fn a_palette_entry_that_opens_nothing_still_restores_the_previous_focus(
         cx: &mut TestAppContext,
@@ -2211,7 +2212,9 @@ mod palette_result_focus_tests {
             let groups = app.build_palette_groups(cx);
             let index = palette::flatten(&groups).iter().position(|entry| {
                 entry.target
-                    == palette::EntryTarget::Command(palette::PaletteCommand::ToggleRailGrouping)
+                    == palette::EntryTarget::Command(
+                        palette::PaletteCommand::WindowControlsSystem,
+                    )
             });
             match index {
                 Some(index) => {
@@ -2223,7 +2226,7 @@ mod palette_result_focus_tests {
         });
         assert!(
             ran,
-            "the palette must offer the real rail-grouping command to run"
+            "the palette must offer the real window-controls command to run"
         );
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
@@ -2236,8 +2239,7 @@ mod palette_result_focus_tests {
         cx.run_until_parked();
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .expect("buffer")
                 .content
                 .clone()),

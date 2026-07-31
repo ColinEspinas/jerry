@@ -925,6 +925,85 @@ pub mod scrollbar {
     pub const THUMB_HOVER: ColorToken = super::status::IDLE;
 }
 
+/// The git graph tab (design handoff `design_handoff_jerry_ade/revision 2/CHANGELOG.md`,
+/// 2026-07-31 entry, "git graph (issue #1)") - real hex values transcribed directly from that
+/// entry's §2/§3, not paraphrased.
+pub mod graph {
+    use super::{hex, px, ColorToken, Pixels};
+
+    /// Row height (§2: "Row height 26").
+    pub const ROW: Pixels = px(26.0);
+    /// Lane canvas column width (§2: "lane canvas 100").
+    pub const LANE_CANVAS: Pixels = px(100.0);
+    /// A lane's vertical sits at `x = 9 + lane * 14` (§2).
+    pub const LANE_X_BASE: Pixels = px(9.0);
+    pub const LANE_STEP: Pixels = px(14.0);
+    /// The elbow box's height, in the row's lower half (§2: "a 14px-tall box").
+    pub const ELBOW_HEIGHT: Pixels = px(14.0);
+    /// The elbow box's corner radius (§2: "7px corner radius").
+    pub const ELBOW_RADIUS: Pixels = px(7.0);
+
+    /// The tab chip's own background (§1: "`#2a2030` bg").
+    pub const TAB_CHIP_BG: ColorToken = hex(0x2a2030);
+    /// The tab chip's fork-glyph colour (§1: "`#c98fbf` fork glyph").
+    pub const TAB_CHIP_FG: ColorToken = hex(0xc98fbf);
+
+    /// Six lane colours, cycled by `lane % 6` - lane 0 is the trunk (§2).
+    pub const LANES: [ColorToken; 6] = [
+        hex(0x6b9bd1),
+        hex(0xc98fbf),
+        hex(0x5cb87f),
+        hex(0xd8a94a),
+        hex(0xc0824a),
+        hex(0x8f8fd4),
+    ];
+
+    /// A local branch ref chip's dim background pair, indexed the same way as [`LANES`] (§2: "local
+    /// branch = lane colour on its dim pair").
+    pub const LOCAL_BRANCH_DIM_BG: [ColorToken; 6] = [
+        hex(0x1a2733),
+        hex(0x2a2030),
+        hex(0x16261e),
+        hex(0x2b2413),
+        hex(0x2a1e13),
+        hex(0x1f2033),
+    ];
+
+    /// `HEAD` ref chip (§2: "`HEAD` `#243c50`/`#a5cdf0`").
+    pub const HEAD_CHIP_BG: ColorToken = hex(0x243c50);
+    pub const HEAD_CHIP_FG: ColorToken = hex(0xa5cdf0);
+    /// A remote branch chip is outlined only (§2: "remote outlined `#2a2f34`").
+    pub const REMOTE_CHIP_BORDER: ColorToken = hex(0x2a2f34);
+    /// A tag chip (§2: "tag `#2b2413`/`#d8a94a`").
+    pub const TAG_CHIP_BG: ColorToken = hex(0x2b2413);
+    pub const TAG_CHIP_FG: ColorToken = hex(0xd8a94a);
+
+    /// The commit dot's diameter (§2: "commit 7px filled").
+    pub const DOT_COMMIT: Pixels = px(7.0);
+    /// The `HEAD`/merge dot's diameter (§2: "**HEAD** 9px", "**merge** 9px").
+    pub const DOT_HEAD_OR_MERGE: Pixels = px(9.0);
+    /// The `HEAD` dot's ring colour (§2: "a 2px `#5a9ad4` ring").
+    pub const HEAD_RING: ColorToken = hex(0x5a9ad4);
+    /// The working-tree dot's dashed border colour (§2: "1px dashed `#6b7178` border").
+    pub const WORKING_TREE_BORDER: ColorToken = hex(0x6b7178);
+
+    /// The toolbar band's height (§4: "Toolbar 35 high").
+    pub const TOOLBAR: Pixels = px(35.0);
+    /// The `Push …` menu's width (§4: "opening a 268-wide menu").
+    pub const PUSH_MENU_WIDTH: Pixels = px(268.0);
+    /// The row `⋯` context menu's width (§4: "a 330-wide context menu").
+    pub const ROW_MENU_WIDTH: Pixels = px(330.0);
+    /// Behind-count amber threshold (§5: "behind turns `#a3873f` past 4").
+    pub const BEHIND_WARN_THRESHOLD: usize = 4;
+    pub const BEHIND_WARN: ColorToken = hex(0xa3873f);
+    /// Branches panel row height (§5: "28-high rows").
+    pub const BRANCH_ROW: Pixels = px(28.0);
+    /// Branches panel filter row height (§5: "a 31-high filter row").
+    pub const BRANCHES_FILTER_ROW: Pixels = px(31.0);
+    /// A branch with no lane in the visible graph gets a neutral dot (§5).
+    pub const BRANCH_NO_LANE_DOT: ColorToken = hex(0x3d4248);
+}
+
 pub mod radius {
     use super::{px, Pixels};
 

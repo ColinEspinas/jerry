@@ -11,6 +11,7 @@
 pub mod code_surface;
 pub mod env_info;
 pub mod fonts;
+pub mod graph_view;
 pub mod keymap;
 pub mod keymap_overrides;
 pub mod language;
@@ -233,6 +234,7 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("f12", root::GotoDefinition, None),
         gpui::KeyBinding::new("ctrl-shift-t", root::NewTerminal, None),
         gpui::KeyBinding::new("secondary-shift-n", root::NewAgentPane, None),
+        gpui::KeyBinding::new("secondary-shift-g", root::NewGitGraph, None),
         gpui::KeyBinding::new("]", root::NextChangedFile, Some("diff && !file-editor")),
         gpui::KeyBinding::new("secondary-1", root::JumpToAgent1, None),
         gpui::KeyBinding::new("secondary-2", root::JumpToAgent2, None),

@@ -144,10 +144,14 @@ pub enum PaletteCommand {
     /// Pins `crate::keymap::WindowControlsStyle::WindowsLinuxStyle` - see
     /// [`Self::WindowControlsSystem`].
     WindowControlsWindowsLinux,
+    /// `crate::graph_view::render::AdeApp::open_git_graph` - the palette's own "Git" group
+    /// (design spec §6). Rendered under a dedicated `"Git"` group label rather than the plain
+    /// `"Commands"` one - see [`build_groups`]'s own `is_git_command` split.
+    OpenGitGraph,
 }
 
 impl PaletteCommand {
-    pub const ALL: [PaletteCommand; 9] = [
+    pub const ALL: [PaletteCommand; 10] = [
         PaletteCommand::NewShell,
         PaletteCommand::NewClaudeAgent,
         PaletteCommand::NewCodexAgent,
@@ -157,7 +161,14 @@ impl PaletteCommand {
         PaletteCommand::WindowControlsSystem,
         PaletteCommand::WindowControlsMacos,
         PaletteCommand::WindowControlsWindowsLinux,
+        PaletteCommand::OpenGitGraph,
     ];
+
+    /// Whether this command belongs in the palette's `"Git"` group rather than `"Commands"` -
+    /// see [`build_groups`].
+    pub fn is_git_command(self) -> bool {
+        matches!(self, PaletteCommand::OpenGitGraph)
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -170,6 +181,7 @@ impl PaletteCommand {
             PaletteCommand::WindowControlsSystem => "Window Controls: System Default",
             PaletteCommand::WindowControlsMacos => "Window Controls: macOS Style",
             PaletteCommand::WindowControlsWindowsLinux => "Window Controls: Windows/Linux Style",
+            PaletteCommand::OpenGitGraph => "Open Git Graph",
         }
     }
 
@@ -192,6 +204,7 @@ impl PaletteCommand {
             PaletteCommand::WindowControlsWindowsLinux => {
                 "window controls title bar caption buttons menu keycap platform override windows linux"
             }
+            PaletteCommand::OpenGitGraph => "git graph commit history branches log",
         }
     }
 
@@ -204,6 +217,7 @@ impl PaletteCommand {
         match self {
             PaletteCommand::NewShell => Some("mod+N"),
             PaletteCommand::OpenSettings => Some("mod+,"),
+            PaletteCommand::OpenGitGraph => Some("mod+shift+G"),
             _ => None,
         }
     }
@@ -585,10 +599,24 @@ pub fn build_groups(
     }
 
     if matches!(scope, PaletteScope::All | PaletteScope::Commands) {
-        let entries = filter_commands(commands, query);
+        let (git_commands, plain_commands): (Vec<_>, Vec<_>) = commands
+            .iter()
+            .cloned()
+            .partition(|candidate| candidate.command.is_git_command());
+
+        let entries = filter_commands(&plain_commands, query);
         if !entries.is_empty() {
             groups.push(PaletteGroup {
                 label: "Commands",
+                entries,
+            });
+        }
+
+        // Design spec §6: a dedicated "Git" group, separate from the plain "Commands" one.
+        let entries = filter_commands(&git_commands, query);
+        if !entries.is_empty() {
+            groups.push(PaletteGroup {
+                label: "Git",
                 entries,
             });
         }
@@ -725,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn only_new_shell_and_open_settings_carry_a_real_bound_shortcut() {
+    fn only_commands_with_a_real_global_keybinding_carry_a_shortcut() {
         for command in PaletteCommand::ALL {
             match command {
                 PaletteCommand::NewShell => {
@@ -733,6 +761,9 @@ mod tests {
                 }
                 PaletteCommand::OpenSettings => {
                     assert_eq!(command.shortcut(), Some("mod+,"))
+                }
+                PaletteCommand::OpenGitGraph => {
+                    assert_eq!(command.shortcut(), Some("mod+shift+G"))
                 }
                 _ => assert_eq!(
                     command.shortcut(),
@@ -798,8 +829,9 @@ mod tests {
         let labels: Vec<&str> = groups.iter().map(|g| g.label).collect();
         assert_eq!(
             labels,
-            vec!["Agents", "Commands", "Recent Files"],
-            "real order: Agents, Commands, Files - matching Jerry.dc.html's own fixture"
+            vec!["Agents", "Commands", "Git", "Recent Files"],
+            "real order: Agents, Commands, Git, Files - Git is `OpenGitGraph`'s own group \
+             (design spec §6), split out of plain Commands"
         );
         let files_group = groups.iter().find(|g| g.label == "Recent Files").unwrap();
         assert_eq!(

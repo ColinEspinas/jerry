@@ -44,7 +44,7 @@ impl AdeApp {
         if let Some(notice) = self.render_status_worktree_history_notice() {
             segments.push(notice);
         }
-        if let Some(branch_cluster) = self.render_status_branch_cluster() {
+        if let Some(branch_cluster) = self.render_status_branch_cluster(cx) {
             segments.push(branch_cluster);
         }
         segments.push(self.render_status_urgency_counters(cx).into_any_element());
@@ -120,7 +120,11 @@ impl AdeApp {
     /// still shows real text (`"(detached)"`), matching the agent context bar's own
     /// convention, and a not-yet-computed ahead/behind is honestly omitted rather than shown as
     /// a fabricated `↑0 ↓0`.
-    fn render_status_branch_cluster(&self) -> Option<gpui::AnyElement> {
+    /// The branch text (design spec change 6: "the branch text became a clickable cluster (fork
+    /// glyph + `main` + `↑2 ↓0`, hover `#1b1f22`) that opens the graph tab") - a real click target
+    /// via `crate::graph_view::render::AdeApp::open_git_graph`, the same entry point the `+` menu
+    /// and the palette's "Open git graph" use.
+    fn render_status_branch_cluster(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let agent = self.agents.active()?;
         let branch = self
             .worktrees
@@ -130,9 +134,19 @@ impl AdeApp {
             .unwrap_or_else(|| "(detached)".to_string());
 
         let mut row = div()
+            .id("status-bar-branch-cluster")
+            .debug_selector(|| "status-bar-branch-cluster".to_string())
             .flex()
             .items_center()
             .gap(px(6.0))
+            .cursor_pointer()
+            .rounded(theme::radius::CHIP)
+            .px(px(4.0))
+            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                this.open_git_graph(window, cx);
+            }))
+            .child(crate::graph_view::render::render_graph_tab_chip())
             .child(self.render_status_text(branch));
 
         if let Some(ahead_behind) = self.ahead_behind_cache.get(&agent.cwd) {

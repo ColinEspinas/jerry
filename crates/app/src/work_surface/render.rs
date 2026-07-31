@@ -57,7 +57,7 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.open_change.is_none() && !self.settings_open {
+        if self.open_change.is_none() && !self.settings_open && !self.graph_tab_active {
             self.agents.focus_active(window, cx);
         }
     }
@@ -127,6 +127,11 @@ impl AdeApp {
         self.agents.set_active(id, cx);
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
+        // If the git graph tab was showing, this leaves it (without closing its tab) - see
+        // `crate::graph_view::render::AdeApp::leave_graph_tab`'s own docs for why this must run
+        // *after* `set_active` above: its `restore_focus` fallback resolves to
+        // `Self::agents.active()`, which by this point is already the agent just selected.
+        self.leave_graph_tab(window, cx);
         if self.open_change.is_some() {
             self.open_change = None;
             self.refresh_open_diff_file_cache();
@@ -233,7 +238,14 @@ impl AdeApp {
     /// rail's *root*, not its filter field (which this used to target): see
     /// [`Self::rail_focus_handle`]'s own docs for the real keystroke-swallowing bug that was.
     pub(crate) fn close_agent(&mut self, id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
-        let skip_focus_move = self.open_change.is_some() || self.settings_open;
+        // The graph tab (like a file tab or Settings) occupies the centre pane instead of an
+        // agent's own `TerminalPane` while active, so `Agents::close`'s own focus-follows-close
+        // move onto the newly active agent's pane would be exactly as dangling as the
+        // file-tab/Settings cases this guard already covers - a real, adversarial-audit-found
+        // gap: the sibling guard in `Self::focus_newly_spawned_agent` was updated for this, this
+        // one was not.
+        let skip_focus_move =
+            self.open_change.is_some() || self.settings_open || self.graph_tab_active;
         self.agents.close(id, skip_focus_move, window, cx);
         if self
             .merge_flow
@@ -242,7 +254,11 @@ impl AdeApp {
         {
             self.clear_merge_flow_for_closed_agent(cx);
         }
-        if self.agents.active_id().is_none() && self.open_change.is_none() && !self.settings_open {
+        if self.agents.active_id().is_none()
+            && self.open_change.is_none()
+            && !self.settings_open
+            && !self.graph_tab_active
+        {
             window.focus(&self.rail_focus_handle, cx);
         }
     }
@@ -462,6 +478,14 @@ impl AdeApp {
                     bar = bar.child(self.render_file_tab(&path, cx));
                 }
             }
+        }
+
+        // A third, independent parallel slot for the git graph tab (GitHub issue #1, phase (a)) -
+        // at most one, so a plain `if` rather than a loop over a collection like
+        // `combined_tab_order` above. See `crate::graph_view`'s module docs for why this isn't a
+        // forced three-way `Tab` enum.
+        if self.graph_tab_open {
+            bar = bar.child(crate::graph_view::render::render_graph_tab(self, cx));
         }
 
         bar = bar.child(self.render_tab_strip_plus(cx));
@@ -886,6 +910,23 @@ impl AdeApp {
                             |this, _event: &ClickEvent, window, cx| {
                                 this.plus_menu_open = false;
                                 this.next_changed_file(window, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        render_dropdown_menu_row(
+                            "\u{2325}",
+                            theme::graph::TAB_CHIP_FG.into(),
+                            theme::graph::TAB_CHIP_BG.into(),
+                            "Git graph",
+                            "commit history".to_string(),
+                            keymap::resolve_combo("mod+shift+G", macos),
+                            true,
+                        )
+                        .on_click(cx.listener(
+                            |this, _event: &ClickEvent, window, cx| {
+                                this.plus_menu_open = false;
+                                this.open_git_graph(window, cx);
                             },
                         )),
                     ),
@@ -1752,6 +1793,11 @@ impl AdeApp {
             .h_full()
             .bg(theme::surface::CENTER)
             .child(self.render_tab_strip(cx));
+
+        if self.graph_tab_active {
+            let body = self.render_graph_view(cx);
+            return surface.child(body).into_any_element();
+        }
 
         if let Some(open_path) = self.open_change.clone() {
             // `open_diff_file_cache` already holds the up-to-date `DiffFile` for `open_path`
