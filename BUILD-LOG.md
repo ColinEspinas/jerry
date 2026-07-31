@@ -5362,3 +5362,141 @@ All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `
 regression). One unrelated test in `code_surface::diff_view` (async-highlighting-cache timing)
 flaked once under full-suite load and passed cleanly in isolation on rerun - a pre-existing flake,
 not touched by this change.
+
+## Two more real elbow bugs: a bridge that overshot on adjacent lanes, and hover erasing lines
+
+Two user reports against the S-curve work above, with two screenshots for the first and a verbal
+description for the second.
+
+**Reading the screenshots first.** Both images are small (152x281 and 157x240), so they were scanned
+at 6-14x nearest-neighbour before any conclusion was drawn. In the first, four elbows leave the
+trunk: lane 0 -> lane 3 (amber) and lane 0 -> lane 4 (orange) render cleanly - smooth arc, the
+horizontal meeting the descent exactly - while lane 0 -> lane 1 (pink) and lane 1 -> lane 2 (green)
+both show the same defect: the horizontal run **continues past the corner** as a stub hanging in
+mid-air, and the corner itself reads as a hard notch instead of an arc. The second screenshot shows
+the identical defect at two merge-back elbows (lane 1 -> lane 0) and one branch start (lane 1 ->
+lane 2), confirming it is not specific to one kind. It also happens to capture the second bug: one
+row band is visibly lighter (hovered), and the amber elbow immediately above it is cut off exactly
+at that band's top edge.
+
+That comparison is what actually located the first bug. The report said "merges back into a branch
+that is just one **row** below", but the clean and broken elbows in the same screenshot differ by
+**lane** distance, not row distance - the amber elbow is also exactly one row tall and renders fine.
+
+### Bug 1: the straight bridge ran past the far curve's own arc
+
+`LANE_STEP` is 14px while the two curve boxes together want `2 * ELBOW_CURVE_SIZE` = 20px, so for
+adjacent lanes the boxes do not merely touch, they **overlap by 6px**, and the honest bridge span
+comes out *shorter* than in the wide-gap case, not longer. The width was
+`(right_curve.left + overlap - straight_left).max(overlap * 2.0)`; for a rightward `Diverging` elbow
+from `lane_x(0)` to `lane_x(1)` the raw span is 4px and the floor forced it to 10px. A 1px filled
+rect then ran from x=15 to x=25 while the far curve's arc begins at x=19 and its vertical stroke
+sits at x=23..24 - so the fill painted flat across the whole arc (the flattened corner) and stuck
+out one pixel past the lane line (the dangling stub). Three lane steps apart the raw span is 32px,
+comfortably past the floor, which is exactly why every wider elbow looked right.
+
+The fix clamps **both** ends to the arc, not just the near one: the bridge runs from
+`left_curve.right() - RADIUS` (where the near arc ends) to `right_curve.left + RADIUS` (where the far
+arc begins), flooring the width at zero. When the boxes overlap, the two curves' own straight border
+lead-ins already overlap too, so there is nothing left for a bridge to cover and a shorter one is
+correct rather than a compromise. The floor's original justification - that `StraightSegment` must
+cover each curve's straight run so a border arc and a filled rect never meet mid-seam - is unharmed:
+the bridge still starts and ends exactly at the two tangent points.
+
+### Bug 2: a later row's hover background painted over an earlier row's elbow
+
+The mechanism was verified against GPUI's own source rather than assumed. `Style::overflow_mask`
+(`gpui/src/style.rs:634`) returns `None` outright for the default `Overflow::Visible`, so GPUI clips
+nothing unless asked; `Style::paint` draws a div's background and border and *then* calls the
+continuation that paints its children. Rows are siblings of one `flex_col`, painted in order. So
+anything row N paints outside its own box and into row N+1's rectangle is covered by row N+1's own
+background as soon as that background stops being transparent - which is precisely what
+`.hover(|el| el.bg(theme::surface::ROW_HOVER))` does. Only *downward* spill is affected: a
+`Converging` elbow reaches up into row N-1, which has already painted.
+
+And the elbow did spill. A far curve is `ELBOW_CURVE_SIZE` = 10px tall against only `ROW / 2` = 13px
+of row past the dot, and with the waist one full curve from the dot at y=23 the exit curve ran to
+y=33 - 7px into the next row. Hovering row N+1 therefore erased 7px of row N's branch-start line.
+
+**Fix: clip each lane canvas to its own row.** `render_graph_lane_canvas` is now `overflow_hidden()`.
+On its own that would have been a regression, though: at waist y=23 the exit arc sweeps y=23..28, so
+the clip would cut it at y=26, two pixels before it has finished turning onto the lane column, and
+the next row's segment - a straight line at that column - would not line up with where the cut left
+it. A kink at every row boundary instead of a gap.
+
+So `waist_y` is clamped to keep the whole arc inside the row: `(ROW/2 + CURVE_SIZE).min(ROW - RADIUS)`
+for `Diverging` and the mirror for `Converging`, moving the waist from 23 to 21 and from 3 to 5. The
+arc now ends exactly on the row boundary and the only thing crossing it is `CURVE_SIZE - RADIUS` =
+5px of *straight vertical stroke*, sitting on exactly the column the neighbouring row's own
+`LaneSegment` continues the line on. Clipping it away is lossless: the neighbour redraws those
+pixels. The 2px waist move is a real visual change, and a small improvement in its own right - the
+elbow's dot end is now hidden entirely under even the smallest 7px `DOT_COMMIT` disc, where roughly
+1.5px of it used to poke out beside the dot.
+
+**What that let us delete.** `lane_segment_span`'s neighbouring-row trim existed because the elbow
+really did paint into the next row and two elements for one 1px line disagree by a device pixel at
+fractional scale. With the clip there is no second element in that row at all, so the trim has
+nothing to trim: `RowNeighbours`, `ELBOW_OVERSHOOT`, the `elbows_of` lookup in `render_graph_rows`
+and the parameter threaded through `render_graph_row`/`render_graph_lane_canvas` are all gone, and a
+through-lane runs the full row height again. The doubled-line bug the trim fixed cannot recur,
+because the element that caused it no longer paints there.
+
+One consequence worth recording: GPUI's content mask is a single rectangle
+(`ContentMask { bounds }`), so `overflow_hidden()` bounds x as well as y - there is no y-only clip
+even via `overflow_y_hidden()`, whose two match arms both intersect with the full bounds. That is
+safe here only because `graph_lane_canvas_width` always reserves `LANE_X_BASE` past the rightmost
+lane while no elbow piece ever reaches more than one stroke past it, which is now pinned by a test
+rather than left as an observation.
+
+### Tests
+
+Seven new, five retargeted, four deleted with the trim they covered. All four tests for the two new
+bugs were confirmed **non-vacuous** by reverting each fix on its own and watching only the matching
+tests fail: restoring the `max(overlap * 2.0)` floor fails
+`the_straight_bridge_never_runs_past_the_far_curves_own_arc` (bridge end 25px against an arc
+beginning at 19px) and `adjacent_lanes_get_a_real_but_shorter_bridge_than_a_wide_gap` (10px against
+4px); restoring the unclamped waist fails `every_arc_sweeps_entirely_inside_its_own_rows_box` ("the
+exit curve's arc sweeps 23px..28px, outside its own row's 0..26px box") and
+`what_the_row_clip_removes_is_exactly_what_the_neighbouring_row_paints`.
+
+`ALL_SHAPES_AND_GAPS` extends the existing `ALL_SHAPES` to run every shape at both a three-lane gap
+and the minimum one-lane gap, since the narrow gap turned out to be its own regime rather than just
+a smaller number. `no_elbow_piece_ever_reaches_past_the_lane_canvas_own_width` checks every lane pair
+for lane counts 2..=12 against real `graph_lane_canvas_width` values, covering the rectangular-mask
+consequence above. `consecutive_lane_canvases_tile_exactly_so_the_row_clip_loses_no_line` is a real
+`gpui::test` asserting each canvas is exactly `ROW` tall and sits exactly `ROW` below the last -
+the layout fact the clip's losslessness depends on, which geometry alone cannot show because a row's
+`border_b_1()` makes its content box shorter than `ROW` and the canvas is centred in it.
+
+Five existing tests were measuring "which half of the row" off a curve **box edge**, which the waist
+clamp legitimately moves. They now measure the **waist** - the painted horizontal run, the one piece
+unambiguously on one side of the dot - and bound each curve's dot end by the dot's own disc instead.
+Each curve box straddles the dot centre by design, so a box edge was always the wrong thing to read
+that claim off; the old assertions passed by coincidence of the old constants.
+
+### Confidence, and one limit worth stating plainly
+
+Bug 1 is fully derived: the numbers come from `LANE_STEP`, `ELBOW_CURVE_SIZE` and `ELBOW_RADIUS`, the
+broken and clean elbows in the same screenshot separate the variable cleanly, and the geometry tests
+reproduce the exact overshoot. Bug 2's mechanism is read directly out of GPUI's own source, and the
+spill it depends on is arithmetic.
+
+What is **not** covered is the occlusion itself. GPUI's test harness exposes layout bounds
+(`debug_bounds`) and nothing else - no pixel readback, no way to inspect a content mask - so there is
+no test that asserts "hovering a row no longer erases its neighbour's elbow". The coverage is the
+invariant that makes the fix work (every arc inside its own row; only straight stroke crossing the
+boundary; consecutive canvases tiling exactly), not the symptom. That gap is a property of the
+harness, not something a better test would close, and it sits alongside the previous entry's residual
+fractional-scale seam as a known limit. As with every round on this feature, none of it was seen
+rendered: GPUI's headless renderer is macOS-only at this pinned revision and this sandbox's X11
+capture is broken.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build -p app --bin app`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test -p app --lib` at 1122 app tests (+2 net:
+seven new, four deleted with the trim, one paint test added). Three tests flaked under full-suite
+load on a badly oversubscribed box (load average 30-53 on 16 cores, from unrelated processes) and all
+three passed in isolation - `code_surface::diff_view`'s async-highlighting-cache test needed five
+clean reruns to confirm. To rule the change in or out as the cause, the same suite was run on the
+parent commit under the same load: it failed **five** tests, a different and partly non-overlapping
+set including `status_bar::process_stats` and `lsp::client`. No `graph_view` test failed in any run,
+on either tree.
