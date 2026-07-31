@@ -362,6 +362,76 @@ pub struct LspClient {
     connection_alive: Arc<AtomicBool>,
 }
 
+/// Resolves `binary` (a bare name, e.g. `"typescript-language-server"`) to the real, absolute
+/// path [`LspClient::spawn`] should hand to `Command::new` - via [`pty_core::resolve_on_path`],
+/// the exact same real resolution `crate::settings::state::detect_lsp_rows` in the `app` crate
+/// already uses to decide whether the Settings page shows a server as "ready" (this crate has
+/// no such page of its own, but every real caller of [`LspClient::spawn`] does - see that
+/// function's own docs).
+///
+/// ## The real, verified Windows bug this closes
+///
+/// A bare `Command::new("typescript-language-server").spawn()` used to be handed straight to
+/// `std::process::Command` with no resolution of our own. On Windows that is a real, live-
+/// reproduced bug, not a hypothetical: read directly from this toolchain's own vendored
+/// `library/std/src/sys/process/windows.rs` (`resolve_exe`/`search_paths`, rustc 1.95.0) rather
+/// than assumed - `std::process::Command` does its **own** executable resolution on Windows
+/// (`CreateProcessW`'s built-in search is bypassed entirely once `lpApplicationName` is left
+/// unset the way `std` constructs it), and for a bare name with no extension, that resolution
+/// *only ever appends a literal `.exe`* to every directory it checks - there is no `%PATHEXT%`
+/// fallback to `.cmd`/`.bat`/`.com` the way a real `cmd.exe` prompt (or this exact codebase's
+/// own [`pty_core::resolve_on_path`], which mirrors `portable-pty`'s `PATHEXT`-aware algorithm)
+/// would try. `npm install -g typescript-language-server` on Windows installs exactly a `.cmd`/
+/// `.ps1` shim, never a `.exe` - so `resolve_on_path` (and thus the Settings page) correctly
+/// reports the server "ready", while the *real* spawn attempt fails with `std`'s own hardcoded
+/// `io::ErrorKind::NotFound` message, the literal string `"program not found"` (not a generic
+/// OS `FormatMessage` string - `resolve_exe`'s own `Err(io::const_error!(io::ErrorKind::NotFound,
+/// "program not found"))`), live-reproduced exactly as reported.
+///
+/// The fix is not "teach our own resolver about `.cmd`" - `resolve_on_path` already handles that
+/// correctly. It's that `LspClient::spawn` was never using it, so the two checks (Settings
+/// "ready", and the real spawn) could disagree. Once `resolve_on_path` hands back the batch
+/// shim's own real, absolute `...\typescript-language-server.cmd` path (not a bare name),
+/// `std::process::Command` handles the rest correctly on its own: `resolve_exe`'s "already has
+/// a real path with its own extension" branch trusts it verbatim, and
+/// `spawn_with_attributes`'s own `is_batch_file` check (matching the resolved path's real
+/// extension) then transparently wraps the launch through `cmd.exe /c` - `std` already knows how
+/// to run a `.cmd`/`.bat` file correctly, it just never discovered this one existed when all it
+/// had to go on was the bare, extension-less name.
+///
+/// A real, honest `LspError::Spawn` (not a panic, not a different variant) when `resolve_on_path`
+/// finds nothing at all - the same "genuinely not on PATH" case `std::process::Command` itself
+/// would have reported, just resolved with the real, already-trusted algorithm instead of a
+/// narrower one that could report a false negative for something the user's own Settings page
+/// just told them was ready.
+fn resolve_server_binary(server: &'static str, binary: &'static str) -> Result<PathBuf, LspError> {
+    resolve_server_binary_with(server, binary, pty_core::resolve_on_path)
+}
+
+/// [`resolve_server_binary`]'s own real logic, with the resolver itself injected - mirrors
+/// `crate::settings::state::detect_lsp_rows`'s identical `resolve: impl Fn(&str) -> Option<PathBuf>`
+/// shape in the `app` crate, for the same real reason: [`pty_core::resolve_on_path`] reads the
+/// real, global `PATH` environment variable directly, and this workspace's own established
+/// discipline (see `pty_core::resolve_on_path_skips_a_same_named_directory`'s own docs) is to
+/// never mutate that process-global state from a test - `std::env::set_var` requires `unsafe` as
+/// of this workspace's edition, and would race any other test's own real `PATH` reads under
+/// `cargo test`'s default concurrent execution. Injecting the resolver lets
+/// [`resolve_server_binary`]'s own real "what happens when nothing is found" behavior stay
+/// directly `#[test]`-able without either problem.
+fn resolve_server_binary_with(
+    server: &'static str,
+    binary: &'static str,
+    resolve: impl FnOnce(&str) -> Option<PathBuf>,
+) -> Result<PathBuf, LspError> {
+    resolve(binary).ok_or_else(|| LspError::Spawn {
+        server,
+        source: std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("`{binary}` was not found on PATH"),
+        ),
+    })
+}
+
 impl LspClient {
     /// Spawns the server described by `config` for the repository rooted at `repo_root`,
     /// performs an `initialize` request (awaiting its response) followed by an `initialized`
@@ -381,7 +451,8 @@ impl LspClient {
             .map_err(|_| LspError::InvalidRoot(repo_root.to_path_buf()))?;
 
         let name = config.name;
-        let mut command = Command::new(config.binary);
+        let resolved_binary = resolve_server_binary(name, config.binary)?;
+        let mut command = Command::new(resolved_binary);
         command
             .args(&config.args)
             .current_dir(&repo_root)
@@ -1463,6 +1534,83 @@ mod tests {
         }
     }
 
+    // Real, live-reproduced bug fix: `resolve_server_binary` - see that function's own docs for
+    // the full root cause (`std::process::Command`'s own Windows executable resolution only
+    // ever appends a literal `.exe` to a bare name, never discovering an `npm install -g`
+    // `.cmd`/`.ps1` shim that `pty_core::resolve_on_path` - and thus the Settings page's own
+    // "ready" check - already finds).
+
+    #[test]
+    fn resolve_server_binary_uses_whatever_the_injected_resolver_finds() {
+        let expected = PathBuf::from("C:\\fake\\typescript-language-server.cmd");
+        let resolved = resolve_server_binary_with(
+            "typescript-language-server",
+            "typescript-language-server",
+            |name| {
+                assert_eq!(name, "typescript-language-server");
+                Some(expected.clone())
+            },
+        )
+        .expect("the injected resolver found a real path");
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn resolve_server_binary_is_a_real_honest_spawn_error_when_nothing_is_found() {
+        let err =
+            resolve_server_binary_with("rust-analyzer", "rust-analyzer", |_| None).unwrap_err();
+        match err {
+            LspError::Spawn { server, source } => {
+                assert_eq!(server, "rust-analyzer");
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected LspError::Spawn, got {other:?}"),
+        }
+    }
+
+    /// The real, end-to-end mechanism this bug fix relies on, verified directly against this
+    /// sandbox's own real Windows `std::process::Command` behavior (not assumed from reading
+    /// `library/std/src/sys/process/windows.rs` alone): a real `.cmd` batch file, reachable only
+    /// under its own real name (no `.exe` sibling exists anywhere), genuinely cannot be spawned
+    /// by a bare, extension-less `Command::new` call - reproducing the exact failure mode
+    /// `resolve_server_binary`'s own docs describe - but spawns successfully once given its own
+    /// real, already-resolved absolute path (exactly what `pty_core::resolve_on_path` returns,
+    /// and exactly what `LspClient::spawn` now hands to `Command::new` instead of a bare name).
+    #[cfg(windows)]
+    #[test]
+    fn a_real_windows_batch_shim_is_unspawnable_by_bare_name_but_spawns_via_its_own_resolved_path()
+    {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let script = dir.path().join("lsp_core_fake_server.cmd");
+        std::fs::write(&script, "@echo off\r\necho ready\r\n").expect("write real .cmd script");
+
+        // The real bug: a bare name has no directory of its own for `Command::new` to even
+        // consider, and this tempdir is deliberately not on `PATH`, so this must fail exactly
+        // the way a real, PATH-searched-but-`.exe`-only bare name lookup would for a real
+        // `.cmd`-only install - `NotFound`, never anything else.
+        let bare_name_result = Command::new("lsp_core_fake_server").output();
+        let bare_name_err = bare_name_result.expect_err(
+            "a bare name must never find a sibling .cmd file - this is the real bug being fixed",
+        );
+        assert_eq!(bare_name_err.kind(), std::io::ErrorKind::NotFound);
+
+        // The real fix: an explicit, already-resolved absolute path (carrying its own real
+        // `.cmd` extension) lets `std`'s own batch-file detection - `spawn_with_attributes`'s
+        // `is_batch_file` check in the same vendored `windows.rs` - take over and run it through
+        // `cmd.exe /c` correctly.
+        let output = Command::new(&script)
+            .output()
+            .expect("a real .cmd file must spawn successfully once given its own resolved path");
+        assert!(
+            output.status.success(),
+            "the real script must exit successfully"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("ready"),
+            "the real script's own stdout must actually be captured"
+        );
+    }
+
     /// Whether a `GotoDefinitionResponse` carries zero locations - a distinct "not resolved
     /// yet" case for the `Array`/`Link` shapes (an empty `Vec` is legal for either, spec-wise),
     /// used by [`rust_analyzer_returns_a_real_definition_location_for_a_call_site`] to keep
@@ -1476,8 +1624,10 @@ mod tests {
         }
     }
 
-    /// Direct `/proc/<pid>` existence check, reused by every lifecycle test below - the same
-    /// technique `pty-core`'s own tests use to prove a process is genuinely gone.
+    /// Direct `/proc/<pid>` existence check, reused by every real lifecycle test below - the
+    /// same technique `pty-core`'s own tests use to prove a process is genuinely gone. Unix-only
+    /// (like `crate::proc` itself, and every real caller below).
+    #[cfg(unix)]
     fn pid_exists(pid: u32) -> bool {
         proc::pid_exists(pid)
     }
@@ -1813,6 +1963,14 @@ mod tests {
         );
     }
 
+    // Unix-only: exercises `crate::proc`'s own real `/proc`-descendant-tree walk directly
+    // (`proc::collect_descendant_pids`), which only exists on unix (see that module's own docs -
+    // the real Windows kill path uses `std::process::Child::kill()` directly instead, with no
+    // process-tree concept to walk). This test genuinely never compiled on Windows before this
+    // fix - `proc`/`nix` are both gated `#[cfg(unix)]` at their own declaration site
+    // (`crate::lib.rs`/`Cargo.toml`'s `[target.'cfg(unix)'.dependencies]`), a real, pre-existing
+    // gap this project's own CI never caught since it only ever built (not tested) on Windows.
+    #[cfg(unix)]
     #[test]
     fn spawn_performs_a_real_handshake_and_shutdown_leaves_no_orphan() {
         let project = write_scratch_project("fn main() {}\n");
@@ -1848,6 +2006,9 @@ mod tests {
         );
     }
 
+    /// Unix-only - real `pid_exists` (`crate::proc`) has no Windows equivalent here (see that
+    /// helper's own docs).
+    #[cfg(unix)]
     #[test]
     fn drop_without_shutdown_does_not_leave_an_orphaned_process() {
         let project = write_scratch_project("fn main() {}\n");
@@ -2238,6 +2399,11 @@ mod tests {
     /// `shutdown()` ever called), the reader thread must genuinely observe the connection close
     /// and flip [`LspClient::is_connection_alive`] to `false` - a real, honest, tested signal,
     /// not just a `log::warn!` line nothing else ever reads.
+    ///
+    /// Unix-only for the same real reason as `spawn_performs_a_real_handshake_and_shutdown_leaves_no_orphan`
+    /// above - this test's own real "kill it out from under the client" step uses `crate::proc`/
+    /// `nix` directly, both unix-only.
+    #[cfg(unix)]
     #[test]
     fn killing_the_real_process_flips_is_connection_alive_to_false() {
         let project = write_scratch_project("fn main() {}\n");

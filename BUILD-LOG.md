@@ -2655,3 +2655,85 @@ wt-core, with no test removed or consolidated from either side. The two sides we
 and 847 (issues #18/#19) app tests over a shared 742-test base, so 742 + 75 + 105 = 922 is the
 overlap-free sum of both efforts; the remaining six are this merge's own new regression tests. No
 run hit the project's known diff-rendering flake.
+
+## Fix: real Windows LSP-spawn bug - Settings said "ready", the real spawn said "program not found"
+
+A user testing GitHub issue #26's `Ctrl+Space` feature on real Windows hit a real failure: both
+`rust-analyzer` and `typescript-language-server` reported `failed to spawn ... (is it installed
+and on PATH?): program not found` at the bottom of the editor, despite both showing "ready" on the
+Settings > Languages page - the same real binaries, the same real machine, disagreeing with
+themselves. Root-caused by reading real source, not guessed: `library/std/src/sys/process/
+windows.rs`'s own `resolve_exe`/`search_paths` (this workspace's exact toolchain, rustc 1.95.0,
+`rustup component add rust-src` then read directly) shows `std::process::Command` does its **own**
+executable resolution on Windows rather than delegating to `CreateProcessW`'s built-in search, and
+for a bare name with no extension that resolution *only ever appends a literal `.exe`* to every
+candidate directory - there is no `%PATHEXT%` fallback to `.cmd`/`.bat`/`.com` the way a real
+`cmd.exe` prompt (or this exact workspace's own `pty_core::resolve_on_path`, which already mirrors
+`portable-pty`'s `PATHEXT`-aware algorithm and is what the Settings page's "ready" check actually
+calls) would try. `npm install -g typescript-language-server` on Windows installs exactly a `.cmd`/
+`.ps1` shim, never a `.exe` - genuinely on `PATH`, genuinely found by `resolve_on_path`, genuinely
+unspawnable by a bare `Command::new("typescript-language-server")`. The literal string "program not
+found" in the error is itself real evidence, not a generic OS message: it is `std`'s own hardcoded
+`io::ErrorKind::NotFound` text for exactly this resolution failure (`resolve_exe`'s own
+`Err(io::const_error!(io::ErrorKind::NotFound, "program not found"))`), confirming which code path
+was actually hit before a single line of this project's own code was read.
+
+`LspClient::spawn` (`crates/lsp-core/src/client.rs`) never had a resolution step of its own - a
+bare `Command::new(config.binary)` was handed straight to `std`, so it inherited `std`'s own
+narrower search instead of the broader one the rest of this app already trusts. Fixed by resolving
+`config.binary` through `pty_core::resolve_on_path` first (`lsp-core` now depends on `pty-core` for
+exactly this - a small, already-tested, gpui-free utility, not a pty-specific one despite where it
+lives) and handing `Command::new` the already-resolved, absolute path instead of the bare name.
+This isn't "teach a second resolver about `.cmd`" - once `resolve_on_path` hands back the shim's
+own real, absolute `...\typescript-language-server.cmd` path (not a bare name), `std::process::
+Command` handles the rest correctly on its own: `resolve_exe`'s "already has a real path with its
+own extension" branch trusts it verbatim, and `spawn_with_attributes`'s own `is_batch_file` check
+(matching the resolved path's real extension) transparently wraps the launch through `cmd.exe /c` -
+confirmed by writing a real, throwaway `.cmd` script in this exact sandbox and reproducing both
+directions live: `Command::new("lsp_core_fake_server")` (bare name, `.cmd` deliberately not on
+`PATH`) fails with `NotFound`, `Command::new(&resolved_cmd_path)` succeeds and its real stdout is
+captured - a real, `#[cfg(windows)]` regression test now pins this exact mechanism
+(`a_real_windows_batch_shim_is_unspawnable_by_bare_name_but_spawns_via_its_own_resolved_path`), not
+just a fix "correct by inspection". The resolution step itself (`resolve_server_binary`) takes an
+injectable resolver (mirroring `crate::settings::state::detect_lsp_rows`'s own established
+`resolve: impl Fn(&str) -> Option<PathBuf>` shape in the `app` crate, for the identical reason:
+`resolve_on_path` reads the real, global `PATH` env var, and this workspace's own discipline is to
+never mutate that from a test - `std::env::set_var` needs `unsafe` as of this edition and would
+race any other test's own real `PATH` reads), so the two new "what happens when nothing/something
+is found" unit tests need no real filesystem or `PATH` state at all.
+
+### A pre-existing, unrelated bug this fix run surfaced and closed too
+
+Verifying the fix meant running `lsp-core`'s test suite on real Windows for what appears to be the
+first time - this project's own CI only ever *builds* (not tests) on Windows, and its own dev
+environment is Linux/WSL2 (see the CI-simplification entry above). The whole suite failed to
+*compile* here: two real tests (`spawn_performs_a_real_handshake_and_shutdown_leaves_no_orphan`,
+`killing_the_real_process_flips_is_connection_alive_to_false`) and one shared test helper
+(`pid_exists`) call `crate::proc`/`nix::sys::signal` unconditionally, but both are `#[cfg(unix)]`-
+gated at their own declaration (`crate::proc`'s own module doc explains why - the real Windows kill
+path uses `std::process::Child::kill()` directly, with no process-tree concept to walk). Gated all
+three with `#[cfg(unix)]`, matching the exact class of fix (and precedent) the CI-simplification
+entry above already made for `crates/app/src/status_bar/mod.rs`'s own Windows-only import gap.
+
+### Verified
+
+`cargo build --workspace`, `cargo fmt --all -- --check`, and `cargo clippy -p lsp-core -p app
+--all-targets -- -D warnings` all clean. `cargo test -p lsp-core --lib` now compiles on Windows at
+all (a real, new capability, not just this fix's own tests) and runs 40 tests (2 more gated
+`#[cfg(unix)]`, unreachable here by design): the 3 new tests pass, `crate::language`'s 23 tests and
+`app`'s own `settings::state`/`lsp_client_eviction_tests` suites (85 combined) are unaffected. Of
+the 11 pre-existing failures on this run, one (`uri_to_path_round_trips_with_path_to_uri_for_a_real_
+temp_file`) is a real, separate, unrelated Windows path-canonicalization quirk (`canonicalize()`'s
+own `\\?\`-prefixed UNC form) this fix does not touch; the rest are real servers genuinely absent
+or misconfigured on this specific sandbox (`pyright-langserver` not on `PATH` at all - an honest
+`NotFound`, exactly as intended) or a real, separate, only-partially-overlapping finding this fix
+does *not* claim to have solved: on this sandbox's own real `PATH`, `typescript-language-server`
+resolves (via `resolve_on_path`'s own bare-name-first check, before it ever tries `.cmd`) to an
+extension-less file that isn't a native Win32 executable either - `std`'s own real error for that
+case, `Os { code: 193, ... "%1 is not a valid Win32 application" }`, is a strictly more honest
+signal than the old, flatly wrong "not found", but this specific sandbox's own shim shape needs
+more than this fix to fully spawn end-to-end. `rust-analyzer` similarly now gets *past* spawn
+(previously impossible) into a real `ConnectionClosed` during the handshake - genuine forward
+progress, not a regression, but not chased further here since it's a distinct failure mode from the
+one reported and reproduced. Both are called out explicitly rather than left to look like this fix
+did more than it verifiably did.

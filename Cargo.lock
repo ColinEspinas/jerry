@@ -4244,6 +4244,7 @@ dependencies = [
  "log",
  "lsp-types",
  "nix",
+ "pty-core",
  "serde",
  "serde_json",
  "tempfile",
