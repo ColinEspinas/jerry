@@ -737,8 +737,17 @@ impl AdeApp {
                     .overflow_hidden()
                     .text_color(theme::text::STRONG)
                     // A real caret glyph, so an empty field still reads as "type here" rather
-                    // than as a blank row.
-                    .child(format!("{name}\u{2502}")),
+                    // than as a blank row - blinking (GitHub issue #27), same shared loop
+                    // (`Self::tree_focus_handle` is wired into `crate::root::caret_blink` too) the
+                    // code editor's/palette's own carets use. Same reasoning as the palette's own
+                    // caret for why no separate "unfocused" case is needed here: this row only
+                    // renders while `Self::tree_inline_edit` is genuinely open and
+                    // `tree_focus_handle` is its own real focus target for that whole time.
+                    .child(if self.caret_blink_visible {
+                        format!("{name}\u{2502}")
+                    } else {
+                        name
+                    }),
             )
             .when_some(edit.error.clone(), |el, error| {
                 el.child(

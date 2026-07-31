@@ -44,7 +44,13 @@
 //! `crate::terminal::pane::TerminalPane`'s live cells, grid, and pty. `follow_system_text_size`
 //! stays persisted-only - investigated and found to have no real backing signal available (see
 //! `crate::settings::render`'s `toggle_follow_system_text_size` docs for the specific Linux
-//! GPUI APIs checked).
+//! GPUI APIs checked). `caret_style`/`caret_blink` (GitHub issue #27) are both real, applied
+//! inputs too - `crate::code_surface::editing::render_editable_file_view_line` reads
+//! `caret_style` to choose the painted caret shape (line/block/underline) and `caret_blink`
+//! (alongside the real, always-available `gpui::App::reduce_motion` - see
+//! `crate::root::caret_blink`'s module docs for why that, not real OS-level
+//! prefers-reduced-motion detection, is the honest mechanism this GPUI version exposes) gates
+//! whether `crate::root::AdeApp`'s shared blink loop ever starts at all.
 //!
 //! ## Editor zoom is one global, persisted number now (was three overlapping mechanisms)
 //!
@@ -114,6 +120,14 @@ pub struct AppearanceSettings {
     /// display and `code_surface::zoom::clamp_zoom_percent`'s step logic carry over unchanged - only
     /// *where* the number lives (persisted here, globally) changed.
     pub editor_zoom_percent: u16,
+    /// The code editor's real painted caret shape (GitHub issue #27) - see [`CaretStyle`]'s own
+    /// docs for what each variant paints.
+    pub caret_style: CaretStyle,
+    /// Whether the caret blinks while idle (GitHub issue #27's "no blink" setting). `true`
+    /// (blinking) is the default, matching every mainstream editor's own default; `false` keeps
+    /// the caret permanently solid whenever it would otherwise be visible - see
+    /// `crate::root::caret_blink`'s module docs for the real blink mechanism this gates.
+    pub caret_blink: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -124,6 +138,39 @@ impl Default for AppearanceSettings {
             terminal_font_size: 12.5,
             follow_system_text_size: false,
             editor_zoom_percent: EDITOR_ZOOM_PERCENT_DEFAULT,
+            caret_style: CaretStyle::default(),
+            caret_blink: true,
+        }
+    }
+}
+
+/// The code editor's real painted caret shape (GitHub issue #27: "caret width and style
+/// configurable (line / block / underline) in user settings"). Read by
+/// `crate::code_surface::editing::render_editable_file_view_line`, which is the only real
+/// consumer - see that function's own docs for the exact quad each variant paints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CaretStyle {
+    /// A thin vertical bar just before the character at the caret - every mainstream editor's
+    /// own default, and this app's pre-issue-#27 behavior.
+    #[default]
+    #[serde(rename = "line")]
+    Line,
+    /// A filled block the width of the character at the caret (or [`CARET_BLOCK_FALLBACK_WIDTH`]
+    /// at the real end of a line, where there is no character to measure).
+    #[serde(rename = "block")]
+    Block,
+    /// A thin horizontal bar under the character at the caret.
+    #[serde(rename = "underline")]
+    Underline,
+}
+
+impl CaretStyle {
+    /// The Appearance settings page's label for this style.
+    pub fn label(self) -> &'static str {
+        match self {
+            CaretStyle::Line => "Line",
+            CaretStyle::Block => "Block",
+            CaretStyle::Underline => "Underline",
         }
     }
 }
@@ -485,7 +532,8 @@ pub fn config_keys_line(page: ConfigPage) -> &'static str {
         ConfigPage::Appearance => {
             "appearance.interface_scale_percent \u{b7} appearance.editor_font_size \u{b7} \
              appearance.terminal_font_size \u{b7} appearance.follow_system_text_size \u{b7} \
-             appearance.editor_zoom_percent"
+             appearance.editor_zoom_percent \u{b7} appearance.caret_style \u{b7} \
+             appearance.caret_blink"
         }
         ConfigPage::Theme => {
             "theme.name \u{b7} theme.follow_system \u{b7} theme.high_contrast_diff"
@@ -896,6 +944,8 @@ mod tests {
             terminal_font_size: 13.5,
             follow_system_text_size: true,
             editor_zoom_percent: 130,
+            caret_style: CaretStyle::Block,
+            caret_blink: false,
         };
         let before = appearance.clone();
 

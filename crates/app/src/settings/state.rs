@@ -534,6 +534,11 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::EditorSelectRight" => Some("Editor: extend selection right"),
         "app::EditorSelectUp" => Some("Editor: extend selection up"),
         "app::EditorSelectDown" => Some("Editor: extend selection down"),
+        // GitHub issue #27's "Ctrl+Shift+arrows (word-wise)".
+        "app::EditorWordLeft" => Some("Editor: move left one word"),
+        "app::EditorWordRight" => Some("Editor: move right one word"),
+        "app::EditorSelectWordLeft" => Some("Editor: extend selection left one word"),
+        "app::EditorSelectWordRight" => Some("Editor: extend selection right one word"),
         "app::EditorHome" => Some("Editor: go to line start"),
         "app::EditorEnd" => Some("Editor: go to line end"),
         "app::EditorSelectAll" => Some("Editor: select all"),

@@ -466,6 +466,8 @@ impl AdeApp {
                             hovered_byte_range,
                             hover_target: hover_target.as_deref(),
                             inline_blame: is_current.then_some(inline_blame.as_ref()).flatten(),
+                            caret_style: this.settings.appearance.caret_style,
+                            caret_blink_visible: this.caret_blink_visible,
                         };
                         rows.push(
                             crate::code_surface::editing::render_editable_file_view_line(

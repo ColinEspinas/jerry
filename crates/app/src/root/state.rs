@@ -41,6 +41,30 @@ impl AdeApp {
         // time, which for a worktree this file has never seen (including a freshly created one)
         // is nothing at all.
 
+        // Built before the `Self` literal below (rather than inline as `cx.focus_handle()` at
+        // their own field positions, as every other focus handle in this literal is) because
+        // `AdeApp::wire_caret_blink` needs real, already-constructed handles to subscribe to -
+        // there is no `self` yet to read them back off of at this point in construction. Moved
+        // into the literal below by their own field-init-shorthand once wiring is done.
+        let code_focus_handle = cx.focus_handle();
+        let merge_edit_focus_handle = cx.focus_handle();
+        let palette_focus_handle = cx.focus_handle();
+        let tree_focus_handle = cx.focus_handle();
+        let filter_focus_handle = cx.focus_handle();
+        let settings_keymap_filter_focus_handle = cx.focus_handle();
+        let caret_blink_subscriptions = AdeApp::wire_caret_blink(
+            &[
+                &code_focus_handle,
+                &merge_edit_focus_handle,
+                &palette_focus_handle,
+                &tree_focus_handle,
+                &filter_focus_handle,
+                &settings_keymap_filter_focus_handle,
+            ],
+            window,
+            cx,
+        );
+
         let mut this = Self {
             file_tree_root: repo_path.clone(),
             diff_root: repo_path.clone(),
@@ -78,7 +102,7 @@ impl AdeApp {
             tree_clipboard: None,
             tree_delete_confirm: None,
             tree_op_error: None,
-            tree_focus_handle: cx.focus_handle(),
+            tree_focus_handle,
             file_tree_bounds: gpui::Bounds::default(),
             _tree_delete_task: None,
             _tree_copy_task: None,
@@ -88,8 +112,16 @@ impl AdeApp {
             open_diff_file_cache: None,
             selected_tree_path: None,
             code_view: code_view::CodeView::Diff,
-            code_focus_handle: cx.focus_handle(),
+            code_focus_handle,
             code_focus: OverlayFocus::default(),
+            // `true`/`Task::ready(())`: no blink loop is running yet (nothing is focused at
+            // construction - a fresh window focuses the initial session's terminal pane, not
+            // the code editor, a few lines below), and `Self::start_caret_blink` will replace
+            // this the moment a real caret-bearing handle is - see
+            // `crate::root::caret_blink`'s module docs.
+            caret_blink_visible: true,
+            _caret_blink_task: Task::ready(()),
+            _caret_blink_subscriptions: caret_blink_subscriptions,
             file_view_scroll_handle: UniformListScrollHandle::new(),
             diff_view_scroll_handle: gpui::ScrollHandle::new(),
             file_view_cache: None,
@@ -121,7 +153,7 @@ impl AdeApp {
             palette_scope: palette::PaletteScope::default(),
             palette_query: text_history::TextField::new(),
             palette_selected: 0,
-            palette_focus_handle: cx.focus_handle(),
+            palette_focus_handle,
             palette_focus: OverlayFocus::default(),
             palette_file_candidates: Vec::new(),
             rail_width: px(layout::RAIL_DEFAULT),
@@ -130,7 +162,7 @@ impl AdeApp {
             title_bar_move_armed: false,
             rail_mode: RailMode::default(),
             filter_query: text_history::TextField::new(),
-            filter_focus_handle: cx.focus_handle(),
+            filter_focus_handle,
             rail_focus_handle: cx.focus_handle(),
             diff_cache: HashMap::new(),
             worktree_notes: HashMap::new(),
@@ -156,7 +188,7 @@ impl AdeApp {
             merge_op_in_flight: false,
             merge_highlight_cache: None,
             merge_edit: None,
-            merge_edit_focus_handle: cx.focus_handle(),
+            merge_edit_focus_handle,
             merge_edit_scroll_handle: UniformListScrollHandle::new(),
             merge_edit_row_layout: HashMap::new(),
             merge_edit_last_layout: None,
@@ -212,7 +244,7 @@ impl AdeApp {
             lsp_rows: Vec::new(),
             _lsp_rows_task: None,
             settings_keymap_filter: text_history::TextField::new(),
-            settings_keymap_filter_focus_handle: cx.focus_handle(),
+            settings_keymap_filter_focus_handle,
             keymap_recording: None,
             _keymap_intercept: None,
             keymap_rebind_error: None,

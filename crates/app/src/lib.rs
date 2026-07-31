@@ -238,6 +238,25 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("shift-right", root::EditorSelectRight, Some("file-editor")),
         gpui::KeyBinding::new("shift-up", root::EditorSelectUp, Some("file-editor")),
         gpui::KeyBinding::new("shift-down", root::EditorSelectDown, Some("file-editor")),
+        // GitHub issue #27's "Ctrl+Shift+arrows (word-wise)" - `secondary-*` is this same
+        // codebase's own established platform-aware Ctrl/Cmd alias (`secondary-a`/`secondary-c`/
+        // etc. immediately below), not a new convention.
+        gpui::KeyBinding::new("secondary-left", root::EditorWordLeft, Some("file-editor")),
+        gpui::KeyBinding::new(
+            "secondary-right",
+            root::EditorWordRight,
+            Some("file-editor"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-shift-left",
+            root::EditorSelectWordLeft,
+            Some("file-editor"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-shift-right",
+            root::EditorSelectWordRight,
+            Some("file-editor"),
+        ),
         gpui::KeyBinding::new("home", root::EditorHome, Some("file-editor")),
         gpui::KeyBinding::new("end", root::EditorEnd, Some("file-editor")),
         gpui::KeyBinding::new("secondary-a", root::EditorSelectAll, Some("file-editor")),
@@ -314,6 +333,22 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("shift-right", root::EditorSelectRight, Some("merge-editor")),
         gpui::KeyBinding::new("shift-up", root::EditorSelectUp, Some("merge-editor")),
         gpui::KeyBinding::new("shift-down", root::EditorSelectDown, Some("merge-editor")),
+        gpui::KeyBinding::new("secondary-left", root::EditorWordLeft, Some("merge-editor")),
+        gpui::KeyBinding::new(
+            "secondary-right",
+            root::EditorWordRight,
+            Some("merge-editor"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-shift-left",
+            root::EditorSelectWordLeft,
+            Some("merge-editor"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-shift-right",
+            root::EditorSelectWordRight,
+            Some("merge-editor"),
+        ),
         gpui::KeyBinding::new("home", root::EditorHome, Some("merge-editor")),
         gpui::KeyBinding::new("end", root::EditorEnd, Some("merge-editor")),
         gpui::KeyBinding::new("secondary-a", root::EditorSelectAll, Some("merge-editor")),

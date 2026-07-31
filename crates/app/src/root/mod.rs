@@ -154,6 +154,10 @@ actions!(
         EditorSelectRight,
         EditorSelectUp,
         EditorSelectDown,
+        EditorWordLeft,
+        EditorWordRight,
+        EditorSelectWordLeft,
+        EditorSelectWordRight,
         EditorHome,
         EditorEnd,
         EditorSelectAll,
@@ -405,6 +409,23 @@ pub struct AdeApp {
     pub(crate) code_focus_handle: FocusHandle,
     /// Pre-open focus target for [`Self::code_focus_handle`] - see [`OverlayFocus`].
     pub(crate) code_focus: OverlayFocus,
+    /// Real, shared caret blink state (GitHub issue #27) - see `crate::root::caret_blink`'s
+    /// module docs for the whole mechanism. `true` means the caret is in its "on" (painted)
+    /// phase right now; every caret-bearing surface's own render call site
+    /// (`crate::code_surface::editing::render_editable_file_view_line`) reads this alongside its
+    /// own `FocusHandle::is_focused` check, so a caret only actually blinks while it is both the
+    /// real live caret *and* genuinely focused.
+    pub(crate) caret_blink_visible: bool,
+    /// The live blink loop, restarted by [`Self::reset_caret_blink`]/
+    /// [`Self::start_caret_blink`] on every real cursor-moving action, edit, or focus change so a
+    /// stale timer can never fire after the caret it was blinking has moved on -
+    /// `Task::ready(())` (already-finished, fires nothing) is the real idle value.
+    pub(crate) _caret_blink_task: Task<()>,
+    /// `cx.on_focus`/`cx.on_blur` subscriptions on every real caret-bearing `FocusHandle` this
+    /// app has, wired once in [`Self::new_with_settings`] - see
+    /// `crate::root::caret_blink::AdeApp::wire_caret_blink`. Held for this instance's whole
+    /// lifetime; an unheld `gpui::Subscription` is dropped, and a dropped one stops firing.
+    pub(crate) _caret_blink_subscriptions: Vec<Subscription>,
     /// The File view's `uniform_list` scroll handle (`gpui::UniformListScrollHandle`, matching
     /// `vendor/zed/crates/git_ui/src/git_panel.rs`'s `commit_history_scroll_handle` use of the
     /// same type) - driven by go-to-definition landing on a distant [`Self::code_cursor`] line,
@@ -1768,6 +1789,7 @@ mod settings_persist_tests {
     }
 }
 
+pub(crate) mod caret_blink;
 pub(crate) mod focus;
 pub mod layout;
 pub(crate) mod new_file;

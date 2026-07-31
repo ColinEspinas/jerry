@@ -193,6 +193,7 @@ impl AdeApp {
         let Some(entry) = self.completions.take() else {
             self.replace_text_in_range(None, "\n", window, cx);
             self.sync_cursor_and_scroll();
+            self.reset_caret_blink(cx);
             return;
         };
         self.completions_generation = self.completions_generation.wrapping_add(1);
@@ -200,18 +201,21 @@ impl AdeApp {
             cx.notify();
             self.replace_text_in_range(None, "\n", window, cx);
             self.sync_cursor_and_scroll();
+            self.reset_caret_blink(cx);
             return;
         };
         let Some(item) = items.get(selected) else {
             cx.notify();
             self.replace_text_in_range(None, "\n", window, cx);
             self.sync_cursor_and_scroll();
+            self.reset_caret_blink(cx);
             return;
         };
         let Some(buffer) = self.edit_buffers.get_mut(&entry.path) else {
             cx.notify();
             self.replace_text_in_range(None, "\n", window, cx);
             self.sync_cursor_and_scroll();
+            self.reset_caret_blink(cx);
             return;
         };
 
@@ -227,6 +231,7 @@ impl AdeApp {
         self.schedule_rehighlight(path.clone(), cx);
         self.schedule_lsp_sync(path, cx);
         self.sync_cursor_and_scroll();
+        self.reset_caret_blink(cx);
         cx.notify();
     }
 

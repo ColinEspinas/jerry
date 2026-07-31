@@ -98,6 +98,31 @@ use crate::code_surface::code_view;
 use crate::language::HighlighterFn;
 use crate::text_history::{self, EditKind, SelectionSnapshot, TextEdit, TextHistory};
 
+/// A character's real class for word-wise caret movement/selection (GitHub issue #27) - see
+/// [`EditBuffer::previous_word_boundary`]'s own docs for why this app hand-classifies rather
+/// than using `unicode_segmentation`'s UAX #29 word boundaries for this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordClass {
+    Whitespace,
+    /// A letter, digit, or underscore - grouped together so `foo_bar123` is one real word, not
+    /// three.
+    Word,
+    /// Anything else (`.`, `(`, `)`, `-`, ...) - a real code editor's own word-navigation stops
+    /// at these individually from surrounding word text, but groups a *run* of them together
+    /// (`()` is one hop, not two), matching this app's own real test coverage.
+    Punctuation,
+}
+
+fn word_class(ch: char) -> WordClass {
+    if ch.is_whitespace() {
+        WordClass::Whitespace
+    } else if ch.is_alphanumeric() || ch == '_' {
+        WordClass::Word
+    } else {
+        WordClass::Punctuation
+    }
+}
+
 /// One open file's real, live-edited text plus real cursor/selection/IME-composition state - see
 /// this module's own docs. `selected_range`/`marked_range` are byte offsets into [`Self::content`]
 /// (never UTF-16 code units - that conversion happens only at `crate::code_surface::editing`'s
@@ -1134,6 +1159,192 @@ impl EditBuffer {
         self.select_to(self.content.len());
     }
 
+    /// Real, line-scoped word boundary just before `offset` (GitHub issue #27:
+    /// "Ctrl+Shift+arrows (word-wise)") - a maximal run of same-[`WordClass`] characters,
+    /// skipping over runs of whitespace rather than stopping on them (the same "scan only the
+    /// current line, not the whole buffer" perf discipline [`Self::previous_boundary`] already
+    /// established - see that method's own docs for the measured cost of a whole-buffer scan on
+    /// a large file). Crossing a line boundary (`offset` already at/before this line's own
+    /// start) lands on the previous line's real end, exactly like [`Self::previous_boundary`].
+    ///
+    /// Deliberately *not* `unicode_segmentation::UnicodeSegmentation::split_word_bound_indices`
+    /// (this buffer's own grapheme-boundary methods' crate, and this method's first real
+    /// implementation): that crate's word boundaries are UAX #29's, designed for natural-language
+    /// prose, where e.g. `WB6`/`WB7` deliberately keep `foo.bar` as *one* unbroken word (a
+    /// mid-word `.`/`'`/`:` between two letters doesn't break, matching "don't"/"e.g." staying
+    /// whole) - real, correct behavior for prose, but wrong for source code, where every real
+    /// code editor's own word-navigation stops at `.` in `foo.bar()` (confirmed by writing the
+    /// real test this docstring sits above against that assumption first - it failed against the
+    /// UAX #29 result, `foo.bar` treated as one hop, not the real, expected two).
+    fn previous_word_boundary(&self, offset: usize) -> usize {
+        let (line, _) = self.line_col_for_offset(offset);
+        let Some(line_range) = self.line_ranges.get(line).cloned() else {
+            return 0;
+        };
+        if offset <= line_range.start {
+            return if line == 0 {
+                0
+            } else {
+                self.line_ranges[line - 1].end
+            };
+        }
+        let local_offset = offset - line_range.start;
+        let text = &self.content[line_range.clone()];
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let mut cursor = chars.iter().rposition(|&(index, _)| index < local_offset);
+        while let Some(pos) = cursor {
+            if word_class(chars[pos].1) == WordClass::Whitespace {
+                cursor = pos.checked_sub(1);
+            } else {
+                break;
+            }
+        }
+        let Some(mut start) = cursor else {
+            return line_range.start;
+        };
+        let class = word_class(chars[start].1);
+        while start > 0 && word_class(chars[start - 1].1) == class {
+            start -= 1;
+        }
+        line_range.start + chars[start].0
+    }
+
+    /// The mirror of [`Self::previous_word_boundary`] - see its own docs for why this is a
+    /// hand-classified scan rather than `unicode_segmentation`'s UAX #29 word boundaries.
+    fn next_word_boundary(&self, offset: usize) -> usize {
+        let (line, _) = self.line_col_for_offset(offset);
+        let Some(line_range) = self.line_ranges.get(line).cloned() else {
+            return self.content.len();
+        };
+        if offset >= line_range.end {
+            return self
+                .line_ranges
+                .get(line + 1)
+                .map(|next| next.start)
+                .unwrap_or(self.content.len());
+        }
+        let local_offset = offset - line_range.start;
+        let text = &self.content[line_range.clone()];
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let mut cursor = chars.iter().position(|&(index, _)| index >= local_offset);
+        while let Some(pos) = cursor {
+            if word_class(chars[pos].1) == WordClass::Whitespace {
+                cursor = (pos + 1 < chars.len()).then_some(pos + 1);
+            } else {
+                break;
+            }
+        }
+        let Some(mut end) = cursor else {
+            return line_range.end;
+        };
+        let class = word_class(chars[end].1);
+        while end + 1 < chars.len() && word_class(chars[end + 1].1) == class {
+            end += 1;
+        }
+        let end_byte = chars
+            .get(end + 1)
+            .map(|&(index, _)| index)
+            .unwrap_or(text.len());
+        line_range.start + end_byte
+    }
+
+    /// `Ctrl+Left`: collapses a real selection to its start, or moves the caret to the start of
+    /// the previous real word.
+    pub fn move_word_left(&mut self) {
+        self.goal_column = None;
+        if self.selected_range.is_empty() {
+            let previous = self.previous_word_boundary(self.cursor_offset());
+            self.move_to(previous);
+        } else {
+            self.move_to(self.selected_range.start);
+        }
+    }
+
+    /// The mirror of [`Self::move_word_left`].
+    pub fn move_word_right(&mut self) {
+        self.goal_column = None;
+        if self.selected_range.is_empty() {
+            let next = self.next_word_boundary(self.cursor_offset());
+            self.move_to(next);
+        } else {
+            self.move_to(self.selected_range.end);
+        }
+    }
+
+    /// `Ctrl+Shift+Left`: extends the selection to the start of the previous real word.
+    pub fn select_word_left(&mut self) {
+        self.goal_column = None;
+        let previous = self.previous_word_boundary(self.cursor_offset());
+        self.select_to(previous);
+    }
+
+    /// `Ctrl+Shift+Right`: extends the selection to the end of the next real word.
+    pub fn select_word_right(&mut self) {
+        self.goal_column = None;
+        let next = self.next_word_boundary(self.cursor_offset());
+        self.select_to(next);
+    }
+
+    /// Double-click word select (GitHub issue #27): selects the maximal real same-[`WordClass`]
+    /// run touching `offset` (see [`Self::previous_word_boundary`]'s own docs for why this is a
+    /// hand-classified scan, not `unicode_segmentation`'s natural-language-oriented UAX #29 word
+    /// boundaries). `offset` landing on whitespace (or an empty line) selects nothing - a plain
+    /// caret at `offset` rather than fabricating a plausible-looking word that isn't really
+    /// there.
+    pub fn select_word_at(&mut self, offset: usize) {
+        self.goal_column = None;
+        let (line, _) = self.line_col_for_offset(offset);
+        let Some(line_range) = self.line_ranges.get(line).cloned() else {
+            self.move_to(offset);
+            return;
+        };
+        let local_offset = offset
+            .saturating_sub(line_range.start)
+            .min(line_range.end - line_range.start);
+        let text = &self.content[line_range.clone()];
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        // The char the click actually landed on/just before - the last char whose byte range
+        // contains `local_offset`, or (a click past the last char, e.g. right at the line's real
+        // end) the last char on the line.
+        let Some(mut pos) = chars
+            .iter()
+            .position(|&(index, ch)| local_offset < index + ch.len_utf8())
+            .or_else(|| chars.len().checked_sub(1))
+        else {
+            self.move_to(offset);
+            return;
+        };
+        let class = word_class(chars[pos].1);
+        if class == WordClass::Whitespace {
+            self.move_to(offset);
+            return;
+        }
+        let mut start = pos;
+        while start > 0 && word_class(chars[start - 1].1) == class {
+            start -= 1;
+        }
+        while pos + 1 < chars.len() && word_class(chars[pos + 1].1) == class {
+            pos += 1;
+        }
+        let end_byte = chars
+            .get(pos + 1)
+            .map(|&(index, _)| index)
+            .unwrap_or(text.len());
+        self.selected_range = line_range.start + chars[start].0..line_range.start + end_byte;
+        self.selection_reversed = false;
+    }
+
+    /// Triple-click line select (GitHub issue #27): selects `line`'s whole real text, excluding
+    /// its own line-ending bytes - a no-op (no panic, no change) for an out-of-range `line`.
+    pub fn select_line_at(&mut self, line: usize) {
+        self.goal_column = None;
+        let Some(range) = self.line_ranges.get(line).cloned() else {
+            return;
+        };
+        self.selected_range = range;
+        self.selection_reversed = false;
+    }
+
     /// `Home`: moves the caret to the start of its current line.
     pub fn move_home(&mut self) {
         self.goal_column = None;
@@ -1260,13 +1471,17 @@ impl EditBuffer {
         (start < end).then(|| start - range.start..end - range.start)
     }
 
-    /// The real caret position local to `line`'s text - `None` when there's an active selection
-    /// (no caret bar is drawn then, matching `vendor/zed/crates/gpui/examples/input.rs`'s own
-    /// `TextElement`) or the caret isn't on `line` at all.
+    /// The real caret position local to `line`'s text - `None` when the caret isn't on `line` at
+    /// all. Returns `Some` even while there's an active selection (GitHub issue #27: "caret is
+    /// visible against every theme background, including in selected regions") - this used to
+    /// return `None` whenever [`Self::selected_range`] was non-empty at all, matching
+    /// `vendor/zed/crates/gpui/examples/input.rs`'s own single-line `TextElement`, which never
+    /// draws a separate caret glyph over its own selection fill. That's a reasonable choice for
+    /// a one-line input, but a real code editor's own caret is real, useful information
+    /// (`cursor_offset`, this buffer's own "active end of the selection") a user still needs to
+    /// see while a selection is active - not fabricated, since [`Self::cursor_offset`] already
+    /// names an exact, real position regardless of whether [`Self::selected_range`] is empty.
     pub fn cursor_within_line(&self, line: usize) -> Option<usize> {
-        if !self.selected_range.is_empty() {
-            return None;
-        }
         let range = self.line_ranges.get(line)?;
         let offset = self.cursor_offset();
         // `then_some` eagerly evaluates its argument even when the condition is false - using it
@@ -1292,7 +1507,7 @@ impl EditBuffer {
 mod tests {
     use super::*;
 
-    fn buffer(content: &str) -> EditBuffer {
+    pub(super) fn buffer(content: &str) -> EditBuffer {
         EditBuffer::new(
             PathBuf::from("/tmp/test.rs"),
             content.to_string(),
@@ -1615,6 +1830,22 @@ mod tests {
         assert_eq!(buf.cursor_within_line(0), None);
         assert_eq!(buf.cursor_within_line(1), None);
         assert!(buf.cursor_within_line(2).is_some());
+    }
+
+    /// GitHub issue #27: "caret is visible against every theme background, including in
+    /// selected regions" - `cursor_within_line` must keep reporting the real active end of the
+    /// selection even while one is active, not go back to `None` the moment
+    /// `selected_range` stops being empty.
+    #[test]
+    fn cursor_within_line_stays_some_while_a_selection_is_active() {
+        let mut buf = buffer("hello world");
+        buf.move_to(0);
+        buf.select_to(5); // "hello" selected, caret (active end) at byte 5
+        assert_eq!(
+            buf.cursor_within_line(0),
+            Some(5),
+            "the real active end of the selection must still be reported as the caret position"
+        );
     }
 
     #[test]
@@ -2316,5 +2547,111 @@ mod tests {
         assert!(!buffer.undo());
         assert!(!buffer.redo());
         assert_eq!(buffer.content, "abc\n");
+    }
+}
+
+/// GitHub issue #27's real word-wise-selection and double/triple-click-selection coverage -
+/// `Self::previous_word_boundary`/`Self::next_word_boundary`/`Self::select_word_at`/
+/// `Self::select_line_at`, and the `move_word_*`/`select_word_*` public wrappers around the
+/// first two. A separate module (matching this file's own established precedent, e.g.
+/// `sync_pending_diagnostics_confirmation_tests` in a sibling file) rather than folded into
+/// `mod tests` above, since it's a self-contained real feature slice, not a fix to something
+/// `mod tests` already covers.
+#[cfg(test)]
+mod word_and_click_selection_tests {
+    use super::tests::buffer;
+
+    #[test]
+    fn move_word_right_stops_at_the_end_of_each_real_word() {
+        let mut buf = buffer("foo.bar() baz");
+        buf.move_to(0);
+        buf.move_word_right();
+        assert_eq!(buf.cursor_offset(), 3, "should stop right after \"foo\"");
+        buf.move_word_right();
+        // "." is its own non-whitespace run under UAX #29 word boundaries.
+        assert_eq!(buf.cursor_offset(), 4, "should stop right after \".\"");
+        buf.move_word_right();
+        assert_eq!(buf.cursor_offset(), 7, "should stop right after \"bar\"");
+    }
+
+    #[test]
+    fn move_word_left_stops_at_the_start_of_each_real_word() {
+        let mut buf = buffer("foo.bar() baz");
+        buf.move_to(buf.content.len());
+        buf.move_word_left();
+        assert_eq!(
+            buf.cursor_offset(),
+            10,
+            "should stop at the start of \"baz\""
+        );
+        buf.move_word_left();
+        assert_eq!(buf.cursor_offset(), 7, "should stop at the start of \"()\"");
+    }
+
+    #[test]
+    fn move_word_left_crosses_a_real_line_boundary() {
+        let mut buf = buffer("first\nsecond");
+        buf.move_to(buf.content.len());
+        // "second" is one word - one hop reaches its own start...
+        buf.move_word_left();
+        assert_eq!(buf.cursor_offset(), 6);
+        // ...and a second hop must land on the previous line's real end (byte 5, the newline
+        // itself is not part of either line's text), not panic or stay put.
+        buf.move_word_left();
+        assert_eq!(buf.cursor_offset(), 5);
+    }
+
+    #[test]
+    fn select_word_right_extends_the_real_selection_by_one_word() {
+        let mut buf = buffer("hello world");
+        buf.move_to(0);
+        buf.select_word_right();
+        assert_eq!(buf.selected_range, 0..5, "should select exactly \"hello\"");
+    }
+
+    #[test]
+    fn select_word_at_a_word_selects_the_real_whole_word_under_the_click() {
+        let mut buf = buffer("hello world");
+        // A click landing mid-word ("wor|ld", offset 8) must select the *whole* real word, not
+        // just from the click point onward.
+        buf.select_word_at(8);
+        assert_eq!(
+            buf.selected_range,
+            6..11,
+            "should select the whole real word \"world\""
+        );
+    }
+
+    #[test]
+    fn select_word_at_whitespace_places_a_plain_caret_instead_of_fabricating_a_word() {
+        let mut buf = buffer("hello world");
+        buf.select_word_at(5); // the real space between the two words
+        assert!(
+            buf.selected_range.is_empty(),
+            "clicking real whitespace must not select a plausible-looking word that isn't there"
+        );
+        assert_eq!(buf.cursor_offset(), 5);
+    }
+
+    #[test]
+    fn select_line_at_selects_the_real_whole_line_excluding_its_line_ending() {
+        let mut buf = buffer("first\nsecond\nthird");
+        buf.select_line_at(1);
+        assert_eq!(
+            buf.selected_range,
+            6..12,
+            "should select exactly \"second\", not its trailing newline"
+        );
+    }
+
+    #[test]
+    fn select_line_at_an_out_of_range_line_is_a_real_no_op() {
+        let mut buf = buffer("only one line");
+        let before = buf.selected_range.clone();
+        buf.select_line_at(99);
+        assert_eq!(
+            before, buf.selected_range,
+            "an out-of-range line must not panic or mutate"
+        );
     }
 }

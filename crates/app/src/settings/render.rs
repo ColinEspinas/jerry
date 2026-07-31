@@ -1033,6 +1033,42 @@ impl AdeApp {
                 |this, cx| this.toggle_follow_system_text_size(cx),
             ),
         );
+        let caret_style_choice = self.render_choice_control(
+            "settings-caret-style",
+            &[
+                ChoiceOption::new("Line"),
+                ChoiceOption::new("Block"),
+                ChoiceOption::new("Underline"),
+            ],
+            self.settings.appearance.caret_style.label().to_string(),
+            cx,
+            |this, index, _window, cx| {
+                // Index into the `options` array above, not a label re-match - same discipline
+                // `Self::render_choice_control`'s own docs establish.
+                use settings_store::CaretStyle;
+                let style = match index {
+                    1 => CaretStyle::Block,
+                    2 => CaretStyle::Underline,
+                    _ => CaretStyle::Line,
+                };
+                this.set_caret_style(style, cx);
+            },
+        );
+        let caret_style_row = self.render_settings_row(
+            "Caret style",
+            "How the code editor's real insertion point is drawn.",
+            caret_style_choice,
+        );
+        let caret_blink_row = self.render_settings_row(
+            "Blink caret",
+            "Turn off for a permanently solid caret (also honors reduced-motion).",
+            self.render_toggle_control(
+                "settings-caret-blink",
+                self.settings.appearance.caret_blink,
+                cx,
+                |this, cx| this.toggle_caret_blink(cx),
+            ),
+        );
         div()
             .flex()
             .flex_col()
@@ -1066,6 +1102,18 @@ impl AdeApp {
             .child(editor_font_row)
             .child(terminal_font_row)
             .child(follow_system_row)
+            .child(
+                div()
+                    .pt(px(20.0))
+                    .pb(px(4.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Editing"),
+            )
+            .child(caret_style_row)
+            .child(caret_blink_row)
             .child(self.render_snippet_block(settings_store::ConfigPage::Appearance))
     }
 
@@ -1447,18 +1495,26 @@ impl AdeApp {
             .child(
                 div()
                     .flex_1()
-                    .font(font(theme::font::SANS))
-                    .text_size(px(11.0))
-                    .text_color(if has_query {
-                        theme::text::DIM
-                    } else {
-                        theme::text::GHOST
-                    })
-                    .child(if has_query {
-                        self.settings_keymap_filter.as_str().to_string()
-                    } else {
-                        format!("filter {total} bindings")
-                    }),
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .text_size(px(11.0))
+                            .text_color(if has_query {
+                                theme::text::DIM
+                            } else {
+                                theme::text::GHOST
+                            })
+                            .child(if has_query {
+                                self.settings_keymap_filter.as_str().to_string()
+                            } else {
+                                format!("filter {total} bindings")
+                            }),
+                    )
+                    .child(self.render_simple_input_caret()),
             )
             .child(
                 div()
@@ -1482,6 +1538,9 @@ impl AdeApp {
         if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
             return;
         }
+        // GitHub issue #27's "solid mid-keystroke" - see `crate::palette::render::AdeApp::
+        // handle_palette_key_down`'s identical reasoning.
+        self.reset_caret_blink(cx);
         let changed = match keystroke.key.as_str() {
             "backspace" => self.settings_keymap_filter.pop(Instant::now()),
             // A real, undoable step - see `crate::rail::AdeApp::handle_filter_key_down`'s own
@@ -2048,6 +2107,32 @@ impl AdeApp {
         cx.notify();
     }
 
+    /// `pub(crate)`, not private: `caret_settings_tests` (`crate::code_surface::editing`) drives
+    /// this directly for its own real-render coverage of [`settings_store::CaretStyle`]'s three
+    /// painted shapes, the same edit path the Appearance page's choice control invokes.
+    pub(crate) fn set_caret_style(
+        &mut self,
+        style: settings_store::CaretStyle,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.appearance.caret_style = style;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// `pub(crate)`, not private - see [`Self::set_caret_style`]'s own docs for why
+    /// (`caret_blink_tests`' own real coverage of the shared blink loop this gates).
+    pub(crate) fn toggle_caret_blink(&mut self, cx: &mut Context<Self>) {
+        self.settings.appearance.caret_blink = !self.settings.appearance.caret_blink;
+        // A live toggle takes effect immediately, not just on the next focus/reset - if blink
+        // was just turned off mid-blink-cycle the caret must snap back to solid right away
+        // rather than staying stuck on whichever phase it happened to be in; if it was just
+        // turned on, the idle loop should start fresh rather than waiting for some unrelated
+        // future action to kick it off.
+        self.reset_caret_blink(cx);
+        cx.notify();
+    }
+
     fn adjust_editor_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.settings.appearance.editor_font_size = (self.settings.appearance.editor_font_size
             + delta)
@@ -2448,6 +2533,86 @@ mod settings_lsp_install_action_tests {
             cx.debug_bounds("settings-lsp-install-ready-binary")
                 .is_none(),
             "a ready row has already live-found its binary and should show no Install action"
+        );
+    }
+}
+
+/// GitHub issue #27's "caret width and style configurable ... in user settings" / "no blink
+/// setting" - real coverage for [`AdeApp::set_caret_style`]/[`AdeApp::toggle_caret_blink`],
+/// mirroring `terminal_font_size_tests`' own established "through the real mutator, assert it
+/// actually persisted and applied" discipline.
+#[cfg(test)]
+mod caret_settings_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use crate::settings::store::CaretStyle;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn set_caret_style_changes_the_real_persisted_setting(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.appearance.caret_style),
+            CaretStyle::Line,
+            "sanity check: the real default is Line"
+        );
+
+        app.update(cx, |app, cx| {
+            app.set_caret_style(CaretStyle::Block, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.appearance.caret_style),
+            CaretStyle::Block,
+            "the real Settings field, not a second independent copy, must have changed"
+        );
+
+        app.update(cx, |app, cx| {
+            app.set_caret_style(CaretStyle::Underline, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.appearance.caret_style),
+            CaretStyle::Underline
+        );
+    }
+
+    /// [`AdeApp::toggle_caret_blink`] must both flip the real persisted setting *and* take
+    /// effect immediately on the live blink loop - a toggle that only updated `settings.toml`
+    /// and left a currently-blinking caret blinking (or a currently-solid one solid, if it had
+    /// just been turned back on) until some unrelated future action reset it would be a real,
+    /// user-visible "the toggle didn't do anything until I clicked elsewhere" bug.
+    #[gpui::test]
+    fn toggle_caret_blink_flips_the_real_setting_and_takes_effect_immediately(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        assert!(
+            app.read_with(cx, |app, _| app.settings.appearance.caret_blink),
+            "sanity check: the real default is blinking on"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_caret_blink(cx);
+        });
+        assert!(
+            !app.read_with(cx, |app, _| app.settings.appearance.caret_blink),
+            "the real Settings field must have flipped off"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.caret_blink_visible),
+            "turning blink off must immediately snap the caret to solid/visible, not leave it \
+             wherever the blink phase happened to be"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_caret_blink(cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.settings.appearance.caret_blink),
+            "the real Settings field must have flipped back on"
         );
     }
 }
