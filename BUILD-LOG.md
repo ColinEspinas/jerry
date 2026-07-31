@@ -6068,3 +6068,51 @@ All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `
 unrelated, pre-existing flake (`diff_render_tests::opening_a_real_diff_renders_real_syntax_highlighted_rows`,
 a timing-sensitive async-highlight test in a file untouched by this change) was seen once in a full
 run and passed cleanly both in isolation and on a full-suite rerun - not a regression from this work.
+
+## Two more real fixes on the S-curve shape: a 1px seam, and a wrong merge-line color
+
+Real user feedback on the S-curve redesign above: "everything is good except a small gap of a pixel
+or so in between the connections of lines. Also the line going back to the branch merged should be
+the same color as the branch instead of the color it is being merged in."
+
+**The seam.** `elbow_geometry`'s entry/straight/exit pieces were positioned so the straight bridge's
+own ends land *exactly* on the tangent point each curve's own arc math predicts - correct in theory,
+but a border-radius arc (`render_curve`'s bordered, rounded div) and a straight bridge (a plain
+background-filled div) are two different GPUI rendering paths, and nothing guarantees their
+anti-aliased edges land on the same physical pixel even when the underlying coordinates agree
+exactly. That mismatch reads as a hairline gap right at each entry-to-straight and straight-to-exit
+junction - small enough to have been invisible in the hand-derived arithmetic that verified the
+shape, but visible in the real rendered app. Fixed by always drawing a straight bridge - even between
+lanes exactly `2*RADIUS` apart, where the two curves' own math says they already touch with nothing
+left over - shifted 1px earlier and widened by 2px, so each end overlaps 1px *into* its neighbouring
+curve's own box rather than merely touching it. `ElbowGeometry.straight` changed from
+`Option<StraightSegment>` to a plain `StraightSegment` (always present now); the
+`adjacent_lanes_need_no_straight_segment_at_all` test (asserting `None` in that case) no longer holds
+and was replaced with `adjacent_lanes_still_get_a_minimal_overlapping_straight_bridge`, pinning the
+new 2px-minimum, 1px-overlap-per-side shape directly.
+
+**The merge-line color.** `wt_core::graph::layout_lanes` sets a `Diverging` elbow's `from_lane` to
+*this row's own dot* (the branch being merged **into**) and `to_lane` to the *other* lane (the branch
+actually being merged **in**) - see the doc comment on `ElbowKind::Diverging` itself. The render loop
+colored every elbow with `lane_color(elbow.from_lane)`, which for `Diverging` is backwards: it painted
+the connector with the color of the branch it lands in, not the branch it's carrying. Fixed by pulling
+the color choice out into its own pure function, `elbow_color_lane` (mirroring `elbow_geometry`'s own
+"pure and independently testable" shape, since GPUI's test harness can inspect painted *bounds* via
+`debug_bounds` but has no way to inspect a painted *color*): `Diverging` now resolves to `to_lane`
+(the merged-in branch), `Converging` is unchanged at `from_lane` (the ending lane - there is no
+"merged into" branch at all here, no merge commit is involved, so the ending lane's own color
+continuing is already correct, matching the `ends_here` stub it continues). Added two focused unit
+tests pinning this choice directly by kind.
+
+As with every round on this feature, visual verification remains impossible in this sandbox (GPUI's
+headless test renderer is macOS-only in this pinned revision; this sandbox's own X11 screenshot
+capture is separately, independently broken) - both fixes are verified by hand-derived arithmetic and
+`debug_bounds`/pure-function unit tests, not by looking at the result.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+1111 app + 44 lsp-core + 14 pty-core + 127 wt-core, 0 failed (+2 app tests: the two new
+`elbow_color_lane` unit tests; the wide jump in app/wt-core counts from the prior entry's reported
+928/98 reflects those earlier numbers having been read from a stale or partially-built test binary in
+this sandbox, not any change to those crates in this round - confirmed by grepping the wt-core source
+directly for `#[test]`, which independently counts 127, matching this run exactly).
