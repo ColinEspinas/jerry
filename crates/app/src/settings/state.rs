@@ -547,6 +547,11 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::EditorPaste" => Some("Editor: paste"),
         "app::EditorSave" => Some("Editor: save file"),
         "app::EditorSaveAnyway" => Some("Editor: save file (overwrite external change)"),
+        // Multi-cursor (Revision R13, issue #28).
+        "app::EditorSelectNextOccurrence" => Some("Editor: select next occurrence"),
+        "app::EditorSelectAllOccurrences" => Some("Editor: select all occurrences"),
+        "app::EditorSkipOccurrence" => Some("Editor: skip occurrence"),
+        "app::EditorCollapseCursors" => Some("Editor: collapse cursors"),
         "app::CompletionsUp" => Some("Completions: select previous"),
         "app::CompletionsDown" => Some("Completions: select next"),
         "app::CompletionsAccept" => Some("Completions: accept selected"),
@@ -1126,6 +1131,11 @@ mod tests {
                 "Editor: paste",
                 "Editor: save file",
                 "Editor: save file (overwrite external change)",
+                // Multi-cursor (Revision R13, issue #28).
+                "Editor: select next occurrence",
+                "Editor: select all occurrences",
+                "Editor: skip occurrence",
+                "Editor: collapse cursors",
                 "Completions: select previous",
                 "Completions: select next",
                 "Completions: accept selected",
@@ -1216,6 +1226,11 @@ mod tests {
         // `EditorSelectWordLeft`/`EditorSelectWordRight`, each bound once under `"file-editor"`
         // and once under `"merge-editor"` - the same word-wise-caret-navigation set both real
         // editors share, matching every other `Editor*` action's own dual registration.
+        // Revision R13 (issue #28) added 4 more real scoped bindings, all `Some("file-editor")`
+        // and File-view-only (`crate::merge::editing`'s `"merge-editor"` context deliberately
+        // does not get these): `EditorSelectNextOccurrence` (`Ctrl+D`), `EditorSelectAllOccurrences`
+        // (`Ctrl+Shift+L`), `EditorSkipOccurrence` (`Ctrl+K Ctrl+D`), and `EditorCollapseCursors`
+        // (`Esc`).
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings, &[]);
         assert!(!rows.is_empty());
@@ -1223,12 +1238,13 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            61,
+            65,
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
              every real Completions* binding (5) plus every real merge-editor binding (18) plus \
              Undo/Redo (2) plus TextUndo/TextRedo (3, GitHub issue #17) plus every real \
              file-tree binding (5, GitHub issue #19) plus every real word-wise Editor* binding \
-             (8, GitHub issue #27) to be scoped, not global"
+             (8, GitHub issue #27) plus every real multi-cursor Editor* binding (4, GitHub issue \
+             #28) to be scoped, not global"
         );
         assert!(
             scoped
