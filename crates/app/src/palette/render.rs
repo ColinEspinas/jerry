@@ -399,6 +399,11 @@ impl AdeApp {
         if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
             return;
         }
+        // GitHub issue #27's "solid mid-keystroke" applies to every real caret-bearing input,
+        // not only the code editor - reset unconditionally here, before dispatching on which key
+        // this actually was, since every branch below is a real, live keystroke this input is
+        // handling.
+        self.reset_caret_blink(cx);
         match keystroke.key.as_str() {
             "escape" => {
                 self.close_palette(window, cx);
@@ -533,13 +538,24 @@ impl AdeApp {
         margin_right: gpui::Pixels,
         margin_left: gpui::Pixels,
     ) -> impl IntoElement {
+        // GitHub issue #27's caret blink, applied here too: `Self::palette_focus_handle` is
+        // wired into the same shared blink loop `crate::root::caret_blink` drives for the code
+        // editor (`AdeApp::wire_caret_blink`), and stays genuinely focused for this input's
+        // entire real lifetime - the palette panel's only other interactive children
+        // (`Self::render_palette_scope_control`'s segments) are plain `.on_click()` divs with no
+        // `.track_focus()` of their own, so they never steal keyboard focus away from it. That
+        // means this caret is never actually rendered while unfocused (closing the palette stops
+        // rendering it at all), so unlike the code editor's own caret there's no separate
+        // "dimmed unfocused" case to paint here - `caret_blink_visible` alone is the real, whole
+        // answer for whether to paint it this frame.
+        let visible = self.caret_blink_visible;
         div()
             .flex_none()
             .mr(margin_right)
             .ml(margin_left)
             .w(px(1.5))
             .h(px(16.0))
-            .bg(theme::term::CURSOR)
+            .when(visible, |el| el.bg(theme::term::CURSOR))
             // `debug_selector` is a no-op outside test builds; lets
             // `palette_caret_tests::*` measure the caret's real painted x position in both
             // states and assert it actually moved.
@@ -677,6 +693,7 @@ impl AdeApp {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(&self.palette_results_scroll_handle)
             .flex()
             .flex_col()
             .py(px(4.0));
@@ -685,7 +702,24 @@ impl AdeApp {
         for group in groups {
             container = container.child(self.render_palette_group(group, &mut flat_index, cx));
         }
-        container.into_any_element()
+
+        // See `crate::sidebar::render::AdeApp::render_file_tree`'s own docs on why the scrollbar
+        // must be a sibling of `container`, inside its own non-scrolling `.relative()` wrapper,
+        // never a child of `container` itself (GitHub issue #30).
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(container)
+            .children(self.render_vertical_scrollbar(
+                "palette-results-scrollbar",
+                &self.palette_results_scroll_handle,
+                &[],
+                cx,
+            ))
+            .into_any_element()
     }
 
     pub(in crate::palette) fn render_palette_group(

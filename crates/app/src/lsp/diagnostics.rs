@@ -421,7 +421,7 @@ mod tests {
     fn no_diagnostics_leaves_every_run_untouched_and_unmarked() {
         let runs = vec![
             (SharedString::new("let x: i32 = "), HighlightKind::Keyword),
-            (SharedString::new("\"y\""), HighlightKind::Literal),
+            (SharedString::new("\"y\""), HighlightKind::String),
         ];
         let overlaid = overlay_diagnostic_runs(&runs, &[]);
         assert_eq!(overlaid.len(), 2);

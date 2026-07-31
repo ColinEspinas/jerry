@@ -41,11 +41,12 @@
 //! docs) - the only real "undo" this phase offers is a coarse, whole-buffer
 //! [`AdeApp::discard_merge_hand_edit`].
 
-use gpui::{canvas, fill, point, size, Bounds, ElementInputHandler, Entity, TextRun};
+use gpui::{canvas, fill, point, Bounds, ElementInputHandler, Entity, TextRun};
 
 use super::*;
 use crate::code_surface::editing::split_runs_for_marked_range;
 use crate::code_surface::zoom::zoom_scoped;
+use crate::settings::store as settings_store;
 
 impl AdeApp {
     /// Surface D's real whole-file hand-edit view, shown in place of the read-only two-column
@@ -211,6 +212,8 @@ impl AdeApp {
                         cursor_local,
                         marked_local,
                         is_cursor_line: cursor_line_index == Some(index),
+                        caret_style: this.settings.appearance.caret_style,
+                        caret_blink_visible: this.caret_blink_visible,
                     };
                     rows.push(render_merge_edit_line(context, row_line_height, cx));
                 }
@@ -248,6 +251,10 @@ impl AdeApp {
             .on_action(cx.listener(Self::handle_editor_select_right_action))
             .on_action(cx.listener(Self::handle_editor_select_up_action))
             .on_action(cx.listener(Self::handle_editor_select_down_action))
+            .on_action(cx.listener(Self::handle_editor_word_left_action))
+            .on_action(cx.listener(Self::handle_editor_word_right_action))
+            .on_action(cx.listener(Self::handle_editor_select_word_left_action))
+            .on_action(cx.listener(Self::handle_editor_select_word_right_action))
             .on_action(cx.listener(Self::handle_editor_home_action))
             .on_action(cx.listener(Self::handle_editor_end_action))
             .on_action(cx.listener(Self::handle_editor_select_all_action))
@@ -257,6 +264,9 @@ impl AdeApp {
             .on_action(cx.listener(Self::handle_editor_save_action))
             .on_action(cx.listener(Self::handle_text_undo_action))
             .on_action(cx.listener(Self::handle_text_redo_action))
+            .on_action(cx.listener(Self::handle_editor_indent_action))
+            .on_action(cx.listener(Self::handle_editor_dedent_action))
+            .on_action(cx.listener(Self::handle_editor_escape_action))
             .flex()
             .flex_col()
             .flex_1()
@@ -265,7 +275,25 @@ impl AdeApp {
             .overflow_hidden()
             .bg(theme::surface::CENTER)
             .child(header)
-            .child(zoom_scoped(self.effective_code_rem_px(), code))
+            .child(zoom_scoped(
+                self.effective_code_rem_px(),
+                // See `crate::sidebar::render::AdeApp::render_file_tree`'s own docs on why the
+                // scrollbar must be a sibling of `code`, inside its own non-scrolling
+                // `.relative()` wrapper, never a child of `code` itself (GitHub issue #30).
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(code)
+                    .children(self.render_vertical_scrollbar(
+                        "merge-edit-scrollbar",
+                        &self.merge_edit_scroll_handle,
+                        &[],
+                        cx,
+                    )),
+            ))
             .into_any_element()
     }
 }
@@ -284,6 +312,11 @@ struct MergeEditLineContext<'a> {
     cursor_local: Option<usize>,
     marked_local: Option<Range<usize>>,
     is_cursor_line: bool,
+    /// See `crate::code_surface::editing::EditableLineContext::caret_style`'s own docs - the
+    /// same live, persisted setting, read the same way, for this surface's own caret.
+    caret_style: settings_store::CaretStyle,
+    /// See `crate::code_surface::editing::EditableLineContext::caret_blink_visible`'s own docs.
+    caret_blink_visible: bool,
 }
 
 /// The merge hand-edit view's own row painter - structurally mirrors
@@ -308,6 +341,8 @@ fn render_merge_edit_line(
         cursor_local,
         marked_local,
         is_cursor_line,
+        caret_style,
+        caret_blink_visible,
     } = context;
 
     let runs = build_plain_text_runs(line, &marked_local);
@@ -324,6 +359,9 @@ fn render_merge_edit_line(
     // Overlay-only - see `render_editable_file_view_line`'s own docs for why this never paints
     // the visible glyphs itself (only real cursor/selection quads plus the real
     // `EntityInputHandler` registration for the caret's own row).
+    // See `render_editable_file_view_line`'s own identical comment - two independent `move`
+    // closures, each needing its own owned handle.
+    let focus_handle_for_measure = focus_handle.clone();
     let cursor_overlay = canvas(
         move |bounds, window, _cx| {
             let style = window.text_style();
@@ -332,6 +370,12 @@ fn render_merge_edit_line(
                 .text_system()
                 .shape_line(line_text.clone(), font_size, &runs, None);
 
+            let is_focused = focus_handle_for_measure.is_focused(window);
+            let selection_opacity = if is_focused {
+                theme::syntax::SELECTION_OPACITY
+            } else {
+                theme::syntax::SELECTION_UNFOCUSED_OPACITY
+            };
             let selection_quad = selection_local.as_ref().map(|range| {
                 fill(
                     Bounds::from_corners(
@@ -344,16 +388,26 @@ fn render_merge_edit_line(
                             bounds.bottom(),
                         ),
                     ),
-                    theme::syntax::CARET.resolve().opacity(0.28),
+                    theme::syntax::CARET.resolve().opacity(selection_opacity),
                 )
             });
-            let cursor_quad = cursor_local.map(|offset| {
-                fill(
-                    Bounds::new(
-                        point(bounds.left() + shaped.x_for_index(offset), bounds.top()),
-                        size(gpui::px(2.0), bounds.bottom() - bounds.top()),
-                    ),
-                    theme::syntax::CARET,
+            let cursor_quad = cursor_local.and_then(|offset| {
+                let start_x = bounds.left() + shaped.x_for_index(offset);
+                let next_offset = line_text
+                    .as_ref()
+                    .get(offset..)
+                    .and_then(|rest| rest.chars().next())
+                    .map(|ch| offset + ch.len_utf8())
+                    .unwrap_or(offset);
+                let end_x = bounds.left() + shaped.x_for_index(next_offset);
+                crate::code_surface::editing::caret_paint_quad(
+                    start_x,
+                    end_x,
+                    bounds.top(),
+                    bounds.bottom(),
+                    caret_style,
+                    is_focused,
+                    caret_blink_visible,
                 )
             });
             (shaped, selection_quad, cursor_quad)
@@ -369,10 +423,8 @@ fn render_merge_edit_line(
             if let Some(selection_quad) = selection_quad {
                 window.paint_quad(selection_quad);
             }
-            if focus_handle.is_focused(window) {
-                if let Some(cursor_quad) = cursor_quad {
-                    window.paint_quad(cursor_quad);
-                }
+            if let Some(cursor_quad) = cursor_quad {
+                window.paint_quad(cursor_quad);
             }
             paint_entity.update(cx, |this, _cx| {
                 this.merge_edit_row_layout

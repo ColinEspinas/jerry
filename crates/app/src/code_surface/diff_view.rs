@@ -98,6 +98,7 @@ impl AdeApp {
     pub(in crate::code_surface) fn render_diff_file_detail(
         &self,
         file: &DiffFile,
+        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         // Read the effective zoom once and pass it to `zoom_scoped` at every return point below.
         let rem_px = self.effective_code_rem_px();
@@ -109,15 +110,21 @@ impl AdeApp {
             .min_h_0()
             .overflow_y_scroll()
             .bg(theme::surface::PTY)
-            .py(px(4.0));
+            .py(px(4.0))
+            // GitHub issue #30's real overlay scrollbar reads its geometry straight off this
+            // same handle (`crate::root::scrollbar::AdeApp::render_vertical_scrollbar`).
+            .track_scroll(&self.diff_view_scroll_handle);
 
         if file.is_binary {
             return zoom_scoped(
                 rem_px,
-                container.child(render_sidebar_message(
-                    "binary file (contents not diffed)".to_string(),
-                    theme::text::FAINT.into(),
-                )),
+                self.wrap_with_scrollbar(
+                    container.child(render_sidebar_message(
+                        "binary file (contents not diffed)".to_string(),
+                        theme::text::FAINT.into(),
+                    )),
+                    cx,
+                ),
             );
         }
 
@@ -128,10 +135,13 @@ impl AdeApp {
         if file.hunks.is_empty() {
             return zoom_scoped(
                 rem_px,
-                container.child(render_sidebar_message(
-                    changes::empty_hunks_message(file.status).to_string(),
-                    theme::text::FAINT.into(),
-                )),
+                self.wrap_with_scrollbar(
+                    container.child(render_sidebar_message(
+                        changes::empty_hunks_message(file.status).to_string(),
+                        theme::text::FAINT.into(),
+                    )),
+                    cx,
+                ),
             );
         }
 
@@ -188,7 +198,35 @@ impl AdeApp {
             ));
         }
 
-        zoom_scoped(rem_px, container)
+        zoom_scoped(rem_px, self.wrap_with_scrollbar(container, cx))
+    }
+
+    /// Wraps `content` (the Diff view's own scrollable `container`, already `track_scroll`'d with
+    /// [`Self::diff_view_scroll_handle`]) in the real, non-scrolling `.relative()` sibling wrapper
+    /// GitHub issue #30's overlay scrollbar needs - see `crate::sidebar::render::AdeApp::
+    /// render_file_tree`'s own docs on why the scrollbar must never be a child of the scrolling
+    /// element itself. Factored out because [`Self::render_diff_file_detail`] has three real
+    /// return points (binary, no-hunks, and the real hunk-rendering path), and each needs the
+    /// exact same wrap.
+    fn wrap_with_scrollbar(
+        &self,
+        content: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(content)
+            .children(self.render_vertical_scrollbar(
+                "diff-view-scrollbar",
+                &self.diff_view_scroll_handle,
+                &[],
+                cx,
+            ))
+            .into_any_element()
     }
 }
 
@@ -507,9 +545,10 @@ mod diff_render_tests {
             );
             assert!(
                 all_runs.iter().any(|(text, kind)| text.as_ref() == "2"
-                    && *kind == code_view::HighlightKind::Literal),
-                "the real added integer literal '2' should be classified as Literal - got \
-                 {all_runs:?}"
+                    && *kind == code_view::HighlightKind::ConstantBuiltin),
+                "the real added integer literal '2' should be classified as ConstantBuiltin (a \
+                 real `@constant.builtin` capture - `tree-sitter-rust` has no separate `number` \
+                 capture) - got {all_runs:?}"
             );
         });
     }

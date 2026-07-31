@@ -189,6 +189,26 @@ use gpui::{
 ///     focused widget's handler is the only one that can run. This matters for a real, reachable
 ///     case a state-inspecting handler would get wrong: the command palette can be open with a
 ///     typed query while a file editor is still open behind it, and Ctrl+Z must undo the query.
+/// - GitHub issue #26 added four more real entries, each documented at its own binding below:
+///   `"ctrl-space"` (`CompletionsInvoke`, manual completion trigger/refresh), `"tab"`/`"shift-tab"`
+///   (`EditorIndent`/`EditorDedent`, real Tab/Shift+Tab indentation, replacing the old "falls
+///   through to plain-text-insertion" behavior `Tab` used to have with the popup closed),
+///   `"escape"` (the real accessibility escape hatch `Tab`'s new meaning inside the editor
+///   requires - `EditorCollapseCursors` in the File view, since GitHub issue #28's own multi-
+///   cursor collapse and this escape hatch both want the File view's plain `Escape` and only one
+///   binding can genuinely own it at equal context depth; a separate `EditorEscape` in the merge
+///   hand-edit view, which never gets multi-cursor actions and so never faces that collision -
+///   see `crate::code_surface::editing::AdeApp::handle_editor_collapse_cursors_action`'s own docs
+///   for exactly how the File view composes both real behaviors from one binding), and `"ctrl-w"`
+///   (`CloseFocusedTab`, close the focused tab) - the last of these follows the exact same
+///   literal-`ctrl`/`!terminal`-scoping precedent `"ctrl-shift-t"`/`Undo`/`Redo` already
+///   established above, for the same real reasons. `EditorIndent`/`EditorDedent` are scoped
+///   `"file-editor && !completions"`/`"merge-editor"` like every other plain `Editor*` action,
+///   never `"text-input"` - that tag is GitHub issue #17's own **text-history** context, a
+///   different real concept from "is real text editing allowed here" (see the `TextUndo`/
+///   `TextRedo` entry above), and `Tab`/`Shift+Tab`/`Escape` have no meaning at all in this app's
+///   five non-editor text-input surfaces (a filter row, a query field, a rename prompt) that
+///   would need claiming there.
 pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
     vec![
         gpui::KeyBinding::new("secondary-n", root::NewSession, None),
@@ -238,6 +258,25 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("shift-right", root::EditorSelectRight, Some("file-editor")),
         gpui::KeyBinding::new("shift-up", root::EditorSelectUp, Some("file-editor")),
         gpui::KeyBinding::new("shift-down", root::EditorSelectDown, Some("file-editor")),
+        // GitHub issue #27's "Ctrl+Shift+arrows (word-wise)" - `secondary-*` is this same
+        // codebase's own established platform-aware Ctrl/Cmd alias (`secondary-a`/`secondary-c`/
+        // etc. immediately below), not a new convention.
+        gpui::KeyBinding::new("secondary-left", root::EditorWordLeft, Some("file-editor")),
+        gpui::KeyBinding::new(
+            "secondary-right",
+            root::EditorWordRight,
+            Some("file-editor"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-shift-left",
+            root::EditorSelectWordLeft,
+            Some("file-editor"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-shift-right",
+            root::EditorSelectWordRight,
+            Some("file-editor"),
+        ),
         gpui::KeyBinding::new("home", root::EditorHome, Some("file-editor")),
         gpui::KeyBinding::new("end", root::EditorEnd, Some("file-editor")),
         gpui::KeyBinding::new("secondary-a", root::EditorSelectAll, Some("file-editor")),
@@ -250,6 +289,72 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
             root::EditorSaveAnyway,
             Some("file-editor"),
         ),
+        // Multi-cursor (Revision R13, issue #28) - `crate::code_surface::edit_buffer`'s own
+        // "Multi-cursor" docs for the overall design; each handler's own docs
+        // (`crate::code_surface::editing::AdeApp::handle_editor_select_next_occurrence_action` and
+        // its three siblings) for exactly what each keystroke does. File-view-only, like the rest
+        // of this list's plain `Editor*` entries - `crate::merge::editing`'s `"merge-editor"`
+        // context deliberately does not get these (see `crate::code_surface::render::AdeApp::
+        // render_code_surface`'s own docs for why). `"ctrl-d"`/`"ctrl-shift-l"` are deliberately
+        // literal `ctrl-`, not `"secondary-"`, matching the mockup-independent, cross-editor VS
+        // Code convention issue #28 itself names (`Ctrl+D`/`Ctrl+Shift+L`/`Ctrl+K Ctrl+D` are the
+        // same physical keys on every OS in VS Code itself, including macOS, unlike this list's
+        // other `secondary-` bindings which intentionally follow the *platform* modifier
+        // instead) - `"secondary-d"` would also collide with `EditorSelectAllOccurrences`'s own
+        // real `Cmd+Shift+L`-independent behavior on macOS anyway (VS Code never rebinds `Ctrl+D`
+        // to `Cmd+D` there either; `Cmd+D` is already the macOS-only system-wide "bookmark this
+        // page" shortcut in every browser, a real, live conflict `"ctrl-d"` avoids by staying
+        // literal). `"ctrl-k ctrl-d"` is a real, supported space-separated chord binding (verified
+        // against the pinned `gpui` dependency's own `crates/gpui/src/keymap/binding.rs`, which
+        // splits a keybinding's own keystroke string on whitespace into an ordered chord sequence
+        // - not invented here), matching VS Code's own two-keystroke default for "skip current,
+        // find next".
+        gpui::KeyBinding::new(
+            "ctrl-d",
+            root::EditorSelectNextOccurrence,
+            Some("file-editor"),
+        ),
+        gpui::KeyBinding::new(
+            "ctrl-shift-l",
+            root::EditorSelectAllOccurrences,
+            Some("file-editor"),
+        ),
+        gpui::KeyBinding::new(
+            "ctrl-k ctrl-d",
+            root::EditorSkipOccurrence,
+            Some("file-editor"),
+        ),
+        // Real Tab/Shift+Tab indentation (GitHub issue #26) - scoped `"file-editor &&
+        // !completions"`, the same narrowing `enter`/`up`/`down` above already use, so a genuinely
+        // open Completions popup still gets `Tab`/`Escape` for `CompletionsAccept`/
+        // `CompletionsDismiss` instead (see the `Completions*` group below).
+        gpui::KeyBinding::new(
+            "tab",
+            root::EditorIndent,
+            Some("file-editor && !completions"),
+        ),
+        gpui::KeyBinding::new(
+            "shift-tab",
+            root::EditorDedent,
+            Some("file-editor && !completions"),
+        ),
+        // `Escape` in the File view is `EditorCollapseCursors`, not a separate `EditorEscape`
+        // binding - GPUI resolves two same-keystroke bindings at equal context depth by load
+        // order (later wins), confirmed against the pinned `gpui` dependency's own
+        // `key_dispatch.rs` test suite, so registering both here would silently shadow whichever
+        // loaded first rather than run both. `EditorCollapseCursors`'s own handler (`crate::
+        // code_surface::editing::AdeApp::handle_editor_collapse_cursors_action`) already composes
+        // both real behaviors: a genuine multi-cursor collapse when one is active, or GitHub issue
+        // #26's accessibility escape-hatch fallback (`Self::escape_focus_off_editor`) for the
+        // exact same "nothing multi-cursor-related to do" case it was already documented as a
+        // no-op for - since `Tab`/`Shift+Tab` are now real indent/dedent actions while the editor
+        // has focus, a keyboard-only user still needs some way to leave it and keep tabbing
+        // through the rest of the UI once that fallback fires.
+        gpui::KeyBinding::new(
+            "escape",
+            root::EditorCollapseCursors,
+            Some("file-editor && !completions"),
+        ),
         // Real Completions popup navigation/accept/dismiss (Revision R8.5b) - scoped to
         // `"file-editor && completions"`, the real *narrower* mirror of the `!completions`
         // narrowing on `enter`/`up`/`down` above, added to the same code-surface node only while
@@ -257,16 +362,12 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         // `crate::code_surface::render::AdeApp::render_code_surface`'s own docs for exactly where
         // that context tag comes from, and `crate::lsp::completion_popup::AdeApp::
         // completions_open_for_active_path`'s own docs for why `Loading`/`Failed` don't count).
-        // `Tab` has no competing plain-`Editor*` *action* binding anywhere in this list - but the
-        // real, live-verified reason scoping it only to `"file-editor && completions"` is safe
-        // isn't "nothing else claims it": a real, live keystroke test confirms that with the
-        // popup closed, an unbound `tab` keystroke still reaches the real edit buffer and inserts
-        // a literal `\t`, the same way any other unbound printable character does - GPUI falls
-        // through to the platform's ordinary text-input/IME path (`crate::code_surface::editing`'s
-        // `EntityInputHandler::replace_text_in_range`) for any keystroke with no matching
-        // `KeyBinding` in the currently active context, rather than dropping it. So `Tab` is
-        // never actually *unhandled* outside this narrow context; it's handled by a different,
-        // pre-existing real mechanism than a `KeyBinding`/action at all.
+        // `Tab` here is `CompletionsAccept`, scoped `"file-editor && completions"` - GitHub issue
+        // #26 gave plain `tab`/`shift-tab` (with the popup closed) their own real
+        // `EditorIndent`/`EditorDedent` bindings further up, in the `"file-editor && !completions"`
+        // group alongside `enter`/`up`/`down` - see those bindings' own docs for why `Tab` is no
+        // longer left to fall through to GPUI's ordinary text-input path the way this comment used
+        // to describe.
         gpui::KeyBinding::new(
             "up",
             root::CompletionsUp,
@@ -292,6 +393,20 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
             root::CompletionsDismiss,
             Some("file-editor && completions"),
         ),
+        // `Ctrl+Space` (GitHub issue #26) - opens/refreshes the Completions popup on demand at
+        // the caret, scoped to plain `"file-editor"` (not narrowed to `"... && completions"` or
+        // `"... && !completions"`, unlike every binding above): it must fire identically whether
+        // the popup is already open (a real in-place refresh - see `crate::lsp::completion_popup::
+        // AdeApp::handle_completions_invoke_action`'s own docs) or closed (opening it fresh).
+        // Deliberately a literal `"ctrl-space"`, not `"secondary-space"`, matching this list's own
+        // `"ctrl-shift-t"` precedent for a keystroke that must stay the same physical key on every
+        // OS - Ctrl+Space is the universal convention for "trigger completion" across IDEs/
+        // editors, and the design's Linux caveat (Ctrl+Space is also a common IME-switch chord on
+        // some Linux desktops) is exactly why this binding, like every other one in this list, is
+        // fully rebindable from the Settings > Keybindings page (`crate::keymap_overrides`) rather
+        // than hardcoded - see that module's own docs for the real override mechanism this and
+        // every other binding here already gets for free just by being registered here.
+        gpui::KeyBinding::new("ctrl-space", root::CompletionsInvoke, Some("file-editor")),
         // Surface D's merge hand-edit whole-file editor (Revision R8.5c,
         // `crate::merge::editing`) - a distinct `"merge-editor"` context, deliberately never
         // `"file-editor"` itself: the same real `Editor*` action *types*/handler bodies are
@@ -314,6 +429,22 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("shift-right", root::EditorSelectRight, Some("merge-editor")),
         gpui::KeyBinding::new("shift-up", root::EditorSelectUp, Some("merge-editor")),
         gpui::KeyBinding::new("shift-down", root::EditorSelectDown, Some("merge-editor")),
+        gpui::KeyBinding::new("secondary-left", root::EditorWordLeft, Some("merge-editor")),
+        gpui::KeyBinding::new(
+            "secondary-right",
+            root::EditorWordRight,
+            Some("merge-editor"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-shift-left",
+            root::EditorSelectWordLeft,
+            Some("merge-editor"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-shift-right",
+            root::EditorSelectWordRight,
+            Some("merge-editor"),
+        ),
         gpui::KeyBinding::new("home", root::EditorHome, Some("merge-editor")),
         gpui::KeyBinding::new("end", root::EditorEnd, Some("merge-editor")),
         gpui::KeyBinding::new("secondary-a", root::EditorSelectAll, Some("merge-editor")),
@@ -321,6 +452,14 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("secondary-x", root::EditorCut, Some("merge-editor")),
         gpui::KeyBinding::new("secondary-v", root::EditorPaste, Some("merge-editor")),
         gpui::KeyBinding::new("secondary-s", root::EditorSave, Some("merge-editor")),
+        // Real Tab/Shift+Tab indentation plus the Escape focus-out hatch (GitHub issue #26),
+        // mirrored here for the same real reason every other `Editor*` action is: the merge hand-
+        // edit buffer is a real, independent `EditBuffer` too (see `crate::code_surface::editing::
+        // AdeApp::active_edit_target`'s own docs for how the shared `handle_editor_indent_action`/
+        // `handle_editor_dedent_action`/`handle_editor_escape_action` handlers route to it).
+        gpui::KeyBinding::new("tab", root::EditorIndent, Some("merge-editor")),
+        gpui::KeyBinding::new("shift-tab", root::EditorDedent, Some("merge-editor")),
+        gpui::KeyBinding::new("escape", root::EditorEscape, Some("merge-editor")),
         // GitHub issue #19's file-tree bindings. Every one is scoped to
         // `"file-tree && !tree-editing && !tree-delete-confirm"`, and all three terms are
         // load-bearing - see `crate::sidebar::tree_ops`'s own module docs for the full
@@ -364,6 +503,19 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
             root::FileTreePaste,
             Some("file-tree && !tree-editing && !tree-delete-confirm"),
         ),
+        // `Ctrl+W` (GitHub issue #26) - closes the focused tab (file or session), via
+        // `crate::work_surface::render::AdeApp::handle_close_focused_tab_action`'s own docs for
+        // exactly what "focused" resolves to and why this can never close the window (this app
+        // registers no window-close keybinding anywhere in this list, on any platform, so there
+        // is no native default here to intercept in the first place). Scoped `Some("!terminal")`,
+        // the same real precedent `Undo`/`Redo` above already established for this exact conflict
+        // class: plain `Ctrl+W` is `crate::terminal::pane::keystroke_to_bytes`'s own real
+        // `unix-word-rerase` control byte (`0x17`), a standard readline word-backspace a focused
+        // shell needs unclaimed - a global binding here would swallow it in every focused
+        // terminal/agent session on Linux/Windows, the same bug class this list's own
+        // `secondary-p`/`"]"`/`secondary-z` entries already document. A terminal/agent tab is
+        // still always closeable via the tab strip's own `×` or middle-click regardless.
+        gpui::KeyBinding::new("ctrl-w", root::CloseFocusedTab, Some("!terminal")),
     ]
 }
 

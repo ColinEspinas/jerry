@@ -45,23 +45,29 @@ use std::time::Duration;
 
 use gpui::{
     fill, point, prelude::*, size, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Pixels, Point, TextRun, UTF16Selection, UnderlineStyle,
-    Window,
+    EntityInputHandler, FocusHandle, PaintQuad, Pixels, Point, TextRun, UTF16Selection,
+    UnderlineStyle, Window,
 };
 
+use crate::code_surface::blame;
+use crate::code_surface::blame_view::render_inline_blame_span;
 use crate::code_surface::code_view;
 use crate::code_surface::edit_buffer::EditBuffer;
+use crate::code_surface::indent;
 use crate::code_surface::lsp_ui::{
     diagnostic_inline_message_color, diagnostic_row_bg, diagnostic_underline_color,
 };
 use crate::lsp::diagnostics as diagnostics_view;
 use crate::lsp::hover as hover_view;
 use crate::root::{
-    AdeApp, EditorBackspace, EditorCopy, EditorCut, EditorDelete, EditorDown, EditorEnd,
-    EditorEnter, EditorHome, EditorLeft, EditorPaste, EditorRight, EditorSave, EditorSaveAnyway,
-    EditorSelectAll, EditorSelectDown, EditorSelectLeft, EditorSelectRight, EditorSelectUp,
-    EditorUp, TextRedo, TextUndo,
+    AdeApp, EditorBackspace, EditorCollapseCursors, EditorCopy, EditorCut, EditorDedent,
+    EditorDelete, EditorDown, EditorEnd, EditorEnter, EditorEscape, EditorHome, EditorIndent,
+    EditorLeft, EditorPaste, EditorRight, EditorSave, EditorSaveAnyway, EditorSelectAll,
+    EditorSelectAllOccurrences, EditorSelectDown, EditorSelectLeft, EditorSelectNextOccurrence,
+    EditorSelectRight, EditorSelectUp, EditorSelectWordLeft, EditorSelectWordRight,
+    EditorSkipOccurrence, EditorUp, EditorWordLeft, EditorWordRight, TextRedo, TextUndo,
 };
+use crate::settings::store as settings_store;
 use crate::theme;
 
 /// How long after the last keystroke [`AdeApp::schedule_rehighlight`] waits before running a real
@@ -260,6 +266,7 @@ impl AdeApp {
             None => return,
         }
         self.sync_cursor_and_scroll();
+        self.reset_caret_blink(cx);
         cx.notify();
     }
 
@@ -289,6 +296,7 @@ impl AdeApp {
             None => return,
         }
         self.sync_cursor_and_scroll();
+        self.reset_caret_blink(cx);
         cx.notify();
     }
 
@@ -319,6 +327,7 @@ impl AdeApp {
         }
         self.replace_text_in_range(None, "\n", window, cx);
         self.sync_cursor_and_scroll();
+        self.reset_caret_blink(cx);
     }
 
     pub(crate) fn handle_editor_left_action(
@@ -403,6 +412,42 @@ impl AdeApp {
         self.move_active_buffer(cx, EditBuffer::select_down);
     }
 
+    pub(crate) fn handle_editor_word_left_action(
+        &mut self,
+        _: &EditorWordLeft,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_active_buffer(cx, EditBuffer::move_word_left);
+    }
+
+    pub(crate) fn handle_editor_word_right_action(
+        &mut self,
+        _: &EditorWordRight,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_active_buffer(cx, EditBuffer::move_word_right);
+    }
+
+    pub(crate) fn handle_editor_select_word_left_action(
+        &mut self,
+        _: &EditorSelectWordLeft,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_active_buffer(cx, EditBuffer::select_word_left);
+    }
+
+    pub(crate) fn handle_editor_select_word_right_action(
+        &mut self,
+        _: &EditorSelectWordRight,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_active_buffer(cx, EditBuffer::select_word_right);
+    }
+
     pub(crate) fn handle_editor_home_action(
         &mut self,
         _: &EditorHome,
@@ -430,6 +475,228 @@ impl AdeApp {
         self.move_active_buffer(cx, EditBuffer::select_all);
     }
 
+    /// `Ctrl+D` (Revision R13, issue #28): `EditBuffer::select_word_or_add_next_occurrence`'s own
+    /// docs for the real two-step VS Code behavior ("select word under caret" the first time,
+    /// "add the next occurrence as a new cursor" every time after that) this single binding drives.
+    pub(crate) fn handle_editor_select_next_occurrence_action(
+        &mut self,
+        _: &EditorSelectNextOccurrence,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_multi_cursor_action(cx, EditBuffer::select_word_or_add_next_occurrence);
+    }
+
+    /// `Ctrl+Shift+L` (Revision R13, issue #28) - `EditBuffer::select_all_occurrences`'s own docs.
+    pub(crate) fn handle_editor_select_all_occurrences_action(
+        &mut self,
+        _: &EditorSelectAllOccurrences,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_multi_cursor_action(cx, EditBuffer::select_all_occurrences);
+    }
+
+    /// `Ctrl+K Ctrl+D` (Revision R13, issue #28) - `EditBuffer::skip_current_occurrence`'s own
+    /// docs.
+    pub(crate) fn handle_editor_skip_occurrence_action(
+        &mut self,
+        _: &EditorSkipOccurrence,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_multi_cursor_action(cx, EditBuffer::skip_current_occurrence);
+    }
+
+    /// `Esc` in the File view (Revision R13, issue #28; falls through to GitHub issue #26's
+    /// accessibility escape hatch): tries `EditBuffer::collapse_to_single_cursor` first via
+    /// `Self::apply_multi_cursor_action`'s own real change-reporting contract. Only one binding
+    /// can genuinely own the File view's plain `Escape` at equal context depth (`crate::
+    /// default_key_bindings`'s own docs on GPUI's real "later registration wins" precedence for
+    /// same-depth contexts - confirmed against the pinned `gpui` dependency's own
+    /// `key_dispatch.rs` test suite, not guessed), so rather than silently shadowing one of these
+    /// two real, independently-designed behaviors, this handler composes both: a real multi-
+    /// cursor collapse when one is active, or - the exact same no-op case `EditorCollapseCursors`
+    /// was already documented as deliberately doing nothing for - [`Self::
+    /// escape_focus_off_editor`]'s real accessibility fallback when there's nothing multi-cursor-
+    /// related to do. `EditorEscape` stays a real, separately-bound action in its own right for
+    /// `"merge-editor"` (see that binding's own docs), which never gets multi-cursor actions at
+    /// all and so never faces this same collision.
+    pub(crate) fn handle_editor_collapse_cursors_action(
+        &mut self,
+        _: &EditorCollapseCursors,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.apply_multi_cursor_action(cx, EditBuffer::collapse_to_single_cursor) {
+            return;
+        }
+        self.escape_focus_off_editor(window, cx);
+    }
+
+    /// Shared plumbing for every multi-cursor-only action above: applies `f` to the active buffer
+    /// and, only if it reports a real change (`true`), dismisses completions (the caret may have
+    /// moved/multiplied somewhere the popup's own anchor no longer describes - same real reasoning
+    /// as `Self::move_active_buffer`'s own dismissal), notifies, and scrolls the (possibly new)
+    /// primary caret into view. Returns that same `bool` so [`Self::
+    /// handle_editor_collapse_cursors_action`] can tell a genuine no-op (e.g. `Ctrl+D` with no
+    /// word under an empty caret, or `Esc` with only one cursor already active) apart from real
+    /// work - callers that don't need to distinguish (every other action above) simply ignore it.
+    fn apply_multi_cursor_action(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: fn(&mut EditBuffer) -> bool,
+    ) -> bool {
+        let Some(buffer) = self.active_edit_buffer_mut() else {
+            return false;
+        };
+        if !f(buffer) {
+            return false;
+        }
+        self.dismiss_completions();
+        cx.notify();
+        self.sync_cursor_and_scroll();
+        true
+    }
+
+    /// `Tab` (GitHub issue #26) - real indentation, not a raw `\t` character: resolves the real
+    /// indent unit (tabs vs. spaces, width) from [`Self::resolved_indent_settings_for_target`],
+    /// then delegates to [`EditBuffer::indent_lines`] (see that method's own docs for the real
+    /// no-selection-vs-selection behavior). File-target edits schedule a re-highlight/LSP-sync the
+    /// same way every other real text-changing `Editor*` action does; the merge hand-edit target
+    /// has neither (see `crate::merge::editing`'s own top docs for why).
+    pub(crate) fn handle_editor_indent_action(
+        &mut self,
+        _: &EditorIndent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = self.resolved_indent_settings_for_target();
+        let unit = indent::indent_unit(settings);
+        let changed = match self.active_edit_target() {
+            Some(EditTarget::File(path)) => {
+                let Some(buffer) = self.edit_buffers.get_mut(&path) else {
+                    return;
+                };
+                let changed = buffer.indent_lines(&unit);
+                if changed {
+                    self.schedule_rehighlight(path.clone(), cx);
+                    self.schedule_lsp_sync(path, cx);
+                }
+                changed
+            }
+            Some(EditTarget::Merge) => {
+                let Some(edit) = self.merge_edit.as_mut() else {
+                    return;
+                };
+                edit.buffer.indent_lines(&unit)
+            }
+            None => return,
+        };
+        if !changed {
+            return;
+        }
+        self.dismiss_completions();
+        self.sync_cursor_and_scroll();
+        cx.notify();
+    }
+
+    /// `Shift+Tab` (GitHub issue #26) - the mirror of [`Self::handle_editor_indent_action`], via
+    /// [`EditBuffer::dedent_lines`]. A genuine no-op (every touched line already at column 0, or
+    /// no real edit target at all) skips the re-highlight/sync/notify, matching every other
+    /// `Editor*` handler's own "don't do real work for nothing" discipline.
+    pub(crate) fn handle_editor_dedent_action(
+        &mut self,
+        _: &EditorDedent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = self.resolved_indent_settings_for_target();
+        let changed = match self.active_edit_target() {
+            Some(EditTarget::File(path)) => {
+                let Some(buffer) = self.edit_buffers.get_mut(&path) else {
+                    return;
+                };
+                let changed = buffer.dedent_lines(settings.tab_width);
+                if changed {
+                    self.schedule_rehighlight(path.clone(), cx);
+                    self.schedule_lsp_sync(path, cx);
+                }
+                changed
+            }
+            Some(EditTarget::Merge) => {
+                let Some(edit) = self.merge_edit.as_mut() else {
+                    return;
+                };
+                edit.buffer.dedent_lines(settings.tab_width)
+            }
+            None => return,
+        };
+        if !changed {
+            return;
+        }
+        self.dismiss_completions();
+        self.sync_cursor_and_scroll();
+        cx.notify();
+    }
+
+    /// The real [`indent::IndentSettings`] `Tab`/`Shift+Tab` should use right now - resolved from
+    /// a real `.editorconfig` (via [`indent::indent_settings_for_path`]) for the File-view target,
+    /// since only that target has a real on-disk path/worktree root to resolve one against; the
+    /// merge hand-edit target (no real file path of its own - see `crate::merge::editing`'s own
+    /// top docs) always falls back straight to the user's own [`crate::settings::store::
+    /// EditorSettings`] default. `None`/no edit target also falls back to the same user default -
+    /// harmless, since every real caller already returns before using it in that case.
+    fn resolved_indent_settings_for_target(&self) -> indent::IndentSettings {
+        let user_default = indent::IndentSettings {
+            insert_spaces: self.settings.editor.insert_spaces,
+            tab_width: self.settings.editor.tab_width,
+        };
+        match self.active_edit_target() {
+            Some(EditTarget::File(path)) => match self.edit_buffers.get(&path) {
+                Some(buffer) => indent::indent_settings_for_path(
+                    &buffer.path,
+                    &self.file_tree_root,
+                    user_default,
+                ),
+                None => user_default,
+            },
+            _ => user_default,
+        }
+    }
+
+    /// `Escape` in the merge hand-edit view (GitHub issue #26's accessibility requirement) -
+    /// `"merge-editor"` never gets multi-cursor actions bound (see `crate::code_surface::
+    /// edit_buffer`'s own "Multi-cursor" docs for why), so this is a plain, standalone binding
+    /// with no collision to resolve, unlike the File view's own `Escape` (see [`Self::
+    /// handle_editor_collapse_cursors_action`]'s own docs for why *that* one has to compose two
+    /// behaviors instead of just calling this directly).
+    pub(crate) fn handle_editor_escape_action(
+        &mut self,
+        _: &EditorEscape,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.escape_focus_off_editor(window, cx);
+    }
+
+    /// Moves keyboard focus off the editor entirely, onto [`AdeApp::filter_focus_handle`] (the
+    /// rail's own filter field) - the same real fallback target [`crate::work_surface::render::
+    /// AdeApp::close_session`] already uses for "nothing session/file-related is left to focus".
+    /// Since `Tab`/`Shift+Tab` are now real indent/dedent actions while the editor has focus
+    /// (rather than falling through to GPUI's ordinary focus-cycling), a keyboard-only user needs
+    /// some other way to leave the editor and keep tabbing through the rest of the UI - this is
+    /// that "escape hatch": once focus has genuinely moved elsewhere, an ordinary (now-unbound-
+    /// here) `Tab` press resumes GPUI's normal focus-cycling immediately, no special two-key state
+    /// machine needed. Shared by both real `Escape` paths that can reach it - [`Self::
+    /// handle_editor_escape_action`] (`"merge-editor"`) directly, and [`Self::
+    /// handle_editor_collapse_cursors_action`] (`"file-editor && !completions"`) as its own
+    /// fallback once a real multi-cursor collapse has nothing to do.
+    fn escape_focus_off_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.filter_focus_handle, cx);
+        cx.notify();
+    }
+
     /// Shared plumbing for every cursor-movement-only action (no text change, so no re-highlight
     /// to schedule): applies `f` to the active buffer, notifies, and scrolls the new caret
     /// position into view.
@@ -445,6 +712,7 @@ impl AdeApp {
         self.dismiss_completions();
         cx.notify();
         self.sync_cursor_and_scroll();
+        self.reset_caret_blink(cx);
     }
 
     pub(crate) fn handle_editor_copy_action(
@@ -490,6 +758,7 @@ impl AdeApp {
         self.replace_text_in_range(None, "", window, cx);
         self.seal_active_edit_history();
         self.sync_cursor_and_scroll();
+        self.reset_caret_blink(cx);
     }
 
     pub(crate) fn handle_editor_paste_action(
@@ -510,6 +779,7 @@ impl AdeApp {
         self.replace_text_in_range(None, &text, window, cx);
         self.seal_active_edit_history();
         self.sync_cursor_and_scroll();
+        self.reset_caret_blink(cx);
     }
 
     /// Closes the active buffer's current undo group - the caller-driven half of
@@ -783,6 +1053,11 @@ impl AdeApp {
                     let Ok(Some((real_path, content))) = step else {
                         break;
                     };
+                    // Cloned before `real_path` moves into the background write task below - the
+                    // real blame refresh this save should trigger (`force_refresh_blame_for_save`,
+                    // see this file's own docs above) needs the file's absolute path *after* the
+                    // write settles, once `real_path` itself is no longer available here.
+                    let blame_refresh_path = real_path.clone();
                     let write_result = cx
                         .background_executor()
                         .spawn(async move {
@@ -811,6 +1086,12 @@ impl AdeApp {
                                 // be resolved by an immediate reload, not misread as an external
                                 // change on the next throttled tick.
                                 this.file_view_last_freshness_check = None;
+                                // GitHub issue #29: a save is one of the three real triggers
+                                // inline blame must recompute on - force it now rather than
+                                // waiting up to `BLAME_FRESHNESS_CHECK_INTERVAL` for the generic
+                                // poll to notice the new mtime (see `force_refresh_blame_for_
+                                // save`'s own docs).
+                                this.force_refresh_blame_for_save(&blame_refresh_path, cx);
                             }
                             Err(err) => {
                                 this.file_save_error = Some((path.clone(), err.to_string()));
@@ -898,6 +1179,7 @@ impl EntityInputHandler for AdeApp {
             None => return,
         }
         self.sync_cursor_and_scroll();
+        self.reset_caret_blink(cx);
         cx.notify();
     }
 
@@ -931,6 +1213,7 @@ impl EntityInputHandler for AdeApp {
             None => return,
         }
         self.sync_cursor_and_scroll();
+        self.reset_caret_blink(cx);
         cx.notify();
     }
 
@@ -1075,9 +1358,93 @@ pub(in crate::code_surface) struct EditableLineContext<'a> {
     pub selection_local: Option<Range<usize>>,
     pub cursor_local: Option<usize>,
     pub marked_local: Option<Range<usize>>,
+    /// Every *secondary* real cursor's own selection, local to this row - the multi-cursor
+    /// mirror of `selection_local` above (which only ever carries the primary's own). See
+    /// `crate::code_surface::edit_buffer::EditBuffer::secondary_selections_within_line`'s own
+    /// docs; empty in ordinary single-cursor use, so this changes nothing about how an
+    /// unaffected row paints.
+    pub secondary_selections_local: Vec<Range<usize>>,
+    /// Every *secondary* real cursor's own empty-caret position, local to this row - the
+    /// multi-cursor mirror of `cursor_local` above. See `crate::code_surface::edit_buffer::
+    /// EditBuffer::secondary_cursors_within_line`'s own docs.
+    pub secondary_cursors_local: Vec<usize>,
     pub diagnostics: &'a [diagnostics_view::LineDiagnostic],
     pub hovered_byte_range: Option<Range<usize>>,
     pub hover_target: Option<&'a Path>,
+    /// GitHub issue #29's real, already-computed inline blame label for *this* line - `Some`
+    /// only when `is_current` (only the current line ever shows it); see
+    /// `crate::code_surface::blame_view::AdeApp::inline_blame_render_model`'s own docs for how
+    /// it's built.
+    pub inline_blame: Option<&'a blame::InlineBlameLabel>,
+    /// The live, persisted caret shape (GitHub issue #27) - read once per row from
+    /// `AdeApp::settings.appearance.caret_style` rather than threaded through some separate
+    /// theme mechanism, matching every other persisted-and-applied `Settings` field's own
+    /// pattern.
+    pub caret_style: settings_store::CaretStyle,
+    /// The live shared blink phase (GitHub issue #27) - `AdeApp::caret_blink_visible`, read once
+    /// per row rather than re-derived; see `crate::root::caret_blink`'s module docs for the
+    /// whole mechanism this feeds.
+    pub caret_blink_visible: bool,
+}
+
+/// The real quad(s) to paint for a caret at pixel range `[start_x, end_x)` on a row spanning
+/// `[top, bottom)` (GitHub issue #27) - shared by
+/// [`render_editable_file_view_line`]/`crate::merge::editing`'s own row painter (the merge
+/// hand-edit view's deliberately-separate mirror of this same paint approach - see
+/// `crate::merge::editing::MergeEditLineContext`'s own docs for why it stays a separate `struct`)
+/// so the app's two caret-bearing surfaces can never visually drift apart, satisfying issue #27's
+/// own "consistent caret style ... across the code editor and all app text inputs" ask for at
+/// least these two. `end_x` is only read for [`settings_store::CaretStyle::Block`]/
+/// [`settings_store::CaretStyle::Underline`] (the width of the character at the caret); pass
+/// `start_x` again for [`settings_store::CaretStyle::Line`] callers with nothing convenient to
+/// measure it from.
+///
+/// Returns `None` exactly when the caret should be invisible this frame: mid-blink "off" phase
+/// while genuinely focused (`is_focused && !blink_visible`) - never while unfocused, which always
+/// paints a real, dimmed, non-blinking caret instead (issue #27's own explicit ask), never
+/// nothing at all.
+pub(crate) fn caret_paint_quad(
+    start_x: Pixels,
+    end_x: Pixels,
+    top: Pixels,
+    bottom: Pixels,
+    style: settings_store::CaretStyle,
+    is_focused: bool,
+    blink_visible: bool,
+) -> Option<PaintQuad> {
+    if is_focused && !blink_visible {
+        return None;
+    }
+    let color = if is_focused {
+        theme::syntax::CARET.resolve()
+    } else {
+        theme::syntax::CARET
+            .resolve()
+            .opacity(theme::syntax::CARET_UNFOCUSED_OPACITY)
+    };
+    // At most one real char's width (never negative - `end_x` can equal `start_x` for a
+    // `Line`-style caller, or a real end-of-line caret with nothing after it to measure).
+    let char_width = (end_x - start_x).max(gpui::px(1.0));
+    match style {
+        settings_store::CaretStyle::Line => Some(fill(
+            Bounds::new(point(start_x, top), size(gpui::px(2.0), bottom - top)),
+            color,
+        )),
+        settings_store::CaretStyle::Block => Some(fill(
+            Bounds::new(point(start_x, top), size(char_width, bottom - top)),
+            color,
+        )),
+        settings_store::CaretStyle::Underline => {
+            let thickness = gpui::px(2.0);
+            Some(fill(
+                Bounds::new(
+                    point(start_x, bottom - thickness),
+                    size(char_width, thickness),
+                ),
+                color,
+            ))
+        }
+    }
 }
 
 /// The real, editable File view's per-row renderer - the `"real cursor/selection needs real
@@ -1121,15 +1488,20 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
         selection_local,
         cursor_local,
         marked_local,
+        secondary_selections_local,
+        secondary_cursors_local,
         diagnostics,
         hovered_byte_range,
         hover_target,
+        inline_blame,
+        caret_style,
+        caret_blink_visible,
     } = context;
 
     let gutter_color = if is_current {
-        theme::text::DIM
+        theme::editor::GUTTER_TEXT_ACTIVE
     } else {
-        theme::text::GUTTER
+        theme::editor::GUTTER_TEXT
     };
     let worst_severity = diagnostics_view::Severity::worst(diagnostics);
 
@@ -1150,6 +1522,11 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
     );
 
     let row_path = path.clone();
+    // A second, independent clone for the `.on_mouse_move` drag-extend handler below - it needs
+    // its own owned `PathBuf` exactly like the `.on_mouse_down` handler's own `row_path` does
+    // (both are separate `move` closures), not a second reference to the same one `on_mouse_down`
+    // already moved into itself.
+    let drag_row_path = row_path.clone();
     let click_line_index = line_index;
     let click_line_number = line_number;
     let click_hover_target = hover_target.map(|target| target.to_path_buf());
@@ -1167,6 +1544,11 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
     // absolutely-positioned child doesn't affect `text_row`'s own real width/height (which now
     // comes from `visible_runs`' own real, in-flow text content below), it just fills whatever
     // box that real content already resolved to.
+    // A separate clone from `focus_handle` below - the measurement closure and the paint closure
+    // are two independent `move` closures (`gpui::canvas`'s own real two-callback shape), each
+    // needing its own owned handle, not a second reference to the one the paint closure moves
+    // into itself for `window.handle_input`.
+    let focus_handle_for_measure = focus_handle.clone();
     let cursor_overlay = gpui::canvas(
         move |bounds, window, _cx| {
             let style = window.text_style();
@@ -1175,6 +1557,16 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 .text_system()
                 .shape_line(line_text.clone(), font_size, &runs, None);
 
+            // GitHub issue #27: "selection remains visible (dimmed) when the editor loses
+            // focus" / "unfocused editors show a dimmed, non-blinking caret" - both the
+            // selection fill and the caret itself read this same real, live focus check, not two
+            // independently-derived ones that could disagree.
+            let is_focused = focus_handle_for_measure.is_focused(window);
+            let selection_opacity = if is_focused {
+                theme::editor::SELECTION_OPACITY
+            } else {
+                theme::editor::SELECTION_INACTIVE_OPACITY
+            };
             let selection_quad = selection_local.as_ref().map(|range| {
                 fill(
                     Bounds::from_corners(
@@ -1187,21 +1579,93 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                             bounds.bottom(),
                         ),
                     ),
-                    theme::syntax::CARET.resolve().opacity(0.28),
+                    theme::editor::SELECTION
+                        .resolve()
+                        .opacity(selection_opacity),
                 )
             });
-            let cursor_quad = cursor_local.map(|offset| {
-                fill(
-                    Bounds::new(
-                        point(bounds.left() + shaped.x_for_index(offset), bounds.top()),
-                        size(gpui::px(2.0), bounds.bottom() - bounds.top()),
-                    ),
-                    theme::syntax::CARET,
+            let cursor_quad = cursor_local.and_then(|offset| {
+                let start_x = bounds.left() + shaped.x_for_index(offset);
+                // The real next char boundary after `offset` (for `Block`/`Underline` styles'
+                // own real character-width measurement) - `offset` itself for a caret at the
+                // real end of the line, which `caret_paint_quad` falls back to a minimal width
+                // for rather than measuring a character that isn't there.
+                let next_offset = line_text
+                    .as_ref()
+                    .get(offset..)
+                    .and_then(|rest| rest.chars().next())
+                    .map(|ch| offset + ch.len_utf8())
+                    .unwrap_or(offset);
+                let end_x = bounds.left() + shaped.x_for_index(next_offset);
+                caret_paint_quad(
+                    start_x,
+                    end_x,
+                    bounds.top(),
+                    bounds.bottom(),
+                    caret_style,
+                    is_focused,
+                    caret_blink_visible,
                 )
             });
-            (shaped, selection_quad, cursor_quad)
+            // Multi-cursor (Revision R13, issue #28): every *secondary* real cursor's own
+            // selection fill/caret bar on this row, painted with the exact same real tokens as
+            // the primary's own above - `theme.rs` has no separate "secondary cursor" color, and
+            // inventing one with no `design_handoff_jerry_ade` spec to back it would be an
+            // unjustified guess (`CONTRIBUTING.md`'s own "exact values" discipline) - so a real
+            // multi-cursor session simply shows several real, identically-styled carets/
+            // selections rather than a fabricated visual distinction between them. Empty in
+            // ordinary single-cursor use, so this is real, additional work only when it's real,
+            // additional cursors.
+            let secondary_selection_quads: Vec<_> = secondary_selections_local
+                .iter()
+                .map(|range| {
+                    fill(
+                        Bounds::from_corners(
+                            point(
+                                bounds.left() + shaped.x_for_index(range.start),
+                                bounds.top(),
+                            ),
+                            point(
+                                bounds.left() + shaped.x_for_index(range.end),
+                                bounds.bottom(),
+                            ),
+                        ),
+                        theme::editor::SELECTION
+                            .resolve()
+                            .opacity(theme::editor::SELECTION_OPACITY),
+                    )
+                })
+                .collect();
+            let secondary_cursor_quads: Vec<_> = secondary_cursors_local
+                .iter()
+                .map(|offset| {
+                    fill(
+                        Bounds::new(
+                            point(bounds.left() + shaped.x_for_index(*offset), bounds.top()),
+                            size(gpui::px(2.0), bounds.bottom() - bounds.top()),
+                        ),
+                        theme::editor::CARET,
+                    )
+                })
+                .collect();
+            (
+                shaped,
+                selection_quad,
+                cursor_quad,
+                secondary_selection_quads,
+                secondary_cursor_quads,
+            )
         },
-        move |bounds, (shaped, selection_quad, cursor_quad), window, cx| {
+        move |bounds,
+              (
+            shaped,
+            selection_quad,
+            cursor_quad,
+            secondary_selection_quads,
+            secondary_cursor_quads,
+        ),
+              window,
+              cx| {
             if is_cursor_line {
                 window.handle_input(
                     &focus_handle,
@@ -1212,10 +1676,24 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
             if let Some(selection_quad) = selection_quad {
                 window.paint_quad(selection_quad);
             }
-            if focus_handle.is_focused(window) {
-                if let Some(cursor_quad) = cursor_quad {
-                    window.paint_quad(cursor_quad);
-                }
+            for quad in secondary_selection_quads {
+                window.paint_quad(quad);
+            }
+            // The primary caret's own visibility (blink phase, unfocused dimming) is already
+            // fully decided by `caret_paint_quad` above - `cursor_quad` is `None` exactly when
+            // it shouldn't paint this frame, so no extra `is_focused` gate belongs here (GitHub
+            // issue #27's own docs on `caret_paint_quad` are explicit about this). Secondary
+            // cursors don't have their own blink/dim treatment yet (see this row's own docs on
+            // why multi-cursor deliberately keeps every cursor identically styled), so they paint
+            // unconditionally too, matching the primary selection's own always-visible-when-
+            // present treatment above - the alternative (secondary cursors vanishing on focus
+            // loss while the primary caret stays dimly visible) would be a real, visible
+            // inconsistency between cursors in the same buffer.
+            if let Some(cursor_quad) = cursor_quad {
+                window.paint_quad(cursor_quad);
+            }
+            for quad in secondary_cursor_quads {
+                window.paint_quad(quad);
             }
             let row_layout_entry = (bounds, shaped.clone());
             paint_entity.update(cx, |this, _cx| {
@@ -1232,14 +1710,26 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
     .absolute()
     .size_full();
 
-    let text_row = gpui::div()
+    let mut text_row = gpui::div()
         .id(("file-view-editable-text", line_number))
         .relative()
         .flex_1()
         .min_w_0()
         .h(row_line_height)
         .flex()
-        .children(visible_runs)
+        // The code runs keep their natural width in their own `flex_none` box, so they never
+        // shrink; only the blame span placed beside them below yields and truncates.
+        .child(gpui::div().flex_none().flex().children(visible_runs));
+    // GitHub issue #29: the current line's dimmed inline git blame, placed *in-flow* immediately
+    // after the code text so it begins right at the end of the line and is truncated at the
+    // pane's right edge - rather than pinned to the far right of the row (a flex sibling of the
+    // `flex_1` text wrapper), where it used to be painted on top of a long line's own overflowing
+    // glyphs. `inline_blame` is only ever `Some` on the current line (see
+    // `EditableLineContext::inline_blame`'s own docs), so this never appears on any other row.
+    if let Some(label) = inline_blame {
+        text_row = text_row.child(render_inline_blame_span(label, line_number));
+    }
+    let text_row = text_row
         .child(cursor_overlay)
         .on_mouse_down(
             gpui::MouseButton::Left,
@@ -1281,13 +1771,39 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 // real dismiss-on-caret-move reasoning.
                 this.dismiss_completions();
                 if let Some(buffer) = this.edit_buffers.get_mut(&row_path) {
-                    if event.modifiers.shift {
+                    // Alt+click (Revision R13, issue #28): adds a brand-new cursor at the click
+                    // point, keeping every existing real cursor - `EditBuffer::add_cursor_at`'s
+                    // own docs. Checked first, before the click-count/shift chain below, so an
+                    // Alt-modified click always means "add a cursor" regardless of click count -
+                    // this editor has no mouse-drag-to-select of any kind yet (only click/
+                    // shift-click), so a real Alt+Shift+*drag* column selection is a separate,
+                    // currently undone piece of work (see `crate::code_surface::edit_buffer`'s
+                    // own "Multi-cursor" docs for why) - a plain Alt+Shift+click still does
+                    // something real and useful in the meantime rather than silently falling
+                    // through to a plain click.
+                    //
+                    // GitHub issue #27: "double-click selects a word, triple-click selects a
+                    // line, drag extends, Shift+click extends from the caret." GPUI's real
+                    // `MouseDownEvent::click_count` (`vendor` GPUI's own `interactive.rs`,
+                    // verified via the finder subagent before writing this) already counts
+                    // consecutive same-position clicks, so this app doesn't need its own
+                    // double/triple-click timing - it just reads the count GPUI already
+                    // computed. `>= 3` (not `== 3`) so a fourth/fifth rapid click keeps
+                    // re-selecting the line rather than falling back to a plain caret placement.
+                    if event.modifiers.alt {
+                        buffer.add_cursor_at(absolute_offset);
+                    } else if event.click_count >= 3 {
+                        buffer.select_line_at(click_line_index);
+                    } else if event.click_count == 2 {
+                        buffer.select_word_at(absolute_offset);
+                    } else if event.modifiers.shift {
                         buffer.select_to(absolute_offset);
                     } else {
                         buffer.move_to(absolute_offset);
                     }
                 }
                 this.code_cursor = Some(click_line_number);
+                this.reset_caret_blink(cx);
 
                 if let Some(hover_target) = &click_hover_target {
                     if let Some(token_range) = token_at_offset(&click_line_runs, local_offset) {
@@ -1310,6 +1826,46 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                     }
                 }
                 cx.stop_propagation();
+                cx.notify();
+            }),
+        )
+        // GitHub issue #27's "drag extends" - real-drag detection via `MouseMoveEvent::
+        // dragging()` (`vendor` GPUI's own `interactive.rs`: `self.pressed_button ==
+        // Some(MouseButton::Left)`, verified via the finder subagent, real usage confirmed at
+        // `data_table.rs:350`'s own `if !ev.dragging() { return; }`), the same real idiom this
+        // whole file's own per-row hit-testing already uses for clicks - registered per-row
+        // (matching `crate::code_surface::lsp_ui`'s own per-row `.on_mouse_move` hover-debounce
+        // precedent in this same crate) rather than a window-level capture, so this naturally
+        // only extends the selection while the pointer is actually over *some* row - dragging
+        // past the very top/bottom of the visible rows (auto-scroll) is a real, documented gap,
+        // not built this phase - see `BUILD-LOG.md`.
+        .on_mouse_move(
+            cx.listener(move |this, event: &gpui::MouseMoveEvent, _window, cx| {
+                if !event.dragging() {
+                    return;
+                }
+                let Some((bounds, shaped)) =
+                    this.file_view_row_layout.get(&click_line_number).cloned()
+                else {
+                    return;
+                };
+                let Some(local_point) = bounds.localize(&event.position) else {
+                    return;
+                };
+                let local_offset = shaped.closest_index_for_x(local_point.x);
+                let Some(buffer) = this.edit_buffers.get(&drag_row_path) else {
+                    return;
+                };
+                let Some(line_range) = buffer.line_ranges.get(click_line_index).cloned() else {
+                    return;
+                };
+                let absolute_offset = line_range.start + local_offset;
+                let Some(buffer) = this.edit_buffers.get_mut(&drag_row_path) else {
+                    return;
+                };
+                buffer.select_to(absolute_offset);
+                this.code_cursor = Some(click_line_number);
+                this.reset_caret_blink(cx);
                 cx.notify();
             }),
         );
@@ -1336,7 +1892,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
         .flex()
         .items_center();
     if is_current {
-        row = row.bg(theme::surface::CURRENT_LINE);
+        row = row.bg(theme::editor::CURRENT_LINE);
     } else if let Some(bg) = worst_severity.and_then(diagnostic_row_bg) {
         row = row.bg(bg);
     }
@@ -1362,7 +1918,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 .w(gpui::px(3.0))
                 .self_stretch()
                 .bg(if is_changed {
-                    theme::diff::GIT_GUTTER
+                    theme::editor::DIFF_ADDED
                 } else {
                     theme::ColorToken(crate::work_surface::state::TRANSPARENT)
                 }),
@@ -1387,6 +1943,9 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 .child(first_line.to_string()),
         );
     }
+
+    // NB: the current line's inline git blame is rendered *inside* `text_row` above (right after
+    // the code runs), not appended here at the end of the row - see that construction's own docs.
 
     row.into_any_element()
 }
@@ -1823,6 +2382,359 @@ mod editing_tests {
             selected,
             0..3,
             "three real shift-right keystrokes should select \"hel\""
+        );
+    }
+
+    /// GitHub issue #27: "Ctrl+Shift+arrows (word-wise)" - driven through the real, bound
+    /// `EditorSelectWordRight`/`EditorWordLeft` keystrokes, matching this module's own
+    /// established "through the real key bindings, not a direct method call" discipline for
+    /// every other `Editor*` action test in this file.
+    #[gpui::test]
+    fn ctrl_shift_arrow_extends_a_real_selection_word_wise_through_the_real_key_bindings(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.txt", "hello world\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.txt");
+
+        let select_word_right = if cfg!(target_os = "macos") {
+            "cmd-shift-right"
+        } else {
+            "ctrl-shift-right"
+        };
+        cx.simulate_keystrokes(select_word_right);
+
+        let selected = app.read_with(cx, |app, _| {
+            app.edit_buffers
+                .get(&relative)
+                .unwrap()
+                .selected_range
+                .clone()
+        });
+        assert_eq!(
+            selected,
+            0..5,
+            "one real Ctrl+Shift+Right from offset 0 in \"hello world\" should select exactly \
+             \"hello\", the whole first real word - not one grapheme, matching plain \
+             `shift-right`'s own behavior"
+        );
+
+        let word_left = if cfg!(target_os = "macos") {
+            "cmd-left"
+        } else {
+            "ctrl-left"
+        };
+        cx.simulate_keystrokes(word_left);
+        let cursor = app.read_with(cx, |app, _| {
+            app.edit_buffers.get(&relative).unwrap().cursor_offset()
+        });
+        assert_eq!(
+            cursor, 0,
+            "a real Ctrl+Left should collapse the selection to its start (real `move_word_left` \
+             semantics - a real selection collapses rather than jumping a further word)"
+        );
+    }
+
+    /// GitHub issue #27: "double-click selects a word, triple-click selects a line" - driven
+    /// through real `MouseDownEvent`s with a real, non-1 `click_count`
+    /// (`vendor` GPUI's own real click-count field, not a hand-rolled double-click timer this
+    /// app would otherwise need), matching `clicking_a_real_editable_row_places_the_real_cursor_
+    /// without_panicking`'s own established real-click-simulation precedent.
+    #[gpui::test]
+    fn double_click_selects_the_real_word_and_triple_click_selects_the_real_line(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.txt", "hello world\nsecond line\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        let relative = PathBuf::from("sample.txt");
+
+        let row_bounds = cx
+            .debug_bounds("file-view-text-row-1")
+            .expect("line 1's real text row should have painted real bounds");
+        // Land inside "world" (not "hello") so a real double-click must select the *whole* real
+        // word, not just extend from wherever the click's own x lands.
+        let click_point = gpui::point(row_bounds.right() - gpui::px(10.0), row_bounds.center().y);
+
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: click_point,
+            modifiers: gpui::Modifiers::none(),
+            button: gpui::MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+
+        let selected_text = app.read_with(cx, |app, _| {
+            let buffer = app.edit_buffers.get(&relative).unwrap();
+            buffer.content[buffer.selected_range.clone()].to_string()
+        });
+        assert_eq!(
+            selected_text, "world",
+            "a real double-click (click_count == 2) must select the whole real word under the \
+             click, not just place a caret or select one character"
+        );
+
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: click_point,
+            modifiers: gpui::Modifiers::none(),
+            button: gpui::MouseButton::Left,
+            click_count: 3,
+            first_mouse: false,
+        });
+
+        let selected_text = app.read_with(cx, |app, _| {
+            let buffer = app.edit_buffers.get(&relative).unwrap();
+            buffer.content[buffer.selected_range.clone()].to_string()
+        });
+        assert_eq!(
+            selected_text, "hello world",
+            "a real triple-click (click_count == 3) must select the whole real line, not just \
+             the one word a double-click would"
+        );
+    }
+
+    /// GitHub issue #27: "selection survives scrolling with virtualized/windowed rendering - no
+    /// dropped highlight on rows recycled out of view." A real regression risk in this app's own
+    /// architecture: [`AdeApp::file_view_row_layout`] is pruned to only the currently *painted*
+    /// range on every render (`crate::code_surface::file_view::AdeApp::render_file_view`'s own
+    /// `.retain(...)`, matching `uniform_list`'s real virtualization), so a selection that lived
+    /// only in some per-row cache keyed by that map could plausibly vanish once its row scrolls
+    /// out and back in. It doesn't: [`EditBuffer::selected_range`] is the one real source of
+    /// truth every row's [`EditBuffer::selection_within_line`] is derived from fresh on every
+    /// single render, not cached per-row at all - this test proves that structurally, by
+    /// selecting text, forcing far-scroll-away-and-back (two real render passes with a distant
+    /// [`Self::code_cursor`] each time, exactly what a real scroll would do to which rows get
+    /// painted), and confirming the real selection is still exactly what it was.
+    #[gpui::test]
+    fn selection_survives_a_row_scrolling_out_of_the_virtualized_range_and_back(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let many_lines: String = (0..500).map(|n| format!("line {n}\n")).collect();
+        let file_path = write_file(repo.path(), "sample.txt", &many_lines);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        let relative = PathBuf::from("sample.txt");
+
+        // A real selection on line 1 (offsets 0..4, "line").
+        app.update(cx, |app, cx| {
+            let buffer = app.edit_buffers.get_mut(&relative).unwrap();
+            buffer.move_to(0);
+            buffer.select_to(4);
+            cx.notify();
+        });
+        app.update(cx, |app, cx| app.render_center_pane(cx));
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .unwrap()
+                .selection_within_line(0)),
+            Some(0..4),
+            "sanity check: the real selection should be visible on line 1 before any scrolling"
+        );
+
+        // Force line 1's own row out of the painted range by scrolling
+        // `file_view_scroll_handle` directly - the real, underlying mechanism
+        // `Self::sync_cursor_and_scroll` itself drives (`UniformListScrollHandle::
+        // scroll_to_item`), used directly here rather than through a cursor move: a real mouse-
+        // wheel scroll doesn't touch the caret/selection at all, and going through `EditBuffer::
+        // move_to` here would collapse the very selection this test exists to prove survives -
+        // `move_to`'s own docs are explicit that it clears the selection, which is real,
+        // correct behavior for a cursor move, just not what this test is about.
+        app.update(cx, |app, cx| {
+            app.file_view_scroll_handle
+                .scroll_to_item(400, gpui::ScrollStrategy::Top);
+            cx.notify();
+        });
+        app.update(cx, |app, cx| app.render_center_pane(cx));
+        cx.run_until_parked();
+        app.update(cx, |app, cx| app.render_center_pane(cx));
+
+        assert!(
+            cx.debug_bounds("file-view-text-row-1").is_none(),
+            "sanity check: line 1's own row must genuinely not be in the painted range this far \
+             from the real scroll position - otherwise this test isn't proving anything"
+        );
+
+        // Scroll back - line 1 is repainted (a real, freshly-built row, not reused state).
+        app.update(cx, |app, cx| {
+            app.file_view_scroll_handle
+                .scroll_to_item(0, gpui::ScrollStrategy::Top);
+            cx.notify();
+        });
+        app.update(cx, |app, cx| app.render_center_pane(cx));
+        cx.run_until_parked();
+        app.update(cx, |app, cx| app.render_center_pane(cx));
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .unwrap()
+                .selection_within_line(0)),
+            Some(0..4),
+            "the real selection must survive a row being scrolled out of the virtualized range \
+             and back - it must not have been silently dropped by whatever pruned \
+             `file_view_row_layout` while the row was out of view"
+        );
+    }
+
+    /// Multi-cursor (Revision R13, issue #28): `Ctrl+D` through the real, bound
+    /// `EditorSelectNextOccurrence` keystroke - first press selects the real word under the
+    /// caret, second press adds the next real occurrence as a new cursor, and typing afterward
+    /// (through the real `EntityInputHandler::replace_text_in_range` path, not a direct
+    /// `EditBuffer` call) lands at *both* cursors at once.
+    #[gpui::test]
+    fn ctrl_d_through_real_key_bindings_adds_a_cursor_and_typing_fans_out_to_both(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.txt", "value + value\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.txt");
+
+        app.update(cx, |app, cx| {
+            app.edit_buffers.get_mut(&relative).unwrap().move_to(1);
+            cx.notify();
+        });
+
+        cx.simulate_keystrokes("ctrl-d");
+        let after_first = app.read_with(cx, |app, _| {
+            app.edit_buffers
+                .get(&relative)
+                .unwrap()
+                .selected_range
+                .clone()
+        });
+        assert_eq!(
+            after_first,
+            0..5,
+            "the first Ctrl+D should select the real word (\"value\") under the caret"
+        );
+
+        cx.simulate_keystrokes("ctrl-d");
+        let cursor_count = app.read_with(cx, |app, _| {
+            app.edit_buffers.get(&relative).unwrap().cursor_count()
+        });
+        assert_eq!(
+            cursor_count, 2,
+            "the second Ctrl+D should add the next real occurrence as a new cursor"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.replace_text_in_range(None, "x", window, cx);
+        });
+        let content = app.read_with(cx, |app, _| {
+            app.edit_buffers.get(&relative).unwrap().content.clone()
+        });
+        assert_eq!(
+            content, "x + x\n",
+            "typing after Ctrl+D must land at every real cursor at once, through the real \
+             EntityInputHandler path"
+        );
+    }
+
+    /// Multi-cursor (Revision R13, issue #28): `Ctrl+Shift+L` through the real, bound
+    /// `EditorSelectAllOccurrences` keystroke selects every real occurrence at once.
+    #[gpui::test]
+    fn ctrl_shift_l_through_real_key_bindings_selects_every_occurrence(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.txt", "value + value + value\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.txt");
+
+        app.update(cx, |app, cx| {
+            app.edit_buffers.get_mut(&relative).unwrap().move_to(1);
+            cx.notify();
+        });
+
+        cx.simulate_keystrokes("ctrl-shift-l");
+
+        let cursor_count = app.read_with(cx, |app, _| {
+            app.edit_buffers.get(&relative).unwrap().cursor_count()
+        });
+        assert_eq!(
+            cursor_count, 3,
+            "every real occurrence of \"value\" should get a cursor"
+        );
+    }
+
+    /// Multi-cursor (Revision R13, issue #28): `Ctrl+K Ctrl+D` (a real, space-separated chord
+    /// binding) through the real, bound `EditorSkipOccurrence` keystroke skips the current
+    /// occurrence rather than keeping it selected.
+    #[gpui::test]
+    fn ctrl_k_ctrl_d_through_real_key_bindings_skips_without_adding_a_cursor(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.txt", "value + value\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.txt");
+
+        app.update(cx, |app, cx| {
+            app.edit_buffers.get_mut(&relative).unwrap().move_to(1);
+            cx.notify();
+        });
+        cx.simulate_keystrokes("ctrl-d"); // selects the first "value"
+
+        cx.simulate_keystrokes("ctrl-k ctrl-d");
+
+        let (cursor_count, selected) = app.read_with(cx, |app, _| {
+            let buffer = app.edit_buffers.get(&relative).unwrap();
+            (buffer.cursor_count(), buffer.selected_range.clone())
+        });
+        assert_eq!(cursor_count, 1, "skip must not add a cursor");
+        assert_eq!(selected, 8..13, "skip should move to the second \"value\"");
+    }
+
+    /// Multi-cursor (Revision R13, issue #28): `Esc` through the real, bound
+    /// `EditorCollapseCursors` keystroke collapses back to a single cursor.
+    #[gpui::test]
+    fn escape_through_real_key_bindings_collapses_multi_cursor_state(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.txt", "value + value\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.txt");
+
+        app.update(cx, |app, cx| {
+            app.edit_buffers.get_mut(&relative).unwrap().move_to(1);
+            cx.notify();
+        });
+        cx.simulate_keystrokes("ctrl-d");
+        cx.simulate_keystrokes("ctrl-d");
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .unwrap()
+                .cursor_count()),
+            2
+        );
+
+        cx.simulate_keystrokes("escape");
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .unwrap()
+                .cursor_count()),
+            1,
+            "Escape should collapse back to a single real cursor"
         );
     }
 

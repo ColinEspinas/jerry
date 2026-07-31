@@ -90,6 +90,7 @@ impl AdeApp {
         // becomes active again - see `Self::dismiss_completions`'s own docs).
         self.hover = None;
         self.dismiss_completions();
+        self.close_tab_confirm_armed = None;
         cx.notify();
     }
 
@@ -126,6 +127,7 @@ impl AdeApp {
         // alongside `hover` prevents (Revision R8.5b audit finding 3).
         self.hover = None;
         self.dismiss_completions();
+        self.close_tab_confirm_armed = None;
         cx.notify();
     }
 
@@ -174,6 +176,7 @@ impl AdeApp {
         self.code_cursor = None;
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
+        self.close_tab_confirm_armed = None;
         cx.notify();
     }
 
@@ -193,6 +196,42 @@ impl AdeApp {
     /// tab close is not a "discard this file's edits" action - reopening the same path restores
     /// its real, still-unsaved content), only the completions/sync state tied to the tab that no
     /// longer exists.
+    /// Real entry point for every real close gesture (GitHub issue #26): the tab strip's `×`,
+    /// middle-click, and the global `Ctrl+W`/[`crate::root::CloseFocusedTab`] action all call this
+    /// instead of [`Self::close_file_tab`] directly, so none of them can bypass the real unsaved-
+    /// changes confirmation below.
+    ///
+    /// A tab whose [`crate::code_surface::edit_buffer::EditBuffer::is_dirty`] is `false` closes
+    /// immediately - there is nothing real to lose (and, per [`Self::close_file_tab`]'s own docs,
+    /// this app doesn't even drop the buffer on an ordinary close - reopening the same path
+    /// restores it - so a prompt there would be friction over nothing). A *dirty* tab needs one
+    /// real confirming gesture on the same `path` first: the first call arms
+    /// [`AdeApp::close_tab_confirm_armed`] (which `crate::work_surface::render`'s tab renderers
+    /// read to show a real, visible "close without saving?" cue - never a silent internal flag
+    /// with no on-screen feedback) and returns without closing anything; a second call while still
+    /// armed for the *same* `path` disarms and really closes it - the same real two-gesture
+    /// idiom [`Self::request_prune`]/[`crate::worktree_history::flow::AdeApp::
+    /// request_discard_worktree`] already establish for this app's other destructive-feeling
+    /// actions, reused here rather than a third, independently-invented confirmation mechanism.
+    pub(crate) fn request_close_file_tab(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_dirty = self
+            .edit_buffers
+            .get(&path)
+            .is_some_and(|buffer| buffer.is_dirty());
+        if is_dirty && self.close_tab_confirm_armed.as_deref() != Some(path.as_path()) {
+            self.close_tab_confirm_armed = Some(path);
+            cx.notify();
+            return;
+        }
+        self.close_tab_confirm_armed = None;
+        self.close_file_tab(path, window, cx);
+    }
+
     pub(crate) fn close_file_tab(
         &mut self,
         path: PathBuf,
@@ -202,6 +241,9 @@ impl AdeApp {
         let Some(index) = self.open_files.iter().position(|open| open == &path) else {
             return;
         };
+        if self.close_tab_confirm_armed.as_deref() == Some(path.as_path()) {
+            self.close_tab_confirm_armed = None;
+        }
         self.open_files.remove(index);
         self._lsp_sync_tasks.remove(&path);
         if self
@@ -242,11 +284,12 @@ impl AdeApp {
     }
 
     /// Closes the currently active file tab, if any (the code surface toolbar's own "× close",
-    /// distinct from the tab strip's). Delegates to [`Self::close_file_tab`] so both affordances
-    /// share the same close behavior.
+    /// distinct from the tab strip's). Delegates to [`Self::request_close_file_tab`] (GitHub issue
+    /// #26) so every close affordance shares the same real unsaved-changes confirmation, not just
+    /// the same underlying close behavior.
     pub(crate) fn close_change_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = self.open_change.clone() {
-            self.close_file_tab(path, window, cx);
+            self.request_close_file_tab(path, window, cx);
         }
     }
 

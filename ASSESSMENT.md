@@ -1,5 +1,33 @@
 # Assessment
 
+> **Addendum (inline git blame, GitHub issue #29):** the rest of this document is a
+> point-in-time snapshot from an earlier, much smaller phase of this project (see its own
+> line counts below) and is left as-is rather than rewritten. What follows is an honest,
+> narrowly-scoped note on the one subsystem added in this session, not a refresh of the
+> whole picture.
+>
+> **Real, end to end:** `wt_core::blame::blame_file`/`commit_message` run real `git blame
+> --line-porcelain`/`git log` against real repositories (9 tests, real tempdir repos, no
+> mocking) and correctly distinguish "not a repo"/"untracked file" from a genuine failure.
+> The app-side current-line inline blame is wired to that real data, not a placeholder: it
+> runs off the GPUI foreground thread, is cached per file and revision, recomputes via a
+> throttled freshness poll (verified to cover a save; verified in code, not by hand-testing
+> a real `git commit`/checkout from inside a running app window, that the same poll also
+> catches a commit or branch switch - a real but slightly weaker chain of evidence than the
+> save path, which has an explicit, direct trigger and its own docs say so). The hover
+> tooltip's full commit message is real and lazily fetched, not truncated/faked.
+> **Not built:** the issue's secondary gutter/full-file blame view - no settings field or UI
+> element pretends to offer it. **Not independently visually verified:** unlike this
+> document's own "watched it run, not just read code that claims it runs" standard for
+> earlier steps, this session had no interactive GPUI window available to click into and
+> screenshot - `cargo test`/`cargo clippy` on the two crates this change touches
+> (`wt-core`, `app`) are the actual evidence; a full `cargo test --workspace` run in this
+> session's sandbox hit a large number of pre-existing, unrelated failures (real `/proc`
+> reads, real PTY behavior, real language-server process spawns, a Windows path-separator
+> assertion in recently-rebased code) that reproduce identically with this change's files
+> stashed out, so they're excluded from this feature's own verification rather than
+> papered over.
+
 Written at the end of an autonomous, multi-agent build session: ~10h40m of wall-clock
 time (first commit 00:43, last commit 11:24, same day), roughly 2.4M+ tokens of subagent
 work across builder/checker/finder delegations, 10 commits, 5546 lines of hand-written
@@ -34,6 +62,16 @@ the parts that don't reflect well on the process.
   the wrong filename, a bug that silently hid every untracked file, and a bug that broke
   under a common (not obscure) git config setting. All three are fixed and covered by
   regression tests built from the actual reproduction, not from guessing at a fix.
+- **The code editor's minimap** (GitHub issue #30, added well after this document's original
+  session - see `BUILD-LOG.md`'s "Minimap: a real, canvas-rendered overview" entry for the full
+  design record) is real, not a decorative panel: it renders the open file's actual syntax-colored
+  content at reduced scale from the same highlighted data the editor itself paints from, its
+  viewport slider is genuinely draggable and click-to-jump genuinely scrolls the real editor, and
+  its git-diff overlay reads the same real on-disk diff the gutter stripe does. Two disclosed,
+  narrower limits, not fabricated ones: search-match overlays aren't implemented (this app has no
+  find-in-file feature to source real matches from at all), and the "doesn't cost frames while
+  scrolling" requirement was met structurally (a large-file gate, no re-highlighting) rather than
+  proven with an actual `gpui::FrameTiming` measurement.
 
 ## What does not run, or is genuinely rough
 
@@ -183,3 +221,58 @@ working three-zone layout showing sample data and a shell that echoes text back 
 exactly the kind of result this project's own rules ("no fake functionality," "mark it
 stubbed instead") were written to rule out as a stopping point, not to reach as a finish
 line.
+
+## Addendum: multi-cursor editing (GitHub issue #28)
+
+This file otherwise reflects only the original five-step build session and was never kept
+current through the many revisions BUILD-LOG.md records afterward (R1–R12, the feature-folder
+restructure, the file tree work) — checked directly: `git log -- ASSESSMENT.md` shows exactly
+one commit, its own creation. This one paragraph is added because the multi-cursor work is a
+real new subsystem, not because the rest of the file has been re-audited against everything
+that shipped since; treat the sections above as a snapshot of the original build, not of the
+project as it stands today.
+
+**What's real**: the core data model (a primary cursor plus a `Vec` of secondary cursors on
+`EditBuffer`), `Ctrl+D`'s two-step select-word/add-next-occurrence flow, `Ctrl+Shift+L`,
+`Ctrl+K Ctrl+D`, Alt+click, Esc, simultaneous typing/pasting/backspacing/deleting across every
+active cursor as one atomic edit, collision merging, and multi-cursor arrow-key movement are all
+genuinely wired end to end — driven through the same real key-binding table and
+`EntityInputHandler` path every other editing feature in this app uses, not a parallel or
+special-cased mechanism, and painted with real per-cursor selection fills/caret bars, not a data
+model with nothing visible backing it. This was rebased mid-implementation onto a separately-landed
+branch (GitHub issue #17) that added this editor's first real text undo/redo, and the two are
+genuinely integrated, not just made to compile side by side: a multi-cursor edit now really is one
+`Ctrl+Z` step (`EditBuffer::apply_at_every_cursor` records every cursor's own splice into the same
+history group), with one honest, documented exception — undo/redo restores all of the affected text
+correctly, but only the *primary* cursor's own caret/selection precisely, since the shared
+`SelectionSnapshot` type (used by every text-input widget in this app, not just the File view) has
+no way to represent more than one cursor. 25 new tests, including four that drive the real bound
+keystrokes rather than calling `EditBuffer` methods directly, and five covering the undo/redo
+integration specifically (one-step coalescing, redo, the documented single-cursor-after-undo
+outcome, and a multi-keystroke burst still coalescing to one group).
+
+**What's genuinely not there**: Alt+Shift+drag column selection is absent because ordinary
+mouse-drag-to-select doesn't exist in this editor at all yet, for any selection, single- or
+multi-cursor. Multi-cursor support does not extend to the separate merge hand-edit surface
+(`crate::merge::editing`) — a deliberate scope narrowing to the File view only, documented in
+BUILD-LOG.md's own entry for this work. Undo/redo's own single-selection limitation above is a
+real, live gap for the specific case of undoing a multi-cursor edit, not a hypothetical one.
+
+**Independent verification note**: this work was built from a Windows sandbox instead of this
+project's usual Linux/WSL2 environment, and that gap turned out to be real, not theoretical.
+`lsp-core`'s own test target does not compile on Windows at all (a pre-existing `#[cfg(unix)]` gap,
+confirmed unaffected by this change by reproducing it against a stash of the pre-rebase commit
+too), which blocks a literal `cargo test --workspace`/`cargo clippy --workspace --all-targets` run
+outright. Beyond that, a class of test scattered through modules this change never touches - real
+language-server wiring, real `git` worktree operations, real terminal session spawn/close - either
+crashed the whole test binary or hung indefinitely under this sandbox specifically, seemingly tied
+to how this sandbox's process/toolchain setup differs from the project's native Linux/WSL2 one
+(confirmed missing `rust-analyzer` for the pinned toolchain; likely different process-teardown
+behavior from the Unix-signal-based teardown `pty-core`'s own tests assume). Every one of those
+tests that could be run in isolation passed cleanly, so this reads as sandbox-specific flakiness
+under a long, sequential, real-process-heavy run, not a logic bug - but it does mean the full
+`cargo test --workspace` this project's own `CONTRIBUTING.md` asks for could not be completed here,
+end to end, for reasons unrelated to this change. What could be verified cleanly: every test this
+change actually added or touches (`cargo test -p app --lib code_surface::`, 235 tests, 0 failed),
+`cargo build --workspace`, `cargo fmt --all -- --check`, and `cargo clippy --workspace --exclude
+lsp-core --all-targets -- -D warnings` - see BUILD-LOG.md's own entry for the exact commands.

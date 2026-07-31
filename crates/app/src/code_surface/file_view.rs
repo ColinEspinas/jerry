@@ -12,6 +12,7 @@ use crate::lsp::client::{lsp_file_status, LspFileStatus};
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
 use crate::root::widgets::render_sidebar_message;
+use std::collections::HashSet;
 
 impl AdeApp {
     /// Surface C's File view: a breadcrumb, line-numbered/syntax-highlighted code
@@ -108,6 +109,12 @@ impl AdeApp {
                 }
             }
         }
+
+        // GitHub issue #29: real, off-thread, cached inline git blame - a no-op call whenever
+        // the setting is off or a fresh-enough cache entry already exists (see
+        // `Self::maybe_refresh_blame`'s own docs), so this costs nothing extra on the common
+        // "nothing changed since last render" path.
+        self.maybe_refresh_blame(&absolute_path, cx);
 
         if !cache_fresh {
             // A load already in flight, or a previous read failure, for this exact path must not
@@ -315,6 +322,11 @@ impl AdeApp {
             .edit_buffers
             .get(&relative_path_buf)
             .is_some_and(|buffer| buffer.is_dirty());
+        // GitHub issue #29: the current line's real, already-cached inline git blame label -
+        // `None` while the buffer is dirty, while the setting is off, or while no fresh cache
+        // entry exists yet for this file (see `Self::current_line_blame`'s own docs). Computed
+        // once here, not per row: only the current line ever shows it.
+        let inline_blame = self.inline_blame_render_model(&absolute_path, cursor, buffer_dirty, cx);
         // `true` while a dirty buffer's own content hasn't reached the language server yet, *or*
         // has reached it but the server hasn't genuinely answered for it yet (the real debounce
         // in `Self::schedule_lsp_sync` hasn't fired, there's no ready client at all, or a real
@@ -376,6 +388,7 @@ impl AdeApp {
         // handler further down (see its own docs) needs its own independent copy of both.
         let has_buffer = self.edit_buffers.contains_key(&relative_path_buf);
         let below_content_click_path = relative_path_buf.clone();
+        let minimap_relative_path = relative_path_buf.clone();
 
         let mut code = uniform_list(
             "file-view-code",
@@ -436,6 +449,13 @@ impl AdeApp {
                         let selection_local = buffer.selection_within_line(index);
                         let cursor_local = buffer.cursor_within_line(index);
                         let marked_local = buffer.marked_within_line(index);
+                        // Multi-cursor (Revision R13, issue #28) - empty `Vec`s in ordinary
+                        // single-cursor use, so this changes nothing about how an unaffected row
+                        // paints; see `EditBuffer::secondary_selections_within_line`/
+                        // `EditBuffer::secondary_cursors_within_line`'s own docs.
+                        let secondary_selections_local =
+                            buffer.secondary_selections_within_line(index);
+                        let secondary_cursors_local = buffer.secondary_cursors_within_line(index);
                         let context = crate::code_surface::editing::EditableLineContext {
                             entity: entity.clone(),
                             focus_handle: code_focus_handle.clone(),
@@ -449,9 +469,14 @@ impl AdeApp {
                             selection_local,
                             cursor_local,
                             marked_local,
+                            secondary_selections_local,
+                            secondary_cursors_local,
                             diagnostics: &line_diagnostics,
                             hovered_byte_range,
                             hover_target: hover_target.as_deref(),
+                            inline_blame: is_current.then_some(inline_blame.as_ref()).flatten(),
+                            caret_style: this.settings.appearance.caret_style,
+                            caret_blink_visible: this.caret_blink_visible,
                         };
                         rows.push(
                             crate::code_surface::editing::render_editable_file_view_line(
@@ -492,6 +517,7 @@ impl AdeApp {
                         HoverRenderContext {
                             target: hover_target.as_deref(),
                             entry: hover_entry.as_ref(),
+                            inline_blame: is_current.then_some(inline_blame.as_ref()).flatten(),
                         },
                         cx,
                     ));
@@ -585,7 +611,62 @@ impl AdeApp {
             );
         }
 
-        body = body.child(zoom_scoped(self.effective_code_rem_px(), code));
+        // GitHub issue #30's real editor scrollbar decoration marks - see `Self::render_file_tree`'s
+        // own docs (`crate::sidebar::render`) on why the scrollbar must be a sibling of the
+        // scrollable element, inside its own non-scrolling `.relative()` wrapper, never a child of
+        // `code` itself. `marks` is built from real, already-computed state (see
+        // [`editor_scrollbar_marks`]'s own docs) - never invented for the scrollbar.
+        let marks = editor_scrollbar_marks(
+            &self.file_view_diagnostics,
+            &self.file_view_changed_lines,
+            self.code_cursor,
+            line_count,
+        );
+        let code_with_scrollbar = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(code)
+            .children(self.render_vertical_scrollbar(
+                "file-view-scrollbar",
+                &self.file_view_scroll_handle,
+                &marks,
+                cx,
+            ));
+        // GitHub issue #30's real minimap (`crate::code_surface::minimap`) - reads the exact
+        // same highlighted lines this view itself renders from (a live edit buffer's, or the
+        // read-only parsed cache's - the same `has_buffer`/fallback split `code`'s own row
+        // builder above already makes), and the same real git-changed-line set the gutter stripe
+        // and scrollbar marks above already use. `None` (no minimap) is a real, structural
+        // outcome (the setting is off, or the file is too large - see that module's own docs),
+        // not a placeholder.
+        let minimap_lines: Option<&[code_view::RenderedLine]> =
+            if let Some(buffer) = self.edit_buffers.get(&minimap_relative_path) {
+                Some(buffer.lines.as_slice())
+            } else {
+                self.file_view_cache
+                    .as_ref()
+                    .map(|parsed| parsed.lines.as_slice())
+            };
+        let minimap = match minimap_lines {
+            Some(lines) => self.render_minimap(
+                lines,
+                &self.file_view_changed_lines,
+                row_line_height.as_f32(),
+                cx,
+            ),
+            None => None,
+        };
+        let code_row = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .child(code_with_scrollbar)
+            .children(minimap);
+        body = body.child(zoom_scoped(self.effective_code_rem_px(), code_row));
 
         if truncated {
             body = body.child(render_sidebar_message(
@@ -613,6 +694,133 @@ impl AdeApp {
         // mechanism `Self::render_completions_popover` already established.
 
         body.child(status_bar).into_any_element()
+    }
+}
+
+/// The File view's real editor scrollbar decoration marks (GitHub issue #30's "search matches,
+/// git changes, errors/warnings, cursor position" requirement, minus search matches - see
+/// `crate::root::scrollbar`'s own module docs for why: this app has no find-in-file feature to
+/// source real match positions from). Every mark here comes from state this view already
+/// maintains for its own inline rendering - `diagnostics` backs the dotted-underline/row-tint
+/// diagnostics (`crate::code_surface::lsp_ui`), `changed_lines` backs the git-gutter stripe
+/// (`render_file_view_line`), `cursor_line` is the real blinking caret's own line - not a second,
+/// parallel data source invented for the scrollbar.
+///
+/// Only [`Severity::Error`]/[`Severity::Warning`] get a diagnostic mark (matching most real
+/// editors' own overview-ruler convention of not drawing a mark per hint/information diagnostic,
+/// which on a large file can vastly outnumber the lines actually worth flagging at a glance).
+/// `line_count == 0` returns no marks at all (nothing to divide a fraction by) rather than
+/// panicking or producing `NaN` fractions.
+pub(in crate::code_surface) fn editor_scrollbar_marks(
+    diagnostics: &HashMap<usize, Vec<diagnostics_view::LineDiagnostic>>,
+    changed_lines: &HashSet<usize>,
+    cursor_line: Option<usize>,
+    line_count: usize,
+) -> Vec<scrollbar::ScrollbarMark> {
+    if line_count == 0 {
+        return Vec::new();
+    }
+    let fraction_for_line =
+        |line_number: usize| -> f32 { line_number.saturating_sub(1) as f32 / line_count as f32 };
+
+    let mut marks = Vec::new();
+    for (&line_number, line_diagnostics) in diagnostics {
+        let color = match diagnostics_view::Severity::worst(line_diagnostics) {
+            Some(diagnostics_view::Severity::Error) => Some(theme::status::FAIL.resolve()),
+            Some(diagnostics_view::Severity::Warning) => Some(theme::status::ASK.resolve()),
+            _ => None,
+        };
+        if let Some(color) = color {
+            marks.push(scrollbar::ScrollbarMark::new(
+                fraction_for_line(line_number),
+                color,
+            ));
+        }
+    }
+    for &line_number in changed_lines {
+        marks.push(scrollbar::ScrollbarMark::new(
+            fraction_for_line(line_number),
+            theme::diff::GIT_GUTTER.resolve(),
+        ));
+    }
+    if let Some(line_number) = cursor_line {
+        marks.push(scrollbar::ScrollbarMark::new(
+            fraction_for_line(line_number),
+            theme::syntax::CARET.resolve(),
+        ));
+    }
+    marks
+}
+
+#[cfg(test)]
+mod editor_scrollbar_mark_tests {
+    use super::*;
+
+    fn diagnostic(severity: diagnostics_view::Severity) -> diagnostics_view::LineDiagnostic {
+        diagnostics_view::LineDiagnostic {
+            byte_range: 0..1,
+            severity,
+            message: "test".to_string(),
+            source: None,
+            code: None,
+        }
+    }
+
+    #[test]
+    fn an_empty_file_produces_no_marks_rather_than_a_divide_by_zero() {
+        let marks = editor_scrollbar_marks(&HashMap::new(), &HashSet::new(), Some(1), 0);
+        assert!(marks.is_empty());
+    }
+
+    #[test]
+    fn a_line_with_only_hint_or_information_diagnostics_gets_no_mark() {
+        let mut diagnostics = HashMap::new();
+        diagnostics.insert(
+            5,
+            vec![
+                diagnostic(diagnostics_view::Severity::Hint),
+                diagnostic(diagnostics_view::Severity::Information),
+            ],
+        );
+        let marks = editor_scrollbar_marks(&diagnostics, &HashSet::new(), None, 100);
+        assert!(marks.is_empty());
+    }
+
+    #[test]
+    fn an_error_diagnostic_produces_a_real_mark_at_the_lines_fraction() {
+        let mut diagnostics = HashMap::new();
+        diagnostics.insert(51, vec![diagnostic(diagnostics_view::Severity::Error)]);
+        let marks = editor_scrollbar_marks(&diagnostics, &HashSet::new(), None, 100);
+        assert_eq!(marks.len(), 1);
+        // Line 51 of 100, 1-based -> fraction 0.50.
+        assert!((marks[0].fraction - 0.50).abs() < 0.001);
+    }
+
+    #[test]
+    fn the_cursor_line_produces_its_own_mark_independent_of_diagnostics_and_git_changes() {
+        let marks = editor_scrollbar_marks(&HashMap::new(), &HashSet::new(), Some(1), 100);
+        assert_eq!(marks.len(), 1);
+        assert!((marks[0].fraction - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_changed_line_produces_its_own_mark() {
+        let mut changed = HashSet::new();
+        changed.insert(100);
+        let marks = editor_scrollbar_marks(&HashMap::new(), &changed, None, 100);
+        assert_eq!(marks.len(), 1);
+        // Line 100 of 100, 1-based -> fraction 0.99.
+        assert!((marks[0].fraction - 0.99).abs() < 0.001);
+    }
+
+    #[test]
+    fn diagnostics_changed_lines_and_the_cursor_all_contribute_independent_marks() {
+        let mut diagnostics = HashMap::new();
+        diagnostics.insert(1, vec![diagnostic(diagnostics_view::Severity::Error)]);
+        let mut changed = HashSet::new();
+        changed.insert(2);
+        let marks = editor_scrollbar_marks(&diagnostics, &changed, Some(3), 100);
+        assert_eq!(marks.len(), 3);
     }
 }
 
@@ -660,6 +868,12 @@ pub(in crate::code_surface) struct HoverRenderContext<'a> {
     target: Option<&'a Path>,
     /// [`AdeApp::hover`]'s current entry, if any.
     entry: Option<&'a HoverEntry>,
+    /// GitHub issue #29's real, already-computed inline blame label for *this* line - `Some`
+    /// only on whichever line is `is_current`; every other row is always `None` (only the
+    /// current line ever shows it). Bundled in here rather than as a ninth positional parameter
+    /// on [`render_file_view_line`], for the same `too_many_arguments` reason this struct
+    /// already exists.
+    inline_blame: Option<&'a blame::InlineBlameLabel>,
 }
 
 pub(in crate::code_surface) fn render_file_view_line(
@@ -674,11 +888,12 @@ pub(in crate::code_surface) fn render_file_view_line(
     let HoverRenderContext {
         target: hover_target,
         entry: hover_entry,
+        inline_blame,
     } = hover;
     let gutter_color = if is_current {
-        theme::text::DIM
+        theme::editor::GUTTER_TEXT_ACTIVE
     } else {
-        theme::text::GUTTER
+        theme::editor::GUTTER_TEXT
     };
     // "Worst wins": the tie-break for a line's row-level treatment when it carries diagnostics
     // of mixed severity (see `Severity::worst`), not whichever is first in the Vec.
@@ -688,7 +903,10 @@ pub(in crate::code_surface) fn render_file_view_line(
     let hovered_byte_range = hover_entry
         .and_then(|entry| (entry.line_number == line_number).then(|| entry.byte_range.clone()));
 
-    let mut text_row = div().flex();
+    // The code runs (and the inline diagnostic message) keep their natural width in their own
+    // `flex_none` box, so they never shrink; only the blame span placed beside them below yields
+    // and truncates at the pane's right edge.
+    let mut runs = div().flex().flex_none();
     let mut byte_cursor = 0usize;
     for (run_text, kind, is_diagnostic) in
         diagnostics_view::overlay_diagnostic_runs(&line.runs, diagnostics)
@@ -747,7 +965,7 @@ pub(in crate::code_surface) fn render_file_view_line(
                 ));
             }
         }
-        text_row = text_row.child(run);
+        runs = runs.child(run);
     }
     if let Some(first) = diagnostics.first() {
         // Only the message's first line is shown inline: `uniform_list` measures one row's
@@ -755,12 +973,22 @@ pub(in crate::code_surface) fn render_file_view_line(
         // `\n`s are routine) would otherwise clip or overlap the row below. The full message is
         // still shown in `render_diagnostics_card` below, which isn't height-constrained.
         let first_line = first.message.lines().next().unwrap_or_default();
-        text_row = text_row.child(
+        runs = runs.child(
             div()
                 .pl(px(10.0))
                 .text_color(diagnostic_inline_message_color(first.severity))
                 .child(first_line.to_string()),
         );
+    }
+    // `flex_1` + `min_w_0` so the text row fills the pane's remaining width and the blame span
+    // below (the only shrinkable child) truncates exactly at its right edge.
+    let mut text_row = div().flex().flex_1().min_w_0().child(runs);
+    // GitHub issue #29: the current line's dimmed inline git blame, placed in-flow immediately
+    // after the code text so it begins right at the end of the line and is truncated at the
+    // pane's right edge. `inline_blame` is only ever `Some` on the current line (see
+    // `HoverRenderContext::inline_blame`'s own docs).
+    if let Some(label) = inline_blame {
+        text_row = text_row.child(blame_view::render_inline_blame_span(label, line_number));
     }
 
     div()
@@ -769,7 +997,7 @@ pub(in crate::code_surface) fn render_file_view_line(
         .flex()
         .items_center()
         .cursor_pointer()
-        .when(is_current, |el| el.bg(theme::surface::CURRENT_LINE))
+        .when(is_current, |el| el.bg(theme::editor::CURRENT_LINE))
         .when_some(
             if is_current {
                 None
@@ -813,7 +1041,7 @@ pub(in crate::code_surface) fn render_file_view_line(
                 // strip.
                 .self_stretch()
                 .bg(if is_changed {
-                    theme::diff::GIT_GUTTER
+                    theme::editor::DIFF_ADDED
                 } else {
                     theme::ColorToken(work_surface::TRANSPARENT)
                 }),

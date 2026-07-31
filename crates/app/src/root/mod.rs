@@ -86,7 +86,9 @@ use crate::work_surface::state as work_surface;
 use crate::worktree_history::flow as worktree_history;
 use crate::worktree_history::undo;
 
-use crate::code_surface::state::{DiffLoadState, FileLoadState, HoverEntry};
+use crate::code_surface::state::{
+    BlameCacheEntry, BlameLoadState, CommitMessageState, DiffLoadState, FileLoadState, HoverEntry,
+};
 use crate::lsp::client::LspClientState;
 use crate::lsp::completion_popup::CompletionsEntry;
 use crate::root::resize::{PaneResizeDrag, ResizeTarget};
@@ -152,6 +154,10 @@ actions!(
         EditorSelectRight,
         EditorSelectUp,
         EditorSelectDown,
+        EditorWordLeft,
+        EditorWordRight,
+        EditorSelectWordLeft,
+        EditorSelectWordRight,
         EditorHome,
         EditorEnd,
         EditorSelectAll,
@@ -160,14 +166,23 @@ actions!(
         EditorPaste,
         EditorSave,
         EditorSaveAnyway,
+        EditorSelectNextOccurrence,
+        EditorSelectAllOccurrences,
+        EditorSkipOccurrence,
+        EditorCollapseCursors,
         CompletionsUp,
         CompletionsDown,
         CompletionsAccept,
         CompletionsDismiss,
+        CompletionsInvoke,
+        EditorIndent,
+        EditorDedent,
+        EditorEscape,
         Undo,
         Redo,
         TextUndo,
         TextRedo,
+        CloseFocusedTab,
         FileTreeContextMenu,
         FileTreeRename,
         FileTreeCopy,
@@ -229,12 +244,27 @@ pub struct AdeApp {
     pub(crate) repo_path: PathBuf,
     pub(crate) worktrees: Vec<WorktreeItem>,
     pub(crate) worktrees_error: Option<String>,
+    /// The session rail's own real overlay scrollbar handle (GitHub issue #30) - a plain
+    /// `gpui::ScrollHandle`: `crate::rail::render::AdeApp::render_rail_list` renders every row
+    /// eagerly, not through a `uniform_list`.
+    pub(crate) rail_scroll_handle: gpui::ScrollHandle,
     pub(crate) selected: Option<usize>,
     pub(crate) sessions: Sessions,
     pub(crate) file_tree: Vec<FileTreeEntry>,
     pub(crate) file_tree_root: PathBuf,
     pub(crate) file_tree_error: Option<String>,
     pub(crate) right_sidebar_view: RightSidebarView,
+    /// The file tree's own `uniform_list` scroll handle (GitHub issue #30) - real overlay
+    /// scrollbar geometry (`crate::root::scrollbar::AdeApp::render_vertical_scrollbar`) is read
+    /// straight off this handle's `base_handle` (`gpui::UniformListScrollHandle::0`), the same
+    /// handle `crate::sidebar::render::AdeApp::render_file_tree`'s own `uniform_list` is
+    /// `track_scroll`'d with - not a second, parallel tracking mechanism.
+    pub(crate) file_tree_scroll_handle: UniformListScrollHandle,
+    /// The Changes list's own equivalent of [`Self::file_tree_scroll_handle`] - a separate handle
+    /// (not shared) because the two `uniform_list`s are mutually exclusive tabs of the same panel
+    /// but never rendered at the same time, and giving them independent scroll state is what lets
+    /// switching tabs and back restore each list's own scroll position rather than the other's.
+    pub(crate) changes_rows_scroll_handle: UniformListScrollHandle,
     pub(crate) diff_root: PathBuf,
     pub(crate) diff_state: DiffLoadState,
     /// The real `+n`/`-n` totals across every file in [`Self::diff_state`]'s currently loaded
@@ -366,6 +396,15 @@ pub struct AdeApp {
     /// tab (`Self::activate_file_tab`); cleared by selecting a session tab or closing the active
     /// tab down to none left.
     pub(crate) open_change: Option<PathBuf>,
+    /// `Some(path)` for one real "arming" click/keystroke on a *dirty* file tab's close
+    /// affordance (`×`, middle-click, or `Ctrl+W` - GitHub issue #26), cleared by the confirming
+    /// second gesture on the same `path` (which then really closes it) or by most other tab/file
+    /// navigation in the meantime - the same real two-gesture confirmation idiom
+    /// [`Self::prune_confirm_armed`]/[`Self::discard_confirm_armed`] already establish for this
+    /// app's other destructive-feeling actions. A clean (non-dirty) tab never arms this at all -
+    /// see [`crate::code_surface::tabs::AdeApp::request_close_file_tab`]'s own docs for why an
+    /// unsaved-changes prompt for a tab with nothing unsaved would be real, unnecessary friction.
+    pub(crate) close_tab_confirm_armed: Option<PathBuf>,
     /// Cached `DiffFile` for whichever path [`Self::open_change`] names (`None` if it has no
     /// diff, or nothing is open) - kept fresh by [`Self::refresh_open_diff_file_cache`] instead
     /// of re-cloning the whole diff (up to 2000 hunk lines) on every render.
@@ -388,12 +427,35 @@ pub struct AdeApp {
     pub(crate) code_focus_handle: FocusHandle,
     /// Pre-open focus target for [`Self::code_focus_handle`] - see [`OverlayFocus`].
     pub(crate) code_focus: OverlayFocus,
+    /// Real, shared caret blink state (GitHub issue #27) - see `crate::root::caret_blink`'s
+    /// module docs for the whole mechanism. `true` means the caret is in its "on" (painted)
+    /// phase right now; every caret-bearing surface's own render call site
+    /// (`crate::code_surface::editing::render_editable_file_view_line`) reads this alongside its
+    /// own `FocusHandle::is_focused` check, so a caret only actually blinks while it is both the
+    /// real live caret *and* genuinely focused.
+    pub(crate) caret_blink_visible: bool,
+    /// The live blink loop, restarted by [`Self::reset_caret_blink`]/
+    /// [`Self::start_caret_blink`] on every real cursor-moving action, edit, or focus change so a
+    /// stale timer can never fire after the caret it was blinking has moved on -
+    /// `Task::ready(())` (already-finished, fires nothing) is the real idle value.
+    pub(crate) _caret_blink_task: Task<()>,
+    /// `cx.on_focus`/`cx.on_blur` subscriptions on every real caret-bearing `FocusHandle` this
+    /// app has, wired once in [`Self::new_with_settings`] - see
+    /// `crate::root::caret_blink::AdeApp::wire_caret_blink`. Held for this instance's whole
+    /// lifetime; an unheld `gpui::Subscription` is dropped, and a dropped one stops firing.
+    pub(crate) _caret_blink_subscriptions: Vec<Subscription>,
     /// The File view's `uniform_list` scroll handle (`gpui::UniformListScrollHandle`, matching
     /// `vendor/zed/crates/git_ui/src/git_panel.rs`'s `commit_history_scroll_handle` use of the
     /// same type) - driven by go-to-definition landing on a distant [`Self::code_cursor`] line,
     /// never on an ordinary click or fresh file open (no reason to fight the user's own scroll
     /// position).
     pub(crate) file_view_scroll_handle: UniformListScrollHandle,
+    /// The read-only Diff view's own real overlay scrollbar handle (GitHub issue #30) - a plain
+    /// `gpui::ScrollHandle`: `crate::code_surface::diff_view::AdeApp::render_diff_file_detail`
+    /// renders every hunk line eagerly into a plain `overflow_y_scroll()` div, not a
+    /// `uniform_list`, so it needs the base handle type directly rather than the `uniform_list`
+    /// wrapper [`Self::file_view_scroll_handle`] uses.
+    pub(crate) diff_view_scroll_handle: gpui::ScrollHandle,
     /// Cached parse/highlight of whichever file [`Self::render_file_view`] last loaded
     /// (`code_view::load_file`/`highlight_rust`) - reused unless `code_view::cache_is_fresh`
     /// says otherwise, always written from [`Self::spawn_file_load`]'s background task, never
@@ -426,11 +488,39 @@ pub struct AdeApp {
     /// [`Self::open_diff_file_cache`] holds - recomputed only by
     /// [`Self::refresh_open_diff_file_cache`], never per render.
     pub(crate) file_view_changed_lines: HashSet<usize>,
+    /// The real minimap panel's most recently measured bounds (`crate::code_surface::minimap`) -
+    /// updated every render by a small measuring `gpui::canvas` child, the same established
+    /// one-frame-lag idiom [`Self::body_bounds`]/[`Self::plus_button_bounds`] already use for the
+    /// same real reason (an absolutely-positioned sibling - here, the viewport slider - needs a
+    /// real pixel height that's only known after layout). `gpui::Bounds::default()` (zero) until
+    /// the first real measurement lands.
+    pub(crate) minimap_panel_bounds: gpui::Bounds<Pixels>,
     /// The File view's "last click" cursor line (1-indexed), set by
     /// [`Self::render_file_view_line`]'s click handler and reset to `1` on a fresh file load.
     /// No column tracking: per-character hit-testing against a monospace run wasn't implemented
     /// this phase, so no column is shown at all rather than a fabricated `col 1`.
     pub(crate) code_cursor: Option<usize>,
+    /// Real, cached `wt_core::blame::blame_file` results (GitHub issue #29), keyed by absolute
+    /// path - see `crate::code_surface::blame_view`'s own module docs for the threading/caching
+    /// design and what "revision" means for freshness here.
+    pub(crate) blame_cache: HashMap<PathBuf, BlameCacheEntry>,
+    /// In-flight/settled state per absolute path, mirroring [`Self::file_load_state`]'s own
+    /// single-flight discipline so [`Self::maybe_refresh_blame`] never dispatches a second
+    /// background `git blame` for a path that already has one running.
+    pub(crate) blame_state: HashMap<PathBuf, BlameLoadState>,
+    pub(crate) _blame_tasks: HashMap<PathBuf, Task<()>>,
+    /// Path and time [`Self::maybe_refresh_blame`] last rechecked blame freshness for, throttling
+    /// that (potentially real-`git`-spawning) recheck the same way
+    /// [`Self::file_view_last_freshness_check`] throttles the syntax-highlight one - see
+    /// [`crate::code_surface::blame_view::BLAME_FRESHNESS_CHECK_INTERVAL`]'s own docs.
+    pub(crate) blame_last_freshness_check: Option<(PathBuf, Instant)>,
+    /// Real, full commit-message bodies (`wt_core::blame::commit_message`), keyed by commit sha
+    /// rather than by file/line - a sha's message is the same regardless of which file/line
+    /// referenced it, so this is shared across every open file. Populated lazily, only for a sha
+    /// the current line's hover tooltip actually needs (see
+    /// [`Self::ensure_blame_commit_message`]), off-thread.
+    pub(crate) blame_commit_messages: HashMap<String, CommitMessageState>,
+    pub(crate) _blame_message_tasks: HashMap<String, Task<()>>,
     /// Real, live per-tab text-editing state for the File view (Revision R8.5a) - keyed the same
     /// way as [`Self::open_files`] (a worktree-relative path), so switching between open file
     /// tabs never loses unsaved edits in a background tab. Created lazily the first time a file
@@ -522,6 +612,10 @@ pub struct AdeApp {
     pub(crate) file_external_conflict: HashSet<PathBuf>,
     /// Whether the command palette (⌘K) overlay is open.
     pub(crate) palette_open: bool,
+    /// The palette's own real overlay scrollbar handle (GitHub issue #30) - a plain
+    /// `gpui::ScrollHandle`: `crate::palette::render::AdeApp::render_palette_groups` renders
+    /// every result row eagerly, not through a `uniform_list`.
+    pub(crate) palette_results_scroll_handle: gpui::ScrollHandle,
     /// The palette's active scope (`All`/`Commands`/`Files`).
     pub(crate) palette_scope: palette::PaletteScope,
     /// The palette's currently typed query - the same minimal hand-rolled append/backspace text
@@ -674,6 +768,13 @@ pub struct AdeApp {
     /// [`Self::open_settings`]/[`Self::close_settings`], which use the same
     /// capture-and-restore shape as [`Self::palette_open`].
     pub(crate) settings_open: bool,
+    /// The Settings nav column's real overlay scrollbar handle (GitHub issue #30) - a plain
+    /// `gpui::ScrollHandle`, not `UniformListScrollHandle`: the nav groups render eagerly (there
+    /// are only ever a handful of them), not through a `uniform_list`.
+    pub(crate) settings_nav_scroll_handle: gpui::ScrollHandle,
+    /// The Settings content column's own equivalent of [`Self::settings_nav_scroll_handle`] - a
+    /// separate handle since the two columns scroll independently of each other.
+    pub(crate) settings_content_scroll_handle: gpui::ScrollHandle,
     /// Which Settings nav page is selected - persists across opens/closes (unlike the palette's
     /// query/scope, which resets every time).
     pub(crate) settings_page: settings::SettingsPage,
@@ -1106,6 +1207,17 @@ impl AdeApp {
         cx.notify();
     }
 
+    /// Sets `Settings.blame.show_inline` and persists it - GitHub issue #29's own "user setting
+    /// to hide it entirely" requirement. `crate::code_surface::blame_view::AdeApp::
+    /// maybe_refresh_blame`/`current_line_blame` both check this field directly (not a cached
+    /// copy), so flipping it off here also stops the real background `git blame` work, not just
+    /// the rendering - a genuine off switch, not merely a visual one.
+    pub(crate) fn set_show_inline_blame(&mut self, show: bool, cx: &mut Context<Self>) {
+        self.settings.blame.show_inline = show;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
     /// Queues a background-executor save of the current [`Self::settings`] to
     /// [`Self::settings_path`] (`Settings::save_at`), called from every settings mutation. A
     /// `None` path (every GPUI test) makes this a no-op; a save failure is logged, not surfaced.
@@ -1313,6 +1425,7 @@ impl Render for AdeApp {
             .on_action(cx.listener(Self::handle_jump_to_session_8_action))
             .on_action(cx.listener(Self::handle_undo_action))
             .on_action(cx.listener(Self::handle_redo_action))
+            .on_action(cx.listener(Self::handle_close_focused_tab_action))
             .child(self.render_title_bar(cx))
             // The Settings surface (`design_handoff_jerry_ade/README.md`: "a separate surface,
             // not a modal: it replaces the three zones while the title bar and status bar
@@ -1695,11 +1808,14 @@ mod settings_persist_tests {
     }
 }
 
+pub(crate) mod caret_blink;
 pub(crate) mod focus;
 pub mod layout;
 pub(crate) mod new_file;
 pub(crate) mod rem_scope;
 pub(crate) mod resize;
+pub(crate) mod scrollbar;
+pub(crate) mod scrollbar_geometry;
 pub(crate) mod state;
 pub(crate) mod task_pool;
 pub(crate) mod widgets;

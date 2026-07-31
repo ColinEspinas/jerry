@@ -41,17 +41,44 @@ impl AdeApp {
         // time, which for a worktree this file has never seen (including a freshly created one)
         // is nothing at all.
 
+        // Built before the `Self` literal below (rather than inline as `cx.focus_handle()` at
+        // their own field positions, as every other focus handle in this literal is) because
+        // `AdeApp::wire_caret_blink` needs real, already-constructed handles to subscribe to -
+        // there is no `self` yet to read them back off of at this point in construction. Moved
+        // into the literal below by their own field-init-shorthand once wiring is done.
+        let code_focus_handle = cx.focus_handle();
+        let merge_edit_focus_handle = cx.focus_handle();
+        let palette_focus_handle = cx.focus_handle();
+        let tree_focus_handle = cx.focus_handle();
+        let filter_focus_handle = cx.focus_handle();
+        let settings_keymap_filter_focus_handle = cx.focus_handle();
+        let caret_blink_subscriptions = AdeApp::wire_caret_blink(
+            &[
+                &code_focus_handle,
+                &merge_edit_focus_handle,
+                &palette_focus_handle,
+                &tree_focus_handle,
+                &filter_focus_handle,
+                &settings_keymap_filter_focus_handle,
+            ],
+            window,
+            cx,
+        );
+
         let mut this = Self {
             file_tree_root: repo_path.clone(),
             diff_root: repo_path.clone(),
             repo_path: repo_path.clone(),
             worktrees: Vec::new(),
             worktrees_error: None,
+            rail_scroll_handle: gpui::ScrollHandle::new(),
             selected: None,
             sessions: Sessions::new(),
             file_tree: Vec::new(),
             file_tree_error: None,
             right_sidebar_view: RightSidebarView::Files,
+            file_tree_scroll_handle: UniformListScrollHandle::new(),
+            changes_rows_scroll_handle: UniformListScrollHandle::new(),
             diff_state: DiffLoadState::Loading,
             diff_totals: None,
             // Both are filled in immediately after this literal, through the same single
@@ -75,25 +102,42 @@ impl AdeApp {
             tree_clipboard: None,
             tree_delete_confirm: None,
             tree_op_error: None,
-            tree_focus_handle: cx.focus_handle(),
+            tree_focus_handle,
             file_tree_bounds: gpui::Bounds::default(),
             _tree_delete_task: None,
             _tree_copy_task: None,
             reviewed_files: HashSet::new(),
             open_files: Vec::new(),
             open_change: None,
+            close_tab_confirm_armed: None,
             open_diff_file_cache: None,
             selected_tree_path: None,
             code_view: code_view::CodeView::Diff,
-            code_focus_handle: cx.focus_handle(),
+            code_focus_handle,
             code_focus: OverlayFocus::default(),
+            // `true`/`Task::ready(())`: no blink loop is running yet (nothing is focused at
+            // construction - a fresh window focuses the initial session's terminal pane, not
+            // the code editor, a few lines below), and `Self::start_caret_blink` will replace
+            // this the moment a real caret-bearing handle is - see
+            // `crate::root::caret_blink`'s module docs.
+            caret_blink_visible: true,
+            _caret_blink_task: Task::ready(()),
+            _caret_blink_subscriptions: caret_blink_subscriptions,
             file_view_scroll_handle: UniformListScrollHandle::new(),
+            diff_view_scroll_handle: gpui::ScrollHandle::new(),
             file_view_cache: None,
             diff_highlight_cache: None,
             file_view_last_freshness_check: None,
             file_load_state: FileLoadState::Idle,
             file_view_changed_lines: HashSet::new(),
+            minimap_panel_bounds: gpui::Bounds::default(),
             code_cursor: None,
+            blame_cache: HashMap::new(),
+            blame_state: HashMap::new(),
+            _blame_tasks: HashMap::new(),
+            blame_last_freshness_check: None,
+            blame_commit_messages: HashMap::new(),
+            _blame_message_tasks: HashMap::new(),
             edit_buffers: HashMap::new(),
             file_view_row_layout: HashMap::new(),
             file_view_last_layout: None,
@@ -106,10 +150,11 @@ impl AdeApp {
             file_save_error: None,
             file_external_conflict: HashSet::new(),
             palette_open: false,
+            palette_results_scroll_handle: gpui::ScrollHandle::new(),
             palette_scope: palette::PaletteScope::default(),
             palette_query: text_history::TextField::new(),
             palette_selected: 0,
-            palette_focus_handle: cx.focus_handle(),
+            palette_focus_handle,
             palette_focus: OverlayFocus::default(),
             palette_file_candidates: Vec::new(),
             rail_width: px(layout::RAIL_DEFAULT),
@@ -118,7 +163,7 @@ impl AdeApp {
             title_bar_move_armed: false,
             rail_mode: RailMode::default(),
             filter_query: text_history::TextField::new(),
-            filter_focus_handle: cx.focus_handle(),
+            filter_focus_handle,
             rail_focus_handle: cx.focus_handle(),
             diff_cache: HashMap::new(),
             worktree_notes: HashMap::new(),
@@ -134,6 +179,8 @@ impl AdeApp {
             worktree_history_status: None,
             discard_confirm_armed: None,
             settings_open: false,
+            settings_nav_scroll_handle: gpui::ScrollHandle::new(),
+            settings_content_scroll_handle: gpui::ScrollHandle::new(),
             settings_page: settings::SettingsPage::General,
             settings_focus_handle: cx.focus_handle(),
             settings_focus: OverlayFocus::default(),
@@ -142,7 +189,7 @@ impl AdeApp {
             merge_op_in_flight: false,
             merge_highlight_cache: None,
             merge_edit: None,
-            merge_edit_focus_handle: cx.focus_handle(),
+            merge_edit_focus_handle,
             merge_edit_scroll_handle: UniformListScrollHandle::new(),
             merge_edit_row_layout: HashMap::new(),
             merge_edit_last_layout: None,
@@ -198,7 +245,7 @@ impl AdeApp {
             lsp_rows: Vec::new(),
             _lsp_rows_task: None,
             settings_keymap_filter: text_history::TextField::new(),
-            settings_keymap_filter_focus_handle: cx.focus_handle(),
+            settings_keymap_filter_focus_handle,
             keymap_recording: None,
             _keymap_intercept: None,
             keymap_rebind_error: None,
@@ -578,6 +625,19 @@ impl AdeApp {
         self.hover = None;
         self.dismiss_completions();
         self.pending_cursor_line = None;
+        // Real blame state (GitHub issue #29) is absolute-path-keyed - cleared alongside the
+        // hover cache above for the identical reason: without this, a same-named file's blame
+        // from the worktree just left could reappear (wrongly attributed) the instant a
+        // same-named file opens in the new one, and a stale `Loading`/in-flight task from the
+        // old worktree has no reason to keep running once its own worktree is no longer active.
+        self.blame_cache.clear();
+        self.blame_state.clear();
+        self._blame_tasks.clear();
+        self.blame_last_freshness_check = None;
+        // Commit messages are sha-keyed, not path-keyed - a sha means the same real commit
+        // regardless of which worktree it's viewed from, so this cache deliberately survives a
+        // worktree switch (the same "safe to keep, sha is a real global identity" reasoning
+        // `AdeApp::lsp_uri_cache`'s own root-scoped-only pruning already applies elsewhere).
         self.load_file_tree(path.clone(), cx);
         // `load_file_tree` above already set `self.file_tree_root = path` synchronously, so
         // `path` is the active root by the time eviction runs.

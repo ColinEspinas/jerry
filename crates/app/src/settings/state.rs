@@ -7,12 +7,15 @@
 //!
 //! ## Which pages are real
 //!
-//! General, Agents, Worktrees, Appearance, Themes, Keybindings, and Language servers render
-//! real, live-derived content (see [`SettingsPage::is_implemented`]). Editor, Notifications,
+//! General, Agents, Worktrees, Appearance, Themes, Keybindings, Editor, and Language servers
+//! render real, live-derived content (see [`SettingsPage::is_implemented`]). Notifications,
 //! Integrations, and About are honest nav-only placeholders - `Jerry.dc.html`'s own `setStub`
-//! copy, "not designed in this mockup". Editor in particular has no real backing anywhere in
-//! this codebase for indentation/soft-wrap/whitespace-display, so it stays a placeholder rather
-//! than growing controls bound to nothing.
+//! copy, "not designed in this mockup". Editor is a partial exception, not a full one: its one
+//! real row is the minimap (`crate::code_surface::minimap`, GitHub issue #30's
+//! `editor.minimap.enabled`) - indentation/soft-wrap/whitespace-display still have no real
+//! backing anywhere in this codebase, so those stay left off the page entirely rather than
+//! growing controls bound to nothing, the same "only what's real" discipline every other page
+//! here already follows.
 //!
 //! ## Why the Agents/Worktrees "Behaviour"/"Policy" toggle sections are left out
 //!
@@ -105,6 +108,7 @@ impl SettingsPage {
                 | SettingsPage::Appearance
                 | SettingsPage::Theme
                 | SettingsPage::Keymap
+                | SettingsPage::Editor
                 | SettingsPage::LanguageServers
         )
     }
@@ -136,6 +140,9 @@ impl SettingsPage {
             }
             SettingsPage::LanguageServers => {
                 "One row per language server this app knows how to spawn, detected live on PATH - not configured."
+            }
+            SettingsPage::Editor => {
+                "The minimap (right of the code column) is real: syntax-colored overview, a draggable viewport slider, git-change ticks - saved for real and applied live. Search-match overlays, indentation, soft-wrap and whitespace display aren't built yet, so they're left off this page rather than shown inert."
             }
             _ => "Not designed yet - this page has no real content in this build.",
         }
@@ -527,6 +534,11 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::EditorSelectRight" => Some("Editor: extend selection right"),
         "app::EditorSelectUp" => Some("Editor: extend selection up"),
         "app::EditorSelectDown" => Some("Editor: extend selection down"),
+        // GitHub issue #27's "Ctrl+Shift+arrows (word-wise)".
+        "app::EditorWordLeft" => Some("Editor: move left one word"),
+        "app::EditorWordRight" => Some("Editor: move right one word"),
+        "app::EditorSelectWordLeft" => Some("Editor: extend selection left one word"),
+        "app::EditorSelectWordRight" => Some("Editor: extend selection right one word"),
         "app::EditorHome" => Some("Editor: go to line start"),
         "app::EditorEnd" => Some("Editor: go to line end"),
         "app::EditorSelectAll" => Some("Editor: select all"),
@@ -535,10 +547,19 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::EditorPaste" => Some("Editor: paste"),
         "app::EditorSave" => Some("Editor: save file"),
         "app::EditorSaveAnyway" => Some("Editor: save file (overwrite external change)"),
+        // Multi-cursor (Revision R13, issue #28).
+        "app::EditorSelectNextOccurrence" => Some("Editor: select next occurrence"),
+        "app::EditorSelectAllOccurrences" => Some("Editor: select all occurrences"),
+        "app::EditorSkipOccurrence" => Some("Editor: skip occurrence"),
+        "app::EditorCollapseCursors" => Some("Editor: collapse cursors"),
         "app::CompletionsUp" => Some("Completions: select previous"),
         "app::CompletionsDown" => Some("Completions: select next"),
         "app::CompletionsAccept" => Some("Completions: accept selected"),
         "app::CompletionsDismiss" => Some("Completions: dismiss"),
+        "app::CompletionsInvoke" => Some("Completions: trigger"),
+        "app::EditorIndent" => Some("Editor: indent"),
+        "app::EditorDedent" => Some("Editor: dedent"),
+        "app::EditorEscape" => Some("Editor: move focus out"),
         // Deliberately *not* bare "Undo"/"Redo": GitHub issue #17 adds a second, genuinely
         // distinct undo system on the same physical keys (text undo, below), and two rows both
         // labelled "Undo" on this page would be exactly the confusion this project's own
@@ -548,6 +569,7 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::Redo" => Some("Worktree history: redo"),
         "app::TextUndo" => Some("Text: undo"),
         "app::TextRedo" => Some("Text: redo"),
+        "app::CloseFocusedTab" => Some("Close focused tab"),
         "app::FileTreeContextMenu" => Some("Files tree: context menu"),
         "app::FileTreeRename" => Some("Files tree: rename"),
         "app::FileTreeCopy" => Some("Files tree: copy"),
@@ -693,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_seven_documented_pages_are_implemented() {
+    fn exactly_the_eight_documented_pages_are_implemented() {
         for page in SettingsPage::ALL {
             let expected = matches!(
                 page,
@@ -703,6 +725,7 @@ mod tests {
                     | SettingsPage::Appearance
                     | SettingsPage::Theme
                     | SettingsPage::Keymap
+                    | SettingsPage::Editor
                     | SettingsPage::LanguageServers
             );
             assert_eq!(
@@ -716,7 +739,7 @@ mod tests {
 
     #[test]
     fn nav_only_pages_share_the_same_honest_placeholder_subtitle() {
-        let placeholder = SettingsPage::Editor.subtitle();
+        let placeholder = SettingsPage::Notifications.subtitle();
         for page in SettingsPage::ALL {
             if page.is_implemented() {
                 assert_ne!(
@@ -1100,6 +1123,11 @@ mod tests {
                 "Editor: extend selection right",
                 "Editor: extend selection up",
                 "Editor: extend selection down",
+                // GitHub issue #27's "Ctrl+Shift+arrows (word-wise)".
+                "Editor: move left one word",
+                "Editor: move right one word",
+                "Editor: extend selection left one word",
+                "Editor: extend selection right one word",
                 "Editor: go to line start",
                 "Editor: go to line end",
                 "Editor: select all",
@@ -1108,11 +1136,29 @@ mod tests {
                 "Editor: paste",
                 "Editor: save file",
                 "Editor: save file (overwrite external change)",
+                // Multi-cursor (Revision R13, issue #28): Ctrl+D/Ctrl+Shift+L/Ctrl+K Ctrl+D.
+                "Editor: select next occurrence",
+                "Editor: select all occurrences",
+                "Editor: skip occurrence",
+                // GitHub issue #26's real Tab/Shift+Tab indentation, scoped
+                // `"file-editor && !completions"` - see `crate::default_key_bindings`'s own docs
+                // for why `Tab` no longer falls through to plain-text insertion here.
+                "Editor: indent",
+                "Editor: dedent",
+                // `Escape` here is `EditorCollapseCursors`, not a separate `EditorEscape` - it
+                // composes GitHub issue #28's own multi-cursor collapse with issue #26's
+                // accessibility focus-out hatch, since only one binding can genuinely own the
+                // File view's plain `Escape` at equal context depth (see `crate::code_surface::
+                // editing::AdeApp::handle_editor_collapse_cursors_action`'s own docs).
+                "Editor: collapse cursors",
                 "Completions: select previous",
                 "Completions: select next",
                 "Completions: accept selected",
                 "Completions: accept selected",
                 "Completions: dismiss",
+                // GitHub issue #26's manual completion trigger/refresh, scoped plain
+                // `"file-editor"` (fires whether the popup is open or closed).
+                "Completions: trigger",
                 // Revision R8.5c's `"merge-editor"`-scoped bindings for Surface D's merge
                 // hand-edit whole-file editor - the same real `Editor*` action *types*/labels as
                 // the `"file-editor"` set above (reused, not duplicated - see
@@ -1132,6 +1178,10 @@ mod tests {
                 "Editor: extend selection right",
                 "Editor: extend selection up",
                 "Editor: extend selection down",
+                "Editor: move left one word",
+                "Editor: move right one word",
+                "Editor: extend selection left one word",
+                "Editor: extend selection right one word",
                 "Editor: go to line start",
                 "Editor: go to line end",
                 "Editor: select all",
@@ -1139,6 +1189,12 @@ mod tests {
                 "Editor: cut",
                 "Editor: paste",
                 "Editor: save file",
+                // The same GitHub issue #26 indent/dedent/escape bindings, mirrored here for the
+                // merge hand-edit target - scoped plain `"merge-editor"` (no completions popup
+                // exists for this surface, so there's no `!completions` narrowing to mirror).
+                "Editor: indent",
+                "Editor: dedent",
+                "Editor: move focus out",
                 // GitHub issue #19's file-tree bindings, each scoped to
                 // `"file-tree && !tree-editing"` - see `crate::default_key_bindings`' own docs
                 // and `crate::sidebar::tree_ops`' module docs for why both halves of that
@@ -1148,6 +1204,8 @@ mod tests {
                 "Files tree: copy",
                 "Files tree: cut",
                 "Files tree: paste",
+                // GitHub issue #26's `Ctrl+W` - closes the focused tab, scoped `Some("!terminal")`.
+                "Close focused tab",
             ]
         );
     }
@@ -1190,6 +1248,29 @@ mod tests {
         // `Some("!terminal && !text-input")` - still scoped either way, so only the count of
         // scoped rows moves. See `crate::default_key_bindings`'s own docs for why the two undo
         // systems are kept disjoint structurally rather than by dispatch order.
+        // GitHub issue #27 added 8 more real scoped bindings: `EditorWordLeft`/`EditorWordRight`/
+        // `EditorSelectWordLeft`/`EditorSelectWordRight`, each bound once under `"file-editor"`
+        // and once under `"merge-editor"` - the same word-wise-caret-navigation set both real
+        // editors share, matching every other `Editor*` action's own dual registration.
+        // Revision R13 (issue #28) added 4 more real scoped bindings, all File-view-only
+        // (`crate::merge::editing`'s `"merge-editor"` context deliberately does not get these):
+        // `EditorSelectNextOccurrence` (`Ctrl+D`), `EditorSelectAllOccurrences` (`Ctrl+Shift+L`),
+        // `EditorSkipOccurrence` (`Ctrl+K Ctrl+D`, all three `Some("file-editor")`), and
+        // `EditorCollapseCursors` (`Esc`, `Some("file-editor && !completions")` - narrowed rather
+        // than the other three's bare `"file-editor"` because GitHub issue #26 also wants the
+        // File view's plain `Escape` for its own accessibility focus-out hatch, and only one
+        // binding can genuinely own a keystroke at equal context depth; see `crate::
+        // code_surface::editing::AdeApp::handle_editor_collapse_cursors_action`'s own docs for how
+        // it composes both real behaviors from this one binding rather than a separate
+        // `EditorEscape` shadowing or being shadowed by it).
+        // GitHub issue #26 added 7 more real scoped bindings on top of that (not counting
+        // `EditorCollapseCursors` above, which is issue #28's own action): `EditorIndent`/
+        // `EditorDedent` under `"file-editor && !completions"` (2), the same two again plus
+        // `EditorEscape` under plain `"merge-editor"` (3, `EditorEscape` here since
+        // `"merge-editor"` never gets multi-cursor actions and so never faces the same collision
+        // `EditorCollapseCursors` resolves in the File view), `CompletionsInvoke` under plain
+        // `"file-editor"` (1), and `CloseFocusedTab` under `Some("!terminal")` (1, the same real
+        // terminal-control-byte conflict class as `Undo`/`Redo` above).
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings, &[]);
         assert!(!rows.is_empty());
@@ -1197,11 +1278,15 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            53,
+            72,
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
              every real Completions* binding (5) plus every real merge-editor binding (18) plus \
              Undo/Redo (2) plus TextUndo/TextRedo (3, GitHub issue #17) plus every real \
-             file-tree binding (5, GitHub issue #19) to be scoped, not global"
+             file-tree binding (5, GitHub issue #19) plus every real word-wise Editor* binding \
+             (8, GitHub issue #27) plus every real multi-cursor Editor* binding (4, GitHub issue \
+             #28) plus every real GitHub issue #26 binding (7, not counting \
+             EditorCollapseCursors above, which is issue #28's own action) to be scoped, not \
+             global"
         );
         assert!(
             scoped

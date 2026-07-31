@@ -1064,9 +1064,9 @@ impl AdeApp {
             let relative_path = relative_path.clone();
             async move |this, cx| {
                 cx.background_executor().timer(LSP_SYNC_DEBOUNCE).await;
-                let Ok(Some(plan)) =
-                    this.update(cx, |this, cx| this.prepare_lsp_sync(&relative_path, cx))
-                else {
+                let Ok(Some(plan)) = this.update(cx, |this, cx| {
+                    this.prepare_lsp_sync(&relative_path, cx, false)
+                }) else {
                     return;
                 };
                 let LspSyncPlan { sync, completion } = plan;
@@ -1297,6 +1297,96 @@ impl AdeApp {
         self._lsp_sync_tasks.insert(relative_path, task);
     }
 
+    /// `Ctrl+Space`'s real dispatch (GitHub issue #26,
+    /// [`crate::lsp::completion_popup::AdeApp::handle_completions_invoke_action`]) - unlike
+    /// [`Self::schedule_lsp_sync`], this never waits out [`LSP_SYNC_DEBOUNCE`] first: a real,
+    /// explicit keystroke asking for suggestions right now should dispatch immediately, not sit
+    /// behind a debounce meant to coalesce a *fast typist's* burst of edits. Reuses
+    /// [`Self::prepare_lsp_sync`] (`force_completion: true`) for the actual plan - the same real
+    /// sync-then-complete ordering and version/generation bookkeeping - but runs a smaller, real
+    /// continuation than [`Self::schedule_lsp_sync`]'s own: just the real sync (if the buffer
+    /// hasn't already been sent) and the real completion request/response, never the diagnostics-
+    /// pull sequence further down in that method (irrelevant to what `Ctrl+Space` needs, and
+    /// already covered by whichever `schedule_lsp_sync` debounce the same edit already armed).
+    /// This is a deliberate, documented duplication of `schedule_lsp_sync`'s own sync-dispatch
+    /// shape rather than a deeper shared refactor of that already-large method - see this crate's
+    /// own `CONTRIBUTING.md` for why a judgment call like this gets a comment, not a silent choice.
+    ///
+    /// A genuine no-op when [`Self::prepare_lsp_sync`] finds nothing real to do (no buffer, or no
+    /// ready LSP client for this file's language) - `Ctrl+Space` in a file with no language server
+    /// simply does nothing, the same honest "nothing real to complete against" this app already
+    /// gives the automatic, keystroke-driven path in that case.
+    pub(crate) fn invoke_completions_now(
+        &mut self,
+        relative_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(plan) = self.prepare_lsp_sync(&relative_path, cx, true) else {
+            return;
+        };
+        let LspSyncPlan { sync, completion } = plan;
+        let Some(request) = completion else {
+            return;
+        };
+
+        let task = cx.spawn(async move |this, cx| {
+            let mut server_has_latest_content = true;
+            if let Some(sync_request) = sync {
+                let LspSyncRequest {
+                    client,
+                    absolute_path,
+                    content,
+                    version,
+                    ..
+                } = sync_request;
+                let sync_client = client.clone();
+                let sync_path = absolute_path.clone();
+                let content_for_wire = content.clone();
+                let sync_result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        sync_client.did_change_full(&sync_path, content_for_wire, version)
+                    })
+                    .await;
+                server_has_latest_content = sync_result.is_ok();
+                if sync_result.is_ok() {
+                    let record_path = relative_path.clone();
+                    let _ = this.update(cx, |this, _cx| {
+                        this.lsp_last_synced_content
+                            .insert(record_path.clone(), content);
+                        this.lsp_synced_version.insert(record_path, version);
+                    });
+                }
+            }
+            if !server_has_latest_content {
+                // The same real wire-ordering rule `Self::schedule_lsp_sync`'s own docs explain:
+                // never let a completion request race ahead of a `didChange` that failed to send,
+                // which risks the server answering against stale, pre-edit content.
+                return;
+            }
+
+            let CompletionRequestPlan {
+                client,
+                generation,
+                params,
+                relative_path,
+            } = request;
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    client.request::<lsp_core::lsp_types::request::Completion>(
+                        params,
+                        LSP_QUERY_TIMEOUT,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_completion_result(&relative_path, generation, result, cx);
+            });
+        });
+        self._completions_request_task = Some(task);
+    }
+
     /// The synchronous, foreground half of [`Self::schedule_lsp_sync`]'s debounced work - reads
     /// [`AdeApp::edit_buffers`]/[`AdeApp::lsp_clients`] fresh (this is the *first* foreground step
     /// after the debounce timer, so this is always the real, current state, never a stale
@@ -1312,10 +1402,19 @@ impl AdeApp {
     /// schedule_lsp_sync`]'s own docs for where that write actually happens now, and why): this
     /// is *plan* time, before the real `did_change_full` send is even attempted, let alone known
     /// to have succeeded.
+    ///
+    /// `force_completion` (GitHub issue #26's `Ctrl+Space` manual invoke - see
+    /// [`AdeApp::invoke_completions_now`]) bypasses [`crate::lsp::completion::completion_trigger`]'s
+    /// own "was the character before the caret completion-worthy" judgment entirely, always
+    /// building a real `CompletionTriggerKind::INVOKED` request with no `trigger_character` -
+    /// the real "explicitly ask for suggestions right here, mid-word or not" contract `Ctrl+Space`
+    /// needs, as opposed to the automatic, keystroke-driven path this same method also serves
+    /// (`force_completion: false`, from [`AdeApp::schedule_lsp_sync`]).
     fn prepare_lsp_sync(
         &mut self,
         relative_path: &Path,
         cx: &mut Context<Self>,
+        force_completion: bool,
     ) -> Option<LspSyncPlan> {
         let buffer = self.edit_buffers.get(relative_path)?;
         let absolute_path = buffer.path.clone();
@@ -1352,10 +1451,16 @@ impl AdeApp {
         let content_unchanged = self.lsp_last_synced_content.get(relative_path) == Some(&content);
         let should_sync = !content_unchanged && client.supports_document_sync();
 
-        let char_before_cursor = crate::lsp::completion::char_before(&content, cursor);
-        let trigger_characters = client.completion_trigger_characters();
-        let completion_context =
-            crate::lsp::completion::completion_trigger(char_before_cursor, &trigger_characters);
+        let completion_context = if force_completion {
+            Some(lsp_core::lsp_types::CompletionContext {
+                trigger_kind: lsp_core::lsp_types::CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            })
+        } else {
+            let char_before_cursor = crate::lsp::completion::char_before(&content, cursor);
+            let trigger_characters = client.completion_trigger_characters();
+            crate::lsp::completion::completion_trigger(char_before_cursor, &trigger_characters)
+        };
 
         if !should_sync && completion_context.is_none() {
             if self

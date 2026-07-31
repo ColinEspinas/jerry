@@ -25,6 +25,9 @@ impl AdeApp {
         if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
             return;
         }
+        // GitHub issue #27's "solid mid-keystroke" - see `crate::palette::render::AdeApp::
+        // handle_palette_key_down`'s identical reasoning.
+        self.reset_caret_blink(cx);
         let changed = match keystroke.key.as_str() {
             "backspace" => self.filter_query.pop(Instant::now()),
             // A real, undoable step, not a silent loss: `Esc` clearing a typed filter is exactly
@@ -382,11 +385,26 @@ impl AdeApp {
             })
             .child(
                 div()
-                    .id("session-rail-list")
+                    .relative()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .child(self.render_rail_list(cx)),
+                    .child(
+                        div()
+                            .id("session-rail-list")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.rail_scroll_handle)
+                            .child(self.render_rail_list(cx)),
+                    )
+                    .children(self.render_vertical_scrollbar(
+                        "rail-scrollbar",
+                        &self.rail_scroll_handle,
+                        &[],
+                        cx,
+                    )),
             )
             .child(self.render_rail_footer(cx))
     }
@@ -535,18 +553,26 @@ impl AdeApp {
             .child(
                 div()
                     .flex_1()
-                    .font(font(theme::font::MONO))
-                    .text_size(self.ui_text_size(10.5))
-                    .text_color(if has_query {
-                        theme::text::DIM
-                    } else {
-                        theme::text::GHOST
-                    })
-                    .child(if has_query {
-                        self.filter_query.as_str().to_string()
-                    } else {
-                        "filter sessions".to_string()
-                    }),
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(self.ui_text_size(10.5))
+                            .text_color(if has_query {
+                                theme::text::DIM
+                            } else {
+                                theme::text::GHOST
+                            })
+                            .child(if has_query {
+                                self.filter_query.as_str().to_string()
+                            } else {
+                                "filter sessions".to_string()
+                            }),
+                    )
+                    .child(self.render_simple_input_caret()),
             )
     }
 

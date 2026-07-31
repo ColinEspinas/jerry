@@ -427,7 +427,35 @@ impl AdeApp {
         // this `flex_1`. Drop it, or put this list under any ancestor without a definite
         // height, and the list renders zero rows with no panic and no warning.
         .flex_1()
-        .min_h_0();
+        .min_h_0()
+        // GitHub issue #30's real overlay scrollbar reads its geometry straight off this same
+        // handle (`crate::root::scrollbar::AdeApp::render_vertical_scrollbar`) - not a second,
+        // parallel tracking mechanism.
+        .track_scroll(&self.file_tree_scroll_handle);
+
+        // The scrollbar is a *sibling* of `list`, inside its own non-scrolling `.relative()`
+        // wrapper - never a child of `list` itself. `Interactivity::prepaint`'s own real scroll
+        // translation (`vendor/zed/crates/gpui/src/elements/div.rs:1844-1851`'s
+        // `window.with_element_offset(scroll_offset, ...)`) applies uniformly to *every* child of
+        // a scrolling element, including an absolutely-positioned one - verified directly, not
+        // assumed - so a scrollbar painted as `list`'s own child would scroll away with the rows
+        // instead of staying pinned like a real overlay. The wrapper keeps `list`'s own
+        // `flex_1().min_h_0()` working exactly as before (a `.relative()` div is still a normal
+        // flex parent once `.flex().flex_col()` is added) by taking over the *outer* flex slot
+        // `list` used to occupy directly inside `column`, below.
+        let list = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(list)
+            .children(self.render_vertical_scrollbar(
+                "file-tree-scrollbar",
+                &self.file_tree_scroll_handle,
+                &[],
+                cx,
+            ));
 
         // `flex_1().min_h_0()`, deliberately not `size_full()`. Both do in fact lay out
         // correctly here - GPUI's sizes are border-box, so an `h_full()` alongside this 4px of
@@ -709,8 +737,17 @@ impl AdeApp {
                     .overflow_hidden()
                     .text_color(theme::text::STRONG)
                     // A real caret glyph, so an empty field still reads as "type here" rather
-                    // than as a blank row.
-                    .child(format!("{name}\u{2502}")),
+                    // than as a blank row - blinking (GitHub issue #27), same shared loop
+                    // (`Self::tree_focus_handle` is wired into `crate::root::caret_blink` too) the
+                    // code editor's/palette's own carets use. Same reasoning as the palette's own
+                    // caret for why no separate "unfocused" case is needed here: this row only
+                    // renders while `Self::tree_inline_edit` is genuinely open and
+                    // `tree_focus_handle` is its own real focus target for that whole time.
+                    .child(if self.caret_blink_visible {
+                        format!("{name}\u{2502}")
+                    } else {
+                        name
+                    }),
             )
             .when_some(edit.error.clone(), |el, error| {
                 el.child(
@@ -1250,27 +1287,45 @@ impl AdeApp {
         // method's own docs. Up to `MAX_RENDERED_DIFF_FILES` change rows were previously built,
         // laid out and painted every frame regardless of how few were on screen; every row is
         // exactly `theme::band::CHANGE_ROW` tall, which is `uniform_list`'s one real requirement.
+        let changes_list = uniform_list(
+            "changes-rows-list",
+            rendered_count,
+            cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
+                // Re-resolved (not captured) so a diff that got replaced between this
+                // frame's `item_count` read and this call renders fewer rows rather than
+                // indexing a stale snapshot.
+                let Some(diff) = this.current_diff() else {
+                    return Vec::new();
+                };
+                let start = range.start.min(diff.files.len());
+                let end = range.end.min(diff.files.len());
+                diff.files[start..end]
+                    .iter()
+                    .map(|file| this.render_change_row(file, cx).into_any_element())
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .min_h_0()
+        .track_scroll(&self.changes_rows_scroll_handle);
+
+        // See `Self::render_file_tree`'s own docs on why the scrollbar must be a sibling of the
+        // list, inside its own non-scrolling `.relative()` wrapper, never a child of `list`
+        // itself.
         column = column.child(
-            uniform_list(
-                "changes-rows-list",
-                rendered_count,
-                cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
-                    // Re-resolved (not captured) so a diff that got replaced between this
-                    // frame's `item_count` read and this call renders fewer rows rather than
-                    // indexing a stale snapshot.
-                    let Some(diff) = this.current_diff() else {
-                        return Vec::new();
-                    };
-                    let start = range.start.min(diff.files.len());
-                    let end = range.end.min(diff.files.len());
-                    diff.files[start..end]
-                        .iter()
-                        .map(|file| this.render_change_row(file, cx).into_any_element())
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .flex_1()
-            .min_h_0(),
+            div()
+                .relative()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(changes_list)
+                .children(self.render_vertical_scrollbar(
+                    "changes-rows-scrollbar",
+                    &self.changes_rows_scroll_handle,
+                    &[],
+                    cx,
+                )),
         );
 
         if total_files > rendered_count {

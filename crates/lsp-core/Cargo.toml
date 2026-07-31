@@ -33,6 +33,16 @@ log = "0.4"
 # segments, etc.) is a real footgun `url` already solves; already resolved transitively in
 # this workspace's `Cargo.lock` (2.5.8, via other deps), so this is not new version surface.
 url = "2"
+# `pty_core::resolve_on_path` - the one real, already-tested cross-platform "find this binary
+# on PATH" resolver in this workspace (`crate::settings::state::detect_lsp_rows` in the `app`
+# crate already trusts it to decide whether the Settings page shows a language server as
+# "ready"). `LspClient::spawn` reuses the exact same resolution instead of handing a bare
+# name to `std::process::Command` and letting it do its own, narrower search - see that
+# function's own docs for the real, live-reproduced Windows bug this closes (a bare
+# `Command::new("typescript-language-server")` only ever looks for a literal `.exe` sibling,
+# never the `.cmd`/`.bat` shim `npm install -g` actually produces on that platform, even
+# though it's genuinely on `PATH` and `resolve_on_path` already finds it).
+pty-core = { path = "../pty-core" }
 
 # Process-tree kill (SIGTERM-then-SIGKILL, plus a `/proc` descendant sweep so a `cargo
 # check`/`rustc` child rust-analyzer spawned while indexing doesn't survive as an orphan) -

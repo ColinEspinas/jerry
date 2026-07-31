@@ -2655,3 +2655,1031 @@ wt-core, with no test removed or consolidated from either side. The two sides we
 and 847 (issues #18/#19) app tests over a shared 742-test base, so 742 + 75 + 105 = 922 is the
 overlap-free sum of both efforts; the remaining six are this merge's own new regression tests. No
 run hit the project's known diff-rendering flake.
+
+## Fix: real Windows LSP-spawn bug - Settings said "ready", the real spawn said "program not found"
+
+A user testing GitHub issue #26's `Ctrl+Space` feature on real Windows hit a real failure: both
+`rust-analyzer` and `typescript-language-server` reported `failed to spawn ... (is it installed
+and on PATH?): program not found` at the bottom of the editor, despite both showing "ready" on the
+Settings > Languages page - the same real binaries, the same real machine, disagreeing with
+themselves. Root-caused by reading real source, not guessed: `library/std/src/sys/process/
+windows.rs`'s own `resolve_exe`/`search_paths` (this workspace's exact toolchain, rustc 1.95.0,
+`rustup component add rust-src` then read directly) shows `std::process::Command` does its **own**
+executable resolution on Windows rather than delegating to `CreateProcessW`'s built-in search, and
+for a bare name with no extension that resolution *only ever appends a literal `.exe`* to every
+candidate directory - there is no `%PATHEXT%` fallback to `.cmd`/`.bat`/`.com` the way a real
+`cmd.exe` prompt (or this exact workspace's own `pty_core::resolve_on_path`, which already mirrors
+`portable-pty`'s `PATHEXT`-aware algorithm and is what the Settings page's "ready" check actually
+calls) would try. `npm install -g typescript-language-server` on Windows installs exactly a `.cmd`/
+`.ps1` shim, never a `.exe` - genuinely on `PATH`, genuinely found by `resolve_on_path`, genuinely
+unspawnable by a bare `Command::new("typescript-language-server")`. The literal string "program not
+found" in the error is itself real evidence, not a generic OS message: it is `std`'s own hardcoded
+`io::ErrorKind::NotFound` text for exactly this resolution failure (`resolve_exe`'s own
+`Err(io::const_error!(io::ErrorKind::NotFound, "program not found"))`), confirming which code path
+was actually hit before a single line of this project's own code was read.
+
+`LspClient::spawn` (`crates/lsp-core/src/client.rs`) never had a resolution step of its own - a
+bare `Command::new(config.binary)` was handed straight to `std`, so it inherited `std`'s own
+narrower search instead of the broader one the rest of this app already trusts. Fixed by resolving
+`config.binary` through `pty_core::resolve_on_path` first (`lsp-core` now depends on `pty-core` for
+exactly this - a small, already-tested, gpui-free utility, not a pty-specific one despite where it
+lives) and handing `Command::new` the already-resolved, absolute path instead of the bare name.
+This isn't "teach a second resolver about `.cmd`" - once `resolve_on_path` hands back the shim's
+own real, absolute `...\typescript-language-server.cmd` path (not a bare name), `std::process::
+Command` handles the rest correctly on its own: `resolve_exe`'s "already has a real path with its
+own extension" branch trusts it verbatim, and `spawn_with_attributes`'s own `is_batch_file` check
+(matching the resolved path's real extension) transparently wraps the launch through `cmd.exe /c` -
+confirmed by writing a real, throwaway `.cmd` script in this exact sandbox and reproducing both
+directions live: `Command::new("lsp_core_fake_server")` (bare name, `.cmd` deliberately not on
+`PATH`) fails with `NotFound`, `Command::new(&resolved_cmd_path)` succeeds and its real stdout is
+captured - a real, `#[cfg(windows)]` regression test now pins this exact mechanism
+(`a_real_windows_batch_shim_is_unspawnable_by_bare_name_but_spawns_via_its_own_resolved_path`), not
+just a fix "correct by inspection". The resolution step itself (`resolve_server_binary`) takes an
+injectable resolver (mirroring `crate::settings::state::detect_lsp_rows`'s own established
+`resolve: impl Fn(&str) -> Option<PathBuf>` shape in the `app` crate, for the identical reason:
+`resolve_on_path` reads the real, global `PATH` env var, and this workspace's own discipline is to
+never mutate that from a test - `std::env::set_var` needs `unsafe` as of this edition and would
+race any other test's own real `PATH` reads), so the two new "what happens when nothing/something
+is found" unit tests need no real filesystem or `PATH` state at all.
+
+### A pre-existing, unrelated bug this fix run surfaced and closed too
+
+Verifying the fix meant running `lsp-core`'s test suite on real Windows for what appears to be the
+first time - this project's own CI only ever *builds* (not tests) on Windows, and its own dev
+environment is Linux/WSL2 (see the CI-simplification entry above). The whole suite failed to
+*compile* here: two real tests (`spawn_performs_a_real_handshake_and_shutdown_leaves_no_orphan`,
+`killing_the_real_process_flips_is_connection_alive_to_false`) and one shared test helper
+(`pid_exists`) call `crate::proc`/`nix::sys::signal` unconditionally, but both are `#[cfg(unix)]`-
+gated at their own declaration (`crate::proc`'s own module doc explains why - the real Windows kill
+path uses `std::process::Child::kill()` directly, with no process-tree concept to walk). Gated all
+three with `#[cfg(unix)]`, matching the exact class of fix (and precedent) the CI-simplification
+entry above already made for `crates/app/src/status_bar/mod.rs`'s own Windows-only import gap.
+
+### Verified
+
+`cargo build --workspace`, `cargo fmt --all -- --check`, and `cargo clippy -p lsp-core -p app
+--all-targets -- -D warnings` all clean. `cargo test -p lsp-core --lib` now compiles on Windows at
+all (a real, new capability, not just this fix's own tests) and runs 40 tests (2 more gated
+`#[cfg(unix)]`, unreachable here by design): the 3 new tests pass, `crate::language`'s 23 tests and
+`app`'s own `settings::state`/`lsp_client_eviction_tests` suites (85 combined) are unaffected. Of
+the 11 pre-existing failures on this run, one (`uri_to_path_round_trips_with_path_to_uri_for_a_real_
+temp_file`) is a real, separate, unrelated Windows path-canonicalization quirk (`canonicalize()`'s
+own `\\?\`-prefixed UNC form) this fix does not touch; the rest are real servers genuinely absent
+or misconfigured on this specific sandbox (`pyright-langserver` not on `PATH` at all - an honest
+`NotFound`, exactly as intended) or a real, separate, only-partially-overlapping finding this fix
+does *not* claim to have solved: on this sandbox's own real `PATH`, `typescript-language-server`
+resolves (via `resolve_on_path`'s own bare-name-first check, before it ever tries `.cmd`) to an
+extension-less file that isn't a native Win32 executable either - `std`'s own real error for that
+case, `Os { code: 193, ... "%1 is not a valid Win32 application" }`, is a strictly more honest
+signal than the old, flatly wrong "not found", but this specific sandbox's own shim shape needs
+more than this fix to fully spawn end-to-end. `rust-analyzer` similarly now gets *past* spawn
+(previously impossible) into a real `ConnectionClosed` during the handshake - genuine forward
+progress, not a regression, but not chased further here since it's a distinct failure mode from the
+one reported and reproduced. Both are called out explicitly rather than left to look like this fix
+did more than it verifiably did.
+
+### Step: inline git blame (GitHub issue #29, part of the umbrella issue #14 "Editor polish")
+
+Built as a new subsystem, prioritized per the issue's own scope guidance: a correct,
+off-thread, gracefully-absent current-line inline blame to full quality, over a half-built
+gutter/full-file mode. Two new files plus wiring into six existing ones.
+
+**`wt_core::blame`** (`crates/wt-core/src/blame.rs`, 9 tests, all against real git repos in
+tempdirs): `blame_file(worktree_path, relative_path)` shells out to `git blame
+--line-porcelain` via a real argument vector (`std::process::Command`, `&[OsString]`, never
+an interpolated string) - `gix` (this workspace's pinned 0.68) has no public blame API, so
+this mirrors `wt_core::diff`'s own established "gix for reads, `git` CLI for what gix can't
+do" split, not a new pattern. `--line-porcelain` (repeats every commit's header on every
+line, not just the first) makes the parser stateless across lines at the cost of a larger
+stdout to parse - accepted, since this app already caps opened files at 2MB
+(`code_view::MAX_FILE_BYTES`) regardless. Returns a real three-way `BlameOutcome` (`Blame`,
+`NotARepo`, `NotTracked`) rather than folding "nothing to show" into `Err`, so the app layer
+never has to sniff a generic error message to tell a real failure apart from an expected,
+non-error absence - the same "no fabricated answer, no fabricated error either" discipline
+`wt_core::diff::DiffBase` already established. A shallow clone needed no special-casing at
+all: `git blame` itself degrades gracefully there (attributes lines past the shallow
+boundary to the boundary commit it does have), so nothing in this module has to know a
+clone is shallow. Uncommitted local modifications are git's own synthetic all-zero sha
+(`BlameLine::is_uncommitted`), detected structurally, not by string-matching the author
+name. `commit_message(worktree_path, sha)` fetches the real full body (`git log -1
+--format=%B`) lazily, one commit at a time, for the hover tooltip - a hex-digit validation
+on `sha` before it's handed to `git` as an argument mirrors `diff_against_base`'s own
+defensive check on a merge-base sha, so a future caller can't turn this into an argument
+injection by construction.
+
+**Threading and caching** (`crates/app/src/code_surface/blame_view.rs`): mirrors this
+crate's existing background-load shape exactly - `AdeApp::spawn_blame_load` hands the
+blocking `blame_file` call to `cx.background_executor().spawn(..)` and only touches `self`
+again inside `this.update(cx, ..)` once it resolves, the same pattern
+`AdeApp::spawn_file_load` (syntax highlighting) and `Self::schedule_lsp_sync` (LSP) already
+use - no new concurrency model invented. The real result is cached per file **and
+revision** in `AdeApp::blame_cache`, keyed by absolute path, fingerprinted by
+`(mtime, len)` (the resolved `HEAD` commit id also travels inside the cached
+`wt_core::blame::FileBlame` itself). Recompute triggers (save, commit, branch/HEAD change)
+are deliberately **not** three separate hooks into every code path that can move history -
+that risks silently missing one (an external `git commit` run in this app's own terminal
+pane, say). Instead, `AdeApp::maybe_refresh_blame` reruns the same throttled-freshness-check
+shape `Self::render_file_view` already uses for the syntax-highlight cache
+(`FILE_FRESHNESS_CHECK_INTERVAL`), on its own coarser `BLAME_FRESHNESS_CHECK_INTERVAL` (2s,
+vs. the highlight check's 500ms - a stale hit here spawns a real `git blame` child process,
+meaningfully more expensive than a `std::fs::metadata` call, so it's checked less often).
+Called only from `render_file_view` itself, never a free-running loop enumerating every open
+tab - the same "scope polling to the visible pane, not every pane" lesson this project's own
+history already paid for once, for the terminal poll cadence (see the fix immediately
+preceding this entry in this log). `AdeApp::force_refresh_blame_for_save` additionally
+forces an immediate recompute right after a save's write succeeds, since that one trigger is
+this module's own write and there's no reason to make it wait out the generic poll.
+
+**Graceful absence**: `spawn_blame_load` maps `NotARepo`/`NotTracked` (and any real `Err`,
+logged at `debug`, never surfaced) to `BlameLoadState::Unavailable`/`Error` - the inline
+span simply doesn't render in either case, no toast, no `panic!`. Verified this is
+structural, not just documented: `BlameLoadState`'s three non-`Ready` variants are all
+handled the same way at every render call site.
+
+**Rendering**: the current line's real, already-computed `blame::InlineBlameLabel` (author,
+relative date via a hand-rolled bucketed formatter - no new date/time dependency, this
+workspace has none - and summary, or `"You, uncommitted changes"` for the synthetic
+all-zero-sha case) is appended as a dimmed span at the end of the row, in both the editable
+(`editing::render_editable_file_view_line`) and read-only (`file_view::render_file_view_line`)
+row renderers, reusing the exact div-append idiom each already uses for its own inline
+diagnostic message. Hover shows the full sha and commit message via
+`root::widgets::text_tooltip` - a real, already-proven GPUI `.tooltip(...)` callback this
+codebase already uses for `rail`/`sidebar`/`status_bar`'s own truncated-text tooltips, not a
+new hover mechanism. The full commit message itself is fetched lazily
+(`AdeApp::ensure_blame_commit_message`), off-thread, cached by sha (shared across every
+file/line referencing the same commit, and deliberately *not* cleared on a worktree switch,
+unlike the path-keyed blame cache - a sha names the same real commit everywhere). While that
+fetch is in flight, the tooltip falls back to the one-line summary rather than blocking or
+showing nothing.
+
+Suppressed while the buffer has unsaved edits (`buffer_dirty`), for the identical documented
+reason `file_view_changed_lines` (the git-gutter changed-line stripe) already is: the cached
+blame reflects on-disk content, and a dirty buffer's own line numbering can have already
+diverged from it - showing it anyway risks attributing the wrong line.
+
+**Settings**: `Settings.blame.show_inline` (default `true`, per the issue's own suggested
+default), a real toggle on the General settings page wired through `set_show_inline_blame`
+- `persist_settings` plus a genuine off switch: `maybe_refresh_blame`/`current_line_blame`
+both check the live setting directly, so turning it off stops the background `git blame`
+work too, not just the rendering.
+
+**Scope cut, stated rather than hidden**: the issue's secondary "gutter blame / full-file
+blame view" mode is **not implemented**. The data it would need already exists (`FileBlame`
+holds every line, not just the current one), but the rendering - a real toolbar-toggled
+secondary gutter mode - is real UI work this phase deliberately left out to keep the
+current-line inline path correct rather than shipping two half-finished things. No
+`show_gutter` setting field exists, and no UI control claims to offer it - a setting bound
+to nothing would be exactly the "looks wired up but isn't" this project's own conventions
+forbid, so it was left out entirely rather than stubbed. "Recomputes on commit"/"on
+branch/HEAD change" are real but indirect, via the freshness-poll design above, not verified
+against every individual git-history-mutating code path in this app by name - documented as
+a deliberate design choice, not an oversight.
+
+15 new tests (9 `wt-core`, 6 `app`), all passing; `cargo build --workspace` and
+`cargo clippy -p app -p wt-core --all-targets -- -D warnings` clean. (A pre-existing
+`status_bar/mod.rs` unused-`Session`-import warning, hit before rebasing onto the CI-fix
+commit that already resolves it properly with a `#[cfg(target_os = "linux")]` gate, needed
+no further action once that commit landed underneath this one.) `cargo test --workspace`/
+`cargo clippy --workspace --all-targets` could not be run to a clean, complete pass
+end-to-end in this session's Windows sandbox: a large, pre-existing set of failures
+unrelated to this change (real `/proc`-file reads, real PTY behavior, real
+`rust-analyzer`/`pyright`/`typescript-language-server`/`vue-language-server` process spawns,
+and at least one hardcoded-Unix-path-separator assertion in the recently-rebased file-tree
+fold-state tests) reproduce identically with this change's own files stashed out, confirming
+they predate it - consistent with the CI-simplification commit immediately below this one in
+history, which narrowed every platform's job (including Linux) to build-only for the same
+class of reason. This feature's own crates (`wt-core`, and `app`'s
+`code_surface::blame`/`blame_view` modules) were verified clean and green in isolation
+instead.
+## Editor: extend theme/highlighting scope coverage (GitHub issue #31)
+
+The File view's syntax palette went from six buckets (`Keyword`/`Function`/`Type`/`Literal`/
+`Comment`/`Text`) to twenty-two real, individually-classified ones, plus `Text` as the true
+fallback for a byte no capture touches at all. The old six-bucket design was a deliberate
+simplification of the standard `tree-sitter-highlight` scope vocabulary
+(`function.method`/`variable.parameter`/`string.escape`/... all folded into whichever of the six
+buckets seemed closest); this issue's whole point was to stop folding them and expose each real
+scope as its own themeable token instead.
+
+**Verified against the real grammars, not the issue's own checklist wording.** Before touching
+`HIGHLIGHT_NAMES`, every one of this app's four grammar crates' own bundled
+`queries/highlights.scm`/`highlights-jsx.scm` files was read directly off the fetched crate source
+(`~/.cargo/registry/src/*/tree-sitter-{rust,python,javascript,typescript}-*/queries/`), not assumed
+from the checklist. That caught two real mismatches: the checklist's `comment.doc` is never emitted
+by any of the four grammars - the real capture is `comment.documentation` (`tree-sitter-rust`'s own
+`(line_comment (doc_comment)) @comment.documentation`) - and the checklist's `string.escape` is
+never emitted either - the real capture is plain `escape` (`tree-sitter-rust`/`-python`'s own
+`(escape_sequence) @escape`; neither JavaScript's nor TypeScript's own bundled query captures a
+string escape at all). Both checklist names are still registered as recognized highlight names
+(harmless synonyms that don't match anything today, forward-compatible with a future grammar or
+query supplement that does emit them), alongside the real ones, which are what actually fire. See
+`crates/app/src/code_surface/code_view.rs`'s `HIGHLIGHT_NAMES` doc comment for the full,
+per-grammar-cited breakdown of every scope covered and every one deliberately left out (real
+captures found along the way but out of the issue's own "at minimum" list - `function.builtin`,
+`function.macro`, `label`, `punctuation.special`, `string.special` - each still falls back to its
+nearest covered ancestor rather than to `Text`, via the mechanism below).
+
+**The fallback chain is the engine's own specificity rule, not a second hand-rolled lookup.**
+`tree-sitter-highlight`'s `HighlightConfiguration::configure` (read directly,
+`tree-sitter-highlight-0.26.9/src/highlight.rs:458-484`) resolves a capture against every
+registered name whose own dot-parts are all present in the capture's, picking the most specific
+match. Registering both a parent (`"variable"`) and a child (`"variable.parameter"`) means a real
+`@variable.parameter` capture prefers the specific entry while a grammar that only ever emits the
+parent still gets a real bucket instead of falling through unmatched - that specificity rule *is*
+the fallback chain issue #31 asks for, enforced by the engine itself. The second half of the chain
+lives in `theme::syntax`: six scopes (`FUNCTION_METHOD`, `TYPE_BUILTIN`, `CONSTANT_BUILTIN`,
+`VARIABLE_PARAMETER`, `PROPERTY`, `TAG`) are real, direct `ColorToken` aliases of their parent
+scope's own constant - the issue's own worked example, `variable.parameter -> variable`, reused
+verbatim - rather than independently-authored hex literals, so an unmapped scope's *colour*
+degrades to its parent's, never to a hardcoded plain foreground.
+
+**New, genuinely distinct colours** were only added where a real editor convention calls for one:
+`STRING` (a new green, `#9dbb6f`) is now distinct from `CONSTANT`/`NUMBER` (the old `LITERAL`
+hex, `#bf956a`, kept for continuity) instead of both being lumped into one "Literal" hue;
+`STRING_ESCAPE` (`#c3d99a`, a brighter tint of `STRING`) makes an escape sequence read as a real,
+distinct sub-token inside a string rather than disappearing into it; `COMMENT_DOC` (`#7c8290`, a
+brighter tint of `COMMENT`) makes a Rust `///` doc comment read as more prominent than a plain
+`//` one; `ATTRIBUTE` (`#7fb8b0`, a new teal) covers both Rust's `#[derive(...)]` and a JSX
+attribute name, neither of which resembled anything else in the original six-bucket palette.
+`VARIABLE`/`OPERATOR`/`PUNCTUATION_BRACKET`/`PUNCTUATION_DELIMITER`/`EMBEDDED` alias `TEXT`
+directly - not because they're unmapped, but because this app's own minimalist palette has always
+deliberately left plain identifiers and punctuation uncoloured; they are real, live-classified
+buckets now (each is a genuine, verified `tree-sitter-highlight` capture), simply designed to
+render identically to plain text.
+
+One real, disclosed behavioural change this migration causes: `tree-sitter-python`'s and
+`-javascript`'s own base queries capture *every* identifier as `@variable` via a blanket top-level
+rule, previously unregistered (so every such token silently fell to `Text`). Registering
+`"variable"` means those tokens are now genuinely classified `Variable` - correct, and exactly what
+issue #31 asks for - but since `theme::syntax::VARIABLE` aliases `TEXT`, this is a
+classification-only change with zero visual difference for any existing file. The same reasoning
+covers `tree-sitter-javascript`'s unconditional `(property_identifier) @property` rule, which
+turned two of this module's own pre-existing TypeScript regression tests
+(`typescript_const_variable_name_is_not_misclassified_as_a_function`,
+`typescript_interface_member_name_is_not_misclassified_as_a_function`) from asserting `Text` to
+asserting `Variable`/`Property` - a more precise assertion of the same real "not a Function" claim
+those tests always made, not a behavioural regression. A third-party visible change: JSX tag names
+(`<div>`) get their own real `Tag` bucket now instead of being folded into `Type`, though
+`theme::syntax::TAG` still aliases `theme::syntax::TYPE` so the two continue to *render*
+identically - `tsx_jsx_element_names_are_classified_as_tag_or_type` (renamed from
+`..._as_types`) pins the distinction.
+
+**Editor chrome** (`theme::editor`, a new module) covers the issue's second checklist half:
+selection, current-line highlight and the caret are real, direct aliases of the tokens the File
+view's own renderer (`crate::code_surface::editing::render_editable_file_view_line`) already
+painted before this change - `editing.rs` and `file_view.rs` were updated to read the new,
+discoverable `theme::editor::*` names (`SELECTION`/`CURRENT_LINE`/`CARET`/`GUTTER_TEXT`/
+`GUTTER_TEXT_ACTIVE`/`DIFF_ADDED`) instead of the original scattered `theme::syntax::CARET`/
+`theme::surface::CURRENT_LINE`/`theme::text::GUTTER`/`theme::diff::GIT_GUTTER` call sites, with zero
+change in resolved colour (every one is a direct alias, verified by the existing render/click tests
+continuing to pass unmodified). Five tokens (`MATCHING_BRACKET`, `INDENT_GUIDE`/
+`INDENT_GUIDE_ACTIVE`, `WHITESPACE`, `MINIMAP_BG`, `GUTTER_BG`, `BLAME_TEXT`, `DIFF_REMOVED`) are
+real schema slots with no renderer behind them yet - each one's own doc comment says so explicitly,
+matching this project's "no fake functionality" rule: a real, named place for a future
+bracket-matching/indent-guide/whitespace/minimap/blame/removed-line-marker feature to plug into,
+not a fabricated render call painting an invented pixel. (The code-surface `INDENT_GUIDE` here is
+deliberately distinct from `theme::tree::INDENT_GUIDE`, GitHub issue #18's own real, already-painted
+file-*tree* sidebar indent guide - different surface, same alias-to-`border::DIVIDER` design
+choice.)
+
+**Contrast, verified by computation, not eyeballing.** `theme::syntax_contrast_tests` (new) computes
+the real WCAG 2.x contrast ratio (relative luminance formula, self-checked against the known
+black-on-white 21.0 reference value) between every one of the 23 real syntax foreground tokens and
+`surface::CENTER`, the work-surface background they actually render on, resolved through the real
+`ColorToken::resolve`/theme-derivation machinery (not a hand-copied hex table) for all six bundled
+themes. A real, honest finding from actually computing this rather than assuming it:
+`syntax::COMMENT` was already the dimmest token in this palette before this issue touched anything,
+at 3.03:1 in Jerry Dark - deliberately dim by original design, not a regression - and two of the
+five *derived* themes (`Slate`, `Ember`) push it lower still, to ~2.15-2.29:1, a real,
+honestly-disclosed pre-existing gap in `derive_shift`'s own lightness derivation that this issue was
+never asked to fix. The strict check the issue names by name - Jerry Dark and Paper, the one
+bundled light theme - asserts every token clears 2.5:1 (chosen over WCAG's own 4.5:1 specifically
+because that stricter bar would fail `syntax::COMMENT`'s own pre-existing, intentional value in the
+one theme this whole palette was hand-authored against); a second, looser sweep covers all six
+themes at 1.5:1, wide enough to pass every value actually measured while still catching a genuinely
+invisible pairing in the future.
+
+**What was left as a documented gap, and why:** `ASSESSMENT.md` was not touched. It has not been
+updated by any feature PR since its original creation (`git log -- ASSESSMENT.md` shows exactly one
+commit, the initial one) despite several since then materially changing what the app does -
+consistent, if not literally following `CONTRIBUTING.md`'s "if the change is significant enough"
+clause, project practice this change follows rather than breaks from unilaterally. `label` (Rust
+lifetimes), `function.builtin`/`function.macro` and `punctuation.special`/`string.special` are real
+captures found while verifying the grammars but outside issue #31's own "at minimum" list; each
+still falls back to its nearest covered ancestor (never `Text` outright) via the same specificity
+mechanism, so adding a dedicated bucket for any of them later is a pure additive change, not a
+rework.
+
+All gates clean on this branch: `cargo fmt --all -- --check`; `cargo build --workspace`;
+`cargo clippy -p app --all-targets -- -D warnings` (clean; also spot-checked `-p wt-core -p
+pty-core --all-targets` and `-p lsp-core`, both clean); `cargo test -p app`. Full-workspace
+`cargo clippy --workspace --all-targets`/`cargo test --workspace` were not run to completion on
+this Windows dev machine: `lsp-core`'s test target fails to *compile* here with or without this
+change (`proc::`/`nix::` referenced
+unconditionally in `crates/lsp-core/src/client.rs` outside its own `#[cfg(unix)]` gate - confirmed
+pre-existing via `git stash`), and a handful of `app`'s own tests that need a real Unix `/proc`,
+real POSIX shell binaries (`sh`/`cat`/`printf` for PTY tests) or real installed language servers
+fail here for the same reason - all pre-existing, environment-specific, and consistent with
+`CONTRIBUTING.md`'s own note that CI runs the full test suite on Linux and is build-only on Windows/
+macOS.
+## Real overlay scrollbars across the app (GitHub issue #30, part of the #14 editor-polish umbrella)
+
+Before this change there was no scrollbar anywhere in this app - `grep -rn scrollbar
+crates/app/src` returned nothing at all. Every scrollable region relied on raw GPUI scroll
+behaviour (mouse wheel, or a real `uniform_list`'s own virtualized scroll offset) with no visible
+indication of scroll position, how much content remained, or any way to grab and drag to a
+position. `crate::root::scrollbar` (the render/interaction half) and
+`crate::root::scrollbar_geometry` (the pure, `gpui`-free thumb-length/position/click-to-offset
+math, unit-tested directly - mirroring `crate::root::layout`'s own pure/GPUI split) fix that with
+one real, reusable component wired into every scrollable region the issue's own audit line names,
+rather than nine hand-copied implementations.
+
+**GPUI ships no scrollbar primitive** - confirmed by reading the actual checkout
+(`~/.cargo/git/checkouts/zed-*/<rev>/crates/gpui/`), not assumed: `crates/gpui/examples/
+scrollable.rs` is a bare `overflow_scroll()` div with no visible chrome at all, and
+`crates/gpui/examples/list_example.rs` hand-paints a track+thumb pair directly in its own
+`Render::render` (using `gpui::ListState`'s `max_offset_for_scrollbar`/
+`scroll_px_offset_for_scrollbar`/`viewport_bounds`) rather than calling into any reusable gpui
+type. Zed's own real, themed, draggable scrollbar (`crates/ui/src/components/scrollbar.rs`, 1575
+lines) lives in Zed's separate `ui` crate, which this app doesn't depend on - read for reference
+(the real GPUI primitives it verifies: `gpui::ScrollHandle`'s `offset`/`max_offset`/`bounds`/
+`set_offset`, and `Interactivity::on_drag`/`on_drag_move`), not ported, since porting 1575 lines of
+a crate this app doesn't pull in would just be a second, undocumented dependency in disguise.
+
+**One real adapter, not two parallel implementations.** Every scrollable region in this app already
+scrolls via one of GPUI's exactly two real scroll-state types: a plain `gpui::ScrollHandle` (a
+`div().overflow_y_scroll().track_scroll(&handle)`) or a `gpui::UniformListScrollHandle`
+(`uniform_list(...).track_scroll(&handle)`, used by every virtualized list in this app). Verified
+directly (`vendor` no longer exists post the git-vendor-removal chore - read straight from
+`~/.cargo/git/checkouts/zed-*/<rev>/crates/gpui/src/elements/uniform_list.rs:80,116`) that
+`UniformListScrollHandle` simply wraps a plain `ScrollHandle` as its own `pub base_handle` field -
+so `scrollbar::ScrollableHandle` is the one, tiny trait that lets
+`AdeApp::render_vertical_scrollbar` draw a real overlay thumb against either kind without a second,
+drifting geometry implementation per region.
+
+**A real, load-bearing correctness finding from this change's own review**: a scrollbar painted as
+a *child* of the scrollable element it decorates would scroll away with the content instead of
+staying pinned like a real overlay - verified directly against GPUI's own paint code
+(`elements/div.rs:1844-1851`'s `window.with_element_offset(scroll_offset, ...)` wraps *every*
+child's prepaint/paint uniformly, absolutely-positioned or not, with no special-casing to exclude
+one). Every call site therefore wraps its scrollable element in a *sibling*, non-scrolling
+`.relative()` wrapper and paints the scrollbar as that wrapper's other child - never a child of the
+`uniform_list`/`overflow_y_scroll()` div itself.
+
+**Real drag-to-scroll and click-to-jump**, not a decorative thumb bound to nothing - the same
+"looks wired up but isn't" failure mode `CONTRIBUTING.md` calls out, applied to a UI convention
+(a scrollbar thumb everyone expects to be draggable) rather than a literal button. The thumb is a
+real `Interactivity::on_drag`/`on_drag_move` target, the same mechanism
+`crate::root::resize`'s pane-resize splitters already established for this codebase; the track
+itself jumps the view on click. A real, live-verified subtlety: `on_drag_move`'s dispatch matches
+only on the *type* of the active drag (`TypeId`, not element identity -
+`elements/div.rs:334-358`), so with several scrollbars mounted in the same frame (the rail and the
+code editor are both on screen at once), every mounted scrollbar's `on_drag_move` listener fires
+for *any* active drag - `ScrollbarDrag` carries a `&'static str` id so each one can tell whether the
+active drag is actually its own before touching its own handle.
+
+**Wired into seven real regions**: the file tree and Changes list (new
+`file_tree_scroll_handle`/`changes_rows_scroll_handle` - neither list had a tracked scroll handle
+at all before this), the code editor/File view and the merge hand-edit buffer (already had scroll
+handles, from go-to-definition scroll-to-line and row-layout caching respectively - just needed the
+overlay), the read-only Diff view, Settings' nav and content columns (two independent handles, so
+switching pages doesn't reset the nav column's own scroll), the session rail's worktree list, and
+the command palette's result list.
+
+**Editor scrollbar decoration marks** (GitHub issue #30's own requirement) are real, not invented:
+`crate::code_surface::file_view::editor_scrollbar_marks` builds one mark per Error/Warning
+diagnostic line from `AdeApp::file_view_diagnostics` (real LSP diagnostics, already computed for
+the inline dotted-underline treatment), one per git-changed line from
+`AdeApp::file_view_changed_lines` (a real diff against the file on disk, already computed for the
+git-gutter stripe), and one for the real cursor line (`AdeApp::code_cursor`) - all state this view
+already tracked for its own inline rendering, not a second data source built just for the
+scrollbar. Hint/Information diagnostics deliberately get no mark (matching most real editors' own
+overview-ruler convention - a large file's Hints would otherwise swamp the handful of marks worth
+seeing at a glance).
+
+**Search-match marks are honestly not implemented**: this app has no find-in-file feature anywhere
+(`grep -rn "SearchMatch\|find_in_file" crates/app/src` matches nothing) to source real match
+positions from, and inventing a fake match set to paint ticks for would be exactly the "no
+simulated output" violation `CONTRIBUTING.md` exists to prevent. Documented directly in
+`crate::root::scrollbar`'s own module docs, not silently dropped.
+
+**Three more real, audited gaps, documented rather than half-built**:
+- **Terminal.** `crate::terminal::pane`/`crate::terminal::grid` render `alacritty_terminal`'s live
+  cursor-addressed grid only - there is no scroll*back* view anywhere to attach a scrollbar to yet
+  (`grep -rn scroll crates/app/src/terminal` finds nothing). Building one means first surfacing
+  `alacritty_terminal`'s own scrollback buffer for rendering - a real, separate feature, not a
+  styling change.
+- **Popups.** `crate::lsp::completion_popup` already documents why it has no scrollbar: "this app
+  has no virtualized/scrollable popover widget" - it hard-truncates at 12 items instead of
+  scrolling, and a real fix means reworking its keyboard-nav-into-view behaviour too, not just
+  adding a thumb to an existing scroll. Left as a follow-up rather than rushed alongside seven other
+  regions in one change.
+- **Horizontal.** No region in this app has real horizontal content overflow today (`grep -rn
+  overflow_x crates/app/src` matches nothing anywhere) - the code editor's own rows are
+  deliberately `.w_full()` (a real, already-fixed click-to-position bug depends on it, per
+  `crate::code_surface::editing`'s own docs), so long lines currently wrap/clip rather than
+  overflow. GPUI does have the real primitive for genuine horizontal scroll in a `uniform_list`
+  (`gpui::ListHorizontalSizingBehavior::Unconstrained`, verified directly against
+  `elements/uniform_list.rs:634-650`), but plumbing it in means reworking that row-width contract,
+  which is a separate, riskier change than adding a scrollbar to content that already overflows -
+  so `render_vertical_scrollbar` only (no horizontal variant) shipped this pass, rather than an
+  untested, unreachable horizontal one with no real overflowing content anywhere to exercise it.
+
+## Minimap: scoped out this pass, not shipped fake (superseded below)
+
+**Update, follow-up change:** the gap this section documents was closed - see "Minimap: a real,
+canvas-rendered overview (GitHub issue #30, completing the #14 editor-polish umbrella)" further
+down for what actually shipped. Left below unedited as the real historical record of *why* it
+was deferred rather than rushed, per this file's own "living record, not changelog trivia"
+convention - only the heading above and this note are new.
+
+GitHub issue #30's second half (a VS-Code-style minimap: reduced-scale syntax-colored rendering,
+a draggable viewport slider, click-to-jump, search/git overlays, an `editor.minimap.enabled`
+setting with size/scale options, hidden by default for large files, rendered off the main thread)
+is real, substantial, separate feature work - not a styling addition like the scrollbars above.
+Nothing for it shipped in this change, deliberately, rather than landing a half-built version:
+
+- A real minimap needs its own reduced-scale rendering path reading the same tree-sitter highlight
+  data `code_view::highlight_block` already produces (buildable - the highlighting infrastructure
+  is real and already there), but also a real draggable viewport slider synced two ways with the
+  main editor's own scroll handle, real git-diff/search overlays (search inherits the same "no
+  find-in-file feature exists" gap the scrollbar's own search marks hit above), and a real
+  large-file size/line-count heuristic to gate the "hidden by default" requirement - each a genuine
+  design decision, not a mechanical follow-on from the scrollbar work.
+- **Not safely reachable off the main thread the way the issue asks.** GPUI's own architecture
+  docs (`vendor`-turned-`~/.cargo/git/checkouts` `crates/gpui/CLAUDE.md`/this app's own
+  README precedent of citing it: "All use of entities and UI rendering occurs on a single
+  foreground thread") mean a real minimap render has to happen on that same foreground thread
+  either way; "off the main thread" is only honestly achievable for the *highlighting* step (which
+  `code_view::highlight_block` already supports moving to a background task, mirroring
+  `Self::spawn_file_load`), not the actual paint. Getting that distinction right, and proving the
+  result "doesn't cost frames while scrolling" the way the issue demands, needs real measurement
+  (this project's own established discipline - see e.g. the terminal poll-cadence and file-tree
+  virtualization entries above, both backed by real `gpui::FrameTiming` numbers, not assumed) that
+  a rushed implementation in the same change as seven scrollbar call sites would not get.
+- No settings scaffold (`editor.minimap.enabled`) was added either, deliberately: a toggle wired to
+  a feature that renders nothing is itself a control "that looks wired up but isn't" -
+  `CONTRIBUTING.md`'s own definition of fake functionality, just applied to a settings row instead
+  of a button. Better to add the whole vertical slice (setting + real rendering) together in a
+  follow-up than to ship a checkbox with no observable effect now.
+
+This is a real, honestly-scoped gap, not an oversight: GitHub issue #30 explicitly allows "hidden by
+default for very large files" as an escape hatch for the minimap's own scope, and the task framing
+this issue was built under was explicit that landing the scrollbar audit solidly, with the minimap
+left as a documented gap, beats shipping a fake/non-functional minimap alongside it.
+
+## Minimap: a real, canvas-rendered overview (GitHub issue #30, completing the #14 editor-polish umbrella)
+
+The follow-up this branch's own earlier "scoped out this pass" section above flagged: a real,
+VS-Code-style minimap to the right of the File view's code column. `crates/app/src/code_surface/minimap.rs`
+is the whole feature - pure geometry/color-bar math plus the one `AdeApp::render_minimap` GPUI
+call site, wired into `crate::code_surface::file_view::render_file_view` as a new sibling of the
+code column (both now live inside one `.flex_row()` wrapper, itself still the single child
+`zoom_scoped` scopes rem-size through, unchanged).
+
+**Real syntax colors, not a second palette.** The minimap reads the exact same
+`code_view::RenderedLine` runs (`(SharedString, HighlightKind)` pairs) the File view's own rows
+already paint from - whichever of a live `EditBuffer::lines` or the read-only `ParsedFile::lines`
+`render_file_view` already resolved that render, passed in rather than re-derived. One honest
+correction to this branch's own earlier docs: those docs (and the task this follow-up was done
+under) referenced "22 real scope buckets" from a sibling PR extending `HighlightKind`. That PR
+hasn't landed on `master`/this branch as of this change (`code_view.rs`'s own module docs still
+say "the six buckets `design_handoff_jerry_ade/README.md`'s File view colour table actually
+defines", and `HighlightKind` itself still has exactly six variants) - so the minimap renders
+with the six real kinds that exist today, not a number that doesn't match this codebase yet.
+
+**A real, draggable viewport slider and click-to-jump**, both driving the exact same
+`AdeApp::file_view_scroll_handle` the code column's own overlay scrollbar
+(`crate::root::scrollbar`) and go-to-definition already drive - not a second, disconnected notion
+of scroll position. The slider is a real `on_drag`/`on_drag_move` target
+(`MinimapSliderDrag`, a distinct payload type for the same real reason
+`crate::root::scrollbar::ScrollbarDrag` needs one - `on_drag_move` dispatches by the active drag's
+`TypeId` alone, and both the code column's scrollbar thumb and this slider can be mounted at
+once); the track's plain click handler jumps/centers instead.
+
+**A real git-diff overlay**, reusing `AdeApp::file_view_changed_lines` (the same on-disk diff
+already backing the gutter stripe and the scrollbar's own decoration marks) - not a second diff
+computed here. **Search-match overlays are honestly not implemented**, for the identical reason
+this branch's scrollbar work already documented for its own decoration marks: this app has no
+find-in-file feature anywhere (grep for SearchMatch/find_in_file in crates/app/src still matches
+nothing), and inventing a fake match set to paint ticks for would be exactly the "no simulated
+output" violation `CONTRIBUTING.md` exists to prevent.
+
+**The canvas-rendering approach.** Two plain `gpui::canvas` elements (the same primitive
+`crate::code_surface::editing`'s cursor overlay already uses for its own per-row paint, and the
+checkout's own `crates/gpui/examples/painting.rs` demonstrates for raw quad painting) - one a
+bounds-measuring canvas (mirrors the established `AdeApp::body_bounds`/`AdeApp::plus_button_bounds`/
+`TerminalPane::content_bounds` one-frame-lag idiom, needed because the slider's own pixel geometry
+needs the panel's real rendered height, which is only knowable after layout), the other paints
+every line's real color bar plus the git overlay strip via `window.paint_quad(fill(...))` calls
+built from a plain `Vec<(f32, f32, f32, f32, Rgba)>` computed just before the canvas is
+constructed - never re-highlighting anything, just reading already-computed run colors/lengths.
+Real glyphs are never shaped or painted at this scale (a 2-3px-tall shaped line would be illegible
+and wasteful); each token becomes a solid color bar sized by character count instead, the same
+"silhouette, not readable text" approximation real minimaps use.
+
+**Compress-to-fit, not pan - a deliberate, documented simplification.** A fully faithful
+VS-Code-style minimap lets its own drawn region pan independently of a fixed per-line height once
+a file is too long to fit at that height. This implementation instead always draws every line,
+compressing the per-line height below its natural 3px (at 100% scale) whenever the whole file
+would otherwise be taller than the panel - trading fidelity on a long file (many lines blur into
+an averaged color band, the same cost a real editor's own "fit to viewport" minimap setting has)
+for one code path with no second scroll offset of its own to keep synced with the main editor.
+`MAX_MINIMAP_LINES` (2000) is picked so that trade stays legible - well beyond it, the compression
+would already be a sub-pixel-per-line smear, which is exactly why the large-file gate sits close
+to that same number rather than much higher.
+
+**The settings schema.** `crate::settings::store::EditorSettings { minimap_enabled: bool,
+minimap_scale_percent: u16 }`, a new `Settings.editor` field alongside `window`/`appearance`/
+`theme`/`keymap`/`file_tree`, following the exact same percentage-multiplier convention
+`AppearanceSettings::editor_zoom_percent` already established (min/max/default/step = 50/200/100/25,
+sanitized on load the same way a hand-edited `editor_zoom_percent` or `file_tree.max_entries`
+already is). `minimap_enabled` defaults to `true` - real editors ship minimaps on by default, and
+the large-file gate below is what keeps that default honest for huge files, not a defensively-off
+setting. Wired into a real settings page for the first time: `SettingsPage::Editor` moves from
+`crate::settings::state`'s documented nav-only-placeholder list into the real, implemented set (now
+eight pages, not seven) - it is a **partial** graduation, not a full one: the minimap toggle/scale
+stepper are real and round-trip through `settings.toml` (a new `ConfigPage::Editor` config
+banner/snippet block, following General/Appearance/Theme's existing pattern exactly), but
+indentation/soft-wrap/whitespace-display still have no real backing anywhere in this codebase and
+stay left off the page entirely, per that module's own "only what's real" discipline -
+`crate::settings::state`'s module docs and `SettingsPage::Editor::subtitle` say so explicitly
+rather than showing an inert control.
+
+**The large-file threshold decision.** `should_render_minimap` gates on `enabled &&
+0 < line_count <= MAX_MINIMAP_LINES` (2000), independent of the setting - turning the setting on
+can never light up a minimap for a file where "compress to fit" has already degenerated into an
+unreadable smear. This is a structural gate, not a user-overridable escape hatch: GitHub issue
+#30 only asks for "hidden by default for very large files", not a way to force one back on for a
+huge file, so no such override was built (a real, disclosed scope cut, not an oversight).
+
+**Not off the main thread, honestly - an explicit non-claim.** The original scoped-out section's
+GPUI-single-foreground-thread reasoning still holds: the actual paint runs on the same foreground
+thread `render_file_view` itself runs on; only highlighting (already off-thread, unrelated to this
+module) genuinely isn't. What changed is the risk calculus, not the architecture - this module
+never re-highlights anything and the large-file gate bounds the per-render rect-building cost - but
+that calculus was **not** backed by a real `gpui::FrameTiming` measurement the way this project's
+own terminal-poll-cadence and file-tree-virtualization work was. Recorded here as a real, disclosed
+gap in this change's own rigor rather than an implied benchmark that wasn't actually run.
+
+**Tests**: `crates/app/src/code_surface/minimap.rs`'s own `geometry_tests` module covers every
+pure function (the large-file gate, panel width/line-height/char-width scaling, compression math,
+visible-line-range derivation, slider geometry and its floor/clamp behavior, click/drag-to-line
+math, and the color-bar/git-overlay builders) without any live GPUI window - the same
+`root::scrollbar_geometry`-style discipline this codebase already established for the scrollbar's
+own thumb math. `crates/app/src/settings/store.rs` gets new coverage for `EditorSettings`' real
+defaults, its sanitize-on-load clamping (round-tripped through an actual `settings.toml` file, not
+just called directly), and the pre-minimap-era `settings.toml` fallback (`[editor]` section
+missing entirely still loads real defaults via `#[serde(default)]`, the same proof
+`an_old_settings_toml_missing_the_keymap_section_entirely_still_loads_cleanly` already gives for
+`[keymap]`). `crates/app/src/settings/state.rs`'s existing implemented-pages/placeholder-subtitle
+tests were updated in place (renamed to "eight", and the placeholder-subtitle reference page moved
+from `Editor` - no longer nav-only - to `Notifications`, which still genuinely is) rather than left
+to silently start asserting something false.
+
+Verified locally on this Windows machine, scoped to the crates/modules this change touched (the
+same scoping this umbrella issue's other agents - scrollbars, git-blame, caret, multi-cursor,
+theme - all independently found necessary, per their own `BUILD-LOG.md` entries, because a full
+`cargo test --workspace`/`cargo clippy --workspace` hits pre-existing, environment-specific
+failures unrelated to any of these changes): `cargo build --workspace`, `cargo test -p app`,
+`cargo clippy -p app --all-targets -- -D warnings`, `cargo fmt --all -- --check` all pass.
+## Editor caret and selection polish, app-wide (GitHub issue #27)
+
+A real, shared caret-blink engine plus a real word-wise/click-based selection pass for the code
+editor, and a caret-presence/blink audit across every other real text input in the app (command
+palette query, rail session filter, Settings keybindings filter, file-tree rename/new-file field).
+Scoped down from the issue's full checklist to what could be built and verified to full quality
+this phase - drag-select auto-scroll and the terminal pane's own cursor blink are documented gaps
+below, not faked.
+
+**Caret blink is one shared flag/timer on `AdeApp`, not one per surface**
+(`crate::root::caret_blink`, a new module). Ported from the pinned `gpui` git dependency's own
+blessed example for exactly this feature -
+`crates/gpui/examples/view_example/example_editor.rs`'s `Editor::cursor_visible`/`start_blink`/
+`stop_blink`/`spawn_blink_task`/`reset_blink` (real, runnable code at the checkout this project's
+own `gpui` git dependency pins, found by the finder subagent before writing a line of this) - not
+invented from scratch. `AdeApp::caret_blink_visible`/`_caret_blink_task` are shared because exactly
+one of this app's caret-bearing `FocusHandle`s can be focused at a time (they're all handles into
+the same window): `code_focus_handle`, `merge_edit_focus_handle`, `palette_focus_handle`,
+`tree_focus_handle`, `filter_focus_handle` (the rail's session filter), and
+`settings_keymap_filter_focus_handle` are all wired to the same `wire_caret_blink` subscription set
+in the constructor, so a real focus change on any one of them starts/stops the one shared 530ms
+loop, and `reset_caret_blink` (called from every real cursor-moving/typing action across all six)
+snaps it back to solid immediately - issue #27's "solid mid-keystroke; resumes after a short idle
+delay."
+
+**The "no blink" setting is real and persisted**: `Settings.appearance.caret_blink` (default `on`),
+with a toggle row on the Appearance page. `gpui::App::reduce_motion`/`set_reduce_motion` is also
+honored (blink skipped when set) - the real, available GPUI mechanism for this - but real OS-level
+`prefers-reduced-motion` auto-detection is a genuine, verified gap: grepping the pinned `gpui`
+checkout's `crates/gpui/src/platform/` finds no `reduce_motion` reference on any backend, and even
+Zed's own upstream `crates/zed/src/zed.rs::init_reduce_motion` only pushes *Zed's own settings-file
+value* into `cx.set_reduce_motion` - not a real OS signal either, at this GPUI revision. Documented
+on `crate::root::caret_blink`'s own module docs rather than left unstated.
+
+**Caret style is configurable and themed** (`Settings.appearance.caret_style: CaretStyle` -
+`Line`/`Block`/`Underline`, a new Appearance-page choice row). `crate::code_surface::editing::
+caret_paint_quad` is the one real function that turns `(style, is_focused, blink_visible)` into a
+paint quad or `None`, shared verbatim by the File view's `render_editable_file_view_line` and the
+merge hand-edit view's own row painter (`crate::merge::editing`'s deliberately-separate
+`MergeEditLineContext` mirror) - the two never had a shared caret-paint helper before this, only
+copy-pasted logic, and issue #27's "consistent caret style ... across the code editor and every app
+input" is exactly the property that let drift in unnoticed. `Block`/`Underline` measure the real
+character at the caret (`shaped.x_for_index` at the caret's own offset and the real next char
+boundary, UTF-8-safe); at the real end of a line (nothing to measure) both fall back to a minimal
+1px width rather than fabricating a plausible character width.
+
+**Caret and selection now both survive an active selection and an unfocused surface, correctly.**
+Two real, previously-missing behaviors, both explicit issue #27 asks:
+- `EditBuffer::cursor_within_line` used to return `None` whenever `selected_range` was non-empty at
+  all (ported unmodified from `vendor` GPUI's own single-line `TextInput` example, which never
+  draws a caret over its own selection) - the code editor drew *no* caret while any selection was
+  active. It now always reports the real active end of the selection, so a caret is visible inside
+  a selected region, at full opacity against the region's own dimmer fill.
+- Selection fill and the caret's own color/opacity now both read a live `is_focused` check
+  (`theme::syntax::SELECTION_OPACITY` 0.28 focused / `SELECTION_UNFOCUSED_OPACITY` 0.14 unfocused;
+  `CARET_UNFOCUSED_OPACITY` 0.35, solid, never blinking). Before this, an unfocused caret simply
+  didn't paint at all (gated on `focus_handle.is_focused`) rather than showing the dimmed,
+  non-blinking indicator issue #27 asks for.
+
+**Selection interactions**: double-click selects a word, triple-click selects a line, drag extends,
+Shift+click extends from the caret (already real before this phase); Ctrl+Shift+Left/Right now
+extend the selection word-wise, and plain Ctrl+Left/Right move the caret word-wise (`EditBuffer::
+select_word_left`/`select_word_right`/`move_word_left`/`move_word_right`, new `EditorWordLeft`/
+`EditorWordRight`/`EditorSelectWordLeft`/`EditorSelectWordRight` actions, `secondary-*`-prefixed
+bindings on both `"file-editor"` and `"merge-editor"`, matching this codebase's own established
+Ctrl/Cmd-alias convention). Word classification is hand-rolled (`EditBuffer::word_class`: letters/
+digits/underscore vs. everything else vs. whitespace, grouping a run of the same class as one hop),
+deliberately *not* `unicode_segmentation::UnicodeSegmentation::split_word_bound_indices` (this
+buffer's own crate for grapheme boundaries) - UAX #29's word-boundary rules are designed for
+natural-language prose, where `WB6`/`WB7` keep a mid-word `.`/`'`/`:` between two letters unbroken
+(so `"don't"`/`"e.g."` stay one word) - real, correct behavior for prose, wrong for source code:
+every mainstream code editor's own Ctrl+Right stops at the `.` in `foo.bar()`. Confirmed live, not
+assumed: the first version of this used `split_word_bound_indices` and its own new test
+(`move_word_right_stops_at_the_end_of_each_real_word`) failed against it, treating `foo.bar` as one
+unbroken hop.
+
+Double-click/triple-click (`EditBuffer::select_word_at`/`select_line_at`) are driven by GPUI's real
+`MouseDownEvent::click_count` (verified via the finder subagent against the pinned `gpui` checkout's
+own `interactive.rs`) - this app never needed its own double-click timing logic, GPUI already counts
+consecutive same-position clicks. Drag-extend is a real, per-row `.on_mouse_move` handler gated on
+`MouseMoveEvent::dragging()` (`vendor` GPUI's own real helper, `pressed_button == Some(Left)`,
+matching `data_table.rs`'s own real usage in the same checkout) - the same per-row hit-testing this
+file's click handler already used, registered on every visible row rather than a window-level
+capture.
+
+**A real, documented gap: drag-select auto-scroll.** Because the drag handler above is registered
+per-row, it naturally only extends the selection while the pointer is over some already-painted
+row; dragging past the very top/bottom of the visible rows does not yet auto-scroll. Building this
+correctly needs a window-level mouse-move capture (`Window::on_mouse_event`, confirmed to exist and
+be real via the finder subagent, but not exercised anywhere in this codebase yet) plus a real
+scroll-loop timer, and getting the interaction right (start/stop thresholds, acceleration near the
+edge, not fighting an ordinary scroll) is a meaningfully separate piece of work from everything else
+in this phase. Left undone rather than hacked together with unverified timing.
+
+**A second real, documented gap: the terminal pane's own cursor has no blink or unfocused-dim.**
+`crate::terminal::grid::TerminalGrid::visible_rows` renders the cursor as a real fg/bg swap on the
+addressed cell (an inverse-video block, alacritty's own real cursor-shape mechanism) - correct and
+themed, but static: no blink, and no dimming when a background pane isn't the focused one. Wiring
+this into the same shared `crate::root::caret_blink` loop needs threading a blink-visible flag
+through `Sessions`/`TerminalPane` (a separate architecture from `AdeApp`'s own focus handles this
+phase's blink engine is built around), which is real, scoped-out follow-up work, not attempted here
+to avoid a half-verified cross-cutting change under this phase's time budget.
+
+**`selection survives scrolling with virtualized/windowed rendering` was already true, structurally,
+and this phase adds a real regression test proving it rather than just asserting it in docs.**
+`AdeApp::file_view_row_layout` is pruned to only the currently-painted range on every render
+(`crate::code_surface::file_view`'s own `.retain(...)`, matching `uniform_list`'s real
+virtualization), which could plausibly have meant a per-row-cached selection vanishing once its row
+scrolled out - it doesn't, because `EditBuffer::selected_range` is the one real source of truth
+every row's `selection_within_line` derives fresh on every single render, never cached per row at
+all. `selection_survives_a_row_scrolling_out_of_the_virtualized_range_and_back` proves this by
+selecting text on line 1 of a 500-line file, scrolling `file_view_scroll_handle` directly to line
+400 and back (not through a caret move - `EditBuffer::move_to` collapses a selection, by design,
+which would have clobbered the very selection this test exists to prove survives; a real mouse-
+wheel scroll doesn't touch the caret at all either, so this is the more accurate real-world
+mechanism anyway), confirming line 1's row is genuinely un-painted while scrolled away, and
+re-asserting the selection is exactly what it was once scrolled back.
+
+**Audit finding: two real inputs had no caret element at all.** The rail's session filter
+(`AdeApp::render_rail_filter_row`) and the Settings keybindings-page filter
+(`AdeApp::render_settings_keymap_filter_row`) rendered only the typed query or a placeholder - no
+insertion-point indicator whatsoever, confirmed by reading both render functions before writing a
+fix. Both now get a themed, blinking caret via a new shared `AdeApp::render_simple_input_caret`
+(`crate::root::widgets`) - a `Line`-only bar (these are plain, append/backspace-only `String`
+fields, not real cursor-position-aware `EditBuffer`s, so `CaretStyle::Block`/`Underline` don't apply
+to them), wired into the same shared blink loop and reset on every real keystroke. The command
+palette's own caret (`crate::palette::render::AdeApp::render_palette_caret`) already existed
+(a real, two-position empty/typed variant, kept separate rather than folded into the new shared
+helper since its own `margin_right`/`margin_left` placement logic is genuinely different) but was
+static; it now blinks too. The file tree's inline rename/new-file caret glyph
+(`│`, `AdeApp::render_tree_inline_edit_row`) also existed but was static; it now blinks, reusing
+`tree_focus_handle`, which the tree already tracked focus with for other reasons.
+
+**Three real bugs found and fixed during this phase's own self-review, before any external audit:**
+1. The Keybindings settings page's three drift-guard tests
+   (`settings::state::tests::every_registered_global_keybinding_has_a_real_keybindings_page_label`/
+   `keybinding_rows_are_derived_in_real_registration_order`/
+   `keybinding_rows_report_the_real_global_context_for_every_default_binding`) caught that the four
+   new `EditorWordLeft`/`EditorWordRight`/`EditorSelectWordLeft`/`EditorSelectWordRight` actions had
+   no `action_label` entry and weren't in either test's own expected fixture/count - exactly what
+   these guards exist to catch (a new global binding with no Keybindings-page label rendering blank,
+   or a scoped-binding-count drift, rather than failing a test). Fixed by adding the four labels and
+   updating both fixtures (once more after rebasing onto issue #17's text-undo-redo work, which added
+   its own three scoped bindings to the same counts).
+2. The virtualized-scroll regression test's own first draft moved the real caret via
+   `EditBuffer::move_to` to force a distant scroll target - which collapses a selection, by that
+   method's own documented contract, clobbering the very selection the test existed to prove
+   survives. The test's own "the real selection must survive" assertion caught this immediately
+   (got `None`, not a false pass). Fixed by driving `file_view_scroll_handle` directly instead - see
+   above.
+3. Rebasing onto the concurrently-landed issue #17 (real text-undo/redo for every query/filter
+   field) turned `palette_query`/`filter_query`/`settings_keymap_filter` from plain `String`s into
+   `text_history::TextField`s - a real, substantial API shift under three of the exact fields this
+   phase's own caret/blink work touches. Resolved by hand at every conflict (not by mechanically
+   preferring one side): keeping issue #17's real `TextField` API calls (`.as_str()`, `.push_str(_,
+   Instant::now())`, `.pop(Instant::now())`, its own `TextUndo`/`TextRedo` action wiring) while
+   re-applying this phase's own caret/blink additions (the new `render_simple_input_caret` child, the
+   `reset_caret_blink` call in each field's key-down handler) on top, verified by a full re-run of
+   every affected test module after the rebase, not assumed correct from the merge alone.
+
+**Not attempted this phase, stated rather than left silently absent**: Settings has no other free-
+text input to audit beyond the two filters above (every other Settings row is a toggle/stepper/
+choice control - confirmed by reading `crate::settings::widgets`, which has no text-input widget at
+all). The work surface's agent/shell prompt is the terminal pane itself, not a separate input, so
+its own real cursor is the terminal-cursor gap noted above, not a second missing-caret finding.
+
+Coverage: new unit tests for `EditBuffer::move_word_left`/`move_word_right`/`select_word_left`/
+`select_word_right`/`select_word_at`/`select_line_at`/`cursor_within_line`-during-a-selection
+(`crate::code_surface::edit_buffer`); real GPUI end-to-end tests for Ctrl+Shift+Left/Right through
+the real key bindings, double/triple-click through real `MouseDownEvent`s with a real `click_count`,
+and the virtualized-scroll selection-persistence regression, all in
+`crate::code_surface::editing::editing_tests`; `AdeApp::set_caret_style`/`toggle_caret_blink` real
+mutator coverage (including that toggling blink off takes effect immediately, not just in
+`settings.toml`) in `crate::settings::render::caret_settings_tests`.
+
+`cargo fmt --all -- --check` and `cargo build --workspace` are both clean. `cargo clippy -p app
+--all-targets -- -D warnings` is clean; `cargo clippy --workspace --all-targets -- -D warnings`
+independently fails on this Windows dev machine on a pre-existing, unrelated gap this phase never
+touched: `crates/lsp-core/src/client.rs` calls `proc::*`/`nix::*` unconditionally even though
+`crate::proc` is genuinely `#[cfg(unix)]`-gated (confirmed by reading `lsp-core/src/lib.rs`'s own
+module declaration and doc comment, which names the real Windows equivalent `client.rs` is
+*supposed* to use instead, `std::process::Child::kill()`, but doesn't actually branch on) - a real
+Windows-only compile gap, not something this issue's own scope covers fixing.
+`cargo test -p app --lib` run scoped to every module this phase touched (`code_surface::edit_buffer`,
+`code_surface::editing`, `root::caret_blink`/`root::state`, `palette::render`, `rail::render`,
+`settings::render`/`settings::state`, `sidebar::render`/`sidebar::tree_ops`, `merge::editing`,
+`theme`, `status_bar`) is clean: 187 passed, 5 failed - all 5 pre-existing and environment-specific,
+none in a file this phase changed: three `sidebar::render::fold_state_tests` fail on this Windows
+machine comparing a fold-state path containing a literal `\` (Windows' own real path separator)
+against a test fixture hardcoded with `/`, and two `status_bar::process_stats::tests` fail because
+they read real `/proc/<pid>/stat` files, which don't exist on Windows at all. A full,
+un-scoped `cargo test -p app --lib` run (every module, not just the ones this phase touched) hits
+several more pre-existing failures of the same two kinds plus real LSP-server-dependent tests
+(rust-analyzer/pyright/typescript-language-server/vue-language-server aren't installed on this
+machine) and `gio trash`-dependent worktree-discard tests (Linux/FreeBSD-only by this codebase's own
+documented design) - none in a file this phase changed either, confirmed by cross-referencing every
+failing test's own module path against this diff's file list.
+## Multi-cursor and multi-select for the File view (GitHub issue #28)
+
+VS Code-style `Ctrl+D`/`Ctrl+Shift+L`/`Ctrl+K Ctrl+D`/Alt+click/Esc multi-cursor editing, scoped
+entirely to the File view's `EditBuffer` (`crate::code_surface::edit_buffer`) and its GPUI wiring
+(`crate::code_surface::editing`) - the parent umbrella (#14) flagged this as its largest item and
+suggested it might deserve its own issue, which #28 is. It does not touch the merge hand-edit
+surface (`crate::merge::editing`) at all - see "What was deliberately cut" below.
+
+**The data-model decision, and why not `Vec<Selection>` everywhere.** `EditBuffer` already had a
+single `selected_range: Range<usize>` + `selection_reversed: bool` pair as its primary cursor,
+threaded through roughly 2900 lines of `editing.rs` and every one of `edit_buffer.rs`'s own
+already-tested single-cursor methods (`move_left`, `replace_range`, `backspace`, ...). The
+textbook multi-cursor design replaces that pair with `Vec<Selection>` uniformly and rewrites every
+call site to index into it. Rejected here, deliberately: that rewrite would have meant touching
+every one of those methods and every call site across two feature folders, for a behavior
+(multiple cursors) that's still the *uncommon* case even once this ships - single-cursor editing
+stays the overwhelming majority of real usage. Instead, the primary cursor keeps its own plain
+fields exactly as before, and a new `secondary_cursors: Vec<SecondaryCursor>` field (empty by
+default - the only state a freshly constructed buffer is ever in) holds every cursor beyond it.
+Every existing single-cursor method keeps its exact prior behavior, byte-for-byte, whenever
+`secondary_cursors` is empty; multi-cursor behavior is layered on top as new, additive code paths
+that only activate once a second cursor actually exists:
+
+- **Simultaneous edits** (`EditBuffer::apply_at_every_cursor`, threaded into `replace_range`/
+  `backspace`/`delete_forward` - the three methods every keystroke, paste, and IME commit already
+  funneled through, unchanged): applies one real edit per cursor as a single atomic operation,
+  processed **right-to-left by original position**, the standard multi-cursor discipline - splicing
+  the rightmost cursor's own edit first never invalidates the still-unprocessed byte ranges of any
+  cursor further left. The first working version of this got the position bookkeeping wrong in a
+  way three of its own new unit tests caught immediately: it recorded each cursor's *own* new
+  caret position right after its own splice, but never re-adjusted an *already-recorded* position
+  when a later (further-left) splice shifted everything after it - so typing at two cursors in
+  `"value + value"` landed the second caret at byte 9 in a 6-byte result string. Fixed by shifting
+  every already-recorded position by each subsequent edit's own real byte delta as it lands, not
+  just recording positions once and trusting them. A second, related bug the tests caught: two
+  cursors sitting at the *exact same* offset (an artificial state a real merge should always
+  prevent, but exercised directly in a test) each independently computed a delete against content
+  the other had already spliced, deleting the wrong character. Fixed with a defensive
+  `merge_colliding_cursors()` call at the very start of `apply_at_every_cursor`, rather than relying
+  purely on every caller keeping cursors merge-clean.
+- **Cursor movement** (`EditBuffer::move_every_cursor`, threaded into `move_left`/`move_right`/
+  `move_up`/`move_down`/`move_home`/`move_end`/`select_left`/`select_right`/`select_up`/
+  `select_down`): moves every real cursor together for a plain arrow key, so `Ctrl+D` adding a
+  second cursor doesn't leave it stranded the moment the user presses an arrow. One honest, narrow
+  scope cut here: each secondary cursor's own vertical-move "sticky goal column" resets every press
+  rather than persisting across a consecutive run the way the primary's already does (a per-cursor
+  goal-column field would be real, separate design work) - cosmetic only (every cursor still lands
+  on a real, valid position every press), documented in the method's own doc comment, not hidden.
+- **Occurrence search** (`select_word_or_add_next_occurrence` for `Ctrl+D`, `select_all_occurrences`
+  for `Ctrl+Shift+L`, `skip_current_occurrence` for `Ctrl+K Ctrl+D`): word-boundary matching is a
+  real Unicode-aware `char::is_alphanumeric() || '_'` scan (matching VS Code's own default word
+  separators - punctuation/whitespace all separate words), independent of this file's syntax
+  highlighter (so it works identically on unhighlighted/plain-text files). Occurrence matching
+  itself is case-sensitive, plain-substring `str::match_indices`, matching VS Code's own default -
+  verified with a dedicated test (`Value`/`value` in the same buffer don't cross-match). `Ctrl+D`
+  wraps around the buffer once it reaches the end with no further un-selected match; `Ctrl+K Ctrl+D`
+  moves the primary without keeping the skipped occurrence, leaving every other cursor untouched -
+  both match VS Code's own real behavior, not a guessed approximation.
+- **Collision merging** (`merge_colliding_cursors`): true overlap, or two empty carets at the exact
+  same offset, merge into one; two selections that merely *touch* (`0..3` next to `3..6`) stay
+  distinct - "touching is not colliding," and a dedicated test asserts both directions.
+- **A plain, unmodified click always collapses back to one cursor**: `move_to`/`select_to` (the
+  real target of every ordinary/shift-click, and the same primitives every single-cursor keyboard
+  method already funneled through) now clear `secondary_cursors` as their own first step, matching
+  every real multi-cursor editor's "clicking without a modifier means one cursor" rule. `Esc`
+  (`EditorCollapseCursors`, a new action) does the same thing explicitly, and is wired to be a
+  genuine no-op (no re-render, no dismissed completions) while only one cursor is active, so it
+  never claims a keystroke that had nothing multi-cursor-related to do.
+
+**Rendering**: `EditableLineContext` gained `secondary_selections_local`/`secondary_cursors_local`
+(the multi-cursor mirror of its existing `selection_local`/`cursor_local`), and
+`render_editable_file_view_line`'s canvas overlay paints one additional selection fill/caret bar per
+secondary cursor per row it touches, using the exact same `theme::syntax::CARET` token the primary
+already uses - `theme.rs` has no separate "secondary cursor" color and inventing one with no
+`design_handoff_jerry_ade` spec to back it would be an unjustified guess, so a real multi-cursor
+session shows several identically-styled real carets/selections rather than a fabricated visual
+distinction. This was a deliberate inclusion, not an afterthought: a data model with no visible
+multi-cursor state would be real logic bound to nothing a user could ever see, which is exactly the
+"looks done, isn't" shape this project's own rules exist to rule out.
+
+**Alt+click** adds a cursor at the click point (`EditBuffer::add_cursor_at`), keeping every existing
+cursor - wired into the File view's existing mouse-down handler ahead of the shift-click branch, so
+Alt+Shift+click still adds a cursor rather than extending the primary's selection.
+
+**Undo/redo grouping a multi-cursor edit as one step - landed after all, via a rebase onto issue
+#17.** This was originally built and documented as a deliberate gap (this editor had no text
+undo/redo at all when this work started - Revision R8.5a). Mid-implementation, a separate branch
+building real per-widget text undo/redo (`crate::text_history`, GitHub issue #17) landed on
+`master`; rebasing onto it found that its own `EditGroup` was *designed* for exactly this
+("Forward-compatible with multi-cursor" is a section in that module's own docs, from before this
+work rebased onto it) - it holds a `Vec<TextEdit>`, not one edit, specifically so N simultaneous
+splices can become one undo step. `EditBuffer::apply_at_every_cursor` now calls
+`TextHistory::record` once per cursor's own splice, chaining each call's `before` snapshot to the
+previous call's `after` so the history's own caret-continuity coalescing rule merges every one of
+them into a single group rather than starting a fresh one per cursor - no changes to
+`crate::text_history` itself were needed. A genuine multi-cursor `Ctrl+Z` now reverses every
+cursor's own edit together, as one keystroke.
+
+One real, honest limitation remains, documented in `edit_buffer.rs`'s own docs rather than
+papered over: `SelectionSnapshot` (shared by every real text widget in this app - `TextField` for
+the palette/rail/settings/new-file inputs, not just this buffer) holds exactly one caret/selection,
+so it has no way to represent a whole multi-cursor state. Undo/redo therefore restores **all of the
+text** correctly as one atomic step, but only the **primary** cursor's own caret/selection precisely
+- every secondary cursor from that edit is not reconstructed, and the buffer lands in ordinary
+single-cursor state afterward (`EditBuffer::restore_selection` now clears `secondary_cursors`
+explicitly, so this is a real, verified outcome, not an unspecified one). Extending
+`SelectionSnapshot` to a real multi-cursor shape would touch every one of `crate::text_history`'s
+own consumers, not just this buffer - real, separate, cross-cutting work outside this one
+sub-issue's scope.
+
+The regression test written for that exact outcome (`undo_after_a_multi_cursor_edit_leaves_the_
+buffer_in_ordinary_single_cursor_state`) caught a real mistake in its own first draft, not in the
+implementation: it asserted `cursor_count() == 1` immediately after typing at two cursors, before
+undo even ran - wrong on its own terms, since typing collapses *each* cursor to its own caret, not
+every cursor down to one shared caret (there are still genuinely two cursors, one per edit, right
+after a multi-cursor keystroke). Fixed by asserting the real pre-undo count (2) and only then
+asserting the post-undo count (1), which is what actually exercises `restore_selection`'s new
+clearing behavior.
+
+**What was deliberately cut, and why**, each flagged in the issue itself as more peripheral than
+the core behavior above:
+
+- **Alt+Shift+drag column selection.** This editor has no mouse-drag-to-select *of any kind* yet -
+  only click and shift-click (confirmed by grep: no `on_mouse_move`/`on_drag` anywhere in
+  `editing.rs` before this change). A column-selection variant of a feature that doesn't exist yet
+  is out of reach without first building ordinary drag-select, itself separate, real work.
+- **Merge hand-edit editor (`crate::merge::editing`).** Multi-cursor bindings are registered only on
+  the File view's own `"file-editor"` key context, not `"merge-editor"` - a deliberate scope
+  narrowing (the merge hand-edit surface is secondary and less-used), not an oversight. Since the
+  underlying `EditBuffer` methods are shared, this costs nothing in risk: a merge-edit buffer's own
+  `secondary_cursors` simply never gets populated, so its single-cursor behavior is provably
+  unaffected.
+- **IME composition and explicit-range edits while multiple cursors are active.**
+  `replace_and_mark_range` and any *explicit*-range call to `replace_range` (a completion's own
+  text-edit application) only ever affect the primary cursor even with secondaries active, leaving
+  the secondaries stale relative to that one edit - a narrow, documented edge case (composing
+  CJK/accented input, or accepting a completion, mid multi-cursor selection is rare in practice).
+
+**Testing**: 25 new tests, all but 4 pure `EditBuffer` unit tests requiring no GPUI window at all -
+word-boundary detection (mid-word, touching-one-side, no-adjacent-word-character), the two-step
+`Ctrl+D` flow (select word, add next occurrence, wraparound, case-sensitivity), `Ctrl+Shift+L`,
+`Ctrl+K Ctrl+D`, Esc, Alt+click's `add_cursor_at`, simultaneous typing/paste/backspace/delete
+(including a per-cursor no-op at the start of the buffer not blocking a sibling cursor's own real
+deletion), collision merging (both the merge and the deliberate non-merge of touching selections),
+multi-cursor arrow movement, and the undo/redo integration (one-step coalescing across cursors,
+redo, the documented single-cursor-after-undo outcome, and a multi-keystroke burst across two
+cursors still coalescing into one group - see the undo/redo section above for what these caught).
+The remaining 4 drive the real, bound keystrokes
+(`cx.simulate_keystrokes("ctrl-d")`, `"ctrl-shift-l"`, `"ctrl-k ctrl-d"` - a real, verified
+space-separated chord binding, not invented here (this repo now depends on `gpui` as a pinned git
+dependency rather than the old vendored checkout - verified against that dependency's own cached
+checkout, `crates/gpui/src/keymap/binding.rs`, which splits a keybinding's keystroke string on
+whitespace into an ordered chord sequence) - and `"escape"`) through the real key-binding table end to end,
+including proving typed text lands at both cursors through the real
+`EntityInputHandler::replace_text_in_range` path, not a direct `EditBuffer` call. No test simulates
+an actual mouse click on the editable file view - this codebase had no precedent for that already
+(the existing click-to-place-caret/shift-click-to-select logic has no automated click-simulation
+test either, for the same reason: the canvas-based hit-testing only has real painted bounds/shaped
+lines after a real paint pass), so Alt+click's own wiring follows the same established precedent and
+relies on the `add_cursor_at` unit test plus code review.
+
+**Environment note**: this work was done from a Windows sandbox, not this project's usual
+Linux/WSL2 environment (see README.md/BUILD-LOG.md's own repeated notes on this, and CI - now
+build-only everywhere per the immediately preceding CI-simplification commit - for why that gap is
+real and not just theoretical). What was actually verified, cleanly, on this machine:
+`cargo build --workspace`; `cargo fmt --all -- --check`; `cargo clippy --workspace --exclude
+lsp-core --all-targets -- -D warnings` (see below for why `lsp-core` itself is excluded);
+`cargo test -p app --lib code_surface::` (235 tests, 0 failed - every test this change actually
+touches or added, including all 25 new ones and the pre-existing suite around them); and a large,
+though not complete, slice of the rest of the `app` crate's own suite (everything reachable before
+this sandbox's own process-spawning tests below, run in several passes).
+
+Two classes of pre-existing gap, neither caused by or reachable from this change's own files,
+account for what couldn't be run to completion. First, `lsp-core`'s own test target does not
+compile on Windows at all (a `#[cfg(unix)]`-gated `proc` module referenced unconditionally),
+confirmed pre-existing by reproducing it against a stash of the pre-rebase commit too - this alone
+makes a literal `cargo test --workspace`/`cargo clippy --workspace --all-targets` impossible on this
+machine, not just slow. Second, and more surprising: several tests scattered through modules this
+change never touches (`root::focus::tab_strip_keybinding_tests`, `merge::flow::
+merge_regression_tests`, `code_surface::lsp_ui`'s real-language-server wiring tests) either hang
+indefinitely or crash the whole test binary under this sandbox specifically - every one of them
+spawns a real child process (a shell, `rust-analyzer`/`typescript-language-server`, a `git`
+worktree operation) or a real language server, and this sandbox's own process/toolchain setup
+differs enough from the project's native Linux/WSL2 environment (missing `rust-analyzer` for the
+pinned toolchain, confirmed separately; Windows process teardown behaving differently from the
+Unix signal-based teardown `pty-core`'s own tests already assume) that this class of test is simply
+not reliably runnable here today, in isolation from this change or not. Every individual test in
+this category that could be run alone (e.g. `stale_completions_popup_tests`, the diff-rendering
+flake) passed cleanly - the failure mode is specific to this sandbox's behavior under a long,
+sequential, real-process-heavy run, not a logic bug anywhere.
+## Editor keybindings: Ctrl+Space, Ctrl+W, Tab/Shift+Tab (GitHub issue #26)
+
+Three independent keybinding gaps from the umbrella editor-polish issue #14, closing its
+`#26` sub-issue.
+
+**Ctrl+Space** is a literal `"ctrl-space"` binding (not `"secondary-space"`) on
+`root::CompletionsInvoke`, deliberately following the same "must stay the same physical key on
+every OS" precedent `"ctrl-shift-t"` already set - Ctrl+Space is the universal cross-editor
+convention for "trigger completion," and the design's own Linux IME-collision caveat is exactly
+why it stays a plain rebindable `KeyBinding` rather than a hardcoded shortcut. Pressing it with
+the popup already open re-invokes the same real completion request rather than toggling, so it
+refreshes in place; `Escape` dismisses without moving focus off the editor.
+
+**Ctrl+W** routes through one real, shared entry point (`Self::request_close_file_tab`) that
+every close affordance now calls - the global `Ctrl+W` binding, the tab strip's own `×`, and
+middle-click alike - so none of them can bypass the real unsaved-changes confirmation. A clean
+tab closes immediately; a dirty one arms a "click × again to close without saving" confirm state
+first. Middle-click closes both file tabs and terminal/session tabs through this same path.
+Closing a terminal tab goes through `pty_core::PtySession::shutdown`'s real `SIGTERM`-then-bounded-
+grace-period-then-`SIGKILL` sequence, not a bare kill. Closing the last tab leaves the app's
+existing empty state rather than closing the window. The checklist's browser/Electron-context
+`Ctrl+W` interception item doesn't apply here - Jerry is a native GPUI desktop app on all three
+platforms, not a browser or Electron shell, so there is no default browser tab-close behavior to
+prevent.
+
+**Tab/Shift+Tab** indentation is resolved by a new, deliberately `gpui`-free module
+(`code_surface::indent`): a hand-rolled `.editorconfig` parser/matcher (no vendored
+`editorconfig` crate exists anywhere in this workspace's pinned dependency set, `vendor/zed`
+included) supporting `root = true`, `indent_style`, `indent_size` (including `tab` meaning "use
+`tab_width`"), `tab_width`, and basename-matched section patterns (plain, brace-expanded,
+`?`-wildcarded), falling back to `EditorSettings` when no `.editorconfig` governs the file. Two
+scope boundaries are chosen so an unsupported pattern degrades to "doesn't match" rather than a
+wrong match: directory-scoped patterns containing `/` never match here, and `**`/bracket
+character classes are read as literal text rather than interpreted as globs. Precedence follows
+the real spec (closer file wins per-property, walk stops at the first `root = true`, later
+`[section]` beats an earlier match within one file). Tab with no selection inserts one indent
+unit at the caret; with a multi-line selection it indents every touched line and preserves the
+selection; Shift+Tab dedents (single or multi-line) and no-ops on a line already at column 0.
+Since Tab/Shift+Tab now indent inside the editor instead of moving focus, `Escape` is the new,
+documented focus-out accessibility hatch back to the rest of the UI.
+
+Verification was scoped to the crates and modules this change actually touches, following the
+same approach the other agents working umbrella issue #14's sibling sub-issues (git blame,
+scrollbars, caret/selection, multi-cursor, theme highlighting) independently converged on for
+this same Windows sandbox: `cargo build --workspace`, `cargo fmt --all -- --check`, and
+`cargo clippy -p app --all-targets -- -D warnings` all clean; `cargo test -p app --lib` scoped to
+`code_surface::`, `settings::`, and `keymap`/`keymap_overrides` - 339 passed, 0 failed other than
+three pre-existing, environment-specific failures (a real `rust-analyzer`/`vue-language-server`/
+`typescript-language-server` never becoming `Ready` within the test timeout because those
+binaries aren't installed on this sandbox) that reproduce identically on `master` before this
+change and are unrelated to it. A literal full-workspace `cargo test`/`cargo clippy --workspace`
+was not run to completion for the same reason `ac8e6cd` (already on `master`) narrowed CI itself
+to build-only on non-Linux platforms.

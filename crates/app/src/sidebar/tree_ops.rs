@@ -491,6 +491,10 @@ impl AdeApp {
             }
             return;
         }
+        // GitHub issue #27's "solid mid-keystroke" - see `crate::palette::render::AdeApp::
+        // handle_palette_key_down`'s identical reasoning for resetting unconditionally here,
+        // before dispatching: every branch below is real typing/editing in this real input.
+        self.reset_caret_blink(cx);
         match keystroke.key.as_str() {
             "escape" => {
                 self.cancel_tree_inline_edit(window, cx);

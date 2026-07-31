@@ -199,28 +199,66 @@ pub fn highlighter_for_extension(
     crate::language::entry_for_extension(extension)?.highlighter
 }
 
-/// A syntax span's classification - `design_handoff_jerry_ade/README.md`'s File view
-/// syntax-colour table ("keyword ... function ... type ... literal/self ... comment ...
-/// punctuation/text").
+/// A syntax span's classification - GitHub issue #31's extended scope-coverage checklist (22 real
+/// `tree-sitter-highlight` buckets, up from the original six-bucket
+/// `design_handoff_jerry_ade/README.md` File view table), plus the [`Text`](HighlightKind::Text)
+/// fallback every byte a query doesn't classify at all still receives. See [`HIGHLIGHT_NAMES`] for
+/// the real, verified capture names each variant is reached through, and
+/// `theme::syntax`'s own module docs for the fallback-chain design (which variants are real,
+/// independently-authored colours versus real, direct aliases of a parent scope).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HighlightKind {
     Keyword,
     Function,
+    FunctionMethod,
     Type,
-    Literal,
+    TypeBuiltin,
+    Constant,
+    ConstantBuiltin,
+    String,
+    StringEscape,
+    Number,
     Comment,
+    CommentDoc,
+    Variable,
+    VariableParameter,
+    VariableBuiltin,
+    Property,
+    Operator,
+    PunctuationBracket,
+    PunctuationDelimiter,
+    Tag,
+    Attribute,
+    Embedded,
     Text,
 }
 
-/// Maps a [`HighlightKind`] to its real `theme::syntax::*` colour, per
-/// `design_handoff_jerry_ade/README.md`'s File view table.
+/// Maps a [`HighlightKind`] to its real `theme::syntax::*` colour - see that module's own docs
+/// for the fallback-chain design behind each mapping.
 pub fn color_for_kind(kind: HighlightKind) -> Rgba {
     match kind {
         HighlightKind::Keyword => theme::syntax::KEYWORD.into(),
         HighlightKind::Function => theme::syntax::FUNCTION.into(),
+        HighlightKind::FunctionMethod => theme::syntax::FUNCTION_METHOD.into(),
         HighlightKind::Type => theme::syntax::TYPE.into(),
-        HighlightKind::Literal => theme::syntax::LITERAL.into(),
+        HighlightKind::TypeBuiltin => theme::syntax::TYPE_BUILTIN.into(),
+        HighlightKind::Constant => theme::syntax::CONSTANT.into(),
+        HighlightKind::ConstantBuiltin => theme::syntax::CONSTANT_BUILTIN.into(),
+        HighlightKind::String => theme::syntax::STRING.into(),
+        HighlightKind::StringEscape => theme::syntax::STRING_ESCAPE.into(),
+        HighlightKind::Number => theme::syntax::NUMBER.into(),
         HighlightKind::Comment => theme::syntax::COMMENT.into(),
+        HighlightKind::CommentDoc => theme::syntax::COMMENT_DOC.into(),
+        HighlightKind::Variable => theme::syntax::VARIABLE.into(),
+        HighlightKind::VariableParameter => theme::syntax::VARIABLE_PARAMETER.into(),
+        HighlightKind::VariableBuiltin => theme::syntax::VARIABLE_BUILTIN.into(),
+        HighlightKind::Property => theme::syntax::PROPERTY.into(),
+        HighlightKind::Operator => theme::syntax::OPERATOR.into(),
+        HighlightKind::PunctuationBracket => theme::syntax::PUNCTUATION_BRACKET.into(),
+        HighlightKind::PunctuationDelimiter => theme::syntax::PUNCTUATION_DELIMITER.into(),
+        HighlightKind::Tag => theme::syntax::TAG.into(),
+        HighlightKind::Attribute => theme::syntax::ATTRIBUTE.into(),
+        HighlightKind::Embedded => theme::syntax::EMBEDDED.into(),
         HighlightKind::Text => theme::syntax::TEXT.into(),
     }
 }
@@ -295,82 +333,183 @@ impl Grammar {
 /// parallel array: entry `i` here is classified as entry `i` there. The two are length-checked
 /// against each other at compile time (see [`HIGHLIGHT_KINDS`]) so they can never silently drift.
 ///
-/// ## Why these names, and why so few
+/// ## The matching rule - and how it *is* the fallback chain (GitHub issue #31)
 ///
 /// The real matching rule is not a prefix match, and this is the single most important thing to
 /// understand before editing this list. `HighlightConfiguration::configure`
 /// (`tree-sitter-highlight-0.26.9/src/highlight.rs:458-484`, read directly) splits both the
 /// query's capture name and each recognized name on `.`, and a recognized name matches when
 /// **every one of its own dot-parts is present among the capture's dot-parts**; among all
-/// matches, the one with the *most* parts wins, ties going to the earliest entry here. So the
-/// single entry `"function"` already claims the real captures `function`, `function.method`,
-/// `function.builtin` and `function.macro` that the three grammars' own bundled queries actually
-/// emit - there is no need to enumerate them, and enumerating them would not change the outcome.
+/// matches, the one with the *most* parts wins, ties going to the earliest entry here.
 ///
-/// Deliberately absent (each falls through to no match at all, i.e. [`HighlightKind::Text`]):
-/// `operator`, `punctuation.bracket`, `punctuation.delimiter`, `punctuation.special`, `property`,
-/// `attribute`, `label`, `embedded`, `variable`, `variable.parameter`. That is not an oversight -
-/// `design_handoff_jerry_ade/README.md`'s File view colour table has exactly six buckets and puts
-/// punctuation and plain identifiers in the `Text` one, so a capture with no bucket of its own
-/// must resolve to `Text` rather than being forced into a bucket it doesn't belong in.
+/// This is exactly the mechanism issue #31 asks for: registering both a parent scope (`"variable"`)
+/// and a child scope (`"variable.parameter"`) means a real `@variable.parameter` capture prefers
+/// the more specific entry, while a grammar that only ever emits the plain parent capture still
+/// gets a real, intentional bucket rather than falling through unmatched - the specificity rule
+/// *is* the fallback chain, enforced by the engine itself rather than by a second, hand-rolled
+/// lookup here. `theme::syntax`'s own module docs describe the second half of the chain: even a
+/// scope with its own dedicated [`HighlightKind`] variant can still resolve to a *colour* that is a
+/// real, direct alias of its parent's, rather than an independently-authored hue.
+///
+/// ## Real capture names, verified per grammar - not guessed
+///
+/// Every name below was checked against the real, fetched grammar crates' own bundled
+/// `queries/highlights.scm`/`highlights-jsx.scm` files under
+/// `~/.cargo/registry/src/*/tree-sitter-{rust,python,javascript,typescript}-*/queries/`, not
+/// assumed from GitHub issue #31's own checklist wording (which turned out to name two scopes,
+/// `comment.doc` and `string.escape`, that none of these four grammars actually emit - see below).
+///
+/// - **`keyword`/`function`/`type`/`comment`/`constructor`/`variable.builtin`** - unchanged from
+///   before this issue; see the historical notes further down.
+/// - **`function.method`** - real (`tree-sitter-rust`: `@function.method` on a `field_expression`
+///   call callee; `-javascript`: `@function.method` on a `property_identifier` method definition/
+///   call).
+/// - **`type.builtin`** - real (`-rust`: `(primitive_type) @type.builtin`; `-typescript`:
+///   `(predefined_type) @type.builtin`, e.g. `void`/`number`/`string`/`unknown`).
+/// - **`constant`/`constant.builtin`** - real (`-rust`: an all-caps identifier is `@constant`, a
+///   bool/int/float literal is `@constant.builtin`; `-python`/`-javascript`: the same all-caps
+///   heuristic for `@constant`, and `true`/`false`/`None`/`null`/`undefined` for
+///   `@constant.builtin`).
+/// - **`string`** - real in all four (`(string_literal)`/`(char_literal)`/`(raw_string_literal)`
+///   for Rust, `(string)` for Python, `[(string)(template_string)]` for JS/TS).
+/// - **`escape`, registered here alongside `string.escape`** - `escape`, not `string.escape`, is
+///   the real capture name (`-rust`: `(escape_sequence) @escape`; `-python`: identical). Neither
+///   JavaScript's nor TypeScript's own bundled query captures an escape sequence at all - verified
+///   directly, not assumed - so this bucket is genuinely reachable for Rust/Python source only.
+///   `"string.escape"` (the issue's own checklist name) is registered too, purely so a future
+///   grammar or query supplement that does emit it starts working with no further change here;
+///   it never matches anything today, which is harmless.
+/// - **`number`** - real in Python/JS/TS (`[(integer)(float)] @number` / `(number) @number`).
+///   Rust has no `number` capture at all; its numeric literals are `@constant.builtin` instead
+///   (unchanged from before this issue).
+/// - **`comment.documentation`, registered here alongside `comment.doc`** - `comment.documentation`
+///   is the real capture name (`-rust`: `(line_comment (doc_comment)) @comment.documentation`);
+///   none of the other three grammars has a doc-comment concept in their bundled query.
+///   `"comment.doc"` (the issue's own checklist name) is registered for the same forward-
+///   compatibility reason `"string.escape"` is.
+/// - **`variable`** - real, and a genuinely large behavioural change from before this issue:
+///   `-python`'s query captures *every* identifier as `@variable` via one blanket top-of-file
+///   rule (`(identifier) @variable`), and `-javascript`'s does the same. Previously unregistered,
+///   so every one of those was silently `Text`; seeing `theme::syntax::VARIABLE` is a direct alias
+///   of `theme::syntax::TEXT` (see that module's docs) is what keeps this a classification-only
+///   change with **no** visual difference for existing files.
+/// - **`variable.parameter`** - real (`-rust`: `(parameter (identifier) @variable.parameter)`;
+///   `-typescript`: `required_parameter`/`optional_parameter`). Neither Python nor JavaScript's
+///   own bundled query captures a parameter name distinctly at all - it arrives as a plain
+///   `@variable` there instead, which is a real, grammar-level limitation, not a gap in this list.
+/// - **`property`** - real (`-rust`: `(field_identifier) @property`; `-python`:
+///   `(attribute attribute: (identifier) @property)`; `-javascript`:
+///   `(property_identifier) @property`, unconditionally - this crate's own `code_view` test
+///   module has two pre-existing TypeScript regression tests
+///   (`typescript_const_variable_name_is_not_misclassified_as_a_function`,
+///   `typescript_interface_member_name_is_not_misclassified_as_a_function`) whose expected
+///   [`HighlightKind`] needed updating for exactly this reason).
+/// - **`operator`** - real in all four grammars' own bundled queries (Rust: `*`/`&`/`'` only, a
+///   short list; Python/JS: their full symbolic-operator tables).
+/// - **`punctuation.bracket`/`punctuation.delimiter`** - real in all four.
+/// - **`tag`/`attribute`** - real, both JSX-only (`-javascript`'s `highlights-jsx.scm`): a
+///   lowercase JSX element name is `@tag`, a JSX attribute name is `@attribute`.
+/// - **`embedded`** - real (`-python`'s f-string interpolation, `-javascript`'s template-literal
+///   `${...}` substitution) - see [`HighlightKind::Embedded`]'s own docs (via `theme::syntax`) for
+///   why this rarely shows through in practice despite being a real, live capture.
+///
+/// Deliberately still absent, each a real capture found while verifying the above but out of
+/// scope for issue #31's own "at minimum" list, and each still falls through to
+/// [`HighlightKind::Text`] rather than being forced into an unrelated bucket: `function.builtin`
+/// (Python's builtin-function-call heuristic; already reads as `Function` anyway, since
+/// `"function"`'s single dot-part is a subset match), `function.macro` (Rust's `println!`-style
+/// invocations; same reasoning), `label` (Rust lifetimes), `punctuation.special` (the `${`/`}`
+/// delimiters of an embedded interpolation), `string.special` (JavaScript's `/regex/` literals;
+/// already reads as `String`, since `"string"` is a subset match of `"string.special"`'s parts).
 const HIGHLIGHT_NAMES: &[&str] = &[
     "keyword",
     "function",
+    "function.method",
     "type",
+    "type.builtin",
     "constructor",
     "tag",
+    "constant",
+    "constant.builtin",
     "string",
     "escape",
+    "string.escape",
     "number",
-    "constant",
-    "variable.builtin",
     "comment",
+    "comment.documentation",
+    "comment.doc",
+    "variable",
+    "variable.parameter",
+    "variable.builtin",
+    "property",
+    "operator",
+    "punctuation.bracket",
+    "punctuation.delimiter",
+    "attribute",
+    "embedded",
 ];
 
-/// [`HIGHLIGHT_NAMES`]' positional parallel array: which of this app's six real buckets each
-/// recognized highlight name renders as. See [`HIGHLIGHT_NAMES`] for the indexing contract.
+/// [`HIGHLIGHT_NAMES`]' positional parallel array: which real [`HighlightKind`] each recognized
+/// highlight name renders as. See [`HIGHLIGHT_NAMES`] for the indexing contract.
 ///
 /// The non-obvious mappings, each a real judgement call rather than a mechanical rename:
 ///
-/// - **`constructor` -> `Type`.** All three grammars use `@constructor` for their own
+/// - **`constructor` -> `Type`.** All four grammars use `@constructor` for their own
 ///   "identifier that starts with a capital letter" heuristic (`tree-sitter-rust`'s own comment
 ///   calls these "enum constructors ... either that, or struct names"). Those name a *type* or one
 ///   of its variants, so `Type` is where they belong. Note this is *not* what makes Python's
 ///   `class Foo:` come out right - `@constructor`'s `^[A-Z]` guard makes it unreliable for exactly
 ///   that, which is [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]'s fourth rule's whole reason for existing.
-/// - **`tag` -> `Type`.** `tree-sitter-javascript`'s JSX query captures a *lowercase* JSX element
-///   name (`<div>`) as `@tag`, while an uppercase one (`<Foo>`) is already `@constructor`/`@type`.
-///   Sending both to `Type` is what makes the two read as the same kind of thing on screen, which
-///   is what they are.
-/// - **`variable.builtin` -> `Literal`.** This is the bucket the design table itself names
-///   "literal/self". Rust's `self` reached it in the replaced implementation through a dedicated
-///   `literal_kinds` entry, and Python's `self` through an even more special-cased
-///   leaf-*text* comparison; `tree-sitter-rust`'s own query emits `(self) @variable.builtin`
-///   directly, so Rust now gets it from the real grammar rather than from a local table.
-///   TypeScript's `this`/`super` move here too, which is a real, deliberate *change*: the
-///   replaced code classified them `Keyword` and its own comment recorded that as arbitrary
-///   ("purely for simplicity - no test or real-world distinction depends on which bucket they
-///   land in"). They now match Rust's and Python's `self`, which is the consistency the design
-///   table's own "literal/self" label asks for.
-/// - **`escape` -> `Literal`.** An escape sequence is captured *inside* an already-captured
-///   string, so it must land in the same bucket as the string or every `\n` in the file would
-///   punch a `Text`-coloured hole through a `Literal`-coloured string.
-/// - **`number`/`constant`/`constant.builtin` -> `Literal`.** Rust routes integer/float/boolean
-///   literals through `@constant.builtin` where Python and JavaScript use `@number`; both are the
-///   same bucket here, so the three languages stay consistent regardless of which capture name
-///   their own grammar happens to prefer.
+/// - **`tag` -> `Tag`, a real, dedicated bucket now (was folded into `Type` before this issue).**
+///   `tree-sitter-javascript`'s JSX query captures a *lowercase* JSX element name (`<div>`) as
+///   `@tag`, while an uppercase one (`<Foo>`) is already `@constructor`/`@type`. `theme::syntax::
+///   TAG` is a direct alias of `theme::syntax::TYPE` (see that module's docs), so the two still
+///   *render* identically - this is a classification-precision improvement, not a visual change -
+///   which is why `code_view` test module's `tsx_jsx_element_names_are_classified_as_types` needed
+///   renaming and its `"div"` assertion updating from `HighlightKind::Type` to `HighlightKind::Tag`
+///   (its `"Badge"` assertion, reached through `@type`/`@constructor` rather than `@tag`, is
+///   unaffected).
+/// - **`variable.builtin` -> `VariableBuiltin`.** The bucket the replaced six-colour design table
+///   called "literal/self", now its own dedicated variant rather than folded into a general
+///   `Literal` bucket - `theme::syntax::VARIABLE_BUILTIN` keeps that original colour value (see
+///   that module's docs). Rust's `self` reaches it via the real grammar's own
+///   `(self) @variable.builtin` rule; TypeScript's `this`/`super` and JavaScript's own blanket
+///   built-in-identifier rule land here too, matching Rust's and Python's `self` - the one
+///   deliberate cross-language reclassification this app's original migration made (TypeScript's
+///   `this`/`super` used to be plain `Keyword`).
+/// - **`escape`/`string.escape` -> `StringEscape`, and `number`/`constant`/`constant.builtin` ->
+///   their own real buckets - not `Literal`.** The six-bucket original design folded numbers,
+///   strings, escapes, constants and `self` all into one `Literal` colour; this issue's whole point
+///   is to stop doing that. See `theme::syntax`'s own module docs for exactly which of these five
+///   keep the old `Literal` hex value (as a real, deliberate fallback-chain alias) versus which
+///   ([`String`](HighlightKind::String)/[`StringEscape`](HighlightKind::StringEscape)) get a
+///   genuinely new, distinct colour.
 const HIGHLIGHT_KINDS: [HighlightKind; HIGHLIGHT_NAMES.len()] = [
     HighlightKind::Keyword,
     HighlightKind::Function,
+    HighlightKind::FunctionMethod,
     HighlightKind::Type,
+    HighlightKind::TypeBuiltin,
     HighlightKind::Type,
-    HighlightKind::Type,
-    HighlightKind::Literal,
-    HighlightKind::Literal,
-    HighlightKind::Literal,
-    HighlightKind::Literal,
-    HighlightKind::Literal,
+    HighlightKind::Tag,
+    HighlightKind::Constant,
+    HighlightKind::ConstantBuiltin,
+    HighlightKind::String,
+    HighlightKind::StringEscape,
+    HighlightKind::StringEscape,
+    HighlightKind::Number,
     HighlightKind::Comment,
+    HighlightKind::CommentDoc,
+    HighlightKind::CommentDoc,
+    HighlightKind::Variable,
+    HighlightKind::VariableParameter,
+    HighlightKind::VariableBuiltin,
+    HighlightKind::Property,
+    HighlightKind::Operator,
+    HighlightKind::PunctuationBracket,
+    HighlightKind::PunctuationDelimiter,
+    HighlightKind::Attribute,
+    HighlightKind::Embedded,
 ];
 
 /// Real supplement appended after `tree-sitter-python`'s own bundled `queries/highlights.scm`,
@@ -400,16 +539,35 @@ const HIGHLIGHT_KINDS: [HighlightKind; HIGHLIGHT_NAMES.len()] = [
 /// 3. **Compound type annotations.** `tree-sitter-python`'s bundled rule is
 ///    `(type (identifier) @type)` - it only fires when the annotation is a bare identifier that is
 ///    a *direct* child of the `type` node. A real annotation usually is not: `dict[str, int]`
-///    parses as `(type (generic_type ...))`, `str | None` as `(type (binary_operator ...))`, and
-///    `pathlib.Path` as `(type (attribute ...))` (all three shapes read off real parses, not
-///    assumed). Every one of those rendered as plain text, where the replaced implementation
-///    classified the whole `type` node as `Type` - a real, measured regression across ~620 bytes
-///    of the Python files checked. Capturing `(type)` itself restores exactly the replaced
-///    behaviour. Note this does *not* drag literals inside an annotation along with it: a `None`
-///    return type is an inner `(none) @constant.builtin` node, and nesting means the inner capture
-///    still wins, so `None` renders as `Literal`. That is a deliberate improvement rather than a
-///    leftover - the replaced code rendered `None` as `Type` inside an annotation but `Literal`
-///    everywhere else in the same file, and it is now consistently `Literal` in both places.
+///    parses as `(type (generic_type (identifier) (type_parameter (type (identifier)) (type
+///    (identifier)))))`, and `pathlib.Path` as `(type (attribute object: (identifier) attribute:
+///    (identifier)))` (both shapes read off a real parse via `tree_sitter::Node::to_sexp`, not
+///    assumed - `dict`/`list`'s own base-name node and `pathlib`'s own object node sit *outside*
+///    any per-identifier `(type (identifier) ...)` wrapper, while each of `dict[str, int]`'s own
+///    `str`/`int` type-parameter identifiers is individually re-wrapped in its own nested `(type
+///    (identifier))` and so already matches the bundled rule directly). Every one of those
+///    non-wrapped identifiers rendered as plain text, where the replaced implementation classified
+///    the whole `type` node as `Type` - a real, measured regression across ~620 bytes of the Python
+///    files checked. Capturing `(type) @type` itself (this rule) restores that whole-node
+///    behaviour for any byte the two more specific rules below don't otherwise cover.
+///
+///    That whole-node capture is not, on its own, enough once GitHub issue #31 registers a real
+///    `"variable"`/`"property"` bucket, though - a real, second-order regression an audit of this
+///    issue's own test suite caught. `tree-sitter-python`'s own blanket `(identifier) @variable`
+///    rule (line 3 of its bundled query) captures `dict`/`list`/`pathlib` too, since each is
+///    genuinely, structurally an `(identifier)` node; nested *inside* the whole `type` node this
+///    rule's own `@type` capture covers, the inner `@variable` capture wins (nesting: the innermost
+///    open highlight always wins - see [`highlight_with`]'s own docs) and silently downgrades
+///    `dict`/`list`/`pathlib` from `Type` back to `Variable`. The two rules directly below close
+///    that gap the same way rule 5 closes the method-call one: by capturing the *exact same*
+///    `dict`/`list`/`pathlib` identifier nodes themselves (not a wrapping parent) as `@type`, so
+///    the tie is now between two captures of the *same* node rather than parent-vs-child nesting -
+///    and, being the textually later match, `@type` wins.
+///
+///    Note this machinery does *not* drag literals inside an annotation along with it: a `None`
+///    return type is an inner `(none) @constant.builtin` node, and nesting means that inner capture
+///    still wins over any of this rule's own outer `@type`, so `None` renders as `ConstantBuiltin`
+///    - consistent with every other `None` in the file, not a leftover special case.
 /// 4. **Class names.** `tree-sitter-python` has no `class_definition name:` rule; a class name
 ///    reaches a bucket only via the query's two casing heuristics, and *neither is reliable*.
 ///    `@constructor` requires `^[A-Z]`, so `class _Pickler:` and `class socket:` - a leading
@@ -443,6 +601,9 @@ const PYTHON_HIGHLIGHTS_SUPPLEMENT: &str = r#"
 ] @keyword
 
 (type) @type
+
+(type (generic_type (identifier) @type))
+(type (attribute object: (identifier) @type))
 
 (class_definition name: (identifier) @type)
 
@@ -713,10 +874,15 @@ fn highlight_with(source: &str, grammar: Grammar) -> Vec<HighlightSpan> {
                 let kind = open.last().copied().unwrap_or(HighlightKind::Text);
                 // Coalesce with the previous span when it is both adjacent and the same bucket.
                 // Real, not cosmetic: the engine splits `Source` at every highlight boundary, so a
-                // string containing escapes arrives as several separate `Literal` runs that render
-                // identically to one. Merging here keeps `build_lines`' per-line run lists (and
-                // the `SharedString` allocation each run costs at render time) proportional to
-                // what is actually visually distinct.
+                // keyword list like Rust's `"as" @keyword ... "async" @keyword ...` arrives as one
+                // `Source` event per anonymous token even though they're all the same real
+                // `Keyword` bucket. Merging here keeps `build_lines`' per-line run lists (and the
+                // `SharedString` allocation each run costs at render time) proportional to what is
+                // actually visually distinct - note this deliberately does *not* merge a `String`
+                // run with an adjacent `StringEscape` one (different buckets since GitHub issue
+                // #31), so an escape sequence stays its own real, separately-classified span
+                // rather than disappearing into the surrounding string - see
+                // `escapes_inside_a_string_are_their_own_real_string_escape_run`.
                 match spans.last_mut() {
                     Some(previous) if previous.end == start && previous.kind == kind => {
                         previous.end = end;
@@ -1197,10 +1363,10 @@ mod tests {
     }
 
     #[test]
-    fn a_string_literal_is_classified_as_literal() {
+    fn a_string_literal_is_classified_as_string() {
         let spans = highlight_rust(SAMPLE_RUST);
         let span = find_span(&spans, SAMPLE_RUST, "\"x\"").expect("string literal span");
-        assert_eq!(span.kind, HighlightKind::Literal);
+        assert_eq!(span.kind, HighlightKind::String);
     }
 
     #[test]
@@ -1211,10 +1377,12 @@ mod tests {
     }
 
     #[test]
-    fn a_type_identifier_is_classified_as_type() {
+    fn a_primitive_type_identifier_is_classified_as_type_builtin() {
         let spans = highlight_rust(SAMPLE_RUST);
         // "i32" appears twice (parameter type, return type); just confirm at least one
-        // occurrence was classified as Type.
+        // occurrence was classified as TypeBuiltin - `i32` is a real `(primitive_type)` node in
+        // `tree-sitter-rust`'s own grammar, captured `@type.builtin`, not the plain `@type` a
+        // user-defined type name would get.
         let type_spans: Vec<_> = spans
             .iter()
             .filter(|span| SAMPLE_RUST[span.start..span.end] == *"i32")
@@ -1222,25 +1390,27 @@ mod tests {
         assert!(!type_spans.is_empty());
         assert!(type_spans
             .iter()
-            .all(|span| span.kind == HighlightKind::Type));
+            .all(|span| span.kind == HighlightKind::TypeBuiltin));
     }
 
     #[test]
-    fn a_doc_comment_is_classified_as_comment() {
+    fn a_doc_comment_is_classified_as_comment_doc() {
         let spans = highlight_rust(SAMPLE_RUST);
         // The `line_comment` node's byte range includes its trailing newline; it's treated as
         // one span rather than recursed into, since its children are just lexical pieces, not
-        // separately-colourable syntax.
+        // separately-colourable syntax. `///` is a real `(doc_comment)` child node, captured
+        // `@comment.documentation` - its own dedicated bucket since GitHub issue #31, not the
+        // plain `Comment` an ordinary `//` line gets.
         let span = find_span(&spans, SAMPLE_RUST, "/// Adds one.\n").expect("doc comment span");
-        assert_eq!(span.kind, HighlightKind::Comment);
+        assert_eq!(span.kind, HighlightKind::CommentDoc);
     }
 
     #[test]
-    fn self_is_classified_as_literal_not_keyword() {
+    fn self_is_classified_as_variable_builtin_not_keyword() {
         let source = "impl Foo {\n    fn bar(&self) -> i32 {\n        self.value\n    }\n}\n";
         let spans = highlight_rust(source);
         let span = find_span(&spans, source, "self").expect("self span");
-        assert_eq!(span.kind, HighlightKind::Literal);
+        assert_eq!(span.kind, HighlightKind::VariableBuiltin);
     }
 
     #[test]
@@ -1265,10 +1435,10 @@ mod tests {
     }
 
     #[test]
-    fn typescript_string_literal_is_classified_as_literal() {
+    fn typescript_string_literal_is_classified_as_string() {
         let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
         let span = find_span(&spans, SAMPLE_TYPESCRIPT, "\"x\"").expect("string literal span");
-        assert_eq!(span.kind, HighlightKind::Literal);
+        assert_eq!(span.kind, HighlightKind::String);
     }
 
     #[test]
@@ -1279,8 +1449,9 @@ mod tests {
     }
 
     #[test]
-    fn typescript_predefined_type_is_classified_as_type() {
+    fn typescript_predefined_type_is_classified_as_type_builtin() {
         let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
+        // `number` is a real `(predefined_type)` node, captured `@type.builtin`.
         let type_spans: Vec<_> = spans
             .iter()
             .filter(|span| SAMPLE_TYPESCRIPT[span.start..span.end] == *"number")
@@ -1288,7 +1459,7 @@ mod tests {
         assert!(!type_spans.is_empty());
         assert!(type_spans
             .iter()
-            .all(|span| span.kind == HighlightKind::Type));
+            .all(|span| span.kind == HighlightKind::TypeBuiltin));
     }
 
     #[test]
@@ -1303,7 +1474,11 @@ mod tests {
     /// `name` field collides with `function_declaration`'s `name` field in
     /// `tree-sitter-typescript`'s real grammar, and the old, parent-kind-unaware matching
     /// misclassified every `const`/`let`/`var` binding's name as a Function. `s` here must be
-    /// plain `Text` (a use/declaration of a variable, not a function).
+    /// classified `Variable` (a use/declaration of a variable, not a function) - previously
+    /// asserted as plain `Text`, back when `"variable"` wasn't yet a registered highlight name at
+    /// all (GitHub issue #31 registered it); `theme::syntax::VARIABLE` is still a real, direct
+    /// alias of `theme::syntax::TEXT` (see that module's docs), so this is a classification-only
+    /// change with no visual difference.
     #[test]
     fn typescript_const_variable_name_is_not_misclassified_as_a_function() {
         // The audit's exact reproduction. `find_span`'s plain substring search would otherwise
@@ -1318,29 +1493,37 @@ mod tests {
             .map_or(HighlightKind::Text, |span| span.kind);
         assert_eq!(
             kind,
-            HighlightKind::Text,
+            HighlightKind::Variable,
             "a const/let/var binding's own name must never be classified as a function"
         );
     }
 
     /// The same real collision, for an `interface` member name (`property_signature`'s `name`
-    /// field) - must not be classified as a function either.
+    /// field) - must not be classified as a function either. Classified `Property` (a real,
+    /// registered bucket since GitHub issue #31 - `tree-sitter-javascript`'s own
+    /// `(property_identifier) @property` rule is unconditional), not plain `Text` as before that
+    /// scope existed.
     #[test]
     fn typescript_interface_member_name_is_not_misclassified_as_a_function() {
         let source = "interface Point { x: number }\n";
         let spans = highlight_typescript(source, false);
-        assert_eq!(kind_at(&spans, source, "x: number"), HighlightKind::Text);
+        assert_eq!(
+            kind_at(&spans, source, "x: number"),
+            HighlightKind::Property
+        );
     }
 
     /// The same real collision, for a class method's own name (`method_definition`'s `name`
     /// field, a `property_identifier`) - this one, unlike the two above, genuinely *should* be
     /// classified as a function.
     #[test]
-    fn typescript_class_method_name_is_classified_as_a_function() {
+    fn typescript_class_method_name_is_classified_as_a_function_method() {
         let source = "class Point {\n    length() {\n        return 0;\n    }\n}\n";
         let spans = highlight_typescript(source, false);
         let span = find_span(&spans, source, "length").expect("method name span");
-        assert_eq!(span.kind, HighlightKind::Function);
+        // `(method_definition name: (property_identifier) @function.method)` - its own
+        // dedicated bucket since GitHub issue #31 (previously folded into plain `Function`).
+        assert_eq!(span.kind, HighlightKind::FunctionMethod);
     }
 
     /// The same real collision, for a real function call's callee (`call_expression`'s
@@ -1360,13 +1543,16 @@ mod tests {
     }
 
     /// A real TSX tag name (`jsx_self_closing_element`'s own `name` field) is the same real
-    /// collision one more time - must not render as a Function either.
+    /// collision one more time - must not render as a Function either. Classified `Tag` (its own
+    /// real, dedicated bucket since GitHub issue #31 - previously folded into `Type`; see
+    /// `theme::syntax::TAG`'s own docs for why the two still render identically).
     #[test]
     fn tsx_tag_name_is_not_misclassified_as_a_function() {
         let source = "const el = <div />;\n";
         let spans = highlight_typescript(source, true);
         let span = find_span(&spans, source, "div").expect("tag name span");
         assert_ne!(span.kind, HighlightKind::Function);
+        assert_eq!(span.kind, HighlightKind::Tag);
     }
 
     #[test]
@@ -1390,10 +1576,10 @@ mod tests {
     }
 
     #[test]
-    fn python_string_literal_is_classified_as_literal() {
+    fn python_string_literal_is_classified_as_string() {
         let spans = highlight_python(SAMPLE_PYTHON);
         let span = find_span(&spans, SAMPLE_PYTHON, "\"x\"").expect("string literal span");
-        assert_eq!(span.kind, HighlightKind::Literal);
+        assert_eq!(span.kind, HighlightKind::String);
     }
 
     #[test]
@@ -1424,13 +1610,13 @@ mod tests {
         assert_eq!(span.kind, HighlightKind::Comment);
     }
 
-    /// Matches Rust's own `self_is_classified_as_literal_not_keyword` test - a deliberate,
-    /// documented choice that Python's `self` gets the same Literal treatment Rust's does. Rust
-    /// gets it from its grammar's own `(self) @variable.builtin` rule; Python's grammar has no
-    /// rule for `self` at all, so it comes from [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]'s second rule -
-    /// see there.
+    /// Matches Rust's own `self_is_classified_as_variable_builtin_not_keyword` test - a
+    /// deliberate, documented choice that Python's `self` gets the same `VariableBuiltin`
+    /// treatment Rust's does. Rust gets it from its grammar's own `(self) @variable.builtin` rule;
+    /// Python's grammar has no rule for `self` at all, so it comes from
+    /// [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]'s second rule - see there.
     #[test]
-    fn python_self_is_classified_as_literal_not_a_plain_identifier() {
+    fn python_self_is_classified_as_variable_builtin_not_a_plain_identifier() {
         let source = "class Foo:\n    def bar(self):\n        return self.value\n";
         let spans = highlight_python(source);
         let self_spans: Vec<_> = spans
@@ -1440,7 +1626,7 @@ mod tests {
         assert!(!self_spans.is_empty());
         assert!(self_spans
             .iter()
-            .all(|span| span.kind == HighlightKind::Literal));
+            .all(|span| span.kind == HighlightKind::VariableBuiltin));
     }
 
     /// The real, live-verified regression this fix addresses: `class_definition`'s own `name`
@@ -1537,8 +1723,8 @@ mod tests {
 
     /// [`HIGHLIGHT_NAMES`] and [`HIGHLIGHT_KINDS`] are a positional parallel array pair, and the
     /// whole classification mapping is wrong-but-compiling if they ever drift. The array length is
-    /// already tied together at compile time; this pins the *content* of the two mappings whose
-    /// index positions are easiest to get silently wrong.
+    /// already tied together at compile time; this pins the *content* of every real mapping -
+    /// GitHub issue #31's full extended scope list, not just the original six-bucket handful.
     #[test]
     fn recognized_highlight_names_map_to_the_intended_buckets() {
         let bucket = |name: &str| {
@@ -1550,21 +1736,60 @@ mod tests {
         };
         assert_eq!(bucket("keyword"), HighlightKind::Keyword);
         assert_eq!(bucket("function"), HighlightKind::Function);
+        assert_eq!(bucket("function.method"), HighlightKind::FunctionMethod);
+        assert_eq!(bucket("type"), HighlightKind::Type);
+        assert_eq!(bucket("type.builtin"), HighlightKind::TypeBuiltin);
+        assert_eq!(bucket("constant"), HighlightKind::Constant);
+        assert_eq!(bucket("constant.builtin"), HighlightKind::ConstantBuiltin);
+        assert_eq!(bucket("string"), HighlightKind::String);
+        assert_eq!(bucket("number"), HighlightKind::Number);
         assert_eq!(bucket("comment"), HighlightKind::Comment);
-        // The three non-obvious ones, each argued for in `HIGHLIGHT_KINDS`' own docs.
+        assert_eq!(bucket("variable"), HighlightKind::Variable);
+        assert_eq!(
+            bucket("variable.parameter"),
+            HighlightKind::VariableParameter
+        );
+        assert_eq!(bucket("property"), HighlightKind::Property);
+        assert_eq!(bucket("operator"), HighlightKind::Operator);
+        assert_eq!(
+            bucket("punctuation.bracket"),
+            HighlightKind::PunctuationBracket
+        );
+        assert_eq!(
+            bucket("punctuation.delimiter"),
+            HighlightKind::PunctuationDelimiter
+        );
+        assert_eq!(bucket("attribute"), HighlightKind::Attribute);
+        assert_eq!(bucket("embedded"), HighlightKind::Embedded);
+        // The real capture names verified directly against the grammars' own bundled query files
+        // (`escape`, `comment.documentation`), plus their checklist-name synonyms
+        // (`string.escape`, `comment.doc`) that no grammar here actually emits today - both sides
+        // of each pair resolve to the same bucket.
+        assert_eq!(bucket("escape"), HighlightKind::StringEscape);
+        assert_eq!(bucket("string.escape"), HighlightKind::StringEscape);
+        assert_eq!(bucket("comment.documentation"), HighlightKind::CommentDoc);
+        assert_eq!(bucket("comment.doc"), HighlightKind::CommentDoc);
+        // The non-obvious ones, each argued for in `HIGHLIGHT_KINDS`' own docs.
         assert_eq!(bucket("constructor"), HighlightKind::Type);
-        assert_eq!(bucket("tag"), HighlightKind::Type);
-        assert_eq!(bucket("variable.builtin"), HighlightKind::Literal);
+        assert_eq!(bucket("tag"), HighlightKind::Tag);
+        assert_eq!(bucket("variable.builtin"), HighlightKind::VariableBuiltin);
     }
 
     /// Real gains the replaced implementation genuinely did not have. Its own docs called the
     /// method-call gap "an intentionally narrow, documented gap" it did not cover; the real
-    /// grammar queries do.
+    /// grammar queries do. `clone` is a real `@function.method` capture (its own dedicated bucket
+    /// since GitHub issue #31 registered `"function.method"` as more specific than the plain
+    /// `"function"` it used to fall back to); `println!` is a macro invocation, `@function.macro`,
+    /// which this module deliberately leaves unregistered (see [`HIGHLIGHT_NAMES`]'s own docs) so
+    /// it still falls back to the plain `Function` bucket.
     #[test]
     fn rust_method_calls_and_macros_are_now_classified_as_functions() {
         let source = "fn main() {\n    let x = value.clone();\n    println!(\"{x}\");\n}\n";
         let spans = highlight_rust(source);
-        assert_eq!(kind_at(&spans, source, "clone"), HighlightKind::Function);
+        assert_eq!(
+            kind_at(&spans, source, "clone"),
+            HighlightKind::FunctionMethod
+        );
         assert_eq!(kind_at(&spans, source, "println"), HighlightKind::Function);
     }
 
@@ -1579,36 +1804,41 @@ mod tests {
         assert_eq!(kind_at(&spans, source, "mut "), HighlightKind::Keyword);
     }
 
-    /// Rust's `self` stays `Literal`, now via the real grammar's own `(self) @variable.builtin`
-    /// rather than the replaced implementation's bespoke node-kind table entry - and TypeScript's
-    /// `this` *joins* it, which is the one deliberate cross-language reclassification in this
-    /// migration (see [`HIGHLIGHT_KINDS`]' docs).
+    /// Rust's `self` stays `VariableBuiltin` (its own dedicated bucket since GitHub issue #31,
+    /// carrying forward the same colour the old, unsplit `Literal` bucket used - see
+    /// `theme::syntax::VARIABLE_BUILTIN`'s own docs), now via the real grammar's own
+    /// `(self) @variable.builtin` rather than the replaced implementation's bespoke node-kind
+    /// table entry - and TypeScript's `this` *joins* it, which is the one deliberate
+    /// cross-language reclassification in the original migration (see [`HIGHLIGHT_KINDS`]' docs).
     #[test]
-    fn self_and_this_share_the_literal_self_bucket_across_languages() {
+    fn self_and_this_share_the_variable_builtin_bucket_across_languages() {
         let rust = "impl T { fn get(&self) -> u8 { self.value } }\n";
         assert_eq!(
             kind_at(&highlight_rust(rust), rust, "self.value"),
-            HighlightKind::Literal
+            HighlightKind::VariableBuiltin
         );
         let python = "class T:\n    def get(self):\n        return self.value\n";
         assert_eq!(
             kind_at(&highlight_python(python), python, "self.value"),
-            HighlightKind::Literal
+            HighlightKind::VariableBuiltin
         );
         let typescript = "class T { get() { return this.value; } }\n";
         assert_eq!(
             kind_at(&highlight_typescript(typescript, false), typescript, "this"),
-            HighlightKind::Literal
+            HighlightKind::VariableBuiltin
         );
     }
 
     /// Python's `and`/`or`/`not`/`in`/`is` live in `tree-sitter-python`'s `@operator` list, not
-    /// its `@keyword` list, and this app has no operator bucket - so without
-    /// [`PYTHON_HIGHLIGHTS_SUPPLEMENT`] they would render as plain text where the replaced
-    /// implementation made them real keywords. Symbolic operators must stay `Text`, which is what
-    /// the replaced implementation did with them and what the design colour table asks for.
+    /// its `@keyword` list - [`PYTHON_HIGHLIGHTS_SUPPLEMENT`] promotes the word operators
+    /// specifically to real keywords (the supplement is appended text, so its rule wins the
+    /// "last matching pattern wins" tie against the base query's own `@operator` capture for the
+    /// same node - see [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]'s own docs). A symbolic operator like `+`
+    /// is left alone, so it keeps its base-query `@operator` capture - now a real, registered
+    /// bucket since GitHub issue #31 (`theme::syntax::OPERATOR` is still a direct alias of
+    /// `theme::syntax::TEXT`, so this is a classification-only change with no visual difference).
     #[test]
-    fn python_word_operators_are_keywords_but_symbolic_ones_stay_text() {
+    fn python_word_operators_are_keywords_but_symbolic_ones_are_the_real_operator_bucket() {
         let source = "if a is not b and c in d or not e:\n    total = a + b\n";
         let spans = highlight_python(source);
         for word in ["is not", "and ", "in ", "or ", "not e"] {
@@ -1618,7 +1848,7 @@ mod tests {
                 "python word operator {word:?}"
             );
         }
-        assert_eq!(kind_at(&spans, source, "+ b"), HighlightKind::Text);
+        assert_eq!(kind_at(&spans, source, "+ b"), HighlightKind::Operator);
     }
 
     /// A compound Python type annotation. `tree-sitter-python`'s own rule only fires for a bare
@@ -1675,17 +1905,22 @@ mod tests {
     fn python_method_calls_match_rust_and_typescript() {
         let source = "value = obj.method()\nother = cls(name)\n";
         let spans = highlight_python(source);
-        assert_eq!(kind_at(&spans, source, "method"), HighlightKind::Function);
+        assert_eq!(
+            kind_at(&spans, source, "method"),
+            HighlightKind::FunctionMethod,
+            "a real `obj.method()` call is a method call, its own dedicated bucket since GitHub \
+             issue #31"
+        );
         assert_eq!(
             kind_at(&spans, source, "cls("),
             HighlightKind::Function,
-            "a real `cls(...)` construction is a call, not the `cls` self-reference"
+            "a real `cls(...)` construction is a plain call, not the `cls` self-reference"
         );
-        // ...while a bare `cls`/`self` reference stays in the literal/self bucket.
+        // ...while a bare `cls`/`self` reference stays in the variable-builtin/self bucket.
         let reference = "def f(cls):\n    return cls\n";
         assert_eq!(
             kind_at(&highlight_python(reference), reference, "cls\n"),
-            HighlightKind::Literal
+            HighlightKind::VariableBuiltin
         );
     }
 
@@ -1699,8 +1934,8 @@ mod tests {
         let spans = highlight_typescript(source, false);
         assert_eq!(kind_at(&spans, source, "// note"), HighlightKind::Comment);
         assert_eq!(kind_at(&spans, source, "async"), HighlightKind::Keyword);
-        assert_eq!(kind_at(&spans, source, "\"/api\""), HighlightKind::Literal);
-        assert_eq!(kind_at(&spans, source, "3"), HighlightKind::Literal);
+        assert_eq!(kind_at(&spans, source, "\"/api\""), HighlightKind::String);
+        assert_eq!(kind_at(&spans, source, "3"), HighlightKind::Number);
         assert_eq!(kind_at(&spans, source, "fetch"), HighlightKind::Function);
     }
 
@@ -1727,31 +1962,43 @@ mod tests {
         );
         assert_eq!(
             kind_at(&spans, source, "void"),
-            HighlightKind::Type,
-            "`void` must classify like every other predefined_type keyword"
+            HighlightKind::TypeBuiltin,
+            "`void` must classify like every other predefined_type keyword - its own dedicated \
+             bucket since GitHub issue #31, not the plain `Type` a user-defined type name gets"
         );
-        // The sibling predefined types it has to stay consistent with.
-        assert_eq!(kind_at(&spans, source, "string"), HighlightKind::Type);
+        // The sibling predefined type it has to stay consistent with.
+        assert_eq!(
+            kind_at(&spans, source, "string"),
+            HighlightKind::TypeBuiltin
+        );
     }
 
     /// Real TSX. The JSX query is only composed in for the TSX grammar (it references node kinds
     /// the plain TypeScript grammar does not have), so this is the only place element-name
     /// classification is exercised at all.
+    ///
+    /// `div` and `Badge` used to both assert `HighlightKind::Type` (a lowercase JSX element name
+    /// arriving via `@tag` was folded into the same bucket as a capitalised one arriving via
+    /// TypeScript's own `@type` heuristic - see `theme::syntax::TAG`'s own docs). GitHub issue #31
+    /// gave `@tag` its own dedicated [`HighlightKind::Tag`] bucket, so the two are now correctly
+    /// told apart at the classification level even though `theme::syntax::TAG` still aliases
+    /// `theme::syntax::TYPE` and so the two still *render* identically.
     #[test]
-    fn tsx_jsx_element_names_are_classified_as_types() {
+    fn tsx_jsx_element_names_are_classified_as_tag_or_type() {
         let source = "const view = <div className=\"row\"><Badge label={name} /></div>;\n";
         let spans = highlight_tsx(source);
         assert_eq!(
             kind_at(&spans, source, "div"),
-            HighlightKind::Type,
+            HighlightKind::Tag,
             "a lowercase JSX element name arrives as @tag"
         );
         assert_eq!(
             kind_at(&spans, source, "Badge"),
             HighlightKind::Type,
-            "a capitalised JSX component name must match the lowercase case"
+            "a capitalised JSX component name doesn't match @tag's own lowercase-only regex, so \
+             it falls through to TypeScript's plain capitalised-identifier @type heuristic instead"
         );
-        assert_eq!(kind_at(&spans, source, "\"row\""), HighlightKind::Literal);
+        assert_eq!(kind_at(&spans, source, "\"row\""), HighlightKind::String);
     }
 
     /// Interpolated code inside a template literal / f-string is now classified as the real code
@@ -1763,17 +2010,19 @@ mod tests {
         let ts_spans = highlight_typescript(typescript, false);
         assert_eq!(
             kind_at(&ts_spans, typescript, "n=$"),
-            HighlightKind::Literal,
+            HighlightKind::String,
             "the literal text of the template string is still a string"
         );
         assert_eq!(
             kind_at(&ts_spans, typescript, "toFixed"),
-            HighlightKind::Function
+            HighlightKind::FunctionMethod,
+            "a real `count.toFixed(...)` call is a method call, its own dedicated bucket since \
+             GitHub issue #31"
         );
 
         let python = "msg = f\"n={value if value else other}\"\n";
         let py_spans = highlight_python(python);
-        assert_eq!(kind_at(&py_spans, python, "n="), HighlightKind::Literal);
+        assert_eq!(kind_at(&py_spans, python, "n="), HighlightKind::String);
         assert_eq!(
             kind_at(&py_spans, python, "if value"),
             HighlightKind::Keyword
@@ -1809,24 +2058,41 @@ mod tests {
         }
     }
 
-    /// Adjacent same-kind spans are coalesced, so a string containing escape sequences renders as
-    /// one continuous `Literal` run rather than several - and, critically, the escape does not
-    /// punch a `Text`-coloured hole through the middle of the string the way an unrecognised
-    /// capture name would.
+    /// Before GitHub issue #31, `string` and `escape` both resolved to the same unsplit `Literal`
+    /// bucket, so adjacent same-kind coalescing made a string containing escape sequences render
+    /// as one continuous run with no visible distinction between the string body and its own
+    /// escapes. That was a deliberate simplification at the time, and issue #31's whole point is
+    /// to stop making it: `string.escape` is one of its checklist scopes by name. This test now
+    /// pins the *opposite* invariant - each escape sequence gets its own real, separately
+    /// classified `StringEscape` span, distinct from the surrounding `String` one - while still
+    /// confirming the historical guarantee that mattered (no byte of the string, escapes
+    /// included, ever falls back to plain `Text`).
     #[test]
-    fn escapes_inside_a_string_stay_one_continuous_literal_run() {
+    fn escapes_inside_a_string_are_their_own_real_string_escape_run() {
         let source = "fn main() { let s = \"a\\nb\\tc\"; }\n";
         let spans = highlight_rust(source);
+
+        let newline_escape = find_span(&spans, source, "\\n").expect("\\n escape span");
+        assert_eq!(newline_escape.kind, HighlightKind::StringEscape);
+        let tab_escape = find_span(&spans, source, "\\t").expect("\\t escape span");
+        assert_eq!(tab_escape.kind, HighlightKind::StringEscape);
+
+        // The surrounding string content (opening quote through `a`, `b` between the two
+        // escapes, `c` through the closing quote) stays real `String` - not `StringEscape`, and
+        // not, critically, a `Text`-coloured hole where the escapes used to invisibly merge it.
         let literal_start = source.find('"').expect("string start");
-        let span = spans
-            .iter()
-            .find(|span| span.start <= literal_start && literal_start < span.end)
-            .expect("string span");
-        assert_eq!(span.kind, HighlightKind::Literal);
-        assert!(
-            span.end >= source.find("c\"").expect("string end") + 2,
-            "the whole string literal, escapes included, must be one Literal run"
-        );
+        let literal_end = source.find("c\"").expect("string end") + 2;
+        for offset in literal_start..literal_end {
+            let kind = spans
+                .iter()
+                .find(|span| span.start <= offset && offset < span.end)
+                .map_or(HighlightKind::Text, |span| span.kind);
+            assert!(
+                kind == HighlightKind::String || kind == HighlightKind::StringEscape,
+                "byte {offset} of the string literal classified as {kind:?}, not String/\
+                 StringEscape"
+            );
+        }
     }
 
     // Coverage for finding 5's fix: `highlighter_for_extension` reads from the real registry,
@@ -2158,10 +2424,10 @@ mod tests {
         let has_string_literal = rendered
             .iter()
             .flat_map(|line| &line.runs)
-            .any(|(text, kind)| text.as_ref() == "\"left\"" && *kind == HighlightKind::Literal);
+            .any(|(text, kind)| text.as_ref() == "\"left\"" && *kind == HighlightKind::String);
         assert!(
             has_string_literal,
-            "the real string literal should be classified as Literal"
+            "the real string literal should be classified as String"
         );
     }
 

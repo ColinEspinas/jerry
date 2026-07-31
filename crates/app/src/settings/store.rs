@@ -19,6 +19,12 @@
 //! field, this one included, is "loaded, saved, and genuinely consumed by real behaviour"; what
 //! this one lacks is a UI surface, not a consumer.
 //!
+//! [`EditorSettings`] (GitHub issue #26) is the same kind of file-only tunable: real, applied
+//! defaults for Tab/Shift+Tab indentation (`crate::code_surface::editing`'s
+//! `handle_editor_indent_action`/`handle_editor_dedent_action` read it as the fallback once no
+//! `.editorconfig` file sets a given property - see `crate::code_surface::indent`'s own docs for
+//! the real resolution order), with no settings-page UI of its own yet.
+//!
 //! ## TOML is the real file; JSON is a read-only alternate view
 //!
 //! The config banner's `TOML | JSON` segment (`crate::settings::widgets::render_config_banner`)
@@ -44,7 +50,13 @@
 //! `crate::terminal::pane::TerminalPane`'s live cells, grid, and pty. `follow_system_text_size`
 //! stays persisted-only - investigated and found to have no real backing signal available (see
 //! `crate::settings::render`'s `toggle_follow_system_text_size` docs for the specific Linux
-//! GPUI APIs checked).
+//! GPUI APIs checked). `caret_style`/`caret_blink` (GitHub issue #27) are both real, applied
+//! inputs too - `crate::code_surface::editing::render_editable_file_view_line` reads
+//! `caret_style` to choose the painted caret shape (line/block/underline) and `caret_blink`
+//! (alongside the real, always-available `gpui::App::reduce_motion` - see
+//! `crate::root::caret_blink`'s module docs for why that, not real OS-level
+//! prefers-reduced-motion detection, is the honest mechanism this GPUI version exposes) gates
+//! whether `crate::root::AdeApp`'s shared blink loop ever starts at all.
 //!
 //! ## Editor zoom is one global, persisted number now (was three overlapping mechanisms)
 //!
@@ -85,6 +97,8 @@ pub struct Settings {
     pub theme: ThemeSettings,
     pub keymap: KeymapSettings,
     pub file_tree: FileTreeSettings,
+    pub blame: BlameSettings,
+    pub editor: EditorSettings,
 }
 
 /// `crate::root::AdeApp::window_controls_style`'s persisted backing - see
@@ -112,6 +126,14 @@ pub struct AppearanceSettings {
     /// display and `code_surface::zoom::clamp_zoom_percent`'s step logic carry over unchanged - only
     /// *where* the number lives (persisted here, globally) changed.
     pub editor_zoom_percent: u16,
+    /// The code editor's real painted caret shape (GitHub issue #27) - see [`CaretStyle`]'s own
+    /// docs for what each variant paints.
+    pub caret_style: CaretStyle,
+    /// Whether the caret blinks while idle (GitHub issue #27's "no blink" setting). `true`
+    /// (blinking) is the default, matching every mainstream editor's own default; `false` keeps
+    /// the caret permanently solid whenever it would otherwise be visible - see
+    /// `crate::root::caret_blink`'s module docs for the real blink mechanism this gates.
+    pub caret_blink: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -122,6 +144,39 @@ impl Default for AppearanceSettings {
             terminal_font_size: 12.5,
             follow_system_text_size: false,
             editor_zoom_percent: EDITOR_ZOOM_PERCENT_DEFAULT,
+            caret_style: CaretStyle::default(),
+            caret_blink: true,
+        }
+    }
+}
+
+/// The code editor's real painted caret shape (GitHub issue #27: "caret width and style
+/// configurable (line / block / underline) in user settings"). Read by
+/// `crate::code_surface::editing::render_editable_file_view_line`, which is the only real
+/// consumer - see that function's own docs for the exact quad each variant paints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CaretStyle {
+    /// A thin vertical bar just before the character at the caret - every mainstream editor's
+    /// own default, and this app's pre-issue-#27 behavior.
+    #[default]
+    #[serde(rename = "line")]
+    Line,
+    /// A filled block the width of the character at the caret (or [`CARET_BLOCK_FALLBACK_WIDTH`]
+    /// at the real end of a line, where there is no character to measure).
+    #[serde(rename = "block")]
+    Block,
+    /// A thin horizontal bar under the character at the caret.
+    #[serde(rename = "underline")]
+    Underline,
+}
+
+impl CaretStyle {
+    /// The Appearance settings page's label for this style.
+    pub fn label(self) -> &'static str {
+        match self {
+            CaretStyle::Line => "Line",
+            CaretStyle::Block => "Block",
+            CaretStyle::Underline => "Underline",
         }
     }
 }
@@ -250,6 +305,32 @@ impl Default for FileTreeSettings {
     }
 }
 
+/// Inline git blame (GitHub issue #29): whether Surface C's File view shows the current line's
+/// author/relative-date/summary, dimmed, at the end of the line - see
+/// `crate::code_surface::blame_view`'s own module docs for the real off-thread/caching mechanism
+/// this gates, and `crate::settings::render`'s General page for the one real, wired toggle row
+/// backing this field (`Self::show_inline`).
+///
+/// There is deliberately no `show_gutter` field here: GitHub issue #29 also asks for a secondary
+/// gutter/full-file blame view, which this phase does not implement (see
+/// `crate::code_surface::blame_view`'s own "Scope" docs) - a persisted setting with no real
+/// feature behind it would be exactly the "looks wired up but isn't" this project's conventions
+/// forbid, so it isn't added until the feature it would gate actually exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BlameSettings {
+    /// Defaults to `true` (issue #29's own suggested default: "inline blame on, full gutter
+    /// off") - most users reviewing code want to see who last touched the current line without
+    /// an extra keystroke; it can be turned off entirely from the General settings page.
+    pub show_inline: bool,
+}
+
+impl Default for BlameSettings {
+    fn default() -> Self {
+        Self { show_inline: true }
+    }
+}
+
 /// 20,000 entries - four times the old hard-coded 5,000 bound, and comfortably more than any
 /// real source tree this app is meant for once dot-directories (`.git`, and with them the vast
 /// majority of a repository's loose files) are already skipped by the walk itself.
@@ -276,6 +357,68 @@ impl FileTreeSettings {
         self.max_entries = self
             .max_entries
             .clamp(FILE_TREE_MAX_ENTRIES_MIN, FILE_TREE_MAX_ENTRIES_MAX);
+    }
+}
+
+/// Surface C's minimap - `crate::code_surface::minimap`'s own real, persisted settings
+/// (GitHub issue #30's `editor.minimap.enabled`). This is one of two genuinely-backed fields on
+/// the `Editor` settings page today (see `crate::settings::state`'s own module docs on why the
+/// rest of that page still stays a placeholder) - `minimap_enabled` toggles
+/// `crate::code_surface::minimap::AdeApp::render_minimap` on/off directly, and
+/// `minimap_scale_percent` is the real multiplier that module's own `panel_width`/`char_width`/
+/// `effective_line_height` apply. `insert_spaces`/`tab_width` are GitHub issue #26's real
+/// Tab/Shift+Tab indentation defaults - see the module docs' "One documented exception" section
+/// for why they have no settings page yet. `tab_width` is both "how many literal spaces one
+/// indent level inserts" (when `insert_spaces`) and "how wide one literal `\t` counts as for
+/// `Shift+Tab`'s own dedent" - `crate::code_surface::indent::indent_settings_for_path` overrides
+/// either field from a real `.editorconfig` file when one applies to the file being edited; these
+/// are only the fallback once no `.editorconfig` sets a given property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorSettings {
+    pub minimap_enabled: bool,
+    pub minimap_scale_percent: u16,
+    pub insert_spaces: bool,
+    pub tab_width: u8,
+}
+
+impl Default for EditorSettings {
+    fn default() -> Self {
+        Self {
+            minimap_enabled: true,
+            minimap_scale_percent: MINIMAP_SCALE_PERCENT_DEFAULT,
+            insert_spaces: true,
+            tab_width: EDITOR_TAB_WIDTH_DEFAULT,
+        }
+    }
+}
+
+/// [`EditorSettings::minimap_scale_percent`]'s real bounds/default/step - the same
+/// percentage-multiplier convention [`EDITOR_ZOOM_PERCENT_MIN`]/`_MAX`/`_DEFAULT`/`_STEP` already
+/// established for [`AppearanceSettings::editor_zoom_percent`].
+pub const MINIMAP_SCALE_PERCENT_MIN: u16 = 50;
+pub const MINIMAP_SCALE_PERCENT_MAX: u16 = 200;
+pub const MINIMAP_SCALE_PERCENT_DEFAULT: u16 = 100;
+pub const MINIMAP_SCALE_PERCENT_STEP: u16 = 25;
+
+/// Bounds for [`EditorSettings::tab_width`] - `1` (a real, if unusual, minimum) through `16`
+/// (comfortably more than any real project's own configured indent width), matching
+/// [`AppearanceSettings::sanitize`]'s own "hand-edited file gets clamped, not rejected" discipline.
+pub const EDITOR_TAB_WIDTH_MIN: u8 = 1;
+pub const EDITOR_TAB_WIDTH_MAX: u8 = 16;
+pub const EDITOR_TAB_WIDTH_DEFAULT: u8 = 4;
+
+impl EditorSettings {
+    /// Clamps a hand-edited `minimap_scale_percent`/`tab_width` into their documented ranges -
+    /// the same [`AppearanceSettings::sanitize`] discipline applied here, called once at load
+    /// time (see [`Settings::load_or_init_at`]).
+    pub fn sanitize(&mut self) {
+        self.minimap_scale_percent = self
+            .minimap_scale_percent
+            .clamp(MINIMAP_SCALE_PERCENT_MIN, MINIMAP_SCALE_PERCENT_MAX);
+        self.tab_width = self
+            .tab_width
+            .clamp(EDITOR_TAB_WIDTH_MIN, EDITOR_TAB_WIDTH_MAX);
     }
 }
 
@@ -332,13 +475,16 @@ impl Settings {
     /// rather than crashing the app over a hand-edit mistake, logged via `log::warn!`. If `path`
     /// doesn't exist yet, writes a default file there (via [`Settings::save_at`]) so the config
     /// file exists on first run; a save failure there is also logged rather than propagated. A
-    /// file that does parse still gets [`AppearanceSettings::sanitize`] applied.
+    /// file that does parse still gets every section's own `sanitize` applied
+    /// ([`AppearanceSettings::sanitize`], [`FileTreeSettings::sanitize`],
+    /// [`EditorSettings::sanitize`]).
     pub fn load_or_init_at(path: &Path) -> Settings {
         match std::fs::read_to_string(path) {
             Ok(contents) => match toml::from_str::<Settings>(&contents) {
                 Ok(mut settings) => {
                     settings.appearance.sanitize();
                     settings.file_tree.sanitize();
+                    settings.editor.sanitize();
                     settings
                 }
                 Err(err) => {
@@ -393,7 +539,7 @@ impl Settings {
     }
 }
 
-/// Which settings page a [`snippet_lines`]/[`config_keys_line`] call is for - only the three
+/// Which settings page a [`snippet_lines`]/[`config_keys_line`] call is for - only the four
 /// pages `crate::settings::render` shows a config banner/snippet block on. Every other page
 /// `Jerry.dc.html`'s own `cfgKeys` fixture lists isn't backed by a [`Settings`] field, so a
 /// banner for it would describe a file section that doesn't exist.
@@ -402,6 +548,7 @@ pub enum ConfigPage {
     General,
     Appearance,
     Theme,
+    Editor,
 }
 
 /// The config banner's dot-joined key list for `page` - rewritten from `Jerry.dc.html`'s own
@@ -413,11 +560,13 @@ pub fn config_keys_line(page: ConfigPage) -> &'static str {
         ConfigPage::Appearance => {
             "appearance.interface_scale_percent \u{b7} appearance.editor_font_size \u{b7} \
              appearance.terminal_font_size \u{b7} appearance.follow_system_text_size \u{b7} \
-             appearance.editor_zoom_percent"
+             appearance.editor_zoom_percent \u{b7} appearance.caret_style \u{b7} \
+             appearance.caret_blink"
         }
         ConfigPage::Theme => {
             "theme.name \u{b7} theme.follow_system \u{b7} theme.high_contrast_diff"
         }
+        ConfigPage::Editor => "editor.minimap_enabled \u{b7} editor.minimap_scale_percent",
     }
 }
 
@@ -455,6 +604,11 @@ struct ThemeSnippetDoc<'a> {
     theme: &'a ThemeSettings,
 }
 
+#[derive(Serialize)]
+struct EditorSnippetDoc<'a> {
+    editor: &'a EditorSettings,
+}
+
 /// Renders `page`'s slice of `settings` (the currently-loaded struct, never mockup fixture text)
 /// as TOML or JSON via the same serializers [`Settings::save_at`]/[`Settings::to_json_string`]
 /// use, so this can't drift from what the file (or its JSON preview) actually contains. Each
@@ -488,6 +642,14 @@ pub fn snippet_lines(settings: &Settings, page: ConfigPage, format: CfgFormat) -
         .unwrap_or_default(),
         (ConfigPage::Theme, CfgFormat::Json) => serde_json::to_string_pretty(&ThemeSnippetDoc {
             theme: &settings.theme,
+        })
+        .unwrap_or_default(),
+        (ConfigPage::Editor, CfgFormat::Toml) => toml::to_string_pretty(&EditorSnippetDoc {
+            editor: &settings.editor,
+        })
+        .unwrap_or_default(),
+        (ConfigPage::Editor, CfgFormat::Json) => serde_json::to_string_pretty(&EditorSnippetDoc {
+            editor: &settings.editor,
         })
         .unwrap_or_default(),
     };
@@ -533,6 +695,40 @@ mod tests {
             settings.file_tree.max_entries,
             FILE_TREE_MAX_ENTRIES_DEFAULT
         );
+        assert!(
+            settings.editor.minimap_enabled,
+            "the minimap is on by default"
+        );
+        assert_eq!(
+            settings.editor.minimap_scale_percent,
+            MINIMAP_SCALE_PERCENT_DEFAULT
+        );
+        assert!(settings.editor.insert_spaces);
+        assert_eq!(settings.editor.tab_width, EDITOR_TAB_WIDTH_DEFAULT);
+    }
+
+    #[test]
+    fn a_hand_edited_editor_tab_width_round_trips_and_an_absurd_one_is_clamped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[editor]\ninsert_spaces = false\ntab_width = 2\n").expect("write");
+        let loaded = Settings::load_or_init_at(&path);
+        assert!(!loaded.editor.insert_spaces);
+        assert_eq!(loaded.editor.tab_width, 2);
+
+        std::fs::write(&path, "[editor]\ntab_width = 200\n").expect("write");
+        assert_eq!(
+            Settings::load_or_init_at(&path).editor.tab_width,
+            EDITOR_TAB_WIDTH_MAX,
+            "an absurd tab width is clamped down, not honoured"
+        );
+
+        std::fs::write(&path, "[editor]\ntab_width = 0\n").expect("write");
+        assert_eq!(
+            Settings::load_or_init_at(&path).editor.tab_width,
+            EDITOR_TAB_WIDTH_MIN,
+            "a zero tab width is clamped up, not honoured"
+        );
     }
 
     #[test]
@@ -557,6 +753,66 @@ mod tests {
             Settings::load_or_init_at(&path).file_tree.max_entries,
             FILE_TREE_MAX_ENTRIES_MIN,
             "a cap too small to render a usable tree is clamped up, not honoured"
+        );
+    }
+
+    #[test]
+    fn a_hand_edited_minimap_scale_round_trips_and_an_out_of_range_one_is_clamped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "[editor]\nminimap_enabled = false\nminimap_scale_percent = 150\n",
+        )
+        .expect("write");
+        let loaded = Settings::load_or_init_at(&path);
+        assert!(!loaded.editor.minimap_enabled);
+        assert_eq!(loaded.editor.minimap_scale_percent, 150);
+
+        std::fs::write(
+            &path,
+            "[editor]\nminimap_enabled = true\nminimap_scale_percent = 9000\n",
+        )
+        .expect("write");
+        assert_eq!(
+            Settings::load_or_init_at(&path)
+                .editor
+                .minimap_scale_percent,
+            MINIMAP_SCALE_PERCENT_MAX,
+            "an absurdly large scale is clamped down, not honoured"
+        );
+
+        std::fs::write(
+            &path,
+            "[editor]\nminimap_enabled = true\nminimap_scale_percent = 1\n",
+        )
+        .expect("write");
+        assert_eq!(
+            Settings::load_or_init_at(&path)
+                .editor
+                .minimap_scale_percent,
+            MINIMAP_SCALE_PERCENT_MIN,
+            "an absurdly small scale is clamped up, not honoured"
+        );
+    }
+
+    /// An old `settings.toml` written before the minimap existed has no `[editor]` section at
+    /// all - `#[serde(default)]` must fall back to the real defaults (minimap on) rather than
+    /// failing the whole parse, the same real fallback
+    /// `an_old_settings_toml_missing_the_keymap_section_entirely_still_loads_cleanly` already
+    /// proves for `[keymap]`.
+    #[test]
+    fn an_old_settings_toml_missing_the_editor_section_entirely_still_loads_cleanly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[window]\ncontrols = \"system\"\n").expect("write old file");
+
+        let loaded = Settings::load_or_init_at(&path);
+
+        assert!(loaded.editor.minimap_enabled);
+        assert_eq!(
+            loaded.editor.minimap_scale_percent,
+            MINIMAP_SCALE_PERCENT_DEFAULT
         );
     }
 
@@ -742,6 +998,8 @@ mod tests {
             terminal_font_size: 13.5,
             follow_system_text_size: true,
             editor_zoom_percent: 130,
+            caret_style: CaretStyle::Block,
+            caret_blink: false,
         };
         let before = appearance.clone();
 

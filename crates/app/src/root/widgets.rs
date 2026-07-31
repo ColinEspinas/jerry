@@ -244,3 +244,29 @@ pub(crate) fn text_tooltip(
     let text = text.into();
     move |_window, cx| cx.new(|_| TextTooltip { text: text.clone() }).into()
 }
+
+impl AdeApp {
+    /// A themed, blinking 1.5×14 caret bar for a simple single-line pseudo-input - a query/
+    /// filter field backed by a plain, append/backspace-only `String` (not a real cursor-
+    /// position-aware `EditBuffer`), so it's always a `Line`-style bar at the real end of the
+    /// typed text, never affected by [`settings::store::CaretStyle`] (which only ever describes
+    /// the code editor's own real, mid-string caret - see that type's own docs).
+    ///
+    /// GitHub issue #27's "audit every input/contenteditable in the app for missing carets and
+    /// fix": [`Self::render_rail_filter_row`] and [`Self::render_settings_keymap_filter_row`]
+    /// had *no* caret element at all before this (confirmed by reading both render functions -
+    /// just the typed query or a placeholder, no insertion-point indicator whatsoever). Shared
+    /// here rather than duplicated per call site, and rather than reusing `crate::palette::
+    /// render::AdeApp::render_palette_caret` verbatim: that one is deliberately a two-position
+    /// (`margin_right`/`margin_left`) variant for its own empty-vs-typed placeholder placement
+    /// (see its own docs) that these simpler, always-after-the-text fields don't need.
+    /// Blinks via the same shared [`crate::root::caret_blink`] loop the code editor/palette/tree
+    /// rename field use - see that module's own docs for the whole mechanism.
+    pub(crate) fn render_simple_input_caret(&self) -> impl IntoElement {
+        div()
+            .flex_none()
+            .w(px(1.5))
+            .h(px(14.0))
+            .when(self.caret_blink_visible, |el| el.bg(theme::term::CURSOR))
+    }
+}

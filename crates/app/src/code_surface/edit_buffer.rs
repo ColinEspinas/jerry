@@ -42,6 +42,93 @@
 //! tab or switching worktree drops the buffer and its history with it - explicitly out of scope per
 //! GitHub issue #17's own checklist.
 //!
+//! ### Multi-cursor edits are one real undo step (issue #28, landing on top of issue #17)
+//!
+//! `crate::text_history`'s own docs call this out as a design goal it was built to accommodate: an
+//! [`text_history::EditGroup`] holds a `Vec<TextEdit>`, not a single edit, specifically so that N
+//! simultaneous multi-cursor splices recorded into one group become one undo step. [`Self::
+//! apply_at_every_cursor`] does exactly that - it calls [`TextHistory::record`] once per cursor's
+//! own splice, chaining each call's `before` snapshot to the previous call's `after` so the
+//! coalescing policy's own caret-continuity rule (`before == top.after`) merges every one of them
+//! into a single group rather than starting a fresh one per cursor. The group's *stored*
+//! `before`/`after` (what undo/redo actually restore) are the chain's real first/last values, not
+//! synthetic ones - see that method's own docs for exactly which cursor's snapshot each is.
+//!
+//! **A real, documented limitation, not a fabricated "it just works"**: [`text_history::
+//! SelectionSnapshot`] - shared with every other real text widget in this app
+//! (`crate::text_history::TextField`) - holds exactly one caret/selection, mirroring this buffer's
+//! own primary [`Self::selected_range`]/[`Self::selection_reversed`] pair. It has no way to
+//! represent [`Self::secondary_cursors`]. So undoing/redoing a multi-cursor edit correctly restores
+//! **all of the text** as one atomic step (every cursor's own edit reverses/replays together,
+//! genuinely one Ctrl+Z), but only restores the **primary** cursor's own caret/selection
+//! precisely; every secondary cursor from that edit is not reconstructed by undo/redo, and the
+//! buffer is left in ordinary single-cursor state afterward. Extending `SelectionSnapshot` to a real
+//! multi-cursor shape would touch every one of `crate::text_history`'s own consumers (`rail`,
+//! `palette`, `settings`, `root::new_file`), not just this buffer - real, separate, cross-cutting
+//! work outside this one sub-issue's scope, left as a documented gap rather than guessed at.
+//!
+//! ## Multi-cursor: `Self::secondary_cursors`
+//!
+//! [`Self::selected_range`]/[`Self::selection_reversed`] remain the *primary* cursor exactly as
+//! before this revision (Revision R13, issue #28) - every existing single-cursor method
+//! (`Self::move_left`, `Self::replace_range`, etc.) keeps its exact prior behavior, unchanged,
+//! whenever [`Self::secondary_cursors`] is empty (the default, and the only state a freshly
+//! constructed buffer or a plain click ever leaves it in). [`Self::secondary_cursors`] holds every
+//! *additional* real cursor/selection - VS Code-style `Ctrl+D` ("Add Selection To Next Find
+//! Match"), `Ctrl+Shift+L` ("Select All Occurrences"), and Alt+click all populate it (see
+//! [`Self::select_word_or_add_next_occurrence`], [`Self::select_all_occurrences`],
+//! [`Self::add_cursor_at`]).
+//!
+//! The design choice made here: rather than replacing `selected_range`/`selection_reversed` with a
+//! `Vec<Selection>` everywhere (which would have meant rewriting every one of this file's own
+//! already-correct, already-tested single-cursor methods, and every call site across
+//! `crate::code_surface::editing`'s ~2900 lines, to index into a vector instead of reading a plain
+//! field), the primary cursor keeps its own plain fields and every multi-cursor operation is
+//! layered on top as a genuinely new, additive code path:
+//!
+//! - **Simultaneous edits** ([`Self::replace_range`]/[`Self::backspace`]/[`Self::delete_forward`],
+//!   used by every keystroke, paste, and IME commit - `crate::code_surface::editing`'s
+//!   `EntityInputHandler` impl and `Editor*` action handlers already funnel through these three,
+//!   unchanged): each one now checks `Self::secondary_cursors` first and, if non-empty, routes
+//!   through [`Self::apply_at_every_cursor`] instead of its own prior single-range body - one
+//!   atomic multi-cursor edit, not N independent ones (see that method's own docs for the real
+//!   right-to-left splice ordering this relies on for correctness).
+//! - **Cursor movement** (`Self::move_left`/`Self::move_right`/.../`Self::select_down`, driving
+//!   every arrow-key `Editor*` action): each now routes through [`Self::move_every_cursor`] when
+//!   multiple cursors are active, so an arrow key moves *every* real cursor together instead of
+//!   silently stranding every secondary wherever `Ctrl+D` left it - see that method's own docs for
+//!   the one honest, narrow scope cut (no independent per-cursor sticky goal-column) this makes.
+//! - **Collision merging** ([`Self::merge_colliding_cursors`]): called at the end of every
+//!   operation above that could produce two overlapping/identical cursors (an edit, a movement, or
+//!   adding a new cursor) - VS Code's own "cursors merge when they collide" behavior, not a manual
+//!   step the caller has to remember.
+//! - **A plain, unmodified click always collapses back to one cursor**: [`Self::move_to`]/
+//!   [`Self::select_to`] (the real target of every ordinary/shift-click, and the same primitives
+//!   every single-cursor keyboard method already funneled through) now clear
+//!   [`Self::secondary_cursors`] as their first step - matching every real multi-cursor editor's
+//!   own "clicking without a modifier always means one cursor" rule. `Esc`
+//!   ([`Self::collapse_to_single_cursor`]) does the same thing as an explicit action.
+//!
+//! **A documented, honest gap**: `EditBuffer::replace_and_mark_range` (real IME composition) and
+//! any *explicit*-range call to `Self::replace_range` (e.g. a completion's own text-edit
+//! application) do **not** route through the multi-cursor path even while
+//! `Self::secondary_cursors` is non-empty - composing text or accepting a completion while
+//! multiple cursors are active only ever affects the primary, leaving every secondary cursor's own
+//! position stale relative to the resulting edit. A real, narrow edge case (composing CJK/accented
+//! input, or accepting an LSP completion, while mid multi-cursor selection is rare in practice),
+//! left undone rather than guessed at, per this phase's own priority: a correct core model plus
+//! `Ctrl+D`/simultaneous typing-deleting-pasting, not every possible interaction of every existing
+//! subsystem with a genuinely new one.
+//!
+//! **Also left undone, both flagged in issue #28 itself as more peripheral than the above**:
+//! Alt+Shift+drag column selection (this editor has no mouse-drag-to-select of *any* kind yet -
+//! only click and shift-click, so a column-selection variant of a feature that doesn't exist yet
+//! is out of reach without first building ordinary drag-select, itself a separate, real piece of
+//! work), and `Ctrl+K Ctrl+D`'s own "skip" is implemented ([`Self::skip_current_occurrence`]) but
+//! deliberately does not attempt to also support skipping a cursor other than the most-recently-
+//! added one (matching VS Code's own real behavior, which also only ever acts on the most recent
+//! selection).
+//!
 //! ## Diff/Merge views stay 100% read-only
 //!
 //! Only the File view gets real editing this phase. `crate::code_surface::
@@ -95,8 +182,34 @@ use std::time::{Instant, SystemTime};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::code_surface::code_view;
+use crate::code_surface::indent;
 use crate::language::HighlighterFn;
 use crate::text_history::{self, EditKind, SelectionSnapshot, TextEdit, TextHistory};
+
+/// A character's real class for word-wise caret movement/selection (GitHub issue #27) - see
+/// [`EditBuffer::previous_word_boundary`]'s own docs for why this app hand-classifies rather
+/// than using `unicode_segmentation`'s UAX #29 word boundaries for this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordClass {
+    Whitespace,
+    /// A letter, digit, or underscore - grouped together so `foo_bar123` is one real word, not
+    /// three.
+    Word,
+    /// Anything else (`.`, `(`, `)`, `-`, ...) - a real code editor's own word-navigation stops
+    /// at these individually from surrounding word text, but groups a *run* of them together
+    /// (`()` is one hop, not two), matching this app's own real test coverage.
+    Punctuation,
+}
+
+fn word_class(ch: char) -> WordClass {
+    if ch.is_whitespace() {
+        WordClass::Whitespace
+    } else if ch.is_alphanumeric() || ch == '_' {
+        WordClass::Word
+    } else {
+        WordClass::Punctuation
+    }
+}
 
 /// One open file's real, live-edited text plus real cursor/selection/IME-composition state - see
 /// this module's own docs. `selected_range`/`marked_range` are byte offsets into [`Self::content`]
@@ -178,6 +291,25 @@ pub struct EditBuffer {
     /// `true` only while [`Self::undo`]/[`Self::redo`] is replaying a group, so the splices they
     /// perform aren't recorded as fresh edits - see this module's own docs.
     replaying: bool,
+    /// Every real cursor *beyond* the primary (`Self::selected_range`/`Self::selection_reversed`),
+    /// empty in ordinary single-cursor use (the only state a freshly constructed buffer is ever
+    /// in). See this module's own "Multi-cursor" docs for the overall design and every method that
+    /// populates/consumes this.
+    pub secondary_cursors: Vec<SecondaryCursor>,
+}
+
+/// One additional cursor/selection beyond the primary `EditBuffer::selected_range`/
+/// `EditBuffer::selection_reversed` - see `EditBuffer`'s own "Multi-cursor" docs. Never left
+/// overlapping another real cursor (primary or secondary): every mutation that could produce a
+/// collision re-merges through `EditBuffer::merge_colliding_cursors` immediately afterward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecondaryCursor {
+    /// Byte range into `EditBuffer::content` - a caret when empty, a real selection otherwise,
+    /// exactly like the primary's own `EditBuffer::selected_range`.
+    pub range: Range<usize>,
+    /// Mirrors `EditBuffer::selection_reversed` for this one cursor - which end is "active" while
+    /// a future shift-extend or occurrence-search reads it.
+    pub reversed: bool,
 }
 
 impl EditBuffer {
@@ -244,6 +376,7 @@ impl EditBuffer {
             goal_column: None,
             history: TextHistory::new(),
             replaying: false,
+            secondary_cursors: Vec::new(),
         }
     }
 
@@ -527,7 +660,15 @@ impl EditBuffer {
     /// `End`/a plain click. Does **not** touch [`Self::goal_column`]; callers that mean this as a
     /// horizontal move clear it themselves (vertical moves deliberately preserve it across a
     /// consecutive run - see [`Self::move_up`]/[`Self::move_down`]).
+    ///
+    /// Also clears [`Self::secondary_cursors`] - see this module's own "Multi-cursor" docs for why
+    /// an ordinary, unmodified move/click always collapses back to a single real cursor. Every
+    /// per-cursor call this method receives from [`Self::move_every_cursor`]'s own internal loop
+    /// (the mechanism that moves every real cursor together for a plain arrow key) always finds
+    /// this already empty by construction at that point (see that method's own docs), so this is
+    /// never a lossy no-op there.
     pub fn move_to(&mut self, offset: usize) {
+        self.secondary_cursors.clear();
         let offset = self.floor_char_boundary(offset.min(self.content.len()));
         self.selected_range = offset..offset;
         self.selection_reversed = false;
@@ -536,7 +677,11 @@ impl EditBuffer {
     /// Extends the selection to `offset` from whichever end is currently anchored, flipping
     /// [`Self::selection_reversed`] if the selection crosses over itself - ported from
     /// `vendor/zed/crates/gpui/examples/input.rs`'s own `TextInput::select_to`.
+    ///
+    /// Also clears [`Self::secondary_cursors`] - see [`Self::move_to`]'s own docs for why, and for
+    /// why this is never lossy when called from within [`Self::move_every_cursor`]'s own loop.
     pub fn select_to(&mut self, offset: usize) {
+        self.secondary_cursors.clear();
         let offset = self.floor_char_boundary(offset.min(self.content.len()));
         if self.selection_reversed {
             self.selected_range.start = offset;
@@ -699,6 +844,19 @@ impl EditBuffer {
     /// The one real splice path every text-changing action reduces to - see this module's own
     /// top docs.
     pub fn replace_range(&mut self, range: Option<Range<usize>>, new_text: &str) {
+        // Multi-cursor: an *implicit* range (typing/paste/an ordinary Backspace-or-Delete-driven
+        // call that already resolved its own explicit range below instead - see those methods'
+        // own bodies) applies `new_text` at every real cursor at once, not just the primary - see
+        // this module's own "Multi-cursor" docs for why an *explicit* `range` deliberately still
+        // takes the single-cursor path unconditionally (the documented IME/completion gap).
+        if range.is_none() && !self.secondary_cursors.is_empty() {
+            let new_text = new_text.to_string();
+            self.apply_at_every_cursor(
+                EditKind::for_replacement(&new_text),
+                |buffer, cursor_range| (buffer.clamp_range(cursor_range), new_text.clone()),
+            );
+            return;
+        }
         self.replace_range_recording(range, new_text, None, None);
     }
 
@@ -979,6 +1137,12 @@ impl EditBuffer {
         self.selection_reversed = snapshot.reversed;
         self.marked_range = None;
         self.goal_column = None;
+        // Multi-cursor (issue #28): undo/redo only ever restores the primary's own snapshot (see
+        // this module's own "Multi-cursor edits are one real undo step" docs for why) - clearing
+        // every secondary here makes that real, not just documented: the buffer genuinely lands in
+        // ordinary single-cursor state after an undo/redo, never a stale, unrestored secondary
+        // left pointing at text that may no longer mean what it did before the step was undone.
+        self.secondary_cursors.clear();
     }
 
     /// Adopts `new_content` (what a real, external writer - an agent CLI, a formatter, another
@@ -1022,6 +1186,12 @@ impl EditBuffer {
         self.selection_reversed = false;
         self.marked_range = None;
         self.goal_column = None;
+        // Multi-cursor (issue #28): an external rewrite's own byte offsets have no reliable
+        // relationship to whatever a secondary cursor was pointing at before it landed - the same
+        // honest reasoning that already keeps this method from trying to diff-preserve the primary
+        // caret's exact line, just applied to every cursor beyond it. Cleared rather than clamped
+        // into now-possibly-nonsensical positions.
+        self.secondary_cursors.clear();
         self.line_ranges = code_view::line_ranges(&self.content);
         self.utf16_line_starts =
             Self::cumulative_utf16_line_starts(&self.content, &self.line_ranges);
@@ -1061,6 +1231,17 @@ impl EditBuffer {
     /// instead of one real grapheme - wrong every time Backspace was pressed mid-composition, a
     /// real, live-reachable case for any real CJK/composed input session.
     pub fn backspace(&mut self) {
+        if !self.secondary_cursors.is_empty() {
+            self.apply_at_every_cursor(EditKind::Delete, |buffer, cursor_range| {
+                if cursor_range.is_empty() {
+                    let previous = buffer.previous_boundary(cursor_range.start);
+                    (previous..cursor_range.end, String::new())
+                } else {
+                    (cursor_range, String::new())
+                }
+            });
+            return;
+        }
         // Captured *before* the `select_to` below - see `Self::replace_range_recording`'s own docs
         // for why recording the post-`select_to` selection would both restore a selection the user
         // never made and silently defeat backspace coalescing.
@@ -1078,6 +1259,17 @@ impl EditBuffer {
     /// `Delete`: the mirror of [`Self::backspace`] - see its own docs for why the real, just-
     /// computed [`Self::selected_range`] is passed explicitly rather than `None`.
     pub fn delete_forward(&mut self) {
+        if !self.secondary_cursors.is_empty() {
+            self.apply_at_every_cursor(EditKind::Delete, |buffer, cursor_range| {
+                if cursor_range.is_empty() {
+                    let next = buffer.next_boundary(cursor_range.start);
+                    (cursor_range.start..next, String::new())
+                } else {
+                    (cursor_range, String::new())
+                }
+            });
+            return;
+        }
         // See `Self::backspace`'s own docs for why this is captured before `select_to`.
         let before = self.selection_snapshot();
         if self.selected_range.is_empty() {
@@ -1091,8 +1283,13 @@ impl EditBuffer {
     }
 
     /// `Left`: collapses a real selection to its start, or moves the caret one real grapheme
-    /// left. Clears [`Self::goal_column`] (a horizontal move).
+    /// left. Clears [`Self::goal_column`] (a horizontal move). Moves every real cursor together
+    /// when more than one is active - see [`Self::move_every_cursor`]'s own docs.
     pub fn move_left(&mut self) {
+        self.move_every_cursor(Self::move_left_one_cursor);
+    }
+
+    fn move_left_one_cursor(&mut self) {
         self.goal_column = None;
         if self.selected_range.is_empty() {
             let previous = self.previous_boundary(self.cursor_offset());
@@ -1104,6 +1301,10 @@ impl EditBuffer {
 
     /// The mirror of [`Self::move_left`].
     pub fn move_right(&mut self) {
+        self.move_every_cursor(Self::move_right_one_cursor);
+    }
+
+    fn move_right_one_cursor(&mut self) {
         self.goal_column = None;
         if self.selected_range.is_empty() {
             let next = self.next_boundary(self.cursor_offset());
@@ -1113,37 +1314,401 @@ impl EditBuffer {
         }
     }
 
-    /// `Shift+Left`: extends the selection one real grapheme left.
+    /// `Shift+Left`: extends the selection one real grapheme left, at every real cursor at once.
     pub fn select_left(&mut self) {
+        self.move_every_cursor(Self::select_left_one_cursor);
+    }
+
+    fn select_left_one_cursor(&mut self) {
         self.goal_column = None;
         let previous = self.previous_boundary(self.cursor_offset());
         self.select_to(previous);
     }
 
-    /// `Shift+Right`: extends the selection one real grapheme right.
+    /// `Shift+Right`: extends the selection one real grapheme right, at every real cursor at once.
     pub fn select_right(&mut self) {
+        self.move_every_cursor(Self::select_right_one_cursor);
+    }
+
+    fn select_right_one_cursor(&mut self) {
         self.goal_column = None;
         let next = self.next_boundary(self.cursor_offset());
         self.select_to(next);
     }
 
-    /// `Ctrl/Cmd+A`: selects the whole buffer.
+    /// `Ctrl/Cmd+A`: selects the whole buffer - always collapses to exactly one selection
+    /// regardless of how many real cursors were active beforehand (`Self::move_to`/
+    /// `Self::select_to` below already clear [`Self::secondary_cursors`] as their own first step -
+    /// see those methods' own docs - so "select everything" never leaves a stray secondary cursor
+    /// sitting inside the new, whole-buffer selection).
     pub fn select_all(&mut self) {
         self.goal_column = None;
         self.move_to(0);
         self.select_to(self.content.len());
     }
 
-    /// `Home`: moves the caret to the start of its current line.
+    /// `Tab` (GitHub issue #26): with no selection, splices `indent_unit` in at the caret exactly
+    /// like an ordinary keystroke (via [`Self::replace_range`]) - the caret ends up right after
+    /// it, same as typing any other text. With a real selection (single- or multi-line),
+    /// prepends `indent_unit` to the start of every line [`crate::code_surface::indent::
+    /// touched_line_range`] says the selection touches, and re-expands the selection to keep
+    /// covering the same real lines (including the newly-inserted indentation) rather than
+    /// collapsing to a caret - see that function's own docs for the "selection ends at column 0"
+    /// exclusion this shares with [`Self::dedent_lines`].
+    ///
+    /// Returns whether anything real actually changed - `false` only for the pathological empty
+    /// `indent_unit` case (`crate::code_surface::indent::indent_unit` never actually produces
+    /// one, but this stays honest rather than assuming).
+    ///
+    /// ## One atomic undo step, not N (GitHub issue #17 integration)
+    ///
+    /// The multi-line branch below splices every touched line directly via [`Self::splice_lines`]
+    /// (bypassing [`Self::replace_range`]'s own automatic per-call history recording) and records
+    /// the whole run as one [`TextHistory::record_group`] call instead - seven per-line calls to
+    /// `replace_range` would each be recorded as its own [`EditKind::Programmatic`] group (that
+    /// kind's own "never coalesces" rule means they'd never merge back into one), so a single Tab
+    /// press over N lines would need N separate `Ctrl+Z` presses to undo. See that method's own
+    /// docs for why the edits must be collected in exactly this bottom-to-top order for the
+    /// resulting group to replay correctly in both directions.
+    pub fn indent_lines(&mut self, indent_unit: &str) -> bool {
+        if indent_unit.is_empty() {
+            return false;
+        }
+        if self.selected_range.is_empty() {
+            self.replace_range(Some(self.selected_range.clone()), indent_unit);
+            return true;
+        }
+
+        let before = self.selection_snapshot();
+        let sel_start = self.selected_range.start;
+        let sel_end = self.selected_range.end;
+        let reversed = self.selection_reversed;
+        let (first_line, _) = self.line_col_for_offset(sel_start);
+        let (end_line, end_col) = self.line_col_for_offset(sel_end);
+        let touched = indent::touched_line_range(first_line, end_line, end_col);
+
+        // Bottom-to-top: inserting at an earlier line's own start would shift every later line's
+        // byte offsets out from under a not-yet-processed later insertion otherwise. Edits are
+        // pushed in this same bottom-to-top order, matching how they were really applied.
+        let mut edits = Vec::with_capacity(touched.len());
+        for line in touched.clone().rev() {
+            let Some(line_start) = self.line_ranges.get(line).map(|range| range.start) else {
+                continue;
+            };
+            self.splice_lines(line_start..line_start, indent_unit);
+            edits.push(TextEdit {
+                at: line_start,
+                removed: String::new(),
+                inserted: indent_unit.to_string(),
+            });
+        }
+
+        let touched_count = touched.len();
+        let new_start = self
+            .line_ranges
+            .get(first_line)
+            .map(|range| range.start)
+            .unwrap_or(sel_start);
+        let new_end = (sel_end + indent_unit.len() * touched_count).min(self.content.len());
+        self.selected_range = new_start..new_end.max(new_start);
+        self.selection_reversed = reversed;
+        self.marked_range = None;
+        self.goal_column = None;
+        if !self.replaying {
+            let after = self.selection_snapshot();
+            self.history
+                .record_group(edits, before, after, Instant::now());
+        }
+        true
+    }
+
+    /// `Shift+Tab` (GitHub issue #26): the mirror of [`Self::indent_lines`] - removes up to one
+    /// real indent level ([`crate::code_surface::indent::leading_dedent_len`]) from the start of
+    /// every line the (possibly empty/collapsed-caret) selection touches, a genuine no-op for any
+    /// line already at column 0 (or with no real leading whitespace at all). Re-expands the
+    /// selection to keep covering the same real lines, shifted left by however much was actually
+    /// removed *at or before* each end - never past that line's own new start.
+    ///
+    /// Returns whether anything real actually changed (`false` when every touched line had no
+    /// real leading whitespace to remove) - `crate::code_surface::editing`'s caller uses this to
+    /// skip a pointless re-highlight/LSP-sync/scroll-sync for a genuine no-op keystroke.
+    ///
+    /// Records every real per-line removal as one atomic [`TextHistory::record_group`] step - see
+    /// [`Self::indent_lines`]'s own "One atomic undo step, not N" docs for why.
+    pub fn dedent_lines(&mut self, tab_width: u8) -> bool {
+        let before = self.selection_snapshot();
+        let sel_start = self.selected_range.start;
+        let sel_end = self.selected_range.end;
+        let reversed = self.selection_reversed;
+        let (first_line, _) = self.line_col_for_offset(sel_start);
+        let (end_line, end_col) = self.line_col_for_offset(sel_end);
+        let touched = if self.selected_range.is_empty() {
+            first_line..first_line + 1
+        } else {
+            indent::touched_line_range(first_line, end_line, end_col)
+        };
+
+        let removed: Vec<usize> = touched
+            .clone()
+            .map(|line| {
+                let Some(range) = self.line_ranges.get(line) else {
+                    return 0;
+                };
+                let Some(text) = self.content.get(range.clone()) else {
+                    return 0;
+                };
+                indent::leading_dedent_len(text, tab_width)
+            })
+            .collect();
+        if removed.iter().all(|&len| len == 0) {
+            return false;
+        }
+
+        let mut edits = Vec::with_capacity(touched.len());
+        for (offset, line) in touched.clone().enumerate().rev() {
+            let remove = removed[offset];
+            if remove == 0 {
+                continue;
+            }
+            let Some(line_start) = self.line_ranges.get(line).map(|range| range.start) else {
+                continue;
+            };
+            let remove_range = line_start..line_start + remove;
+            let Some(removed_text) = self.content.get(remove_range.clone()) else {
+                continue;
+            };
+            let removed_text = removed_text.to_string();
+            self.splice_lines(remove_range, "");
+            edits.push(TextEdit {
+                at: line_start,
+                removed: removed_text,
+                inserted: String::new(),
+            });
+        }
+
+        let total_removed: usize = removed.iter().sum();
+        let new_start = self
+            .line_ranges
+            .get(first_line)
+            .map(|range| range.start)
+            .unwrap_or(sel_start);
+        let new_end = sel_end.saturating_sub(total_removed).max(new_start);
+        self.selected_range = new_start..new_end;
+        self.selection_reversed = reversed;
+        self.marked_range = None;
+        self.goal_column = None;
+        if !self.replaying {
+            let after = self.selection_snapshot();
+            self.history
+                .record_group(edits, before, after, Instant::now());
+        }
+        true
+    }
+
+    /// Real, line-scoped word boundary just before `offset` (GitHub issue #27:
+    /// "Ctrl+Shift+arrows (word-wise)") - a maximal run of same-[`WordClass`] characters,
+    /// skipping over runs of whitespace rather than stopping on them (the same "scan only the
+    /// current line, not the whole buffer" perf discipline [`Self::previous_boundary`] already
+    /// established - see that method's own docs for the measured cost of a whole-buffer scan on
+    /// a large file). Crossing a line boundary (`offset` already at/before this line's own
+    /// start) lands on the previous line's real end, exactly like [`Self::previous_boundary`].
+    ///
+    /// Deliberately *not* `unicode_segmentation::UnicodeSegmentation::split_word_bound_indices`
+    /// (this buffer's own grapheme-boundary methods' crate, and this method's first real
+    /// implementation): that crate's word boundaries are UAX #29's, designed for natural-language
+    /// prose, where e.g. `WB6`/`WB7` deliberately keep `foo.bar` as *one* unbroken word (a
+    /// mid-word `.`/`'`/`:` between two letters doesn't break, matching "don't"/"e.g." staying
+    /// whole) - real, correct behavior for prose, but wrong for source code, where every real
+    /// code editor's own word-navigation stops at `.` in `foo.bar()` (confirmed by writing the
+    /// real test this docstring sits above against that assumption first - it failed against the
+    /// UAX #29 result, `foo.bar` treated as one hop, not the real, expected two).
+    fn previous_word_boundary(&self, offset: usize) -> usize {
+        let (line, _) = self.line_col_for_offset(offset);
+        let Some(line_range) = self.line_ranges.get(line).cloned() else {
+            return 0;
+        };
+        if offset <= line_range.start {
+            return if line == 0 {
+                0
+            } else {
+                self.line_ranges[line - 1].end
+            };
+        }
+        let local_offset = offset - line_range.start;
+        let text = &self.content[line_range.clone()];
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let mut cursor = chars.iter().rposition(|&(index, _)| index < local_offset);
+        while let Some(pos) = cursor {
+            if word_class(chars[pos].1) == WordClass::Whitespace {
+                cursor = pos.checked_sub(1);
+            } else {
+                break;
+            }
+        }
+        let Some(mut start) = cursor else {
+            return line_range.start;
+        };
+        let class = word_class(chars[start].1);
+        while start > 0 && word_class(chars[start - 1].1) == class {
+            start -= 1;
+        }
+        line_range.start + chars[start].0
+    }
+
+    /// The mirror of [`Self::previous_word_boundary`] - see its own docs for why this is a
+    /// hand-classified scan rather than `unicode_segmentation`'s UAX #29 word boundaries.
+    fn next_word_boundary(&self, offset: usize) -> usize {
+        let (line, _) = self.line_col_for_offset(offset);
+        let Some(line_range) = self.line_ranges.get(line).cloned() else {
+            return self.content.len();
+        };
+        if offset >= line_range.end {
+            return self
+                .line_ranges
+                .get(line + 1)
+                .map(|next| next.start)
+                .unwrap_or(self.content.len());
+        }
+        let local_offset = offset - line_range.start;
+        let text = &self.content[line_range.clone()];
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let mut cursor = chars.iter().position(|&(index, _)| index >= local_offset);
+        while let Some(pos) = cursor {
+            if word_class(chars[pos].1) == WordClass::Whitespace {
+                cursor = (pos + 1 < chars.len()).then_some(pos + 1);
+            } else {
+                break;
+            }
+        }
+        let Some(mut end) = cursor else {
+            return line_range.end;
+        };
+        let class = word_class(chars[end].1);
+        while end + 1 < chars.len() && word_class(chars[end + 1].1) == class {
+            end += 1;
+        }
+        let end_byte = chars
+            .get(end + 1)
+            .map(|&(index, _)| index)
+            .unwrap_or(text.len());
+        line_range.start + end_byte
+    }
+
+    /// `Ctrl+Left`: collapses a real selection to its start, or moves the caret to the start of
+    /// the previous real word.
+    pub fn move_word_left(&mut self) {
+        self.goal_column = None;
+        if self.selected_range.is_empty() {
+            let previous = self.previous_word_boundary(self.cursor_offset());
+            self.move_to(previous);
+        } else {
+            self.move_to(self.selected_range.start);
+        }
+    }
+
+    /// The mirror of [`Self::move_word_left`].
+    pub fn move_word_right(&mut self) {
+        self.goal_column = None;
+        if self.selected_range.is_empty() {
+            let next = self.next_word_boundary(self.cursor_offset());
+            self.move_to(next);
+        } else {
+            self.move_to(self.selected_range.end);
+        }
+    }
+
+    /// `Ctrl+Shift+Left`: extends the selection to the start of the previous real word.
+    pub fn select_word_left(&mut self) {
+        self.goal_column = None;
+        let previous = self.previous_word_boundary(self.cursor_offset());
+        self.select_to(previous);
+    }
+
+    /// `Ctrl+Shift+Right`: extends the selection to the end of the next real word.
+    pub fn select_word_right(&mut self) {
+        self.goal_column = None;
+        let next = self.next_word_boundary(self.cursor_offset());
+        self.select_to(next);
+    }
+
+    /// Double-click word select (GitHub issue #27): selects the maximal real same-[`WordClass`]
+    /// run touching `offset` (see [`Self::previous_word_boundary`]'s own docs for why this is a
+    /// hand-classified scan, not `unicode_segmentation`'s natural-language-oriented UAX #29 word
+    /// boundaries). `offset` landing on whitespace (or an empty line) selects nothing - a plain
+    /// caret at `offset` rather than fabricating a plausible-looking word that isn't really
+    /// there.
+    pub fn select_word_at(&mut self, offset: usize) {
+        self.goal_column = None;
+        let (line, _) = self.line_col_for_offset(offset);
+        let Some(line_range) = self.line_ranges.get(line).cloned() else {
+            self.move_to(offset);
+            return;
+        };
+        let local_offset = offset
+            .saturating_sub(line_range.start)
+            .min(line_range.end - line_range.start);
+        let text = &self.content[line_range.clone()];
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        // The char the click actually landed on/just before - the last char whose byte range
+        // contains `local_offset`, or (a click past the last char, e.g. right at the line's real
+        // end) the last char on the line.
+        let Some(mut pos) = chars
+            .iter()
+            .position(|&(index, ch)| local_offset < index + ch.len_utf8())
+            .or_else(|| chars.len().checked_sub(1))
+        else {
+            self.move_to(offset);
+            return;
+        };
+        let class = word_class(chars[pos].1);
+        if class == WordClass::Whitespace {
+            self.move_to(offset);
+            return;
+        }
+        let mut start = pos;
+        while start > 0 && word_class(chars[start - 1].1) == class {
+            start -= 1;
+        }
+        while pos + 1 < chars.len() && word_class(chars[pos + 1].1) == class {
+            pos += 1;
+        }
+        let end_byte = chars
+            .get(pos + 1)
+            .map(|&(index, _)| index)
+            .unwrap_or(text.len());
+        self.selected_range = line_range.start + chars[start].0..line_range.start + end_byte;
+        self.selection_reversed = false;
+    }
+
+    /// Triple-click line select (GitHub issue #27): selects `line`'s whole real text, excluding
+    /// its own line-ending bytes - a no-op (no panic, no change) for an out-of-range `line`.
+    pub fn select_line_at(&mut self, line: usize) {
+        self.goal_column = None;
+        let Some(range) = self.line_ranges.get(line).cloned() else {
+            return;
+        };
+        self.selected_range = range;
+        self.selection_reversed = false;
+    }
+
+    /// `Home`: moves the caret to the start of its current line, at every real cursor at once.
     pub fn move_home(&mut self) {
+        self.move_every_cursor(Self::move_home_one_cursor);
+    }
+
+    fn move_home_one_cursor(&mut self) {
         self.goal_column = None;
         let (line, _) = self.line_col_for_offset(self.cursor_offset());
         self.move_to(self.offset_for_line_col(line, 0));
     }
 
     /// `End`: moves the caret to the end of its current line's real text (before any line-ending
-    /// bytes).
+    /// bytes), at every real cursor at once.
     pub fn move_end(&mut self) {
+        self.move_every_cursor(Self::move_end_one_cursor);
+    }
+
+    fn move_end_one_cursor(&mut self) {
         self.goal_column = None;
         let (line, _) = self.line_col_for_offset(self.cursor_offset());
         let len = self.line_len(line);
@@ -1167,8 +1732,13 @@ impl EditBuffer {
         self.offset_for_line_col(target_line, goal)
     }
 
-    /// `Up`: moves the caret to the previous line, at the real remembered goal column.
+    /// `Up`: moves the caret to the previous line, at the real remembered goal column, at every
+    /// real cursor at once.
     pub fn move_up(&mut self) {
+        self.move_every_cursor(Self::move_up_one_cursor);
+    }
+
+    fn move_up_one_cursor(&mut self) {
         let target = self.vertical_offset(-1);
         let goal = self.goal_column;
         self.move_to(target);
@@ -1177,14 +1747,23 @@ impl EditBuffer {
 
     /// `Down`: the mirror of [`Self::move_up`].
     pub fn move_down(&mut self) {
+        self.move_every_cursor(Self::move_down_one_cursor);
+    }
+
+    fn move_down_one_cursor(&mut self) {
         let target = self.vertical_offset(1);
         let goal = self.goal_column;
         self.move_to(target);
         self.goal_column = goal;
     }
 
-    /// `Shift+Up`: extends the selection to the previous line at the real remembered goal column.
+    /// `Shift+Up`: extends the selection to the previous line at the real remembered goal column,
+    /// at every real cursor at once.
     pub fn select_up(&mut self) {
+        self.move_every_cursor(Self::select_up_one_cursor);
+    }
+
+    fn select_up_one_cursor(&mut self) {
         let target = self.vertical_offset(-1);
         let goal = self.goal_column;
         self.select_to(target);
@@ -1193,10 +1772,67 @@ impl EditBuffer {
 
     /// `Shift+Down`: the mirror of [`Self::select_up`].
     pub fn select_down(&mut self) {
+        self.move_every_cursor(Self::select_down_one_cursor);
+    }
+
+    fn select_down_one_cursor(&mut self) {
         let target = self.vertical_offset(1);
         let goal = self.goal_column;
         self.select_to(target);
         self.goal_column = goal;
+    }
+
+    /// Applies a pure cursor-movement method (no text change - `Self::move_left_one_cursor`/
+    /// `Self::select_up_one_cursor`/etc.) to every real cursor at once, not just the primary - see
+    /// this module's own "Multi-cursor" docs for why an arrow key must move every active cursor
+    /// together, not silently strand every secondary wherever it was left. A no-op wrapper (calls
+    /// `mover` once, directly) whenever [`Self::secondary_cursors`] is empty, so ordinary
+    /// single-cursor use pays no extra cost and behaves exactly as before this method existed.
+    ///
+    /// Each secondary cursor's own [`Self::goal_column`] is deliberately *not* carried across
+    /// consecutive vertical-move presses the way the primary's already is (reset to `None` before
+    /// each secondary's own `mover` call below) - a documented, honest scope cut: giving every
+    /// cursor its own independent sticky column would need a per-cursor goal-column field, real
+    /// design work this phase's priority (a correct core multi-cursor model, occurrence search,
+    /// and simultaneous edits) didn't reach. In practice this only matters for a *second*
+    /// consecutive `Up`/`Down` press after crossing a ragged-length line while multiple cursors are
+    /// active - a real, narrow, cosmetic gap, not a correctness bug (every cursor still lands on a
+    /// real, valid position on every press).
+    fn move_every_cursor<F>(&mut self, mut mover: F)
+    where
+        F: FnMut(&mut Self),
+    {
+        if self.secondary_cursors.is_empty() {
+            mover(self);
+            return;
+        }
+        // Taken (not merely cloned) *before* the primary's own `mover` call below - `Self::
+        // move_to`/`Self::select_to` (which every `mover` implementation bottoms out in) clear
+        // `Self::secondary_cursors` as their own first step (see their own docs), so this must
+        // already be empty before that first call, or that clear would silently discard every
+        // secondary before this method ever gets to move them.
+        let saved_secondaries = std::mem::take(&mut self.secondary_cursors);
+        mover(self);
+        let moved_primary = (self.selected_range.clone(), self.selection_reversed);
+        let primary_goal_column = self.goal_column;
+
+        let mut new_secondaries = Vec::with_capacity(saved_secondaries.len());
+        for cursor in saved_secondaries {
+            self.selected_range = cursor.range;
+            self.selection_reversed = cursor.reversed;
+            self.goal_column = None;
+            mover(self);
+            new_secondaries.push(SecondaryCursor {
+                range: self.selected_range.clone(),
+                reversed: self.selection_reversed,
+            });
+        }
+
+        self.selected_range = moved_primary.0;
+        self.selection_reversed = moved_primary.1;
+        self.goal_column = primary_goal_column;
+        self.secondary_cursors = new_secondaries;
+        self.merge_colliding_cursors();
     }
 
     /// Real 0-indexed `(line, column)` for a byte `offset` into [`Self::content`] - both in bytes,
@@ -1260,13 +1896,17 @@ impl EditBuffer {
         (start < end).then(|| start - range.start..end - range.start)
     }
 
-    /// The real caret position local to `line`'s text - `None` when there's an active selection
-    /// (no caret bar is drawn then, matching `vendor/zed/crates/gpui/examples/input.rs`'s own
-    /// `TextElement`) or the caret isn't on `line` at all.
+    /// The real caret position local to `line`'s text - `None` when the caret isn't on `line` at
+    /// all. Returns `Some` even while there's an active selection (GitHub issue #27: "caret is
+    /// visible against every theme background, including in selected regions") - this used to
+    /// return `None` whenever [`Self::selected_range`] was non-empty at all, matching
+    /// `vendor/zed/crates/gpui/examples/input.rs`'s own single-line `TextElement`, which never
+    /// draws a separate caret glyph over its own selection fill. That's a reasonable choice for
+    /// a one-line input, but a real code editor's own caret is real, useful information
+    /// (`cursor_offset`, this buffer's own "active end of the selection") a user still needs to
+    /// see while a selection is active - not fabricated, since [`Self::cursor_offset`] already
+    /// names an exact, real position regardless of whether [`Self::selected_range`] is empty.
     pub fn cursor_within_line(&self, line: usize) -> Option<usize> {
-        if !self.selected_range.is_empty() {
-            return None;
-        }
         let range = self.line_ranges.get(line)?;
         let offset = self.cursor_offset();
         // `then_some` eagerly evaluates its argument even when the condition is false - using it
@@ -1286,13 +1926,498 @@ impl EditBuffer {
         let end = marked.end.min(range.end);
         (start <= end).then(|| start - range.start..end - range.start)
     }
+
+    // ---- Multi-cursor (Revision R13, issue #28) - see this module's own top "Multi-cursor" docs
+    // for the overall design this section implements. ----
+
+    /// `true` while more than one real cursor is active.
+    pub fn has_multiple_cursors(&self) -> bool {
+        !self.secondary_cursors.is_empty()
+    }
+
+    /// The total number of real cursors - always `>= 1` (the primary always counts).
+    pub fn cursor_count(&self) -> usize {
+        1 + self.secondary_cursors.len()
+    }
+
+    /// Every real cursor's own selection range - the primary first, then
+    /// [`Self::secondary_cursors`] in storage order (not guaranteed sorted by position). Used by
+    /// occurrence search (to know what's already covered) and by tests that need to enumerate
+    /// every real cursor.
+    pub fn all_selection_ranges(&self) -> Vec<Range<usize>> {
+        let mut ranges = Vec::with_capacity(self.cursor_count());
+        ranges.push(self.selected_range.clone());
+        ranges.extend(
+            self.secondary_cursors
+                .iter()
+                .map(|cursor| cursor.range.clone()),
+        );
+        ranges
+    }
+
+    /// The real selection ranges of every *secondary* cursor (never the primary - see
+    /// [`Self::selection_within_line`] for that) clipped to `line`'s own bytes and translated
+    /// local to that line's text - one entry per secondary cursor with a non-empty selection
+    /// touching `line`. `crate::code_surface::editing`'s per-row painter reads this to draw every
+    /// real secondary selection fill, exactly like [`Self::selection_within_line`] already does
+    /// for the primary.
+    pub fn secondary_selections_within_line(&self, line: usize) -> Vec<Range<usize>> {
+        let Some(range) = self.line_ranges.get(line) else {
+            return Vec::new();
+        };
+        self.secondary_cursors
+            .iter()
+            .filter(|cursor| !cursor.range.is_empty())
+            .filter_map(|cursor| {
+                let start = cursor.range.start.max(range.start);
+                let end = cursor.range.end.min(range.end);
+                (start < end).then(|| start - range.start..end - range.start)
+            })
+            .collect()
+    }
+
+    /// The real caret position(s) of every *secondary* cursor local to `line`'s text - the
+    /// multi-cursor mirror of [`Self::cursor_within_line`]. Only secondary cursors with an
+    /// *empty* selection contribute a caret bar, matching that method's own "no caret while a
+    /// real selection is active" rule, applied per-cursor.
+    pub fn secondary_cursors_within_line(&self, line: usize) -> Vec<usize> {
+        let Some(range) = self.line_ranges.get(line) else {
+            return Vec::new();
+        };
+        self.secondary_cursors
+            .iter()
+            .filter(|cursor| cursor.range.is_empty())
+            .filter_map(|cursor| {
+                let offset = cursor.range.start;
+                (offset >= range.start && offset <= range.end).then(|| offset - range.start)
+            })
+            .collect()
+    }
+
+    /// `Esc`: drops every secondary cursor, leaving just the primary - the real "back to a single
+    /// cursor" escape hatch every multi-cursor editor provides. Returns `false` (a genuine no-op)
+    /// when there was only ever one cursor, so `crate::code_surface::editing`'s own handler can
+    /// let an unrelated, real single-cursor `Escape` meaning (dismissing some other overlay) take
+    /// over instead of always claiming the keystroke.
+    pub fn collapse_to_single_cursor(&mut self) -> bool {
+        if self.secondary_cursors.is_empty() {
+            return false;
+        }
+        self.secondary_cursors.clear();
+        true
+    }
+
+    /// Alt+click: adds a brand-new, empty cursor at `offset`, keeping every existing cursor - the
+    /// real arbitrary-position complement to [`Self::add_next_occurrence_cursor`]'s text-search-
+    /// driven placement. The new cursor becomes primary (the same "newest cursor is primary"
+    /// convention [`Self::add_next_occurrence_cursor`] itself uses, so a further `Ctrl+D` always
+    /// searches forward from wherever the user most recently pointed).
+    pub fn add_cursor_at(&mut self, offset: usize) {
+        let offset = self.floor_char_boundary(offset.min(self.content.len()));
+        let previous_primary = SecondaryCursor {
+            range: self.selected_range.clone(),
+            reversed: self.selection_reversed,
+        };
+        self.secondary_cursors.push(previous_primary);
+        self.selected_range = offset..offset;
+        self.selection_reversed = false;
+        self.goal_column = None;
+        self.merge_colliding_cursors();
+    }
+
+    /// Real, Unicode-aware "is this a word character" classification - alphanumeric or `_`,
+    /// matching VS Code's own default `wordSeparators` treatment (ASCII punctuation/whitespace all
+    /// separate words; letters/digits/underscore from any script do not). Shared by
+    /// [`Self::word_range_at`]'s own forward/backward scans.
+    fn is_word_char(ch: char) -> bool {
+        ch.is_alphanumeric() || ch == '_'
+    }
+
+    fn word_scan_start(&self, offset: usize) -> usize {
+        let mut start = offset;
+        for (index, ch) in self.content[..offset].char_indices().rev() {
+            if !Self::is_word_char(ch) {
+                break;
+            }
+            start = index;
+        }
+        start
+    }
+
+    fn word_scan_end(&self, offset: usize) -> usize {
+        let mut end = offset;
+        for (index, ch) in self.content[offset..].char_indices() {
+            if !Self::is_word_char(ch) {
+                break;
+            }
+            end = offset + index + ch.len_utf8();
+        }
+        end
+    }
+
+    /// The real word-boundary range touching byte offset `offset` from either side - matches
+    /// every real editor's own "word under the caret" convention: a caret with no selection
+    /// exactly between two words (or inside a run of whitespace/punctuation with no adjacent word
+    /// character at all) touches neither, and this returns `None`. Classification is
+    /// [`Self::is_word_char`]'s own Unicode-aware rule, matching VS Code's default.
+    pub fn word_range_at(&self, offset: usize) -> Option<Range<usize>> {
+        let offset = self.floor_char_boundary(offset.min(self.content.len()));
+        let start = self.word_scan_start(offset);
+        let end = self.word_scan_end(offset);
+        (start < end).then_some(start..end)
+    }
+
+    /// The real search-text source for occurrence matching - the primary cursor's own currently
+    /// selected text. Occurrence search always reads from the primary, never a secondary: every
+    /// method that adds a cursor keeps the newest occurrence as [`Self::selected_range`], pushing
+    /// whatever was previously primary into [`Self::secondary_cursors`] instead - see
+    /// [`Self::add_next_occurrence_cursor`]'s own docs for why that convention makes "the
+    /// primary's own text" always the real, intended search source.
+    fn occurrence_search_text(&self) -> Option<String> {
+        if self.selected_range.is_empty() {
+            return None;
+        }
+        self.content
+            .get(self.selected_range.clone())
+            .map(|text| text.to_string())
+    }
+
+    /// Real forward, wrapping, case-sensitive, plain-substring search for the next occurrence of
+    /// `needle` starting at or after `from`, skipping any byte range an existing real cursor
+    /// (primary or secondary) already covers - shared by [`Self::add_next_occurrence_cursor`]/
+    /// [`Self::skip_current_occurrence`]. Wraps around to the start of the buffer once the search
+    /// reaches the end without finding a not-already-selected match, matching VS Code's own "Add
+    /// Selection To Next Find Match" wraparound. Returns `None` once no further real occurrence
+    /// exists anywhere in the buffer.
+    fn find_next_occurrence(&self, needle: &str, from: usize) -> Option<Range<usize>> {
+        if needle.is_empty() {
+            return None;
+        }
+        let existing = self.all_selection_ranges();
+        let is_already_selected =
+            |range: &Range<usize>| existing.iter().any(|selected| selected == range);
+        let search_from = |start: usize| -> Option<Range<usize>> {
+            self.content
+                .get(start..)?
+                .match_indices(needle)
+                .map(|(index, matched)| (start + index)..(start + index + matched.len()))
+                .find(|range| !is_already_selected(range))
+        };
+        search_from(from.min(self.content.len())).or_else(|| search_from(0))
+    }
+
+    /// `Ctrl+D` ("Add Selection To Next Find Match"): with no active selection at all, selects the
+    /// real word under the caret ([`Self::word_range_at`]) - VS Code's own first step. With any
+    /// active selection (freshly word-selected just now, or a pre-existing manual selection),
+    /// finds the next real occurrence of that selection's own exact text and adds it as a brand-
+    /// new cursor - VS Code's own second step. Both described as one user-facing shortcut here,
+    /// same as VS Code's own single `Ctrl+D` binding. Returns `false` (a genuine no-op) when
+    /// there's no word under an empty caret, or when every real occurrence of the search text is
+    /// already covered by an existing cursor.
+    pub fn select_word_or_add_next_occurrence(&mut self) -> bool {
+        if self.selected_range.is_empty() && self.secondary_cursors.is_empty() {
+            let Some(word) = self.word_range_at(self.cursor_offset()) else {
+                return false;
+            };
+            self.selected_range = word;
+            self.selection_reversed = false;
+            return true;
+        }
+        self.add_next_occurrence_cursor()
+    }
+
+    /// Adds a brand-new cursor at the next real occurrence of the primary selection's own text,
+    /// keeping every existing cursor - see [`Self::select_word_or_add_next_occurrence`]'s own
+    /// docs. The new occurrence becomes primary; the previous primary is pushed into
+    /// [`Self::secondary_cursors`] - so a further `Ctrl+D` always searches forward from the
+    /// rightmost cursor's own end, walking through the buffer one real match at a time.
+    fn add_next_occurrence_cursor(&mut self) -> bool {
+        let Some(needle) = self.occurrence_search_text() else {
+            return false;
+        };
+        let search_from = self
+            .all_selection_ranges()
+            .iter()
+            .map(|range| range.end)
+            .max()
+            .unwrap_or(self.selected_range.end);
+        let Some(next) = self.find_next_occurrence(&needle, search_from) else {
+            return false;
+        };
+        self.secondary_cursors.push(SecondaryCursor {
+            range: self.selected_range.clone(),
+            reversed: self.selection_reversed,
+        });
+        self.selected_range = next;
+        self.selection_reversed = false;
+        self.goal_column = None;
+        self.merge_colliding_cursors();
+        true
+    }
+
+    /// `Ctrl+K Ctrl+D` ("Move Last Selection To Next Find Match"): replaces the primary cursor
+    /// with the next real occurrence of its own selected text, without keeping the current
+    /// occurrence selected - the real "skip this one, keep looking" complement to
+    /// [`Self::add_next_occurrence_cursor`], which always keeps every previous occurrence. Every
+    /// other existing cursor is left untouched, matching VS Code's own real behavior (it only ever
+    /// acts on the most recently added selection). Returns `false` when there's no primary
+    /// selection to search from, or no further real occurrence exists.
+    pub fn skip_current_occurrence(&mut self) -> bool {
+        let Some(needle) = self.occurrence_search_text() else {
+            return false;
+        };
+        let Some(next) = self.find_next_occurrence(&needle, self.selected_range.end) else {
+            return false;
+        };
+        self.selected_range = next;
+        self.selection_reversed = false;
+        self.goal_column = None;
+        self.merge_colliding_cursors();
+        true
+    }
+
+    /// `Ctrl+Shift+L` ("Select All Occurrences of Find Match"): selects the real word under the
+    /// caret first if there's no active selection yet (the same first step
+    /// [`Self::select_word_or_add_next_occurrence`] takes), then replaces every existing cursor
+    /// with one cursor per real occurrence of that text anywhere in the buffer. Not additive on
+    /// top of whatever cursors already existed - matches VS Code's own "select all" semantics:
+    /// this always yields exactly one cursor per real occurrence, never a mix of old and new.
+    /// Returns `false` when there's no word/selection to search for.
+    pub fn select_all_occurrences(&mut self) -> bool {
+        if self.selected_range.is_empty() && self.secondary_cursors.is_empty() {
+            let Some(word) = self.word_range_at(self.cursor_offset()) else {
+                return false;
+            };
+            self.selected_range = word;
+            self.selection_reversed = false;
+        }
+        let Some(needle) = self.occurrence_search_text() else {
+            return false;
+        };
+        let occurrences: Vec<Range<usize>> = self
+            .content
+            .match_indices(needle.as_str())
+            .map(|(index, matched)| index..(index + matched.len()))
+            .collect();
+        let Some(first) = occurrences.first().cloned() else {
+            return false;
+        };
+        self.secondary_cursors = occurrences
+            .into_iter()
+            .skip(1)
+            .map(|range| SecondaryCursor {
+                range,
+                reversed: false,
+            })
+            .collect();
+        self.selected_range = first;
+        self.selection_reversed = false;
+        self.goal_column = None;
+        true
+    }
+
+    /// Merges any real cursors (primary or secondary) that now overlap, or sit at the exact same
+    /// empty-caret position, into one - VS Code's own "cursors merge when they collide" behavior.
+    /// Called at the end of every real operation that could produce a collision: adding a cursor,
+    /// moving every cursor together, or applying a multi-cursor edit. A no-op (returns
+    /// immediately) whenever there's only the primary - the overwhelmingly common case, so this
+    /// never pays real sorting/scanning cost in ordinary single-cursor use.
+    fn merge_colliding_cursors(&mut self) {
+        if self.secondary_cursors.is_empty() {
+            return;
+        }
+
+        struct Tagged {
+            range: Range<usize>,
+            reversed: bool,
+            is_primary: bool,
+        }
+
+        let mut all: Vec<Tagged> = Vec::with_capacity(self.cursor_count());
+        all.push(Tagged {
+            range: self.selected_range.clone(),
+            reversed: self.selection_reversed,
+            is_primary: true,
+        });
+        for cursor in &self.secondary_cursors {
+            all.push(Tagged {
+                range: cursor.range.clone(),
+                reversed: cursor.reversed,
+                is_primary: false,
+            });
+        }
+        all.sort_by(|a, b| {
+            a.range
+                .start
+                .cmp(&b.range.start)
+                .then(a.range.end.cmp(&b.range.end))
+        });
+
+        let mut merged: Vec<Tagged> = Vec::with_capacity(all.len());
+        for item in all {
+            // Collides with the last accepted cursor when the two real ranges genuinely overlap,
+            // or both are empty carets sitting at the exact same offset (two non-overlapping,
+            // merely *adjacent* real selections/carets - e.g. `0..3` next to `3..6` - are
+            // deliberately left as two distinct cursors: "touching" is not "colliding").
+            let collides = merged.last().is_some_and(|last: &Tagged| {
+                item.range.start < last.range.end
+                    || (item.range.start == last.range.end
+                        && item.range.is_empty()
+                        && last.range.is_empty())
+            });
+            if collides {
+                if let Some(last) = merged.last_mut() {
+                    last.range.end = last.range.end.max(item.range.end);
+                    last.is_primary = last.is_primary || item.is_primary;
+                }
+            } else {
+                merged.push(item);
+            }
+        }
+
+        let primary_index = merged.iter().position(|item| item.is_primary).unwrap_or(0);
+        let primary = merged.remove(primary_index);
+        self.selected_range = primary.range;
+        self.selection_reversed = primary.reversed;
+        self.secondary_cursors = merged
+            .into_iter()
+            .map(|item| SecondaryCursor {
+                range: item.range,
+                reversed: item.reversed,
+            })
+            .collect();
+    }
+
+    /// Applies one real edit per cursor - primary and every secondary - as a single atomic
+    /// multi-cursor operation: `compute` is handed `self` (read-only) and that cursor's own
+    /// current range, and returns the real byte range to splice plus the replacement text for it.
+    /// An `(range, text)` where `range` is empty and `text` is empty is treated as a genuine
+    /// per-cursor no-op (e.g. Backspace at the very start of the buffer for one cursor while
+    /// others still have real deletions to make) - skipped without a real splice, so it never
+    /// spuriously marks the buffer's highlighting dirty for a cursor that didn't actually change
+    /// anything.
+    ///
+    /// Processed from the rightmost cursor to the leftmost (by `range.start`), the standard multi-
+    /// cursor discipline every real editor's own batch-edit application relies on: splicing the
+    /// rightmost cursor's own edit first can never invalidate the still-unprocessed byte offsets of
+    /// any cursor still to its left, so `compute`'s own per-cursor boundary lookups (e.g.
+    /// `Self::previous_boundary` for a Backspace with no selection) never need any real cross-
+    /// cursor offset bookkeeping of their own - only this method's own bookkeeping of each
+    /// cursor's *new* caret position (recorded as it's produced, restored onto every real cursor
+    /// only once every real splice has landed) does. Every real cursor collapses to an empty caret
+    /// at its own post-edit position - the "typing/deleting closes any selection" behavior every
+    /// one of this buffer's own single-cursor edit methods already has, applied per-cursor here.
+    ///
+    /// **Records every real per-cursor splice into [`Self::history`] as one group** (GitHub issue
+    /// #17's own history, extended here for issue #28) - see this module's own "Multi-cursor edits
+    /// are one real undo step" docs for the chaining technique and its one documented limitation
+    /// (only the primary cursor's own caret/selection is restored by undo/redo, not every
+    /// secondary). `kind` is shared by every edit in the batch on purpose: typing/pasting the same
+    /// text at every cursor and deleting at every cursor are each internally uniform, and a shared
+    /// kind is what lets [`TextHistory::record`]'s own `top.kind != kind` check never split one
+    /// multi-cursor keystroke into more than one group.
+    fn apply_at_every_cursor<F>(&mut self, kind: EditKind, mut compute: F)
+    where
+        F: FnMut(&Self, Range<usize>) -> (Range<usize>, String),
+    {
+        // Defensive: every real caller keeps `Self::secondary_cursors` merge-clean between
+        // keystrokes already (every mutating multi-cursor operation ends with
+        // `Self::merge_colliding_cursors`), but this method's own right-to-left bookkeeping below
+        // is only correct for non-overlapping input ranges - two identical/overlapping cursors
+        // reaching this method would otherwise each independently compute a real edit against
+        // content the *other* has already spliced, corrupting one of them. A cheap, real safety
+        // net rather than relying purely on caller discipline.
+        self.merge_colliding_cursors();
+
+        let real_before = self.selection_snapshot();
+
+        let mut ordered: Vec<(usize, Range<usize>)> = Vec::with_capacity(self.cursor_count());
+        ordered.push((0, self.selected_range.clone()));
+        for (index, cursor) in self.secondary_cursors.iter().enumerate() {
+            ordered.push((index + 1, cursor.range.clone()));
+        }
+        ordered.sort_by(|a, b| b.1.start.cmp(&a.1.start).then(b.1.end.cmp(&a.1.end)));
+        let last_index = ordered.len().saturating_sub(1);
+
+        let now = Instant::now();
+        let mut chain_before = real_before;
+        let mut new_positions: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::with_capacity(ordered.len());
+        for (loop_index, (id, range)) in ordered.into_iter().enumerate() {
+            let (edit_range, text) = compute(self, range);
+            let edit_range = self.clamp_range(edit_range);
+            if edit_range.is_empty() && text.is_empty() {
+                new_positions.insert(id, edit_range.start);
+                continue;
+            }
+            let removed = self
+                .content
+                .get(edit_range.clone())
+                .map(|removed| removed.to_string())
+                .unwrap_or_default();
+            let delta = text.len() as isize - (edit_range.end - edit_range.start) as isize;
+            self.splice_lines(edit_range.clone(), &text);
+            // Every position already recorded belongs to a cursor processed earlier in this
+            // right-to-left pass, i.e. one that sat to the right of (or exactly at) this edit's
+            // own start - this edit just moved every one of those real positions by its own byte
+            // delta, so each must be shifted to stay correct once every real splice has landed.
+            for pos in new_positions.values_mut() {
+                if *pos >= edit_range.start {
+                    *pos = (*pos as isize + delta) as usize;
+                }
+            }
+            let new_pos = edit_range.start + text.len();
+            new_positions.insert(id, new_pos);
+
+            if !self.replaying && removed != text {
+                // The group's real, stored `after` (what redo restores) is the *primary* cursor's
+                // own final position - see this method's own docs on why only the primary's
+                // selection is restorable at all. Every other edit in the chain gets a synthetic
+                // caret that only needs to satisfy `TextHistory`'s own before-equals-previous-after
+                // continuity check so the whole batch coalesces into one group, never a value a
+                // caller reads back out on its own.
+                let after = if loop_index == last_index {
+                    let primary_pos = new_positions.get(&0).copied().unwrap_or(new_pos);
+                    SelectionSnapshot::caret(primary_pos)
+                } else {
+                    SelectionSnapshot::caret(new_pos)
+                };
+                self.history.record(
+                    TextEdit {
+                        at: edit_range.start,
+                        removed,
+                        inserted: text,
+                    },
+                    chain_before,
+                    after,
+                    kind,
+                    now,
+                );
+                chain_before = after;
+            }
+        }
+
+        if let Some(&pos) = new_positions.get(&0) {
+            self.selected_range = pos..pos;
+            self.selection_reversed = false;
+        }
+        for (index, cursor) in self.secondary_cursors.iter_mut().enumerate() {
+            if let Some(&pos) = new_positions.get(&(index + 1)) {
+                cursor.range = pos..pos;
+                cursor.reversed = false;
+            }
+        }
+        self.marked_range = None;
+        self.goal_column = None;
+        self.merge_colliding_cursors();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn buffer(content: &str) -> EditBuffer {
+    pub(super) fn buffer(content: &str) -> EditBuffer {
         EditBuffer::new(
             PathBuf::from("/tmp/test.rs"),
             content.to_string(),
@@ -1615,6 +2740,22 @@ mod tests {
         assert_eq!(buf.cursor_within_line(0), None);
         assert_eq!(buf.cursor_within_line(1), None);
         assert!(buf.cursor_within_line(2).is_some());
+    }
+
+    /// GitHub issue #27: "caret is visible against every theme background, including in
+    /// selected regions" - `cursor_within_line` must keep reporting the real active end of the
+    /// selection even while one is active, not go back to `None` the moment
+    /// `selected_range` stops being empty.
+    #[test]
+    fn cursor_within_line_stays_some_while_a_selection_is_active() {
+        let mut buf = buffer("hello world");
+        buf.move_to(0);
+        buf.select_to(5); // "hello" selected, caret (active end) at byte 5
+        assert_eq!(
+            buf.cursor_within_line(0),
+            Some(5),
+            "the real active end of the selection must still be reported as the caret position"
+        );
     }
 
     #[test]
@@ -2316,5 +3457,558 @@ mod tests {
         assert!(!buffer.undo());
         assert!(!buffer.redo());
         assert_eq!(buffer.content, "abc\n");
+    }
+
+    // ---- Multi-cursor (Revision R13, issue #28) ----
+
+    #[test]
+    fn word_range_at_finds_the_real_word_touching_either_side_of_the_caret() {
+        let buf = buffer("foo bar_baz\n");
+        // Caret in the middle of "foo".
+        assert_eq!(buf.word_range_at(1), Some(0..3));
+        // Caret right before "bar_baz" - touches only on the right.
+        assert_eq!(buf.word_range_at(4), Some(4..11));
+        // Caret right after "foo" - touches only on the left.
+        assert_eq!(buf.word_range_at(3), Some(0..3));
+        // Underscore counts as a word character - the whole identifier is one word.
+        assert_eq!(buf.word_range_at(8), Some(4..11));
+    }
+
+    #[test]
+    fn word_range_at_is_none_with_no_adjacent_word_character() {
+        let buf = buffer("foo   bar\n");
+        // Deep inside the run of spaces, touching neither word.
+        assert_eq!(buf.word_range_at(5), None);
+    }
+
+    #[test]
+    fn ctrl_d_first_press_selects_the_real_word_under_an_empty_caret() {
+        let mut buf = buffer("let value = value + 1;\n");
+        buf.move_to(6); // inside the first "value"
+        assert!(buf.select_word_or_add_next_occurrence());
+        assert_eq!(buf.selected_range, 4..9);
+        assert_eq!(&buf.content[buf.selected_range.clone()], "value");
+        assert!(buf.secondary_cursors.is_empty());
+    }
+
+    #[test]
+    fn ctrl_d_second_press_adds_the_next_real_occurrence_as_a_new_cursor() {
+        let mut buf = buffer("value + value + value\n");
+        buf.move_to(1); // inside the first "value"
+        assert!(buf.select_word_or_add_next_occurrence()); // selects the first "value"
+        assert!(buf.select_word_or_add_next_occurrence()); // adds the second "value"
+
+        assert_eq!(buf.cursor_count(), 2);
+        let mut ranges = buf.all_selection_ranges();
+        ranges.sort_by_key(|range| range.start);
+        assert_eq!(ranges, vec![0..5, 8..13]);
+        // The newest occurrence becomes primary.
+        assert_eq!(buf.selected_range, 8..13);
+    }
+
+    #[test]
+    fn ctrl_d_keeps_adding_occurrences_and_wraps_around_the_buffer() {
+        let mut buf = buffer("value + value + other\n");
+        buf.move_to(1);
+        assert!(buf.select_word_or_add_next_occurrence()); // first "value" (0..5)
+        assert!(buf.select_word_or_add_next_occurrence()); // second "value" (8..13)
+                                                           // No more real, not-already-selected occurrences of "value" anywhere in the buffer - a
+                                                           // real no-op, not a fabricated third cursor.
+        assert!(!buf.select_word_or_add_next_occurrence());
+        assert_eq!(buf.cursor_count(), 2);
+    }
+
+    #[test]
+    fn ctrl_d_occurrence_search_is_case_sensitive() {
+        let mut buf = buffer("Value value\n");
+        buf.move_to(0);
+        assert!(buf.select_word_or_add_next_occurrence()); // selects "Value" (0..5)
+                                                           // The only other real occurrence in the buffer is lowercase "value" - must not match a
+                                                           // differently-cased real occurrence, matching VS Code's own default case-sensitive search.
+        assert!(!buf.select_word_or_add_next_occurrence());
+        assert_eq!(buf.cursor_count(), 1);
+    }
+
+    #[test]
+    fn ctrl_shift_l_selects_every_real_occurrence_at_once() {
+        let mut buf = buffer("value + value + value\n");
+        buf.move_to(1);
+        assert!(buf.select_all_occurrences());
+        assert_eq!(buf.cursor_count(), 3);
+        let mut ranges = buf.all_selection_ranges();
+        ranges.sort_by_key(|range| range.start);
+        assert_eq!(ranges, vec![0..5, 8..13, 16..21]);
+    }
+
+    #[test]
+    fn ctrl_k_ctrl_d_skips_the_current_occurrence_without_keeping_it_selected() {
+        let mut buf = buffer("value + value + value\n");
+        buf.move_to(1);
+        assert!(buf.select_word_or_add_next_occurrence()); // selects the first "value" (0..5)
+        assert!(buf.skip_current_occurrence()); // moves to the second, not keeping the first
+        assert_eq!(buf.cursor_count(), 1, "skip must not add a cursor");
+        assert_eq!(buf.selected_range, 8..13);
+    }
+
+    #[test]
+    fn escape_collapses_every_secondary_cursor_back_to_one() {
+        let mut buf = buffer("value + value\n");
+        buf.move_to(1);
+        buf.select_word_or_add_next_occurrence();
+        buf.select_word_or_add_next_occurrence();
+        assert_eq!(buf.cursor_count(), 2);
+
+        assert!(buf.collapse_to_single_cursor());
+        assert_eq!(buf.cursor_count(), 1);
+        // A second Escape with only one cursor left is a genuine no-op.
+        assert!(!buf.collapse_to_single_cursor());
+    }
+
+    #[test]
+    fn add_cursor_at_adds_an_arbitrary_empty_cursor_keeping_the_existing_one() {
+        let mut buf = buffer("abcdef\n");
+        buf.move_to(0);
+        buf.add_cursor_at(4);
+        assert_eq!(buf.cursor_count(), 2);
+        let mut ranges = buf.all_selection_ranges();
+        ranges.sort_by_key(|range| range.start);
+        assert_eq!(ranges, vec![0..0, 4..4]);
+        // The newest (just-clicked) position becomes primary.
+        assert_eq!(buf.selected_range, 4..4);
+    }
+
+    #[test]
+    fn typing_with_multiple_cursors_inserts_the_same_text_at_every_cursor_as_one_atomic_edit() {
+        let mut buf = buffer("value + value\n");
+        buf.move_to(1);
+        buf.select_word_or_add_next_occurrence();
+        buf.select_word_or_add_next_occurrence();
+        assert_eq!(buf.cursor_count(), 2);
+
+        buf.replace_range(None, "x");
+
+        assert_eq!(
+            buf.content, "x + x\n",
+            "typing must replace the real selected text at every cursor at once"
+        );
+        // Every cursor collapses to an empty caret right after its own inserted text.
+        let mut ranges = buf.all_selection_ranges();
+        ranges.sort_by_key(|range| range.start);
+        assert_eq!(ranges, vec![1..1, 5..5]);
+    }
+
+    #[test]
+    fn pasting_with_multiple_cursors_applies_to_every_cursor() {
+        // `EntityInputHandler::replace_text_in_range` (paste's own real call path) passes `None`
+        // for an ordinary paste with no explicit range - this proves the exact same real code
+        // path `AdeApp::handle_editor_paste_action` uses fans out across every cursor.
+        let mut buf = buffer("a a\n");
+        buf.selected_range = 0..1; // select the first "a"
+        buf.secondary_cursors = vec![SecondaryCursor {
+            range: 2..3, // select the second "a"
+            reversed: false,
+        }];
+        buf.replace_range(None, "bb");
+        assert_eq!(buf.content, "bb bb\n");
+    }
+
+    #[test]
+    fn backspace_with_multiple_cursors_deletes_one_grapheme_at_every_cursor() {
+        let mut buf = buffer("aXbXc\n");
+        buf.selected_range = 2..2; // right after the first X
+        buf.secondary_cursors = vec![SecondaryCursor {
+            range: 4..4, // right after the second X
+            reversed: false,
+        }];
+        buf.backspace();
+        assert_eq!(buf.content, "abc\n");
+        let mut ranges = buf.all_selection_ranges();
+        ranges.sort_by_key(|range| range.start);
+        assert_eq!(ranges, vec![1..1, 2..2]);
+    }
+
+    #[test]
+    fn backspace_with_multiple_cursors_is_a_real_per_cursor_no_op_at_the_start_of_the_buffer() {
+        // One cursor sits at the very start of the buffer (nothing to delete for it); the other
+        // has real text before it. The first must not block or corrupt the second's own real
+        // deletion.
+        let mut buf = buffer("Xbc\n");
+        buf.selected_range = 0..0;
+        buf.secondary_cursors = vec![SecondaryCursor {
+            range: 2..2, // right after "b"
+            reversed: false,
+        }];
+        buf.backspace();
+        assert_eq!(buf.content, "Xc\n");
+    }
+
+    #[test]
+    fn delete_forward_with_multiple_cursors_deletes_one_grapheme_at_every_cursor() {
+        let mut buf = buffer("aXbXc\n");
+        buf.selected_range = 1..1; // right before the first X
+        buf.secondary_cursors = vec![SecondaryCursor {
+            range: 3..3, // right before the second X
+            reversed: false,
+        }];
+        buf.delete_forward();
+        assert_eq!(buf.content, "abc\n");
+    }
+
+    #[test]
+    fn colliding_cursors_merge_into_one_after_an_edit() {
+        // Two carets one grapheme apart; deleting forward from the left one lands them both on
+        // the exact same offset - they must merge into a single real cursor, not stay duplicated.
+        let mut buf = buffer("aXc\n");
+        buf.selected_range = 1..1; // right before X
+        buf.secondary_cursors = vec![SecondaryCursor {
+            range: 1..1, // an already-identical cursor, simplest real collision case
+            reversed: false,
+        }];
+        buf.delete_forward();
+        assert_eq!(buf.content, "ac\n");
+        assert_eq!(
+            buf.cursor_count(),
+            1,
+            "two cursors landing on the exact same offset must merge"
+        );
+    }
+
+    #[test]
+    fn overlapping_selections_merge_into_one_real_cursor() {
+        let mut buf = buffer("abcdef\n");
+        buf.selected_range = 0..3;
+        buf.secondary_cursors = vec![SecondaryCursor {
+            range: 2..5,
+            reversed: false,
+        }];
+        // Any real operation that runs `Self::merge_colliding_cursors` picks this up - `Ctrl+D`'s
+        // own no-op-when-nothing-to-search path doesn't touch cursors, so use `Self::add_cursor_at`
+        // (itself always merges) with a position that doesn't introduce a *third* collision.
+        buf.add_cursor_at(6);
+        assert_eq!(
+            buf.cursor_count(),
+            2,
+            "the two overlapping ranges merge into one"
+        );
+        let mut ranges = buf.all_selection_ranges();
+        ranges.sort_by_key(|range| range.start);
+        assert_eq!(ranges, vec![0..5, 6..6]);
+    }
+
+    #[test]
+    fn touching_but_non_overlapping_selections_do_not_merge() {
+        let mut buf = buffer("abcdef\n");
+        buf.selected_range = 0..3;
+        buf.secondary_cursors = vec![SecondaryCursor {
+            range: 3..6, // touches at byte 3, but does not overlap
+            reversed: false,
+        }];
+        buf.merge_colliding_cursors();
+        assert_eq!(
+            buf.cursor_count(),
+            2,
+            "merely touching (not overlapping) selections stay distinct"
+        );
+    }
+
+    #[test]
+    fn arrow_keys_move_every_real_cursor_together() {
+        let mut buf = buffer("abc abc\n");
+        buf.selected_range = 0..0;
+        buf.secondary_cursors = vec![SecondaryCursor {
+            range: 4..4,
+            reversed: false,
+        }];
+        buf.move_right();
+        let mut ranges = buf.all_selection_ranges();
+        ranges.sort_by_key(|range| range.start);
+        assert_eq!(
+            ranges,
+            vec![1..1, 5..5],
+            "Right must move both real cursors forward one grapheme each, not just the primary"
+        );
+    }
+
+    #[test]
+    fn a_plain_click_move_to_collapses_every_secondary_cursor() {
+        let mut buf = buffer("abcdef\n");
+        buf.selected_range = 0..0;
+        buf.secondary_cursors = vec![SecondaryCursor {
+            range: 4..4,
+            reversed: false,
+        }];
+        buf.move_to(2);
+        assert_eq!(
+            buf.cursor_count(),
+            1,
+            "an ordinary, unmodified click always collapses back to a single real cursor"
+        );
+        assert_eq!(buf.selected_range, 2..2);
+    }
+
+    #[test]
+    fn select_all_collapses_every_secondary_cursor_into_one_whole_buffer_selection() {
+        let mut buf = buffer("abcdef\n");
+        buf.selected_range = 0..0;
+        buf.secondary_cursors = vec![SecondaryCursor {
+            range: 4..4,
+            reversed: false,
+        }];
+        buf.select_all();
+        assert_eq!(buf.cursor_count(), 1);
+        assert_eq!(buf.selected_range, 0..buf.content.len());
+    }
+
+    // ---- Multi-cursor edits recorded as one real undo step (issue #28, on top of issue #17) ----
+
+    #[test]
+    fn typing_at_multiple_cursors_then_undo_restores_all_of_them_as_one_step() {
+        let mut buf = buffer("value + value\n");
+        buf.move_to(1);
+        buf.select_word_or_add_next_occurrence();
+        buf.select_word_or_add_next_occurrence();
+        assert_eq!(buf.cursor_count(), 2);
+
+        buf.replace_range(None, "x");
+        assert_eq!(buf.content, "x + x\n");
+
+        assert!(buf.undo(), "a multi-cursor edit must be undoable");
+        assert_eq!(
+            buf.content, "value + value\n",
+            "undo must restore the text at every cursor's own edit, not just one"
+        );
+        assert!(
+            !buf.can_undo(),
+            "the whole multi-cursor edit must have been exactly one undo step, not two"
+        );
+    }
+
+    #[test]
+    fn redo_after_undoing_a_multi_cursor_edit_reapplies_every_cursors_own_edit() {
+        let mut buf = buffer("value + value\n");
+        buf.move_to(1);
+        buf.select_word_or_add_next_occurrence();
+        buf.select_word_or_add_next_occurrence();
+        buf.replace_range(None, "x");
+        assert!(buf.undo());
+        assert_eq!(buf.content, "value + value\n");
+
+        assert!(buf.redo());
+        assert_eq!(
+            buf.content, "x + x\n",
+            "redo must reapply every cursor's own edit together, not just one"
+        );
+    }
+
+    #[test]
+    fn undo_after_a_multi_cursor_edit_leaves_the_buffer_in_ordinary_single_cursor_state() {
+        // A real, documented limitation - see `EditBuffer`'s own "Multi-cursor edits are one real
+        // undo step" docs: `text_history::SelectionSnapshot` has no way to represent more than one
+        // cursor, so undo restores the text at every cursor but only the *primary*'s own
+        // caret/selection - every secondary is dropped, not left stale.
+        let mut buf = buffer("value + value\n");
+        buf.move_to(1);
+        buf.select_word_or_add_next_occurrence();
+        buf.select_word_or_add_next_occurrence();
+        buf.replace_range(None, "x");
+        assert_eq!(
+            buf.cursor_count(),
+            2,
+            "typing collapses each real cursor to its own empty caret, not down to a single \
+             global one - there are still two real cursors here, one per edit"
+        );
+
+        assert!(buf.undo());
+        assert_eq!(
+            buf.cursor_count(),
+            1,
+            "undo must leave the buffer in ordinary single-cursor state, not a stale secondary"
+        );
+    }
+
+    #[test]
+    fn backspace_at_multiple_cursors_then_undo_restores_the_deleted_text_at_every_cursor() {
+        let mut buf = buffer("aXbXc\n");
+        buf.selected_range = 2..2; // right after the first X
+        buf.secondary_cursors = vec![SecondaryCursor {
+            range: 4..4, // right after the second X
+            reversed: false,
+        }];
+        buf.backspace();
+        assert_eq!(buf.content, "abc\n");
+
+        assert!(buf.undo());
+        assert_eq!(
+            buf.content, "aXbXc\n",
+            "undo must restore both deleted characters, not just one"
+        );
+    }
+
+    #[test]
+    fn consecutive_multi_cursor_keystrokes_coalesce_into_one_undo_group() {
+        let original = "v + v\n";
+        let mut buf = buffer(original);
+        buf.move_to(0);
+        buf.add_cursor_at(4);
+        assert_eq!(buf.cursor_count(), 2);
+
+        // Three real keystrokes in a row, no intervening caret move - a genuine typing burst
+        // across both cursors, exactly like this module's own single-cursor `type_text` helper
+        // drives for the plain coalescing tests above.
+        buf.replace_range(None, "a");
+        buf.replace_range(None, "b");
+        buf.replace_range(None, "c");
+        assert_ne!(buf.content, original);
+
+        assert!(buf.undo(), "the whole burst must be undoable");
+        assert_eq!(
+            buf.content, original,
+            "three keystrokes across two cursors must undo as one coalesced step, not six"
+        );
+        assert!(
+            !buf.can_undo(),
+            "and there must be nothing left behind it - proving it really was one group"
+        );
+    }
+
+    // GitHub issue #26: `Tab`/`Shift+Tab` indentation.
+
+    #[test]
+    fn indent_lines_with_no_selection_inserts_at_the_caret_like_ordinary_typing() {
+        let mut buf = buffer("fn main() {\nbody\n}\n");
+        buf.move_to(12); // "fn main() {\n" is 12 bytes - this is the real start of "body"
+        assert!(buf.indent_lines("  "));
+        assert_eq!(buf.content, "fn main() {\n  body\n}\n");
+        assert_eq!(buf.selected_range, 14..14);
+    }
+
+    #[test]
+    fn indent_lines_with_a_multi_line_selection_indents_every_touched_line_and_keeps_selecting() {
+        let mut buf = buffer("one\ntwo\nthree\n");
+        buf.selected_range = 1..6; // "ne\ntw" - touches lines 0 and 1
+        buf.selection_reversed = false;
+        assert!(buf.indent_lines("  "));
+        assert_eq!(buf.content, "  one\n  two\nthree\n");
+        // The selection re-expands to the full touched lines' own new start through the shifted
+        // original end (2 lines * 2 inserted spaces each = +4 total by the original end offset).
+        assert_eq!(buf.selected_range, 0..10);
+        assert_eq!(&buf.content[buf.selected_range.clone()], "  one\n  tw");
+    }
+
+    #[test]
+    fn indent_lines_excludes_the_trailing_line_when_selection_ends_at_its_column_zero() {
+        let mut buf = buffer("one\ntwo\nthree\n");
+        buf.selected_range = 0..4; // "one\n" - lands exactly at the start of line 1
+        assert!(buf.indent_lines("  "));
+        assert_eq!(
+            buf.content, "  one\ntwo\nthree\n",
+            "only line 0 should be indented, not line 1"
+        );
+    }
+
+    #[test]
+    fn indent_lines_with_a_single_line_selection_still_block_indents_the_whole_line() {
+        let mut buf = buffer("hello world\n");
+        buf.selected_range = 6..11; // "world", no line break involved at all
+        assert!(buf.indent_lines("\t"));
+        assert_eq!(buf.content, "\thello world\n");
+    }
+
+    #[test]
+    fn dedent_lines_removes_up_to_tab_width_of_leading_spaces_from_every_touched_line() {
+        // Line 0 has fewer leading spaces than `width` (all of them are removed); line 1 has
+        // more (only `width` of them are removed, leaving the rest); line 2 has none (no-op).
+        let mut buf = buffer("  one\n      two\nthree\n");
+        buf.selected_range = 0..buf.content.len();
+        assert!(buf.dedent_lines(4));
+        assert_eq!(buf.content, "one\n  two\nthree\n");
+    }
+
+    #[test]
+    fn dedent_lines_removes_a_single_leading_tab_as_one_whole_level() {
+        let mut buf = buffer("\t\tone\n");
+        buf.move_to(3);
+        assert!(buf.dedent_lines(4));
+        assert_eq!(buf.content, "\tone\n");
+    }
+
+    #[test]
+    fn dedent_lines_is_a_real_no_op_on_a_line_already_at_column_zero() {
+        let mut buf = buffer("one\ntwo\n");
+        buf.selected_range = 0..0;
+        assert!(!buf.dedent_lines(4));
+        assert_eq!(buf.content, "one\ntwo\n");
+    }
+
+    #[test]
+    fn dedent_lines_with_no_selection_dedents_the_current_line_regardless_of_caret_column() {
+        let mut buf = buffer("    hello\n");
+        buf.move_to(7); // caret mid-word ("hel|lo"), nowhere near the leading whitespace
+        assert!(buf.dedent_lines(4));
+        assert_eq!(buf.content, "hello\n");
+    }
+
+    #[test]
+    fn indent_then_dedent_round_trips_back_to_the_original_content() {
+        let mut buf = buffer("one\ntwo\nthree\n");
+        buf.selected_range = 0..buf.content.len();
+        assert!(buf.indent_lines("    "));
+        assert!(buf.dedent_lines(4));
+        assert_eq!(buf.content, "one\ntwo\nthree\n");
+    }
+
+    // GitHub issue #17 integration: a multi-line Tab/Shift+Tab is one atomic undo step.
+
+    #[test]
+    fn indenting_three_lines_at_once_undoes_in_a_single_ctrl_z() {
+        let mut buf = buffer("one\ntwo\nthree\n");
+        buf.selected_range = 0..buf.content.len();
+        assert!(buf.indent_lines("  "));
+        assert_eq!(buf.content, "  one\n  two\n  three\n");
+
+        assert!(buf.undo());
+        assert_eq!(
+            buf.content, "one\ntwo\nthree\n",
+            "indenting all three lines must be exactly one undo step, not three"
+        );
+        assert!(
+            !buf.can_undo(),
+            "and there must be nothing left behind it - proving it really was one step"
+        );
+
+        assert!(buf.redo());
+        assert_eq!(buf.content, "  one\n  two\n  three\n");
+    }
+
+    #[test]
+    fn dedenting_three_lines_at_once_undoes_in_a_single_ctrl_z() {
+        let mut buf = buffer("  one\n  two\n  three\n");
+        buf.selected_range = 0..buf.content.len();
+        assert!(buf.dedent_lines(2));
+        assert_eq!(buf.content, "one\ntwo\nthree\n");
+
+        assert!(buf.undo());
+        assert_eq!(
+            buf.content, "  one\n  two\n  three\n",
+            "dedenting all three lines must be exactly one undo step, not three"
+        );
+        assert!(!buf.can_undo());
+
+        assert!(buf.redo());
+        assert_eq!(buf.content, "one\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn a_dedent_that_only_touches_some_lines_still_undoes_as_one_step() {
+        // Line 1 has no leading whitespace at all - a genuine per-line no-op mixed in with two
+        // real removals, exercising the "skip lines with nothing to remove" path inside one group.
+        let mut buf = buffer("  one\ntwo\n  three\n");
+        buf.selected_range = 0..buf.content.len();
+        assert!(buf.dedent_lines(2));
+        assert_eq!(buf.content, "one\ntwo\nthree\n");
+
+        assert!(buf.undo());
+        assert_eq!(buf.content, "  one\ntwo\n  three\n");
+        assert!(!buf.can_undo());
     }
 }

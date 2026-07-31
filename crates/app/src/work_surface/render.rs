@@ -1,6 +1,7 @@
 use super::*;
 use crate::root::widgets::{
-    render_action_keycap_row, render_env_chip, render_hint_pair, render_keycap_row, KeycapSize,
+    render_action_keycap_row, render_env_chip, render_hint_pair, render_keycap_row, text_tooltip,
+    KeycapSize,
 };
 
 /// Defines one `JumpToSessionN` action handler forwarding a literal position to
@@ -67,6 +68,46 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         self.new_session(SessionKind::Shell, window, cx);
+    }
+
+    /// `Ctrl+W` (GitHub issue #26) - closes whichever tab the centre pane is genuinely showing
+    /// right now: a file tab (via [`crate::code_surface::tabs::AdeApp::request_close_file_tab`],
+    /// the real unsaved-changes-confirming entry point every other close gesture already uses) if
+    /// [`AdeApp::open_change`] is `Some`, else the globally active session tab (via
+    /// [`Self::close_session`], which already tears down its real child process cleanly - SIGHUP,
+    /// a bounded grace period, then `SIGKILL` - see `pty_core::PtySession::shutdown`'s own docs;
+    /// nothing here reimplements that). A genuine no-op, never a window close, whenever there is
+    /// no real tab to close: Settings is showing over the workspace body (`AdeApp::settings_open`,
+    /// meaning nothing tab-like is on screen to act on), or the active worktree already has no
+    /// open tab at all (the real "last tab closed" end state this app leaves alone rather than
+    /// spawning a replacement or closing the window - this app registers no window-close
+    /// keybinding at all, on any platform, so there is no native "Ctrl+W closes the window"
+    /// default here to accidentally fall back to in the first place).
+    ///
+    /// Scoped to `Some("!terminal")` in `crate::default_key_bindings` (not global) - plain
+    /// `Ctrl+W` is `crate::terminal::pane::keystroke_to_bytes`'s own real `unix-word-rerase`
+    /// control byte (`0x17`) a focused shell needs for its own word-backspace; see that list's
+    /// own docs (and its `secondary-z`/`secondary-p`/`"]"` entries) for this project's established
+    /// precedent for exactly this "app-level shortcut steals terminal input" conflict class - a
+    /// live terminal pane keeps `Ctrl+W`, and closing a *terminal* tab this way stays reachable
+    /// through the tab strip's own `×`/middle-click instead.
+    pub(crate) fn handle_close_focused_tab_action(
+        &mut self,
+        _action: &CloseFocusedTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings_open {
+            return;
+        }
+        if let Some(path) = self.open_change.clone() {
+            self.request_close_file_tab(path, window, cx);
+            return;
+        }
+        if let Some(id) = self.sessions.active_id() {
+            self.close_session(id, window, cx);
+            cx.notify();
+        }
     }
 
     /// Activates session `id`'s tab and, if it maps to a currently-listed worktree, also selects
@@ -368,10 +409,13 @@ impl AdeApp {
 
     /// A file tab: language chip (`file_tree::lang_chip_for_name`, dimmed via
     /// `work_surface::file_tab_chip_colors` when inactive), file name, and a close hit box.
-    /// Clicking the body activates the tab ([`Self::activate_file_tab`]); clicking `×` closes it
-    /// ([`Self::close_file_tab`]) and stops propagation so it doesn't also activate (the same
-    /// pattern [`render_session_tab`]'s close button uses). Shares active/inactive bg/underline/
-    /// label colours with session tabs (`work_surface::tab_colors`).
+    /// Clicking the body activates the tab ([`Self::activate_file_tab`]); clicking `×`, middle-
+    /// clicking anywhere on the tab, or the global `Ctrl+W` (GitHub issue #26) all close it via
+    /// [`crate::code_surface::tabs::AdeApp::request_close_file_tab`] (never [`Self::close_file_tab`]
+    /// directly - see that method's own docs for the real unsaved-changes confirmation this keeps
+    /// every close gesture honest about), stopping propagation so a close never also activates
+    /// (the same pattern [`render_session_tab`]'s close button uses). Shares active/inactive bg/
+    /// underline/label colours with session tabs (`work_surface::tab_colors`).
     pub(in crate::work_surface) fn render_file_tab(
         &self,
         path: &Path,
@@ -385,13 +429,21 @@ impl AdeApp {
         let lang = file_tree::lang_chip_for_name(&file_name);
         let chip_colors = work_surface::file_tab_chip_colors(lang, is_active);
         let colors = work_surface::tab_colors(is_active);
-        let close_color = if is_active {
+        // `Self::close_tab_confirm_armed` (GitHub issue #26): a real, visible cue - not just an
+        // internal flag - that this specific dirty tab is one more close gesture away from really
+        // closing without saving, matching `Self::prune_status`'s own "the confirmation state is
+        // always on screen, never silent" precedent for this app's other two-gesture confirmations.
+        let is_close_armed = self.close_tab_confirm_armed.as_deref() == Some(path);
+        let close_color = if is_close_armed {
+            theme::button::DANGER_FG
+        } else if is_active {
             theme::text::DIMMER
         } else {
             theme::text::DISABLED
         };
         let activate_path = path.to_path_buf();
         let close_path = activate_path.clone();
+        let middle_click_path = activate_path.clone();
         let key = path.display().to_string();
         // Real dirty-state indicator (Revision R8.5a): a small dot, shown only while this tab's
         // real `EditBuffer` genuinely has unsaved edits (`EditBuffer::is_dirty`) - `false` for a
@@ -414,6 +466,16 @@ impl AdeApp {
             .border_r_1()
             .border_color(theme::border::INNER)
             .bg(colors.bg)
+            // Middle-click closes any file tab outright (GitHub issue #26), same real
+            // `request_close_file_tab` entry point as `×`/`Ctrl+W` - so a dirty tab still gets the
+            // real unsaved-changes confirmation rather than a middle-click silently bypassing it.
+            .on_mouse_down(
+                gpui::MouseButton::Middle,
+                cx.listener(move |this, _event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.request_close_file_tab(middle_click_path.clone(), window, cx);
+                }),
+            )
             // Real drag-to-reorder among file tabs - see `DraggedSessionTab`'s own docs for the
             // identical mechanism, mirrored here for `Self::open_files` instead of `Sessions`.
             .on_drag(drag_value, |dragged, _position, _window, cx| {
@@ -491,9 +553,17 @@ impl AdeApp {
                             .text_size(px(11.0))
                             .text_color(close_color)
                             .child("\u{d7}")
+                            // Real, visible confirmation cue (GitHub issue #26) - see
+                            // `close_color`'s own docs above for why `is_close_armed` never leaves
+                            // this a silent internal-only flag.
+                            .when(is_close_armed, |el| {
+                                el.tooltip(text_tooltip(
+                                    "Unsaved changes - click × again to close without saving",
+                                ))
+                            })
                             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                                 cx.stop_propagation();
-                                this.close_file_tab(close_path.clone(), window, cx);
+                                this.request_close_file_tab(close_path.clone(), window, cx);
                             })),
                     ),
             )
@@ -966,6 +1036,17 @@ impl AdeApp {
             .border_r_1()
             .border_color(theme::border::INNER)
             .bg(colors.bg)
+            // Middle-click closes any session/terminal tab too (GitHub issue #26) - the same
+            // `Self::close_session` real teardown (`TerminalPane::shutdown`'s SIGHUP/grace/
+            // SIGKILL - see that method's own docs) every other close path already uses.
+            .on_mouse_down(
+                gpui::MouseButton::Middle,
+                cx.listener(move |this, _event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.close_session(id, window, cx);
+                    cx.notify();
+                }),
+            )
             // Real drag-to-reorder (see `DraggedSessionTab`'s own docs): dragging this tab and
             // dropping it on another session tab in the same (per-worktree) strip moves it to
             // sit immediately before whichever tab it was dropped on

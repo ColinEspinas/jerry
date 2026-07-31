@@ -503,6 +503,49 @@ impl TextHistory {
         self.seal();
     }
 
+    /// Records `edits` as one atomic, already-sealed undo step - this module's own top docs'
+    /// "forward-compatible with multi-cursor" design, exercised for real by GitHub issue #26's
+    /// Tab/Shift+Tab indenting or dedenting N touched lines at once: N simultaneous splices that
+    /// must undo/redo together as a single step, not one at a time (`EditKind::Programmatic`'s own
+    /// "never coalesces" rule would otherwise split them into N separate groups if each were
+    /// recorded through [`Self::record`] individually, since consecutive splices at *different,
+    /// disjoint* line-start offsets never satisfy the caret-continuity check `can_coalesce` needs).
+    ///
+    /// `edits` must already be in the real order [`apply_forward`] should replay them - i.e. each
+    /// edit's own `at` must be valid against the text as it exists *after* every earlier edit in
+    /// `edits` has been applied (exactly how [`Self::record`]'s own per-keystroke coalescing already
+    /// builds up a multi-edit group one real, already-applied splice at a time - this just accepts
+    /// the whole run up front instead). [`Self::commit_undo`]/[`Self::commit_redo`]'s existing
+    /// forward/reverse replay handles the rest unchanged. A no-op if `edits` is empty, so a caller
+    /// that computed zero real changes (e.g. `Shift+Tab` on lines already at column 0) never pushes
+    /// an empty step the user would have to press Ctrl+Z past for nothing.
+    pub fn record_group(
+        &mut self,
+        edits: Vec<TextEdit>,
+        before: SelectionSnapshot,
+        after: SelectionSnapshot,
+        now: Instant,
+    ) {
+        if edits.is_empty() {
+            return;
+        }
+        for dropped in self.groups.drain(self.cursor..) {
+            self.bytes = self.bytes.saturating_sub(dropped.byte_cost());
+        }
+        let cost: usize = edits.iter().map(TextEdit::byte_cost).sum();
+        self.groups.push(EditGroup {
+            edits,
+            before,
+            after,
+            kind: EditKind::Programmatic,
+            last_edit_at: now,
+            sealed: true,
+        });
+        self.bytes += cost;
+        self.evict_until_within_budget();
+        self.cursor = self.groups.len();
+    }
+
     /// The group an undo would act on, **without** moving the cursor. The caller applies
     /// [`apply_inverse`] to each of its edits **in reverse order**, restores `before`, and only
     /// then calls [`Self::commit_undo`].
@@ -1518,5 +1561,106 @@ mod tests {
             history.retained_bytes() < with_branch,
             "the discarded redo branch's bytes must be released, not leaked into the running total"
         );
+    }
+
+    // GitHub issue #26: `record_group` - the real multi-edit-group primitive Tab/Shift+Tab
+    // indenting/dedenting N lines at once needs (see `EditBuffer::indent_lines`'s own docs).
+
+    #[test]
+    fn record_group_pushes_every_edit_into_one_real_undo_step() {
+        let mut history = TextHistory::new();
+        let now = t0();
+        history.record_group(
+            vec![insert(8, "  "), insert(0, "  ")],
+            SelectionSnapshot::of(&(0..10), false),
+            SelectionSnapshot::of(&(0..14), false),
+            now,
+        );
+        assert_eq!(
+            history.len(),
+            1,
+            "N simultaneous edits must be one group, not N"
+        );
+        let group = history.peek_undo().expect("one group to undo");
+        assert_eq!(group.edits.len(), 2);
+        assert_eq!(group.before, SelectionSnapshot::of(&(0..10), false));
+        assert_eq!(group.after, SelectionSnapshot::of(&(0..14), false));
+    }
+
+    #[test]
+    fn record_group_is_a_real_no_op_for_an_empty_edit_list() {
+        let mut history = TextHistory::new();
+        history.record_group(
+            Vec::new(),
+            SelectionSnapshot::caret(0),
+            SelectionSnapshot::caret(0),
+            t0(),
+        );
+        assert!(
+            history.is_empty(),
+            "an empty edit list must never push a real, empty undo step"
+        );
+    }
+
+    #[test]
+    fn record_group_never_coalesces_with_a_later_group_of_the_same_kind() {
+        // `EditKind::Programmatic`'s own "never coalesces" rule (shared with
+        // `record_replacement`) must still hold for a grouped multi-edit record - two separate
+        // `Tab` presses stay two separate undo steps, never merging into one.
+        let mut history = TextHistory::new();
+        let now = t0();
+        history.record_group(
+            vec![insert(0, "  ")],
+            SelectionSnapshot::caret(0),
+            SelectionSnapshot::caret(2),
+            now,
+        );
+        history.record_group(
+            vec![insert(2, "  ")],
+            SelectionSnapshot::caret(2),
+            SelectionSnapshot::caret(4),
+            now,
+        );
+        assert_eq!(
+            history.len(),
+            2,
+            "two real record_group calls must stay two real groups"
+        );
+    }
+
+    #[test]
+    fn record_group_drops_a_real_redo_branch_like_an_ordinary_record_does() {
+        let mut history = TextHistory::new();
+        let now = t0();
+        type_burst(&mut history, 0, "ab", now);
+        history.commit_undo();
+        assert!(history.can_redo());
+        history.record_group(
+            vec![insert(0, "X")],
+            SelectionSnapshot::caret(0),
+            SelectionSnapshot::caret(1),
+            now,
+        );
+        assert!(
+            !history.can_redo(),
+            "linear history: a grouped edit after an undo must discard the redo branch too"
+        );
+    }
+
+    #[test]
+    fn record_group_apply_forward_and_inverse_replay_a_real_multi_line_indent() {
+        // The real shape `EditBuffer::indent_lines` produces for a 3-line indent: edits collected
+        // bottom-to-top, each `at` valid against the text as it existed after the earlier (lower)
+        // edits in the list were already applied - see that method's own docs.
+        let mut text = "one\ntwo\nthree\n".to_string();
+        let edits = vec![insert(8, "  "), insert(4, "  "), insert(0, "  ")];
+        for edit in &edits {
+            assert!(apply_forward(&mut text, edit));
+        }
+        assert_eq!(text, "  one\n  two\n  three\n");
+        for edit in edits.iter().rev() {
+            assert!(apply_inverse(&mut text, edit));
+        }
+        assert_eq!(text, "one\ntwo\nthree\n");
     }
 }
