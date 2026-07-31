@@ -540,11 +540,11 @@ impl AdeApp {
     /// merge, which is exactly why this handler needs to exist rather than being assumed: with
     /// the editor open the tree's own node is the deepest focused one, so without the
     /// `"text-input"` context word `crate::sidebar::AdeApp::file_tree_shell` now emits, plain
-    /// `Ctrl+Z` while typing a filename satisfied `Undo`'s `Some("!terminal && !text-input")`
-    /// and ran the *worktree* history instead - discarding or re-committing real git state from
-    /// inside a rename box. The tag makes that predicate unsatisfiable here; this listener is
-    /// what the resulting `TextUndo` lands on. Registered on the same node that carries the tag
-    /// and the focus handle, per `crate::default_key_bindings`' own rule.
+    /// `Ctrl+Z` while typing a filename reached the worktree-level undo/redo this app used to
+    /// also have (removed - GitHub issue #47) instead of undoing the typed name. The tag makes
+    /// that predicate unsatisfiable here; this listener is what the resulting `TextUndo` lands
+    /// on. Registered on the same node that carries the tag and the focus handle, per
+    /// `crate::default_key_bindings`' own rule.
     ///
     /// A no-op when no editor is open: the tag is only emitted while one is, so the action
     /// cannot normally be produced then, and an unconditional `cx.notify()` would repaint for
@@ -1875,21 +1875,13 @@ mod tree_ops_regression_tests {
     /// and issue #17 (per-widget text undo) were built on two branches in parallel and only met
     /// at a merge. Nothing about that merge conflicted textually here, and the merged tree
     /// compiled and passed both sides' suites - but this editor was a bare `String` with no
-    /// `"text-input"` key-context word, so while typing a filename plain `Ctrl+Z` satisfied
-    /// `Undo`'s `Some("!terminal && !text-input")` and ran the **worktree** history: discarding
-    /// or re-committing real git state from inside a rename box, with the name unchanged and no
-    /// indication of what had happened. Verbatim the "a keystroke reaches the wrong handler" bug
-    /// class `crate::default_key_bindings`' own docs catalogue.
-    ///
-    /// Asserts both halves, because either alone would pass against a wrong fix: the typed name
-    /// really is undone (so `TextUndo` genuinely arrived and had a real history to act on), and
-    /// `worktree_history_status` is *still* untouched (so the worktree undo genuinely never ran
-    /// - the assertion that fails against the pre-merge-fix code, where it reads
-    /// `Some("nothing to undo")`).
+    /// `"text-input"` key-context word, so while typing a filename plain `Ctrl+Z` reached the
+    /// worktree-level undo/redo this app used to also have (removed - GitHub issue #47): the
+    /// name stayed unchanged and there was no indication of what had happened. Verbatim the "a
+    /// keystroke reaches the wrong handler" bug class `crate::default_key_bindings`' own docs
+    /// catalogue.
     #[gpui::test]
-    fn ctrl_z_while_typing_a_name_in_the_tree_undoes_the_name_not_the_worktree_history(
-        cx: &mut TestAppContext,
-    ) {
+    fn ctrl_z_while_typing_a_name_in_the_tree_undoes_the_name(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
         seed(&repo);
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
@@ -1914,10 +1906,6 @@ mod tree_ops_regression_tests {
                  or everything below would pass for the wrong reason"
             );
         });
-        assert!(
-            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
-            "sanity check: nothing has touched the worktree history yet"
-        );
 
         cx.simulate_keystrokes(&secondary("z"));
 
@@ -1932,53 +1920,7 @@ mod tree_ops_regression_tests {
                 "Ctrl+Z must undo the name typed into this field - one uninterrupted burst of \
                  typing is one coalesced group, so a single undo clears it"
             );
-            assert!(
-                app.worktree_history_status.is_none(),
-                "and it must never have reached the worktree-level Undo: that is what the \
-                 `\"text-input\"` word this editor's key context now carries makes impossible, \
-                 by rendering `Undo`'s own `!text-input` predicate unsatisfiable here"
-            );
         });
-    }
-
-    /// The other direction, which is what keeps the fix above honest rather than a blanket tag:
-    /// the tree with **no** editor open is not a text surface, so `Ctrl+Z` there must still reach
-    /// the worktree history exactly as it did before issue #17 existed.
-    ///
-    /// Without this, adding `"text-input"` unconditionally to the tree shell would pass the test
-    /// above while silently killing the worktree undo for anyone whose focus happens to sit on
-    /// the file tree - a new instance of the same bug class, pointed the other way.
-    #[gpui::test]
-    fn ctrl_z_in_the_focused_tree_with_no_editor_open_still_reaches_the_worktree_undo(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = TempDir::new().expect("tempdir");
-        seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
-        cx.run_until_parked();
-
-        app.update_in(cx, |app, window, cx| {
-            app.selected_tree_path = Some(repo.path().join("README.md"));
-            app.focus_file_tree(window, cx);
-        });
-        cx.run_until_parked();
-        app.read_with(cx, |app, _| {
-            assert!(
-                app.tree_inline_edit.is_none(),
-                "sanity check: no inline editor, so no `\"text-input\"` word"
-            );
-            assert!(app.worktree_history_status.is_none());
-        });
-
-        cx.simulate_keystrokes(&secondary("z"));
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.worktree_history_status.clone()),
-            Some("nothing to undo".to_string()),
-            "with the tree focused but nothing being typed, secondary-z must still reach the \
-             worktree-level Undo and produce its real, honest status"
-        );
     }
 
     /// The rename editor opens *pre-filled* with the entry's current name, and that pre-fill is
@@ -2030,12 +1972,6 @@ mod tree_ops_regression_tests {
                 "README.md",
                 "the pre-filled name is this field's baseline, not an undoable edit"
             );
-            assert!(
-                app.worktree_history_status.is_none(),
-                "and an empty text history must not let the keystroke fall through to the \
-                 worktree undo - the two systems are disjoint by context, not by whether the \
-                 text one happens to have anything to do"
-            );
         });
     }
 
@@ -2069,7 +2005,6 @@ mod tree_ops_regression_tests {
                 "assets",
                 "secondary-shift-z must redo the tree editor's own text"
             );
-            assert!(app.worktree_history_status.is_none());
         });
 
         // The second real spelling, which this app binds for the same action. The intermediate
@@ -2090,7 +2025,6 @@ mod tree_ops_regression_tests {
                 "assets",
                 "ctrl-y must reach the same handler"
             );
-            assert!(app.worktree_history_status.is_none());
         });
     }
 
@@ -2102,11 +2036,10 @@ mod tree_ops_regression_tests {
     /// Arming a delete goes through the context menu, and [`AdeApp::open_tree_context_menu`]
     /// cancels any open inline editor first. Both audits of the merge that added the tag raised
     /// this arm - keeping `"text-input"` there means `Ctrl+Z` behind the scrim would edit a name
-    /// field the user cannot see, but *dropping* it would hand the keystroke to the worktree
-    /// `Undo` instead, which is strictly worse (it mutates real git state), and guarding the
-    /// handlers would silently swallow the keystroke, which is this project's most-repeated bug
-    /// class. Proving the state unreachable is what makes all three concerns moot; asserting it
-    /// is what stops a later refactor from quietly making it reachable.
+    /// field the user cannot see, but guarding the handlers instead would silently swallow the
+    /// keystroke, which is this project's most-repeated bug class. Proving the state unreachable
+    /// is what makes both concerns moot; asserting it is what stops a later refactor from
+    /// quietly making it reachable.
     #[gpui::test]
     fn arming_a_delete_is_not_reachable_while_an_inline_name_editor_is_open(
         cx: &mut TestAppContext,

@@ -756,84 +756,6 @@ mod tab_strip_keybinding_tests {
         );
     }
 
-    /// Revision R10's own version of the same real conflict class as the two tests above, for
-    /// `Undo`: `secondary-z` resolves to plain `Ctrl+Z` on Linux/Windows, which a focused
-    /// terminal needs unclaimed to receive the real `SIGTSTP` suspend control byte
-    /// (`crate::terminal::pane::keystroke_tests::ctrl_z_maps_to_the_real_sigtstp_control_byte`
-    /// covers
-    /// that half). `AdeApp::new_with_settings` always starts a window with one real shell
-    /// session already focused (see that function's own docs) - no extra spawn/focus needed
-    /// here, unlike the merge/palette tests elsewhere in this file.
-    #[gpui::test]
-    fn secondary_z_does_not_undo_while_the_default_terminal_session_is_focused(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
-        bind_real_keys(cx);
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.sessions.iter().count()),
-            1,
-            "sanity check: a fresh window always starts with one real, focused shell session"
-        );
-        assert!(app.read_with(cx, |app, _| app.worktree_history_status.is_none()));
-
-        let secondary_z = if cfg!(target_os = "macos") {
-            "cmd-z"
-        } else {
-            "ctrl-z"
-        };
-        cx.simulate_keystrokes(secondary_z);
-
-        assert!(
-            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
-            "a real, simulated secondary-z keystroke must NOT reach Undo while the default, \
-             real terminal session has focus - crate::default_key_bindings scopes Undo/Redo to \
-             Some(\"!terminal\") specifically so this stays free to reach the pty as literal \
-             input instead"
-        );
-    }
-
-    /// The positive contrast to the test above: once real focus has genuinely moved off the
-    /// terminal (Settings open, its own real `track_focus`'d surface), `secondary-z` must reach
-    /// the real `Undo` action - proving `Some("!terminal")` isn't just silently swallowing the
-    /// keystroke everywhere.
-    #[gpui::test]
-    fn secondary_z_reaches_undo_once_real_focus_moves_off_the_terminal(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
-        bind_real_keys(cx);
-
-        app.update_in(cx, |app, window, cx| app.open_settings(window, cx));
-        // A real repaint is required before GPUI's key-dispatch tree reflects the new focus
-        // target - `simulate_keystrokes` dispatches against the *last painted* frame's tree,
-        // which (without this) would still be the terminal-showing frame from window creation,
-        // still tagged `"terminal"`.
-        cx.run_until_parked();
-        assert!(
-            app.read_with(cx, |app, _| app.settings_open),
-            "sanity check: Settings should now be open and focused"
-        );
-
-        let secondary_z = if cfg!(target_os = "macos") {
-            "cmd-z"
-        } else {
-            "ctrl-z"
-        };
-        cx.simulate_keystrokes(secondary_z);
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.worktree_history_status.clone()),
-            Some("nothing to undo".to_string()),
-            "once real focus has moved off the terminal, a real, simulated secondary-z \
-             keystroke must reach the real Undo action (Self::perform_undo's own honest \
-             \"nothing to undo\" status, since the stack is genuinely empty)"
-        );
-    }
-
     /// Spawns four extra real shell sessions (five total, including the one `AdeApp::new` starts)
     /// and confirms `secondary-3` really jumps to the third one in real session order - not just
     /// that `AdeApp::jump_to_session_at(3, ..)` does when called directly.
@@ -1361,10 +1283,6 @@ mod code_focus_tests {
 /// GitHub issue #17 §1/§3: real, dispatched `secondary-z` routing across every overlapping-scope
 /// case this app actually has. Deliberately `simulate_keystrokes`-driven throughout - the whole
 /// risk here is *which handler a keystroke reaches*, which no state-assertion-only test can see.
-///
-/// `crate::worktree_history::flow::AdeApp::perform_undo`'s own honest "nothing to undo" status is
-/// used as the real, observable tripwire for "the worktree-level Undo ran": it is set
-/// synchronously, on an empty stack, whenever that handler is genuinely reached.
 #[cfg(test)]
 mod text_undo_scoping_tests {
     use super::*;
@@ -1406,14 +1324,13 @@ mod text_undo_scoping_tests {
     }
 
     /// The hardest real case for §3's terminal rule: a real edit buffer with a real undo history
-    /// genuinely exists, and focus is genuinely back on a terminal. `secondary-z` must reach
-    /// *neither* undo system - not the worktree-level one (`!terminal`), and not text undo (no
-    /// `"text-input"` anywhere in a terminal's dispatch path) - leaving the keystroke free to
-    /// reach the pty as the real `SIGTSTP` control byte, which
+    /// genuinely exists, and focus is genuinely back on a terminal. `secondary-z` must not reach
+    /// text undo - no `"text-input"` anywhere in a terminal's dispatch path - leaving the
+    /// keystroke free to reach the pty as the real `SIGTSTP` control byte, which
     /// `crate::terminal::pane::keystroke_tests::ctrl_z_maps_to_the_real_sigtstp_control_byte`
     /// covers the other half of.
     #[gpui::test]
-    fn secondary_z_with_a_terminal_focused_reaches_neither_undo_system(cx: &mut TestAppContext) {
+    fn secondary_z_with_a_terminal_focused_does_not_reach_text_undo(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let file_path = repo.path().join("notes.txt");
         std::fs::write(&file_path, "hello\n").expect("write notes.txt");
@@ -1446,7 +1363,6 @@ mod text_undo_scoping_tests {
             "sanity check: the buffer (and its history) must still be alive, or this test would \
              pass for the wrong reason"
         );
-        assert!(app.read_with(cx, |app, _| app.worktree_history_status.is_none()));
 
         cx.simulate_keystrokes(SECONDARY_Z);
         cx.simulate_keystrokes(SECONDARY_SHIFT_Z);
@@ -1462,17 +1378,11 @@ mod text_undo_scoping_tests {
             "TYPEDhello\n",
             "with a real terminal focused, secondary-z must not undo a background buffer's text"
         );
-        assert!(
-            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
-            "and it must not reach the worktree-level Undo either - crate::default_key_bindings \
-             scopes it Some(\"!terminal && !text-input\") precisely so the keystroke stays free \
-             to reach the pty as literal input"
-        );
     }
 
     /// The palette-over-an-open-editor case `crate::default_key_bindings`' own docs single out:
     /// `secondary-z` must undo the *palette query*, because the palette is what has focus - not
-    /// the file editor still open behind it, and not the worktree-level history.
+    /// the file editor still open behind it.
     #[gpui::test]
     fn secondary_z_with_the_palette_open_undoes_the_query_not_the_file_editor_behind_it(
         cx: &mut TestAppContext,
@@ -1518,10 +1428,6 @@ mod text_undo_scoping_tests {
             content_before,
             "the file editor behind the palette must be completely untouched"
         );
-        assert!(
-            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
-            "and the worktree-level Undo must not have run"
-        );
 
         cx.simulate_keystrokes(SECONDARY_SHIFT_Z);
         assert_eq!(
@@ -1555,14 +1461,10 @@ mod text_undo_scoping_tests {
         );
     }
 
-    /// Settings › Keybindings' own filter field. Also the real contrast case for the pre-existing
-    /// `secondary_z_reaches_undo_once_real_focus_moves_off_the_terminal` test above: Settings
-    /// being *open* is not enough to claim `"text-input"` - only the filter row itself is tagged,
-    /// so the worktree-level Undo still owns the keystroke everywhere else on that surface.
+    /// Settings › Keybindings' own filter field. Settings being *open* is not enough to claim
+    /// `"text-input"` - only the filter row itself is tagged.
     #[gpui::test]
-    fn secondary_z_in_the_settings_keybindings_filter_undoes_the_filter_not_the_worktree_history(
-        cx: &mut TestAppContext,
-    ) {
+    fn secondary_z_in_the_settings_keybindings_filter_undoes_the_filter(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
@@ -1585,11 +1487,6 @@ mod text_undo_scoping_tests {
             app.read_with(cx, |app, _| app.settings_keymap_filter.as_str().to_string()),
             "",
             "the focused settings text field's own history is what secondary-z must step"
-        );
-        assert!(
-            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
-            "and the worktree-level Undo must not have run - it would have set its honest \
-             \"nothing to undo\" status"
         );
 
         cx.simulate_keystrokes("ctrl-y");
@@ -1633,7 +1530,6 @@ mod text_undo_scoping_tests {
             "main",
             "Esc clearing a filter must be a real, undoable step, not a silent loss"
         );
-        assert!(app.read_with(cx, |app, _| app.worktree_history_status.is_none()));
 
         cx.simulate_keystrokes(SECONDARY_Z);
         assert_eq!(
@@ -1681,7 +1577,6 @@ mod text_undo_scoping_tests {
             "",
             "the focused prompt's own history is what secondary-z must step"
         );
-        assert!(app.read_with(cx, |app, _| app.worktree_history_status.is_none()));
 
         // Cancel and reopen: a genuinely new prompt, so nothing to undo back to.
         app.update_in(cx, |app, window, cx| app.cancel_new_file(window, cx));
@@ -1701,99 +1596,6 @@ mod text_undo_scoping_tests {
                 .to_string()),
             "",
             "a fresh prompt must have no predecessor history reachable from it"
-        );
-    }
-
-    /// The exact sequence self-review turned up: with nothing left to focus, the app falls
-    /// back to the rail, and `secondary-z` must still reach the worktree-level `Undo` rather than
-    /// being silently swallowed by a text input the user never asked to type in.
-    ///
-    /// This is the regression for a real, reachable bug this issue's own first draft introduced:
-    /// the fallback used to target `filter_focus_handle`, which now carries a `"text-input"` key
-    /// context, so `Undo`'s `!terminal && !text-input` predicate became unsatisfiable and
-    /// `TextUndo` won against an empty field - a keystroke consumed with no effect and no
-    /// feedback, verbatim the bug class `crate::default_key_bindings`' own docs catalogue
-    /// seven-plus instances of. Fixed by giving the rail's context-less root its own focus handle
-    /// (`AdeApp::rail_focus_handle`) and pointing all three fallback sites at that instead.
-    #[gpui::test]
-    fn secondary_z_still_reaches_the_worktree_undo_after_focus_falls_back_to_the_rail(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
-        bind_real_keys(cx);
-
-        let session_id = app
-            .read_with(cx, |app, _| app.sessions.active_id())
-            .expect("a fresh window always starts with one real, focused shell session");
-        app.update_in(cx, |app, window, cx| {
-            app.close_session(session_id, window, cx);
-        });
-        cx.run_until_parked();
-        assert!(
-            app.read_with(cx, |app, _| app.sessions.active_id().is_none()
-                && app.open_change.is_none()
-                && !app.settings_open),
-            "sanity check: this must really be the \"nothing left to focus\" fallback state, or \
-             the assertion below would pass for the wrong reason"
-        );
-        assert!(app.read_with(cx, |app, _| app.worktree_history_status.is_none()));
-
-        cx.simulate_keystrokes(SECONDARY_Z);
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.worktree_history_status.clone()),
-            Some("nothing to undo".to_string()),
-            "with focus on the app's fallback target - not a text widget anyone chose - \
-             secondary-z must still reach the worktree-level Undo and produce its real, honest \
-             status, never be swallowed by an empty text field's own history"
-        );
-    }
-
-    /// The fourth dangling-focus site of this shape, found by an independent adversarial audit
-    /// after the three already fixed on this branch: switching Settings pages away from
-    /// Keybindings left focus on that page's own now-unrendered filter field. GPUI then falls back
-    /// to the dispatch root with an **empty** context stack, against which every scoped predicate
-    /// is dead - so `secondary-z` reached neither undo system and vanished with no feedback at all.
-    ///
-    /// Asserts real feedback, not merely "the filter didn't change": silence is exactly the
-    /// symptom, so a test that only checked the text would have passed against the bug.
-    #[gpui::test]
-    fn secondary_z_still_reaches_a_real_handler_after_switching_away_from_the_keybindings_page(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        bind_real_keys(cx);
-
-        app.update_in(cx, |app, window, cx| {
-            app.open_settings(window, cx);
-            app.select_settings_page(settings::SettingsPage::Keymap, window, cx);
-            window.focus(&app.settings_keymap_filter_focus_handle, cx);
-        });
-        cx.run_until_parked();
-        cx.simulate_input("abc");
-        assert_eq!(
-            app.read_with(cx, |app, _| app.settings_keymap_filter.as_str().to_string()),
-            "abc",
-            "sanity check: the filter must really be focused and receiving real keystrokes"
-        );
-
-        // Leave the page. The filter row stops being rendered entirely.
-        app.update_in(cx, |app, window, cx| {
-            app.select_settings_page(settings::SettingsPage::Appearance, window, cx);
-        });
-        cx.run_until_parked();
-
-        assert!(app.read_with(cx, |app, _| app.worktree_history_status.is_none()));
-        cx.simulate_keystrokes(SECONDARY_Z);
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.worktree_history_status.clone()),
-            Some("nothing to undo".to_string()),
-            "with the filter no longer rendered, secondary-z must reach a real handler and \
-             produce real feedback - not fall into an empty dispatch context and vanish"
         );
     }
 }

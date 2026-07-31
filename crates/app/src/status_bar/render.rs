@@ -38,9 +38,8 @@ impl AdeApp {
     fn render_status_bar_left(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mut segments: Vec<gpui::AnyElement> = Vec::new();
         // Shown first, and only while genuinely set - the real, transient feedback from
-        // "keep all changes"/"discard worktree"/`Undo`/`Redo` (Revision R10). See this method's
-        // own docs for why this lives here, in the status bar, rather than the rail footer's own
-        // status slot.
+        // "keep all changes"/"discard worktree" (Revision R10). See this method's own docs for
+        // why this lives here, in the status bar, rather than the rail footer's own status slot.
         if let Some(notice) = self.render_status_worktree_history_notice() {
             segments.push(notice);
         }
@@ -53,10 +52,10 @@ impl AdeApp {
         render_status_segment_row(segments).into_any_element()
     }
 
-    /// The transient "keeping all changes…"/"discarded …"/"undo failed: …" feedback from
-    /// `AdeApp::keep_all_changes`/`AdeApp::execute_discard_worktree`/`AdeApp::perform_undo`/
-    /// `AdeApp::perform_redo` (`worktree_history::flow`, Revision R10) - `None` (nothing rendered
-    /// at all) whenever [`AdeApp::worktree_history_status`] is `None`.
+    /// The transient "keeping all changes…"/"discarded …" feedback from
+    /// `AdeApp::keep_all_changes`/`AdeApp::execute_discard_worktree` (`worktree_history::flow`,
+    /// Revision R10) - `None` (nothing rendered at all) whenever
+    /// [`AdeApp::worktree_history_status`] is `None`.
     ///
     /// Deliberately shown here, in the status bar, rather than the rail footer's own status slot
     /// (`Self::render_rail_footer`) - an audit found two real problems with that shared slot:
@@ -64,9 +63,9 @@ impl AdeApp {
     /// field's own docs), so a single prune click permanently hid every future worktree-history
     /// status for the rest of the session; and the rail footer disappears entirely while Settings
     /// is open (`AdeApp::render_workspace_body` isn't called - `root/mod.rs`'s `Render` impl
-    /// swaps it out for `Self::render_settings`), leaving *no* real status surface at all for a
-    /// keybinding-triggered `Undo`/`Redo`. The status bar is rendered as an unconditional sibling
-    /// of that swap, so it stays visible either way.
+    /// swaps it out for `Self::render_settings`), leaving *no* real status surface at all for
+    /// this feedback while Settings is open. The status bar is rendered as an unconditional
+    /// sibling of that swap, so it stays visible either way.
     ///
     /// Long, load-bearing text (`Error::DiscardRemovalFailedAfterStash`'s real stash id,
     /// `Error::HeadMovedSinceRecorded`'s two full 40-character commit shas, ...) is truncated

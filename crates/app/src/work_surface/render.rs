@@ -1594,10 +1594,10 @@ impl AdeApp {
                 enabled = false;
             }
             // `Keep all`/`Discard worktree` (Revision R10) share one in-flight guard
-            // (`Self::worktree_history_op_in_flight`) with `Undo`/`Redo` - see
-            // `crate::worktree_history::flow`'s own module docs for why one flag is enough
-            // discipline here. Disabled, not just relabelled, while busy - mirrors
-            // `Self::render_rail_footer`'s own `prune_in_flight` gating.
+            // (`Self::worktree_history_op_in_flight`) - see `crate::worktree_history::flow`'s own
+            // module docs for why one flag is enough discipline here. Disabled, not just
+            // relabelled, while busy - mirrors `Self::render_rail_footer`'s own `prune_in_flight`
+            // gating.
             let is_worktree_history_action = matches!(
                 action.kind,
                 work_surface::ActionKind::KeepAllChanges
@@ -1609,7 +1609,7 @@ impl AdeApp {
             // Busy labels are keyed off the *specific* in-flight kind, not just "something is
             // running" - a real, live-reproduced bug an audit caught: keying this off the bare
             // in-flight flag alone made every visible `Discard worktree` button across every
-            // session read "discarding…" while an unrelated `Undo` of a `Keep all` was running.
+            // session read "discarding…" while an unrelated `Keep all` was running.
             let label = match action.kind {
                 work_surface::ActionKind::DiscardWorktree
                     if self.worktree_history_op_in_flight

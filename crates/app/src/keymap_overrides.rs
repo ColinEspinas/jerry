@@ -217,8 +217,7 @@ pub fn real_context_stacks() -> Vec<Vec<&'static str>> {
 /// thing it guards grows is not a guard.
 ///
 /// `"text-input"` is emitted for both editor-open cases: an inline name editor is a real
-/// text-typing surface, and the tag is what makes `Undo`'s `"!terminal && !text-input"`
-/// unsatisfiable there, so `Ctrl+Z` mid-filename cannot reach the *worktree* history.
+/// text-typing surface, and the tag is what routes `Ctrl+Z` mid-filename to `TextUndo`.
 ///
 /// `(true, true)` is a deliberate over-approximation: no real gesture sequence reaches it, because
 /// arming a delete goes through the context menu and
@@ -576,86 +575,9 @@ mod tests {
         );
     }
 
-    /// The exact checker's answer for `Undo` (`"!terminal && !text-input"`) versus a
-    /// `"file-editor"`-scoped binding: **no** collision, because every real stack carrying
-    /// `"file-editor"` also carries `"text-input"` (they are emitted by the same
-    /// `crate::code_surface::render` node), so `Undo` is provably never live over a file editor.
-    ///
-    /// This assertion is the exact opposite of what it was before GitHub issue #17, and the flip
-    /// is the point. It used to warn, correctly, because `Undo` was scoped bare `"!terminal"` and
-    /// a file editor is not a terminal. Both facts changed: `Undo` gained `&& !text-input`, and
-    /// the file editor gained the `"text-input"` tag. The heuristic this replaced could not see
-    /// either change - it answered `false` for two unrelated `Identifier`s and `true` for a
-    /// negation it couldn't rule out, neither of which was ever a *proof*.
-    #[test]
-    fn worktree_undo_provably_cannot_collide_with_a_file_editor_binding() {
-        let bindings = crate::default_key_bindings();
-        let undo = bindings
-            .iter()
-            .find(|b| b.action().name() == "app::Undo")
-            .expect("Undo should be a real default binding");
-        assert_eq!(
-            context_label(undo.predicate().as_deref()),
-            "!terminal && !text-input",
-            "sanity check: this test is only meaningful while Undo really carries both negations"
-        );
-        let editor_copy = bindings
-            .iter()
-            .find(|b| {
-                b.action().name() == "app::EditorCopy"
-                    && context_label(b.predicate().as_deref()) == "file-editor"
-            })
-            .expect("a file-editor-scoped EditorCopy binding should exist");
-
-        let collision = find_colliding_binding(
-            &bindings,
-            &bindings,
-            undo,
-            &editor_copy.keystrokes()[0].inner().unparse(),
-        );
-        let collision = collision.map(|b| b.action().name());
-        // This test's own claim, asserted directly against the predicate pair rather than via
-        // *which* binding `find_colliding_binding` happens to return first - a bare
-        // `assert_ne!(collision, Some("app::EditorCopy"))` would be satisfied by any other
-        // binding merely being found earlier, which is not the same statement at all.
-        assert!(
-            !contexts_could_overlap(
-                undo.predicate().as_deref(),
-                editor_copy.predicate().as_deref(),
-            ),
-            "no real context stack carries file-editor without text-input, so Undo genuinely \
-             cannot fire alongside EditorCopy - this test's own claim, and still true"
-        );
-        // ...but `secondary-c` is not EditorCopy's alone any more, and the honest answer to
-        // "would rebinding Undo onto it collide?" is now yes, against a *different* binding.
-        //
-        // GitHub issue #19 bound `FileTreeCopy` to the same keystroke under
-        // `"file-tree && !tree-editing && !tree-delete-confirm"`, and the focused file tree with
-        // no inline editor open (`["app", "file-tree"]`) really does satisfy both that and
-        // `Undo`'s `"!terminal && !text-input"` - a tree row is not a terminal and not a text
-        // input, which is exactly why Ctrl+Z there reaches the worktree history (asserted by
-        // `crate::sidebar::tree_ops`'s own
-        // `ctrl_z_in_the_focused_tree_with_no_editor_open_still_reaches_the_worktree_undo`).
-        //
-        // So this is a real warning about a real overlap, not a false positive, and it is
-        // asserted rather than tolerated: the two actions coexist safely today only because
-        // their *default* keystrokes differ, and a user rebinding `Worktree history: undo` onto
-        // Ctrl+C through the Settings UI genuinely would leave GPUI's dispatch order to pick a
-        // winner. It became visible only when the merge that brought issue #19's tree into this
-        // branch added the four `file-tree*` stacks to `real_context_stacks()`; before that the
-        // checker had never seen a stack where `FileTreeCopy` was live at all.
-        assert_eq!(
-            collision,
-            Some("app::FileTreeCopy"),
-            "the file tree is a real context where the worktree-level Undo is live, so a rebind \
-             onto secondary-c must be reported as colliding with the tree's own Copy binding"
-        );
-    }
-
-    /// The direction that *must* warn, and the exact reason GitHub issue #17 needed this checker
-    /// made precise: `"file-editor"` and `"text-input"` are emitted by the **same node**, so a
-    /// `file-editor`-scoped binding rebound onto `secondary-z` really does collide - with
-    /// `TextUndo`, not with the worktree-level `Undo` the old heuristic used to name.
+    /// The exact reason GitHub issue #17 needed this checker made precise: `"file-editor"` and
+    /// `"text-input"` are emitted by the **same node**, so a `file-editor`-scoped binding rebound
+    /// onto `secondary-z` really does collide - with `TextUndo`.
     #[test]
     fn a_file_editor_binding_rebound_onto_secondary_z_collides_with_text_undo() {
         let bindings = crate::default_key_bindings();
@@ -854,65 +776,6 @@ mod tests {
                 "context literal {literal:?} is emitted by real render code but missing from \
                  real_context_stacks()"
             );
-        }
-    }
-
-    /// GitHub issue #17's central scoping claim, checked here as pure predicate logic rather than
-    /// as a live-dispatch assertion (that half is covered by real `simulate_keystrokes` tests in
-    /// `crate::root::focus` and `crate::code_surface::editing`): the worktree-level `Undo` and the
-    /// per-widget `TextUndo` are both bound to `secondary-z`, and their context predicates are
-    /// *provably* disjoint - not merely unflagged by a checker that doesn't understand them.
-    #[test]
-    fn the_two_undo_systems_share_a_keystroke_but_are_provably_disjoint_scopes() {
-        let bindings = crate::default_key_bindings();
-        let worktree_undo = bindings
-            .iter()
-            .find(|b| b.action().name() == "app::Undo")
-            .expect("Undo should be a real default binding");
-        let text_undo = bindings
-            .iter()
-            .find(|b| b.action().name() == "app::TextUndo")
-            .expect("TextUndo should be a real default binding");
-
-        assert_eq!(
-            worktree_undo.keystrokes()[0].inner().unparse(),
-            text_undo.keystrokes()[0].inner().unparse(),
-            "sanity check: this test is only meaningful while the two really do share one \
-             physical keystroke"
-        );
-        assert!(!contexts_could_overlap(
-            worktree_undo.predicate().as_deref(),
-            text_undo.predicate().as_deref(),
-        ));
-        assert!(!contexts_could_overlap(
-            text_undo.predicate().as_deref(),
-            worktree_undo.predicate().as_deref(),
-        ));
-    }
-
-    /// The same disjointness for the redo half, including the extra `ctrl-y` binding GitHub issue
-    /// #17's checklist asks for.
-    #[test]
-    fn every_text_redo_binding_is_disjoint_from_the_worktree_level_redo() {
-        let bindings = crate::default_key_bindings();
-        let worktree_redo = bindings
-            .iter()
-            .find(|b| b.action().name() == "app::Redo")
-            .expect("Redo should be a real default binding");
-        let text_redos: Vec<&KeyBinding> = bindings
-            .iter()
-            .filter(|b| b.action().name() == "app::TextRedo")
-            .collect();
-        assert_eq!(
-            text_redos.len(),
-            2,
-            "TextRedo is bound twice by design: secondary-shift-z and ctrl-y"
-        );
-        for binding in text_redos {
-            assert!(!contexts_could_overlap(
-                worktree_redo.predicate().as_deref(),
-                binding.predicate().as_deref(),
-            ));
         }
     }
 

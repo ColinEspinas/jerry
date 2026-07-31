@@ -305,11 +305,11 @@ pub enum ActionKind {
     /// `crate::worktree_history::flow::AdeApp::keep_all_changes` (Revision R10): a real,
     /// undoable `wt_core::undo::commit_all_changes` on this session's worktree.
     KeepAllChanges,
-    /// `crate::worktree_history::flow::AdeApp::request_discard_worktree` (Revision R10): a real,
-    /// undoable `wt_core::undo::discard_worktree`, behind the same two-click confirmation as the
-    /// rail footer's `prune` button (see that method's own docs for why - this is real,
-    /// destructive-feeling, and force-removes a worktree, even though it's now recoverable via
-    /// `Undo`).
+    /// `crate::worktree_history::flow::AdeApp::request_discard_worktree` (Revision R10): a real
+    /// `wt_core::undo::discard_worktree`, behind the same two-click confirmation as the rail
+    /// footer's `prune` button (see that method's own docs for why - this is a real, destructive
+    /// action that force-removes a worktree, preserving uncommitted/untracked content in a real
+    /// git stash first).
     DiscardWorktree,
     /// No backing logic exists yet (git-level review/editor-surface workflows) - always rendered
     /// disabled regardless of [`FooterAction::implemented`] (always `false` for these).
@@ -347,7 +347,7 @@ pub fn footer_actions(status: Status) -> Vec<FooterAction> {
                 // global keybinding for it - see `crate::default_key_bindings`'s own docs on
                 // why a global `Ctrl+Enter`/`Cmd+Enter` isn't safe to add casually (the same
                 // "app-level shortcut steals terminal input" risk class already documented
-                // there for `Undo`/`Redo`, which scope themselves away from a focused terminal
+                // there for `CloseFocusedTab`, which scopes itself away from a focused terminal
                 // rather than accept the collision; this app's whole domain is running agent
                 // CLIs in terminals, and Ctrl+Enter/Cmd+Enter is a plausible binding one
                 // of them could reasonably use for its own "submit" gesture). An audit caught

@@ -133,39 +133,11 @@ impl AdeApp {
             },
         ];
 
-        // At most two real rows (Revision R10) - see `palette::HistoryCandidate`'s own docs for
-        // why this is never a full log. Omitted entirely while a worktree-history operation is
-        // already in flight (`Self::worktree_history_op_in_flight`) - a real, live-reproduced
-        // bug an audit caught: `Self::perform_undo`/`perform_redo` already no-op while busy
-        // (mirroring every other entry point into this feature), so leaving the rows visible and
-        // apparently clickable in that window was exactly the "looks actionable but silently
-        // does nothing" pattern this app's own rules forbid, the same discipline the footer's
-        // `Keep all`/`Discard worktree` buttons already get by being genuinely disabled while
-        // busy.
-        let mut history = Vec::new();
-        if self.worktree_history_op_in_flight.is_none() {
-            if let Some(entry) = self.undo_stack.peek_undo() {
-                history.push(palette::HistoryCandidate {
-                    direction: palette::HistoryDirection::Undo,
-                    description: entry.description.clone(),
-                    worktree_path: entry.action.worktree_path().to_path_buf(),
-                });
-            }
-            if let Some(entry) = self.undo_stack.peek_redo() {
-                history.push(palette::HistoryCandidate {
-                    direction: palette::HistoryDirection::Redo,
-                    description: entry.description.clone(),
-                    worktree_path: entry.action.worktree_path().to_path_buf(),
-                });
-            }
-        }
-
         palette::build_groups(
             self.palette_scope,
             self.palette_query.as_str(),
             &sessions,
             &commands,
-            &history,
             &self.palette_file_candidates,
         )
     }
@@ -386,12 +358,6 @@ impl AdeApp {
                 }
                 palette::EntryTarget::Session(id) => self.select_session(id, window, cx),
                 palette::EntryTarget::File(path) => self.open_palette_file_result(path, window, cx),
-                palette::EntryTarget::History(palette::HistoryDirection::Undo) => {
-                    self.perform_undo(cx)
-                }
-                palette::EntryTarget::History(palette::HistoryDirection::Redo) => {
-                    self.perform_redo(cx)
-                }
             }
         }
         if window.focused(cx) == focus_before {
@@ -533,14 +499,12 @@ impl AdeApp {
                     .id("palette-panel")
                     .track_focus(&self.palette_focus_handle)
                     // The one shared context tag every real text-typing surface in this app
-                    // carries (GitHub issue #17): it routes `secondary-z` to `TextUndo` here
-                    // rather than to `crate::worktree_history`'s worktree-level `Undo`, which is
-                    // correspondingly scoped `"!terminal && !text-input"`. Registering the
-                    // listener on *this* node - the one `palette_focus_handle` is tracked on - is
-                    // what makes the routing structural: GPUI only dispatches an action along the
-                    // focused node's own ancestor path, so a palette query typed over an open file
-                    // editor undoes the query, not the file. See `crate::default_key_bindings`'
-                    // own docs.
+                    // carries (GitHub issue #17): it routes `secondary-z` to `TextUndo` here.
+                    // Registering the listener on *this* node - the one `palette_focus_handle` is
+                    // tracked on - is what makes the routing structural: GPUI only dispatches an
+                    // action along the focused node's own ancestor path, so a palette query typed
+                    // over an open file editor undoes the query, not the file. See
+                    // `crate::default_key_bindings`' own docs.
                     .key_context("text-input")
                     .on_action(cx.listener(Self::handle_palette_text_undo))
                     .on_action(cx.listener(Self::handle_palette_text_redo))
@@ -839,10 +803,6 @@ impl AdeApp {
                     .unwrap_or_default();
                 render_palette_file_chip(file_tree::lang_chip_for_name(&name)).into_any_element()
             }
-            // History rows (Revision R10) are commands in every sense that matters to this
-            // chip (a fixed, non-file, non-session action) - reusing the same chip rather than
-            // inventing a dedicated one for two rows.
-            palette::EntryTarget::History(_) => render_palette_command_chip().into_any_element(),
         };
 
         let mut row = div()

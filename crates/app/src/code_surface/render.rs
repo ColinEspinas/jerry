@@ -189,12 +189,9 @@ impl AdeApp {
         // `"text-input"` (GitHub issue #17) rides alongside `"file-editor"` on exactly the same
         // node, for exactly the same real reason `"file-editor"` itself does (see above): it is
         // the one shared tag every real text-typing surface in this app carries, and it is what
-        // routes `secondary-z` to text undo rather than to `crate::worktree_history`'s
-        // worktree-level `Undo` - which is correspondingly scoped `"!terminal && !text-input"`, so
-        // the two are provably disjoint rather than order-dependent. See
-        // `crate::default_key_bindings`' own docs for the full rationale. It is added only in the
-        // `is_file_editor` cases: the read-only Diff view has no text history to undo, and must
-        // keep leaving `secondary-z` to the worktree-level `Undo`, exactly as before.
+        // routes `secondary-z` to text undo. See `crate::default_key_bindings`' own docs for the
+        // full rationale. It is added only in the `is_file_editor` cases: the read-only Diff view
+        // has no text history to undo.
         let key_context = match (is_file_editor, completions_open) {
             (true, true) => "diff file-editor text-input completions",
             (true, false) => "diff file-editor text-input",

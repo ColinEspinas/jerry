@@ -4569,3 +4569,142 @@ Verification, from this Linux sandbox with the usual `LIBRARY_PATH` X11 workarou
 `pty-core` 14, `wt-core` 107) - including no reappearance of the known
 `diff_render_tests::opening_a_real_diff_renders_real_syntax_highlighted_rows` flake this run at
 all.
+## Remove the worktree-level undo/redo action and shortcut (GitHub issue #47)
+
+GitHub issue #47, verbatim: "Remove undo/redo worktree action and shortcut, they are useless and
+not in the initial scope." This app has always had two entirely separate undo systems sharing one
+physical keystroke (`secondary-z`/`secondary-shift-z`): a command-pattern stack over real git
+mutations (`root::Undo`/`root::Redo`, Revision R10 - reverting/reapplying "keep all changes"/
+"discard worktree") and per-widget **text** undo (`root::TextUndo`/`root::TextRedo`, GitHub issue
+#17). This revision removes only the first. The second - and the underlying `wt_core::undo::
+commit_all_changes`/`discard_worktree` operations plus the "Keep all changes"/"Discard worktree"
+footer buttons that call them directly - are unrelated, still-wanted features and were
+deliberately left untouched.
+
+**What was removed.** `root::Undo`/`root::Redo` (the `actions!` entries, their `on_action`
+registrations, and `crate::worktree_history::flow::AdeApp::handle_undo_action`/
+`handle_redo_action`/`perform_undo`/`perform_redo`, along with the `RedoResult` enum and the
+`canonical_paths_match` identity-guard helper `perform_redo` alone used); the two
+`secondary-z`/`secondary-shift-z` → `Undo`/`Redo` default keybindings in
+`crate::default_key_bindings` (Revision R10's `Some("!terminal && !text-input")` scoping); the
+`crate::worktree_history::undo` module entirely (`UndoStack`/`UndoableAction`/`UndoEntry` - a
+pure, GPUI-free command-pattern stack with nothing left to call it once `perform_undo`/
+`perform_redo` were gone) and its own unit tests; the `AdeApp::undo_stack` field and its
+`root::state::new_with_settings` initializer; the command palette's History group
+(`palette::state::HistoryDirection`/`HistoryCandidate`, the `EntryTarget::History` variant,
+`filter_history`, and the group's slot in `build_groups`/`build_palette_groups`) along with its
+own render-side chip case and `run_selected_palette_entry` dispatch arm; the title bar's Edit
+menu's "Undo worktree action"/"Redo worktree action" rows and their now-redundant divider (the
+text `Undo`/`Redo` pair directly above stays); and the Keybindings page's `"app::Undo"`/
+`"app::Redo"` → `"Worktree history: undo"`/`"Worktree history: redo"` pretty-name entries.
+
+**What stayed, deliberately.** `wt_core::undo::commit_all_changes`/`discard_worktree` (and every
+other function in that module - `undo_commit_all_changes`/`redo_commit_all_changes`/
+`undo_discard_worktree`, all their own real git-level identity guards) are untouched: the "Keep
+all changes"/"Discard worktree" footer buttons (`crate::worktree_history::flow::AdeApp::
+keep_all_changes`/`request_discard_worktree`/`execute_discard_worktree`) still call them directly
+and are still fully real and functional - only the *ability to undo/redo* those two operations
+from within the app is gone now. `AdeApp::worktree_history_op_in_flight`/
+`WorktreeHistoryOpKind` (still a real, named two-variant enum, `Keep`/`Discard` - simplified down
+from four variants rather than removed, since Keep/Discard still need one shared in-flight guard
+for exactly the reason their own docs already gave: an audit-caught bug where the busy label was
+keyed off a bare `bool` rather than a specific kind) and `AdeApp::worktree_history_status` (the
+status-bar feedback slot both buttons still write into) both stay, simplified rather than deleted.
+`text_history`/`TextUndo`/`TextRedo` were not touched in any way - same coalescing policy, same
+`Some("text-input")` scoping, same five hand-rolled single-line inputs plus the code surface and
+merge hand-edit buffer, same tests, same behavior.
+
+**Doc-comment surgery.** A large share of this diff is prose, not logic: dozens of doc comments
+throughout `crates/app/src` explained the *disjointness* of the two undo systems - why
+`secondary-z` routes to one or the other depending on context, why that routing is structural
+(per-node `on_action` registration) rather than dispatch-order-dependent, and which real,
+previously-shipped bugs that disjointness fixed. With only one system left, every one of those
+comments was rewritten rather than deleted outright wherever it still carried live information
+(e.g. `crate::keymap_overrides::file_tree_key_context`'s docs on why the file tree's inline editor
+carries `"text-input"`, `crate::terminal::pane`'s docs on why terminal panes carry a `"terminal"`
+context tag - now illustrated by `CloseFocusedTab`'s `Some("!terminal")` scoping instead of the
+removed `Undo`/`Redo`'s, since that's the real remaining binding the tag exists for) - see
+`crates/app/src/lib.rs`'s `default_key_bindings` doc comment, `crates/app/src/text_history.rs`'s
+module docs, and `crates/app/src/worktree_history/mod.rs`/`flow.rs`'s own module docs for the most
+substantial rewrites.
+
+**Test accounting.** Exactly 31 tests were removed from the `app` crate, all real, all specific to
+the removed system - no test that covers `TextUndo`/`TextRedo`, or `wt_core::undo`'s own functions,
+or the "Keep all"/"Discard worktree" buttons themselves, was touched beyond stripping a
+now-permanently-vacuous `worktree_history_status.is_none()`/`can_undo()`/`peek_undo()` assertion
+that could never fail again once the code path that could set it no longer exists:
+- `worktree_history::undo`'s own 8 unit tests (the whole module was deleted).
+- 10 tests in `worktree_history::flow::worktree_history_regression_tests` that exercised
+  `perform_undo`/`perform_redo`/`handle_undo_action`/`handle_redo_action`/the History palette
+  group directly (`undo_then_redo_of_keep_all_changes_round_trips_through_real_git_state`,
+  `undo_of_keep_all_changes_is_refused_and_reported_when_head_moved_since`,
+  `redo_of_discard_also_honestly_notes_when_gitignored_content_was_lost`,
+  `undo_of_discard_recreates_the_worktree_with_stash_content_restored_but_not_the_session`,
+  `redo_of_discard_re_discards_the_recreated_worktrees_real_current_content`,
+  `a_new_keep_all_changes_after_an_undo_clears_the_redo_stack`,
+  `redo_of_discard_refuses_when_the_path_was_reoccupied_by_a_different_branch_since_the_undo`,
+  `the_in_flight_kind_is_tracked_as_a_specific_enum_value_not_a_bare_bool`,
+  `a_keybinding_triggered_redo_while_an_undo_is_still_in_flight_is_visibly_rejected_not_silently_dropped`,
+  `history_palette_rows_are_hidden_while_an_operation_is_in_flight`); the 3 tests
+  (`keep_all_changes_commits_a_dirty_worktree`, `a_second_keep_all_changes_while_the_first_is_in_flight_does_not_race_it`,
+  `discard_worktree_two_click_confirm_removes_it_and_closes_its_session`) that also exercise real
+  `keep_all_changes`/`request_discard_worktree` git mutations were kept, trimmed of only their
+  stack-specific assertions.
+- 1 test in `lib.rs`'s `undo_scoping_matrix_tests`
+  (`every_redo_spelling_is_claimed_by_at_most_one_undo_system_in_every_real_context`); its sibling
+  `secondary_z_is_claimed_by_at_most_one_undo_system_in_every_real_context` was kept and renamed
+  to `secondary_z_reaches_text_undo_in_exactly_the_real_text_input_contexts`, now asserting only
+  `TextUndo`'s own enablement per real context stack (the exact same per-stack expectations it
+  always encoded for the text half).
+- 3 tests in `palette::state` (`no_history_candidates_means_no_history_group_at_all`,
+  `history_group_shows_undo_and_redo_rows_with_the_real_direction_targets`,
+  `history_group_only_appears_in_all_and_commands_scope_and_respects_the_query`).
+- 4 tests in `root::focus` (`secondary_z_does_not_undo_while_the_default_terminal_session_is_focused`,
+  `secondary_z_reaches_undo_once_real_focus_moves_off_the_terminal`,
+  `secondary_z_still_reaches_the_worktree_undo_after_focus_falls_back_to_the_rail`,
+  `secondary_z_still_reaches_a_real_handler_after_switching_away_from_the_keybindings_page`) - the
+  last two are a real, honestly-disclosed coverage gap, not an oversight: both used the
+  worktree-level undo's own honest "nothing to undo" status as an observable tripwire for "a
+  keybinding reached a real handler after a dangling-focus fallback," and with that handler gone
+  there is no longer any action left for `secondary-z` to reach in either of those two states to
+  serve as a tripwire. The underlying fallback-focus-handle mechanism those tests were guarding
+  (`AdeApp::rail_focus_handle`, and the Keybindings-page-switch focus restoration) is completely
+  unchanged and still real; it is just no longer independently regression-tested by this specific
+  keystroke-observability trick. `root::focus`'s other five text-undo-scoping tests were kept,
+  renamed where their names referenced the removed system
+  (`secondary_z_with_a_terminal_focused_reaches_neither_undo_system` →
+  `secondary_z_with_a_terminal_focused_does_not_reach_text_undo`), and trimmed of their
+  now-vacuous worktree assertions.
+- 1 test in `sidebar::tree_ops`
+  (`ctrl_z_in_the_focused_tree_with_no_editor_open_still_reaches_the_worktree_undo`); its sibling
+  `ctrl_z_while_typing_a_name_in_the_tree_undoes_the_name_not_the_worktree_history` was kept,
+  renamed to `ctrl_z_while_typing_a_name_in_the_tree_undoes_the_name`, and trimmed.
+- 3 tests in `keymap_overrides`
+  (`worktree_undo_provably_cannot_collide_with_a_file_editor_binding`,
+  `the_two_undo_systems_share_a_keystroke_but_are_provably_disjoint_scopes`,
+  `every_text_redo_binding_is_disjoint_from_the_worktree_level_redo`) - all pure predicate-logic
+  proofs about `app::Undo`/`app::Redo`'s own scoping, with nothing left to prove once those
+  actions don't exist. `a_file_editor_binding_rebound_onto_secondary_z_collides_with_text_undo`
+  and `rebinding_text_undo_onto_a_key_the_editor_already_claims_is_flagged` (both purely about
+  `TextUndo`, never referencing `app::Undo`) were kept unchanged.
+- 1 test in `title_bar::menu` (`edit_menu_worktree_undo_row_runs_the_real_undo_stack`), the row it
+  drove having been deleted; `edit_menu_text_undo_row_is_inert_until_there_is_real_text_to_undo`
+  (the sibling text-row test) was kept, trimmed of its own now-vacuous worktree assertion.
+
+8 + 10 + 1 + 3 + 4 + 1 + 3 + 1 = 31, matching the `app` crate's test count dropping from 1056 (this
+branch's `origin/master` baseline, commit `7b4f047`) to 1025 exactly - every single test removed is
+accounted for above, and none of it is a coverage regression in `TextUndo`/`TextRedo`, `wt_core::
+undo`, or the "Keep all"/"Discard worktree" buttons themselves (all of which kept every one of
+their own tests, unmodified apart from stripping now-dead assertions against a field that can
+still be set, just never by the code path those particular tests exercised).
+
+**Verification**, from this project's usual Linux sandbox
+(`export LIBRARY_PATH=/tmp/x11-deps/prefix/usr/lib/x86_64-linux-gnu`): `cargo fmt --all --
+--check`, `cargo build --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings`
+all clean. `cargo test --workspace --lib -- --test-threads=1`: **1190 passed, 0 failed** across
+all four crates (`app` 1025, `lsp-core` 44, `pty-core` 14, `wt-core` 107) - `lsp-core`/`pty-core`/
+`wt-core` counts are all bit-for-bit identical to the `origin/master` baseline (this change never
+touches those crates, including `wt_core::undo` itself), and the drop in `app`'s own count from
+1056 to 1025 is the expected, fully-accounted-for consequence of removing a real feature's real
+tests, not a red flag. The known pre-existing `code_surface::diff_view::diff_render_tests` flake
+was not observed on this run at all.

@@ -237,8 +237,8 @@ impl AdeApp {
             .track_focus(&self.merge_edit_focus_handle)
             // `"text-input"` rides alongside `"merge-editor"` here for the same real reason it
             // does on the code surface (GitHub issue #17): this is a real, editable text buffer,
-            // so `secondary-z` must mean text undo over it, never `crate::worktree_history`'s
-            // worktree-level `Undo`. See `crate::default_key_bindings`' own docs.
+            // so `secondary-z` must mean text undo over it. See `crate::default_key_bindings`'
+            // own docs.
             .key_context("merge-editor text-input")
             .on_action(cx.listener(Self::handle_editor_backspace_action))
             .on_action(cx.listener(Self::handle_editor_delete_action))
