@@ -575,6 +575,61 @@ fn non_colliding_dest_path(dest_dir: &Path, name: &str) -> PathBuf {
     candidate
 }
 
+/// The real, well-commented starting-point template a user can copy to author their own theme -
+/// checked in at `assets/themes/template.toml` and embedded here via `include_str!` so the file a
+/// user finds in the repository and the one [`write_template_theme`]'s "New from template"
+/// Themes-page action writes are the literal same bytes, never two independently-maintained
+/// copies that could drift apart. Deliberately *not* one of [`crate::settings::state::THEME_DEFS`]'
+/// own six `include_str!`s: that list names all six built-in theme files explicitly, and this
+/// isn't a seventh built-in theme - it lives in the same `assets/themes/` directory purely because
+/// that's this repository's one real home for theme-shaped `.toml` files, not because it's wired
+/// into `THEME_DEFS`.
+pub const CUSTOM_THEME_TEMPLATE_TOML: &str =
+    include_str!("../../../../assets/themes/template.toml");
+
+/// Writes the real template ([`CUSTOM_THEME_TEMPLATE_TOML`]) into `dest_dir` - the Themes page's
+/// "New from template" action's one real caller
+/// (`crate::settings::render::AdeApp::start_create_theme_from_template`). Validates through the
+/// same [`parse_theme_file_str`] core [`import_theme_file`] uses (never written unvalidated - if
+/// this template itself ever regressed into something that fails its own validation, this would
+/// fail loudly rather than silently hand a user a broken file), then writes the template's own
+/// literal bytes - comments and all - not a re-serialized [`CustomTheme::to_toml_string`] copy,
+/// unlike [`import_theme_file`]: the whole point of a "well-commented template" is that a user who
+/// clicks the button gets the same explanatory comments as one who copies the file straight out of
+/// the repository, not a canonicalized file stripped down to five bare key-value lines.
+///
+/// Uses the same [`non_colliding_dest_path`] collision handling [`import_theme_file`] does: a
+/// second click reuses (refreshes) the one file this already wrote, since the template's own
+/// `name` never changes between clicks, rather than spawning a `-2` sibling every time - *as long
+/// as that file's contents are still the pristine, unedited template*. An adversarial audit
+/// caught the original version of this function always overwriting that path unconditionally: a
+/// user who clicked "New from template", edited the resulting file's colours in place (keeping
+/// its default `name`), then clicked "New from template" again - e.g. wanting a *second* fresh
+/// theme to start a new one from - would have silently lost those edits with no confirmation,
+/// unlike every other destructive action in this module (`execute_remove_custom_theme` requires
+/// an arm-then-confirm double click). Fixed by checking the existing file's real bytes first: if
+/// they've diverged from [`CUSTOM_THEME_TEMPLATE_TOML`], this leaves the file untouched and hands
+/// back the user's own edited theme instead of clobbering it; only a byte-identical (never
+/// touched since the last write) file is refreshed.
+pub fn write_template_theme(dest_dir: &Path) -> Result<CustomTheme, ThemeFileError> {
+    let mut theme = parse_theme_file_str(CUSTOM_THEME_TEMPLATE_TOML)?;
+    std::fs::create_dir_all(dest_dir).map_err(|err| ThemeFileError::Io(err.to_string()))?;
+    let dest_path = non_colliding_dest_path(dest_dir, &theme.name);
+    if let Ok(existing_contents) = std::fs::read_to_string(&dest_path) {
+        if existing_contents != CUSTOM_THEME_TEMPLATE_TOML {
+            // The user has edited this file since it was created from the template - do not
+            // overwrite their real edits. Hand back their existing theme as-is.
+            let mut existing = parse_theme_file_str(&existing_contents)?;
+            existing.source_path = Some(dest_path);
+            return Ok(existing);
+        }
+    }
+    std::fs::write(&dest_path, CUSTOM_THEME_TEMPLATE_TOML)
+        .map_err(|err| ThemeFileError::Io(err.to_string()))?;
+    theme.source_path = Some(dest_path);
+    Ok(theme)
+}
+
 /// Real export: serializes `theme` (see [`CustomTheme::to_toml_string`]) to `dest_path` - a
 /// user-chosen destination (e.g. a real "Save file" dialog's result), not necessarily inside a
 /// [`custom_themes_dir_for`] directory at all, since exporting means "give me a shareable file",
@@ -1078,6 +1133,106 @@ mod tests {
         assert_eq!(imported.name, theme.name);
         assert_eq!(imported.subtitle, theme.subtitle);
         assert_eq!(imported.swatches, theme.swatches);
+    }
+
+    /// Real proof (not an assumption) that `toml`/`serde`'s parsing genuinely ignores
+    /// `#`-prefixed comments: [`CUSTOM_THEME_TEMPLATE_TOML`] is mostly comment lines, and this
+    /// feeds its *real, checked-in* contents (not a hand-copied excerpt) through the exact same
+    /// [`parse_theme_file_str`] a user's own disk file goes through.
+    #[test]
+    fn the_real_template_file_parses_and_validates_as_a_well_formed_theme() {
+        let theme = parse_theme_file_str(CUSTOM_THEME_TEMPLATE_TOML)
+            .expect("the real, checked-in template file must parse and validate cleanly");
+        assert_eq!(theme.name, "My Custom Theme");
+        assert_eq!(theme.subtitle, "replace this with a short description");
+        assert_eq!(
+            theme.swatches,
+            [0x0c0d10, 0x181a1e, 0x5cb87f, 0xe2a336, 0xe07a5f]
+        );
+    }
+
+    #[test]
+    fn write_template_theme_writes_the_real_template_bytes_verbatim_comments_included() {
+        let dest_dir = tempfile::tempdir().expect("tempdir");
+
+        let written = write_template_theme(dest_dir.path()).expect("should write");
+
+        assert_eq!(written.name, "My Custom Theme");
+        let dest_path = written.source_path.expect("should record its own path");
+        let on_disk = std::fs::read_to_string(&dest_path).expect("should read back");
+        assert_eq!(
+            on_disk, CUSTOM_THEME_TEMPLATE_TOML,
+            "the written file must be the template's own literal bytes - comments included - \
+             not a re-serialized, comment-stripped copy"
+        );
+        assert!(
+            on_disk.contains("READABILITY FLOOR"),
+            "a real explanatory comment must have survived the write"
+        );
+
+        // The written file is itself a real, loadable custom theme, not just bytes on disk.
+        let (loaded, errors) = load_custom_themes_from_dir(dest_dir.path());
+        assert!(
+            errors.is_empty(),
+            "the written template must load cleanly: {errors:?}"
+        );
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "My Custom Theme");
+    }
+
+    #[test]
+    fn write_template_theme_a_second_time_refreshes_the_same_file_not_a_new_one() {
+        let dest_dir = tempfile::tempdir().expect("tempdir");
+
+        let first = write_template_theme(dest_dir.path()).expect("first write");
+        let second = write_template_theme(dest_dir.path()).expect("second write");
+
+        assert_eq!(
+            first.source_path, second.source_path,
+            "writing the template twice must refresh the same file, not spawn a -2 sibling"
+        );
+        let (loaded, _) = load_custom_themes_from_dir(dest_dir.path());
+        assert_eq!(
+            loaded.len(),
+            1,
+            "must not have left a stale duplicate file behind"
+        );
+    }
+
+    /// Adversarial-audit regression: a user who edits the template-created file in place (keeping
+    /// its default `name`) must not have those edits silently destroyed by a second "New from
+    /// template" click.
+    #[test]
+    fn write_template_theme_never_clobbers_a_file_the_user_has_since_edited() {
+        let dest_dir = tempfile::tempdir().expect("tempdir");
+
+        let first = write_template_theme(dest_dir.path()).expect("first write");
+        let dest_path = first.source_path.clone().expect("should record its path");
+
+        // The user edits the file in place, keeping the same `name`.
+        let edited_toml = CUSTOM_THEME_TEMPLATE_TOML.replace("#0c0d10", "#123456");
+        assert_ne!(
+            edited_toml, CUSTOM_THEME_TEMPLATE_TOML,
+            "sanity check: the edit must actually change the file's bytes"
+        );
+        std::fs::write(&dest_path, &edited_toml).expect("simulate a user edit");
+
+        let second = write_template_theme(dest_dir.path()).expect("second write");
+
+        assert_eq!(
+            second.source_path, first.source_path,
+            "must still resolve to the same file, not a -2 sibling"
+        );
+        assert_eq!(
+            second.swatches[0], 0x123456,
+            "the user's edited colour must be preserved, not overwritten with the pristine \
+             template's own #0c0d10"
+        );
+        let on_disk = std::fs::read_to_string(&dest_path).expect("read back");
+        assert_eq!(
+            on_disk, edited_toml,
+            "the file on disk must be untouched by the second click"
+        );
     }
 
     #[test]

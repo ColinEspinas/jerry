@@ -1219,6 +1219,13 @@ pub struct AdeApp {
     /// (`Self::execute_remove_custom_theme`) - same one-slot reasoning as
     /// [`Self::_custom_theme_import_task`].
     pub(crate) _custom_theme_remove_task: Option<Task<()>>,
+    /// The in-flight "New from template" background write-and-reload task
+    /// (`Self::start_create_theme_from_template`) - same one-slot reasoning as
+    /// [`Self::_custom_theme_import_task`]; unlike Import there's no file-picker dialog to await
+    /// first (the "file" is a fixed, embedded constant), but the actual disk write still runs on
+    /// the background executor like every other real write in this module, so this still needs a
+    /// slot to keep that task alive.
+    pub(crate) _custom_theme_create_task: Option<Task<()>>,
     /// A real, just-armed "Remove" click on a custom theme card, by name - an adversarial audit
     /// caught the first version of this action deleting the user's file on a single click, unlike
     /// every other destructive action in this app (`Self::prune_confirm_armed`,

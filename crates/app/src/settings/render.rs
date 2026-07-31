@@ -1280,10 +1280,10 @@ impl AdeApp {
     /// GitHub issue #5: the "Custom themes" block - every real, disk-loaded
     /// [`custom_theme::CustomTheme`] as a card (same [`Self::render_theme_card`] used for the six
     /// built-ins, so a custom theme is visually a first-class citizen, not a second-tier list),
-    /// the real `Import theme…`/`Export current theme…` actions
-    /// ([`Self::start_import_custom_theme`]/[`Self::start_export_custom_theme`]), any real
-    /// load errors from the last time `Self::custom_themes` was populated, and the most recent
-    /// action's own real result.
+    /// the real `New from template…`/`Import theme…`/`Export current theme…` actions
+    /// ([`Self::start_create_theme_from_template`]/[`Self::start_import_custom_theme`]/
+    /// [`Self::start_export_custom_theme`]), any real load errors from the last time
+    /// `Self::custom_themes` was populated, and the most recent action's own real result.
     fn render_custom_themes_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let has_custom = !self.custom_themes.is_empty();
 
@@ -1305,6 +1305,12 @@ impl AdeApp {
                 div()
                     .flex()
                     .gap(px(6.0))
+                    .child(self.render_theme_action_button(
+                        "settings-theme-new-from-template",
+                        "New from template\u{2026}",
+                        cx,
+                        |this, cx| this.start_create_theme_from_template(cx),
+                    ))
                     .child(self.render_theme_action_button(
                         "settings-theme-import",
                         "Import theme\u{2026}",
@@ -1348,8 +1354,9 @@ impl AdeApp {
                 .text_size(px(10.5))
                 .text_color(theme::text::DISABLED)
                 .child(format!(
-                    "No custom themes yet - Import a `.toml` theme file, or drop one into \
-                     {themes_dir}/."
+                    "No custom themes yet - click \u{201c}New from template\u{2026}\u{201d} for a \
+                     real, well-commented starting point, Import a `.toml` theme file, or drop \
+                     one into {themes_dir}/."
                 ))
         });
 
@@ -2606,12 +2613,38 @@ impl AdeApp {
         >,
         cx: &mut Context<Self>,
     ) {
+        self.apply_custom_theme_load_result(result, |name| format!("Imported \"{name}\"."), cx);
+    }
+
+    /// The real, shared "a background load-or-write-then-reload-from-disk action finished"
+    /// applier both [`Self::apply_custom_theme_import_result`] and
+    /// [`Self::apply_custom_theme_create_from_template_result`] go through - not two
+    /// independently-maintained copies of the same success/failure bookkeeping (registry
+    /// replacement, load-error replacement, status line, and - if the affected theme is the one
+    /// currently selected - an immediate re-skin via [`Self::apply_theme_selection`], matching
+    /// [`Self::apply_custom_theme_import_result`]'s own original "re-import the active theme"
+    /// fix). `success_message` is the one real difference between the two real callers: what the
+    /// status line should say for *this* action having succeeded.
+    #[allow(clippy::type_complexity)]
+    fn apply_custom_theme_load_result(
+        &mut self,
+        result: Result<
+            (
+                custom_theme::CustomTheme,
+                Vec<custom_theme::CustomTheme>,
+                Vec<String>,
+            ),
+            custom_theme::ThemeFileError,
+        >,
+        success_message: impl FnOnce(&str) -> String,
+        cx: &mut Context<Self>,
+    ) {
         match result {
-            Ok((imported, themes, errors)) => {
-                let name = imported.name;
+            Ok((theme, themes, errors)) => {
+                let name = theme.name;
                 self.custom_themes = themes;
                 self.custom_theme_load_errors = errors;
-                self.custom_theme_status = Some(Ok(format!("Imported \"{name}\".")));
+                self.custom_theme_status = Some(Ok(success_message(&name)));
                 if self.settings.theme.name == name {
                     self.apply_theme_selection(cx);
                 }
@@ -2621,6 +2654,65 @@ impl AdeApp {
             }
         }
         cx.notify();
+    }
+
+    /// GitHub issue #5 follow-up's real "New from template" action - writes the same real,
+    /// well-commented starting-point file the repository itself ships at
+    /// `assets/themes/template.toml` (`custom_theme::write_template_theme`, which embeds and
+    /// writes `custom_theme::CUSTOM_THEME_TEMPLATE_TOML` verbatim) straight into this instance's
+    /// own real custom-themes directory, then reloads the registry from disk - the same real
+    /// background-executor write-then-reload-from-disk shape
+    /// [`Self::start_import_custom_theme`] already uses, reusing the exact same
+    /// [`custom_theme::load_custom_themes_from_dir`] reload and
+    /// [`Self::apply_custom_theme_load_result`] applier, not a second, parallel path. Unlike
+    /// Import, there's no file-picker dialog to await first - the "file" being written is a
+    /// fixed, embedded constant, not something the user picks - so this goes straight to the
+    /// background executor.
+    pub(in crate::settings) fn start_create_theme_from_template(&mut self, cx: &mut Context<Self>) {
+        let Some(settings_path) = self.settings_path.clone() else {
+            self.custom_theme_status = Some(Err(
+                "can't create a theme: no settings file location is known".to_string(),
+            ));
+            cx.notify();
+            return;
+        };
+        let task = cx.spawn(async move |this, cx| {
+            let dest_dir = custom_theme::custom_themes_dir_for(&settings_path);
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let created = custom_theme::write_template_theme(&dest_dir)?;
+                    let (themes, errors) = custom_theme::load_custom_themes_from_dir(&dest_dir);
+                    Ok((created, themes, errors))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_custom_theme_create_from_template_result(result, cx);
+            });
+        });
+        self._custom_theme_create_task = Some(task);
+    }
+
+    /// Applies [`Self::start_create_theme_from_template`]'s real result - shared with nothing
+    /// else but [`Self::apply_custom_theme_load_result`]'s own common bookkeeping.
+    #[allow(clippy::type_complexity)]
+    fn apply_custom_theme_create_from_template_result(
+        &mut self,
+        result: Result<
+            (
+                custom_theme::CustomTheme,
+                Vec<custom_theme::CustomTheme>,
+                Vec<String>,
+            ),
+            custom_theme::ThemeFileError,
+        >,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_custom_theme_load_result(
+            result,
+            |name| format!("Created \"{name}\" from the template."),
+            cx,
+        );
     }
 
     /// GitHub issue #5's real "Export current theme…" action - serializes whichever theme
@@ -4141,6 +4233,158 @@ mod custom_theme_settings_tests {
             app.read_with(cx, |app, _| app._custom_theme_export_task.is_some()),
             "a real click on the button must actually invoke Self::start_export_custom_theme, \
              not silently do nothing"
+        );
+    }
+
+    /// The full real, click-driven "New from template" round trip - not just "the handler was
+    /// reached" (unlike the Import/Export click tests above, this action has no file-picker
+    /// dialog to get stuck awaiting, so a real click here really can run to completion under
+    /// `cx.run_until_parked()`): a genuine click on the button writes the real template file to
+    /// disk, the resulting theme actually renders as a selectable Themes-page card (not just data
+    /// sitting unrendered in `Self::custom_themes`), selecting that card really re-skins the app,
+    /// and the two-click Remove affordance on it really deletes the file again - proving this
+    /// isn't a decorative button bound to nothing.
+    #[gpui::test]
+    fn clicking_new_from_template_creates_a_real_selectable_removable_theme_end_to_end(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let themes_dir = settings_dir.path().join("themes");
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path.clone(),
+        );
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Theme, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.custom_themes.is_empty()),
+            "sanity check: no custom theme should exist before the click"
+        );
+
+        // The real click.
+        let create_bounds = cx
+            .debug_bounds("settings-theme-new-from-template")
+            .expect("the New from template… button must have painted");
+        cx.simulate_click(create_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        // The real file landed on disk, at the real settings-sibling themes directory.
+        let written_path = themes_dir.join("my-custom-theme.toml");
+        assert!(
+            written_path.exists(),
+            "a real click must actually write the template file to the real custom-themes \
+             directory, not just update in-memory state"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&written_path).expect("read written template"),
+            custom_theme::CUSTOM_THEME_TEMPLATE_TOML,
+            "the written file must be the real template's own bytes, comments included"
+        );
+        assert_eq!(app.read_with(cx, |app, _| app.custom_themes.len()), 1);
+        let status = app.read_with(cx, |app, _| app.custom_theme_status.clone());
+        assert!(
+            matches!(status, Some(Ok(_))),
+            "a real successful create-from-template should report a real success status, got \
+             {status:?}"
+        );
+
+        // It really renders as a selectable card, not just data.
+        assert!(
+            cx.debug_bounds("settings-theme-card-My Custom Theme")
+                .is_some(),
+            "the created theme must actually render as a card on the Themes page"
+        );
+
+        // Selecting it really re-skins the app and persists.
+        let jerry_dark_window_bg = theme::surface::WINDOW.resolve();
+        let card_bounds = cx
+            .debug_bounds("settings-theme-card-My Custom Theme")
+            .expect("card must still be painted");
+        cx.simulate_click(card_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.name.clone()),
+            "My Custom Theme"
+        );
+        assert!(
+            theme::surface::WINDOW.resolve() != jerry_dark_window_bg,
+            "selecting the template-created theme must really change what a representative \
+             colour token resolves to"
+        );
+
+        // And it's really removable: first click arms, second click deletes.
+        let remove_bounds = cx
+            .debug_bounds("settings-theme-card-remove-My Custom Theme")
+            .expect("the Remove affordance must have painted");
+        cx.simulate_click(remove_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.custom_theme_remove_armed.clone()),
+            Some("My Custom Theme".to_string())
+        );
+        let confirm_bounds = cx
+            .debug_bounds("settings-theme-card-remove-My Custom Theme")
+            .expect("the button must still be painted, now reading Confirm?");
+        cx.simulate_click(confirm_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            !written_path.exists(),
+            "confirming Remove must really delete the real backing file"
+        );
+        assert!(app.read_with(cx, |app, _| app.custom_themes.is_empty()));
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.name.clone()),
+            "Jerry Dark",
+            "removing the currently-selected theme must fall back to Jerry Dark"
+        );
+    }
+
+    /// A second real click on "New from template" refreshes the same on-disk file rather than
+    /// creating a second, differently-suffixed one - matching
+    /// `custom_theme::write_template_theme_a_second_time_refreshes_the_same_file_not_a_new_one`'s
+    /// pure-function proof, exercised here through the real button instead.
+    #[gpui::test]
+    fn clicking_new_from_template_twice_refreshes_the_same_file_not_a_duplicate(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path,
+        );
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Theme, window, cx);
+        });
+        cx.run_until_parked();
+
+        for _ in 0..2 {
+            let create_bounds = cx
+                .debug_bounds("settings-theme-new-from-template")
+                .expect("the New from template… button must have painted");
+            cx.simulate_click(create_bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.custom_themes.len()),
+            1,
+            "clicking New from template twice must not leave two entries behind"
         );
     }
 

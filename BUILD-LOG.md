@@ -4458,3 +4458,38 @@ All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `
 `settings::render::custom_theme_settings_tests`). One full run hit the known
 `code_surface::diff_view::diff_render_tests::switching_the_open_diff_to_a_different_file_recomputes_the_highlight_cache`
 flake noted above; re-run alone immediately afterward, it passed.
+
+## Custom theme template and docs (GitHub issue #5 follow-up)
+
+A user asked, after the custom-theme work above landed, for "something like a theme template and
+docs so we can know how they work" - both in the app and in the repository, not just an external
+file someone would have to go find.
+
+Added `assets/themes/template.toml`: a real, well-commented starting-point theme file, embedded
+into the binary as `custom_theme::CUSTOM_THEME_TEMPLATE_TOML` and parsed through the exact same
+`parse_theme_file_str` validation path a user-supplied file goes through - not a second, informally
+-maintained example that could quietly drift out of sync with what the app actually accepts. Every
+claim its own comments make (the five-swatch format, the `#rrggbb` requirement, the readability
+floor's real `28`-per-mille threshold) is read from the real code, not guessed.
+
+The Themes settings page gets a third real action, `New from template…`
+(`AdeApp::start_create_theme_from_template`), alongside the existing `Import theme…`/`Export
+current theme…`. It writes `CUSTOM_THEME_TEMPLATE_TOML` straight into the real custom-themes
+directory via a new `custom_theme::write_template_theme`, then reloads the registry from disk -
+the same real background-executor write-then-reload shape `start_import_custom_theme` already
+uses, sharing its result-applying code (`apply_custom_theme_load_result`, factored out of what was
+previously import-specific handling) rather than duplicating the success/failure bookkeeping.
+`write_template_theme` is idempotent and non-destructive: clicking the action again refreshes the
+same file only if its contents still match the template verbatim; if a user has since edited it,
+the file is left alone and the existing (now user-owned) theme is handed back instead of being
+silently overwritten - covered by `write_template_theme_a_second_time_refreshes_the_same_file_not_a_new_one`
+and `write_template_theme_never_clobbers_a_file_the_user_has_since_edited`.
+
+`README.md` gets a new "Custom themes" section: the file format with a real example, where files
+live, that the six built-ins are themselves just files now (cross-referencing the follow-up
+above), and the three real in-app actions - matching this project's existing documentation depth
+rather than writing a separate, longer guide.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, and `cargo test --workspace --lib -- --test-threads=1`
+at 989 app + 42 lsp-core + 14 pty-core + 98 wt-core, 0 failed.

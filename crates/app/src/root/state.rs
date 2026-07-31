@@ -290,6 +290,7 @@ impl AdeApp {
             _custom_theme_import_task: None,
             _custom_theme_export_task: None,
             _custom_theme_remove_task: None,
+            _custom_theme_create_task: None,
             custom_theme_remove_armed: None,
         };
         // See the `expanded_dirs`/`fold_state_root_key` note in the literal above: resolving the
