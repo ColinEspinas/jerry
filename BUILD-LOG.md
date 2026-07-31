@@ -4963,3 +4963,60 @@ All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `
 --workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
 978 app + 42 lsp-core + 14 pty-core + 118 wt-core, 0 failed (+3 app tests: the new segment-overlap
 regression, plus two `graph_lane_canvas_width` unit tests).
+
+## Elbow redesign: a real two-curve S-shape, replacing the single-corner fix above
+
+A third round of direct user feedback on the same feature, after the two fixes above: "the start of
+lines are the good size now but the horizontal lines corners are then wrong direction so they need to
+go toward the line. Also the end of the lines need to have corners too so they rejoin after merge."
+The previous design (both fixes above) painted exactly **one** rounded-corner box per elbow: a
+vertical stroke on one side smoothly curving into the horizontal middle, but the *other* end of that
+same box just stopped flat, with no curve at all - the line "rejoining" the next row's straight
+segment (or `own_lane`'s dot) as a sharp, uncurved corner instead of a real bend. Both ends needed
+their own curve, not one curve and one flat dead-end.
+
+Replaced the old flat `ElbowGeometry { top, left, width, height, horizontal, vertical }` with a
+nested shape: `entry: CurveBox` (continues whichever lane already has a line there - `own_lane`'s own
+dot for `Diverging`, the ending lane's own already-painted `ends_here` stub for `Converging`),
+`straight: Option<StraightSegment>` (a plain 1px-tall bridge, only present when the two lanes are far
+enough apart that the two curves don't already meet), and `exit: CurveBox` (lands exactly on the
+*other* lane - the continuing lane's own `starts_here` stub in the row below for `Diverging`, or
+`own_lane`'s own dot for `Converging`). Each `CurveBox` is one `ELBOW_RADIUS`-square quarter-circle,
+reusing the same `HorizontalEdge`/`VerticalEdge` border/corner scheme the old single-box design used,
+just applied twice per elbow instead of once.
+
+`ELBOW_RADIUS` being exactly half of `ELBOW_HEIGHT` (7px/14px) is a load-bearing coincidence: the two
+curves' combined height exactly fills the row's available half with nothing left over, so the
+existing 1px overshoot into the neighbouring row (matching `LaneSegment`'s own half-height stubs)
+falls out of the same arithmetic with no extra fudge term. Verified this by hand for both directions
+and both `ElbowKind`s before touching the render loop.
+
+Rewrote the render loop (`render_graph_lane_canvas`) to paint 2-3 pieces per elbow via a small
+`render_curve` closure (one call per `CurveBox`, shared between entry and exit), plus the optional
+straight segment as a plain background-colored div. Debug selectors gained an explicit part suffix
+(`graph-row-{row}-elbow-{index}-{kind}-entry` / `-straight` / `-exit`) since a single elbow no longer
+paints as one box.
+
+Rewrote both test modules to match: `elbow_geometry_tests` (pure, `Pixels`-only) now asserts each
+curve's own position and edge/corner choice independently, plus two new tests for the straight
+segment's presence/absence and its exact no-gap-no-overlap fit between the two curves. Dropped the
+old "converging and diverging never share a horizontal edge" assertion - it doesn't hold for this
+shape (both kinds legitimately use the same Bottom-then-Top border pattern; only their absolute row
+position tells them apart now) - and replaced it with a same-purpose "always occupy opposite row
+halves" test. `graph_elbow_render_tests` (paint-based, real GPUI test app) now checks the entry and
+exit curves' bounds separately against `from_lane`/`to_lane`'s real x, instead of one box spanning
+both.
+
+As with the two rounds above, visual verification of the actual rendered curves remains impossible in
+this sandbox (GPUI's headless test renderer is macOS-only in this pinned revision; the sandbox's own
+X11 screenshot capture is separately, independently broken). This geometry is verified by hand-derived
+arithmetic and `debug_bounds`-based paint tests, not by looking at it - the real test is the next round
+of user feedback.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+928 app + 42 lsp-core + 14 pty-core + 98 wt-core, 0 failed (+3 app tests net in
+`elbow_geometry_tests`: two new straight-segment tests, one entry/exit split adding a test). One
+unrelated, pre-existing flake (`diff_render_tests::opening_a_real_diff_renders_real_syntax_highlighted_rows`,
+a timing-sensitive async-highlight test in a file untouched by this change) was seen once in a full
+run and passed cleanly both in isolation and on a full-suite rerun - not a regression from this work.
