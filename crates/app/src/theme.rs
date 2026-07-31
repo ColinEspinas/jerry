@@ -348,7 +348,7 @@ fn derive_shift(base_swatches: [u32; 5], target_swatches: [u32; 5]) -> HslShift 
 fn theme_shift(index: usize) -> HslShift {
     static SHIFTS: std::sync::OnceLock<[HslShift; 6]> = std::sync::OnceLock::new();
     let shifts = SHIFTS.get_or_init(|| {
-        let defs = crate::settings::state::THEME_DEFS;
+        let defs = *crate::settings::state::THEME_DEFS;
         let base = defs[0].swatches;
         std::array::from_fn(|i| {
             if i == 0 {

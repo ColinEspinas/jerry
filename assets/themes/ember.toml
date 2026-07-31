@@ -1,0 +1,7 @@
+name = "Ember"
+subtitle = "warm"
+background   = "#12100e"
+panel        = "#1e1a16"
+accent_green = "#8fae6b"
+accent_amber = "#d98b3a"
+accent_blue  = "#c4713f"

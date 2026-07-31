@@ -1,0 +1,7 @@
+name = "Paper"
+subtitle = "light · beta"
+background   = "#f4f1ea"
+panel        = "#e4e0d6"
+accent_green = "#3f7a52"
+accent_amber = "#a8752a"
+accent_blue  = "#3d6c9c"

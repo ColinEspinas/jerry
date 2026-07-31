@@ -174,13 +174,33 @@ impl CustomThemeFile {
     /// [`crate::settings::state::THEME_DEFS`], not a second hand-copied name list) must not
     /// collide with a built-in theme's own name - a custom theme silently shadowing e.g. "Jerry
     /// Dark" would be confusing at best, and would also make `crate::root::AdeApp::
-    /// apply_theme_selection`'s "which one did the user mean" lookup ambiguous.
+    /// apply_theme_selection`'s "which one did the user mean" lookup ambiguous. A thin wrapper
+    /// over [`Self::validate_with_builtin_check`] with the collision check always on - see that
+    /// function's own docs for the one real caller that needs it off.
     pub fn validate(&self) -> Result<CustomTheme, ThemeFileError> {
+        self.validate_with_builtin_check(true)
+    }
+
+    /// The real, shared validation core [`Self::validate`] and [`parse_builtin_theme_file_str`]
+    /// both go through - not two independently-maintained checks. `check_builtin_collision` is
+    /// `false` for exactly one real caller: [`parse_builtin_theme_file_str`], parsing the six
+    /// built-in themes' own embedded files while `crate::settings::state::THEME_DEFS` (a
+    /// `std::sync::LazyLock`) is itself still being computed *from* those same files - checking a
+    /// built-in theme's name against `THEME_DEFS` at that point would read a value still in the
+    /// middle of being initialized. Every other check (non-empty name, real `#rrggbb` colours)
+    /// still runs regardless - see `custom_theme::tests::
+    /// validate_with_builtin_check_false_skips_only_the_collision_check_not_the_others`. Built-in
+    /// name uniqueness is instead guarded the ordinary way, by
+    /// `crate::settings::state::tests::every_theme_def_name_is_unique_and_jerry_dark_is_the_default_named_theme`.
+    pub(crate) fn validate_with_builtin_check(
+        &self,
+        check_builtin_collision: bool,
+    ) -> Result<CustomTheme, ThemeFileError> {
         let name = self.name.trim();
         if name.is_empty() {
             return Err(ThemeFileError::EmptyName);
         }
-        if THEME_DEFS.iter().any(|def| def.name == name) {
+        if check_builtin_collision && THEME_DEFS.iter().any(|def| def.name == name) {
             return Err(ThemeFileError::NameCollidesWithBuiltin(name.to_string()));
         }
         let parse = |field: &'static str, value: &str| -> Result<u32, ThemeFileError> {
@@ -203,6 +223,28 @@ impl CustomThemeFile {
             source_path: None,
         })
     }
+}
+
+/// Parses and validates one built-in theme's embedded TOML text (one of the six real
+/// `assets/themes/*.toml` files `crate::settings::state::THEME_DEFS` embeds via `include_str!`)
+/// through the exact same [`CustomThemeFile`] deserialization and
+/// [`CustomThemeFile::validate_with_builtin_check`] validation core [`parse_theme_file_str`] uses
+/// for a user's own disk-loaded file - not a second, parallel parser. Only the built-in-collision
+/// half of that check is skipped (see [`CustomThemeFile::validate_with_builtin_check`]'s own
+/// docs for why that one specific check is self-referential here).
+///
+/// Panics on a malformed file. That's a real, deliberate choice, not a shortcut: these six files
+/// are compiled into the binary from this repository at build time (not user input reachable at
+/// runtime), and `custom_theme::tests::
+/// parse_builtin_theme_file_str_parses_every_embedded_built_in_theme_file_into_the_exact_documented_swatches`
+/// already proves every one of them parses and validates cleanly - a failure here could only mean
+/// a real, committed asset went bad, which should fail loudly (a panic surfaces immediately in
+/// `cargo test`/at first real use) rather than silently reducing the Themes page below six cards.
+pub(crate) fn parse_builtin_theme_file_str(contents: &str) -> CustomTheme {
+    let file: CustomThemeFile = toml::from_str(contents)
+        .expect("a built-in theme file under assets/themes/ failed to parse as TOML");
+    file.validate_with_builtin_check(false)
+        .expect("a built-in theme file under assets/themes/ failed validation")
 }
 
 impl CustomTheme {
@@ -825,6 +867,126 @@ mod tests {
         assert_eq!(
             custom_themes_dir_for(Path::new("settings.toml")),
             Path::new("themes")
+        );
+    }
+
+    /// GitHub issue #5 follow-up: the six built-in themes moved from a hardcoded Rust
+    /// `THEME_DEFS` const array to real `assets/themes/*.toml` files, embedded via `include_str!`
+    /// and parsed through [`parse_builtin_theme_file_str`] - this pins the exact hex swatches and
+    /// names/subtitles those files must produce, transcribed verbatim from the old array, so a
+    /// single-digit typo made while writing one of those files would fail a test rather than
+    /// silently changing the app's real default appearance.
+    #[test]
+    fn parse_builtin_theme_file_str_parses_every_embedded_built_in_theme_file_into_the_exact_documented_swatches(
+    ) {
+        let cases: [(&str, &str, &str, [u32; 5]); 6] = [
+            (
+                include_str!("../../../../assets/themes/jerry-dark.toml"),
+                "Jerry Dark",
+                "default",
+                [0x0e0f11, 0x1a1e21, 0x5cb87f, 0xe2a336, 0x74ade8],
+            ),
+            (
+                include_str!("../../../../assets/themes/jerry-dim.toml"),
+                "Jerry Dim",
+                "lower contrast",
+                [0x15181b, 0x20252a, 0x6ab97f, 0xd8a94a, 0x7f9ad4],
+            ),
+            (
+                include_str!("../../../../assets/themes/slate.toml"),
+                "Slate",
+                "cool greys",
+                [0x0d1117, 0x161b22, 0x57a773, 0xc9a227, 0x6b9bd1],
+            ),
+            (
+                include_str!("../../../../assets/themes/ember.toml"),
+                "Ember",
+                "warm",
+                [0x12100e, 0x1e1a16, 0x8fae6b, 0xd98b3a, 0xc4713f],
+            ),
+            (
+                include_str!("../../../../assets/themes/moss.toml"),
+                "Moss",
+                "green-tinted",
+                [0x0f1310, 0x1a201b, 0x7fc79a, 0xc8b45a, 0x6f9bb5],
+            ),
+            (
+                include_str!("../../../../assets/themes/paper.toml"),
+                "Paper",
+                "light \u{b7} beta",
+                [0xf4f1ea, 0xe4e0d6, 0x3f7a52, 0xa8752a, 0x3d6c9c],
+            ),
+        ];
+        for (contents, name, subtitle, swatches) in cases {
+            let theme = parse_builtin_theme_file_str(contents);
+            assert_eq!(theme.name, name, "name mismatch for {contents:?}");
+            assert_eq!(theme.subtitle, subtitle, "subtitle mismatch for {name}");
+            assert_eq!(theme.swatches, swatches, "swatch mismatch for {name}");
+            assert_eq!(
+                theme.source_path, None,
+                "a built-in theme parsed straight from an embedded string was never read from a \
+                 real path on disk"
+            );
+        }
+    }
+
+    /// Proves the built-in files really do go through the *same* deserialization/validation core
+    /// a user-supplied file does, not a second parser: feeding one's raw embedded contents to the
+    /// ordinary user-facing [`parse_theme_file_str`] (which - unlike
+    /// [`parse_builtin_theme_file_str`] - does check for a built-in-name collision) is correctly
+    /// rejected, since by definition its name already is a real `THEME_DEFS` entry.
+    #[test]
+    fn a_built_in_theme_files_raw_contents_are_rejected_by_the_ordinary_user_facing_parser_as_a_builtin_collision(
+    ) {
+        let contents = include_str!("../../../../assets/themes/slate.toml");
+        let err = parse_theme_file_str(contents).unwrap_err();
+        assert_eq!(
+            err,
+            ThemeFileError::NameCollidesWithBuiltin("Slate".to_string())
+        );
+    }
+
+    /// [`CustomThemeFile::validate_with_builtin_check`]'s `false` branch (the one
+    /// [`parse_builtin_theme_file_str`] uses to avoid the self-referential "is this built-in name
+    /// already in `THEME_DEFS`" check while `THEME_DEFS` is itself still being built from these
+    /// same files) must still run every *other* real check - a bad hex colour or an empty name in
+    /// a built-in file would be a real bug in that file, not something to silently wave through.
+    #[test]
+    fn validate_with_builtin_check_false_skips_only_the_collision_check_not_the_others() {
+        let mut colliding_but_valid = valid_file();
+        colliding_but_valid.name = "Jerry Dark".to_string();
+        assert!(
+            colliding_but_valid
+                .validate_with_builtin_check(false)
+                .is_ok(),
+            "the collision check must be skippable"
+        );
+        assert_eq!(
+            colliding_but_valid.validate_with_builtin_check(true),
+            Err(ThemeFileError::NameCollidesWithBuiltin(
+                "Jerry Dark".to_string()
+            )),
+            "sanity check: the same file must still collide when the check runs"
+        );
+
+        let mut bad_color = valid_file();
+        bad_color.name = "Jerry Dark".to_string();
+        bad_color.background = "not-a-color".to_string();
+        assert_eq!(
+            bad_color.validate_with_builtin_check(false),
+            Err(ThemeFileError::InvalidColor {
+                field: "background",
+                value: "not-a-color".to_string()
+            }),
+            "an invalid colour must still be rejected even with the collision check off"
+        );
+
+        let mut empty_name = valid_file();
+        empty_name.name = "   ".to_string();
+        assert_eq!(
+            empty_name.validate_with_builtin_check(false),
+            Err(ThemeFileError::EmptyName),
+            "an empty name must still be rejected even with the collision check off"
         );
     }
 }

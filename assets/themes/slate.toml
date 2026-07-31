@@ -1,0 +1,7 @@
+name = "Slate"
+subtitle = "cool greys"
+background   = "#0d1117"
+panel        = "#161b22"
+accent_green = "#57a773"
+accent_amber = "#c9a227"
+accent_blue  = "#6b9bd1"

@@ -4269,3 +4269,86 @@ theme_runtime_tests`). All four gates clean: `cargo fmt --all -- --check`, `carg
 - confirmed pre-existing and unrelated: that file has zero diff on this branch, and the same test
 run three times in complete isolation with nothing else running failed once on its own, an
 already-known timing flake in that module, not a regression from this work.
+
+## Built-in themes as real files, not a hardcoded array (GitHub issue #5 follow-up)
+
+A distinct follow-up to the "Custom theme support" entry above, not a duplicate of it: the app's
+six *built-in* themes moved from a hardcoded `const THEME_DEFS: [ThemeDef; 6]` array of Rust
+struct literals in `crates/app/src/settings/state.rs` to six real, checked-in files at
+`assets/themes/{jerry-dark,jerry-dim,slate,ember,moss,paper}.toml` - the exact same five-swatch
+format a user's own custom theme file already used - embedded via `include_str!` and parsed
+through the exact same `CustomThemeFile` deserialization and validation core
+(`crate::settings::custom_theme::parse_builtin_theme_file_str`, a thin wrapper that skips only the
+self-referential built-in-name-collision half of the check) that GitHub issue #5's user-authored
+themes already go through, not a second, parallel parser. `THEME_DEFS` itself became a
+`std::sync::LazyLock<[ThemeDef; 6]>` in place of the old `const`, computed once on first access;
+every existing call site across the crate only ever indexed or iterated it, so none needed to
+change. The five swatch values themselves are untouched, transcribed verbatim from the old array -
+this was a "where do these six live" change, not a "what do they look like" change - and the
+existing `derive_shift`/`apply_shift` HSL-shift machinery that turns Jerry Dark's tokens into the
+other five themes' tokens was not touched at all.
+
+### Self-review and what it found
+
+Before this file's own work started, an existing user's `settings.toml` persists a theme choice by
+*name* (`ThemeSettings::name`, a plain `String`), never by array index - `theme_swatches_for` and
+`apply_theme_selection` in `crate::settings::render` both resolve it with
+`THEME_DEFS.iter().find(|def| def.name == name)`, which a `LazyLock`'s `Deref` serves identically
+to the old `const`. Traced end to end (and pinned by
+`every_documented_built_in_theme_name_still_resolves_by_name_lookup` in `state.rs` and the
+existing click-driven `selecting_a_real_theme_card_...`/`follow_system_selects_paper_on_light_...`
+tests in `render.rs`), this still resolves correctly for all six built-in names - an existing
+user's settings file keeps loading and re-skinning the app exactly as before. Built-ins also stay
+correctly protected from the Remove/import paths issue #5 added: built-in cards render with
+`is_custom: false` (no Remove affordance at all), `execute_remove_custom_theme` only ever touches
+`Self::custom_themes`, and `import_theme_file`'s validation path rejects any file whose name
+collides with a built-in (`NameCollidesWithBuiltin`) before anything is written to disk.
+
+An independent, adversarial checker sub-agent was then dispatched against the finished diff with
+instructions to verify those same three things itself (not trust this description of them) plus a
+general pass over the rest of the change. It confirmed all three by reading the real code and
+running its own tests, and separately caught two real, distinct problems this session then fixed:
+
+**A real formatting/lint break left over from a prior, interrupted session.** `cargo fmt --all --
+--check` and `cargo clippy --workspace --all-targets -- -D warnings` both failed outright before
+being touched here: two unformatted blocks (an inline `enum` variant and a wrapped `symlink()`
+call) plus eight `clippy::doc_lazy_continuation` errors from a doc comment on
+`custom_theme_shift_preserves_readability` whose second line started with `- ` in a way rustdoc's
+markdown parser reads as an unindented list continuation. Both fixed - `cargo fmt --all` for the
+former, a reflow that removes the leading dash for the latter.
+
+**A real reentrant-deadlock bug, not just a lint issue.** `custom_theme_shift_preserves_readability`
+(added earlier in this same uncommitted diff, gating every candidate theme's swatches against a
+readability floor before `validate()` accepts them) read
+`crate::settings::state::THEME_DEFS[0].swatches` as its comparison base. But that function's one
+real caller into `CustomThemeFile::validate_with_builtin_check` runs *inside* `THEME_DEFS`'s own
+`LazyLock` initializer while parsing `jerry-dark.toml` itself - so reading `THEME_DEFS[0]` from
+there re-enters the still-initializing `LazyLock` and hangs forever on `std::sync::Once`, not a
+panic. This meant the app could never start, and every test that touched a theme (`cargo test
+--workspace --lib -- --test-threads=1` in full) hung indefinitely - confirmed with a real repro
+(the checker's own isolated invocations timed out at exit code 124, and this session independently
+found and had to `kill -9` several minutes-stuck `cargo test`/`app-*` processes still running from
+the same underlying cause). Fixed by introducing `JERRY_DARK_BASE_SWATCHES`, a real, pinned `const`
+copy of Jerry Dark's five swatches used as the comparison base instead of reading through the
+`LazyLock` - with a new regression test,
+`jerry_dark_base_swatches_matches_the_real_initialized_theme_defs_entry`, asserting it stays equal
+to the real, safely-initialized `THEME_DEFS[0].swatches` from an ordinary test context where
+reading it is no longer reentrant.
+
+The checker also flagged, as a non-blocking observation rather than a bug to fix here: the
+readability-floor validation (bundled into this same diff ahead of this session, alongside a
+theme-file size cap and a dangling-symlink import fix) now also runs on every custom theme file
+`load_custom_themes_from_dir` reads from disk at startup, so a pre-existing hand-authored file with
+`panel` no lighter than `background` would newly fail to load. This isn't silent, though - that
+loader already reports a validation failure per file, prefixed with the file name, through the
+existing `custom_theme_load_errors` list the Themes page renders, the same path any other malformed
+custom theme file already goes through.
+
+14 new tests in this follow-up specifically (`settings::custom_theme::tests`,
+`settings::state::tests`, `theme::theme_runtime_tests`), on top of the 38 from the base custom-theme
+work. All four gates clean after the deadlock fix: `cargo fmt --all -- --check`, `cargo build
+--workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and a full `cargo test
+--workspace --lib -- --test-threads=1` at 983 app + 42 lsp-core + 14 pty-core + 98 wt-core, 0
+failed. A separate full run earlier hit the same known
+`code_surface::diff_view::diff_render_tests` flake documented above (that file has zero diff on
+this branch); re-run in isolation, all 7 of that module's tests passed.

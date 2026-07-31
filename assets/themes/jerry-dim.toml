@@ -1,0 +1,7 @@
+name = "Jerry Dim"
+subtitle = "lower contrast"
+background   = "#15181b"
+panel        = "#20252a"
+accent_green = "#6ab97f"
+accent_amber = "#d8a94a"
+accent_blue  = "#7f9ad4"
