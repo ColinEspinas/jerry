@@ -570,7 +570,14 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::TextUndo" => Some("Text: undo"),
         "app::TextRedo" => Some("Text: redo"),
         "app::CloseFocusedTab" => Some("Close focused tab"),
-        "app::FileTreeContextMenu" => Some("Files tree: context menu"),
+        // Deliberately says what it is *for*, not just what it opens. This page has no
+        // description column - a row's label is the whole explanation a user ever gets - and
+        // "Files tree: context menu" left a real reader with no idea why the app binds Shift+F10
+        // at all. It is the keyboard equivalent of right-clicking the selected row, which is what
+        // GitHub issue #19 §2 required and what this wording now states outright. The Files
+        // tree's own footer hint strip
+        // (`crate::sidebar::render::render_file_tree_footer`) is the other half of that answer.
+        "app::FileTreeContextMenu" => Some("Files tree: open the selected row's actions menu"),
         "app::FileTreeRename" => Some("Files tree: rename"),
         "app::FileTreeCopy" => Some("Files tree: copy"),
         "app::FileTreeCut" => Some("Files tree: cut"),
@@ -1199,7 +1206,7 @@ mod tests {
                 // `"file-tree && !tree-editing"` - see `crate::default_key_bindings`' own docs
                 // and `crate::sidebar::tree_ops`' module docs for why both halves of that
                 // predicate are load-bearing.
-                "Files tree: context menu",
+                "Files tree: open the selected row's actions menu",
                 "Files tree: rename",
                 "Files tree: copy",
                 "Files tree: cut",

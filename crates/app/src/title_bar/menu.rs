@@ -7,6 +7,7 @@
 use super::*;
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
+use crate::root::widgets::render_menu_group_divider;
 use crate::work_surface::render::render_dropdown_menu_row;
 
 /// The Windows/Linux title bar's five real menu dropdowns (`File Edit View Agent Help`) - see
@@ -154,15 +155,14 @@ impl AdeApp {
             .into_any_element()
     }
 
-    /// A thin 1px divider between two groups of rows within a [`render_title_menu`] popover -
-    /// the same [`theme::border::DIVIDER`] token the title bar's own left-cluster divider uses.
+    /// A thin 1px divider between two groups of rows within a [`render_title_menu`] popover.
+    ///
+    /// Kept as a named method purely for this module's own call sites; the element itself is
+    /// `crate::root::widgets::render_menu_group_divider`, shared with the file tree's right-click
+    /// context menu (GitHub issue #19) so the app has exactly one in-menu divider rather than two
+    /// that happen to agree today.
     fn render_title_menu_divider() -> gpui::AnyElement {
-        div()
-            .h(px(1.0))
-            .mx(px(10.0))
-            .my(px(4.0))
-            .bg(theme::border::DIVIDER)
-            .into_any_element()
+        render_menu_group_divider()
     }
 
     /// The File menu: open a file (the same real, files-scoped command palette the `+` menu's
@@ -748,22 +748,22 @@ mod title_menu_tests {
     /// Generalizes [`first_row_click_point`] to any row deeper in the popover: the real click
     /// point of the row that sits after `rows_before` real rows and `dividers_before` dividers,
     /// using the same real per-row/per-divider heights every menu shares
-    /// (`theme::band::PLUS_MENU_ROW`, and [`render_title_menu_divider`]'s own `h(1.0)` plus
-    /// `my(4.0)` top/bottom margins - `1.0 + 4.0 + 4.0 = 9.0`px total) rather than a hand-tuned
+    /// (`theme::band::PLUS_MENU_ROW`, and `crate::root::widgets::MENU_GROUP_DIVIDER_HEIGHT` -
+    /// the divider element's own `h(1.0)` plus `my(4.0)` top/bottom margins, read from the
+    /// constant that element is measured by rather than restated here) rather than a hand-tuned
     /// pixel offset that could silently drift from the real rendered layout.
     fn nth_row_click_point(
         button_bounds: gpui::Bounds<Pixels>,
         rows_before: u32,
         dividers_before: u32,
     ) -> gpui::Point<Pixels> {
-        const DIVIDER_HEIGHT: Pixels = px(9.0);
         let popover_top = button_bounds.origin.y + button_bounds.size.height;
         gpui::point(
             button_bounds.origin.x + px(20.0),
             popover_top
                 + px(4.0)
                 + theme::band::PLUS_MENU_ROW * rows_before as f32
-                + DIVIDER_HEIGHT * dividers_before as f32
+                + crate::root::widgets::MENU_GROUP_DIVIDER_HEIGHT * dividers_before as f32
                 + theme::band::PLUS_MENU_ROW / 2.0,
         )
     }

@@ -131,7 +131,7 @@ impl AdeApp {
             self.open_change = None;
             self.refresh_open_diff_file_cache();
             self.hover = None;
-            // See `crate::code_surface::tabs::AdeApp::open_change_diff`'s identical
+            // See `crate::code_surface::tabs::AdeApp::open_and_focus_file`'s identical
             // `dismiss_completions()` call for why (Revision R8.5b audit finding 3).
             self.dismiss_completions();
             if self.settings_open {

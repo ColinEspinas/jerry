@@ -14,11 +14,33 @@ impl AdeApp {
     /// (`Self::open_change` was `None`) - a second file opened while one is already showing must
     /// not overwrite the real original target with `Self::code_focus_handle` itself (already
     /// focused by then). Always moves focus onto [`Self::code_focus_handle`] regardless.
+    ///
+    /// A handle belonging to one of this app's *other* overlays is never captured, even on that
+    /// transition. An overlay's handle is by definition about to stop being rendered - the
+    /// overlay is closing, which is why something is being opened underneath it - so storing one
+    /// as this surface's return target just relocates the dangling-focus bug to whenever the last
+    /// file tab is closed ([`Self::close_file_tab`] restores through the same
+    /// [`OverlayFocus`]). Reproduced by this branch's own adversarial audit: opening a file from
+    /// the palette with no tab yet captured `palette_focus_handle`, and closing that tab then
+    /// focused it. Each overlay already holds the real pre-overlay target in its own
+    /// `OverlayFocus`; declining to capture here leaves `restore_focus`'s active-session-pane
+    /// fallback as the honest answer instead of a handle that is certain to be wrong.
     pub(crate) fn focus_code_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.open_change.is_none() {
+        if self.open_change.is_none() && !self.focus_is_on_an_overlay(window, cx) {
             self.code_focus.capture(window, &self.agents, cx);
         }
         window.focus(&self.code_focus_handle, cx);
+    }
+
+    /// Whether keyboard focus is currently on one of this app's overlay handles - the palette,
+    /// Settings, or the "New file" prompt. See [`Self::focus_code_surface`] for why capturing one
+    /// as a return target is always wrong.
+    fn focus_is_on_an_overlay(&self, window: &Window, cx: &App) -> bool {
+        window.focused(cx).is_some_and(|focused| {
+            focused == self.palette_focus_handle
+                || focused == self.settings_focus_handle
+                || focused == self.new_file_focus_handle
+        })
     }
 
     /// Opens the command palette (⌘P): resets query/scope/selection to a fresh "browse
@@ -47,8 +69,10 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Closes the palette overlay (scrim click, Esc, or running a result) and restores focus via
-    /// [`restore_focus`].
+    /// Closes the palette overlay (scrim click, Esc, or running a result that moved no focus)
+    /// and restores focus via [`restore_focus`]. A result that *did* move focus closes through
+    /// [`Self::close_palette_keeping_result_focus`] instead - see
+    /// [`crate::palette::render::AdeApp::run_selected_palette_entry`].
     pub(crate) fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = false;
         if self.settings_open {
@@ -63,6 +87,35 @@ impl AdeApp {
             return;
         }
         restore_focus(&self.agents, &mut self.palette_focus, window, cx);
+        cx.notify();
+    }
+
+    /// Closes the palette *without* touching focus - for the one case
+    /// [`crate::palette::render::AdeApp::run_selected_palette_entry`] detects: the entry that
+    /// just ran moved keyboard focus onto its own result, and that is where focus belongs
+    /// (GitHub issue #15's "an action focuses its result"). See that method's docs for how the
+    /// two closing paths are chosen between.
+    ///
+    /// Deliberately *not* `restore_focus` with a pre-cleared [`OverlayFocus`]: that function
+    /// falls back to the active session's terminal pane when it has no captured target, so
+    /// clearing first would have moved focus off the file that was just opened and into the
+    /// terminal - the same class of wrong-place focus this whole mechanism exists to stop. The
+    /// captured target is discarded via [`OverlayFocus::clear`] instead, which is exactly what
+    /// that method is for and what `Self::close_palette`'s own Settings branch already does.
+    ///
+    /// This does not violate [`OverlayFocus`]' dangling-focus invariant, but only because the
+    /// entries that move focus each move it onto something they have also made *rendered*. That
+    /// is a property of those entries, not something this function can check, and this branch's
+    /// own adversarial audit found the one case where it did not hold: a file result run while
+    /// Settings was open focused `code_focus_handle` while `render` was still drawing Settings
+    /// instead of the workspace. The fix is at the source -
+    /// [`crate::code_surface::tabs::AdeApp::open_and_focus_file`] now closes Settings before
+    /// focusing the code surface, so what it focuses really is rendered - rather than a special
+    /// case here, which would only have restored focus while leaving the user staring at
+    /// Settings after asking for a file.
+    pub(crate) fn close_palette_keeping_result_focus(&mut self, cx: &mut Context<Self>) {
+        self.palette_open = false;
+        self.palette_focus.clear();
         cx.notify();
     }
 
@@ -1737,6 +1790,460 @@ mod text_undo_scoping_tests {
             Some("nothing to undo".to_string()),
             "with the filter no longer rendered, secondary-z must reach a real handler and \
              produce real feedback - not fall into an empty dispatch context and vanish"
+        );
+    }
+}
+
+/// GitHub issue #15: "an action focuses its result". Every one of these drives the *real*
+/// palette - open it, type a real query, press a real `enter` - and then asserts with a real
+/// keystroke, because the whole risk is which widget the keystroke reaches, which no state
+/// assertion can see. `cx.simulate_input` goes through GPUI's real platform input path, so
+/// "the character landed in the buffer" is only true if a real `EntityInputHandler` was really
+/// registered against the really-focused editor.
+#[cfg(test)]
+mod palette_result_focus_tests {
+    use super::*;
+    use crate::palette::state as palette;
+    use gpui::{Entity, TestAppContext};
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// `src/main.rs` (the file every test opens) plus a sibling, so the palette's own filtering
+    /// has something to actually discriminate between.
+    fn seed(repo: &TempDir) {
+        fs::create_dir_all(repo.path().join("src")).expect("mkdir");
+        fs::write(repo.path().join("src/main.rs"), "fn main() {}\n").expect("write");
+        fs::write(repo.path().join("src/other.rs"), "pub fn o() {}\n").expect("write");
+    }
+
+    fn open_seeded(
+        cx: &mut TestAppContext,
+    ) -> (TempDir, Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+        cx.run_until_parked();
+        (repo, app, cx)
+    }
+
+    /// Opens the palette and drives it to the file result for `name` the way a user does - typing
+    /// the query and pressing `enter` - after asserting that the highlighted row really is that
+    /// file, so a test can never pass by running some unrelated entry that happened to be first.
+    fn open_file_through_the_palette(
+        app: &Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        query: &str,
+        expected: &std::path::Path,
+    ) {
+        app.update_in(cx, |app, window, cx| app.open_palette(window, cx));
+        cx.run_until_parked();
+        cx.simulate_input(query);
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            let groups = app.build_palette_groups(cx);
+            let flat = palette::flatten(&groups);
+            let entry = flat
+                .get(app.palette_selected)
+                .expect("the palette must have a highlighted row");
+            assert_eq!(
+                entry.target,
+                palette::EntryTarget::File(expected.to_path_buf()),
+                "premise: typing {query:?} must highlight {expected:?}, not some other entry"
+            );
+        });
+
+        cx.simulate_keystrokes("enter");
+        // The file's content arrives on a background read; `edit_buffers` is seeded from its
+        // completion handler, and the caret's row has to paint once for the real input handler to
+        // be registered. Same render/park cycle `text_undo_scoping_tests::open_file_for_editing`
+        // drives for the same reason.
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+    }
+
+    /// The *open and reveal* half of the issue: a palette file result really opens the file's
+    /// tab, with a real edit buffer behind it, and really highlights it in the tree. The keystroke
+    /// half is the two tests below - deliberately separate, so a failure names one thing.
+    ///
+    /// Before the fix the diff-less branch of `open_palette_file_result` opened no tab at all: it
+    /// expanded the file's ancestors, highlighted its row, and stopped. That is both this issue's
+    /// report and the separately-reported "reveal in tree selects the file but does not open it".
+    #[gpui::test]
+    fn selecting_a_file_in_the_palette_opens_and_reveals_it(cx: &mut TestAppContext) {
+        let (repo, app, cx) = open_seeded(cx);
+        let target = repo.path().join("src/main.rs");
+        open_file_through_the_palette(&app, cx, "main.rs", &target);
+
+        let relative = PathBuf::from("src/main.rs");
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.open_change.as_deref(),
+                Some(relative.as_path()),
+                "the palette must have opened the file's tab"
+            );
+            assert_eq!(app.open_files, vec![relative.clone()]);
+            assert!(
+                app.edit_buffers.contains_key(&relative),
+                "and a real edit buffer must be backing it"
+            );
+        });
+        assert!(
+            !app.read_with(cx, |app, _| app.palette_open),
+            "and the palette must have closed behind it"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.selected_tree_path.clone()),
+            Some(target),
+            "the same action must also highlight the file in the tree - reveal and open are one \
+             action, not two that might disagree"
+        );
+    }
+
+    /// The issue's own acceptance criterion, verbatim: "Palette -> type a name -> Enter -> type:
+    /// the characters land in the file. No mouse involved at any point."
+    ///
+    /// This is the assertion `close_palette`'s unconditional `restore_focus` used to fail: the
+    /// file opened, and the keystroke went to whatever had focus before the palette.
+    #[gpui::test]
+    fn the_keystroke_after_a_palette_file_result_lands_in_the_buffer(cx: &mut TestAppContext) {
+        let (repo, app, cx) = open_seeded(cx);
+        let target = repo.path().join("src/main.rs");
+        open_file_through_the_palette(&app, cx, "main.rs", &target);
+        let relative = PathBuf::from("src/main.rs");
+
+        cx.simulate_input("X");
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .expect("buffer")
+                .content
+                .clone()),
+            "Xfn main() {}\n",
+            "the very next keystroke after the palette closes must land in the file that was \
+             just opened - not in the palette, and not in the terminal that had focus before"
+        );
+    }
+
+    /// The arrow-key half of the same criterion: `EditorRight` is a real, `\"file-editor\"`-scoped
+    /// action, so it only fires if the code surface really is the focused dispatch node.
+    #[gpui::test]
+    fn arrow_keys_after_a_palette_file_result_move_the_caret(cx: &mut TestAppContext) {
+        let (repo, app, cx) = open_seeded(cx);
+        let target = repo.path().join("src/main.rs");
+        open_file_through_the_palette(&app, cx, "main.rs", &target);
+        let relative = PathBuf::from("src/main.rs");
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .expect("buffer")
+                .cursor_offset()),
+            0,
+            "a freshly opened file starts at 1:1"
+        );
+
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .expect("buffer")
+                .cursor_offset()),
+            1,
+            "arrow keys must move the caret in the opened file"
+        );
+    }
+
+    /// "Works identically when the file is already open: switch to its tab and focus it, never
+    /// open a duplicate." Focus is deliberately parked somewhere else first, so this genuinely
+    /// tests the re-open path rather than passing because focus never moved.
+    #[gpui::test]
+    fn reopening_an_already_open_file_focuses_it_without_duplicating_its_tab(
+        cx: &mut TestAppContext,
+    ) {
+        let (repo, app, cx) = open_seeded(cx);
+        let target = repo.path().join("src/main.rs");
+        let relative = PathBuf::from("src/main.rs");
+
+        open_file_through_the_palette(&app, cx, "main.rs", &target);
+        cx.simulate_input("A");
+        cx.run_until_parked();
+
+        // Park focus off the editor, the way clicking into the file tree would - so this test
+        // genuinely exercises the re-open path rather than passing because focus never left.
+        app.update_in(cx, |app, window, cx| {
+            window.focus(&app.tree_focus_handle, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("!");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.edit_buffers.get(&relative).expect("buffer").content,
+                "Afn main() {}\n",
+                "premise: with the tree focused, a keystroke must not reach the buffer"
+            );
+        });
+
+        open_file_through_the_palette(&app, cx, "main.rs", &target);
+        cx.simulate_input("B");
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.open_files,
+                vec![relative.clone()],
+                "reopening the same file must reuse its tab, never append a second one"
+            );
+            assert_eq!(
+                app.edit_buffers.get(&relative).expect("buffer").content,
+                "ABfn main() {}\n",
+                "both keystrokes must have landed in the same real buffer - and `B` lands \
+                 *after* `A` because the buffer kept its own caret (offset 1) across the \
+                 reopen. That half is pre-existing `edit_buffers` behaviour, not this change; \
+                 the visible half of the same clause is covered by \
+                 `code_surface::tabs::reopened_file_caret_tests`"
+            );
+        });
+    }
+
+    /// "Dismissing the palette with Esc (no selection) restores focus to exactly where it was
+    /// before the palette opened." Asserted through a real keystroke against a real editor rather
+    /// than by reading `window.focused`, so it covers the dispatch path and not just the handle.
+    #[gpui::test]
+    fn escaping_the_palette_restores_focus_to_the_editor_it_was_opened_over(
+        cx: &mut TestAppContext,
+    ) {
+        let (repo, app, cx) = open_seeded(cx);
+        let target = repo.path().join("src/main.rs");
+        open_file_through_the_palette(&app, cx, "main.rs", &target);
+        let relative = PathBuf::from("src/main.rs");
+
+        app.update_in(cx, |app, window, cx| app.open_palette(window, cx));
+        cx.run_until_parked();
+        cx.simulate_input("some query");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!app.read_with(cx, |app, _| app.palette_open));
+
+        cx.simulate_input("Z");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .expect("buffer")
+                .content
+                .clone()),
+            "Zfn main() {}\n",
+            "an Esc-dismissed palette must hand focus straight back to the editor it opened \
+             over - the query it swallowed must not have taken the editor's focus with it"
+        );
+    }
+
+    /// Adversarial-audit regression, CRITICAL. Running a palette file result while the Settings
+    /// surface is open used to focus `code_focus_handle` while `AdeApp::render` was still drawing
+    /// Settings *instead of* the workspace body - so `Window::focus` pointed at a `FocusId` that
+    /// `focus_node_id_in_rendered_frame` could not find, GPUI fell back to the dispatch root with
+    /// an empty context stack, and every context-scoped binding died. Esc included: the user was
+    /// left on a Settings page they could not leave, with no file in sight, until they clicked.
+    ///
+    /// The fix is that opening a file closes Settings, so what gets focused really is rendered.
+    /// Asserted end to end: the file is showing, a keystroke reaches its buffer, and Esc still
+    /// does something real.
+    #[gpui::test]
+    fn a_palette_file_result_run_over_settings_leaves_a_usable_keyboard(cx: &mut TestAppContext) {
+        let (repo, app, cx) = open_seeded(cx);
+        let target = repo.path().join("src/main.rs");
+        let relative = PathBuf::from("src/main.rs");
+
+        app.update_in(cx, |app, window, cx| app.open_settings(window, cx));
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.settings_open),
+            "premise: Settings must really be up"
+        );
+
+        open_file_through_the_palette(&app, cx, "main.rs", &target);
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.settings_open,
+                "opening a file must not leave Settings covering it - focusing a surface that \
+                 isn't rendered is the dangling-focus bug this app has shipped repeatedly"
+            );
+            assert_eq!(app.open_change.as_deref(), Some(relative.as_path()));
+        });
+
+        cx.simulate_input("K");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .expect("buffer")
+                .content
+                .clone()),
+            "Kfn main() {}\n",
+            "and the next keystroke must land in the file that was asked for"
+        );
+    }
+
+    /// Adversarial-audit regression, MAJOR. `focus_code_surface` captures the pre-open focus
+    /// target on the first file opened - and with no tab open yet, the thing holding focus at
+    /// that moment is the palette's own handle. Capturing it moved the dangling-focus bug to
+    /// `close_file_tab`, which restores through the very same `OverlayFocus`.
+    #[gpui::test]
+    fn opening_the_first_file_from_the_palette_never_captures_the_palettes_own_handle(
+        cx: &mut TestAppContext,
+    ) {
+        let (repo, app, cx) = open_seeded(cx);
+        let target = repo.path().join("src/main.rs");
+        let relative = PathBuf::from("src/main.rs");
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.open_change.is_none(),
+                "premise: no tab yet, so this really is the capturing transition"
+            );
+        });
+        open_file_through_the_palette(&app, cx, "main.rs", &target);
+
+        app.update_in(cx, |app, window, cx| {
+            app.close_file_tab(relative.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let (focused, palette_handle) = app.update_in(cx, |app, window, cx| {
+            (window.focused(cx), app.palette_focus_handle.clone())
+        });
+        assert_ne!(
+            focused.as_ref(),
+            Some(&palette_handle),
+            "closing the last tab must not restore focus onto the palette's own handle - the \
+             palette has not been rendered since it closed"
+        );
+    }
+
+    /// Adversarial-audit regression, MAJOR. With the tree focused, opening the palette captures
+    /// `tree_focus_handle`; running the palette's own "Toggle Files / Changes" then unrenders the
+    /// whole tree. `set_right_sidebar_view`'s own `is_focused` guard cannot see this, because the
+    /// *palette* holds focus at that moment - so closing the palette restored focus straight onto
+    /// a handle that is no longer in the frame.
+    #[gpui::test]
+    fn toggling_to_changes_from_the_palette_does_not_restore_focus_onto_the_unrendered_tree(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded(cx);
+
+        app.update_in(cx, |app, window, cx| {
+            window.focus(&app.tree_focus_handle, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| app.open_palette(window, cx));
+        cx.run_until_parked();
+
+        let ran = app.update(cx, |app, cx| {
+            let groups = app.build_palette_groups(cx);
+            let index = palette::flatten(&groups).iter().position(|entry| {
+                entry.target
+                    == palette::EntryTarget::Command(palette::PaletteCommand::ToggleFilesChanges)
+            });
+            match index {
+                Some(index) => {
+                    app.palette_selected = index;
+                    true
+                }
+                None => false,
+            }
+        });
+        assert!(ran, "the palette must offer the real Files/Changes toggle");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.right_sidebar_view,
+                RightSidebarView::Changes,
+                "premise: the toggle really ran and the tree really is unrendered"
+            );
+        });
+        let (focused, tree_handle) = app.update_in(cx, |app, window, cx| {
+            (window.focused(cx), app.tree_focus_handle.clone())
+        });
+        assert_ne!(
+            focused.as_ref(),
+            Some(&tree_handle),
+            "focus must not be restored onto the file tree's handle once the tree is gone - \
+             GPUI would fall back to the dispatch root and silently kill every scoped binding"
+        );
+    }
+
+    /// The other direction of the same rule, and the reason it is *observed* rather than
+    /// declared: an entry that opens nothing must leave focus exactly where it was.
+    /// `ToggleRailGrouping` is the smallest real such entry - it flips one rail field and
+    /// touches no focus handle at all.
+    #[gpui::test]
+    fn a_palette_entry_that_opens_nothing_still_restores_the_previous_focus(
+        cx: &mut TestAppContext,
+    ) {
+        let (repo, app, cx) = open_seeded(cx);
+        let target = repo.path().join("src/main.rs");
+        open_file_through_the_palette(&app, cx, "main.rs", &target);
+        let relative = PathBuf::from("src/main.rs");
+
+        app.update_in(cx, |app, window, cx| app.open_palette(window, cx));
+        cx.run_until_parked();
+        let ran = app.update(cx, |app, cx| {
+            let groups = app.build_palette_groups(cx);
+            let index = palette::flatten(&groups).iter().position(|entry| {
+                entry.target
+                    == palette::EntryTarget::Command(palette::PaletteCommand::ToggleRailGrouping)
+            });
+            match index {
+                Some(index) => {
+                    app.palette_selected = index;
+                    true
+                }
+                None => false,
+            }
+        });
+        assert!(
+            ran,
+            "the palette must offer the real rail-grouping command to run"
+        );
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.palette_open),
+            "premise: the entry really ran and closed the palette"
+        );
+
+        cx.simulate_input("Q");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffers
+                .get(&relative)
+                .expect("buffer")
+                .content
+                .clone()),
+            "Qfn main() {}\n",
+            "an entry that focuses nothing must restore the pre-palette focus, or every \
+             non-opening palette command would silently strand the next keystroke"
         );
     }
 }

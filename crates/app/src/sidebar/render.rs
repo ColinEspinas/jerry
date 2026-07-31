@@ -1,7 +1,8 @@
 use super::*;
 use crate::keymap;
 use crate::root::widgets::{
-    render_keycap_row, render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
+    modal_scrim_bg, render_keycap_row, render_menu_group_divider, render_modal_button,
+    render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
 };
 use crate::settings::widgets::ChoiceOption;
 use crate::worktree_history::flow as worktree_history;
@@ -43,6 +44,17 @@ impl AdeApp {
             if self.tree_focus_handle.is_focused(window) {
                 restore_focus(&self.agents, &mut self.code_focus, window, cx);
             }
+            // 1 again, one level removed, and invisible to the check above: an *overlay* can be
+            // holding the tree's handle as its own return target while the overlay itself has
+            // focus - which is exactly the state the palette's own "Toggle Files / Changes"
+            // command runs in, since the palette is focused and the tree is not. Closing the
+            // palette afterwards would then restore focus onto a handle this very branch has
+            // just unrendered. Swept from every overlay rather than only the palette, so a
+            // future overlay reaching this path doesn't reintroduce it. Reproduced by this
+            // change's own adversarial audit; see `OverlayFocus::forget_target`.
+            self.palette_focus.forget_target(&self.tree_focus_handle);
+            self.settings_focus.forget_target(&self.tree_focus_handle);
+            self.code_focus.forget_target(&self.tree_focus_handle);
         }
         self.right_sidebar_view = view;
         if view == RightSidebarView::Changes {
@@ -1300,15 +1312,21 @@ impl AdeApp {
             // (`vendor/zed/crates/gpui/src/elements/uniform_list.rs`'s `uniform_list()`), so an
             // outer scroll box here would let the list grow to its full virtual height inside a
             // second scroller and defeat the virtualization entirely.
-            RightSidebarView::Files => container.child(
-                div()
-                    .id("right-sidebar-body")
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.render_file_tree(cx)),
-            ),
+            RightSidebarView::Files => container
+                .child(
+                    div()
+                        .id("right-sidebar-body")
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .child(self.render_file_tree(cx)),
+                )
+                .child(render_file_tree_footer(
+                    self.ui_text_size(10.0),
+                    self.window_controls_style().is_macos(),
+                    self.tree_inline_edit.is_none() && self.tree_delete_confirm.is_none(),
+                )),
             RightSidebarView::Changes => match self.current_diff() {
                 Some(diff) => {
                     let header = self.render_changes_header(diff);
@@ -1525,9 +1543,10 @@ impl AdeApp {
     /// (Revision R12 §5, multi-agent worktrees only - see [`Self::render_change_author_chips`]),
     /// an optional tag pill, `+n`/`−n`, and the five-segment stat bar. Clicking anywhere on the
     /// row other than the checkbox itself (see [`Self::render_staging_checkbox`]'s
-    /// `stop_propagation`) opens the file's diff via [`Self::open_change_diff`] - the checkbox
-    /// **is** staging, not "reviewed": it has its own click target, entirely separate from the
-    /// row body's.
+    /// `stop_propagation`) opens the file's diff via [`Self::open_change_diff`] - which, since
+    /// GitHub issue #15, also reveals and highlights that file in the Files tree, the same as
+    /// every other way of opening a file in this app. The checkbox **is** staging, not
+    /// "reviewed": it has its own click target, entirely separate from the row body's.
     pub(in crate::sidebar) fn render_change_row(
         &self,
         file: &DiffFile,
@@ -2256,13 +2275,27 @@ impl AdeApp {
     /// The panel's origin is [`AdeApp::tree_context_menu`]'s already-clamped one, resolved at
     /// open time from the real click and the real `Window::bounds()` - so the menu near a window
     /// edge is repositioned once, not re-solved (and possibly moved) on every frame it's open.
+    ///
+    /// ## The scrim genuinely blocks what is behind it
+    ///
+    /// `.occlude()` (`gpui::InteractiveElement::occlude`, which sets
+    /// `HitboxBehavior::BlockMouse` - `vendor/zed/crates/gpui/src/window.rs`'s `hit_test` stops
+    /// walking hitboxes at the first one carrying it) is what makes this a real modal layer
+    /// rather than a decorative one. Without it the scrim's `on_click` fired *and* the file-tree
+    /// row underneath it took the same click - so dismissing the menu also opened whatever file
+    /// happened to be under the cursor - and every row under the pointer still painted its
+    /// `:hover` fill and its tooltip, because those read `Hitbox::is_hovered` directly and never
+    /// consulted the click handlers at all. A `cx.stop_propagation()` in the scrim's own handler
+    /// could only ever have fixed the click half; hover styling is not an event. The same
+    /// `.occlude()` is on `Self::render_tree_delete_confirm`'s scrim, and this app already used
+    /// the identical mechanism for the pane resize handles (`crate::root::resize`).
     pub(crate) fn render_tree_context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let menu = self.tree_context_menu.clone();
         let macos = self.window_controls_style().is_macos();
         let (shadow_x, shadow_y, shadow_blur) = theme::shadow::PLUS_MENU;
-        let items = menu
+        let rows = menu
             .as_ref()
-            .map(|menu| context_menu::menu_items(&menu.target, self.tree_clipboard.is_some()))
+            .map(|menu| context_menu::menu_rows(&menu.target, self.tree_clipboard.is_some()))
             .unwrap_or_default();
         let origin_x = menu.as_ref().map(|menu| menu.origin_x).unwrap_or(0.0);
         let origin_y = menu.as_ref().map(|menu| menu.origin_y).unwrap_or(0.0);
@@ -2270,10 +2303,17 @@ impl AdeApp {
         div()
             .id("tree-context-menu-scrim")
             .absolute()
-            .top(px(0.0))
+            // Starts *below* the title bar, exactly like `crate::palette::render`'s own scrim
+            // does and for the same reason - now a real one, since this layer `.occlude()`s.
+            // A full-window occluding scrim swallows the window's own close/minimise/maximise
+            // caption buttons and the title bar's drag region, so the window could not be closed
+            // or moved while it was up. Reproduced against the real caption button by this
+            // change's own adversarial audit.
+            .top(theme::band::TITLE_BAR)
             .left(px(0.0))
             .right(px(0.0))
             .bottom(px(0.0))
+            .occlude()
             .bg(work_surface::TRANSPARENT)
             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                 this.close_tree_context_menu(cx);
@@ -2293,7 +2333,13 @@ impl AdeApp {
                     .debug_selector(|| "tree-context-menu".to_string())
                     .absolute()
                     .left(px(origin_x))
-                    .top(px(origin_y))
+                    // `origin_y` is window-space (it is clamped against `Window::bounds()`, from
+                    // a window-space `MouseDownEvent::position`), but this panel is positioned
+                    // relative to the scrim - which starts at `theme::band::TITLE_BAR`, not at
+                    // the window top. Without this subtraction the menu paints a whole title bar
+                    // too low. `context_menu_paints_at_its_clamped_window_space_origin` is the
+                    // assertion that keeps the two in step.
+                    .top(px(origin_y) - theme::band::TITLE_BAR)
                     .w(px(context_menu::MENU_WIDTH))
                     .py(px(context_menu::MENU_VERTICAL_PADDING / 2.0))
                     .bg(theme::surface::PALETTE)
@@ -2309,17 +2355,46 @@ impl AdeApp {
                     .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
                         cx.stop_propagation();
                     }))
-                    .children(
-                        items
-                            .into_iter()
-                            .map(|item| self.render_tree_context_menu_row(item, macos, cx)),
-                    ),
+                    .children(rows.into_iter().map(|row| match row {
+                        context_menu::MenuRow::Item(item) => {
+                            self.render_tree_context_menu_row(item, macos, cx)
+                        }
+                        context_menu::MenuRow::Separator => render_menu_group_divider(),
+                    })),
             )
     }
 
     /// One context-menu row. A disabled row is still drawn (so the menu's shape doesn't jump
     /// between right-clicks) but carries no click handler at all - not a handler that returns
     /// early, which would be a row that looks clickable and silently isn't.
+    ///
+    /// Speaks this app's own established dropdown-row language rather than one invented here.
+    /// Every value below is `crate::work_surface::render::render_dropdown_menu_row`'s - the row
+    /// shared by the tab strip's `+` menu and the title bar's File/Edit/View/Agent/Help menus,
+    /// and the closest thing this app has to a specified menu row (the design handoff's
+    /// `revision/CHANGELOG.md` specifies that popover; it has no context-menu spec of its own).
+    /// That function is deliberately *not* reused: its row is a fixed chip + label + sub-label +
+    /// keycap quad, and a file-tree context menu has no honest chip glyph or secondary text for
+    /// two of those four slots.
+    ///
+    /// Four values were off that language, and the first of them was the reported "the context
+    /// menu has no hover state" bug outright:
+    ///
+    /// - **hover fill** was `theme::surface::ROW_HOVER` (`#15181b`) - the *exact* hex of
+    ///   `theme::surface::PALETTE`, this panel's own background - so hovering a row painted
+    ///   nothing at all. `theme::surface::PLUS_MENU_ROW_HOVER` (`#1d2226`) is the token that
+    ///   exists for this; `theme::palette::ROW_HOVER`'s own docs record the identical trap for
+    ///   the palette's rows.
+    /// - **label colour and size** were `theme::text::BODY` at 11.0px, against the dropdown row's
+    ///   `theme::text::HEADING` at 11.5px medium.
+    /// - **gap** was 8px, against 9.
+    /// - **disabled rows** were `theme::text::GHOST` and kept `cursor_pointer`'s absence but not
+    ///   the explicit `cursor_default()`; the dropdown row uses `theme::text::GHOSTER` and sets
+    ///   the cursor, so a row that cannot be run does not advertise itself as clickable.
+    ///
+    /// The destructive tint stays `theme::status::FAIL`, unchanged - `theme::button::DANGER_FG`
+    /// is this app's destructive *button* pair (the rail's prune control, and now the delete
+    /// confirmation's own confirm button), not its menu-row accent.
     fn render_tree_context_menu_row(
         &self,
         item: context_menu::MenuItem,
@@ -2332,11 +2407,11 @@ impl AdeApp {
             .map(|spec| keymap::resolve_combo(spec, macos))
             .unwrap_or_default();
         let color = if !item.enabled {
-            theme::text::GHOST
+            theme::text::GHOSTER
         } else if action.is_destructive() {
             theme::status::FAIL
         } else {
-            theme::text::BODY
+            theme::text::HEADING
         };
 
         let mut row = div()
@@ -2348,26 +2423,30 @@ impl AdeApp {
             .flex()
             .items_center()
             .justify_between()
-            .gap(px(8.0))
+            .gap(px(9.0))
             .w_full()
             .h(px(context_menu::MENU_ROW_HEIGHT))
             .px(px(10.0))
             .font(font(theme::font::SANS))
-            .text_size(self.ui_text_size(11.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(self.ui_text_size(11.5))
             .text_color(color)
-            .child(div().flex_1().min_w_0().child(action.label()))
+            .child(div().flex_1().min_w_0().truncate().child(action.label()))
             .child(render_keycap_row(&keycaps, KeycapSize::Hint));
 
         if item.enabled {
             row = row
                 .cursor_pointer()
-                .hover(|el| el.bg(theme::surface::ROW_HOVER))
+                .hover(|el| el.bg(theme::surface::PLUS_MENU_ROW_HOVER))
                 .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                     cx.stop_propagation();
                     this.run_tree_menu_action(action, window, cx);
                 }));
-        } else if let Some(reason) = item.disabled_reason {
-            row = row.tooltip(text_tooltip(reason));
+        } else {
+            row = row.cursor_default();
+            if let Some(reason) = item.disabled_reason {
+                row = row.tooltip(text_tooltip(reason));
+            }
         }
 
         row.into_any_element()
@@ -2384,6 +2463,23 @@ impl AdeApp {
     /// and the sentence above it both come from the already-resolved
     /// [`crate::sidebar::tree_ops::PendingTreeDelete::mechanism`], so what is promised here and
     /// what actually runs cannot disagree.
+    ///
+    /// ## Design language
+    ///
+    /// The panel geometry is `crate::root::new_file::AdeApp::render_new_file_prompt`'s - this
+    /// app's first centered modal and therefore the pattern to match, not to re-derive: scrim +
+    /// `flex/items_center/justify_center`, panel `p(12)` `gap(8)` on
+    /// `theme::surface::PALETTE`/`theme::border::POPOVER`/`theme::radius::CARD`, title SANS 11.5
+    /// MEDIUM `theme::text::HEADING`, body SANS 10.5 `theme::text::DIM`. Three things that were
+    /// genuinely off it are fixed here: the scrim was a raw `gpui::black()` literal rather than a
+    /// theme token (now `crate::root::widgets::modal_scrim_bg`, shared with the New file prompt),
+    /// the two buttons had no hover state at all, and the destructive one was tinted
+    /// `theme::status::FAIL` - the rail's *status* red - rather than `theme::button::DANGER_FG`,
+    /// the pair this app already uses for a destructive control. Both buttons now come from the
+    /// one shared `crate::root::widgets::render_modal_button`.
+    ///
+    /// The scrim `.occlude()`s for the same real reason
+    /// [`Self::render_tree_context_menu`]'s does - see that method's docs.
     pub(crate) fn render_tree_delete_confirm(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let pending = self.tree_delete_confirm.clone();
         let name = pending
@@ -2403,14 +2499,21 @@ impl AdeApp {
         div()
             .id("tree-delete-scrim")
             .absolute()
-            .top(px(0.0))
+            // Starts *below* the title bar, exactly like `crate::palette::render`'s own scrim
+            // does and for the same reason - now a real one, since this layer `.occlude()`s.
+            // A full-window occluding scrim swallows the window's own close/minimise/maximise
+            // caption buttons and the title bar's drag region, so the window could not be closed
+            // or moved while it was up. Reproduced against the real caption button by this
+            // change's own adversarial audit.
+            .top(theme::band::TITLE_BAR)
             .left(px(0.0))
             .right(px(0.0))
             .bottom(px(0.0))
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::black().opacity(0.35))
+            .occlude()
+            .bg(modal_scrim_bg())
             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                 this.cancel_tree_delete(cx);
             }))
@@ -2451,18 +2554,7 @@ impl AdeApp {
                             .justify_end()
                             .gap(px(8.0))
                             .child(
-                                div()
-                                    .id("tree-delete-cancel")
-                                    .debug_selector(|| "tree-delete-cancel".to_string())
-                                    .cursor_pointer()
-                                    .px(px(10.0))
-                                    .py(px(4.0))
-                                    .rounded(theme::radius::CHIP)
-                                    .bg(theme::surface::SEGMENT_TRACK)
-                                    .font(font(theme::font::SANS))
-                                    .text_size(px(10.5))
-                                    .text_color(theme::text::BODY)
-                                    .child("Cancel")
+                                render_modal_button("tree-delete-cancel", "Cancel", false)
                                     .on_click(cx.listener(
                                         |this, _event: &ClickEvent, _window, cx| {
                                             this.cancel_tree_delete(cx);
@@ -2470,19 +2562,7 @@ impl AdeApp {
                                     )),
                             )
                             .child(
-                                div()
-                                    .id("tree-delete-confirm")
-                                    .debug_selector(|| "tree-delete-confirm".to_string())
-                                    .cursor_pointer()
-                                    .px(px(10.0))
-                                    .py(px(4.0))
-                                    .rounded(theme::radius::CHIP)
-                                    .bg(theme::surface::SEGMENT_TRACK)
-                                    .font(font(theme::font::SANS))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_size(px(10.5))
-                                    .text_color(theme::status::FAIL)
-                                    .child(confirm_label)
+                                render_modal_button("tree-delete-confirm", confirm_label, true)
                                     .on_click(cx.listener(
                                         |this, _event: &ClickEvent, _window, cx| {
                                             this.confirm_tree_delete(cx);
@@ -2517,6 +2597,93 @@ pub(in crate::sidebar) fn render_changes_footer(text_size: Pixels) -> impl IntoE
         .text_color(theme::text::HINT)
         .child("click a file to open its diff in the centre")
 }
+
+/// The Files tree's keyboard-hint footer - the counterpart to [`render_changes_footer`] beside
+/// it, so switching between the two sidebar views with a diff loaded doesn't move the list under
+/// the cursor. (The Changes view's *no-diff* arm still has no footer; that arm renders a single
+/// message rather than a list, so there is nothing for a footer to sit under.)
+///
+/// This exists to answer a real, reported complaint: `Shift+F10` opens the tree's context menu
+/// (issue #19 §2 required the menu to be reachable from the keyboard, so right-click alone was
+/// never enough) but nothing in the product said so. A user's only encounter with it was a row in
+/// Settings → Keybindings reading "Files tree: context menu", which explains what it does and not
+/// why it exists or that it is the right-click equivalent. Two surfaces now do: that row's own
+/// label (`crate::settings::state::action_label`), and this strip.
+///
+/// The shape is the hint strip the design handoff already specifies for
+/// exactly this job - `design_handoff_jerry_ade/revision/Jerry.dc.html`'s own `diffHints` strip:
+/// `height:28px ... padding:0 12px;background:#111316;border-top:1px solid #1c2023`, hints at
+/// `gap:11`, each hint `gap:5`, hint-size keycaps, label `400 10px 'IBM Plex Sans'` in `#4a5057`.
+/// Which is this app's
+/// `theme::band::SURFACE_FOOTER`/`surface::FOOTER`/`border::INNER`/`text::PATH` and the
+/// `KeycapSize::Hint` keycap it already had.
+///
+/// The keystrokes are resolved through [`keymap::resolve_combo`], the same per-platform
+/// resolution the context menu's own row keycaps use - never a hard-coded keystroke string that
+/// could drift from the real binding, which is also why the tooltip below names no key at all and
+/// points at the keycaps instead. Both hints are for real, registered bindings in
+/// `crate::default_key_bindings`, asserted by
+/// `crate::sidebar::tree_ops`'s own
+/// `the_file_tree_footer_only_advertises_real_registered_bindings`.
+///
+/// `live` is the other half of that honesty: both bindings are scoped
+/// `"file-tree && !tree-editing && !tree-delete-confirm"`, so while an inline name editor or the
+/// delete confirmation is open they genuinely do not fire, and the strip drops its hints rather
+/// than advertising a dead shortcut. The band itself stays, so the tree doesn't jump 28px.
+///
+/// `text_size` - see [`render_changes_footer`]'s docs for why this takes an already-scaled value.
+pub(in crate::sidebar) fn render_file_tree_footer(
+    text_size: Pixels,
+    macos: bool,
+    live: bool,
+) -> impl IntoElement {
+    let hint = move |spec: &'static str, label: &'static str| {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .child(render_keycap_row(
+                &keymap::resolve_combo(spec, macos),
+                KeycapSize::Hint,
+            ))
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .text_size(text_size)
+                    .text_color(theme::text::PATH)
+                    .child(label),
+            )
+    };
+
+    div()
+        .id("file-tree-footer")
+        .debug_selector(|| "file-tree-footer".to_string())
+        .flex_none()
+        .h(theme::band::SURFACE_FOOTER)
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .gap(px(11.0))
+        .border_t_1()
+        .border_color(theme::border::INNER)
+        .bg(theme::surface::FOOTER)
+        .tooltip(text_tooltip(
+            "Right-click a row for file actions. The keycaps here are the keyboard equivalents, \
+             for the row currently selected in the tree.",
+        ))
+        .when(live, |el| {
+            el.child(hint(FILE_TREE_CONTEXT_MENU_SPEC, "actions"))
+                .child(hint(FILE_TREE_RENAME_SPEC, "rename"))
+        })
+}
+
+/// The two `crate::keymap::resolve_combo` specs [`render_file_tree_footer`] advertises, named so
+/// its own test can assert each one really is a registered binding rather than a plausible
+/// string. `shift+F10` has no `mod` in it and so resolves identically on every platform; it still
+/// goes through `resolve_combo` rather than being written out, so the glyphs match every other
+/// keycap in the app.
+pub(in crate::sidebar) const FILE_TREE_CONTEXT_MENU_SPEC: &str = "shift+F10";
+pub(in crate::sidebar) const FILE_TREE_RENAME_SPEC: &str = "F2";
 
 /// The file tree row's `▾`/`▸` caret, signaling a directory row is clickable/expandable,
 /// distinct from the folder icon itself. Blank but still 8px wide for a file row, to keep
@@ -3281,6 +3448,22 @@ mod fold_state_tests {
             cx.debug_bounds("file-tree-row-main.rs").is_some(),
             "the revealed file's row must really be showing"
         );
+        // Reveal and open are one action, not two (the "Reveal in tree selects the file but does
+        // not open it" report, and GitHub issue #15's "reveal + highlight the opened file in the
+        // file tree"). Before that fix this branch expanded the ancestors and highlighted the row
+        // while opening nothing at all.
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.open_change.as_deref(),
+                Some(Path::new("src/app/main.rs")),
+                "revealing a file must also open its tab"
+            );
+            assert_eq!(app.selected_tree_path.as_deref(), Some(target.as_path()));
+            assert_eq!(
+                app.code_view,
+                crate::code_surface::code_view::CodeView::File
+            );
+        });
 
         let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
         cx.run_until_parked();

@@ -4437,3 +4437,156 @@ honestly disabled, not fake-clickable - unchanged, no fix needed there.
 **Verification**: `cargo fmt --all -- --check`, `cargo build --workspace`,
 `cargo clippy --workspace --all-targets -- -D warnings` - all clean. `cargo test --workspace --lib
 --test-threads=1`: **1130 + 44 + 14 + 119 = 1307 passed, 0 failed** across all four crates.
+
+## Focus-follows-open (issue #15) and seven file-tree UI reports
+
+Two things that looked like separate bug lists turned out to be one defect and one design gap.
+
+**The one defect.** `open_palette_file_result`'s diff-less branch expanded a file's ancestors,
+highlighted its tree row, and stopped: no tab, nothing in the centre pane, focus untouched. That
+is both issue #15's report ("the file opens, but you still have to click into the editor") and the
+separately-reported "Reveal in tree selects the file in the tree but does not open it" - the same
+five lines. Its sibling branch was wrong in the mirror-image way: a *changed* file opened and
+focused a tab but never revealed or highlighted itself in the tree, so which half of the behaviour
+you got depended on whether the file happened to be in the loaded diff. Both now run one function,
+`code_surface::tabs::AdeApp::open_and_focus_file`, which opens-or-reuses the tab, moves real focus
+onto `code_focus_handle`, and reveals + highlights the row - and which `open_file_view` and
+`open_change_diff` are both now thin wrappers over. "Reveal and open are one action" is structural
+here, not a convention two call sites happen to follow.
+
+Focusing the editor is also what makes the caret real: `code_surface::editing`'s per-row paint only
+emits the caret quad when `code_focus_handle.is_focused(window)`, and only registers the real
+`Window::handle_input` from the caret's own row. So "the next keystroke lands in the buffer" is a
+consequence of that one call, not a separate feature to build.
+
+**"An action focuses its result", without a flag to forget.** Opening the file was only half of it:
+`close_palette` then restored focus to wherever it was before the palette, so the file really did
+open and the keystroke really did go to the terminal. The rule is that an entry which opens
+something owns focus afterwards and one that opens nothing restores it - and which applies is now
+*observed* rather than declared: `run_selected_palette_entry` reads `window.focused(cx)` either
+side of dispatch (`Window::focus` writes synchronously) and picks its closing path from the
+difference. Deliberately not a per-entry `bool`: that has to be set at every site that focuses
+something, and the failure mode of forgetting one is a silently swallowed keystroke, which is this
+project's most-shipped bug (see `crate::lib`'s own module docs). There is nothing to forget here.
+
+Two smaller pieces of #15's checklist: reopening a file restored its buffer caret already
+(`edit_buffers` outlives a tab close) but *showed* line 1 and stayed scrolled to the top, so a
+caret restored to line 200 was correct, misreported and invisible - both now follow the buffer.
+And the "different tab group/pane" bullet is trivially satisfied: this app has one centre pane and
+one global `open_change`, which is recorded rather than quietly skipped.
+
+**The design gap** was the file-tree context menu, and one of its seven reports was not a taste
+question at all: its rows *did* have a `.hover(..)`, set to `theme::surface::ROW_HOVER` - which is
+byte-identical to `theme::surface::PALETTE`, the popover's own background. The hover state existed
+and painted nothing. `theme::palette::ROW_HOVER`'s own docs record the identical trap for the
+palette's rows, which is where `theme::surface::PLUS_MENU_ROW_HOVER` came from. Alongside it: the
+row now speaks `work_surface::render::render_dropdown_menu_row`'s language (11.5px `text::HEADING`
+medium, `gap(9)`, `text::GHOSTER` + `cursor_default()` when disabled) rather than four values
+invented for this one menu; issue #19 §1's groups get the app's one real in-menu divider, extracted
+out of `title_bar::menu` into `root::widgets::render_menu_group_divider` so both menus draw the
+same element; and the delete confirmation gets the hover states its two buttons never had, the
+destructive `theme::button::DANGER_FG`/`DANGER_FG_HOVER` pair the rail's prune button already
+uses instead of the rail's *status* red, `theme::radius::BUTTON` instead of the chip radius, and a
+scrim built from `theme::surface::SCRIM` instead of a raw `gpui::black()` literal.
+
+**"Still lets you select the rows underneath it" had a cause no `stop_propagation` could fix.** The
+scrim was a real full-window element with a real dismiss handler, but nothing about it stopped the
+row beneath from also taking the click - and hover styling isn't an event at all, so a propagation
+guard could only ever have fixed half of it. `.occlude()` is the real mechanism (`HitboxBehavior::
+BlockMouse`; `Window::hit_test` stops walking hitboxes at the first one carrying it, which is what
+both mouse dispatch *and* `Hitbox::is_hovered` consult), and this app already used it for the pane
+resize handles. Applied to the context menu and to both centred modals.
+
+**`Shift+F10` was kept, and made findable.** Issue #19 §2 required the menu to be reachable from
+the keyboard, so deleting it was never the right answer; the honest problem was that nothing in the
+product said why it exists. The Keybindings row now reads "Files tree: open the selected row's
+actions menu" (that page has no description column - the label is the whole explanation a user
+gets), and the Files tree gained the keyboard-hint footer strip the design handoff already
+specifies for exactly this job, with keycaps resolved through `keymap::resolve_combo` rather than
+written out, and hidden while an inline editor or the delete confirmation is open - because the
+bindings genuinely don't fire then, and advertising a dead shortcut is its own small lie.
+
+### What the independent audit then found
+
+A real adversarial review sub-agent was dispatched over the finished branch and really reported;
+everything below is its work, not the author's own reasoning, and it reproduced each finding with
+throwaway probe tests before reporting. It found one CRITICAL that this change had introduced.
+
+**CRITICAL - a palette file result run while Settings is open.** `open_and_focus_file` focused
+`code_focus_handle` while `AdeApp::render` was still drawing Settings *instead of* the workspace
+body, so `Window::focus` pointed at a `FocusId` no longer in the rendered frame; GPUI fell back to
+the dispatch root with an empty context stack and every scoped binding died, Esc included. The
+user was left on a Settings page they could not leave, with no file in sight, until they clicked.
+`close_palette` had a hand-written Settings branch that used to catch this, and the new
+observe-focus path routed around it. Fixed at the source rather than by re-adding the special
+case: opening a file now closes Settings first, so what gets focused really is rendered. Restoring
+focus instead would have left the user staring at Settings after asking for a file.
+
+Two MAJOR findings were dangling-focus bugs one level removed from the code changed here, both of
+which this change made reachable or more reachable. `focus_code_surface` captures the pre-open
+focus target on the first file opened - and with no tab yet, the thing holding focus at that
+moment is the *palette's own handle*; capturing it just relocated the bug to `close_file_tab`,
+which restores through the same `OverlayFocus`. It now refuses to capture any overlay handle at
+all. And running the palette's own "Toggle Files / Changes" unrenders the whole file tree while the
+palette holds focus, so `set_right_sidebar_view`'s existing `tree_focus_handle.is_focused(window)`
+guard could not see that an overlay was holding the tree's handle as its *return* target; closing
+the palette then restored focus straight onto it. `OverlayFocus::forget_target` is the fix, swept
+from all three overlays rather than only the palette.
+
+Two more MAJOR findings were about this change's own edges. `.occlude()`ing a full-window scrim
+swallows the window's own close/minimise/maximise buttons and the title bar's drag region - the
+audit reproduced a close click being eaten - so all three scrims now start at
+`theme::band::TITLE_BAR`, which is what `render_palette`'s scrim had always done and which is now a
+load-bearing choice rather than an aesthetic one. That in turn moved the context menu's panel a
+whole title bar down, since its origin is clamped in *window* space; the offset is subtracted
+explicitly and `right_clicking_a_folder_row_opens_the_folder_menu_at_a_clamped_origin` now asserts
+the popover's real painted origin against the clamped one, which is what caught it. And
+`open_change_diff` was resolving its relative path against `file_tree_root` when `DiffFile::path`
+is relative to `diff_root` - normally equal, but `merge::flow` and `worktree_history::flow` both
+load the *main repo's* diff while a worktree is selected, so a Changes-row click there produced a
+path that exists nowhere, which the new shared reveal would have written into this worktree's
+persisted fold state. Both roots are now used for what they are, and the reveal is guarded on the
+path really being inside the tree on screen.
+
+The audit also caught this change citing `design_handoff_jerry_ade/revision 2/` - a newer handoff
+revision that is real, but is not committed to this repository, so five source comments pointed at
+a path that does not exist, and three geometry constants derived from it had no support in the
+handoff that *is* committed. Those constants are gone: the menu's row height and horizontal
+padding are back to what shipped, and the grouping is drawn with the app's own existing divider
+element. Everything now cited resolves in-tree. The footer strip's citation was real all along and
+just named the wrong directory - its shape is `design_handoff_jerry_ade/revision/Jerry.dc.html`'s
+own `diffHints` strip, values included.
+
+Smaller audit findings, all fixed: a test that asserted `menu_groups(..).flatten() == menu_items(..)`
+when `menu_items` is *defined* as that expression (deleted, and replaced with a real assertion that
+dividers never lead, trail, double up, or reorder anything); the scroll half of the caret-restore
+change having no coverage at all (it now asserts the real `UniformListScrollHandle`'s resolved
+offset against a 400-line file, and fails when reverted); a test named
+`..._and_the_next_keystroke_lands_in_the_buffer` that never simulated a keystroke; the footer's own
+tooltip hard-coding the very keystroke string its doc said it never hard-codes; the footer binding
+guard reconstructing only `shift`, so a binding that gained a Ctrl would still have matched; a doc
+enumerating `OverlayFocus::clear`'s "only" caller when it now has three; four cross-references left
+stale by the `open_and_focus_file` extraction; and an undocumented `text::GHOST` → `GHOSTER` change.
+
+Three findings were checked and deliberately not acted on, recorded here rather than left silent.
+The `+` menu's and title-bar menus' scrims have the same non-occluding click-through as the tree
+menu did - real, but not reported and not in this change's scope. A truncated or non-UTF-8 file has
+no `EditBuffer`, so the "otherwise scrolled to top" clause can't be honoured for it; the shared
+scroll handle keeps the previous file's offset, which is now written down on the test module that
+owns the behaviour. And the audit flagged two pre-existing bugs entirely outside this diff (the
+palette's Prune Worktrees entry can never actually prune, since `open_palette` disarms the
+confirmation it just armed; and `render_changes_footer`'s doc claims `]` isn't bound to anything
+when `default_key_bindings` binds it) - left for their own change.
+
+Verification: all four gates clean - `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace --lib -- --test-threads=1` at 946 app + 42 lsp-core + 14 pty-core + 98
+wt-core, up from 928 app at the verified baseline. Every fix here was confirmed non-vacuous by
+reverting it and watching its own regression fail: the focus-ownership branch in *both* directions
+(always-restore fails five tests, never-restore fails the sixth), the palette's open-the-file half,
+the `.occlude()`, the panel's title-bar offset, the caret indicator, the scroll, and all three
+audit fixes. The project's known diff-rendering flake appeared twice during this work, a different
+test in the module each time. Because this change touches `open_change_diff`, that was not assumed:
+the flakiest test was run 55 times on this branch and 55 times on the untouched base, interleaved,
+giving 3/55 here against 4/55 there - the same rate, and load-dependent rather than
+change-dependent.

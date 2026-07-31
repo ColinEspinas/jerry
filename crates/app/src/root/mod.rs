@@ -1867,12 +1867,31 @@ impl OverlayFocus {
         self.opened_agent = agents.active_id();
     }
 
-    /// Discards captured state without restoring it - used only by
-    /// [`AdeApp::close_palette`]'s Settings-showing-underneath branch, which moves focus onto
-    /// `settings_focus_handle` directly instead of through [`restore_focus`].
+    /// Discards captured state without restoring it. Three real callers: [`AdeApp::close_palette`]'s
+    /// Settings-showing-underneath branch and [`AdeApp::close_palette_keeping_result_focus`],
+    /// both of which put focus somewhere real themselves instead of going through
+    /// [`restore_focus`], and `crate::work_surface::render`'s session teardown.
     pub(crate) fn clear(&mut self) {
         self.return_focus = None;
         self.opened_agent = None;
+    }
+
+    /// Forgets a captured target that is about to stop being rendered, leaving [`restore_focus`]
+    /// to fall back to the active session's pane instead of focusing a node GPUI can no longer
+    /// find in the frame.
+    ///
+    /// This exists for a real, reproduced case (found by the `tree-focus-bugfixes` branch's own
+    /// adversarial audit): with the file tree focused, opening the palette captures
+    /// `tree_focus_handle`; running the palette's own "Toggle Files / Changes" then unrenders the
+    /// whole tree, and closing the palette restored focus straight onto it.
+    /// `crate::sidebar::render::AdeApp::set_right_sidebar_view` already had a
+    /// `tree_focus_handle.is_focused(window)` guard for the *direct* version of this, but the
+    /// palette is what holds focus at that moment, so the guard could not see it. Every overlay
+    /// that could be holding the tree's handle is swept there instead.
+    pub(crate) fn forget_target(&mut self, handle: &FocusHandle) {
+        if self.return_focus.as_ref() == Some(handle) {
+            self.return_focus = None;
+        }
     }
 }
 

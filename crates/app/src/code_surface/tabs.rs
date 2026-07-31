@@ -101,17 +101,81 @@ impl AdeApp {
         }
     }
 
-    /// Opens `path`'s diff in the centre pane (the Changes row click handler).
-    pub(crate) fn open_change_diff(
+    /// **The** "open this file and make it the thing the user is looking at and typing into"
+    /// action - the single real code path behind every entry point that opens a file: a Files
+    /// tree row click, a Changes row click, a command-palette file result, go-to-definition, a
+    /// terminal path link, and a just-created file. [`Self::open_file_view`] and
+    /// [`Self::open_change_diff`] are now thin `view`-choosing wrappers over this, not two
+    /// parallel implementations.
+    ///
+    /// It does four things that used to be spread across (or missing from) those callers, and
+    /// they belong together because two of them were genuinely inconsistent:
+    ///
+    /// 1. **Opens the tab** - `push_open_file` + `open_change`, so the tab list can never drift
+    ///    from what's showing, and an already-open path is *reused*, never duplicated.
+    /// 2. **Moves real keyboard focus into the editor** ([`Self::focus_code_surface`]). This is
+    ///    what makes the caret paint at all: `crate::code_surface::editing`'s per-row paint only
+    ///    emits the caret quad when `code_focus_handle.is_focused(window)`, and only registers
+    ///    the real `Window::handle_input` for the caret's own row - so "the next keystroke lands
+    ///    in the buffer" is a consequence of this call, not a separate feature.
+    /// 3. **Reveals and highlights it in the Files tree** - `reveal_in_tree` expands (and
+    ///    persists, issue #18 §5) every ancestor, then `selected_tree_path` highlights the row.
+    /// 4. Drops the per-file caches and popups that belong to whatever was showing before.
+    ///
+    /// Points 2 and 3 are exactly the two halves GitHub issue #15 and the "Reveal in tree selects
+    /// but doesn't open" report were about, and they were previously split: the palette's
+    /// diff-less branch did (3) and neither (1) nor (2) - it revealed and highlighted a row while
+    /// opening nothing and leaving focus wherever it was - while `open_change_diff` did (1) and
+    /// (2) and neither half of (3), so opening a *changed* file from the palette left the tree
+    /// pointing at something else entirely. Having one function do all four is what makes "reveal
+    /// and open are one action" true structurally rather than by convention.
+    ///
+    /// `relative` is the key `open_files`/`open_change`/`edit_buffers` use; `absolute` is the
+    /// real on-disk path, used only for the tree reveal. They are passed separately rather than
+    /// derived one from the other because the two callers resolve against *different* roots -
+    /// see [`Self::open_change_diff`]'s own docs for the real state in which they differ.
+    fn open_and_focus_file(
         &mut self,
-        path: PathBuf,
+        relative: PathBuf,
+        absolute: PathBuf,
+        view: code_view::CodeView,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Settings *replaces* the workspace body (`crate::root::AdeApp::render`), so focusing the
+        // code surface while it is up would pin `Window::focus` to a handle that is not in the
+        // rendered frame at all - the exact dangling-focus state `crate::root::OverlayFocus`'
+        // docs describe, and one that leaves every context-scoped binding (Esc included) dead
+        // until the next click. Found by this branch's own adversarial audit, which reproduced it
+        // through the real palette. Closing Settings is the honest resolution rather than
+        // declining to focus: the user asked to open a file, and leaving the Settings page on
+        // screen would be showing them something else.
+        if self.settings_open {
+            self.close_settings(window, cx);
+        }
         self.focus_code_surface(window, cx);
-        self.push_open_file(&path);
-        self.open_change = Some(path.clone());
-        self.code_view = code_view::CodeView::Diff;
+        self.push_open_file(&relative);
+        self.open_change = Some(relative);
+        self.code_view = view;
+        // Every "this file is now the selected tree row" path reveals it (GitHub issue #18 §5).
+        // A click in the tree has its ancestors expanded already, so this is a no-op there - but
+        // go-to-definition (`Self::navigate_to_definition`), a palette result and a terminal link
+        // all land on files in folders nobody has expanded, and now that the tree starts
+        // collapsed, highlighting a row that isn't showing would be no highlight at all.
+        //
+        // Guarded, because `absolute` is not always inside the tree currently on screen: a
+        // terminal link resolves against its session's own cwd, and `Self::open_change_diff`
+        // resolves against [`Self::diff_root`], which really can differ from
+        // [`Self::file_tree_root`] (`crate::merge::flow` and `crate::worktree_history::flow` both
+        // load the *main repo's* diff while a worktree is selected). Revealing and highlighting a
+        // path this tree does not contain would write a junk fold-state entry to disk and
+        // highlight a row that does not exist. `reveal_in_tree` already refuses such a path;
+        // `selected_tree_path` did not, which is what makes the check live here rather than
+        // there.
+        if absolute.starts_with(&self.file_tree_root) {
+            self.reveal_in_tree(&absolute, cx);
+            self.selected_tree_path = Some(absolute);
+        }
         self.refresh_open_diff_file_cache();
         // A hover card is only valid for the file it was requested against - and so is a real
         // Completions popup (Revision R8.5b audit finding 3's fix for a real, live-reproduced
@@ -124,7 +188,33 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Opens `path` directly in Surface C's File view (the Files-tree row click handler).
+    /// Opens `path`'s diff in the centre pane (the Changes row click handler, and a palette file
+    /// result for a file that really is in the loaded diff).
+    ///
+    /// `path` is relative to [`Self::diff_root`] here - that is the form `wt_core::diff`'s own
+    /// `DiffFile::path` carries, and the form every caller of this method already holds. It is
+    /// also what `open_files`/`open_change` key by, so it is passed through unchanged.
+    ///
+    /// The absolute path handed to [`Self::open_and_focus_file`] is therefore resolved against
+    /// `diff_root`, **not** `file_tree_root`. The two are normally equal, but they genuinely
+    /// diverge: `crate::merge::flow` and `crate::worktree_history::flow` both call `load_diff`
+    /// with the main repo path while the user has a worktree selected. Resolving against the
+    /// wrong one produced a path that exists nowhere, which `open_and_focus_file` would then have
+    /// revealed and persisted into this worktree's fold state - found by this branch's own
+    /// adversarial audit. That function's own `starts_with` guard is the second half of the fix.
+    pub(crate) fn open_change_diff(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let absolute = self.diff_root.join(&path);
+        self.open_and_focus_file(path, absolute, code_view::CodeView::Diff, window, cx);
+    }
+
+    /// Opens `path` (absolute) directly in Surface C's File view - the Files-tree row click
+    /// handler, go-to-definition, a terminal path link, a just-created file, and a palette file
+    /// result with no diff to show.
     pub(crate) fn open_file_view(
         &mut self,
         path: PathBuf,
@@ -133,32 +223,14 @@ impl AdeApp {
     ) {
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
-        self.focus_code_surface(window, cx);
         // Clear any stale pending cursor line from an abandoned navigation;
         // `navigate_to_definition` re-sets it right after this if it has a target line.
         self.pending_cursor_line = None;
         let relative = path
             .strip_prefix(&self.file_tree_root)
-            .map(|p| p.to_path_buf())
+            .map(|relative| relative.to_path_buf())
             .unwrap_or_else(|_| path.clone());
-        self.push_open_file(&relative);
-        self.open_change = Some(relative.clone());
-        self.code_view = code_view::CodeView::File;
-        // Every "this file is now the selected tree row" path reveals it (GitHub issue #18 §5).
-        // A click in the tree has its ancestors expanded already, so this is a no-op there - but
-        // go-to-definition (`Self::navigate_to_definition`) lands on files in folders nobody has
-        // expanded, and now that the tree starts collapsed, highlighting a row that isn't
-        // showing would be no highlight at all.
-        self.reveal_in_tree(&path, cx);
-        self.selected_tree_path = Some(path);
-        self.refresh_open_diff_file_cache();
-        // See `Self::select_worktree`'s identical reset for why - and `Self::open_change_diff`'s
-        // sibling `dismiss_completions()` call for the real data-corruption bug closing this
-        // alongside `hover` prevents (Revision R8.5b audit finding 3).
-        self.hover = None;
-        self.dismiss_completions();
-        self.close_tab_confirm_armed = None;
-        cx.notify();
+        self.open_and_focus_file(relative, path, code_view::CodeView::File, window, cx);
     }
 
     /// Activates a file tab (the tab strip's click handler), as opposed to
@@ -200,7 +272,7 @@ impl AdeApp {
         };
         self.refresh_open_diff_file_cache();
         self.hover = None;
-        // See `Self::open_change_diff`'s identical `dismiss_completions()` call for why
+        // See `Self::open_and_focus_file`'s identical `dismiss_completions()` call for why
         // (Revision R8.5b audit finding 3).
         self.dismiss_completions();
         self.code_cursor = None;
@@ -516,6 +588,16 @@ impl AdeApp {
                         if reloaded {
                             this.schedule_lsp_sync(cwd.clone(), relative_path.clone(), cx);
                         }
+                        // Whether this load is a *different* file arriving in the view, as
+                        // opposed to a freshness re-read of the one already showing. Read before
+                        // `file_view_cache` is overwritten below, since that is what it compares
+                        // against. Only a genuine arrival is allowed to move the scroll position:
+                        // a re-read of the current file must never yank the view away from
+                        // wherever the user has scrolled it.
+                        let newly_in_view = this
+                            .file_view_cache
+                            .as_ref()
+                            .is_none_or(|cached| cached.path != path);
                         this.file_view_cache = Some(parsed);
                         // A pending go-to-definition target line applies only if it names the
                         // file that just finished loading, so an unrelated file's load can't
@@ -524,12 +606,34 @@ impl AdeApp {
                             Some((pending_path, line)) if pending_path == &path => Some(*line),
                             _ => None,
                         };
+                        // GitHub issue #15: "reopening a previously visited file restores its last
+                        // caret position when known; otherwise caret at 1:1, scrolled to top."
+                        // The caret itself was already restored - `edit_buffers` deliberately
+                        // survives a tab close (see that field's docs), so its `cursor_offset` is
+                        // still the real one - but the two things that *show* it were not: the
+                        // status bar's line indicator was hard-reset to 1, and nothing scrolled
+                        // the caret's row back into view, so a caret restored to line 400 was
+                        // invisible and misreported. Both now follow the buffer. A file being
+                        // opened for the very first time has a fresh buffer at offset 0, so this
+                        // reduces to exactly "line 1, scrolled to top" with no special case.
+                        let buffer_cursor_line =
+                            this.edit_buffers.get(&relative_path).map(|buffer| {
+                                let (line, _) = buffer.line_col_for_offset(buffer.cursor_offset());
+                                line + 1
+                            });
+                        let cursor_line =
+                            target_line.or(reloaded_cursor_line).or(buffer_cursor_line);
                         if let Some(line) = target_line {
                             this.pending_cursor_line = None;
                             this.file_view_scroll_handle
                                 .scroll_to_item(line.saturating_sub(1), ScrollStrategy::Center);
+                        } else if newly_in_view {
+                            if let Some(line) = buffer_cursor_line {
+                                this.file_view_scroll_handle
+                                    .scroll_to_item(line.saturating_sub(1), ScrollStrategy::Center);
+                            }
                         }
-                        this.code_cursor = Some(target_line.or(reloaded_cursor_line).unwrap_or(1));
+                        this.code_cursor = Some(cursor_line.unwrap_or(1));
                         this.file_load_state = FileLoadState::Idle;
                     }
                     Err(error) => {
@@ -997,6 +1101,172 @@ mod unreadable_file_tests {
 /// [`AdeApp::open_change_diff`]/[`AdeApp::open_file_view`] no longer discard a file when the user
 /// navigates elsewhere, [`AdeApp::activate_file_tab`] switches which one is showing without
 /// touching the list, and [`AdeApp::close_file_tab`] is the only place a tab leaves the list.
+/// GitHub issue #15's "reopening a previously visited file restores its last caret/scroll
+/// position when known; otherwise caret at 1:1, scrolled to top."
+///
+/// What is actually implemented, stated precisely because the issue's wording is looser than the
+/// mechanism: no scroll *position* is stored anywhere. The buffer's caret is what survives (see
+/// [`AdeApp::edit_buffers`]' own docs), and both the status bar's line indicator and the scroll
+/// are re-derived from it on reopen. For a file whose caret never moved that is exactly "1:1,
+/// scrolled to top"; for one whose caret is on line 400 it is line 400, centred. A file with no
+/// `EditBuffer` at all - truncated past `code_view::MAX_FILE_BYTES`, or not valid UTF-8, both of
+/// which this app deliberately keeps read-only - has no caret to derive from, so the shared
+/// `file_view_scroll_handle` keeps whatever offset the previously shown file left it at. A real,
+/// deliberately unfixed gap rather than an unnoticed one.
+#[cfg(test)]
+mod reopened_file_caret_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Drives the real background load/render cycle `edit_buffers` is seeded from - the same
+    /// shape `code_view_cache_tests` and `editing_tests::open_file_for_editing` use.
+    fn open_and_settle(
+        app: &gpui::Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        path: PathBuf,
+    ) {
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(path, window, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+    }
+
+    /// The buffer's caret itself already survived a tab switch (`edit_buffers` deliberately
+    /// outlives a tab close - see that field's docs). What did not was the *visible* half:
+    /// `spawn_file_load`'s completion handler hard-reset `code_cursor` - the status bar's real
+    /// `ln N` indicator - to 1 for any load with no go-to-definition target, so a file reopened
+    /// with its caret on line 4 reported line 1 while the caret really sat on line 4. A visible
+    /// lie about where the next keystroke will land, in the one widget that exists to say so.
+    #[gpui::test]
+    fn reopening_a_file_reports_its_restored_caret_line_not_line_one(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let target = repo.path().join("many.txt");
+        // Long enough that the caret's row genuinely cannot be on screen at scroll offset 0 -
+        // otherwise "the view scrolled to the caret" and "the view never moved" look identical.
+        let long_file: String = (1..=400).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&target, &long_file).expect("write");
+        let other = repo.path().join("other.txt");
+        std::fs::write(&other, "x\n").expect("write");
+
+        let (app, cx) =
+            crate::root::focus::palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_and_settle(&app, cx, target.clone());
+        let relative = PathBuf::from("many.txt");
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_cursor),
+            Some(1),
+            "a first open is caret at 1:1"
+        );
+
+        assert_eq!(
+            app.read_with(cx, |app, _| f32::from(
+                app.file_view_scroll_handle
+                    .0
+                    .borrow()
+                    .base_handle
+                    .offset()
+                    .y
+            )),
+            0.0,
+            "premise: a first open really is scrolled to the top"
+        );
+
+        // Move the real caret down through the real editor actions.
+        app.update_in(cx, |app, window, cx| {
+            for _ in 0..200 {
+                app.handle_editor_down_action(&crate::root::EditorDown, window, cx);
+            }
+        });
+        cx.run_until_parked();
+        let moved = app.read_with(cx, |app, _| {
+            let buffer = app.edit_buffers.get(&relative).expect("buffer");
+            buffer.line_col_for_offset(buffer.cursor_offset()).0
+        });
+        assert_eq!(
+            moved, 200,
+            "premise: the caret really moved to buffer line 200"
+        );
+        assert_eq!(app.read_with(cx, |app, _| app.code_cursor), Some(201));
+
+        // Switch away and back, which is what makes `spawn_file_load` run again.
+        open_and_settle(&app, cx, other);
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(target, window, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let buffer = app.edit_buffers.get(&relative).expect("buffer");
+            assert_eq!(
+                buffer.line_col_for_offset(buffer.cursor_offset()).0,
+                200,
+                "premise: the buffer's own caret survived the round trip"
+            );
+            assert_eq!(
+                app.code_cursor,
+                Some(201),
+                "and the indicator must follow it rather than snapping back to line 1"
+            );
+            // The other half of the same fix, read off the real list's own resolved scroll
+            // offset (`vendor/zed/crates/gpui/src/elements/uniform_list.rs`'s `base_handle`,
+            // which is what `scroll_to_item`'s deferred target resolves into on the next
+            // layout): the caret's row must have been scrolled back into view, or a caret
+            // restored to line 200 of a 400-line file would be correct and invisible.
+            assert!(
+                f32::from(
+                    app.file_view_scroll_handle
+                        .0
+                        .borrow()
+                        .base_handle
+                        .offset()
+                        .y
+                ) < 0.0,
+                "reopening must scroll the restored caret's row into view, not sit at the top"
+            );
+        });
+    }
+
+    /// The "otherwise" half of the same clause. This one deliberately still passes with the fix
+    /// reverted - it is an over-correction guard, not coverage: it fails only if some future edit
+    /// makes a *first* open report anything but 1:1, which is the direction "always restore the
+    /// buffer's caret" would break if the buffer were ever seeded at a non-zero offset.
+    #[gpui::test]
+    fn a_first_open_is_caret_at_line_one(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let target = repo.path().join("fresh.txt");
+        std::fs::write(&target, "a\nb\nc\n").expect("write");
+
+        let (app, cx) =
+            crate::root::focus::palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_and_settle(&app, cx, target);
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.code_cursor, Some(1));
+            assert_eq!(
+                app.edit_buffers
+                    .get(Path::new("fresh.txt"))
+                    .expect("buffer")
+                    .cursor_offset(),
+                0
+            );
+        });
+    }
+}
+
 #[cfg(test)]
 mod multi_file_tab_tests {
     use super::*;
@@ -1004,7 +1274,7 @@ mod multi_file_tab_tests {
 
     /// Writes three files under `dir` and returns both their absolute paths (what
     /// `open_file_view` takes) and their repo-relative paths (what `open_change`/`open_files`/
-    /// `activate_file_tab`/`close_file_tab` key by, via `open_file_view`'s `strip_prefix`).
+    /// `activate_file_tab`/`close_file_tab` key by, via `open_file_view`'s own `strip_prefix`).
     fn write_three_files(
         dir: &std::path::Path,
     ) -> ((PathBuf, PathBuf, PathBuf), (PathBuf, PathBuf, PathBuf)) {
