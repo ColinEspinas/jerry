@@ -3796,3 +3796,137 @@ diff_render_tests` flake (a real, unrelated timing race, already documented in t
 reproduced once in an earlier full run and confirmed flaky - not a regression - by re-running that
 module alone three times (2 clean, 1 failure on a different test within the same module each
 time).
+
+## Movable tabs between terminal and file groups, with a real drop indicator (GitHub issue #16, scoped)
+
+Issue #16's full body describes a large unified-tab-model feature (drag ghost, insertion
+carets, cross-group highlight, settle/cancel spring animations, a reduced-motion setting, and
+full arbitrary-layout persistence across restart). Per explicit direction, this pass is
+deliberately narrowed to the two concrete things actually requested: every tab draggable between
+the terminal-tab group and the file-tab group (today they're two rigid, non-interleaving
+blocks), and clearer visual feedback during a drag.
+
+**The real architectural blocker.** `work_surface::sessions::Sessions` (a flat `Vec<Session>`,
+filtered per-worktree by `iter_for_cwd`) and `AdeApp::open_files` (a separate, independently
+ordered `Vec<PathBuf>`) are two entirely independent ordered lists with no shared notion of
+position - `render_tab_strip` rendered them as "every session, then every file," full stop.
+Drag-and-drop already existed, but `DraggedSessionTab`/`DraggedFileTab` were two deliberately
+separate types precisely so a session tab could never land in a file tab's `on_drop::<T>`
+handler or vice versa - GPUI dispatches `on_drop::<T>` purely on the dragged value's concrete
+type (verified against `vendor/zed/crates/gpui/src/elements/div.rs`), so two distinct types can
+never cross-target each other's handlers by construction.
+
+**Data structure: a combined per-worktree order, reconciled fresh on every render rather than
+eagerly maintained.** Added `work_surface::state::TabRef` (`Session(SessionId)` / `File(PathBuf)`)
+and `AdeApp::tab_order: HashMap<PathBuf, Vec<TabRef>>`, keyed by worktree cwd. Deliberately *not*
+the source of truth for which tabs exist - `Sessions`/`AdeApp::open_files` keep that job entirely
+unchanged, so spawning, closing, PTY lifecycle, and edit-buffer state needed zero modification, as
+directed. `tab_order` only ever records a user's real drag-chosen *position*. The two are
+reconnected by a small, deliberately `gpui`-free pure function,
+`work_surface::state::reconcile_tab_order(stored, sessions_for_cwd, open_files)`: it drops any
+stored entry that no longer exists (a closed session, a closed file tab) and appends anything open
+that isn't in `stored` yet, in creation/open order - the same position a brand-new tab has always
+landed at. `AdeApp::combined_tab_order()` calls this fresh on every read (never caches a mutated
+copy), which is what let `render_tab_strip`, `current_worktree_sessions` (and therefore the
+`secondary-1`..`8` jump keycaps and Session-menu "Next/Previous session" cycling, which both read
+`current_worktree_sessions`) become order-agnostic to tab *kind* for free, satisfying "keyboard
+cycling and tab actions must work regardless of a tab's position in the combined order" without
+touching their own logic at all. The one place that does mutate `tab_order` is
+`AdeApp::reorder_tab` (the real drag-drop entry point), which reconciles, calls the equally pure
+`work_surface::state::move_tab_order(order, dragged, target, insert_after)`, and persists the
+result back into the map for that worktree's cwd - `insert_after` lets one function place the
+dragged tab on either side of the target, so cross-kind and same-kind reorders share one code
+path instead of two.
+
+This design choice deliberately *removed* `Sessions::move_before` and
+`AdeApp::reorder_open_file_before`, the two old same-kind reorder functions the tab strip used to
+call directly: once `tab_order` is the real visual source of truth, letting `Sessions`'/
+`open_files`' own internal `Vec` order *also* silently drift via a second, independent mutation
+path was judged a worse footgun (two orderings that can disagree) than one clean cut - their own
+two tests (`drag_reordering_two_session_tabs_changes_their_order`,
+`drag_reorder_is_a_no_op_for_an_unknown_or_identical_id`) were rewritten in place to exercise
+`AdeApp::reorder_tab`/`current_worktree_sessions` instead of the removed methods directly, keeping
+the same real assertions.
+
+Because `open_files` is already fully cleared on every worktree switch
+(`reset_per_worktree_ui_state`) and never holds more than one worktree's file tabs at once, a
+worktree's own `tab_order` entry naturally reconciles down to just its session tabs the moment its
+file tabs close - no extra reset code was needed in `select_worktree` at all. A pleasant, *un*designed
+side effect of this same reconciliation: if a file is closed and later reopened at the same
+worktree-relative path (including across a worktree switch away and back), it silently reclaims
+its old position in the stored order rather than always landing at the end - real, but explicitly
+not a guarantee this pass makes or tests for (see "left out of scope" below).
+
+**Unified drag type.** `DraggedSessionTab`/`DraggedFileTab` were merged into one
+`DraggedTab { Session { id, label }, File { path, label } }` enum, with a `.tab_ref()` method
+converting either variant to the `TabRef` `AdeApp::reorder_tab` actually moves. Both
+`render_session_tab` and `render_file_tab` now register exactly one `on_drag`/`on_drag_move`/
+`on_drop` set, all typed `DraggedTab` - so a file tab dropped on a session tab (or vice versa)
+reaches the same real handler a same-kind drop does. `Render for DraggedTab` keeps the existing
+floating-chip ghost essentially unchanged (still a small legible label chip), per direction not to
+over-invest there.
+
+**The drop indicator: a precise per-tab insertion caret, not a whole-tab highlight.** The old
+feedback was `tab.border_l(px(2.0))` on `drag_over::<T>` - the entire hovered tab got a left
+border regardless of where the cursor actually was over it, so "will this land before or after
+the hovered tab" was ambiguous. The new mechanism registers `on_drag_move::<DraggedTab>` on
+*every* tab (not a single container-level listener) - verified real GPUI behavior, confirmed both
+against `vendor/zed/crates/gpui/src/elements/div.rs`'s own dispatch and this repo's own
+`root::scrollbar` module docs, which document the identical caveat for `ScrollbarDrag`: GPUI
+dispatches a matching `on_drag_move::<T>` to *every* mounted element of that type on every
+drag-move tick, each receiving its own element's `bounds` - so each tab's own handler
+(`AdeApp::update_tab_drag_insertion`) checks `event.bounds.contains(&event.event.position)`
+itself before claiming the caret, and splits its own width in half via `Bounds::center()` to
+decide "before" (left half) vs. "after" (right half). The winning tab renders a 2px absolute
+`div` at the exact boundary (`render_tab_insertion_caret`) - unambiguous, not a whole-tab tint.
+State lives in one new field, `AdeApp::tab_drag_insertion: Option<(TabRef, bool)>`, read by
+`AdeApp::drop_dragged_tab` (the shared `on_drop` handler both tab kinds call) to decide the real
+`insert_after` value, and cleared there once handled. Because a drag can be cancelled by
+releasing outside any tab's own hitbox (no `on_drop` fires in that case), a defensive
+`on_mouse_up` was also added to `render_workspace_body` (which spans virtually the whole window
+below the title bar) clearing `tab_drag_insertion` so a cancelled drag can't leave a caret
+stuck on a tab nothing is being dragged over anymore.
+
+**Left out of scope, explicitly, per the user's own narrowing (not partially attempted, not
+half-shipped):**
+- No reduced-motion setting - there is no new animation for it to gate.
+- No settle/cancel spring animations for the dragged chip or the tabs it passes over - the
+  existing instant-reflow drag ghost is unchanged.
+- No designed guarantee that an arbitrary mixed session/file layout survives an app restart -
+  `AdeApp::tab_order` is in-memory only, never written to `settings.toml`/disk. It does survive a
+  worktree switch away and back within the same running window (sessions persist regardless;
+  files reconcile back into their old slot if reopened at the same path, per the "un-designed side
+  effect" noted above) but that's a byproduct of the reconciliation design, not a tested contract,
+  and explicitly does not extend across a process restart.
+- `AdeApp::close_file_tab`'s own "which tab becomes active next" fallback was deliberately left
+  reading only `open_files`' own neighbor, not the combined order - closing a file tab still
+  activates the next/previous *file* tab (falling back to the active session only once no file
+  tabs remain), rather than whichever tab is visually adjacent in the combined strip. Changing
+  this would touch a currently-working, separately-tested code path for a corner case outside the
+  two things actually asked for.
+
+**Testing discipline.** New coverage spans both layers: seven new `work_surface::state` plain
+`#[test]`s for `reconcile_tab_order`/`move_tab_order` (no GPUI needed - deliberately kept
+`gpui`-free like the rest of that module), and two new `#[gpui::test]`s in
+`work_surface::render`'s `tab_scoping_tests`: `dragging_a_file_tab_between_two_session_tabs_interleaves_them`
+(spawns two real sessions, opens one real temp file via the real `open_file_view` path, drags the
+file tab to land between the two sessions, asserts `combined_tab_order()` actually interleaves
+them - the core new capability), and `drop_dragged_tab_honors_the_recorded_insertion_side_then_clears_it`
+(asserts `insert_after` is honored and the caret state is cleared post-drop). The two existing
+drag-reorder tests were adapted in place rather than deleted, per the note above. Every new test
+was verified to actually fail without its corresponding fix by temporarily reverting the
+production code (breaking `move_tab_order`'s `insert_after` branch, no-opping
+`reconcile_tab_order`'s filter, no-opping `AdeApp::reorder_tab`'s call into `move_tab_order`, and
+hardcoding `drop_dragged_tab`'s `insert_after` to `false`), confirming the exact expected failure,
+then restoring the real fix.
+
+**Gates**, from this project's usual Linux sandbox (`export
+LIBRARY_PATH=/tmp/x11-deps/prefix/usr/lib/x86_64-linux-gnu`): `cargo fmt --all -- --check`,
+`cargo build --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` all clean.
+`cargo test --workspace --lib -- --test-threads=1`: **1230 passed, 0 failed** across all four
+crates on the final, clean run (`app` 1065, `lsp-core` 44, `pty-core` 14, `wt-core` 107). One
+earlier run of the full suite hit the known pre-existing `code_surface::diff_view::
+diff_render_tests` flake - a different test in that module than the two previously documented in
+this repo's own notes (`repeated_refreshes_of_the_same_open_diff_reuse_the_cached_highlighting`
+this time), same timing-sensitive family, `diff_view.rs` untouched anywhere by this change -
+confirmed it passes cleanly in isolation, and the subsequent full-suite re-run above was clean.

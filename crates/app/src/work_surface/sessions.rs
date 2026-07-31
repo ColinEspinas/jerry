@@ -341,40 +341,6 @@ impl Sessions {
         }
         self.sync_pane_cadence(cx);
     }
-
-    /// Moves session `dragged_id` to sit immediately before session `target_id` in this app's
-    /// underlying tab order - the real backing for the tab strip's drag-to-reorder gesture
-    /// (`crate::root::AdeApp::render_session_tab`'s `on_drop`). A no-op if either id is
-    /// missing, or if they're the same id.
-    ///
-    /// Reorders within the single flat `Vec` shared by every worktree's sessions, not a
-    /// per-worktree sub-list - safe because the tab strip only ever drags tabs that are
-    /// already both visible in the same (per-worktree-filtered) strip, and inserting
-    /// `dragged_id` immediately before `target_id`'s own position preserves their relative
-    /// order in *any* filtered view that contains both, regardless of which other worktrees'
-    /// sessions happen to be interleaved between them in the real storage order.
-    pub fn move_before(&mut self, dragged_id: SessionId, target_id: SessionId) {
-        if dragged_id == target_id {
-            return;
-        }
-        let Some(from) = self
-            .sessions
-            .iter()
-            .position(|session| session.id == dragged_id)
-        else {
-            return;
-        };
-        if !self.sessions.iter().any(|session| session.id == target_id) {
-            return;
-        }
-        let session = self.sessions.remove(from);
-        let to = self
-            .sessions
-            .iter()
-            .position(|session| session.id == target_id)
-            .unwrap_or(self.sessions.len());
-        self.sessions.insert(to, session);
-    }
 }
 
 impl Default for Sessions {
@@ -387,12 +353,14 @@ impl Default for Sessions {
 mod tests {
     use super::*;
 
-    /// `move_before`/`close`/`activate_for_worktree` all need a real `Session` (a real
-    /// `Entity<TerminalPane>`, only buildable via `Sessions::spawn` inside a real GPUI window) to
-    /// exercise meaningfully, so that coverage lives in `work_surface::render`'s GPUI-test
-    /// module (`tab_scoping_tests`) instead, alongside the rest of this revision's worktree/tab
-    /// scoping coverage. This module only holds the plain, GPUI-free checks that don't need a
-    /// real pane at all.
+    /// `close`/`activate_for_worktree` both need a real `Session` (a real `Entity<TerminalPane>`,
+    /// only buildable via `Sessions::spawn` inside a real GPUI window) to exercise meaningfully,
+    /// so that coverage lives in `work_surface::render`'s GPUI-test module (`tab_scoping_tests`)
+    /// instead, alongside the rest of this revision's worktree/tab scoping coverage (and the
+    /// combined tab-order drag-to-reorder coverage - see `work_surface::state`'s own
+    /// `reconcile_tab_order`/`move_tab_order` for the tab strip's real ordering layer, which
+    /// tracks position on top of `Sessions` rather than inside it). This module only holds the
+    /// plain, GPUI-free checks that don't need a real pane at all.
     #[test]
     fn a_fresh_sessions_collection_has_no_active_session() {
         let sessions = Sessions::new();

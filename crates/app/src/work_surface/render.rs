@@ -3,6 +3,7 @@ use crate::root::widgets::{
     render_action_keycap_row, render_env_chip, render_hint_pair, render_keycap_row, text_tooltip,
     KeycapSize,
 };
+use gpui::DragMoveEvent;
 
 /// Defines one `JumpToSessionN` action handler forwarding a literal position to
 /// [`AdeApp::jump_to_session_at`]. Each `actions!`-generated struct is a distinct action type
@@ -330,22 +331,124 @@ impl AdeApp {
         }
     }
 
-    /// Every session open in the *currently selected* worktree (`Self::active_session_cwd`), in
-    /// creation order - the real per-worktree tab-strip filter (`crate::work_surface::sessions::Sessions::
-    /// iter_for_cwd`) both [`Self::render_tab_strip`] and [`Self::session_jump_keys`]/
-    /// [`Self::jump_to_session_at`] share, so the tabs shown and the tabs a jump keycap can
-    /// reach can never disagree.
-    pub(crate) fn current_worktree_sessions(&self) -> impl Iterator<Item = &Session> {
-        self.sessions.iter_for_cwd(self.active_session_cwd())
+    /// The active worktree's real combined tab order (GitHub issue #16) - every session and file
+    /// tab currently open in it, interleaved exactly as [`Self::render_tab_strip`] draws them,
+    /// instead of always "every session, then every file". Reconciled fresh from
+    /// [`Self::tab_order`]'s stored order plus whatever's *actually* open right now
+    /// (`work_surface::state::reconcile_tab_order`'s own docs on why this is safe to call on
+    /// every render rather than caching a mutated copy) - [`Self::tab_order`] itself only records
+    /// a user's real drag-chosen order, never which tabs exist; that's still `Sessions`/
+    /// [`Self::open_files`]'s job.
+    pub(crate) fn combined_tab_order(&self) -> Vec<work_surface::TabRef> {
+        let cwd = self.active_session_cwd();
+        let stored = self.tab_order.get(&cwd).map(Vec::as_slice).unwrap_or(&[]);
+        let session_ids: Vec<SessionId> = self
+            .sessions
+            .iter_for_cwd(cwd.clone())
+            .map(|session| session.id)
+            .collect();
+        work_surface::reconcile_tab_order(stored, &session_ids, &self.open_files)
     }
 
-    /// The tab strip: one [`render_session_tab`] per session open in the *currently selected*
-    /// worktree (`Self::current_worktree_sessions`) - never every session across every
-    /// worktree, per this revision's whole point (see `crate::root::mod`'s "One rail row per
-    /// worktree" docs) - followed by one [`Self::render_file_tab`] per entry of
-    /// [`Self::open_files`] in that `Vec`'s order (already worktree-scoped: `Self::
-    /// select_worktree` clears it on every switch), then the `+` menu button
-    /// ([`Self::render_tab_strip_plus`]) and right-aligned session-jump keycaps.
+    /// The unified tab strip's real drag-to-reorder entry point (GitHub issue #16) - moves
+    /// `dragged` to sit immediately before (or, if `insert_after`, immediately after) `target` in
+    /// the active worktree's own combined tab order, regardless of whether either is a session or
+    /// a file tab (`work_surface::state::move_tab_order`'s own docs on why this is one function,
+    /// not a per-kind pair). Persists the result into [`Self::tab_order`], keyed by the active
+    /// worktree's cwd, so it survives the next render's [`Self::combined_tab_order`]
+    /// reconciliation and, for session tabs, a later worktree switch away and back. Never
+    /// restarts a pty or reloads a file buffer - `Sessions`/[`Self::open_files`] themselves are
+    /// untouched; only this ordering layer changes.
+    pub(in crate::work_surface) fn reorder_tab(
+        &mut self,
+        dragged: work_surface::TabRef,
+        target: work_surface::TabRef,
+        insert_after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let cwd = self.active_session_cwd();
+        let mut order = self.combined_tab_order();
+        work_surface::move_tab_order(&mut order, &dragged, &target, insert_after);
+        self.tab_order.insert(cwd, order);
+        cx.notify();
+    }
+
+    /// One tab's own `on_drag_move::<DraggedTab>` handler (both [`Self::render_session_tab`] and
+    /// [`Self::render_file_tab`] register this, each closing over its own `hovered` [`work_surface::
+    /// TabRef`]) - real per-tab mouse tracking during a drag, not a container-level listener:
+    /// `on_drag_move`'s own doc comment and `crate::root::scrollbar`'s module docs both confirm
+    /// GPUI dispatches a matching `on_drag_move::<T>` to *every* mounted element of that type on
+    /// every drag-move tick, each receiving its own `event.bounds` - so every tab checks whether
+    /// the live cursor (`event.event.position`) actually falls inside its own bounds before
+    /// claiming the insertion caret; whichever tab's bounds the cursor is really over is the one
+    /// that wins, on the very next tick after the cursor crosses into it. Splits `hovered`'s own
+    /// width in half (`Bounds::center`) to decide "before" (`insert_after = false`, left half) vs.
+    /// "after" (`insert_after = true`, right half) - the exact cursor-position precision GitHub
+    /// issue #16 asks for, replacing the old whole-tab `border_l` highlight that couldn't tell
+    /// the two apart. A no-op while the dragged tab is hovering over *itself* - dropping a tab on
+    /// its own slot is always a no-op ([`work_surface::state::move_tab_order`]'s own docs), so no
+    /// caret should invite it either.
+    pub(in crate::work_surface) fn update_tab_drag_insertion(
+        &mut self,
+        hovered: &work_surface::TabRef,
+        event: &DragMoveEvent<DraggedTab>,
+        cx: &mut Context<Self>,
+    ) {
+        if event.drag(cx).tab_ref() == *hovered {
+            return;
+        }
+        if !event.bounds.contains(&event.event.position) {
+            return;
+        }
+        let insert_after = event.event.position.x >= event.bounds.center().x;
+        if self.tab_drag_insertion.as_ref() != Some(&(hovered.clone(), insert_after)) {
+            self.tab_drag_insertion = Some((hovered.clone(), insert_after));
+            cx.notify();
+        }
+    }
+
+    /// One tab's own `on_drop::<DraggedTab>` handler (both [`Self::render_session_tab`] and
+    /// [`Self::render_file_tab`] register this) - reads which half of `target`'s own tab the
+    /// cursor last landed on from [`Self::tab_drag_insertion`] (defaulting to "before" if the
+    /// drop lands on a tab [`Self::update_tab_drag_insertion`] never actually recorded for - a
+    /// drop can still fire on a tab the cursor technically never entered, e.g. a very fast
+    /// release), then delegates to [`Self::reorder_tab`], and clears the now-stale caret state.
+    pub(in crate::work_surface) fn drop_dragged_tab(
+        &mut self,
+        dragged: work_surface::TabRef,
+        target: work_surface::TabRef,
+        cx: &mut Context<Self>,
+    ) {
+        let insert_after = self
+            .tab_drag_insertion
+            .as_ref()
+            .is_some_and(|(hovered, after)| *hovered == target && *after);
+        self.reorder_tab(dragged, target, insert_after, cx);
+        self.tab_drag_insertion = None;
+    }
+
+    /// Every session open in the *currently selected* worktree (`Self::active_session_cwd`), in
+    /// the same order [`Self::combined_tab_order`] renders them - never Sessions' own raw
+    /// creation order once a real drag has interleaved them differently, and never every session
+    /// across every worktree, per this revision's whole point (see `crate::root::mod`'s "One
+    /// rail row per worktree" docs). The real per-worktree tab-strip order both
+    /// [`Self::render_tab_strip`] and [`Self::session_jump_keys`]/[`Self::jump_to_session_at`]
+    /// share, so the tabs shown and the tabs a jump keycap can reach can never disagree.
+    pub(crate) fn current_worktree_sessions(&self) -> impl Iterator<Item = &Session> {
+        let order = self.combined_tab_order();
+        order.into_iter().filter_map(move |tab_ref| match tab_ref {
+            work_surface::TabRef::Session(id) => {
+                self.sessions.iter().find(|session| session.id == id)
+            }
+            work_surface::TabRef::File(_) => None,
+        })
+    }
+
+    /// The tab strip: one tab per entry of [`Self::combined_tab_order`], in that exact order -
+    /// [`Self::render_session_tab`] for a `TabRef::Session`, [`Self::render_file_tab`] for a
+    /// `TabRef::File` - so a session tab and a file tab can sit side by side in either order
+    /// (GitHub issue #16), rather than always "every session, then every file" - followed by the
+    /// `+` menu button ([`Self::render_tab_strip_plus`]) and right-aligned session-jump keycaps.
     pub(in crate::work_surface) fn render_tab_strip(
         &self,
         cx: &mut Context<Self>,
@@ -360,18 +463,17 @@ impl AdeApp {
             .border_b_1()
             .border_color(theme::border::ZONE);
 
-        let session_ids: Vec<SessionId> = self
-            .current_worktree_sessions()
-            .map(|session| session.id)
-            .collect();
-        for id in &session_ids {
-            if let Some(session) = self.sessions.iter().find(|session| session.id == *id) {
-                bar = bar.child(self.render_session_tab(session, cx));
+        for tab_ref in self.combined_tab_order() {
+            match tab_ref {
+                work_surface::TabRef::Session(id) => {
+                    if let Some(session) = self.sessions.iter().find(|session| session.id == id) {
+                        bar = bar.child(self.render_session_tab(session, cx));
+                    }
+                }
+                work_surface::TabRef::File(path) => {
+                    bar = bar.child(self.render_file_tab(&path, cx));
+                }
             }
-        }
-
-        for path in &self.open_files {
-            bar = bar.child(self.render_file_tab(path, cx));
         }
 
         bar = bar.child(self.render_tab_strip_plus(cx));
@@ -454,13 +556,19 @@ impl AdeApp {
             .edit_buffers
             .get(path)
             .is_some_and(|buffer| buffer.is_dirty());
-        let drag_value = DraggedFileTab {
+        let tab_ref = work_surface::TabRef::File(path.to_path_buf());
+        let drag_value = DraggedTab::File {
             path: path.to_path_buf(),
             label: file_name.clone(),
+        };
+        let insertion_caret = match &self.tab_drag_insertion {
+            Some((target, insert_after)) if *target == tab_ref => Some(*insert_after),
+            _ => None,
         };
 
         div()
             .id(format!("file-tab-{key}"))
+            .relative()
             .flex()
             .flex_none()
             .flex_col()
@@ -477,21 +585,26 @@ impl AdeApp {
                     this.request_close_file_tab(middle_click_path.clone(), window, cx);
                 }),
             )
-            // Real drag-to-reorder among file tabs - see `DraggedSessionTab`'s own docs for the
-            // identical mechanism, mirrored here for `Self::open_files` instead of `Sessions`.
+            // Real drag-to-reorder, unified across session and file tabs (GitHub issue #16) -
+            // see `DraggedTab`'s own docs for the shared mechanism.
             .on_drag(drag_value, |dragged, _position, _window, cx| {
                 cx.new(|_| dragged.clone())
             })
-            .drag_over::<DraggedFileTab>(|tab, _dragged, _window, _cx| {
-                tab.border_l(px(2.0)).border_color(theme::status::ASK)
-            })
-            .on_drop(cx.listener({
-                let target = path.to_path_buf();
-                move |this, dragged: &DraggedFileTab, _window, cx| {
-                    this.reorder_open_file_before(&dragged.path, &target);
-                    cx.notify();
+            .on_drag_move(cx.listener({
+                let tab_ref = tab_ref.clone();
+                move |this, event: &DragMoveEvent<DraggedTab>, _window, cx| {
+                    this.update_tab_drag_insertion(&tab_ref, event, cx);
                 }
             }))
+            .on_drop(cx.listener({
+                let target = tab_ref.clone();
+                move |this, dragged: &DraggedTab, _window, cx| {
+                    this.drop_dragged_tab(dragged.tab_ref(), target.clone(), cx);
+                }
+            }))
+            .when_some(insertion_caret, |el, insert_after| {
+                el.child(render_tab_insertion_caret(insert_after))
+            })
             .child(
                 div()
                     .id(format!("file-tab-hit-{key}"))
@@ -569,33 +682,6 @@ impl AdeApp {
                     ),
             )
             .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline))
-    }
-
-    /// Moves `dragged` to sit immediately before `target` in [`Self::open_files`] - the file-tab
-    /// strip's own drag-to-reorder backing, mirroring `crate::work_surface::sessions::Sessions::move_before`'s
-    /// identical shape for session tabs. A no-op if either path isn't currently open, or if
-    /// they're the same path.
-    pub(in crate::work_surface) fn reorder_open_file_before(
-        &mut self,
-        dragged: &Path,
-        target: &Path,
-    ) {
-        if dragged == target {
-            return;
-        }
-        let Some(from) = self.open_files.iter().position(|path| path == dragged) else {
-            return;
-        };
-        if !self.open_files.iter().any(|path| path == target) {
-            return;
-        }
-        let path = self.open_files.remove(from);
-        let to = self
-            .open_files
-            .iter()
-            .position(|path| path == target)
-            .unwrap_or(self.open_files.len());
-        self.open_files.insert(to, path);
     }
 
     /// The tab strip's `+` menu button - toggles [`Self::plus_menu_open`] (unconditionally
@@ -1025,13 +1111,19 @@ impl AdeApp {
         };
         let is_mono = matches!(chip_kind, work_surface::TabChipKind::Cli);
         let colors = work_surface::tab_colors(is_active);
-        let drag_value = DraggedSessionTab {
+        let tab_ref = work_surface::TabRef::Session(id);
+        let drag_value = DraggedTab::Session {
             id,
             label: label.clone(),
+        };
+        let insertion_caret = match &self.tab_drag_insertion {
+            Some((target, insert_after)) if *target == tab_ref => Some(*insert_after),
+            _ => None,
         };
 
         div()
             .id(("session-tab", id))
+            .relative()
             .flex()
             .flex_none()
             .flex_col()
@@ -1049,24 +1141,28 @@ impl AdeApp {
                     cx.notify();
                 }),
             )
-            // Real drag-to-reorder (see `DraggedSessionTab`'s own docs): dragging this tab and
-            // dropping it on another session tab in the same (per-worktree) strip moves it to
-            // sit immediately before whichever tab it was dropped on
-            // (`crate::work_surface::sessions::Sessions::move_before`). No `can_drop` predicate needed - the
-            // `on_drop::<DraggedSessionTab>` type parameter alone already rejects a drop of any
-            // other dragged-value type (e.g. `DraggedFileTab`).
+            // Real drag-to-reorder, unified across session and file tabs (GitHub issue #16) -
+            // see `DraggedTab`'s own docs for the shared mechanism. No `can_drop` predicate
+            // needed - the `on_drop::<DraggedTab>` type parameter alone already rejects a drop of
+            // any other dragged-value type.
             .on_drag(drag_value, |dragged, _position, _window, cx| {
                 cx.new(|_| dragged.clone())
             })
-            .drag_over::<DraggedSessionTab>(|tab, _dragged, _window, _cx| {
-                tab.border_l(px(2.0)).border_color(theme::status::ASK)
+            .on_drag_move(cx.listener({
+                let tab_ref = tab_ref.clone();
+                move |this, event: &DragMoveEvent<DraggedTab>, _window, cx| {
+                    this.update_tab_drag_insertion(&tab_ref, event, cx);
+                }
+            }))
+            .on_drop(cx.listener({
+                let target = tab_ref.clone();
+                move |this, dragged: &DraggedTab, _window, cx| {
+                    this.drop_dragged_tab(dragged.tab_ref(), target.clone(), cx);
+                }
+            }))
+            .when_some(insertion_caret, |el, insert_after| {
+                el.child(render_tab_insertion_caret(insert_after))
             })
-            .on_drop(
-                cx.listener(move |this, dragged: &DraggedSessionTab, _window, cx| {
-                    this.sessions.move_before(dragged.id, id);
-                    cx.notify();
-                }),
-            )
             .child(
                 div()
                     .id(("session-tab-hit", id))
@@ -1882,21 +1978,44 @@ pub(in crate::work_surface) fn render_tab_chip(
     }
 }
 
-/// The tab strip's drag-to-reorder value for a session tab (`Self::render_session_tab`'s
-/// `on_drag`/`on_drop`) - real GPUI drag-and-drop (`on_drag`/`drag_over`/`can_drop`/`on_drop`,
-/// verified against `vendor/zed/crates/gpui/src/elements/div.rs` and mirroring
-/// `vendor/zed/crates/workspace/src/pane.rs`'s own `DraggedTab` for exactly this "reorder tabs
-/// by dragging" pattern), not this project's earlier `on_drag`/`on_drag_move` use in
-/// `crate::root::resize` (a resize-handle hack with no real drag *payload* at all). `Render`ing
-/// the dragged value itself as its own small floating chip - the same choice Zed's own
-/// `DraggedTab` makes - rather than a generic ghost, so what's being dragged stays legible.
+/// The unified tab strip's drag-to-reorder value (GitHub issue #16) - both
+/// [`AdeApp::render_session_tab`] and [`AdeApp::render_file_tab`]'s `on_drag`/`on_drag_move`/
+/// `on_drop` share this one type (rather than the two separate, kind-locked types this revision
+/// replaces) precisely so a session tab can be dropped onto a file tab and vice versa: GPUI's
+/// `on_drop::<T>`/`on_drag_move::<T>` dispatch purely on the dragged value's concrete type
+/// (verified against `vendor/zed/crates/gpui/src/elements/div.rs`, and
+/// `crate::root::scrollbar`'s own module docs on that exact dispatch rule), so two distinct types
+/// could never cross-target each other's drop handlers - real GPUI drag-and-drop
+/// (`on_drag`/`on_drag_move`/`on_drop`), not this project's earlier `on_drag`/`on_drag_move` use
+/// in `crate::root::resize` (a resize-handle hack with no real drag *payload* at all), and
+/// mirroring `vendor/zed/crates/workspace/src/pane.rs`'s own `DraggedTab` for the "reorder tabs
+/// by dragging" pattern itself. `Render`ing the dragged value as its own small floating chip -
+/// the same choice Zed's own `DraggedTab` makes - keeps what's being dragged legible.
 #[derive(Clone)]
-pub(in crate::work_surface) struct DraggedSessionTab {
-    pub(in crate::work_surface) id: SessionId,
-    pub(in crate::work_surface) label: String,
+pub(in crate::work_surface) enum DraggedTab {
+    Session { id: SessionId, label: String },
+    File { path: PathBuf, label: String },
 }
 
-impl Render for DraggedSessionTab {
+impl DraggedTab {
+    fn label(&self) -> &str {
+        match self {
+            DraggedTab::Session { label, .. } => label,
+            DraggedTab::File { label, .. } => label,
+        }
+    }
+
+    /// This dragged value's own identity as a [`work_surface::TabRef`] - what
+    /// [`AdeApp::reorder_tab`] actually moves, regardless of which concrete kind was dragged.
+    pub(in crate::work_surface) fn tab_ref(&self) -> work_surface::TabRef {
+        match self {
+            DraggedTab::Session { id, .. } => work_surface::TabRef::Session(*id),
+            DraggedTab::File { path, .. } => work_surface::TabRef::File(path.clone()),
+        }
+    }
+}
+
+impl Render for DraggedTab {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .px(px(10.0))
@@ -1908,34 +2027,25 @@ impl Render for DraggedSessionTab {
             .font(font(theme::font::SANS))
             .text_size(px(11.0))
             .text_color(theme::text::BODY)
-            .child(self.label.clone())
+            .child(self.label().to_string())
     }
 }
 
-/// The file-tab strip's own drag-to-reorder value - see [`DraggedSessionTab`]'s own docs for the
-/// shared mechanism; kept as a distinct type (not a shared enum) so a session tab can never be
-/// accidentally dropped into a file-tab reorder or vice versa - GPUI's `on_drop::<T>` dispatches
-/// purely on the dragged value's concrete type.
-#[derive(Clone)]
-pub(in crate::work_surface) struct DraggedFileTab {
-    pub(in crate::work_surface) path: PathBuf,
-    pub(in crate::work_surface) label: String,
-}
-
-impl Render for DraggedFileTab {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px(px(10.0))
-            .py(px(4.0))
-            .rounded(theme::radius::CHIP)
-            .bg(theme::surface::PALETTE)
-            .border_1()
-            .border_color(theme::border::POPOVER)
-            .font(font(theme::font::SANS))
-            .text_size(px(11.0))
-            .text_color(theme::text::BODY)
-            .child(self.label.clone())
-    }
+/// A precise insertion-point marker (GitHub issue #16's "better visual feedback" ask) - a thin
+/// vertical bar at the exact boundary a dropped tab would land on: a hovered tab's own left edge
+/// if `insert_after` is `false` (the dragged tab would land immediately before it), its right
+/// edge if `insert_after` is `true` (immediately after) - replacing the old whole-tab `border_l`
+/// highlight, which never distinguished "before" from "after" the hovered tab, with an
+/// unambiguous "it lands exactly here" caret instead.
+fn render_tab_insertion_caret(insert_after: bool) -> impl IntoElement {
+    div()
+        .absolute()
+        .top(px(0.0))
+        .bottom(px(0.0))
+        .w(px(2.0))
+        .bg(theme::status::ASK)
+        .when(insert_after, |el| el.right(px(0.0)))
+        .when(!insert_after, |el| el.left(px(0.0)))
 }
 
 /// The session context bar's status pill: a coloured dot plus label in the status colour.
@@ -2262,8 +2372,10 @@ mod tab_scoping_tests {
         );
     }
 
-    /// Real drag-to-reorder: dropping one session tab onto another must actually change their
-    /// order in `Sessions`' own underlying storage (what `Self::render_tab_strip` iterates).
+    /// Real drag-to-reorder, unified across session and file tabs (GitHub issue #16): dropping
+    /// one session tab onto another must actually change the *combined* tab order
+    /// (`Self::current_worktree_sessions`, which now reads `Self::combined_tab_order` rather than
+    /// `Sessions`' own raw creation order - see that method's own docs on why).
     #[gpui::test]
     fn drag_reordering_two_session_tabs_changes_their_order(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2288,17 +2400,24 @@ mod tab_scoping_tests {
             (initial_id, id2, id3)
         });
 
-        let before: Vec<SessionId> =
-            app.read_with(cx, |app, _| app.sessions.iter().map(|s| s.id).collect());
+        let before: Vec<SessionId> = app.read_with(cx, |app, _| {
+            app.current_worktree_sessions().map(|s| s.id).collect()
+        });
         assert_eq!(before, vec![initial_id, id2, id3]);
 
-        // The real drop handler's own logic: drag id3, drop it on `initial_id`'s tab.
-        app.update(cx, |app, _cx| {
-            app.sessions.move_before(id3, initial_id);
+        // The real drop handler's own logic: drag id3, drop it before `initial_id`'s tab.
+        app.update(cx, |app, cx| {
+            app.reorder_tab(
+                work_surface::TabRef::Session(id3),
+                work_surface::TabRef::Session(initial_id),
+                false,
+                cx,
+            );
         });
 
-        let after: Vec<SessionId> =
-            app.read_with(cx, |app, _| app.sessions.iter().map(|s| s.id).collect());
+        let after: Vec<SessionId> = app.read_with(cx, |app, _| {
+            app.current_worktree_sessions().map(|s| s.id).collect()
+        });
         assert_eq!(
             after,
             vec![id3, initial_id, id2],
@@ -2307,8 +2426,9 @@ mod tab_scoping_tests {
         );
     }
 
-    /// `move_before` must never corrupt the tab order on a bad target - an unknown dragged id, an
-    /// unknown drop target, or dropping a tab onto itself must all be real no-ops.
+    /// `Self::reorder_tab`/`work_surface::state::move_tab_order` must never corrupt the tab order
+    /// on a bad target - an unknown dragged id, an unknown drop target, or dropping a tab onto
+    /// itself must all be real no-ops.
     #[gpui::test]
     fn drag_reorder_is_a_no_op_for_an_unknown_or_identical_id(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2317,14 +2437,30 @@ mod tab_scoping_tests {
             app.sessions.active_id().expect("initial shell session")
         });
 
-        app.update(cx, |app, _cx| {
-            app.sessions.move_before(initial_id, initial_id);
-            app.sessions.move_before(9999, initial_id);
-            app.sessions.move_before(initial_id, 9999);
+        app.update(cx, |app, cx| {
+            app.reorder_tab(
+                work_surface::TabRef::Session(initial_id),
+                work_surface::TabRef::Session(initial_id),
+                false,
+                cx,
+            );
+            app.reorder_tab(
+                work_surface::TabRef::Session(9999),
+                work_surface::TabRef::Session(initial_id),
+                false,
+                cx,
+            );
+            app.reorder_tab(
+                work_surface::TabRef::Session(initial_id),
+                work_surface::TabRef::Session(9999),
+                false,
+                cx,
+            );
         });
 
-        let after: Vec<SessionId> =
-            app.read_with(cx, |app, _| app.sessions.iter().map(|s| s.id).collect());
+        let after: Vec<SessionId> = app.read_with(cx, |app, _| {
+            app.current_worktree_sessions().map(|s| s.id).collect()
+        });
         assert_eq!(
             after,
             vec![initial_id],
@@ -2408,6 +2544,120 @@ mod tab_scoping_tests {
             foreground_ids(&app, cx),
             Vec::<SessionId>::new(),
             "with no active session, no pane may keep the foreground cadence"
+        );
+    }
+
+    /// The real cross-kind capability GitHub issue #16 exists to unlock: a file tab dragged so it
+    /// lands between two session tabs must actually interleave them in the combined tab order,
+    /// not just reorder within its own kind - the exact case the old, kind-locked
+    /// `DraggedSessionTab`/`DraggedFileTab` types could never produce (GPUI's `on_drop::<T>`
+    /// dispatches purely on the dragged value's concrete type, so a `DraggedFileTab` could never
+    /// be dropped onto a session tab's `on_drop::<DraggedSessionTab>` handler or vice versa).
+    #[gpui::test]
+    fn dragging_a_file_tab_between_two_session_tabs_interleaves_them(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("a.txt");
+        std::fs::write(&file_path, "hello\n").expect("write a.txt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
+            let initial_id = app.sessions.active_id().expect("initial shell session");
+            let second_id = app.sessions.spawn(
+                SessionKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            app.open_file_view(file_path.clone(), window, cx);
+            (initial_id, second_id)
+        });
+
+        let before = app.read_with(cx, |app, _| app.combined_tab_order());
+        assert_eq!(
+            before,
+            vec![
+                work_surface::TabRef::Session(initial_id),
+                work_surface::TabRef::Session(second_id),
+                work_surface::TabRef::File(PathBuf::from("a.txt")),
+            ],
+            "with no drag yet, sessions come first (creation order), then files - the old \
+             two-block layout"
+        );
+
+        // The real cross-kind drop: drag the file tab so it lands between the two session tabs.
+        app.update(cx, |app, cx| {
+            app.reorder_tab(
+                work_surface::TabRef::File(PathBuf::from("a.txt")),
+                work_surface::TabRef::Session(second_id),
+                false,
+                cx,
+            );
+        });
+
+        let after = app.read_with(cx, |app, _| app.combined_tab_order());
+        assert_eq!(
+            after,
+            vec![
+                work_surface::TabRef::Session(initial_id),
+                work_surface::TabRef::File(PathBuf::from("a.txt")),
+                work_surface::TabRef::Session(second_id),
+            ],
+            "the file tab must now sit between the two session tabs - the real cross-group \
+             interleaving this revision exists to unlock"
+        );
+    }
+
+    /// `Self::drop_dragged_tab` must actually honor whichever half of the target tab the cursor
+    /// was last recorded over (`Self::tab_drag_insertion`, set by
+    /// `Self::update_tab_drag_insertion`'s own real per-tab `on_drag_move` tracking) - "after"
+    /// must land the dragged tab on the far side of the target from a plain "before" drop - and
+    /// must clear that state once handled, so a later drop on a different tab can't inherit it.
+    #[gpui::test]
+    fn drop_dragged_tab_honors_the_recorded_insertion_side_then_clears_it(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
+            let initial_id = app.sessions.active_id().expect("initial shell session");
+            let second_id = app.sessions.spawn(
+                SessionKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            (initial_id, second_id)
+        });
+
+        // Simulates what a real `on_drag_move` tick over the right half of `second_id`'s tab
+        // would already have recorded, just before the drop.
+        app.update(cx, |app, _cx| {
+            app.tab_drag_insertion = Some((work_surface::TabRef::Session(second_id), true));
+        });
+
+        app.update(cx, |app, cx| {
+            app.drop_dragged_tab(
+                work_surface::TabRef::Session(initial_id),
+                work_surface::TabRef::Session(second_id),
+                cx,
+            );
+        });
+
+        let order = app.read_with(cx, |app, _| app.combined_tab_order());
+        assert_eq!(
+            order,
+            vec![
+                work_surface::TabRef::Session(second_id),
+                work_surface::TabRef::Session(initial_id),
+            ],
+            "insert_after == true must land the dragged tab immediately after the target, not \
+             before"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.tab_drag_insertion.clone()),
+            None,
+            "a handled drop must clear the now-stale insertion-caret state"
         );
     }
 }

@@ -267,6 +267,8 @@ impl AdeApp {
             new_file_input: None,
             new_file_focus_handle: cx.focus_handle(),
             new_file_error: None,
+            tab_order: HashMap::new(),
+            tab_drag_insertion: None,
         };
         // See the `expanded_dirs`/`fold_state_root_key` note in the literal above: resolving the
         // worktree key here, through the one function that ever resolves it, is what keeps the

@@ -1176,6 +1176,22 @@ pub struct AdeApp {
     /// convention. Cleared by [`Self::start_new_file`]/[`Self::create_new_file`]'s own success
     /// path.
     pub(crate) new_file_error: Option<String>,
+    /// Each worktree's own real, drag-chosen tab order (GitHub issue #16) - session and file
+    /// tabs interleaved, keyed by that worktree's cwd. Never itself the source of truth for
+    /// which tabs exist (`Sessions`/[`Self::open_files`] still are - see
+    /// [`Self::combined_tab_order`]'s own docs); only [`Self::reorder_tab`] writes to it, and a
+    /// worktree with no entry here simply renders its sessions then its files, exactly the old
+    /// two-block layout.
+    pub(crate) tab_order: HashMap<PathBuf, Vec<work_surface::TabRef>>,
+    /// The unified tab strip's real, precise drop-target indicator (GitHub issue #16's "better
+    /// visual feedback" ask): `Some((target, insert_after))` while a tab is being dragged over
+    /// `target`'s own tab, where `insert_after` says whether the cursor is over the right half
+    /// of `target` (dragged tab would land immediately after it) or the left half (immediately
+    /// before) - see [`Self::render_tab_strip`]'s per-tab `on_drag_move` wiring. Cleared on drop
+    /// and, defensively, on any mouse-up over the workspace body, so a cancelled drag (released
+    /// outside any drop target) can't leave a stale caret painted on a tab no drag is over
+    /// anymore.
+    pub(crate) tab_drag_insertion: Option<(work_surface::TabRef, bool)>,
 }
 
 impl AdeApp {
@@ -1505,6 +1521,21 @@ impl AdeApp {
                     this.apply_pane_resize(target, event.event.position.x, cx);
                 },
             ))
+            // Defensive cleanup for `Self::tab_drag_insertion`: unlike `PaneResizeDrag` above,
+            // this one *does* need an explicit mouse-up handler, because it isn't derived fresh
+            // from the cursor position on every tick - it's the last tab strip
+            // `on_drag_move::<DraggedTab>` claimed, which stays stale if the drag ends by
+            // releasing outside any tab's own hitbox (a cancelled drag) rather than through a
+            // real `on_drop`. The body spans virtually the whole window below the title bar, so
+            // this reaches almost every real release point.
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event: &gpui::MouseUpEvent, _window, cx| {
+                    if this.tab_drag_insertion.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             // Captures the body's paint bounds into `Self::body_bounds` every render, the same
             // `gpui::canvas` pattern `vendor/zed/crates/workspace/src/workspace.rs` uses for its
             // own dock-resize `bounds` field.
