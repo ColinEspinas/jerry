@@ -452,6 +452,15 @@ pub(crate) fn render_graph_tab(app: &AdeApp, cx: &mut Context<AdeApp>) -> impl I
         .border_r_1()
         .border_color(theme::border::INNER)
         .bg(colors.bg)
+        // Middle-click closes the graph tab too (GitHub issue #26) - the same real
+        // `close_git_graph_tab` teardown the `×` button already uses, matching file/session tabs.
+        .on_mouse_down(
+            gpui::MouseButton::Middle,
+            cx.listener(move |this, _event: &gpui::MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                this.close_git_graph_tab(window, cx);
+            }),
+        )
         .child(
             div()
                 .id("graph-tab-hit")
@@ -3581,5 +3590,36 @@ mod graph_focus_tests {
             "closing an inactive graph tab must not move focus at all"
         );
         assert!(!app.read_with(cx, |app, _| app.graph_tab_open));
+    }
+
+    #[gpui::test]
+    fn middle_clicking_the_graph_tab_closes_it_like_every_other_tab_kind(cx: &mut TestAppContext) {
+        // A real user report: the graph tab was the one tab kind that didn't support middle-click
+        // close (GitHub issue #26 already wired this for file and session tabs via
+        // `on_mouse_down(MouseButton::Middle, ...)` - the graph tab's own `render_graph_tab` had
+        // simply never been given the same treatment).
+        let (_repo, app, cx) = open_seeded(cx);
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(app.read_with(cx, |app, _| app.graph_tab_open));
+
+        let tab_bounds = cx
+            .debug_bounds("graph-tab")
+            .expect("the graph tab must be painted while open");
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Middle,
+            position: tab_bounds.center(),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app.graph_tab_open),
+            "middle-clicking the graph tab must close it, same as a file or session tab"
+        );
     }
 }
