@@ -8,12 +8,100 @@
 //! wiring click handlers) happens one layer up, in `crate::root`, which has the
 //! `Context<AdeApp>` these decisions need to act on.
 
+use std::path::PathBuf;
+
 use gpui::Rgba;
 
 use crate::rail::status::Status;
 use crate::sidebar::file_tree::LangChip;
 use crate::theme;
-use crate::work_surface::sessions::SessionKind;
+use crate::work_surface::sessions::{SessionId, SessionKind};
+
+/// One entry in a worktree's combined tab-strip order (GitHub issue #16) - either a session tab
+/// or a file tab. `Sessions`/`crate::root::AdeApp::open_files` remain the real storage for
+/// *existence* and all process/buffer behaviour (spawning, closing, PTY lifecycle, edit-buffer
+/// state) - this only records where a tab sits *visually*, so the two groups can interleave in
+/// one strip instead of always rendering as two rigid blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TabRef {
+    Session(SessionId),
+    File(PathBuf),
+}
+
+/// Reconciles a worktree's stored tab order (`crate::root::AdeApp::tab_order`) against what's
+/// *actually* open right now: drops any entry that no longer exists (a closed session, a closed
+/// file tab), then appends anything open that isn't in `stored` yet (a freshly spawned session,
+/// a freshly opened file) in `sessions_for_cwd`/`open_files`'s own order - the same "just append
+/// at the end" position a brand new tab has always landed at.
+///
+/// Pure and idempotent: calling it again on its own output, with the same
+/// `sessions_for_cwd`/`open_files`, changes nothing. That's what lets
+/// `crate::root::AdeApp::combined_tab_order` call this fresh on every render instead of caching
+/// a mutated copy - only a real drag-drop (`crate::root::AdeApp::reorder_tab`) needs to persist a
+/// changed `Vec<TabRef>` back into `tab_order`.
+pub fn reconcile_tab_order(
+    stored: &[TabRef],
+    sessions_for_cwd: &[SessionId],
+    open_files: &[PathBuf],
+) -> Vec<TabRef> {
+    let mut order: Vec<TabRef> = stored
+        .iter()
+        .filter(|tab_ref| match tab_ref {
+            TabRef::Session(id) => sessions_for_cwd.contains(id),
+            TabRef::File(path) => open_files.contains(path),
+        })
+        .cloned()
+        .collect();
+    for id in sessions_for_cwd {
+        if !order
+            .iter()
+            .any(|tab_ref| matches!(tab_ref, TabRef::Session(existing) if existing == id))
+        {
+            order.push(TabRef::Session(*id));
+        }
+    }
+    for path in open_files {
+        if !order
+            .iter()
+            .any(|tab_ref| matches!(tab_ref, TabRef::File(existing) if existing == path))
+        {
+            order.push(TabRef::File(path.clone()));
+        }
+    }
+    order
+}
+
+/// Moves `dragged` to sit immediately before `target` (or immediately after it, if
+/// `insert_after`) in `order` - the real backing for the unified tab strip's drag-to-reorder
+/// gesture (`crate::root::AdeApp::reorder_tab`), used regardless of whether `dragged`/`target`
+/// are the same kind (`TabRef::Session`/`TabRef::File`) or not, which is GitHub issue #16's real
+/// "any tab can cross into either group" ask - there is no separate per-kind reorder function to
+/// keep in sync. A no-op if either entry is missing from `order`, or if they're the same entry.
+pub fn move_tab_order(
+    order: &mut Vec<TabRef>,
+    dragged: &TabRef,
+    target: &TabRef,
+    insert_after: bool,
+) {
+    if dragged == target {
+        return;
+    }
+    let Some(from) = order.iter().position(|tab_ref| tab_ref == dragged) else {
+        return;
+    };
+    if !order.iter().any(|tab_ref| tab_ref == target) {
+        return;
+    }
+    let item = order.remove(from);
+    let mut to = order
+        .iter()
+        .position(|tab_ref| tab_ref == target)
+        .unwrap_or(order.len());
+    if insert_after {
+        to += 1;
+    }
+    order.insert(to, item);
+}
 
 /// Fully transparent - used for the "outline"/"ghost" button variants and an inactive tab's
 /// background, so every button/tab can always call `.bg()`/`.border_color()` uniformly rather
@@ -556,5 +644,122 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A fresh worktree (nothing dragged yet) must render its sessions first, in creation order,
+    /// then its file tabs, in `open_files`' own order - exactly the old two-block layout, so this
+    /// revision's interleaving layer is a strict superset of the old behaviour, not a visible
+    /// change until a real drag happens.
+    #[test]
+    fn reconcile_with_no_stored_order_appends_sessions_then_files_in_their_own_order() {
+        let order = reconcile_tab_order(
+            &[],
+            &[1, 2],
+            &[PathBuf::from("a.rs"), PathBuf::from("b.rs")],
+        );
+        assert_eq!(
+            order,
+            vec![
+                TabRef::Session(1),
+                TabRef::Session(2),
+                TabRef::File(PathBuf::from("a.rs")),
+                TabRef::File(PathBuf::from("b.rs")),
+            ]
+        );
+    }
+
+    /// The real interleaving case (GitHub issue #16): a stored order with a file tab sitting
+    /// between two session tabs must survive reconciliation unchanged, as long as every entry in
+    /// it still exists.
+    #[test]
+    fn reconcile_preserves_a_stored_interleaved_order() {
+        let stored = vec![
+            TabRef::Session(1),
+            TabRef::File(PathBuf::from("a.rs")),
+            TabRef::Session(2),
+        ];
+        let order = reconcile_tab_order(&stored, &[1, 2], &[PathBuf::from("a.rs")]);
+        assert_eq!(order, stored);
+    }
+
+    /// A session closed (or a file tab closed) since the order was last stored must be dropped,
+    /// not left as a dangling reference to something `crate::root::AdeApp::render_tab_strip`
+    /// would otherwise try to render.
+    #[test]
+    fn reconcile_drops_entries_that_no_longer_exist() {
+        let stored = vec![
+            TabRef::Session(1),
+            TabRef::File(PathBuf::from("a.rs")),
+            TabRef::Session(2),
+        ];
+        let order = reconcile_tab_order(&stored, &[2], &[]);
+        assert_eq!(order, vec![TabRef::Session(2)]);
+    }
+
+    /// A brand new session/file not yet in the stored order must be appended at the end, never
+    /// silently dropped or inserted somewhere the user never asked for.
+    #[test]
+    fn reconcile_appends_newly_opened_tabs_not_yet_in_the_stored_order() {
+        let stored = vec![TabRef::Session(1)];
+        let order = reconcile_tab_order(&stored, &[1, 2], &[PathBuf::from("a.rs")]);
+        assert_eq!(
+            order,
+            vec![
+                TabRef::Session(1),
+                TabRef::Session(2),
+                TabRef::File(PathBuf::from("a.rs")),
+            ]
+        );
+    }
+
+    /// The real cross-kind drag this revision exists to unlock: dropping a file tab so it lands
+    /// immediately before a session tab must actually interleave them, not just reorder within
+    /// each tab's own kind.
+    #[test]
+    fn move_tab_order_drops_a_file_tab_before_a_session_tab() {
+        let mut order = vec![
+            TabRef::Session(1),
+            TabRef::Session(2),
+            TabRef::File(PathBuf::from("a.rs")),
+        ];
+        move_tab_order(
+            &mut order,
+            &TabRef::File(PathBuf::from("a.rs")),
+            &TabRef::Session(2),
+            false,
+        );
+        assert_eq!(
+            order,
+            vec![
+                TabRef::Session(1),
+                TabRef::File(PathBuf::from("a.rs")),
+                TabRef::Session(2),
+            ]
+        );
+    }
+
+    /// `insert_after` must land the dragged tab on the far side of the target from a plain
+    /// "insert before" - the real distinction the insertion-caret precision (left half vs. right
+    /// half of the hovered tab) is for.
+    #[test]
+    fn move_tab_order_respects_insert_after() {
+        let mut order = vec![TabRef::Session(1), TabRef::Session(2), TabRef::Session(3)];
+        move_tab_order(&mut order, &TabRef::Session(1), &TabRef::Session(2), true);
+        assert_eq!(
+            order,
+            vec![TabRef::Session(2), TabRef::Session(1), TabRef::Session(3)]
+        );
+    }
+
+    /// `move_tab_order` must never corrupt the order on a bad move - dropping a tab onto itself,
+    /// an unknown dragged entry, or an unknown target must all be real no-ops.
+    #[test]
+    fn move_tab_order_is_a_no_op_for_an_unknown_or_identical_entry() {
+        let original = vec![TabRef::Session(1), TabRef::File(PathBuf::from("a.rs"))];
+        let mut order = original.clone();
+        move_tab_order(&mut order, &TabRef::Session(1), &TabRef::Session(1), false);
+        move_tab_order(&mut order, &TabRef::Session(99), &TabRef::Session(1), false);
+        move_tab_order(&mut order, &TabRef::Session(1), &TabRef::Session(99), false);
+        assert_eq!(order, original);
     }
 }
