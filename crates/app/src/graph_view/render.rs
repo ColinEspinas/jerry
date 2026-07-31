@@ -1658,8 +1658,13 @@ struct CurveBox {
     vertical: VerticalEdge,
 }
 
-/// A plain 1px-tall straight segment connecting the entry and exit curves, when the two lanes are
-/// far enough apart that the curves alone don't already meet.
+/// A plain 1px-tall straight segment connecting the entry and exit curves. Always overlaps 1px into
+/// each curve's own box (rather than stopping exactly at the tangent point the two curves' own
+/// arithmetic would predict) - a real user report found a hairline gap at that exact seam: a
+/// border-radius arc and a filled background rect are two different rendering paths, and GPUI (like
+/// CSS) does not guarantee their anti-aliased edges land on the same physical pixel even when the
+/// underlying math says they should touch exactly. The 1px overlap on each side trades an
+/// imperceptible amount of curve-covered-by-straight for a seam that can never visibly gap.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct StraightSegment {
     left: Pixels,
@@ -1669,8 +1674,9 @@ struct StraightSegment {
 
 /// One elbow's real S-curve geometry - two quarter-circle corners (an entry curve continuing
 /// whichever lane already has a line there, an exit curve delivering the path to the *other*
-/// lane) joined by a straight middle segment when they're far enough apart to need one. Pure and
-/// GPUI-element-free, so it's testable with plain `Pixels` values.
+/// lane) joined by a straight middle segment (see [`StraightSegment`]'s own docs for why it is
+/// always present, even between adjacent lanes, rather than only when the lanes are far apart).
+/// Pure and GPUI-element-free, so it's testable with plain `Pixels` values.
 ///
 /// A real user report against the previous single-corner design ("curve the start and end of
 /// branch lines to make them join the horizontal lines instead of continuing... the end of the
@@ -1680,7 +1686,7 @@ struct StraightSegment {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ElbowGeometry {
     entry: CurveBox,
-    straight: Option<StraightSegment>,
+    straight: StraightSegment,
     exit: CurveBox,
 }
 
@@ -1713,15 +1719,20 @@ fn elbow_geometry(kind: ElbowKind, x_from: Pixels, x_to: Pixels, row_h: Pixels) 
     let radius = theme::graph::ELBOW_RADIUS;
     let rightward = x_to >= x_from;
     let (entry_x, exit_x) = (x_from, x_to);
-    let straight = if rightward {
+    // Raw gap between where the two curves' own arcs meet - can be zero or even negative for
+    // adjacent lanes, where the curves already touch (or would overlap) with no straight run
+    // between them at all. `.max(px(0.0))` floors that at zero rather than an invalid negative
+    // width; the always-added 1px-per-side overlap below (see `StraightSegment`'s own docs) then
+    // guarantees a real, visible bridge even in that adjacent-lane case.
+    let (straight_left, raw_width) = if rightward {
         let left = entry_x + radius;
-        let width = exit_x - radius - left;
-        (width > px(0.0)).then_some((left, width))
+        (left, exit_x - radius - left)
     } else {
         let left = exit_x + radius;
-        let width = entry_x - radius - left;
-        (width > px(0.0)).then_some((left, width))
+        (left, entry_x - radius - left)
     };
+    let straight_left = straight_left - px(1.0);
+    let straight_width = raw_width.max(px(0.0)) + px(2.0);
 
     match kind {
         ElbowKind::Diverging => {
@@ -1752,11 +1763,11 @@ fn elbow_geometry(kind: ElbowKind, x_from: Pixels, x_to: Pixels, row_h: Pixels) 
             };
             ElbowGeometry {
                 entry,
-                straight: straight.map(|(left, width)| StraightSegment {
-                    left,
+                straight: StraightSegment {
+                    left: straight_left,
                     top: waist_y,
-                    width: width + px(1.0),
-                }),
+                    width: straight_width,
+                },
                 exit,
             }
         }
@@ -1788,14 +1799,31 @@ fn elbow_geometry(kind: ElbowKind, x_from: Pixels, x_to: Pixels, row_h: Pixels) 
             };
             ElbowGeometry {
                 entry,
-                straight: straight.map(|(left, width)| StraightSegment {
-                    left,
+                straight: StraightSegment {
+                    left: straight_left,
                     top: waist_y,
-                    width: width + px(1.0),
-                }),
+                    width: straight_width,
+                },
                 exit,
             }
         }
+    }
+}
+
+/// Which lane's color an elbow should be painted with - pulled out as its own pure function (like
+/// `elbow_geometry`) since GPUI's test harness can only inspect painted *bounds*, not colors; this
+/// makes the choice itself independently testable. `Diverging`'s `from_lane` is always `own_lane`
+/// (the branch being merged *into*) - the connector reads as the branch actually being merged in
+/// (`to_lane`) continuing its own color, not the color of the branch it lands in. A real user
+/// report ("the line going back to the branch merged should be the same color as the branch
+/// instead of the color it is being merged in") asked for exactly this. `Converging` has no
+/// "merged into" branch at all (two independently-diverged lanes just happen to share an ancestor,
+/// with no merge commit involved) - `from_lane` (the ending lane) is already the right choice,
+/// matching the color of the `ends_here` stub it continues.
+fn elbow_color_lane(kind: ElbowKind, from_lane: usize, to_lane: usize) -> usize {
+    match kind {
+        ElbowKind::Diverging => to_lane,
+        ElbowKind::Converging => from_lane,
     }
 }
 
@@ -1878,7 +1906,13 @@ fn render_graph_lane_canvas(
             ElbowKind::Diverging => "diverging",
             ElbowKind::Converging => "converging",
         };
-        let color = lane_color(elbow.from_lane);
+        // Diverging's from_lane is always own_lane (the branch being merged *into*) and to_lane is
+        // the branch actually being merged in - the connector must read as that merged branch's own
+        // color continuing, not the color of the branch it lands in. Converging has no such
+        // "merged into" branch (no merge commit is involved at all - two independent lanes just
+        // happen to share an ancestor), so from_lane (the ending lane) is already the right color,
+        // matching the already-painted `ends_here` stub it continues.
+        let color = lane_color(elbow_color_lane(elbow.kind, elbow.from_lane, elbow.to_lane));
 
         let render_curve = |curve: CurveBox, part: &'static str| {
             let curve_box = div()
@@ -1912,20 +1946,18 @@ fn render_graph_lane_canvas(
         };
 
         canvas = canvas.child(render_curve(geo.entry, "entry"));
-        if let Some(straight) = geo.straight {
-            canvas = canvas.child(
-                div()
-                    .absolute()
-                    .left(straight.left)
-                    .top(straight.top)
-                    .w(straight.width)
-                    .h(px(1.0))
-                    .bg(color)
-                    .debug_selector(move || {
-                        format!("graph-row-{row_index}-elbow-{elbow_index}-{kind_tag}-straight")
-                    }),
-            );
-        }
+        canvas = canvas.child(
+            div()
+                .absolute()
+                .left(geo.straight.left)
+                .top(geo.straight.top)
+                .w(geo.straight.width)
+                .h(px(1.0))
+                .bg(color)
+                .debug_selector(move || {
+                    format!("graph-row-{row_index}-elbow-{elbow_index}-{kind_tag}-straight")
+                }),
+        );
         canvas = canvas.child(render_curve(geo.exit, "exit"));
     }
 
@@ -2722,28 +2754,35 @@ mod elbow_geometry_tests {
     }
 
     #[test]
-    fn a_wide_lane_gap_gets_a_real_straight_middle_segment_with_no_gap_or_overlap() {
+    fn a_wide_lane_gap_gets_a_real_straight_middle_segment_overlapping_1px_into_each_curve() {
         // Three lane steps apart (42px) is comfortably past 2*RADIUS (14px) - a real straight
-        // segment must bridge the two curves, touching each with no gap and no overlap.
+        // segment must bridge the two curves, each end reaching 1px *past* the natural tangent
+        // point and into the neighbouring curve's own box (see `StraightSegment`'s own docs for
+        // why: a border-radius arc and a filled rect are different rendering paths, and a real
+        // user report found a hairline gap where GPUI left them merely touching, not overlapping).
         let geo = elbow_geometry(ElbowKind::Diverging, px(9.0), px(9.0 + 3.0 * 14.0), ROW_H);
-        let straight = geo
-            .straight
-            .expect("a wide lane gap must produce a real straight middle segment");
-        assert_eq!(straight.left, geo.entry.left + RADIUS);
-        assert_eq!(straight.left + straight.width - px(1.0), geo.exit.left);
-        assert_eq!(straight.top, geo.entry.top + RADIUS);
-        assert_eq!(straight.top, geo.exit.top);
+        assert_eq!(geo.straight.left, geo.entry.left + RADIUS - px(1.0));
+        assert_eq!(
+            geo.straight.left + geo.straight.width,
+            geo.exit.left + px(1.0)
+        );
+        assert_eq!(geo.straight.top, geo.entry.top + RADIUS);
+        assert_eq!(geo.straight.top, geo.exit.top);
     }
 
     #[test]
-    fn adjacent_lanes_need_no_straight_segment_at_all() {
-        // Exactly one lane step apart (14px) equals 2*RADIUS exactly - the two curves' own widths
-        // already fully span the gap with nothing left over for a straight piece.
+    fn adjacent_lanes_still_get_a_minimal_overlapping_straight_bridge() {
+        // Exactly one lane step apart (14px) equals 2*RADIUS exactly - the two curves' own arcs
+        // would already touch with no straight segment mathematically needed, but a real user
+        // report found a visible hairline gap right at that tangent point (the same rendering-path
+        // mismatch `StraightSegment`'s docs explain). A minimal 2px bridge - 1px overlapping into
+        // each curve's own box - closes that gap even in this "curves already touch" case.
         let geo = elbow_geometry(ElbowKind::Diverging, px(9.0), px(23.0), ROW_H);
+        assert_eq!(geo.straight.width, px(2.0));
+        assert_eq!(geo.straight.left, geo.entry.left + RADIUS - px(1.0));
         assert_eq!(
-            geo.straight, None,
-            "adjacent lanes (exactly 2*RADIUS apart) need no straight segment: {:?}",
-            geo.straight
+            geo.straight.left + geo.straight.width,
+            geo.exit.left + px(1.0)
         );
     }
 
@@ -2771,6 +2810,23 @@ mod elbow_geometry_tests {
                 converging.exit.top + RADIUS
             );
         }
+    }
+
+    #[test]
+    fn a_diverging_elbows_color_follows_the_branch_merged_in_not_the_branch_it_lands_in() {
+        // from_lane is always own_lane (the branch merged *into*) for Diverging - a real user
+        // report found the connector was being colored with that landing branch's color instead of
+        // the merged-in branch's own color (to_lane).
+        assert_eq!(elbow_color_lane(ElbowKind::Diverging, 0, 2), 2);
+        assert_eq!(elbow_color_lane(ElbowKind::Diverging, 2, 0), 0);
+    }
+
+    #[test]
+    fn a_converging_elbows_color_follows_the_ending_lane_it_continues() {
+        // Converging has no "merged into" branch at all - from_lane (the ending lane) is already
+        // the color that continues its own already-painted `ends_here` stub from the row above.
+        assert_eq!(elbow_color_lane(ElbowKind::Converging, 1, 0), 1);
+        assert_eq!(elbow_color_lane(ElbowKind::Converging, 0, 1), 0);
     }
 }
 
