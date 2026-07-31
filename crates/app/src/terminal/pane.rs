@@ -62,6 +62,7 @@
 //! anything - and feeds a confirmed exit into the exact same `newly_exited`/`process_ended`
 //! state transition the unix EOF path already uses.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
@@ -141,6 +142,14 @@ const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(33);
 /// Note this is a *budget*, not a buffer: the drain stops once it has taken **at least** this
 /// many bytes, so one oversized chunk is always taken whole. Chunks are never split, so byte
 /// order and chunk boundaries reaching `TerminalGrid::append_bytes` are unchanged.
+/// Cap on [`TerminalPane::recent_output`], the activity-text tap - see that field's docs.
+///
+/// 8 KiB is generous for the module's actual need (`crate::rail::authorship::extract_activity`
+/// only looks at the last handful of printed lines) while staying trivially cheap to keep
+/// around per pane and to lossy-decode on every read: a `claude`/`codex` tool-call summary line
+/// is well under 200 bytes, so 8 KiB holds tens of them even through ANSI escape overhead.
+const RECENT_OUTPUT_BUFFER_BYTES: usize = 8 * 1024;
+
 const MAX_BYTES_PER_TICK: usize = 256 * 1024;
 
 /// [`MAX_BYTES_PER_TICK`]'s counterpart for a background pane (see
@@ -336,6 +345,17 @@ pub struct TerminalPane {
     /// from; intentionally not itself a `Status` - this pane only knows "when did I last see
     /// this process do something".
     activity_at: Option<Instant>,
+    /// A bounded tap on this pane's raw pty output, byte-identical to what feeds
+    /// [`Self::grid`] at the same drain point ([`Self::poll_task`]'s drain loop appends to both
+    /// in the same match arm) - added for `crate::rail::authorship`'s activity-text extraction,
+    /// which needs recent literal output text and has no other way to observe it: `pty_core`'s
+    /// `PtySession::output()` is a single-consumer `std::sync::mpsc::Receiver` (see that crate's
+    /// docs), so a second, independent reader isn't possible without changing that crate's
+    /// public API. Tapping here - the one place these bytes are already read - is the smaller-
+    /// blast-radius option. Capped at [`RECENT_OUTPUT_BUFFER_BYTES`] and trimmed from the front
+    /// on overflow (never mid-UTF8-boundary trimmed, since trimming works on raw bytes and
+    /// decoding is lossy and only done on read - see [`Self::recent_output_text`]).
+    recent_output: VecDeque<u8>,
     /// `true` from the moment pty EOF is observed until the child's exit status is either
     /// confirmed or given up on - see [`eof_poll_decision`]'s docs for the bug this state
     /// exists to fix. While `true`, [`Self::session`] is deliberately not yet cleared: the
@@ -403,6 +423,7 @@ impl TerminalPane {
             spawn_error: None,
             exit_status: None,
             activity_at: None,
+            recent_output: VecDeque::new(),
             eof_pending: false,
             eof_poll_ticks: 0,
             focus_handle: cx.focus_handle(),
@@ -485,6 +506,26 @@ impl TerminalPane {
                 .map(|at| at.elapsed())
                 .unwrap_or(Duration::ZERO),
         )
+    }
+
+    /// How long it has been since this pane's process last produced output, **not** gated on
+    /// [`Self::is_running`] the way [`Self::idle_duration`] is - `crate::rail::authorship`'s
+    /// file-attribution needs this for a session that has just *exited* too (an agent commonly
+    /// finishes its last file write and exits within the same beat), so unlike the rail-status
+    /// heuristic this must not go `None` the moment the process is reaped. `None` only if no
+    /// process has ever produced output in this pane's lifetime (matches [`Self::activity_at`]'s
+    /// own field docs).
+    pub fn time_since_last_output(&self) -> Option<Duration> {
+        self.activity_at.map(|at| at.elapsed())
+    }
+
+    /// A lossy-UTF8 decode of the last [`RECENT_OUTPUT_BUFFER_BYTES`] of this pane's raw pty
+    /// output - the activity-text tap described at [`Self::recent_output`]'s field docs. Decoded
+    /// fresh on every call (not cached) since it's only read a few times a second at most, by
+    /// `crate::rail::authorship`'s activity-string extraction.
+    pub fn recent_output_text(&self) -> String {
+        let bytes: Vec<u8> = self.recent_output.iter().copied().collect();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// The exit status of this pane's process, once observed - see [`Self::exit_status`]'s
@@ -748,6 +789,10 @@ impl TerminalPane {
                                     // unbounded if that ever changes is not a bound.
                                     drained_bytes += chunk.len().max(1);
                                     this.grid.append_bytes(&chunk);
+                                    this.recent_output.extend(chunk.iter().copied());
+                                    while this.recent_output.len() > RECENT_OUTPUT_BUFFER_BYTES {
+                                        this.recent_output.pop_front();
+                                    }
                                     this.activity_at = Some(Instant::now());
                                     appended = true;
                                 }

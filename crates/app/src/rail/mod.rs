@@ -9,6 +9,9 @@
 //! - [`status`] - derives a session's `Status` ("who needs me") from already-read process
 //!   signals; the rail's whole reason for existing, and shared with the tab strip and
 //!   status bar that surface the same answer.
+//! - [`authorship`] - the file-authorship and "what is it doing" activity heuristics from
+//!   Revision R12 (`by: ['s1','s9']` change-row attribution, the agent row's live activity
+//!   text). Self-contained and not yet wired into `state`/`render` - see its own module docs.
 //! - [`render`] - the real GPUI rail, its rows, hover affordances and click handlers, as
 //!   `impl AdeApp` methods.
 //!
@@ -35,6 +38,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
+pub mod authorship;
 pub mod state;
 pub mod status;
 pub mod worktrees;
