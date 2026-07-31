@@ -871,6 +871,22 @@ pub mod settings {
     pub const SNIPPET_SECTION: ColorToken = hex(0xc294e0);
 }
 
+/// The overlay scrollbar's own colours (GitHub issue #30) - not from `design_handoff_jerry_ade`
+/// (that mockup has no scrollbar spec at all: every scrollable region there relies on raw,
+/// invisible browser/OS scrolling), so these are a deliberate, judgment-call derivation from
+/// existing neutral tokens rather than a transcription. `THUMB` aliases [`text::GUTTER`] (the
+/// line-number gutter's own muted grey - already the UI's "quiet structural chrome" colour) and
+/// `THUMB_HOVER` aliases [`status::IDLE`] (a session's resting-state grey, one step brighter) so
+/// the two states read as "the same neutral family, one step apart" rather than inventing a third
+/// hex pair. Both are painted at reduced opacity (see `crate::root::scrollbar`) rather than full
+/// strength, matching the "overlay, not a solid rail" requirement.
+pub mod scrollbar {
+    use super::ColorToken;
+
+    pub const THUMB: ColorToken = super::text::GUTTER;
+    pub const THUMB_HOVER: ColorToken = super::status::IDLE;
+}
+
 pub mod radius {
     use super::{px, Pixels};
 

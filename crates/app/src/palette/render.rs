@@ -677,6 +677,7 @@ impl AdeApp {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(&self.palette_results_scroll_handle)
             .flex()
             .flex_col()
             .py(px(4.0));
@@ -685,7 +686,24 @@ impl AdeApp {
         for group in groups {
             container = container.child(self.render_palette_group(group, &mut flat_index, cx));
         }
-        container.into_any_element()
+
+        // See `crate::sidebar::render::AdeApp::render_file_tree`'s own docs on why the scrollbar
+        // must be a sibling of `container`, inside its own non-scrolling `.relative()` wrapper,
+        // never a child of `container` itself (GitHub issue #30).
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(container)
+            .children(self.render_vertical_scrollbar(
+                "palette-results-scrollbar",
+                &self.palette_results_scroll_handle,
+                &[],
+                cx,
+            ))
+            .into_any_element()
     }
 
     pub(in crate::palette) fn render_palette_group(

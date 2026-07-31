@@ -382,11 +382,26 @@ impl AdeApp {
             })
             .child(
                 div()
-                    .id("session-rail-list")
+                    .relative()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .child(self.render_rail_list(cx)),
+                    .child(
+                        div()
+                            .id("session-rail-list")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.rail_scroll_handle)
+                            .child(self.render_rail_list(cx)),
+                    )
+                    .children(self.render_vertical_scrollbar(
+                        "rail-scrollbar",
+                        &self.rail_scroll_handle,
+                        &[],
+                        cx,
+                    )),
             )
             .child(self.render_rail_footer(cx))
     }

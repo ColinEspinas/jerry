@@ -145,7 +145,7 @@ impl AdeApp {
             );
 
         let body = match (effective_view, diff_file) {
-            (code_view::CodeView::Diff, Some(file)) => self.render_diff_file_detail(file),
+            (code_view::CodeView::Diff, Some(file)) => self.render_diff_file_detail(file, cx),
             _ => self.render_file_view(relative_path, cx),
         };
 

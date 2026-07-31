@@ -265,7 +265,25 @@ impl AdeApp {
             .overflow_hidden()
             .bg(theme::surface::CENTER)
             .child(header)
-            .child(zoom_scoped(self.effective_code_rem_px(), code))
+            .child(zoom_scoped(
+                self.effective_code_rem_px(),
+                // See `crate::sidebar::render::AdeApp::render_file_tree`'s own docs on why the
+                // scrollbar must be a sibling of `code`, inside its own non-scrolling
+                // `.relative()` wrapper, never a child of `code` itself (GitHub issue #30).
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(code)
+                    .children(self.render_vertical_scrollbar(
+                        "merge-edit-scrollbar",
+                        &self.merge_edit_scroll_handle,
+                        &[],
+                        cx,
+                    )),
+            ))
             .into_any_element()
     }
 }

@@ -12,6 +12,7 @@ use crate::lsp::client::{lsp_file_status, LspFileStatus};
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
 use crate::root::widgets::render_sidebar_message;
+use std::collections::HashSet;
 
 impl AdeApp {
     /// Surface C's File view: a breadcrumb, line-numbered/syntax-highlighted code
@@ -598,7 +599,34 @@ impl AdeApp {
             );
         }
 
-        body = body.child(zoom_scoped(self.effective_code_rem_px(), code));
+        // GitHub issue #30's real editor scrollbar decoration marks - see `Self::render_file_tree`'s
+        // own docs (`crate::sidebar::render`) on why the scrollbar must be a sibling of the
+        // scrollable element, inside its own non-scrolling `.relative()` wrapper, never a child of
+        // `code` itself. `marks` is built from real, already-computed state (see
+        // [`editor_scrollbar_marks`]'s own docs) - never invented for the scrollbar.
+        let marks = editor_scrollbar_marks(
+            &self.file_view_diagnostics,
+            &self.file_view_changed_lines,
+            self.code_cursor,
+            line_count,
+        );
+        let code_with_scrollbar = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(code)
+            .children(self.render_vertical_scrollbar(
+                "file-view-scrollbar",
+                &self.file_view_scroll_handle,
+                &marks,
+                cx,
+            ));
+        body = body.child(zoom_scoped(
+            self.effective_code_rem_px(),
+            code_with_scrollbar,
+        ));
 
         if truncated {
             body = body.child(render_sidebar_message(
@@ -626,6 +654,133 @@ impl AdeApp {
         // mechanism `Self::render_completions_popover` already established.
 
         body.child(status_bar).into_any_element()
+    }
+}
+
+/// The File view's real editor scrollbar decoration marks (GitHub issue #30's "search matches,
+/// git changes, errors/warnings, cursor position" requirement, minus search matches - see
+/// `crate::root::scrollbar`'s own module docs for why: this app has no find-in-file feature to
+/// source real match positions from). Every mark here comes from state this view already
+/// maintains for its own inline rendering - `diagnostics` backs the dotted-underline/row-tint
+/// diagnostics (`crate::code_surface::lsp_ui`), `changed_lines` backs the git-gutter stripe
+/// (`render_file_view_line`), `cursor_line` is the real blinking caret's own line - not a second,
+/// parallel data source invented for the scrollbar.
+///
+/// Only [`Severity::Error`]/[`Severity::Warning`] get a diagnostic mark (matching most real
+/// editors' own overview-ruler convention of not drawing a mark per hint/information diagnostic,
+/// which on a large file can vastly outnumber the lines actually worth flagging at a glance).
+/// `line_count == 0` returns no marks at all (nothing to divide a fraction by) rather than
+/// panicking or producing `NaN` fractions.
+pub(in crate::code_surface) fn editor_scrollbar_marks(
+    diagnostics: &HashMap<usize, Vec<diagnostics_view::LineDiagnostic>>,
+    changed_lines: &HashSet<usize>,
+    cursor_line: Option<usize>,
+    line_count: usize,
+) -> Vec<scrollbar::ScrollbarMark> {
+    if line_count == 0 {
+        return Vec::new();
+    }
+    let fraction_for_line =
+        |line_number: usize| -> f32 { line_number.saturating_sub(1) as f32 / line_count as f32 };
+
+    let mut marks = Vec::new();
+    for (&line_number, line_diagnostics) in diagnostics {
+        let color = match diagnostics_view::Severity::worst(line_diagnostics) {
+            Some(diagnostics_view::Severity::Error) => Some(theme::status::FAIL.resolve()),
+            Some(diagnostics_view::Severity::Warning) => Some(theme::status::ASK.resolve()),
+            _ => None,
+        };
+        if let Some(color) = color {
+            marks.push(scrollbar::ScrollbarMark::new(
+                fraction_for_line(line_number),
+                color,
+            ));
+        }
+    }
+    for &line_number in changed_lines {
+        marks.push(scrollbar::ScrollbarMark::new(
+            fraction_for_line(line_number),
+            theme::diff::GIT_GUTTER.resolve(),
+        ));
+    }
+    if let Some(line_number) = cursor_line {
+        marks.push(scrollbar::ScrollbarMark::new(
+            fraction_for_line(line_number),
+            theme::syntax::CARET.resolve(),
+        ));
+    }
+    marks
+}
+
+#[cfg(test)]
+mod editor_scrollbar_mark_tests {
+    use super::*;
+
+    fn diagnostic(severity: diagnostics_view::Severity) -> diagnostics_view::LineDiagnostic {
+        diagnostics_view::LineDiagnostic {
+            byte_range: 0..1,
+            severity,
+            message: "test".to_string(),
+            source: None,
+            code: None,
+        }
+    }
+
+    #[test]
+    fn an_empty_file_produces_no_marks_rather_than_a_divide_by_zero() {
+        let marks = editor_scrollbar_marks(&HashMap::new(), &HashSet::new(), Some(1), 0);
+        assert!(marks.is_empty());
+    }
+
+    #[test]
+    fn a_line_with_only_hint_or_information_diagnostics_gets_no_mark() {
+        let mut diagnostics = HashMap::new();
+        diagnostics.insert(
+            5,
+            vec![
+                diagnostic(diagnostics_view::Severity::Hint),
+                diagnostic(diagnostics_view::Severity::Information),
+            ],
+        );
+        let marks = editor_scrollbar_marks(&diagnostics, &HashSet::new(), None, 100);
+        assert!(marks.is_empty());
+    }
+
+    #[test]
+    fn an_error_diagnostic_produces_a_real_mark_at_the_lines_fraction() {
+        let mut diagnostics = HashMap::new();
+        diagnostics.insert(51, vec![diagnostic(diagnostics_view::Severity::Error)]);
+        let marks = editor_scrollbar_marks(&diagnostics, &HashSet::new(), None, 100);
+        assert_eq!(marks.len(), 1);
+        // Line 51 of 100, 1-based -> fraction 0.50.
+        assert!((marks[0].fraction - 0.50).abs() < 0.001);
+    }
+
+    #[test]
+    fn the_cursor_line_produces_its_own_mark_independent_of_diagnostics_and_git_changes() {
+        let marks = editor_scrollbar_marks(&HashMap::new(), &HashSet::new(), Some(1), 100);
+        assert_eq!(marks.len(), 1);
+        assert!((marks[0].fraction - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_changed_line_produces_its_own_mark() {
+        let mut changed = HashSet::new();
+        changed.insert(100);
+        let marks = editor_scrollbar_marks(&HashMap::new(), &changed, None, 100);
+        assert_eq!(marks.len(), 1);
+        // Line 100 of 100, 1-based -> fraction 0.99.
+        assert!((marks[0].fraction - 0.99).abs() < 0.001);
+    }
+
+    #[test]
+    fn diagnostics_changed_lines_and_the_cursor_all_contribute_independent_marks() {
+        let mut diagnostics = HashMap::new();
+        diagnostics.insert(1, vec![diagnostic(diagnostics_view::Severity::Error)]);
+        let mut changed = HashSet::new();
+        changed.insert(2);
+        let marks = editor_scrollbar_marks(&diagnostics, &changed, Some(3), 100);
+        assert_eq!(marks.len(), 3);
     }
 }
 

@@ -180,16 +180,36 @@ impl AdeApp {
             )
             .child(
                 div()
-                    .id("settings-nav-groups")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .py(px(6.0))
+                    .relative()
                     .flex()
                     .flex_col()
-                    .children(groups.into_iter().map(|group| {
-                        self.render_settings_nav_group(group, agent_count, worktree_count, cx)
-                    })),
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .id("settings-nav-groups")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.settings_nav_scroll_handle)
+                            .py(px(6.0))
+                            .flex()
+                            .flex_col()
+                            .children(groups.into_iter().map(|group| {
+                                self.render_settings_nav_group(
+                                    group,
+                                    agent_count,
+                                    worktree_count,
+                                    cx,
+                                )
+                            })),
+                    )
+                    .children(self.render_vertical_scrollbar(
+                        "settings-nav-scrollbar",
+                        &self.settings_nav_scroll_handle,
+                        &[],
+                        cx,
+                    )),
             )
             .child(
                 div()
@@ -375,41 +395,56 @@ impl AdeApp {
             )
             .child(
                 div()
-                    .id("settings-content-body")
+                    .relative()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .px(px(26.0))
-                    .pb(px(20.0))
                     .child(
                         div()
-                            .w_full()
-                            .max_w(theme::zone::SETTINGS_CONTENT_MAX_WIDTH)
-                            .child(match page {
-                                SettingsPage::General => {
-                                    self.render_settings_general_page(cx).into_any_element()
-                                }
-                                SettingsPage::Agents => {
-                                    self.render_settings_agents_page(cx).into_any_element()
-                                }
-                                SettingsPage::Worktrees => {
-                                    self.render_settings_worktrees_page(cx).into_any_element()
-                                }
-                                SettingsPage::Appearance => {
-                                    self.render_settings_appearance_page(cx).into_any_element()
-                                }
-                                SettingsPage::Theme => {
-                                    self.render_settings_theme_page(cx).into_any_element()
-                                }
-                                SettingsPage::Keymap => {
-                                    self.render_settings_keymap_page(cx).into_any_element()
-                                }
-                                SettingsPage::LanguageServers => {
-                                    self.render_settings_lsp_page(cx).into_any_element()
-                                }
-                                _ => render_settings_placeholder_page().into_any_element(),
-                            }),
-                    ),
+                            .id("settings-content-body")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.settings_content_scroll_handle)
+                            .px(px(26.0))
+                            .pb(px(20.0))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .max_w(theme::zone::SETTINGS_CONTENT_MAX_WIDTH)
+                                    .child(match page {
+                                        SettingsPage::General => {
+                                            self.render_settings_general_page(cx).into_any_element()
+                                        }
+                                        SettingsPage::Agents => {
+                                            self.render_settings_agents_page(cx).into_any_element()
+                                        }
+                                        SettingsPage::Worktrees => self
+                                            .render_settings_worktrees_page(cx)
+                                            .into_any_element(),
+                                        SettingsPage::Appearance => self
+                                            .render_settings_appearance_page(cx)
+                                            .into_any_element(),
+                                        SettingsPage::Theme => {
+                                            self.render_settings_theme_page(cx).into_any_element()
+                                        }
+                                        SettingsPage::Keymap => {
+                                            self.render_settings_keymap_page(cx).into_any_element()
+                                        }
+                                        SettingsPage::LanguageServers => {
+                                            self.render_settings_lsp_page(cx).into_any_element()
+                                        }
+                                        _ => render_settings_placeholder_page().into_any_element(),
+                                    }),
+                            ),
+                    )
+                    .children(self.render_vertical_scrollbar(
+                        "settings-content-scrollbar",
+                        &self.settings_content_scroll_handle,
+                        &[],
+                        cx,
+                    )),
             )
     }
 

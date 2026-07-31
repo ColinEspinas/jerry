@@ -231,12 +231,27 @@ pub struct AdeApp {
     pub(crate) repo_path: PathBuf,
     pub(crate) worktrees: Vec<WorktreeItem>,
     pub(crate) worktrees_error: Option<String>,
+    /// The session rail's own real overlay scrollbar handle (GitHub issue #30) - a plain
+    /// `gpui::ScrollHandle`: `crate::rail::render::AdeApp::render_rail_list` renders every row
+    /// eagerly, not through a `uniform_list`.
+    pub(crate) rail_scroll_handle: gpui::ScrollHandle,
     pub(crate) selected: Option<usize>,
     pub(crate) sessions: Sessions,
     pub(crate) file_tree: Vec<FileTreeEntry>,
     pub(crate) file_tree_root: PathBuf,
     pub(crate) file_tree_error: Option<String>,
     pub(crate) right_sidebar_view: RightSidebarView,
+    /// The file tree's own `uniform_list` scroll handle (GitHub issue #30) - real overlay
+    /// scrollbar geometry (`crate::root::scrollbar::AdeApp::render_vertical_scrollbar`) is read
+    /// straight off this handle's `base_handle` (`gpui::UniformListScrollHandle::0`), the same
+    /// handle `crate::sidebar::render::AdeApp::render_file_tree`'s own `uniform_list` is
+    /// `track_scroll`'d with - not a second, parallel tracking mechanism.
+    pub(crate) file_tree_scroll_handle: UniformListScrollHandle,
+    /// The Changes list's own equivalent of [`Self::file_tree_scroll_handle`] - a separate handle
+    /// (not shared) because the two `uniform_list`s are mutually exclusive tabs of the same panel
+    /// but never rendered at the same time, and giving them independent scroll state is what lets
+    /// switching tabs and back restore each list's own scroll position rather than the other's.
+    pub(crate) changes_rows_scroll_handle: UniformListScrollHandle,
     pub(crate) diff_root: PathBuf,
     pub(crate) diff_state: DiffLoadState,
     /// The real `+n`/`-n` totals across every file in [`Self::diff_state`]'s currently loaded
@@ -396,6 +411,12 @@ pub struct AdeApp {
     /// never on an ordinary click or fresh file open (no reason to fight the user's own scroll
     /// position).
     pub(crate) file_view_scroll_handle: UniformListScrollHandle,
+    /// The read-only Diff view's own real overlay scrollbar handle (GitHub issue #30) - a plain
+    /// `gpui::ScrollHandle`: `crate::code_surface::diff_view::AdeApp::render_diff_file_detail`
+    /// renders every hunk line eagerly into a plain `overflow_y_scroll()` div, not a
+    /// `uniform_list`, so it needs the base handle type directly rather than the `uniform_list`
+    /// wrapper [`Self::file_view_scroll_handle`] uses.
+    pub(crate) diff_view_scroll_handle: gpui::ScrollHandle,
     /// Cached parse/highlight of whichever file [`Self::render_file_view`] last loaded
     /// (`code_view::load_file`/`highlight_rust`) - reused unless `code_view::cache_is_fresh`
     /// says otherwise, always written from [`Self::spawn_file_load`]'s background task, never
@@ -545,6 +566,10 @@ pub struct AdeApp {
     pub(crate) file_external_conflict: HashSet<PathBuf>,
     /// Whether the command palette (⌘K) overlay is open.
     pub(crate) palette_open: bool,
+    /// The palette's own real overlay scrollbar handle (GitHub issue #30) - a plain
+    /// `gpui::ScrollHandle`: `crate::palette::render::AdeApp::render_palette_groups` renders
+    /// every result row eagerly, not through a `uniform_list`.
+    pub(crate) palette_results_scroll_handle: gpui::ScrollHandle,
     /// The palette's active scope (`All`/`Commands`/`Files`).
     pub(crate) palette_scope: palette::PaletteScope,
     /// The palette's currently typed query - the same minimal hand-rolled append/backspace text
@@ -697,6 +722,13 @@ pub struct AdeApp {
     /// [`Self::open_settings`]/[`Self::close_settings`], which use the same
     /// capture-and-restore shape as [`Self::palette_open`].
     pub(crate) settings_open: bool,
+    /// The Settings nav column's real overlay scrollbar handle (GitHub issue #30) - a plain
+    /// `gpui::ScrollHandle`, not `UniformListScrollHandle`: the nav groups render eagerly (there
+    /// are only ever a handful of them), not through a `uniform_list`.
+    pub(crate) settings_nav_scroll_handle: gpui::ScrollHandle,
+    /// The Settings content column's own equivalent of [`Self::settings_nav_scroll_handle`] - a
+    /// separate handle since the two columns scroll independently of each other.
+    pub(crate) settings_content_scroll_handle: gpui::ScrollHandle,
     /// Which Settings nav page is selected - persists across opens/closes (unlike the palette's
     /// query/scope, which resets every time).
     pub(crate) settings_page: settings::SettingsPage,
@@ -1734,6 +1766,8 @@ pub mod layout;
 pub(crate) mod new_file;
 pub(crate) mod rem_scope;
 pub(crate) mod resize;
+pub(crate) mod scrollbar;
+pub(crate) mod scrollbar_geometry;
 pub(crate) mod state;
 pub(crate) mod task_pool;
 pub(crate) mod widgets;
