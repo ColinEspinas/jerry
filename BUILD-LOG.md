@@ -3630,3 +3630,56 @@ not reliably runnable here today, in isolation from this change or not. Every in
 this category that could be run alone (e.g. `stale_completions_popup_tests`, the diff-rendering
 flake) passed cleanly - the failure mode is specific to this sandbox's behavior under a long,
 sequential, real-process-heavy run, not a logic bug anywhere.
+## Editor keybindings: Ctrl+Space, Ctrl+W, Tab/Shift+Tab (GitHub issue #26)
+
+Three independent keybinding gaps from the umbrella editor-polish issue #14, closing its
+`#26` sub-issue.
+
+**Ctrl+Space** is a literal `"ctrl-space"` binding (not `"secondary-space"`) on
+`root::CompletionsInvoke`, deliberately following the same "must stay the same physical key on
+every OS" precedent `"ctrl-shift-t"` already set - Ctrl+Space is the universal cross-editor
+convention for "trigger completion," and the design's own Linux IME-collision caveat is exactly
+why it stays a plain rebindable `KeyBinding` rather than a hardcoded shortcut. Pressing it with
+the popup already open re-invokes the same real completion request rather than toggling, so it
+refreshes in place; `Escape` dismisses without moving focus off the editor.
+
+**Ctrl+W** routes through one real, shared entry point (`Self::request_close_file_tab`) that
+every close affordance now calls - the global `Ctrl+W` binding, the tab strip's own `×`, and
+middle-click alike - so none of them can bypass the real unsaved-changes confirmation. A clean
+tab closes immediately; a dirty one arms a "click × again to close without saving" confirm state
+first. Middle-click closes both file tabs and terminal/session tabs through this same path.
+Closing a terminal tab goes through `pty_core::PtySession::shutdown`'s real `SIGTERM`-then-bounded-
+grace-period-then-`SIGKILL` sequence, not a bare kill. Closing the last tab leaves the app's
+existing empty state rather than closing the window. The checklist's browser/Electron-context
+`Ctrl+W` interception item doesn't apply here - Jerry is a native GPUI desktop app on all three
+platforms, not a browser or Electron shell, so there is no default browser tab-close behavior to
+prevent.
+
+**Tab/Shift+Tab** indentation is resolved by a new, deliberately `gpui`-free module
+(`code_surface::indent`): a hand-rolled `.editorconfig` parser/matcher (no vendored
+`editorconfig` crate exists anywhere in this workspace's pinned dependency set, `vendor/zed`
+included) supporting `root = true`, `indent_style`, `indent_size` (including `tab` meaning "use
+`tab_width`"), `tab_width`, and basename-matched section patterns (plain, brace-expanded,
+`?`-wildcarded), falling back to `EditorSettings` when no `.editorconfig` governs the file. Two
+scope boundaries are chosen so an unsupported pattern degrades to "doesn't match" rather than a
+wrong match: directory-scoped patterns containing `/` never match here, and `**`/bracket
+character classes are read as literal text rather than interpreted as globs. Precedence follows
+the real spec (closer file wins per-property, walk stops at the first `root = true`, later
+`[section]` beats an earlier match within one file). Tab with no selection inserts one indent
+unit at the caret; with a multi-line selection it indents every touched line and preserves the
+selection; Shift+Tab dedents (single or multi-line) and no-ops on a line already at column 0.
+Since Tab/Shift+Tab now indent inside the editor instead of moving focus, `Escape` is the new,
+documented focus-out accessibility hatch back to the rest of the UI.
+
+Verification was scoped to the crates and modules this change actually touches, following the
+same approach the other agents working umbrella issue #14's sibling sub-issues (git blame,
+scrollbars, caret/selection, multi-cursor, theme highlighting) independently converged on for
+this same Windows sandbox: `cargo build --workspace`, `cargo fmt --all -- --check`, and
+`cargo clippy -p app --all-targets -- -D warnings` all clean; `cargo test -p app --lib` scoped to
+`code_surface::`, `settings::`, and `keymap`/`keymap_overrides` - 339 passed, 0 failed other than
+three pre-existing, environment-specific failures (a real `rust-analyzer`/`vue-language-server`/
+`typescript-language-server` never becoming `Ready` within the test timeout because those
+binaries aren't installed on this sandbox) that reproduce identically on `master` before this
+change and are unrelated to it. A literal full-workspace `cargo test`/`cargo clippy --workspace`
+was not run to completion for the same reason `ac8e6cd` (already on `master`) narrowed CI itself
+to build-only on non-Linux platforms.

@@ -160,6 +160,28 @@ impl AdeApp {
         cx.notify();
     }
 
+    /// `Ctrl+Space` (GitHub issue #26) - opens the Completions popup at the caret on demand, even
+    /// mid-word with no completion-worthy character just typed (`crate::lsp::client::AdeApp::
+    /// invoke_completions_now` builds a real, forced `CompletionTriggerKind::INVOKED` request
+    /// regardless of what `crate::lsp::completion::completion_trigger` would otherwise say about
+    /// the character before the caret). Pressing it again while a popup is already open re-runs
+    /// the exact same real request path, which overwrites [`AdeApp::completions`] in place - never
+    /// dismissing it first - so this reads as a real in-place refresh, not a close-then-reopen
+    /// flicker. A no-op (no popup, no request) when there's no active editable file or no LSP
+    /// client ready for it yet - see [`crate::lsp::client::AdeApp::invoke_completions_now`]'s own
+    /// docs for exactly which real preconditions this needs.
+    pub(crate) fn handle_completions_invoke_action(
+        &mut self,
+        _: &CompletionsInvoke,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.active_editable_path() else {
+            return;
+        };
+        self.invoke_completions_now(path, cx);
+    }
+
     pub(crate) fn handle_completions_accept_action(
         &mut self,
         _: &CompletionsAccept,

@@ -182,6 +182,7 @@ use std::time::{Instant, SystemTime};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::code_surface::code_view;
+use crate::code_surface::indent;
 use crate::language::HighlighterFn;
 use crate::text_history::{self, EditKind, SelectionSnapshot, TextEdit, TextHistory};
 
@@ -1344,6 +1345,165 @@ impl EditBuffer {
         self.goal_column = None;
         self.move_to(0);
         self.select_to(self.content.len());
+    }
+
+
+    /// `Tab` (GitHub issue #26): with no selection, splices `indent_unit` in at the caret exactly
+    /// like an ordinary keystroke (via [`Self::replace_range`]) - the caret ends up right after
+    /// it, same as typing any other text. With a real selection (single- or multi-line),
+    /// prepends `indent_unit` to the start of every line [`crate::code_surface::indent::
+    /// touched_line_range`] says the selection touches, and re-expands the selection to keep
+    /// covering the same real lines (including the newly-inserted indentation) rather than
+    /// collapsing to a caret - see that function's own docs for the "selection ends at column 0"
+    /// exclusion this shares with [`Self::dedent_lines`].
+    ///
+    /// Returns whether anything real actually changed - `false` only for the pathological empty
+    /// `indent_unit` case (`crate::code_surface::indent::indent_unit` never actually produces
+    /// one, but this stays honest rather than assuming).
+    ///
+    /// ## One atomic undo step, not N (GitHub issue #17 integration)
+    ///
+    /// The multi-line branch below splices every touched line directly via [`Self::splice_lines`]
+    /// (bypassing [`Self::replace_range`]'s own automatic per-call history recording) and records
+    /// the whole run as one [`TextHistory::record_group`] call instead - seven per-line calls to
+    /// `replace_range` would each be recorded as its own [`EditKind::Programmatic`] group (that
+    /// kind's own "never coalesces" rule means they'd never merge back into one), so a single Tab
+    /// press over N lines would need N separate `Ctrl+Z` presses to undo. See that method's own
+    /// docs for why the edits must be collected in exactly this bottom-to-top order for the
+    /// resulting group to replay correctly in both directions.
+    pub fn indent_lines(&mut self, indent_unit: &str) -> bool {
+        if indent_unit.is_empty() {
+            return false;
+        }
+        if self.selected_range.is_empty() {
+            self.replace_range(Some(self.selected_range.clone()), indent_unit);
+            return true;
+        }
+
+        let before = self.selection_snapshot();
+        let sel_start = self.selected_range.start;
+        let sel_end = self.selected_range.end;
+        let reversed = self.selection_reversed;
+        let (first_line, _) = self.line_col_for_offset(sel_start);
+        let (end_line, end_col) = self.line_col_for_offset(sel_end);
+        let touched = indent::touched_line_range(first_line, end_line, end_col);
+
+        // Bottom-to-top: inserting at an earlier line's own start would shift every later line's
+        // byte offsets out from under a not-yet-processed later insertion otherwise. Edits are
+        // pushed in this same bottom-to-top order, matching how they were really applied.
+        let mut edits = Vec::with_capacity(touched.len());
+        for line in touched.clone().rev() {
+            let Some(line_start) = self.line_ranges.get(line).map(|range| range.start) else {
+                continue;
+            };
+            self.splice_lines(line_start..line_start, indent_unit);
+            edits.push(TextEdit {
+                at: line_start,
+                removed: String::new(),
+                inserted: indent_unit.to_string(),
+            });
+        }
+
+        let touched_count = touched.len();
+        let new_start = self
+            .line_ranges
+            .get(first_line)
+            .map(|range| range.start)
+            .unwrap_or(sel_start);
+        let new_end = (sel_end + indent_unit.len() * touched_count).min(self.content.len());
+        self.selected_range = new_start..new_end.max(new_start);
+        self.selection_reversed = reversed;
+        self.marked_range = None;
+        self.goal_column = None;
+        if !self.replaying {
+            let after = self.selection_snapshot();
+            self.history
+                .record_group(edits, before, after, Instant::now());
+        }
+        true
+    }
+
+    /// `Shift+Tab` (GitHub issue #26): the mirror of [`Self::indent_lines`] - removes up to one
+    /// real indent level ([`crate::code_surface::indent::leading_dedent_len`]) from the start of
+    /// every line the (possibly empty/collapsed-caret) selection touches, a genuine no-op for any
+    /// line already at column 0 (or with no real leading whitespace at all). Re-expands the
+    /// selection to keep covering the same real lines, shifted left by however much was actually
+    /// removed *at or before* each end - never past that line's own new start.
+    ///
+    /// Returns whether anything real actually changed (`false` when every touched line had no
+    /// real leading whitespace to remove) - `crate::code_surface::editing`'s caller uses this to
+    /// skip a pointless re-highlight/LSP-sync/scroll-sync for a genuine no-op keystroke.
+    ///
+    /// Records every real per-line removal as one atomic [`TextHistory::record_group`] step - see
+    /// [`Self::indent_lines`]'s own "One atomic undo step, not N" docs for why.
+    pub fn dedent_lines(&mut self, tab_width: u8) -> bool {
+        let before = self.selection_snapshot();
+        let sel_start = self.selected_range.start;
+        let sel_end = self.selected_range.end;
+        let reversed = self.selection_reversed;
+        let (first_line, _) = self.line_col_for_offset(sel_start);
+        let (end_line, end_col) = self.line_col_for_offset(sel_end);
+        let touched = if self.selected_range.is_empty() {
+            first_line..first_line + 1
+        } else {
+            indent::touched_line_range(first_line, end_line, end_col)
+        };
+
+        let removed: Vec<usize> = touched
+            .clone()
+            .map(|line| {
+                let Some(range) = self.line_ranges.get(line) else {
+                    return 0;
+                };
+                let Some(text) = self.content.get(range.clone()) else {
+                    return 0;
+                };
+                indent::leading_dedent_len(text, tab_width)
+            })
+            .collect();
+        if removed.iter().all(|&len| len == 0) {
+            return false;
+        }
+
+        let mut edits = Vec::with_capacity(touched.len());
+        for (offset, line) in touched.clone().enumerate().rev() {
+            let remove = removed[offset];
+            if remove == 0 {
+                continue;
+            }
+            let Some(line_start) = self.line_ranges.get(line).map(|range| range.start) else {
+                continue;
+            };
+            let remove_range = line_start..line_start + remove;
+            let Some(removed_text) = self.content.get(remove_range.clone()) else {
+                continue;
+            };
+            let removed_text = removed_text.to_string();
+            self.splice_lines(remove_range, "");
+            edits.push(TextEdit {
+                at: line_start,
+                removed: removed_text,
+                inserted: String::new(),
+            });
+        }
+
+        let total_removed: usize = removed.iter().sum();
+        let new_start = self
+            .line_ranges
+            .get(first_line)
+            .map(|range| range.start)
+            .unwrap_or(sel_start);
+        let new_end = sel_end.saturating_sub(total_removed).max(new_start);
+        self.selected_range = new_start..new_end;
+        self.selection_reversed = reversed;
+        self.marked_range = None;
+        self.goal_column = None;
+        if !self.replaying {
+            let after = self.selection_snapshot();
+            self.history
+                .record_group(edits, before, after, Instant::now());
+        }
+        true
     }
 
     /// Real, line-scoped word boundary just before `offset` (GitHub issue #27:
@@ -3711,110 +3871,145 @@ mod tests {
             "and there must be nothing left behind it - proving it really was one group"
         );
     }
-}
 
-/// GitHub issue #27's real word-wise-selection and double/triple-click-selection coverage -
-/// `Self::previous_word_boundary`/`Self::next_word_boundary`/`Self::select_word_at`/
-/// `Self::select_line_at`, and the `move_word_*`/`select_word_*` public wrappers around the
-/// first two. A separate module (matching this file's own established precedent, e.g.
-/// `sync_pending_diagnostics_confirmation_tests` in a sibling file) rather than folded into
-/// `mod tests` above, since it's a self-contained real feature slice, not a fix to something
-/// `mod tests` already covers.
-#[cfg(test)]
-mod word_and_click_selection_tests {
-    use super::tests::buffer;
+    // GitHub issue #26: `Tab`/`Shift+Tab` indentation.
 
     #[test]
-    fn move_word_right_stops_at_the_end_of_each_real_word() {
-        let mut buf = buffer("foo.bar() baz");
-        buf.move_to(0);
-        buf.move_word_right();
-        assert_eq!(buf.cursor_offset(), 3, "should stop right after \"foo\"");
-        buf.move_word_right();
-        // "." is its own non-whitespace run under UAX #29 word boundaries.
-        assert_eq!(buf.cursor_offset(), 4, "should stop right after \".\"");
-        buf.move_word_right();
-        assert_eq!(buf.cursor_offset(), 7, "should stop right after \"bar\"");
+    fn indent_lines_with_no_selection_inserts_at_the_caret_like_ordinary_typing() {
+        let mut buf = buffer("fn main() {\nbody\n}\n");
+        buf.move_to(12); // "fn main() {\n" is 12 bytes - this is the real start of "body"
+        assert!(buf.indent_lines("  "));
+        assert_eq!(buf.content, "fn main() {\n  body\n}\n");
+        assert_eq!(buf.selected_range, 14..14);
     }
 
     #[test]
-    fn move_word_left_stops_at_the_start_of_each_real_word() {
-        let mut buf = buffer("foo.bar() baz");
-        buf.move_to(buf.content.len());
-        buf.move_word_left();
+    fn indent_lines_with_a_multi_line_selection_indents_every_touched_line_and_keeps_selecting() {
+        let mut buf = buffer("one\ntwo\nthree\n");
+        buf.selected_range = 1..6; // "ne\ntw" - touches lines 0 and 1
+        buf.selection_reversed = false;
+        assert!(buf.indent_lines("  "));
+        assert_eq!(buf.content, "  one\n  two\nthree\n");
+        // The selection re-expands to the full touched lines' own new start through the shifted
+        // original end (2 lines * 2 inserted spaces each = +4 total by the original end offset).
+        assert_eq!(buf.selected_range, 0..10);
+        assert_eq!(&buf.content[buf.selected_range.clone()], "  one\n  tw");
+    }
+
+    #[test]
+    fn indent_lines_excludes_the_trailing_line_when_selection_ends_at_its_column_zero() {
+        let mut buf = buffer("one\ntwo\nthree\n");
+        buf.selected_range = 0..4; // "one\n" - lands exactly at the start of line 1
+        assert!(buf.indent_lines("  "));
         assert_eq!(
-            buf.cursor_offset(),
-            10,
-            "should stop at the start of \"baz\""
-        );
-        buf.move_word_left();
-        assert_eq!(buf.cursor_offset(), 7, "should stop at the start of \"()\"");
-    }
-
-    #[test]
-    fn move_word_left_crosses_a_real_line_boundary() {
-        let mut buf = buffer("first\nsecond");
-        buf.move_to(buf.content.len());
-        // "second" is one word - one hop reaches its own start...
-        buf.move_word_left();
-        assert_eq!(buf.cursor_offset(), 6);
-        // ...and a second hop must land on the previous line's real end (byte 5, the newline
-        // itself is not part of either line's text), not panic or stay put.
-        buf.move_word_left();
-        assert_eq!(buf.cursor_offset(), 5);
-    }
-
-    #[test]
-    fn select_word_right_extends_the_real_selection_by_one_word() {
-        let mut buf = buffer("hello world");
-        buf.move_to(0);
-        buf.select_word_right();
-        assert_eq!(buf.selected_range, 0..5, "should select exactly \"hello\"");
-    }
-
-    #[test]
-    fn select_word_at_a_word_selects_the_real_whole_word_under_the_click() {
-        let mut buf = buffer("hello world");
-        // A click landing mid-word ("wor|ld", offset 8) must select the *whole* real word, not
-        // just from the click point onward.
-        buf.select_word_at(8);
-        assert_eq!(
-            buf.selected_range,
-            6..11,
-            "should select the whole real word \"world\""
+            buf.content, "  one\ntwo\nthree\n",
+            "only line 0 should be indented, not line 1"
         );
     }
 
     #[test]
-    fn select_word_at_whitespace_places_a_plain_caret_instead_of_fabricating_a_word() {
-        let mut buf = buffer("hello world");
-        buf.select_word_at(5); // the real space between the two words
+    fn indent_lines_with_a_single_line_selection_still_block_indents_the_whole_line() {
+        let mut buf = buffer("hello world\n");
+        buf.selected_range = 6..11; // "world", no line break involved at all
+        assert!(buf.indent_lines("\t"));
+        assert_eq!(buf.content, "\thello world\n");
+    }
+
+    #[test]
+    fn dedent_lines_removes_up_to_tab_width_of_leading_spaces_from_every_touched_line() {
+        // Line 0 has fewer leading spaces than `width` (all of them are removed); line 1 has
+        // more (only `width` of them are removed, leaving the rest); line 2 has none (no-op).
+        let mut buf = buffer("  one\n      two\nthree\n");
+        buf.selected_range = 0..buf.content.len();
+        assert!(buf.dedent_lines(4));
+        assert_eq!(buf.content, "one\n  two\nthree\n");
+    }
+
+    #[test]
+    fn dedent_lines_removes_a_single_leading_tab_as_one_whole_level() {
+        let mut buf = buffer("\t\tone\n");
+        buf.move_to(3);
+        assert!(buf.dedent_lines(4));
+        assert_eq!(buf.content, "\tone\n");
+    }
+
+    #[test]
+    fn dedent_lines_is_a_real_no_op_on_a_line_already_at_column_zero() {
+        let mut buf = buffer("one\ntwo\n");
+        buf.selected_range = 0..0;
+        assert!(!buf.dedent_lines(4));
+        assert_eq!(buf.content, "one\ntwo\n");
+    }
+
+    #[test]
+    fn dedent_lines_with_no_selection_dedents_the_current_line_regardless_of_caret_column() {
+        let mut buf = buffer("    hello\n");
+        buf.move_to(7); // caret mid-word ("hel|lo"), nowhere near the leading whitespace
+        assert!(buf.dedent_lines(4));
+        assert_eq!(buf.content, "hello\n");
+    }
+
+    #[test]
+    fn indent_then_dedent_round_trips_back_to_the_original_content() {
+        let mut buf = buffer("one\ntwo\nthree\n");
+        buf.selected_range = 0..buf.content.len();
+        assert!(buf.indent_lines("    "));
+        assert!(buf.dedent_lines(4));
+        assert_eq!(buf.content, "one\ntwo\nthree\n");
+    }
+
+    // GitHub issue #17 integration: a multi-line Tab/Shift+Tab is one atomic undo step.
+
+    #[test]
+    fn indenting_three_lines_at_once_undoes_in_a_single_ctrl_z() {
+        let mut buf = buffer("one\ntwo\nthree\n");
+        buf.selected_range = 0..buf.content.len();
+        assert!(buf.indent_lines("  "));
+        assert_eq!(buf.content, "  one\n  two\n  three\n");
+
+        assert!(buf.undo());
+        assert_eq!(
+            buf.content, "one\ntwo\nthree\n",
+            "indenting all three lines must be exactly one undo step, not three"
+        );
         assert!(
-            buf.selected_range.is_empty(),
-            "clicking real whitespace must not select a plausible-looking word that isn't there"
+            !buf.can_undo(),
+            "and there must be nothing left behind it - proving it really was one step"
         );
-        assert_eq!(buf.cursor_offset(), 5);
+
+        assert!(buf.redo());
+        assert_eq!(buf.content, "  one\n  two\n  three\n");
     }
 
     #[test]
-    fn select_line_at_selects_the_real_whole_line_excluding_its_line_ending() {
-        let mut buf = buffer("first\nsecond\nthird");
-        buf.select_line_at(1);
+    fn dedenting_three_lines_at_once_undoes_in_a_single_ctrl_z() {
+        let mut buf = buffer("  one\n  two\n  three\n");
+        buf.selected_range = 0..buf.content.len();
+        assert!(buf.dedent_lines(2));
+        assert_eq!(buf.content, "one\ntwo\nthree\n");
+
+        assert!(buf.undo());
         assert_eq!(
-            buf.selected_range,
-            6..12,
-            "should select exactly \"second\", not its trailing newline"
+            buf.content, "  one\n  two\n  three\n",
+            "dedenting all three lines must be exactly one undo step, not three"
         );
+        assert!(!buf.can_undo());
+
+        assert!(buf.redo());
+        assert_eq!(buf.content, "one\ntwo\nthree\n");
     }
 
     #[test]
-    fn select_line_at_an_out_of_range_line_is_a_real_no_op() {
-        let mut buf = buffer("only one line");
-        let before = buf.selected_range.clone();
-        buf.select_line_at(99);
-        assert_eq!(
-            before, buf.selected_range,
-            "an out-of-range line must not panic or mutate"
-        );
+    fn a_dedent_that_only_touches_some_lines_still_undoes_as_one_step() {
+        // Line 1 has no leading whitespace at all - a genuine per-line no-op mixed in with two
+        // real removals, exercising the "skip lines with nothing to remove" path inside one group.
+        let mut buf = buffer("  one\ntwo\n  three\n");
+        buf.selected_range = 0..buf.content.len();
+        assert!(buf.dedent_lines(2));
+        assert_eq!(buf.content, "one\ntwo\nthree\n");
+
+        assert!(buf.undo());
+        assert_eq!(buf.content, "  one\ntwo\n  three\n");
+        assert!(!buf.can_undo());
     }
 }

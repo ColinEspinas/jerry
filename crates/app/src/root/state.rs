@@ -109,6 +109,7 @@ impl AdeApp {
             reviewed_files: HashSet::new(),
             open_files: Vec::new(),
             open_change: None,
+            close_tab_confirm_armed: None,
             open_diff_file_cache: None,
             selected_tree_path: None,
             code_view: code_view::CodeView::Diff,

@@ -19,6 +19,12 @@
 //! field, this one included, is "loaded, saved, and genuinely consumed by real behaviour"; what
 //! this one lacks is a UI surface, not a consumer.
 //!
+//! [`EditorSettings`] (GitHub issue #26) is the same kind of file-only tunable: real, applied
+//! defaults for Tab/Shift+Tab indentation (`crate::code_surface::editing`'s
+//! `handle_editor_indent_action`/`handle_editor_dedent_action` read it as the fallback once no
+//! `.editorconfig` file sets a given property - see `crate::code_surface::indent`'s own docs for
+//! the real resolution order), with no settings-page UI of its own yet.
+//!
 //! ## TOML is the real file; JSON is a read-only alternate view
 //!
 //! The config banner's `TOML | JSON` segment (`crate::settings::widgets::render_config_banner`)
@@ -355,17 +361,25 @@ impl FileTreeSettings {
 }
 
 /// Surface C's minimap - `crate::code_surface::minimap`'s own real, persisted settings
-/// (GitHub issue #30's `editor.minimap.enabled`). This is the one field in the `Editor` settings
-/// page that's genuinely backed by real behaviour today (see `crate::settings::state`'s own
-/// module docs on why the rest of that page still stays a placeholder) - `minimap_enabled`
-/// toggles `crate::code_surface::minimap::AdeApp::render_minimap` on/off directly, and
+/// (GitHub issue #30's `editor.minimap.enabled`). This is one of two genuinely-backed fields on
+/// the `Editor` settings page today (see `crate::settings::state`'s own module docs on why the
+/// rest of that page still stays a placeholder) - `minimap_enabled` toggles
+/// `crate::code_surface::minimap::AdeApp::render_minimap` on/off directly, and
 /// `minimap_scale_percent` is the real multiplier that module's own `panel_width`/`char_width`/
-/// `effective_line_height` apply.
+/// `effective_line_height` apply. `insert_spaces`/`tab_width` are GitHub issue #26's real
+/// Tab/Shift+Tab indentation defaults - see the module docs' "One documented exception" section
+/// for why they have no settings page yet. `tab_width` is both "how many literal spaces one
+/// indent level inserts" (when `insert_spaces`) and "how wide one literal `\t` counts as for
+/// `Shift+Tab`'s own dedent" - `crate::code_surface::indent::indent_settings_for_path` overrides
+/// either field from a real `.editorconfig` file when one applies to the file being edited; these
+/// are only the fallback once no `.editorconfig` sets a given property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EditorSettings {
     pub minimap_enabled: bool,
     pub minimap_scale_percent: u16,
+    pub insert_spaces: bool,
+    pub tab_width: u8,
 }
 
 impl Default for EditorSettings {
@@ -373,6 +387,8 @@ impl Default for EditorSettings {
         Self {
             minimap_enabled: true,
             minimap_scale_percent: MINIMAP_SCALE_PERCENT_DEFAULT,
+            insert_spaces: true,
+            tab_width: EDITOR_TAB_WIDTH_DEFAULT,
         }
     }
 }
@@ -385,14 +401,24 @@ pub const MINIMAP_SCALE_PERCENT_MAX: u16 = 200;
 pub const MINIMAP_SCALE_PERCENT_DEFAULT: u16 = 100;
 pub const MINIMAP_SCALE_PERCENT_STEP: u16 = 25;
 
+/// Bounds for [`EditorSettings::tab_width`] - `1` (a real, if unusual, minimum) through `16`
+/// (comfortably more than any real project's own configured indent width), matching
+/// [`AppearanceSettings::sanitize`]'s own "hand-edited file gets clamped, not rejected" discipline.
+pub const EDITOR_TAB_WIDTH_MIN: u8 = 1;
+pub const EDITOR_TAB_WIDTH_MAX: u8 = 16;
+pub const EDITOR_TAB_WIDTH_DEFAULT: u8 = 4;
+
 impl EditorSettings {
-    /// Clamps a hand-edited `minimap_scale_percent` into its documented range - the same
-    /// [`AppearanceSettings::sanitize`] discipline applied here, called once at load time (see
-    /// [`Settings::load_or_init_at`]).
+    /// Clamps a hand-edited `minimap_scale_percent`/`tab_width` into their documented ranges -
+    /// the same [`AppearanceSettings::sanitize`] discipline applied here, called once at load
+    /// time (see [`Settings::load_or_init_at`]).
     pub fn sanitize(&mut self) {
         self.minimap_scale_percent = self
             .minimap_scale_percent
             .clamp(MINIMAP_SCALE_PERCENT_MIN, MINIMAP_SCALE_PERCENT_MAX);
+        self.tab_width = self
+            .tab_width
+            .clamp(EDITOR_TAB_WIDTH_MIN, EDITOR_TAB_WIDTH_MAX);
     }
 }
 
@@ -449,7 +475,9 @@ impl Settings {
     /// rather than crashing the app over a hand-edit mistake, logged via `log::warn!`. If `path`
     /// doesn't exist yet, writes a default file there (via [`Settings::save_at`]) so the config
     /// file exists on first run; a save failure there is also logged rather than propagated. A
-    /// file that does parse still gets [`AppearanceSettings::sanitize`] applied.
+    /// file that does parse still gets every section's own `sanitize` applied
+    /// ([`AppearanceSettings::sanitize`], [`FileTreeSettings::sanitize`],
+    /// [`EditorSettings::sanitize`]).
     pub fn load_or_init_at(path: &Path) -> Settings {
         match std::fs::read_to_string(path) {
             Ok(contents) => match toml::from_str::<Settings>(&contents) {
@@ -674,6 +702,32 @@ mod tests {
         assert_eq!(
             settings.editor.minimap_scale_percent,
             MINIMAP_SCALE_PERCENT_DEFAULT
+        );
+        assert!(settings.editor.insert_spaces);
+        assert_eq!(settings.editor.tab_width, EDITOR_TAB_WIDTH_DEFAULT);
+    }
+
+    #[test]
+    fn a_hand_edited_editor_tab_width_round_trips_and_an_absurd_one_is_clamped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[editor]\ninsert_spaces = false\ntab_width = 2\n").expect("write");
+        let loaded = Settings::load_or_init_at(&path);
+        assert!(!loaded.editor.insert_spaces);
+        assert_eq!(loaded.editor.tab_width, 2);
+
+        std::fs::write(&path, "[editor]\ntab_width = 200\n").expect("write");
+        assert_eq!(
+            Settings::load_or_init_at(&path).editor.tab_width,
+            EDITOR_TAB_WIDTH_MAX,
+            "an absurd tab width is clamped down, not honoured"
+        );
+
+        std::fs::write(&path, "[editor]\ntab_width = 0\n").expect("write");
+        assert_eq!(
+            Settings::load_or_init_at(&path).editor.tab_width,
+            EDITOR_TAB_WIDTH_MIN,
+            "a zero tab width is clamped up, not honoured"
         );
     }
 

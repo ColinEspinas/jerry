@@ -174,10 +174,15 @@ actions!(
         CompletionsDown,
         CompletionsAccept,
         CompletionsDismiss,
+        CompletionsInvoke,
+        EditorIndent,
+        EditorDedent,
+        EditorEscape,
         Undo,
         Redo,
         TextUndo,
         TextRedo,
+        CloseFocusedTab,
         FileTreeContextMenu,
         FileTreeRename,
         FileTreeCopy,
@@ -391,6 +396,15 @@ pub struct AdeApp {
     /// tab (`Self::activate_file_tab`); cleared by selecting a session tab or closing the active
     /// tab down to none left.
     pub(crate) open_change: Option<PathBuf>,
+    /// `Some(path)` for one real "arming" click/keystroke on a *dirty* file tab's close
+    /// affordance (`×`, middle-click, or `Ctrl+W` - GitHub issue #26), cleared by the confirming
+    /// second gesture on the same `path` (which then really closes it) or by most other tab/file
+    /// navigation in the meantime - the same real two-gesture confirmation idiom
+    /// [`Self::prune_confirm_armed`]/[`Self::discard_confirm_armed`] already establish for this
+    /// app's other destructive-feeling actions. A clean (non-dirty) tab never arms this at all -
+    /// see [`crate::code_surface::tabs::AdeApp::request_close_file_tab`]'s own docs for why an
+    /// unsaved-changes prompt for a tab with nothing unsaved would be real, unnecessary friction.
+    pub(crate) close_tab_confirm_armed: Option<PathBuf>,
     /// Cached `DiffFile` for whichever path [`Self::open_change`] names (`None` if it has no
     /// diff, or nothing is open) - kept fresh by [`Self::refresh_open_diff_file_cache`] instead
     /// of re-cloning the whole diff (up to 2000 hunk lines) on every render.
@@ -1411,6 +1425,7 @@ impl Render for AdeApp {
             .on_action(cx.listener(Self::handle_jump_to_session_8_action))
             .on_action(cx.listener(Self::handle_undo_action))
             .on_action(cx.listener(Self::handle_redo_action))
+            .on_action(cx.listener(Self::handle_close_focused_tab_action))
             .child(self.render_title_bar(cx))
             // The Settings surface (`design_handoff_jerry_ade/README.md`: "a separate surface,
             // not a modal: it replaces the three zones while the title bar and status bar

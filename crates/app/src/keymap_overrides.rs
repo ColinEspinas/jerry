@@ -482,10 +482,24 @@ mod tests {
     fn a_narrower_context_colliding_with_its_own_broader_parent_context_is_flagged() {
         // `"file-editor"` (broad) vs `"file-editor && completions"` (narrower, a real subset) -
         // `contexts_could_overlap` must catch this via `is_superset`, unlike the genuinely
-        // disjoint case above. `escape` is used real-world-uniquely by `CompletionsDismiss` (no
-        // `Editor*` binding claims it), so this candidate can only ever collide with that one
-        // real binding - unlike e.g. `"up"`, which both `EditorUp` *and* `CompletionsUp` already
-        // use under their own, different (but still overlapping) contexts.
+        // disjoint case above. `escape` is real-world-shared by two scoped bindings under
+        // `"file-editor"` since GitHub issue #26 added a real Tab/Shift+Tab-driven escape hatch
+        // scoped `"file-editor && !completions"`, alongside the pre-existing `CompletionsDismiss`
+        // (`"file-editor && completions"`) - it's `EditorCollapseCursors` that actually owns that
+        // exact keystroke+context today, not a separate `EditorEscape` action: GitHub issue #28's
+        // own multi-cursor collapse and this escape hatch both want the File view's plain
+        // `Escape`, and only one binding can genuinely own it at equal context depth (see
+        // `crate::code_surface::editing::AdeApp::handle_editor_collapse_cursors_action`'s own
+        // docs for how it composes both real behaviors from this one binding).
+        // `find_colliding_binding` returns the *first* match in real registration order
+        // (`crate::default_key_bindings`), which is `EditorCollapseCursors` (registered before
+        // the `Completions*` group) - either real match would equally prove the point this test
+        // exists for (a broad `"file-editor"` rebind collides with *some* real narrower
+        // `"file-editor && ..."` binding sharing the same keystroke), so asserting on the specific
+        // one `find_colliding_binding` actually returns keeps this test honest about its own real
+        // behavior rather than papering over which one - matching e.g. `"up"`, which both
+        // `EditorUp` *and* `CompletionsUp` already use under their own, different (but still
+        // overlapping) contexts.
         let bindings = crate::default_key_bindings();
         let editor_left = bindings
             .iter()
@@ -494,26 +508,25 @@ mod tests {
                     && context_label(b.predicate().as_deref()) == "file-editor"
             })
             .expect("a file-editor-scoped EditorLeft binding should exist");
-        let completions_dismiss = bindings
+        let editor_collapse_cursors = bindings
             .iter()
-            .find(|b| b.action().name() == "app::CompletionsDismiss")
-            .expect("CompletionsDismiss should be a real default binding");
-        assert_eq!(
-            context_label(completions_dismiss.predicate().as_deref()),
-            "file-editor && completions"
-        );
+            .find(|b| {
+                b.action().name() == "app::EditorCollapseCursors"
+                    && context_label(b.predicate().as_deref()) == "file-editor && !completions"
+            })
+            .expect("a file-editor-scoped EditorCollapseCursors binding should exist");
 
         let collision = find_colliding_binding(
             &bindings,
             &bindings,
             editor_left,
-            &completions_dismiss.keystrokes()[0].inner().unparse(),
+            &editor_collapse_cursors.keystrokes()[0].inner().unparse(),
         );
         assert_eq!(
             collision.map(|b| b.action().name()),
-            Some("app::CompletionsDismiss"),
-            "file-editor is a real superset of file-editor && completions - rebinding \
-             EditorLeft onto CompletionsDismiss's own keystroke must be flagged"
+            Some("app::EditorCollapseCursors"),
+            "file-editor is a real superset of file-editor && !completions - rebinding \
+             EditorLeft onto EditorCollapseCursors's own keystroke must be flagged"
         );
     }
 
@@ -686,7 +699,14 @@ mod tests {
 
         for (keystroke, expected) in [
             ("backspace", "app::EditorBackspace"),
-            ("escape", "app::CompletionsDismiss"),
+            // `escape` is real-world-shared by two scoped bindings under `"file-editor"` since
+            // GitHub issue #26 added a real escape hatch (`"file-editor && !completions"`,
+            // via `EditorCollapseCursors` - see that binding's own docs for why it's not a
+            // separate `EditorEscape` action here) alongside the pre-existing `CompletionsDismiss`
+            // (`"file-editor && completions"`) - either is a real collision that proves this
+            // test's own point; `find_colliding_binding` finds `EditorCollapseCursors` first
+            // since it's registered earlier in `crate::default_key_bindings`.
+            ("escape", "app::EditorCollapseCursors"),
         ] {
             let collision = find_colliding_binding(&bindings, &bindings, text_undo, keystroke);
             assert_eq!(

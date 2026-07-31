@@ -53,18 +53,19 @@ use crate::code_surface::blame;
 use crate::code_surface::blame_view::render_inline_blame_span;
 use crate::code_surface::code_view;
 use crate::code_surface::edit_buffer::EditBuffer;
+use crate::code_surface::indent;
 use crate::code_surface::lsp_ui::{
     diagnostic_inline_message_color, diagnostic_row_bg, diagnostic_underline_color,
 };
 use crate::lsp::diagnostics as diagnostics_view;
 use crate::lsp::hover as hover_view;
 use crate::root::{
-    AdeApp, EditorBackspace, EditorCollapseCursors, EditorCopy, EditorCut, EditorDelete,
-    EditorDown, EditorEnd, EditorEnter, EditorHome, EditorLeft, EditorPaste, EditorRight,
-    EditorSave, EditorSaveAnyway, EditorSelectAll, EditorSelectAllOccurrences, EditorSelectDown,
-    EditorSelectLeft, EditorSelectNextOccurrence, EditorSelectRight, EditorSelectUp,
-    EditorSelectWordLeft, EditorSelectWordRight, EditorSkipOccurrence, EditorUp, EditorWordLeft,
-    EditorWordRight, TextRedo, TextUndo,
+    AdeApp, EditorBackspace, EditorCollapseCursors, EditorCopy, EditorCut, EditorDedent,
+    EditorDelete, EditorDown, EditorEnd, EditorEnter, EditorEscape, EditorHome, EditorIndent,
+    EditorLeft, EditorPaste, EditorRight, EditorSave, EditorSaveAnyway, EditorSelectAll,
+    EditorSelectAllOccurrences, EditorSelectDown, EditorSelectLeft, EditorSelectNextOccurrence,
+    EditorSelectRight, EditorSelectUp, EditorSelectWordLeft, EditorSelectWordRight,
+    EditorSkipOccurrence, EditorUp, EditorWordLeft, EditorWordRight, TextRedo, TextUndo,
 };
 use crate::settings::store as settings_store;
 use crate::theme;
@@ -507,40 +508,193 @@ impl AdeApp {
         self.apply_multi_cursor_action(cx, EditBuffer::skip_current_occurrence);
     }
 
-    /// `Esc` (Revision R13, issue #28) - `EditBuffer::collapse_to_single_cursor`'s own docs. A
-    /// real no-op (via `Self::apply_multi_cursor_action`'s own `false`-skips-notify contract)
-    /// while only one cursor is active, so this never claims the keystroke - and never dismisses
-    /// completions or scrolls - for a plain `Escape` that has nothing multi-cursor-related to do.
+    /// `Esc` in the File view (Revision R13, issue #28; falls through to GitHub issue #26's
+    /// accessibility escape hatch): tries `EditBuffer::collapse_to_single_cursor` first via
+    /// `Self::apply_multi_cursor_action`'s own real change-reporting contract. Only one binding
+    /// can genuinely own the File view's plain `Escape` at equal context depth (`crate::
+    /// default_key_bindings`'s own docs on GPUI's real "later registration wins" precedence for
+    /// same-depth contexts - confirmed against the pinned `gpui` dependency's own
+    /// `key_dispatch.rs` test suite, not guessed), so rather than silently shadowing one of these
+    /// two real, independently-designed behaviors, this handler composes both: a real multi-
+    /// cursor collapse when one is active, or - the exact same no-op case `EditorCollapseCursors`
+    /// was already documented as deliberately doing nothing for - [`Self::
+    /// escape_focus_off_editor`]'s real accessibility fallback when there's nothing multi-cursor-
+    /// related to do. `EditorEscape` stays a real, separately-bound action in its own right for
+    /// `"merge-editor"` (see that binding's own docs), which never gets multi-cursor actions at
+    /// all and so never faces this same collision.
     pub(crate) fn handle_editor_collapse_cursors_action(
         &mut self,
         _: &EditorCollapseCursors,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_multi_cursor_action(cx, EditBuffer::collapse_to_single_cursor);
+        if self.apply_multi_cursor_action(cx, EditBuffer::collapse_to_single_cursor) {
+            return;
+        }
+        self.escape_focus_off_editor(window, cx);
     }
 
     /// Shared plumbing for every multi-cursor-only action above: applies `f` to the active buffer
     /// and, only if it reports a real change (`true`), dismisses completions (the caret may have
     /// moved/multiplied somewhere the popup's own anchor no longer describes - same real reasoning
     /// as `Self::move_active_buffer`'s own dismissal), notifies, and scrolls the (possibly new)
-    /// primary caret into view. A `false` result is a genuine no-op (e.g. `Ctrl+D` with no word
-    /// under an empty caret, or `Esc` with only one cursor already active) - no re-render, no
-    /// dismissed completions, for a keystroke that changed nothing.
+    /// primary caret into view. Returns that same `bool` so [`Self::
+    /// handle_editor_collapse_cursors_action`] can tell a genuine no-op (e.g. `Ctrl+D` with no
+    /// word under an empty caret, or `Esc` with only one cursor already active) apart from real
+    /// work - callers that don't need to distinguish (every other action above) simply ignore it.
     fn apply_multi_cursor_action(
         &mut self,
         cx: &mut Context<Self>,
         f: fn(&mut EditBuffer) -> bool,
-    ) {
+    ) -> bool {
         let Some(buffer) = self.active_edit_buffer_mut() else {
-            return;
+            return false;
         };
         if !f(buffer) {
-            return;
+            return false;
         }
         self.dismiss_completions();
         cx.notify();
         self.sync_cursor_and_scroll();
+        true
+    }
+
+    /// `Tab` (GitHub issue #26) - real indentation, not a raw `\t` character: resolves the real
+    /// indent unit (tabs vs. spaces, width) from [`Self::resolved_indent_settings_for_target`],
+    /// then delegates to [`EditBuffer::indent_lines`] (see that method's own docs for the real
+    /// no-selection-vs-selection behavior). File-target edits schedule a re-highlight/LSP-sync the
+    /// same way every other real text-changing `Editor*` action does; the merge hand-edit target
+    /// has neither (see `crate::merge::editing`'s own top docs for why).
+    pub(crate) fn handle_editor_indent_action(
+        &mut self,
+        _: &EditorIndent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = self.resolved_indent_settings_for_target();
+        let unit = indent::indent_unit(settings);
+        let changed = match self.active_edit_target() {
+            Some(EditTarget::File(path)) => {
+                let Some(buffer) = self.edit_buffers.get_mut(&path) else {
+                    return;
+                };
+                let changed = buffer.indent_lines(&unit);
+                if changed {
+                    self.schedule_rehighlight(path.clone(), cx);
+                    self.schedule_lsp_sync(path, cx);
+                }
+                changed
+            }
+            Some(EditTarget::Merge) => {
+                let Some(edit) = self.merge_edit.as_mut() else {
+                    return;
+                };
+                edit.buffer.indent_lines(&unit)
+            }
+            None => return,
+        };
+        if !changed {
+            return;
+        }
+        self.dismiss_completions();
+        self.sync_cursor_and_scroll();
+        cx.notify();
+    }
+
+    /// `Shift+Tab` (GitHub issue #26) - the mirror of [`Self::handle_editor_indent_action`], via
+    /// [`EditBuffer::dedent_lines`]. A genuine no-op (every touched line already at column 0, or
+    /// no real edit target at all) skips the re-highlight/sync/notify, matching every other
+    /// `Editor*` handler's own "don't do real work for nothing" discipline.
+    pub(crate) fn handle_editor_dedent_action(
+        &mut self,
+        _: &EditorDedent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = self.resolved_indent_settings_for_target();
+        let changed = match self.active_edit_target() {
+            Some(EditTarget::File(path)) => {
+                let Some(buffer) = self.edit_buffers.get_mut(&path) else {
+                    return;
+                };
+                let changed = buffer.dedent_lines(settings.tab_width);
+                if changed {
+                    self.schedule_rehighlight(path.clone(), cx);
+                    self.schedule_lsp_sync(path, cx);
+                }
+                changed
+            }
+            Some(EditTarget::Merge) => {
+                let Some(edit) = self.merge_edit.as_mut() else {
+                    return;
+                };
+                edit.buffer.dedent_lines(settings.tab_width)
+            }
+            None => return,
+        };
+        if !changed {
+            return;
+        }
+        self.dismiss_completions();
+        self.sync_cursor_and_scroll();
+        cx.notify();
+    }
+
+    /// The real [`indent::IndentSettings`] `Tab`/`Shift+Tab` should use right now - resolved from
+    /// a real `.editorconfig` (via [`indent::indent_settings_for_path`]) for the File-view target,
+    /// since only that target has a real on-disk path/worktree root to resolve one against; the
+    /// merge hand-edit target (no real file path of its own - see `crate::merge::editing`'s own
+    /// top docs) always falls back straight to the user's own [`crate::settings::store::
+    /// EditorSettings`] default. `None`/no edit target also falls back to the same user default -
+    /// harmless, since every real caller already returns before using it in that case.
+    fn resolved_indent_settings_for_target(&self) -> indent::IndentSettings {
+        let user_default = indent::IndentSettings {
+            insert_spaces: self.settings.editor.insert_spaces,
+            tab_width: self.settings.editor.tab_width,
+        };
+        match self.active_edit_target() {
+            Some(EditTarget::File(path)) => match self.edit_buffers.get(&path) {
+                Some(buffer) => indent::indent_settings_for_path(
+                    &buffer.path,
+                    &self.file_tree_root,
+                    user_default,
+                ),
+                None => user_default,
+            },
+            _ => user_default,
+        }
+    }
+
+    /// `Escape` in the merge hand-edit view (GitHub issue #26's accessibility requirement) -
+    /// `"merge-editor"` never gets multi-cursor actions bound (see `crate::code_surface::
+    /// edit_buffer`'s own "Multi-cursor" docs for why), so this is a plain, standalone binding
+    /// with no collision to resolve, unlike the File view's own `Escape` (see [`Self::
+    /// handle_editor_collapse_cursors_action`]'s own docs for why *that* one has to compose two
+    /// behaviors instead of just calling this directly).
+    pub(crate) fn handle_editor_escape_action(
+        &mut self,
+        _: &EditorEscape,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.escape_focus_off_editor(window, cx);
+    }
+
+    /// Moves keyboard focus off the editor entirely, onto [`AdeApp::filter_focus_handle`] (the
+    /// rail's own filter field) - the same real fallback target [`crate::work_surface::render::
+    /// AdeApp::close_session`] already uses for "nothing session/file-related is left to focus".
+    /// Since `Tab`/`Shift+Tab` are now real indent/dedent actions while the editor has focus
+    /// (rather than falling through to GPUI's ordinary focus-cycling), a keyboard-only user needs
+    /// some other way to leave the editor and keep tabbing through the rest of the UI - this is
+    /// that "escape hatch": once focus has genuinely moved elsewhere, an ordinary (now-unbound-
+    /// here) `Tab` press resumes GPUI's normal focus-cycling immediately, no special two-key state
+    /// machine needed. Shared by both real `Escape` paths that can reach it - [`Self::
+    /// handle_editor_escape_action`] (`"merge-editor"`) directly, and [`Self::
+    /// handle_editor_collapse_cursors_action`] (`"file-editor && !completions"`) as its own
+    /// fallback once a real multi-cursor collapse has nothing to do.
+    fn escape_focus_off_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.filter_focus_handle, cx);
+        cx.notify();
     }
 
     /// Shared plumbing for every cursor-movement-only action (no text change, so no re-highlight

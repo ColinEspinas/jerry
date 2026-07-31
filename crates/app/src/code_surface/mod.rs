@@ -11,6 +11,8 @@
 //!   and every mutation that can happen to them.
 //! - [`blame`] - turning a `wt_core::blame::BlameLine` into the inline label/tooltip text
 //!   shown for the current line (GitHub issue #29).
+//! - [`indent`] - Tab/Shift+Tab indentation resolution (tabs vs. spaces, width), including a
+//!   real, minimal `.editorconfig` reader (GitHub issue #26).
 //!
 //! GPUI-facing:
 //! - [`state`] - the load-state enums the surface's own fields are typed with.
@@ -66,6 +68,7 @@ use wt_core::diff::{DiffBase, DiffFile, DiffLineKind, WorktreeDiff};
 pub mod blame;
 pub mod code_view;
 pub mod edit_buffer;
+pub mod indent;
 
 pub(crate) mod blame_view;
 pub(crate) mod diff_view;
