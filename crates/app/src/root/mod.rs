@@ -1774,6 +1774,7 @@ impl Render for AdeApp {
             .on_action(cx.listener(Self::handle_goto_definition_action))
             .on_action(cx.listener(Self::handle_new_terminal_action))
             .on_action(cx.listener(Self::handle_new_agent_pane_action))
+            .on_action(cx.listener(Self::handle_new_git_graph_action))
             .on_action(cx.listener(Self::handle_next_changed_file_action))
             .on_action(cx.listener(Self::handle_jump_to_agent_1_action))
             .on_action(cx.listener(Self::handle_jump_to_agent_2_action))
