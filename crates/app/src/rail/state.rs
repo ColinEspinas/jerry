@@ -59,6 +59,23 @@ pub struct SessionRow {
     /// The process exit code, only for [`Status::Fail`]/[`Status::Review`]/exited-`Idle`
     /// rows. `None` while still running or never started.
     pub exit_code: Option<u32>,
+    /// The agent row's "what it is doing" trailing text for a [`Status::Run`] row -
+    /// `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.3: "the live tool call -
+    /// `writing auth.rs`, `editing reports.rs`, `bench 3 of 5`, `148 of 312`".
+    ///
+    /// A sibling field here rather than a payload on [`Status::Run`] itself, mirroring
+    /// [`Self::question_preview`]'s own shape immediately above (also status-conditional, also a
+    /// row-level fact rather than part of the status enum) - keeping [`Status`] itself a plain
+    /// `Copy` value users of `Status::ORDER`/`urgency_rank`/`color` etc. can keep relying on,
+    /// rather than every one of those call sites suddenly needing to supply or ignore an
+    /// `activity` payload for a `Run` variant they don't care about.
+    ///
+    /// **Always `None` today.** The real PTY-output-to-activity-text heuristic is a separate,
+    /// parallel piece of work (this revision's Phase 0 is data-model-and-persistence only); this
+    /// field exists so that work has a real, already-plumbed-through place to write into -
+    /// [`crate::rail::render::AdeApp::build_session_rows`] is where a live value would be filled
+    /// in, the same real construction site [`Self::question_preview`] is already filled in from.
+    pub activity: Option<String>,
 }
 
 impl SessionRow {
@@ -586,7 +603,25 @@ mod tests {
             del: 0,
             question_preview: None,
             exit_code: None,
+            activity: None,
         }
+    }
+
+    /// [`SessionRow::activity`] is a plain, independent field - carrying a value must not change
+    /// filtering (it isn't title/branch/kind text) or anything else about the row's identity.
+    #[test]
+    fn activity_is_independent_of_filtering_and_defaults_to_none() {
+        let idle_row = row(1, Status::Run, "agent-a", "/a");
+        assert_eq!(idle_row.activity, None);
+
+        let mut running_row = row(2, Status::Run, "agent-b", "/b");
+        running_row.activity = Some("writing auth.rs".to_string());
+        assert_eq!(running_row.activity.as_deref(), Some("writing auth.rs"));
+        // Matching is still driven by title/kind/branch alone - an unrelated `activity` value
+        // must never make an otherwise-non-matching row start matching a filter query, or vice
+        // versa.
+        assert!(running_row.matches_filter("agent-b"));
+        assert!(!running_row.matches_filter("writing auth.rs"));
     }
 
     #[test]

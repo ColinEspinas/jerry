@@ -80,7 +80,7 @@ impl AdeApp {
         let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
             return;
         };
-        let repo_path = self.repo_path.clone();
+        let repo_path = self.focused_repo_path();
         let worktree_path = session.cwd.clone();
         // A fresh attempt, even one reusing `id` (e.g. Abort then immediately Merge again on the
         // same session tab) - see `merge::MergeFlow::generation`'s own docs. Any hand-edit from a
@@ -284,7 +284,7 @@ impl AdeApp {
                             this.merge_flow = None;
                             this.clear_merge_edit_state();
                         }
-                        let repo_path = this.repo_path.clone();
+                        let repo_path = this.focused_repo_path();
                         this.load_worktrees(cx);
                         this.load_diff(repo_path, cx);
                     }
@@ -294,7 +294,7 @@ impl AdeApp {
                             // MERGE_HEAD is still present when `complete_merge`'s defense in
                             // depth is what failed, so `Abort merge` stays offered.
                             let abortable_worktree =
-                                wt_core::merge::find_in_progress_merge(&this.repo_path)
+                                wt_core::merge::find_in_progress_merge(&this.focused_repo_path())
                                     .ok()
                                     .flatten();
                             if let Some(flow) = this.merge_flow.as_mut() {
@@ -367,8 +367,11 @@ impl AdeApp {
                             this.clear_merge_edit_state();
                         }
                         Err(err) => {
-                            let abortable_worktree =
-                                wt_core::merge::find_in_progress_merge(&this.repo_path).ok().flatten();
+                            let abortable_worktree = wt_core::merge::find_in_progress_merge(
+                                &this.focused_repo_path(),
+                            )
+                            .ok()
+                            .flatten();
                             if let Some(flow) = this.merge_flow.as_mut() {
                                 flow.state = merge::MergeFlowState::Error {
                                     message: format!(
