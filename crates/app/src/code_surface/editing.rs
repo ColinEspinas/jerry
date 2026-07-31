@@ -1343,7 +1343,9 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                             bounds.bottom(),
                         ),
                     ),
-                    theme::editor::SELECTION.resolve().opacity(selection_opacity),
+                    theme::editor::SELECTION
+                        .resolve()
+                        .opacity(selection_opacity),
                 )
             });
             let cursor_quad = cursor_local.and_then(|offset| {
@@ -1419,38 +1421,41 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
     if let Some(label) = inline_blame {
         text_row = text_row.child(render_inline_blame_span(label, line_number));
     }
-    let text_row = text_row.child(cursor_overlay).on_mouse_down(
-        gpui::MouseButton::Left,
-        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-            let Some((bounds, shaped)) = this.file_view_row_layout.get(&click_line_number).cloned()
-            else {
-                return;
-            };
-            let Some(local_point) = bounds.localize(&event.position) else {
-                return;
-            };
-            let local_offset = shaped.closest_index_for_x(local_point.x);
-            // `this` (not a separately-captured `Entity<AdeApp>::read(cx)`) - `this` is
-            // already the real, live-leased `&mut AdeApp` `cx.listener` hands this closure;
-            // a real, live-reproduced bug this fixes: reading a *second*, independent handle
-            // to the same entity while `cx.listener`'s own update lease is still active is a
-            // real double-lease, and GPUI's `EntityMap::read` panics on exactly that
-            // (confirmed live: "cannot read app::root::AdeApp while it is already being
-            // updated") - every real left-click on an editable row hit this, unconditionally.
-            let Some(buffer) = this.edit_buffers.get(&row_path) else {
-                return;
-            };
-            let Some(line_range) = buffer.line_ranges.get(click_line_index).cloned() else {
-                return;
-            };
-            // Revision R8.5b: hover is no longer suppressed on a dirty buffer - `hover_view::
-            // position_for_line_byte_offset` below is computed from `click_line_text`, the
-            // *live* buffer's own line text (see `EditableLineContext::line`'s docs), and the
-            // language server now genuinely tracks that same live content via
-            // `Self::schedule_lsp_sync`'s real `didChange` sync, not just the last-saved
-            // snapshot (see `crate::code_surface`'s own `sync_pending` docs for the
-            // one, honest remaining latency-window caveat this doesn't try to hide).
-            let absolute_offset = line_range.start + local_offset;
+    let text_row = text_row
+        .child(cursor_overlay)
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                let Some((bounds, shaped)) =
+                    this.file_view_row_layout.get(&click_line_number).cloned()
+                else {
+                    return;
+                };
+                let Some(local_point) = bounds.localize(&event.position) else {
+                    return;
+                };
+                let local_offset = shaped.closest_index_for_x(local_point.x);
+                // `this` (not a separately-captured `Entity<AdeApp>::read(cx)`) - `this` is
+                // already the real, live-leased `&mut AdeApp` `cx.listener` hands this closure;
+                // a real, live-reproduced bug this fixes: reading a *second*, independent handle
+                // to the same entity while `cx.listener`'s own update lease is still active is a
+                // real double-lease, and GPUI's `EntityMap::read` panics on exactly that
+                // (confirmed live: "cannot read app::root::AdeApp while it is already being
+                // updated") - every real left-click on an editable row hit this, unconditionally.
+                let Some(buffer) = this.edit_buffers.get(&row_path) else {
+                    return;
+                };
+                let Some(line_range) = buffer.line_ranges.get(click_line_index).cloned() else {
+                    return;
+                };
+                // Revision R8.5b: hover is no longer suppressed on a dirty buffer - `hover_view::
+                // position_for_line_byte_offset` below is computed from `click_line_text`, the
+                // *live* buffer's own line text (see `EditableLineContext::line`'s docs), and the
+                // language server now genuinely tracks that same live content via
+                // `Self::schedule_lsp_sync`'s real `didChange` sync, not just the last-saved
+                // snapshot (see `crate::code_surface`'s own `sync_pending` docs for the
+                // one, honest remaining latency-window caveat this doesn't try to hide).
+                let absolute_offset = line_range.start + local_offset;
 
                 window.focus(&this.code_focus_handle, cx);
                 // A real click moves the caret somewhere the popup's own anchor almost certainly
