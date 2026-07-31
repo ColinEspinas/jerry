@@ -1146,9 +1146,9 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
     } = context;
 
     let gutter_color = if is_current {
-        theme::text::DIM
+        theme::editor::GUTTER_TEXT_ACTIVE
     } else {
-        theme::text::GUTTER
+        theme::editor::GUTTER_TEXT
     };
     let worst_severity = diagnostics_view::Severity::worst(diagnostics);
 
@@ -1206,7 +1206,9 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                             bounds.bottom(),
                         ),
                     ),
-                    theme::syntax::CARET.resolve().opacity(0.28),
+                    theme::editor::SELECTION
+                        .resolve()
+                        .opacity(theme::editor::SELECTION_OPACITY),
                 )
             });
             let cursor_quad = cursor_local.map(|offset| {
@@ -1215,7 +1217,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                         point(bounds.left() + shaped.x_for_index(offset), bounds.top()),
                         size(gpui::px(2.0), bounds.bottom() - bounds.top()),
                     ),
-                    theme::syntax::CARET,
+                    theme::editor::CARET,
                 )
             });
             (shaped, selection_quad, cursor_quad)
@@ -1363,7 +1365,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
         .flex()
         .items_center();
     if is_current {
-        row = row.bg(theme::surface::CURRENT_LINE);
+        row = row.bg(theme::editor::CURRENT_LINE);
     } else if let Some(bg) = worst_severity.and_then(diagnostic_row_bg) {
         row = row.bg(bg);
     }
@@ -1389,7 +1391,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 .w(gpui::px(3.0))
                 .self_stretch()
                 .bg(if is_changed {
-                    theme::diff::GIT_GUTTER
+                    theme::editor::DIFF_ADDED
                 } else {
                     theme::ColorToken(crate::work_surface::state::TRANSPARENT)
                 }),

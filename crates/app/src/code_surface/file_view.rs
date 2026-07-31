@@ -696,9 +696,9 @@ pub(in crate::code_surface) fn render_file_view_line(
         inline_blame,
     } = hover;
     let gutter_color = if is_current {
-        theme::text::DIM
+        theme::editor::GUTTER_TEXT_ACTIVE
     } else {
-        theme::text::GUTTER
+        theme::editor::GUTTER_TEXT
     };
     // "Worst wins": the tie-break for a line's row-level treatment when it carries diagnostics
     // of mixed severity (see `Severity::worst`), not whichever is first in the Vec.
@@ -802,7 +802,7 @@ pub(in crate::code_surface) fn render_file_view_line(
         .flex()
         .items_center()
         .cursor_pointer()
-        .when(is_current, |el| el.bg(theme::surface::CURRENT_LINE))
+        .when(is_current, |el| el.bg(theme::editor::CURRENT_LINE))
         .when_some(
             if is_current {
                 None
@@ -846,7 +846,7 @@ pub(in crate::code_surface) fn render_file_view_line(
                 // strip.
                 .self_stretch()
                 .bg(if is_changed {
-                    theme::diff::GIT_GUTTER
+                    theme::editor::DIFF_ADDED
                 } else {
                     theme::ColorToken(work_surface::TRANSPARENT)
                 }),
