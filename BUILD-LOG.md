@@ -4493,3 +4493,33 @@ rather than writing a separate, longer guide.
 All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
 --workspace --all-targets -- -D warnings`, and `cargo test --workspace --lib -- --test-threads=1`
 at 989 app + 42 lsp-core + 14 pty-core + 98 wt-core, 0 failed.
+
+## "Open theme folder" action, and a real per-character-wrap rendering bug
+
+Two more real fixes, reported directly against the built app: the theme card's `subtitle` text
+had `.overflow_hidden()` alone, the same missing-`.truncate()` gap the git graph tab's row text
+had (`.truncate()` is really `overflow_hidden() + whitespace_nowrap() + text_ellipsis()` -
+without the middle one, wrapped text is still legal layout). Here it manifested far more visibly
+than in the graph tab, because the subtitle is a `flex_1().min_w_0()` item competing against three
+`flex_none()` siblings (name, an "in use" badge, Remove) inside one narrow 212px card - with
+almost no space left over, `min_w_0()` let it shrink toward zero width, and with no
+`whitespace_nowrap()` the text wrapped at every available character boundary: the template
+theme's own subtitle rendered as one character per line, dozens of lines tall. Fixed the same way
+as the graph tab: `.truncate()` in place of the bare `.overflow_hidden()`.
+
+Added a fourth real action to the Themes page's "Custom themes" toolbar, `Open theme folder`
+(`AdeApp::start_open_custom_themes_folder`), reusing `Self::open_path_with_os_handler` - the same
+real per-platform default-open handler (`xdg-open`/`open`/`cmd /c start`) the file tree's "Reveal
+in file manager" already uses - rather than growing a second one. Creates the real directory
+first if it doesn't exist yet (a user who has never imported or created a custom theme has
+nothing there otherwise), via `std::fs::create_dir_all` on the background executor, never the
+GPUI foreground thread, matching every other real I/O in this module.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, and `cargo test --workspace --lib -- --test-threads=1`
+at 989 app + 42 lsp-core + 14 pty-core + 98 wt-core, 0 failed (unchanged counts - both fixes reuse
+already-tested primitives: `open_command_for`/`spawn_open_command` already have real coverage, and
+`.truncate()` is GPUI's own tested method, not new logic here - no new subprocess-spawning test
+was added for the folder-open action itself, since actually invoking `xdg-open` from a test would
+risk real flakiness in this sandbox with no established precedent elsewhere in the codebase for
+doing so).

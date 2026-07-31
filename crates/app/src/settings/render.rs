@@ -1322,6 +1322,12 @@ impl AdeApp {
                         "Export current theme\u{2026}",
                         cx,
                         |this, cx| this.start_export_custom_theme(cx),
+                    ))
+                    .child(self.render_theme_action_button(
+                        "settings-theme-open-folder",
+                        "Open theme folder",
+                        cx,
+                        |this, cx| this.start_open_custom_themes_folder(cx),
                     )),
             );
 
@@ -1504,7 +1510,7 @@ impl AdeApp {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .overflow_hidden()
+                            .truncate()
                             .font(font(theme::font::MONO))
                             .text_size(px(10.0))
                             .text_color(theme::text::FAINTER)
@@ -2542,6 +2548,41 @@ impl AdeApp {
     /// [`Self::apply_custom_theme_import_result`] applies the outcome once it resolves. A
     /// cancelled dialog (`Ok(Ok(None))`) or a platform error (`Err`/`Ok(Err(_))`) is a real,
     /// silent no-op - there is nothing wrong to report, the user simply didn't pick a file.
+    /// "Open theme folder" - hands the real custom-themes directory
+    /// ([`custom_theme::custom_themes_dir_for`]) to [`Self::open_path_with_os_handler`], the same
+    /// real per-platform default-open handler the file tree's "Reveal in file manager" already
+    /// uses. Creates the directory first if it doesn't exist yet, on the background executor
+    /// (never the GPUI foreground thread, matching every other real I/O in this module) - a user
+    /// who has never imported or created a custom theme has no real directory there otherwise,
+    /// and handing a nonexistent path to `xdg-open`/`open`/`cmd /c start` would just fail.
+    pub(in crate::settings) fn start_open_custom_themes_folder(&mut self, cx: &mut Context<Self>) {
+        let Some(settings_path) = self.settings_path.clone() else {
+            self.custom_theme_status = Some(Err(
+                "can't open the themes folder: no settings file location is known".to_string(),
+            ));
+            cx.notify();
+            return;
+        };
+        let dest_dir = custom_theme::custom_themes_dir_for(&settings_path);
+        cx.spawn(async move |this, cx| {
+            let mkdir_dir = dest_dir.clone();
+            let mkdir_result = cx
+                .background_executor()
+                .spawn(async move { std::fs::create_dir_all(&mkdir_dir) })
+                .await;
+            if let Err(err) = mkdir_result {
+                log::warn!(
+                    "failed to create the custom themes directory {}: {err}",
+                    dest_dir.display()
+                );
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.open_path_with_os_handler(&dest_dir, cx);
+            });
+        })
+        .detach();
+    }
+
     pub(in crate::settings) fn start_import_custom_theme(&mut self, cx: &mut Context<Self>) {
         let paths_receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
