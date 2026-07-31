@@ -3243,3 +3243,200 @@ theme - all independently found necessary, per their own `BUILD-LOG.md` entries,
 `cargo test --workspace`/`cargo clippy --workspace` hits pre-existing, environment-specific
 failures unrelated to any of these changes): `cargo build --workspace`, `cargo test -p app`,
 `cargo clippy -p app --all-targets -- -D warnings`, `cargo fmt --all -- --check` all pass.
+## Editor caret and selection polish, app-wide (GitHub issue #27)
+
+A real, shared caret-blink engine plus a real word-wise/click-based selection pass for the code
+editor, and a caret-presence/blink audit across every other real text input in the app (command
+palette query, rail session filter, Settings keybindings filter, file-tree rename/new-file field).
+Scoped down from the issue's full checklist to what could be built and verified to full quality
+this phase - drag-select auto-scroll and the terminal pane's own cursor blink are documented gaps
+below, not faked.
+
+**Caret blink is one shared flag/timer on `AdeApp`, not one per surface**
+(`crate::root::caret_blink`, a new module). Ported from the pinned `gpui` git dependency's own
+blessed example for exactly this feature -
+`crates/gpui/examples/view_example/example_editor.rs`'s `Editor::cursor_visible`/`start_blink`/
+`stop_blink`/`spawn_blink_task`/`reset_blink` (real, runnable code at the checkout this project's
+own `gpui` git dependency pins, found by the finder subagent before writing a line of this) - not
+invented from scratch. `AdeApp::caret_blink_visible`/`_caret_blink_task` are shared because exactly
+one of this app's caret-bearing `FocusHandle`s can be focused at a time (they're all handles into
+the same window): `code_focus_handle`, `merge_edit_focus_handle`, `palette_focus_handle`,
+`tree_focus_handle`, `filter_focus_handle` (the rail's session filter), and
+`settings_keymap_filter_focus_handle` are all wired to the same `wire_caret_blink` subscription set
+in the constructor, so a real focus change on any one of them starts/stops the one shared 530ms
+loop, and `reset_caret_blink` (called from every real cursor-moving/typing action across all six)
+snaps it back to solid immediately - issue #27's "solid mid-keystroke; resumes after a short idle
+delay."
+
+**The "no blink" setting is real and persisted**: `Settings.appearance.caret_blink` (default `on`),
+with a toggle row on the Appearance page. `gpui::App::reduce_motion`/`set_reduce_motion` is also
+honored (blink skipped when set) - the real, available GPUI mechanism for this - but real OS-level
+`prefers-reduced-motion` auto-detection is a genuine, verified gap: grepping the pinned `gpui`
+checkout's `crates/gpui/src/platform/` finds no `reduce_motion` reference on any backend, and even
+Zed's own upstream `crates/zed/src/zed.rs::init_reduce_motion` only pushes *Zed's own settings-file
+value* into `cx.set_reduce_motion` - not a real OS signal either, at this GPUI revision. Documented
+on `crate::root::caret_blink`'s own module docs rather than left unstated.
+
+**Caret style is configurable and themed** (`Settings.appearance.caret_style: CaretStyle` -
+`Line`/`Block`/`Underline`, a new Appearance-page choice row). `crate::code_surface::editing::
+caret_paint_quad` is the one real function that turns `(style, is_focused, blink_visible)` into a
+paint quad or `None`, shared verbatim by the File view's `render_editable_file_view_line` and the
+merge hand-edit view's own row painter (`crate::merge::editing`'s deliberately-separate
+`MergeEditLineContext` mirror) - the two never had a shared caret-paint helper before this, only
+copy-pasted logic, and issue #27's "consistent caret style ... across the code editor and every app
+input" is exactly the property that let drift in unnoticed. `Block`/`Underline` measure the real
+character at the caret (`shaped.x_for_index` at the caret's own offset and the real next char
+boundary, UTF-8-safe); at the real end of a line (nothing to measure) both fall back to a minimal
+1px width rather than fabricating a plausible character width.
+
+**Caret and selection now both survive an active selection and an unfocused surface, correctly.**
+Two real, previously-missing behaviors, both explicit issue #27 asks:
+- `EditBuffer::cursor_within_line` used to return `None` whenever `selected_range` was non-empty at
+  all (ported unmodified from `vendor` GPUI's own single-line `TextInput` example, which never
+  draws a caret over its own selection) - the code editor drew *no* caret while any selection was
+  active. It now always reports the real active end of the selection, so a caret is visible inside
+  a selected region, at full opacity against the region's own dimmer fill.
+- Selection fill and the caret's own color/opacity now both read a live `is_focused` check
+  (`theme::syntax::SELECTION_OPACITY` 0.28 focused / `SELECTION_UNFOCUSED_OPACITY` 0.14 unfocused;
+  `CARET_UNFOCUSED_OPACITY` 0.35, solid, never blinking). Before this, an unfocused caret simply
+  didn't paint at all (gated on `focus_handle.is_focused`) rather than showing the dimmed,
+  non-blinking indicator issue #27 asks for.
+
+**Selection interactions**: double-click selects a word, triple-click selects a line, drag extends,
+Shift+click extends from the caret (already real before this phase); Ctrl+Shift+Left/Right now
+extend the selection word-wise, and plain Ctrl+Left/Right move the caret word-wise (`EditBuffer::
+select_word_left`/`select_word_right`/`move_word_left`/`move_word_right`, new `EditorWordLeft`/
+`EditorWordRight`/`EditorSelectWordLeft`/`EditorSelectWordRight` actions, `secondary-*`-prefixed
+bindings on both `"file-editor"` and `"merge-editor"`, matching this codebase's own established
+Ctrl/Cmd-alias convention). Word classification is hand-rolled (`EditBuffer::word_class`: letters/
+digits/underscore vs. everything else vs. whitespace, grouping a run of the same class as one hop),
+deliberately *not* `unicode_segmentation::UnicodeSegmentation::split_word_bound_indices` (this
+buffer's own crate for grapheme boundaries) - UAX #29's word-boundary rules are designed for
+natural-language prose, where `WB6`/`WB7` keep a mid-word `.`/`'`/`:` between two letters unbroken
+(so `"don't"`/`"e.g."` stay one word) - real, correct behavior for prose, wrong for source code:
+every mainstream code editor's own Ctrl+Right stops at the `.` in `foo.bar()`. Confirmed live, not
+assumed: the first version of this used `split_word_bound_indices` and its own new test
+(`move_word_right_stops_at_the_end_of_each_real_word`) failed against it, treating `foo.bar` as one
+unbroken hop.
+
+Double-click/triple-click (`EditBuffer::select_word_at`/`select_line_at`) are driven by GPUI's real
+`MouseDownEvent::click_count` (verified via the finder subagent against the pinned `gpui` checkout's
+own `interactive.rs`) - this app never needed its own double-click timing logic, GPUI already counts
+consecutive same-position clicks. Drag-extend is a real, per-row `.on_mouse_move` handler gated on
+`MouseMoveEvent::dragging()` (`vendor` GPUI's own real helper, `pressed_button == Some(Left)`,
+matching `data_table.rs`'s own real usage in the same checkout) - the same per-row hit-testing this
+file's click handler already used, registered on every visible row rather than a window-level
+capture.
+
+**A real, documented gap: drag-select auto-scroll.** Because the drag handler above is registered
+per-row, it naturally only extends the selection while the pointer is over some already-painted
+row; dragging past the very top/bottom of the visible rows does not yet auto-scroll. Building this
+correctly needs a window-level mouse-move capture (`Window::on_mouse_event`, confirmed to exist and
+be real via the finder subagent, but not exercised anywhere in this codebase yet) plus a real
+scroll-loop timer, and getting the interaction right (start/stop thresholds, acceleration near the
+edge, not fighting an ordinary scroll) is a meaningfully separate piece of work from everything else
+in this phase. Left undone rather than hacked together with unverified timing.
+
+**A second real, documented gap: the terminal pane's own cursor has no blink or unfocused-dim.**
+`crate::terminal::grid::TerminalGrid::visible_rows` renders the cursor as a real fg/bg swap on the
+addressed cell (an inverse-video block, alacritty's own real cursor-shape mechanism) - correct and
+themed, but static: no blink, and no dimming when a background pane isn't the focused one. Wiring
+this into the same shared `crate::root::caret_blink` loop needs threading a blink-visible flag
+through `Sessions`/`TerminalPane` (a separate architecture from `AdeApp`'s own focus handles this
+phase's blink engine is built around), which is real, scoped-out follow-up work, not attempted here
+to avoid a half-verified cross-cutting change under this phase's time budget.
+
+**`selection survives scrolling with virtualized/windowed rendering` was already true, structurally,
+and this phase adds a real regression test proving it rather than just asserting it in docs.**
+`AdeApp::file_view_row_layout` is pruned to only the currently-painted range on every render
+(`crate::code_surface::file_view`'s own `.retain(...)`, matching `uniform_list`'s real
+virtualization), which could plausibly have meant a per-row-cached selection vanishing once its row
+scrolled out - it doesn't, because `EditBuffer::selected_range` is the one real source of truth
+every row's `selection_within_line` derives fresh on every single render, never cached per row at
+all. `selection_survives_a_row_scrolling_out_of_the_virtualized_range_and_back` proves this by
+selecting text on line 1 of a 500-line file, scrolling `file_view_scroll_handle` directly to line
+400 and back (not through a caret move - `EditBuffer::move_to` collapses a selection, by design,
+which would have clobbered the very selection this test exists to prove survives; a real mouse-
+wheel scroll doesn't touch the caret at all either, so this is the more accurate real-world
+mechanism anyway), confirming line 1's row is genuinely un-painted while scrolled away, and
+re-asserting the selection is exactly what it was once scrolled back.
+
+**Audit finding: two real inputs had no caret element at all.** The rail's session filter
+(`AdeApp::render_rail_filter_row`) and the Settings keybindings-page filter
+(`AdeApp::render_settings_keymap_filter_row`) rendered only the typed query or a placeholder - no
+insertion-point indicator whatsoever, confirmed by reading both render functions before writing a
+fix. Both now get a themed, blinking caret via a new shared `AdeApp::render_simple_input_caret`
+(`crate::root::widgets`) - a `Line`-only bar (these are plain, append/backspace-only `String`
+fields, not real cursor-position-aware `EditBuffer`s, so `CaretStyle::Block`/`Underline` don't apply
+to them), wired into the same shared blink loop and reset on every real keystroke. The command
+palette's own caret (`crate::palette::render::AdeApp::render_palette_caret`) already existed
+(a real, two-position empty/typed variant, kept separate rather than folded into the new shared
+helper since its own `margin_right`/`margin_left` placement logic is genuinely different) but was
+static; it now blinks too. The file tree's inline rename/new-file caret glyph
+(`│`, `AdeApp::render_tree_inline_edit_row`) also existed but was static; it now blinks, reusing
+`tree_focus_handle`, which the tree already tracked focus with for other reasons.
+
+**Three real bugs found and fixed during this phase's own self-review, before any external audit:**
+1. The Keybindings settings page's three drift-guard tests
+   (`settings::state::tests::every_registered_global_keybinding_has_a_real_keybindings_page_label`/
+   `keybinding_rows_are_derived_in_real_registration_order`/
+   `keybinding_rows_report_the_real_global_context_for_every_default_binding`) caught that the four
+   new `EditorWordLeft`/`EditorWordRight`/`EditorSelectWordLeft`/`EditorSelectWordRight` actions had
+   no `action_label` entry and weren't in either test's own expected fixture/count - exactly what
+   these guards exist to catch (a new global binding with no Keybindings-page label rendering blank,
+   or a scoped-binding-count drift, rather than failing a test). Fixed by adding the four labels and
+   updating both fixtures (once more after rebasing onto issue #17's text-undo-redo work, which added
+   its own three scoped bindings to the same counts).
+2. The virtualized-scroll regression test's own first draft moved the real caret via
+   `EditBuffer::move_to` to force a distant scroll target - which collapses a selection, by that
+   method's own documented contract, clobbering the very selection the test existed to prove
+   survives. The test's own "the real selection must survive" assertion caught this immediately
+   (got `None`, not a false pass). Fixed by driving `file_view_scroll_handle` directly instead - see
+   above.
+3. Rebasing onto the concurrently-landed issue #17 (real text-undo/redo for every query/filter
+   field) turned `palette_query`/`filter_query`/`settings_keymap_filter` from plain `String`s into
+   `text_history::TextField`s - a real, substantial API shift under three of the exact fields this
+   phase's own caret/blink work touches. Resolved by hand at every conflict (not by mechanically
+   preferring one side): keeping issue #17's real `TextField` API calls (`.as_str()`, `.push_str(_,
+   Instant::now())`, `.pop(Instant::now())`, its own `TextUndo`/`TextRedo` action wiring) while
+   re-applying this phase's own caret/blink additions (the new `render_simple_input_caret` child, the
+   `reset_caret_blink` call in each field's key-down handler) on top, verified by a full re-run of
+   every affected test module after the rebase, not assumed correct from the merge alone.
+
+**Not attempted this phase, stated rather than left silently absent**: Settings has no other free-
+text input to audit beyond the two filters above (every other Settings row is a toggle/stepper/
+choice control - confirmed by reading `crate::settings::widgets`, which has no text-input widget at
+all). The work surface's agent/shell prompt is the terminal pane itself, not a separate input, so
+its own real cursor is the terminal-cursor gap noted above, not a second missing-caret finding.
+
+Coverage: new unit tests for `EditBuffer::move_word_left`/`move_word_right`/`select_word_left`/
+`select_word_right`/`select_word_at`/`select_line_at`/`cursor_within_line`-during-a-selection
+(`crate::code_surface::edit_buffer`); real GPUI end-to-end tests for Ctrl+Shift+Left/Right through
+the real key bindings, double/triple-click through real `MouseDownEvent`s with a real `click_count`,
+and the virtualized-scroll selection-persistence regression, all in
+`crate::code_surface::editing::editing_tests`; `AdeApp::set_caret_style`/`toggle_caret_blink` real
+mutator coverage (including that toggling blink off takes effect immediately, not just in
+`settings.toml`) in `crate::settings::render::caret_settings_tests`.
+
+`cargo fmt --all -- --check` and `cargo build --workspace` are both clean. `cargo clippy -p app
+--all-targets -- -D warnings` is clean; `cargo clippy --workspace --all-targets -- -D warnings`
+independently fails on this Windows dev machine on a pre-existing, unrelated gap this phase never
+touched: `crates/lsp-core/src/client.rs` calls `proc::*`/`nix::*` unconditionally even though
+`crate::proc` is genuinely `#[cfg(unix)]`-gated (confirmed by reading `lsp-core/src/lib.rs`'s own
+module declaration and doc comment, which names the real Windows equivalent `client.rs` is
+*supposed* to use instead, `std::process::Child::kill()`, but doesn't actually branch on) - a real
+Windows-only compile gap, not something this issue's own scope covers fixing.
+`cargo test -p app --lib` run scoped to every module this phase touched (`code_surface::edit_buffer`,
+`code_surface::editing`, `root::caret_blink`/`root::state`, `palette::render`, `rail::render`,
+`settings::render`/`settings::state`, `sidebar::render`/`sidebar::tree_ops`, `merge::editing`,
+`theme`, `status_bar`) is clean: 187 passed, 5 failed - all 5 pre-existing and environment-specific,
+none in a file this phase changed: three `sidebar::render::fold_state_tests` fail on this Windows
+machine comparing a fold-state path containing a literal `\` (Windows' own real path separator)
+against a test fixture hardcoded with `/`, and two `status_bar::process_stats::tests` fail because
+they read real `/proc/<pid>/stat` files, which don't exist on Windows at all. A full,
+un-scoped `cargo test -p app --lib` run (every module, not just the ones this phase touched) hits
+several more pre-existing failures of the same two kinds plus real LSP-server-dependent tests
+(rust-analyzer/pyright/typescript-language-server/vue-language-server aren't installed on this
+machine) and `gio trash`-dependent worktree-discard tests (Linux/FreeBSD-only by this codebase's own
+documented design) - none in a file this phase changed either, confirmed by cross-referencing every
+failing test's own module path against this diff's file list.
