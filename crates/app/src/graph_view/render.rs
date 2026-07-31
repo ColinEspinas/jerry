@@ -74,6 +74,19 @@ impl AdeApp {
         cx.notify();
     }
 
+    /// `mod+shift+G` (`NewGitGraph`, bound in `crate::default_key_bindings`). The palette's own
+    /// "Open git graph" entry and the tab's `+` menu both call [`Self::open_git_graph`] directly;
+    /// this is the action-dispatch door for the raw keystroke, matching every other global
+    /// shortcut's `handle_*_action` -> `on_action` wiring in `root::mod::AdeApp::render`.
+    pub(crate) fn handle_new_git_graph_action(
+        &mut self,
+        _action: &NewGitGraph,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_git_graph(window, cx);
+    }
+
     /// Closes the git graph tab outright (its `×`), removing it from the tab strip. Dropping the
     /// cached [`GraphLoadState`] back to `NotLoaded` means a later re-open does a fresh load
     /// rather than showing a stale snapshot - cheap insurance since re-opening is exactly when a
@@ -3921,6 +3934,29 @@ mod graph_focus_tests {
              handle"
         );
         assert!(app.read_with(cx, |app, _| app.graph_tab_open && app.graph_tab_active));
+    }
+
+    /// Regression: `NewGitGraph` was bound to `mod+shift+G` in `crate::default_key_bindings` but
+    /// `root::mod::AdeApp::render`'s `.on_action` chain never registered a handler for it, so the
+    /// real dispatch path (walked via `cx.dispatch_action`, exactly like a live keystroke) silently
+    /// no-opped - the palette's "Open git graph" row called `Self::open_git_graph` directly and
+    /// masked the gap. `cx.dispatch_action` (not a direct `app.open_git_graph(..)` call) is the
+    /// point: it proves the action reaches the handler through the same on_action chain a real
+    /// keystroke uses, not merely that the handler function itself works.
+    #[gpui::test]
+    fn mod_shift_g_actually_opens_the_graph_tab_through_real_action_dispatch(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded(cx);
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+
+        cx.dispatch_action(NewGitGraph);
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.graph_tab_open && app.graph_tab_active),
+            "mod+shift+G must open the graph tab through the real on_action dispatch path"
+        );
     }
 
     /// Regression for a real, adversarial-audit-found gap (CRITICAL C2): opening the graph tab
