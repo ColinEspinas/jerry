@@ -4807,3 +4807,89 @@ timing-dependent test, not the project's previously-documented `diff_render_test
 one full-workspace run under test-thread contention and was confirmed a pre-existing, unrelated flake
 by re-running it alone (passes immediately in isolation) - this diff touches no LSP code at all. A
 clean full re-run afterward showed zero failures.
+
+## Git graph tab: connecting elbows for shared-ancestor convergence, and a selection-border layout
+shift (GitHub issue #1, phase (a) follow-up)
+
+Two more real bugs against the git graph tab above, diagnosed directly against this repository's own
+commit history rather than a synthetic fixture.
+
+**Converging elbows.** `layout_lanes` drew a real elbow for a merge commit's second parent (`Elbow`
+with what is now `ElbowKind::Diverging`) but had no equivalent for the opposite, equally-real case:
+two independent lanes sharing an ancestor with *no* merge commit involved (e.g. this repository's own
+row 9, `ac8e6cd`, where two unrelated branch tips both reach the same shared parent). The ending
+lane's `LaneSegment` still marked `ends_here`, but nothing drew the elbow connecting it to the
+surviving lane's dot - the line simply dead-ended. Fixed by giving `Elbow` a new `kind: ElbowKind`
+field (`Diverging` for the existing merge case, `Converging` for the new shared-ancestor case, drawn
+as the geometric mirror in the row's *top* half instead of the *bottom*), wired through a new pure
+`elbow_geometry` function in `crate::graph_view::render` that picks the bordered edge/corner and
+row-half per kind, with `debug_selector`-tagged real paint coverage (`graph_elbow_render_tests`)
+alongside pure geometry unit tests (`elbow_geometry_tests`) - the two were kept separate because
+`debug_bounds`-only assertions on a painted box's position/size can't tell a swapped edge/corner
+choice apart from a correct one (same bounds, different border), which only the pure test can pin
+down directly.
+
+### What the independent adversarial check found
+
+A genuinely independent checker sub-agent was dispatched against this fix with no access to prior
+reasoning, asked to verify two things by hand-tracing `layout_lanes` and `elbow_geometry` against
+constructed multi-branch DAGs (not just re-reading the existing tests' own names): that every ending
+lane really gets a connecting elbow, and that a `Converging` elbow can never paint in a row's bottom
+half (or a `Diverging` one in its top half). Both held - but brute-forcing 265,200 synthetic layouts
+(all topologically-sound 6-node DAGs plus adjacent-row swaps) surfaced two real, reachable defects in
+`layout_lanes` itself, both stemming from the same root cause: Step 4's "open a new lane for this
+merge's second parent" allocation could reuse a lane index this *same row* had just freed a few lines
+earlier, which the checker traced to two distinct broken outputs:
+
+- A **self-loop elbow** (`Elbow { from_lane: N, to_lane: N }`) when a merge's first parent had
+  already been seen elsewhere (an out-of-order history), which frees `own_lane` in Step 3 - Step 4
+  could then hand that same just-freed slot right back out for the second parent, producing a
+  1px-wide elbow box that connects a lane to itself instead of a real merge point.
+- A **duplicate `LaneSegment`** for one lane in one row when Step 4 reused a lane Step 2 had just
+  freed via a `Converging` collapse - the row ended up with both an `ends_here` segment and a
+  `starts_here` segment at the same lane index, which `render_graph_lane_canvas` then painted as one
+  unbroken pass-through line for what were really two entirely unrelated branches. The existing
+  `a_merge_row_that_is_also_a_shared_ancestor_gets_both_elbow_kinds` test (added for the original
+  `Converging` fix) already constructed this exact scenario but only asserted on `row.elbows`, never
+  on `row.segments`, so it passed while still rendering the bug.
+
+Fixed with a new `free_before_row` snapshot (which lane indices were actually free *before* this
+row's own Step 2/3 mutations) and a dedicated `allocate_fresh_lane` used only by Step 4's new-lane
+path, which - unlike the general-purpose `allocate_lane` Step 1 still uses for the ordinary
+recycled-lane case - refuses to hand back `own_lane` or anything freed earlier in the same row. The
+existing shared-ancestor test now also asserts every lane index in `m_row.segments` is unique and
+that the row's `Diverging` elbow's `to_lane` is never `own_lane`; a new dedicated regression,
+`a_merge_whose_first_parent_was_already_seen_never_self_loops_its_second_parent`, covers the self-loop
+case directly.
+
+**Selection-border layout shift.** User report: clicking a graph row visibly moved its content
+instead of just highlighting it. `render_graph_row` applied `.border_l_2()` only inside
+`.when(selected, ...)`, so selecting a row added 2px of border-box inset that had not been there a
+frame earlier, pushing every child (lane canvas, ref chips, subject, ...) 2px to the right on click.
+Fixed the same way this codebase already solves this exact class of problem elsewhere
+(`crate::work_surface::state::TRANSPARENT`, documented there as existing specifically "so every
+button/tab can always call `.bg()`/`.border_color()` uniformly rather than conditionally skipping the
+call, which would also shift the box model by the border's width"): `.border_l_2()` is now applied
+unconditionally, and only its *colour* toggles between `theme::border::SELECTED_EDGE` and
+`work_surface::TRANSPARENT`. A new regression test, `graph_selection_render_tests::
+selecting_a_row_never_shifts_its_own_lane_canvas`, drives a real selection change on a live `AdeApp`
+and asserts the lane canvas's real painted `debug_bounds` (position *and* size) are identical before
+and after - mirroring `code_surface::editing`'s own `assert_eq!(a.size.width, b.size.width, ...)`
+bounds-comparison pattern and `merge::flow`'s "capture bounds before and after a real state-changing
+action on the same live entity" shape, rather than a fresh `TestAppContext` per state (the bug is
+specifically about the *same* row moving when its own selection flips, not about two different rows
+differing).
+
+The exact same conditional-`border_l_2()` pattern also exists in `crate::sidebar::render`'s
+change-row rendering - a real, pre-existing bug in the same shape, not introduced by this change and
+left untouched here since it is a separate surface with its own scope; noted for a future pass rather
+than silently left unmentioned.
+
+Verification: all four gates clean - `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace --lib -- --test-threads=1` at 975 app + 42 lsp-core + 14 pty-core + 118
+wt-core, up from 967/42/14/115 at the prior entry's own baseline (+8 app tests: 5
+`elbow_geometry_tests` + 2 `graph_elbow_render_tests` for the `Converging` elbow's real paint/geometry
+coverage, + 1 `graph_selection_render_tests` for the border fix; +3 wt-core tests: the two
+`Converging`-elbow scenarios plus the new self-loop regression). A full, clean run showed zero
+failures this time - no `diff_render_tests` or other flake reappeared.

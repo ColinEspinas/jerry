@@ -7,9 +7,9 @@ use crate::root::widgets::{render_sidebar_message, render_tag_pill};
 use crate::settings::widgets;
 use crate::sidebar::changes;
 use crate::work_surface::render::render_dropdown_menu_row;
-use gpui::{BoxShadow, KeyDownEvent};
+use gpui::{BoxShadow, KeyDownEvent, Pixels};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use wt_core::graph::{DotKind, Graph, GraphRow, GraphScope, RefKind};
+use wt_core::graph::{DotKind, ElbowKind, Graph, GraphRow, GraphScope, RefKind};
 
 impl AdeApp {
     /// Opens the git graph tab (the tab strip's own entry, the `+` menu's "Git graph" row, the
@@ -910,11 +910,20 @@ impl AdeApp {
             .border_b_1()
             .border_color(theme::border::ROW)
             .cursor_pointer()
-            .when(selected, |el| {
-                el.bg(theme::surface::ROW_SELECTED)
-                    .border_l_2()
-                    .border_color(theme::border::SELECTED_EDGE)
+            // `border_l_2()` is applied unconditionally, reserving the 2px of space whether or
+            // not this row is selected, so selecting a row never shifts its content (lane
+            // canvas, ref chips, subject, everything) 2px to the right - only the border's
+            // *colour* toggles. Mirrors `crate::work_surface::state`'s own `TRANSPARENT`
+            // convention (see its doc comment: "so every button/tab can always call
+            // `.bg()`/`.border_color()` uniformly rather than conditionally skipping the call,
+            // which would also shift the box model by the border's width").
+            .border_l_2()
+            .border_color(if selected {
+                theme::border::SELECTED_EDGE.into()
+            } else {
+                work_surface::TRANSPARENT
             })
+            .when(selected, |el| el.bg(theme::surface::ROW_SELECTED))
             .when(!selected, |el| {
                 el.hover(|el| el.bg(theme::surface::ROW_HOVER))
             })
@@ -941,7 +950,7 @@ impl AdeApp {
             .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                 this.select_graph_row(index, cx);
             }))
-            .child(render_graph_lane_canvas(row, lane_count))
+            .child(render_graph_lane_canvas(index, row, lane_count))
             .child(render_graph_ref_chips(row))
             .child(
                 div()
@@ -1623,18 +1632,121 @@ fn render_graph_toolbar_button(
         .child(label)
 }
 
+/// Which edge of an elbow box carries the horizontal border stroke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HorizontalEdge {
+    Top,
+    Bottom,
+}
+
+/// Which edge of an elbow box carries the vertical border stroke (and, paired with
+/// [`HorizontalEdge`], which corner gets the radius).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerticalEdge {
+    Left,
+    Right,
+}
+
+/// One elbow's real pixel box, plus which edges its border goes on - everything
+/// `render_graph_lane_canvas` needs to build the actual `div()`, computed by a pure function so
+/// the edge/corner choice is unit-testable without a real GPUI paint pass (a `debug_bounds`-only
+/// render test can see the box's position and size, but not which edge its border is drawn on -
+/// an adversarial audit of this fix found that gap, see `elbow_geometry_tests`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ElbowGeometry {
+    top: Pixels,
+    left: Pixels,
+    width: Pixels,
+    height: Pixels,
+    horizontal: HorizontalEdge,
+    vertical: VerticalEdge,
+}
+
+/// Computes one elbow's box geometry - pure and GPUI-element-free, so it's testable with plain
+/// `Pixels` values. `x_from`/`x_to` are `lane_x(elbow.from_lane)`/`lane_x(elbow.to_lane)`.
+///
+/// Both elbow kinds anchor their vertical stroke, and their box's *open* (unbordered) edge, at
+/// **this row's own dot** - `Diverging`'s `from_lane` already *is* `own_lane` (Step 4 of
+/// `wt_core::graph::layout_lanes` always sets `from_lane: own_lane`), so anchoring at `x_from`
+/// and anchoring at the dot are the same thing there. `Converging`'s `from_lane` is a
+/// *different* lane (Step 2 sets `from_lane` to the *ending* lane, `to_lane: own_lane`) - so its
+/// vertical stroke and open edge are anchored at `x_to`, not `x_from`, which is why the
+/// left/right (and therefore corner) choice below is `x_to`-relative for `Converging` but
+/// `x_from`-relative for `Diverging`. Without this, a `Converging` elbow's own box would never
+/// itself touch the dot - it would rely entirely on some *other*, separately-drawn segment
+/// happening to bridge the remaining gap, which is fragile to verify and to keep correct under
+/// future changes, even though (as traced by hand during this fix) it does not currently leave a
+/// visible gap for any real graph shape.
+///
+/// The two kinds occupy opposite row halves and opposite anchor edges (design spec §2's elbow
+/// box is "in the lower half" for a real merge; `Converging` is the same box mirrored into the
+/// upper half): `Diverging`'s box sits in the row's bottom half with its *bottom* edge bordered
+/// (`HorizontalEdge::Bottom`, overshooting the row by 1px so its corner meets the lane segment
+/// starting in the row below - see `wt_core::graph::LaneSegment`'s own docs); `Converging`'s box
+/// sits in the row's top half with its *top* edge bordered (`HorizontalEdge::Top`, overshooting
+/// upward by 1px to meet the ending lane's own segment continuing from the row above).
+fn elbow_geometry(kind: ElbowKind, x_from: Pixels, x_to: Pixels, row_h: Pixels) -> ElbowGeometry {
+    match kind {
+        ElbowKind::Diverging => {
+            let rightward = x_to >= x_from;
+            let (left, width) = if rightward {
+                (x_from, x_to - x_from)
+            } else {
+                (x_to, x_from - x_to)
+            };
+            ElbowGeometry {
+                top: row_h - theme::graph::ELBOW_HEIGHT + px(1.0),
+                left,
+                width: width + px(1.0),
+                height: theme::graph::ELBOW_HEIGHT,
+                horizontal: HorizontalEdge::Bottom,
+                vertical: if rightward {
+                    VerticalEdge::Left
+                } else {
+                    VerticalEdge::Right
+                },
+            }
+        }
+        ElbowKind::Converging => {
+            let own_right_of_ending = x_to >= x_from;
+            let (left, width) = if own_right_of_ending {
+                (x_from, x_to - x_from)
+            } else {
+                (x_to, x_from - x_to)
+            };
+            ElbowGeometry {
+                top: row_h / 2.0 - theme::graph::ELBOW_HEIGHT,
+                left,
+                width: width + px(1.0),
+                height: theme::graph::ELBOW_HEIGHT,
+                horizontal: HorizontalEdge::Top,
+                vertical: if own_right_of_ending {
+                    VerticalEdge::Right
+                } else {
+                    VerticalEdge::Left
+                },
+            }
+        }
+    }
+}
+
 /// Draws one row's lane canvas: full-height verticals for every lane passing through, half-height
 /// stubs where a lane starts/ends this row, and an elbow box for each merge/branch point (design
 /// spec §2). Every element is a flat rect - "Emit one element per lane per row... do not draw two
 /// stacked halves per row", so a `starts_here`/`ends_here` segment renders as a single half-height
 /// rect anchored to the correct edge, never two.
-fn render_graph_lane_canvas(row: &GraphRow, lane_count: usize) -> impl IntoElement {
+fn render_graph_lane_canvas(
+    row_index: usize,
+    row: &GraphRow,
+    lane_count: usize,
+) -> impl IntoElement {
     let row_h = theme::graph::ROW;
     let mut canvas = div()
         .relative()
         .flex_none()
         .w(theme::graph::LANE_CANVAS)
-        .h(row_h);
+        .h(row_h)
+        .debug_selector(move || format!("graph-row-{row_index}-lane-canvas"));
 
     for segment in &row.lane_segments {
         let x = lane_x(segment.lane);
@@ -1660,39 +1772,43 @@ fn render_graph_lane_canvas(row: &GraphRow, lane_count: usize) -> impl IntoEleme
         canvas = canvas.child(line);
     }
 
-    for elbow in &row.elbows {
+    for (elbow_index, elbow) in row.elbows.iter().enumerate() {
         let x_from = lane_x(elbow.from_lane);
         let x_to = lane_x(elbow.to_lane);
-        // `from_lane` is this row's own dot, at the vertical centre of the row - which is
-        // exactly this box's *top* edge (`top` below sits at `row_h / 2`, see the dot's own
-        // `top` a few lines down). `to_lane` is where the line continues in the row below, at
-        // this box's *bottom* edge. So the vertical stroke belongs on whichever side `from_lane`
-        // sits on, the horizontal stroke belongs on the *bottom* edge (not the top - a lane
-        // starting here draws its own bottom-half segment the same way, see `lane_segments`
-        // above), and the curve is wherever those two meet.
-        let rightward = x_to >= x_from;
-        let (left, width) = if rightward {
-            (x_from, x_to - x_from)
-        } else {
-            (x_to, x_from - x_to)
+        let geo = elbow_geometry(elbow.kind, x_from, x_to, row_h);
+        let kind_tag = match elbow.kind {
+            ElbowKind::Diverging => "diverging",
+            ElbowKind::Converging => "converging",
         };
         let elbow_box = div()
             .absolute()
-            .left(left)
-            .top(row_h - theme::graph::ELBOW_HEIGHT + px(1.0))
-            .w(width + px(1.0))
-            .h(theme::graph::ELBOW_HEIGHT)
-            .border_b_1()
-            .border_color(lane_color(elbow.from_lane));
-        canvas = canvas.child(if rightward {
-            elbow_box
+            .left(geo.left)
+            .top(geo.top)
+            .w(geo.width)
+            .h(geo.height)
+            .border_color(lane_color(elbow.from_lane))
+            .debug_selector(move || {
+                format!("graph-row-{row_index}-elbow-{elbow_index}-{kind_tag}")
+            });
+        let elbow_box = match geo.horizontal {
+            HorizontalEdge::Bottom => elbow_box.border_b_1(),
+            HorizontalEdge::Top => elbow_box.border_t_1(),
+        };
+        let elbow_box = match (geo.horizontal, geo.vertical) {
+            (HorizontalEdge::Bottom, VerticalEdge::Left) => elbow_box
                 .border_l_1()
-                .rounded_bl(theme::graph::ELBOW_RADIUS)
-        } else {
-            elbow_box
+                .rounded_bl(theme::graph::ELBOW_RADIUS),
+            (HorizontalEdge::Bottom, VerticalEdge::Right) => elbow_box
                 .border_r_1()
-                .rounded_br(theme::graph::ELBOW_RADIUS)
-        });
+                .rounded_br(theme::graph::ELBOW_RADIUS),
+            (HorizontalEdge::Top, VerticalEdge::Left) => elbow_box
+                .border_l_1()
+                .rounded_tl(theme::graph::ELBOW_RADIUS),
+            (HorizontalEdge::Top, VerticalEdge::Right) => elbow_box
+                .border_r_1()
+                .rounded_tr(theme::graph::ELBOW_RADIUS),
+        };
+        canvas = canvas.child(elbow_box);
     }
 
     let dot_lane = row.lane;
@@ -2392,6 +2508,507 @@ mod graph_row_menu_tests {
                 "an open row menu must not keep painting its scrim over Settings"
             );
         });
+    }
+}
+
+/// Pure, GPUI-paint-free coverage for `elbow_geometry` - an adversarial audit of the git graph
+/// tab's `Converging`-elbow fix found that `graph_elbow_render_tests` below (which only checks
+/// painted *box bounds* via `debug_bounds`) cannot distinguish `border_t_1`+`rounded_tl` from
+/// `border_b_1`+`rounded_bl`: swapping which edge/corner a box's border goes on does not change
+/// the box's own position or size, only which pixels inside it are actually drawn. These tests
+/// assert the edge/corner choice directly, and also confirm `Converging`'s vertical stroke is
+/// anchored at `own_lane` (`to_lane`), not the ending lane (`from_lane`) - the fix applied after
+/// that audit, so the box is self-contained and its open edge always touches this row's own dot,
+/// the same way `Diverging`'s box already is (its `from_lane` *is* `own_lane` by construction).
+#[cfg(test)]
+mod elbow_geometry_tests {
+    use super::*;
+
+    const ROW_H: Pixels = theme::graph::ROW;
+
+    #[test]
+    fn diverging_rightward_anchors_the_vertical_at_own_lane_on_the_left() {
+        // from_lane (own_lane) is left of to_lane - matches `layout_lanes`' own `Elbow {
+        // from_lane: own_lane, .. }` invariant for `Diverging` (Step 4).
+        let geo = elbow_geometry(ElbowKind::Diverging, px(9.0), px(23.0), ROW_H);
+        assert_eq!(geo.horizontal, HorizontalEdge::Bottom);
+        assert_eq!(geo.vertical, VerticalEdge::Left);
+        assert_eq!(geo.left, px(9.0));
+        assert_eq!(geo.width, px(15.0));
+        assert_eq!(geo.top, ROW_H - theme::graph::ELBOW_HEIGHT + px(1.0));
+        assert_eq!(geo.height, theme::graph::ELBOW_HEIGHT);
+    }
+
+    #[test]
+    fn diverging_leftward_anchors_the_vertical_at_own_lane_on_the_right() {
+        let geo = elbow_geometry(ElbowKind::Diverging, px(23.0), px(9.0), ROW_H);
+        assert_eq!(geo.horizontal, HorizontalEdge::Bottom);
+        assert_eq!(geo.vertical, VerticalEdge::Right);
+        assert_eq!(geo.left, px(9.0));
+        assert_eq!(geo.width, px(15.0));
+    }
+
+    #[test]
+    fn converging_with_own_lane_right_of_the_ending_lane_anchors_the_vertical_on_the_right() {
+        // from_lane (the ending lane) is left of to_lane (own_lane) - the vertical stroke must
+        // still land on `to_lane`'s side (the right, here), not `from_lane`'s.
+        let geo = elbow_geometry(ElbowKind::Converging, px(9.0), px(23.0), ROW_H);
+        assert_eq!(geo.horizontal, HorizontalEdge::Top);
+        assert_eq!(
+            geo.vertical,
+            VerticalEdge::Right,
+            "the vertical stroke must be anchored at own_lane (to_lane), not from_lane"
+        );
+        assert_eq!(geo.left, px(9.0));
+        assert_eq!(geo.width, px(15.0));
+        assert_eq!(geo.top, ROW_H / 2.0 - theme::graph::ELBOW_HEIGHT);
+    }
+
+    #[test]
+    fn converging_with_own_lane_left_of_the_ending_lane_anchors_the_vertical_on_the_left() {
+        // This is the shape this repository's own real row 9 produces: own_lane (lane 0) sits to
+        // the left of the ending lanes (lanes 1, 2) - `from_lane` (ending) is on the right,
+        // `to_lane` (own_lane) is on the left, so the vertical stroke - anchored at `to_lane` -
+        // must be `Left`, matching the box's own left edge where `to_lane`'s x sits.
+        let geo = elbow_geometry(ElbowKind::Converging, px(23.0), px(9.0), ROW_H);
+        assert_eq!(geo.horizontal, HorizontalEdge::Top);
+        assert_eq!(
+            geo.vertical,
+            VerticalEdge::Left,
+            "the vertical stroke must be anchored at own_lane (to_lane), not from_lane"
+        );
+        assert_eq!(geo.left, px(9.0));
+        assert_eq!(geo.width, px(15.0));
+    }
+
+    #[test]
+    fn converging_and_diverging_never_share_a_horizontal_edge_for_the_same_lane_pair() {
+        // The two kinds must always occupy opposite row halves and opposite bordered edges - a
+        // `Converging` elbow rendered with `Diverging`'s geometry (or vice versa) is exactly the
+        // "looks just as broken as the original bug" failure mode the adversarial audit was
+        // asked to rule out.
+        for (x_from, x_to) in [(px(9.0), px(23.0)), (px(23.0), px(9.0)), (px(9.0), px(9.0))] {
+            let diverging = elbow_geometry(ElbowKind::Diverging, x_from, x_to, ROW_H);
+            let converging = elbow_geometry(ElbowKind::Converging, x_from, x_to, ROW_H);
+            assert_ne!(diverging.horizontal, converging.horizontal);
+            assert!(
+                diverging.top >= ROW_H / 2.0,
+                "Diverging must stay in the row's bottom half: top was {:?}",
+                diverging.top
+            );
+            assert!(
+                converging.top + converging.height <= ROW_H / 2.0 + px(0.5),
+                "Converging must stay in the row's top half: bottom was {:?}",
+                converging.top + converging.height
+            );
+        }
+    }
+}
+
+/// Real, paint-based coverage for `render_graph_lane_canvas`'s two elbow shapes
+/// ([`wt_core::graph::ElbowKind`]) - a real regression test for the git graph tab's "start of
+/// branches just are not connected at all and end of branches don't merge correctly" bug report:
+/// a `Converging` elbow (two branches sharing an ancestor with no merge commit) was silently
+/// dropped entirely (an empty `elbows` vec, a dangling stub with nothing connecting it), and once
+/// added, needed to render as the geometric *mirror* of the already-correct `Diverging` case (top
+/// half of the row, not the bottom) - a `Converging` elbow painting in the bottom half (or vice
+/// versa) would look just as broken as the original bug. Uses `cx.simulate_event`/`debug_bounds`
+/// real paint measurements (via `render_graph_lane_canvas`'s own `debug_selector` tags), not a
+/// direct call into the pure layout function - `wt_core::graph`'s own unit tests already cover
+/// that; this covers the *rendering* half only `crate::graph_view` owns.
+#[cfg(test)]
+mod graph_elbow_render_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::{Entity, TestAppContext};
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Real timestamps (like `wt_core::graph`'s own `commit_at` test helper) so the time-sorted
+    /// walk produces a deterministic row order across runs, rather than depending on the test
+    /// process happening to cross a wall-clock second between two git invocations.
+    fn commit_at(dir: &std::path::Path, file: &str, contents: &str, message: &str, unix: i64) {
+        std::fs::write(dir.join(file), contents).expect("write file");
+        git(dir, &["add", file]);
+        let date = format!("{unix} +0000");
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["commit", "-m", message])
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .output()
+            .expect("failed to spawn git commit");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo(dir: &std::path::Path) {
+        git(dir, &["init", "-b", "main"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "Test User"]);
+    }
+
+    /// A real, unmerged shared-ancestor history matching the exact shape found in this
+    /// repository's own real row 9 (commit `ac8e6cd`) that this whole fix was found from: `root`
+    /// is reached by *three* separate tips - `main` continues past it with one more real commit
+    /// (`main2`, so `root` is reached by ordinary first-parent continuation, landing `root` on
+    /// that *same*, already-established lane rather than on either `a` or `b`'s lane), while `a`
+    /// and `b` are two entirely independent tips whose own first parent is `root` directly, with
+    /// no merge commit involved anywhere. `root`'s row must therefore end up with real Converging
+    /// elbows for *both* `a`'s and `b`'s now-ending lanes - not one, not zero.
+    fn seed_converging_history(dir: &std::path::Path) {
+        init_repo(dir);
+        commit_at(dir, "root.txt", "1", "root", 1_700_000_000);
+        git(dir, &["branch", "a"]);
+        git(dir, &["branch", "b"]);
+        git(dir, &["checkout", "a"]);
+        commit_at(dir, "a.txt", "1", "a1", 1_700_000_100);
+        git(dir, &["checkout", "b"]);
+        commit_at(dir, "b.txt", "1", "b1", 1_700_000_200);
+        git(dir, &["checkout", "main"]);
+        commit_at(dir, "main2.txt", "1", "main2", 1_700_000_300);
+    }
+
+    fn open_seeded(
+        cx: &mut TestAppContext,
+        seed: impl FnOnce(&std::path::Path),
+    ) -> (
+        tempfile::TempDir,
+        Entity<AdeApp>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        seed(repo.path());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        (repo, app, cx)
+    }
+
+    #[gpui::test]
+    fn a_converging_elbow_paints_in_the_rows_top_half_on_the_ending_lanes_side(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded(cx, seed_converging_history);
+
+        // Row order newest-first by real commit time: main2, b1, a1, root - `root` (row 3) is the
+        // real shared ancestor with two independent lanes (a's and b's) ending on it.
+        let root_row_index = app.read_with(cx, |app, _| {
+            let GraphLoadState::Loaded(graph) = &app.graph_state.load else {
+                panic!("graph must have loaded");
+            };
+            graph
+                .rows
+                .iter()
+                .position(|row| row.commit.subject == "root")
+                .expect("root row present")
+        });
+        let elbow_kinds = app.read_with(cx, |app, _| {
+            let GraphLoadState::Loaded(graph) = &app.graph_state.load else {
+                panic!("graph must have loaded");
+            };
+            graph.rows[root_row_index].elbows.clone()
+        });
+        assert_eq!(
+            elbow_kinds.len(),
+            2,
+            "root must get two real Converging elbows, one per ending lane, not an empty vec: \
+             {elbow_kinds:?}"
+        );
+        assert!(
+            elbow_kinds
+                .iter()
+                .all(|elbow| elbow.kind == wt_core::graph::ElbowKind::Converging),
+            "a shared-ancestor row with no merge commit of its own must only ever produce \
+             Converging elbows: {elbow_kinds:?}"
+        );
+
+        // `TestAppContext::debug_bounds` requires a `&'static str` selector; the row/elbow index
+        // is only known at runtime, so leak the formatted string for the test's lifetime (a real,
+        // process-lifetime-bounded test run, never freed - an accepted tradeoff for test code
+        // that needs a dynamically-built `&'static str`, not a production code path).
+        // The row's *lane canvas* (not the outer row div) - row 0 is auto-selected on load and
+        // gets an extra `border_l_2()`, shifting its content 2px right of the row's own origin;
+        // anchoring off the lane canvas's own painted bounds avoids depending on whether this
+        // particular row happens to be the selected one.
+        let row_selector: &'static str =
+            Box::leak(format!("graph-row-{root_row_index}-lane-canvas").into_boxed_str());
+        let row_bounds = cx
+            .debug_bounds(row_selector)
+            .expect("root row's lane canvas must be painted");
+        let row_center_y = row_bounds.origin.y + theme::graph::ROW / 2.0;
+
+        for (elbow_index, elbow) in elbow_kinds.iter().enumerate() {
+            let selector: &'static str = Box::leak(
+                format!("graph-row-{root_row_index}-elbow-{elbow_index}-converging")
+                    .into_boxed_str(),
+            );
+            let elbow_bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must be painted"));
+            assert!(
+                elbow_bounds.origin.y < row_center_y,
+                "a Converging elbow must start in the row's top half (elbow top {:?} must be \
+                 above the row's vertical centre {row_center_y:?}), not the bottom half where a \
+                 Diverging elbow would render",
+                elbow_bounds.origin.y
+            );
+            assert!(
+                elbow_bounds.origin.y + elbow_bounds.size.height <= row_center_y + px(1.5),
+                "a Converging elbow must end at (or right before) the row's vertical centre \
+                 {row_center_y:?}, not extend into the bottom half like a Diverging elbow would: \
+                 bottom was {:?}",
+                elbow_bounds.origin.y + elbow_bounds.size.height
+            );
+            // Real x-extent coverage (an adversarial audit found the y-only assertions above
+            // could not tell `elbow_geometry`'s edge/corner choice apart from a swapped one,
+            // since a box's position/size stays the same either way - only its *width/left*
+            // actually pins down which lanes the painted box spans): the box must run from the
+            // ending lane's x to `own_lane`'s x, not some other pair.
+            let x_from = row_bounds.origin.x + lane_x(elbow.from_lane);
+            let x_to = row_bounds.origin.x + lane_x(elbow.to_lane);
+            let expected_left = x_from.min(x_to);
+            let expected_width = (x_from - x_to).abs() + px(1.0);
+            assert!(
+                (elbow_bounds.origin.x - expected_left).abs() < px(0.5),
+                "elbow {elbow_index} left was {:?}, expected {expected_left:?} (spanning \
+                 from_lane {} to to_lane {})",
+                elbow_bounds.origin.x,
+                elbow.from_lane,
+                elbow.to_lane
+            );
+            assert!(
+                (elbow_bounds.size.width - expected_width).abs() < px(0.5),
+                "elbow {elbow_index} width was {:?}, expected {expected_width:?}",
+                elbow_bounds.size.width
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn a_diverging_elbow_paints_in_the_rows_bottom_half(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded(cx, |dir| {
+            init_repo(dir);
+            commit_at(dir, "base.txt", "1", "base", 1_700_000_000);
+            git(dir, &["checkout", "-b", "feature"]);
+            commit_at(dir, "feature.txt", "1", "feature work", 1_700_000_100);
+            git(dir, &["checkout", "main"]);
+            let date = "1700000200 +0000";
+            let output = std::process::Command::new("git")
+                .current_dir(dir)
+                .args([
+                    "merge",
+                    "--no-ff",
+                    "feature",
+                    "-m",
+                    "Merge branch 'feature'",
+                ])
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .output()
+                .expect("failed to spawn git merge");
+            assert!(
+                output.status.success(),
+                "git merge failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        });
+
+        let merge_row_index = app.read_with(cx, |app, _| {
+            let GraphLoadState::Loaded(graph) = &app.graph_state.load else {
+                panic!("graph must have loaded");
+            };
+            graph
+                .rows
+                .iter()
+                .position(|row| row.commit.subject == "Merge branch 'feature'")
+                .expect("merge row present")
+        });
+        let elbow_kinds = app.read_with(cx, |app, _| {
+            let GraphLoadState::Loaded(graph) = &app.graph_state.load else {
+                panic!("graph must have loaded");
+            };
+            graph.rows[merge_row_index].elbows.clone()
+        });
+        assert_eq!(
+            elbow_kinds,
+            vec![wt_core::graph::Elbow {
+                from_lane: 0,
+                to_lane: 1,
+                kind: wt_core::graph::ElbowKind::Diverging,
+            }],
+            "a real 2-parent merge with no unrelated converging lane must produce exactly one \
+             real Diverging elbow: {elbow_kinds:?}"
+        );
+
+        // See the Converging test above for why this anchors off the lane canvas, not the row.
+        let row_selector: &'static str =
+            Box::leak(format!("graph-row-{merge_row_index}-lane-canvas").into_boxed_str());
+        let row_bounds = cx
+            .debug_bounds(row_selector)
+            .expect("merge row's lane canvas must be painted");
+        let row_center_y = row_bounds.origin.y + theme::graph::ROW / 2.0;
+        let selector: &'static str =
+            Box::leak(format!("graph-row-{merge_row_index}-elbow-0-diverging").into_boxed_str());
+        let elbow_bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} must be painted"));
+        assert!(
+            elbow_bounds.origin.y >= row_center_y - px(1.5),
+            "a Diverging elbow must start at (or right after) the row's vertical centre \
+             {row_center_y:?}, not the top half where a Converging elbow would render: top was \
+             {:?}",
+            elbow_bounds.origin.y
+        );
+        assert!(
+            elbow_bounds.origin.y + elbow_bounds.size.height > row_center_y,
+            "a Diverging elbow must extend into the row's bottom half: bottom was {:?}, centre \
+             was {row_center_y:?}",
+            elbow_bounds.origin.y + elbow_bounds.size.height
+        );
+        // Real x-extent coverage, mirroring the Converging test above - pins down which two
+        // lanes the painted box actually spans, not just its vertical half.
+        let elbow = &elbow_kinds[0];
+        let x_from = row_bounds.origin.x + lane_x(elbow.from_lane);
+        let x_to = row_bounds.origin.x + lane_x(elbow.to_lane);
+        let expected_left = x_from.min(x_to);
+        let expected_width = (x_from - x_to).abs() + px(1.0);
+        assert!(
+            (elbow_bounds.origin.x - expected_left).abs() < px(0.5),
+            "elbow left was {:?}, expected {expected_left:?}",
+            elbow_bounds.origin.x
+        );
+        assert!(
+            (elbow_bounds.size.width - expected_width).abs() < px(0.5),
+            "elbow width was {:?}, expected {expected_width:?}",
+            elbow_bounds.size.width
+        );
+    }
+}
+
+/// Real regression coverage for a row's selection border never shifting its own content - the
+/// user-reported "when we click on a line, don't move the line, just highlight it" bug.
+/// `render_graph_row` used to apply `.border_l_2()` only `.when(selected, ...)`, so selecting a
+/// row added 2px of border-box inset that was not there before, pushing every child (lane
+/// canvas, ref chips, subject, ...) 2px to the right - a visible jump on click. Mirrors
+/// `crate::code_surface::editing`'s own `assert_eq!(a.size.width, b.size.width, ...)` bounds-
+/// comparison pattern and `crate::merge::flow`'s "capture `debug_bounds` before and after a real
+/// state-changing action, on the same live entity" shape - not a fresh `TestAppContext` per
+/// state, since the bug is specifically about the *same* row moving when its own selection
+/// state flips, not about two different rows differing.
+#[cfg(test)]
+mod graph_selection_render_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::{Entity, TestAppContext};
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Two real commits - `build_graph` yields exactly two rows (indices 0..=1, newest first).
+    /// Row 0 is auto-selected on load (`AdeApp`'s own `load_graph`), so row 1 starts genuinely
+    /// unselected - exactly the row this test drives through a real selection change.
+    fn seed_two_commits(dir: &std::path::Path) {
+        git(dir, &["init", "-b", "main"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "Test User"]);
+        std::fs::write(dir.join("a.txt"), "1\n").expect("write a.txt");
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "first"]);
+        std::fs::write(dir.join("a.txt"), "2\n").expect("write a.txt");
+        git(dir, &["commit", "-am", "second"]);
+    }
+
+    fn open_seeded_graph(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        Entity<AdeApp>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        seed_two_commits(repo.path());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        (repo, app, cx)
+    }
+
+    #[gpui::test]
+    fn selecting_a_row_never_shifts_its_own_lane_canvas(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.selected_row),
+            Some(0),
+            "premise: row 0 is auto-selected on load, so row 1 starts genuinely unselected"
+        );
+
+        let bounds_unselected = cx
+            .debug_bounds("graph-row-1-lane-canvas")
+            .expect("row 1's lane canvas must be painted while unselected");
+
+        app.update(cx, |app, cx| {
+            app.select_graph_row(1, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.selected_row),
+            Some(1),
+            "premise: row 1 really is selected now"
+        );
+
+        let bounds_selected = cx
+            .debug_bounds("graph-row-1-lane-canvas")
+            .expect("row 1's lane canvas must be painted while selected");
+
+        assert_eq!(
+            bounds_unselected.origin.x, bounds_selected.origin.x,
+            "selecting a row must never shift its own content to the right - the row's real \
+             `.border_l_2()` reserves its 2px unconditionally, only its colour should toggle \
+             (unselected: {:?}, selected: {:?})",
+            bounds_unselected, bounds_selected
+        );
+        assert_eq!(
+            bounds_unselected.size, bounds_selected.size,
+            "selecting a row must never resize its own content (unselected: {:?}, selected: \
+             {:?})",
+            bounds_unselected, bounds_selected
+        );
     }
 }
 
