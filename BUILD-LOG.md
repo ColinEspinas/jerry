@@ -5117,3 +5117,121 @@ All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `
 --workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
 1112 app + 44 lsp-core + 14 pty-core + 127 wt-core, 0 failed (+1 app test: the new middle-click
 regression).
+
+## The elbow seam, actually diagnosed: GPUI paints borders *inside* the box, so `border_b` and `border_t` at the same y are always one row apart
+
+Five rounds of "fixed" on this seam had not fixed it. The user's latest, and most precise,
+description: "branch lines elbow start 1px above the base branch elbow" where a branch diverges,
+and "horizontal lines including elbow from branch 1px below the base branch elbow when merging
+back", asking to "align the elbow line from the base with the center horizontal line and the elbows
+from the branch at the start and at the end." The round immediately before this one - extending the
+straight bridge's horizontal reach by `ELBOW_RADIUS` per side so its filled rect would cover each
+curve's whole already-straight border run - came back as, simply, "Still not aligned."
+
+**Stopping the guessing.** Every previous round reasoned about the shape analytically and then
+picked a 1px value. This round started instead by measuring the user's own screenshots pixel by
+pixel (PIL, classifying each pixel by lane color against the `#131518` background) and reading
+GPUI's actual quad rasterizer, rather than only `Corners::clamp_radii_for_quad_size`.
+
+The measurement was unambiguous. On a real diverging orange elbow in the latest screenshot, at 1:1
+device scale (lane columns 14px apart, exactly `LANE_STEP`, confirming no HiDPI scaling to reason
+around): the entry curve's vertical ran down column 75, its arc turned, and its horizontal run
+landed on **row 121** spanning x 78-84 - while the straight bridge ran along **row 122** from x 83
+to 113, and the exit curve's own horizontal run and arc were also on **row 122**, turning down into
+its lane at column 116. The same one-row step, same direction, on the second orange elbow (entry row
+173, bridge and exit row 174) and on both pink elbows (diverging: entry 69, bridge/exit 70;
+converging: entry 23, bridge/exit 24). Not anti-aliasing, not a half-pixel: a clean, reproducible,
+integral one-row step, always with the `HorizontalEdge::Bottom` curve one row above everything else.
+
+**The root cause.** GPUI paints a border *inside* the box's own bounds, exactly like CSS
+`box-sizing: border-box`. Its quad fragment shader (`fs_quad` in `crates/gpui_wgpu/src/shaders.wgsl`
+at the pinned revision `7b030b5`) computes `straight_border_inner_corner_to_point = corner_to_point
++ reduced_border` and treats a pixel as border when it lies between the bounds edge and that inset
+inner edge - measured *inward* from the bounds. `Style::paint` insets the content rect the same way.
+So for the 1px borders this module paints:
+
+* `border_b` on a box whose **bottom** edge is `y` paints the pixel row `[y - 1, y)`;
+* `border_t` on a box whose **top** edge is `y` paints the pixel row `[y, y + 1)`.
+
+`elbow_geometry` placed the entry curve's bottom edge and the exit curve's top edge at the same
+computed `waist_y`, and the 1px-tall filled bridge at `top = waist_y`. The coordinate arithmetic
+really did meet exactly - which is why hand-derivation kept confirming a zero-gap join, and why the
+previous entry in this log concluded the residue "sat within GPUI's own sub-pixel anti-aliasing
+rather than a real coordinate error." It was neither. Two boxes that *touch* at a shared `y` paint
+their two horizontal strokes on two different, adjacent rows, by construction, always.
+
+This also explains precisely why the immediately preceding fix changed nothing: the bridge was
+extended to cover each curve's straight border run, but the entry curve's border run was never on
+the same *row* as the bridge, so there was nothing there for the fill to cover. It painted over
+empty background and left the stray stroke exactly where it was.
+
+**The fix.** `CurveBox` gained a `height` field, and the `HorizontalEdge::Bottom` curve (the entry
+curve, for both `Diverging` and `Converging`) is now built exactly one stroke width taller:
+`curve_size + ELBOW_STROKE`. Its bottom *edge* moves to `waist_y + 1`, so its bottom *border* is
+painted on `waist_y` itself - the same row the bridge and the `HorizontalEdge::Top` exit curve
+already occupied. `render_curve` uses `.h(curve.height)` instead of a fixed `ELBOW_CURVE_SIZE`.
+
+Growing the height rather than moving the box is what makes this safe against the two regressions
+earlier attempts hit. GPUI anchors a rounded corner's arc at the box's own corner, so adding a
+stroke of height to a `rounded_bl`/`rounded_br` box while holding `top` fixed slides the whole arc
+down by exactly that pixel and lengthens the straight vertical lead-in above it by the same amount -
+which is the correction wanted - while leaving `top` (the end that has to meet this row's commit dot
+for `Diverging`, or the row above's own stub for `Converging`) exactly where it was. That is why the
+earlier uniform vertical nudge broke the far end and this does not. And only the `Bottom` curve is
+corrected: an earlier attempt grew *both* curves toward the waist, which just moved the step to the
+other side of the bridge. Only the box whose border is painted on the far side of its own anchoring
+edge is wrong. The box grows on one axis only, so `min(width, height) / 2` is still exactly
+`ELBOW_RADIUS` and GPUI's radius clamp still never engages.
+
+This commit also carries the `ELBOW_CURVE_SIZE` work that was in the working tree unreviewed from
+the previous round and is genuinely correct on its own terms: the curve box used to be
+`ELBOW_RADIUS`-square with a radius request of `ELBOW_RADIUS`, which
+`Corners::clamp_radii_for_quad_size` silently halved. `ELBOW_CURVE_SIZE` is now `2 * ELBOW_RADIUS`
+(10px / 5px), so the clamp's own threshold equals the requested radius and never reduces it, and
+`ELBOW_HEIGHT` follows at 20px.
+
+**Known, deliberately-unfixed sibling.** The same border-box off-by-one has a horizontal face:
+`border_l` paints the column at `left`, but `border_r` paints the column at `right - 1`, so the
+uniform `ELBOW_NUDGE_RIGHT` cannot anchor both edge choices onto their lane's 1px vertical. What it
+actually does is anchor the `VerticalEdge::Right` cases exactly, at the cost of putting the
+`VerticalEdge::Left` cases one column right of their lane x. In the common shapes (a branch
+diverging rightward, merging back leftward) every `Left`-edge end lands inside the row's own 7-9px
+commit dot where a column of offset is invisible, while every `Right`-edge end meets a bare 1px lane
+line where it would not be - which is why the nudge was confirmed correct live. The mirrored shapes
+(a leftward `Diverging`, a rightward `Converging`) do carry that 1px offset against a real lane line.
+It is a separate, so-far-unreported symptom from the waist misalignment, and is documented on
+`ELBOW_NUDGE_RIGHT` rather than folded into an already-delicate change.
+
+**Tests.** Three new pure unit tests in `elbow_geometry_tests`, built around a
+`painted_horizontal_row` helper that deliberately derives each curve's row the way GPUI lays a
+border out (inward from the bounds edge) rather than from the box's anchoring edge - the entire bug
+was the difference between those two.
+`all_three_elbow_pieces_paint_their_horizontal_stroke_on_the_very_same_pixel_row` asserts entry,
+bridge and exit share one painted row across both kinds, both directions, and the degenerate
+same-lane case; `only_the_bottom_edged_curve_carries_the_extra_stroke_of_height` pins which box is
+corrected, so the "grow both" attempt cannot come back; and
+`the_extra_stroke_of_height_still_cannot_trigger_gpuis_radius_clamp` pins the clamp invariant on the
+box's *shorter* side rather than on `ELBOW_CURVE_SIZE` alone. The existing wide-gap test now asserts
+the bridge against `painted_horizontal_row` on both ends instead of against raw box edges, and the
+tests that read a curve's bottom edge now use `curve.height` rather than assuming `CURVE_SIZE`.
+
+**Confidence, stated honestly.** The diagnosis is not a guess this time: the one-row step is
+measured directly in the user's own screenshots at four separate elbows, and the mechanism is read
+directly out of GPUI's shader source at the exact pinned revision. The arithmetic after the fix puts
+all three pieces on the same row for every shape, and the three real paint-based `gpui::test`s still
+pass. What still cannot be done in this sandbox is *looking at the result*: GPUI's headless test
+renderer is macOS-only at this pinned revision and this sandbox's own X11 screenshot capture is
+separately, confirmedly broken, so no new screenshot of this fix exists. If a 1px step somehow
+survives, the next thing to check is whether it has *reversed* direction (which would mean the
+correction is right in kind but applied to the wrong one of the two boxes) rather than staying in
+the same place, and a fresh screenshot would settle that in one measurement.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+1116 app + 44 lsp-core + 14 pty-core + 127 wt-core (+4 app tests over the last commit: the three
+above, plus `elbow_curve_size_is_exactly_double_the_radius_so_gpuis_own_clamp_never_kicks_in` which
+arrived with the uncommitted `ELBOW_CURVE_SIZE` work this commit also carries). The final run was
+fully clean at 0 failed; an earlier run in this same round flaked on
+`code_surface::diff_view::diff_render_tests::opening_a_real_diff_renders_real_syntax_highlighted_rows`,
+the known timing-sensitive async-highlight test in an unrelated file, which passed in isolation
+immediately afterwards and then passed again in the final full run. Untouched by this change.
