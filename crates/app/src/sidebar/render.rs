@@ -1,9 +1,11 @@
 use super::*;
 use crate::keymap;
 use crate::root::widgets::{
-    render_keycap_row, render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
+    render_action_keycap_row, render_keycap_row, render_sidebar_message, render_tag_pill,
+    text_tooltip, KeycapSize,
 };
 use crate::settings::widgets::ChoiceOption;
+use crate::worktree_history::flow as worktree_history;
 
 impl AdeApp {
     /// Switches which data source the right sidebar shows. Switching *to* the Changes view
@@ -242,14 +244,86 @@ impl AdeApp {
         self.load_file_tree(self.file_tree_root.clone(), cx);
     }
 
-    /// Toggles a file's reviewed state - the Changes row checkbox's click handler.
-    /// `Self::render_change_row` stops propagation at the call site so checking a box never
-    /// also opens that file's diff.
-    pub(in crate::sidebar) fn toggle_reviewed(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if !self.reviewed_files.remove(&path) {
-            self.reviewed_files.insert(path);
+    /// Toggles a file's staged state (Revision R12 §5: the checkbox **is** staging) - the
+    /// Changes row checkbox's click handler. `Self::render_change_row` stops propagation at the
+    /// call site so checking a box never also opens that file's diff.
+    pub(in crate::sidebar) fn toggle_staged(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.staged_files.remove(&path) {
+            self.staged_files.insert(path);
         }
         cx.notify();
+    }
+
+    /// The commit composer's primary action (Revision R12 §5) - a real `git add -- <staged
+    /// paths>` + `git commit` (`wt_core::undo::commit_paths`) on [`Self::diff_root`] (the
+    /// worktree the currently-shown diff/staged set belongs to), using
+    /// `changes::draft_commit_message`'s placeholder message (see that function's own docs for
+    /// why real agent-drafted messages are out of scope here). A genuine no-op - never a
+    /// clickable-looking op that silently does nothing - with nothing staged, or while another
+    /// worktree-history operation is already in flight (shares
+    /// [`Self::worktree_history_op_in_flight`] with `Keep all changes`/`Discard worktree`/`Undo`/
+    /// `Redo` - see `worktree_history::flow`'s own module docs for why one flag is enough
+    /// discipline here). On success, clears exactly the committed paths from
+    /// [`Self::staged_files`] (a file staged again after this call started is left alone) and
+    /// reloads the diff so the committed files drop out of the Changes list for real.
+    ///
+    /// No `Undo`/`Redo` integration yet, unlike the other four `worktree_history_op_in_flight`
+    /// operations - a real, stated gap (see `wt_core::undo::commit_paths`'s own docs), not a
+    /// fake "undo" that would only look like it worked.
+    pub(in crate::sidebar) fn commit_staged_files(&mut self, cx: &mut Context<Self>) {
+        if self.worktree_history_op_in_flight.is_some() {
+            return;
+        }
+        let Some(diff) = self.current_diff() else {
+            return;
+        };
+        let staged = changes::staged_subset(&diff.files, &self.staged_files);
+        if staged.is_empty() {
+            return;
+        }
+        let message = changes::draft_commit_message(&staged);
+        let paths: Vec<PathBuf> = staged.iter().map(|file| file.path.clone()).collect();
+        let worktree_path = self.diff_root.clone();
+        let branch_display = self.branch_display_for(&worktree_path);
+        let file_count = paths.len();
+
+        self.worktree_history_op_in_flight = Some(worktree_history::WorktreeHistoryOpKind::Commit);
+        self.worktree_history_status = Some(format!(
+            "committing {file_count} file{} in {branch_display}\u{2026}",
+            if file_count == 1 { "" } else { "s" }
+        ));
+        cx.notify();
+
+        let commit_paths = paths.clone();
+        let commit_worktree_path = worktree_path.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    wt_core::undo::commit_paths(&commit_worktree_path, &commit_paths, &message)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.worktree_history_op_in_flight = None;
+                match result {
+                    Ok(_outcome) => {
+                        this.worktree_history_status = Some(format!(
+                            "committed {file_count} file{} in {branch_display}",
+                            if file_count == 1 { "" } else { "s" }
+                        ));
+                        for path in &paths {
+                            this.staged_files.remove(path);
+                        }
+                        this.load_diff(worktree_path.clone(), cx);
+                    }
+                    Err(err) => {
+                        this.worktree_history_status = Some(format!("commit failed: {err}"));
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self._worktree_history_task = Some(task);
     }
 
     /// The `A`/`M` change marks for every changed file in the currently loaded diff, keyed by
@@ -1151,6 +1225,7 @@ impl AdeApp {
                                 .min_h_0()
                                 .child(self.render_changes_rows(cx)),
                         )
+                        .child(self.render_commit_composer(diff, cx))
                         .child(render_changes_footer(self.ui_text_size(10.0)))
                 }
                 // This arm keeps its `.overflow_y_scroll()`: it renders a single message, never
@@ -1168,20 +1243,25 @@ impl AdeApp {
         }
     }
 
-    /// The Changes header: file count, a review-progress bar, and `N reviewed` count, both
-    /// computed directly from [`Self::reviewed_files`]'s membership against `diff`'s file
-    /// list rather than an independently tracked counter that could drift.
+    /// The Changes header: file count, a staged-progress bar, and `N staged` count, both
+    /// computed directly from [`Self::staged_files`]'s membership against `diff`'s file
+    /// list rather than an independently tracked counter that could drift. Distinct wording from
+    /// the commit composer's own `N of M staged` count just below it (Revision R12 §5/§4's "no
+    /// two counters in the window may share wording while counting different units") - this one
+    /// answers "how many of the worktree's changed files are staged", the composer's answers
+    /// "how many of those staged files is the next commit about to include" (today the same set,
+    /// but a distinct question).
     pub(in crate::sidebar) fn render_changes_header(
         &self,
         diff: &WorktreeDiff,
     ) -> impl IntoElement {
         let total = diff.files.len();
-        let reviewed = diff
+        let staged = diff
             .files
             .iter()
-            .filter(|file| self.reviewed_files.contains(&file.path))
+            .filter(|file| self.staged_files.contains(&file.path))
             .count();
-        let progress = changes::ReviewProgress { reviewed, total };
+        let progress = changes::StagedProgress { staged, total };
         let fraction = progress.fraction();
         const BAR_WIDTH: f32 = 56.0;
 
@@ -1226,7 +1306,7 @@ impl AdeApp {
                     .font(font(theme::font::MONO))
                     .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::DIM)
-                    .child(format!("{reviewed} reviewed")),
+                    .child(format!("{staged} staged")),
             )
     }
 
@@ -1340,10 +1420,13 @@ impl AdeApp {
         column.into_any_element()
     }
 
-    /// One Changes row: a review checkbox, `dir`/`name`, an optional tag pill, `+n`/`−n`, and
-    /// the five-segment stat bar. Clicking anywhere on the row other than the checkbox itself
-    /// (see [`Self::render_review_checkbox`]'s `stop_propagation`) opens the file's diff via
-    /// [`Self::open_change_diff`].
+    /// One Changes row: a staging checkbox, `dir`/`name`, a `flex:none` per-author chip group
+    /// (Revision R12 §5, multi-agent worktrees only - see [`Self::render_change_author_chips`]),
+    /// an optional tag pill, `+n`/`−n`, and the five-segment stat bar. Clicking anywhere on the
+    /// row other than the checkbox itself (see [`Self::render_staging_checkbox`]'s
+    /// `stop_propagation`) opens the file's diff via [`Self::open_change_diff`] - the checkbox
+    /// **is** staging, not "reviewed": it has its own click target, entirely separate from the
+    /// row body's.
     pub(in crate::sidebar) fn render_change_row(
         &self,
         file: &DiffFile,
@@ -1351,12 +1434,13 @@ impl AdeApp {
     ) -> impl IntoElement {
         let path = file.path.clone();
         let open_path = path.clone();
-        let reviewed = self.reviewed_files.contains(&file.path);
+        let staged = self.staged_files.contains(&file.path);
         let selected = self.open_change.as_deref() == Some(file.path.as_path());
         let (add, del) = changes::diff_file_stats(file);
         let (dir, name) = changes::split_dir_name(&file.path);
         let tag = changes::change_tag(file.status);
         let segments = changes::stat_bar_segments(add, del);
+        let author_chips = self.render_change_author_chips(&file.path);
 
         // See `Self::render_file_tree_row`'s own `debug_selector` for why this exists, and why
         // the closure borrows `file` instead of capturing an owned `String`.
@@ -1384,7 +1468,7 @@ impl AdeApp {
             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                 this.open_change_diff(open_path.clone(), window, cx);
             }))
-            .child(self.render_review_checkbox(path, reviewed, cx))
+            .child(self.render_staging_checkbox(path, staged, cx))
             .when(!dir.is_empty(), |el| {
                 el.child(
                     div()
@@ -1403,13 +1487,17 @@ impl AdeApp {
                     .font(font(theme::font::MONO))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_size(self.ui_text_size(11.5))
-                    .text_color(if reviewed {
-                        theme::text::DIMMER
-                    } else {
+                    // Staged rows read at full strength; unstaged drop to `theme::text::DIM` -
+                    // the exact inverse of the old "reviewed" dimming this replaces (Revision R12
+                    // §5), never both conventions at once.
+                    .text_color(if staged {
                         theme::text::STRONG
+                    } else {
+                        theme::text::DIM
                     })
                     .child(name),
             )
+            .when_some(author_chips, |el, chips| el.child(chips))
             .when_some(tag, |el, tag| el.child(render_tag_pill(tag)))
             // A rename-only file gets no `tag` from `changes::change_tag` (a plain rename
             // isn't `new`/`del`), so without this it looked identical to an unchanged file.
@@ -1436,17 +1524,80 @@ impl AdeApp {
             .child(render_stat_bar(segments))
     }
 
-    /// The Changes row's 12×12 review checkbox - toggled via [`Self::toggle_reviewed`]. Stops
-    /// propagation on click so checking a box never also opens the row's diff, mirroring
-    /// `Self::render_agent_tab`'s nested-clickable-child pattern (its tab-close `×`).
-    pub(in crate::sidebar) fn render_review_checkbox(
+    /// The Changes row's `flex:none` per-file author chip group (Revision R12 §5): one
+    /// [`render_change_author_chip`] per agent [`AdeApp::file_authorship`] records as having
+    /// written this file, with a 1px amber ring (`theme::status::ASK_CARD_EDGE`) once it has more
+    /// than one. `None` (never an empty-but-present group) unless the currently selected
+    /// worktree has more than one agent - [`Self::current_worktree_agent_count`] is this
+    /// gate, per the design's own reasoning: with a single agent every chip would be identical
+    /// and carry no information.
+    ///
+    /// `file_authorship` is real, wired data (`crate::sidebar::changes::Authorship::authors_for`)
+    /// that today is always empty - the heuristic that records edits into it lives on a separate,
+    /// not-yet-merged branch (see [`crate::root::AdeApp::file_authorship`]'s own docs) - so a
+    /// multi-agent worktree renders a real, ringless, chip-less group until that heuristic lands,
+    /// rather than fabricating a chip for an agent nobody recorded.
+    pub(in crate::sidebar) fn render_change_author_chips(
+        &self,
+        path: &Path,
+    ) -> Option<impl IntoElement> {
+        if self.current_worktree_agent_count() <= 1 {
+            return None;
+        }
+        let ring: gpui::Rgba = if self.file_authorship.has_multiple_authors(path) {
+            theme::status::ASK_CARD_EDGE.into()
+        } else {
+            work_surface::TRANSPARENT
+        };
+        let mut group = div()
+            .flex_none()
+            .flex()
+            .gap(px(2.0))
+            .p(px(1.0))
+            .rounded(theme::radius::BUTTON)
+            .border_1()
+            .border_color(ring);
+        for &id in self.file_authorship.authors_for(path) {
+            if let Some(kind) = self.agent_kind_for(id) {
+                group = group.child(render_change_author_chip(kind));
+            }
+        }
+        Some(group)
+    }
+
+    /// Resolves a recorded author's [`AgentKind`] for chip tinting - `None` if that agent has
+    /// since closed (its process exited, its tab closed), in which case
+    /// [`Self::render_change_author_chips`] simply omits the chip rather than guessing a kind for
+    /// an agent that no longer exists.
+    fn agent_kind_for(&self, id: AgentId) -> Option<AgentKind> {
+        self.agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .map(|agent| agent.kind)
+    }
+
+    /// How many distinct agent (non-`Shell`) processes are running in the currently selected
+    /// worktree - Revision R12 §5's gate for the Changes row author chip group. Reuses
+    /// [`Self::current_worktree_agents`] (`crate::work_surface::render`) so this and the tab
+    /// strip can never disagree about which agents belong to the selected worktree.
+    pub(in crate::sidebar) fn current_worktree_agent_count(&self) -> usize {
+        self.current_worktree_agents()
+            .filter(|agent| agent.kind != AgentKind::Shell)
+            .count()
+    }
+
+    /// The Changes row's 12×12 staging checkbox (Revision R12 §5: the checkbox **is** staging,
+    /// not "reviewed") - toggled via [`Self::toggle_staged`]. Stops propagation on click so
+    /// checking a box never also opens the row's diff, mirroring `Self::render_agent_tab`'s
+    /// nested-clickable-child pattern (its tab-close `×`).
+    pub(in crate::sidebar) fn render_staging_checkbox(
         &self,
         path: PathBuf,
         checked: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
-            .id(format!("review-checkbox-{}", path.display()))
+            .id(format!("stage-checkbox-{}", path.display()))
             .flex_none()
             .w(px(12.0))
             .h(px(12.0))
@@ -1461,15 +1612,41 @@ impl AdeApp {
                     .border_color(theme::toggle::TRACK_ON)
             })
             .when(!checked, |el| el.border_color(theme::border::BUTTON))
+            .hover(|el| el.border_color(theme::toggle::CHECKBOX_HOVER))
             .font(font(theme::font::MONO))
             .text_size(self.ui_text_size(9.0))
             .text_color(theme::button::GREEN_FG)
             .when(checked, |el| el.child("\u{2713}"))
             .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                 cx.stop_propagation();
-                this.toggle_reviewed(path.clone(), cx);
+                this.toggle_staged(path.clone(), cx);
             }))
     }
+}
+
+/// One author chip in a Changes row's chip group (Revision R12 §5) - the same 13×13 visual
+/// template `Self::render_lang_chip` uses for the file tree's language chip
+/// (`crate::sidebar::file_tree::LangChip`), tinted per-agent via
+/// `work_surface::agent_tint`/`work_surface::agent_initial` (`work_surface::state`'s existing
+/// per-agent colour convention, already the tab strip's own source of truth) rather than a
+/// second, independently-tinted chip style.
+pub(in crate::sidebar) fn render_change_author_chip(kind: AgentKind) -> impl IntoElement {
+    let (fg, bg) = work_surface::agent_tint(kind);
+    let initial = work_surface::agent_initial(kind);
+    div()
+        .flex_none()
+        .w(px(13.0))
+        .h(px(13.0))
+        .rounded(theme::radius::CHIP)
+        .bg(bg)
+        .flex()
+        .items_center()
+        .justify_center()
+        .font(font(theme::font::MONO))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_size(px(7.5))
+        .text_color(fg)
+        .child(initial)
 }
 
 /// Which data source the right sidebar currently shows for the selected worktree - Zone 3's

@@ -233,6 +233,42 @@ pub fn pty_state_label(is_running: bool, status: Status, exit_code: Option<u32>)
     }
 }
 
+/// A bare worktree's shell tab label (Revision R12 §3): the real resolved shell binary name
+/// (`program`, from `TerminalPane::program_label` - never a hardcoded `"zsh"`, even though
+/// that's the design mockup's literal example) joined with the worktree's branch, e.g.
+/// `zsh \u{b7} feature/x`. Falls back to the bare program name for a detached worktree with no
+/// branch, rather than inventing one.
+pub fn bare_worktree_shell_label(program: &str, branch: Option<&str>) -> String {
+    match branch {
+        Some(branch) => format!("{program} \u{b7} {branch}"),
+        None => program.to_string(),
+    }
+}
+
+/// Appends a ` #N` ordinal (1-based, in order of appearance) to every label that repeats within
+/// `labels`, so two agents on the same model in one worktree never render two identical tab
+/// labels (`claude`, `claude` -> `claude #1`, `claude #2` - Revision R12 §3). A label that
+/// appears only once is returned unchanged - a lone `claude` tab never grows a spurious `#1`.
+pub fn disambiguate_tab_labels(labels: Vec<String>) -> Vec<String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for label in &labels {
+        *counts.entry(label.clone()).or_insert(0) += 1;
+    }
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    labels
+        .into_iter()
+        .map(|label| {
+            if counts.get(&label).copied().unwrap_or(0) > 1 {
+                let ordinal = seen.entry(label.clone()).or_insert(0);
+                *ordinal += 1;
+                format!("{label} #{ordinal}")
+            } else {
+                label
+            }
+        })
+        .collect()
+}
+
 /// A footer action button's colour treatment, backed by `theme::button::*`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionStyle {
@@ -623,6 +659,49 @@ mod tests {
                 "{status:?} produced no footer actions at all"
             );
         }
+    }
+
+    #[test]
+    fn a_lone_tab_label_is_never_given_a_spurious_ordinal() {
+        let labels = disambiguate_tab_labels(vec!["claude".to_string(), "codex".to_string()]);
+        assert_eq!(labels, vec!["claude", "codex"]);
+    }
+
+    #[test]
+    fn two_agents_on_the_same_model_get_ordinal_suffixes_never_an_identical_label() {
+        let labels = disambiguate_tab_labels(vec![
+            "sonnet-4.5".to_string(),
+            "sonnet-4.5".to_string(),
+            "codex".to_string(),
+        ]);
+        assert_eq!(labels, vec!["sonnet-4.5 #1", "sonnet-4.5 #2", "codex"]);
+        assert_ne!(
+            labels[0], labels[1],
+            "two tabs must never share an identical label"
+        );
+    }
+
+    #[test]
+    fn three_agents_on_the_same_model_all_get_distinct_ordinals_in_appearance_order() {
+        let labels = disambiguate_tab_labels(vec![
+            "claude".to_string(),
+            "claude".to_string(),
+            "claude".to_string(),
+        ]);
+        assert_eq!(labels, vec!["claude #1", "claude #2", "claude #3"]);
+    }
+
+    #[test]
+    fn a_bare_worktrees_shell_label_joins_the_real_program_name_with_its_branch() {
+        assert_eq!(
+            bare_worktree_shell_label("zsh", Some("feature/x")),
+            "zsh \u{b7} feature/x"
+        );
+    }
+
+    #[test]
+    fn a_bare_worktrees_shell_label_falls_back_to_the_program_name_when_detached() {
+        assert_eq!(bare_worktree_shell_label("bash", None), "bash");
     }
 
     #[test]

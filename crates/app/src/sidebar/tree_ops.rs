@@ -971,7 +971,7 @@ impl AdeApp {
     ///
     /// Structurally the *mirror* of [`Self::rename_open_paths`], and reviewed as one: every field
     /// that method remaps, this one drops. An earlier version handled only tabs, buffers and the
-    /// selection, which left a deleted file's `reviewed_files` entry, its
+    /// selection, which left a deleted file's `staged_files` entry, its
     /// `file_external_conflict` flag, its `file_save_error`, and - worst - its
     /// `lsp_opened_files`/`lsp_document_versions` entries behind. That last one is not cosmetic:
     /// `crate::lsp::client`'s `didOpen` dispatch early-returns for a path already in
@@ -1014,7 +1014,7 @@ impl AdeApp {
         }
 
         // The same field list `Self::rename_open_paths` remaps - see this method's own docs.
-        self.reviewed_files.retain(|path| !under_relative(path));
+        self.staged_files.retain(|path| !under_relative(path));
         self.file_external_conflict
             .retain(|path| !under_relative(path));
         self.file_save_pending.retain(|path| !under_relative(path));
@@ -1196,11 +1196,11 @@ impl AdeApp {
     /// "open tabs / the diff view follow the renamed path - no orphaned buffers").
     ///
     /// Handles a renamed *directory* too, by prefix: every open tab, edit buffer, expanded
-    /// folder and reviewed-file entry underneath it is remapped, not just an exact match.
+    /// folder and staged-file entry underneath it is remapped, not just an exact match.
     ///
     /// **Half of this app's path-keyed state is worktree-relative and half is absolute**, and
     /// getting one wrong is a silent no-op rather than a compile error (`strip_prefix` simply
-    /// fails and the entry is left alone) - see the `reviewed_files` line below for the real bug
+    /// fails and the entry is left alone) - see the `staged_files` line below for the real bug
     /// that produced. Each field is remapped with the pair matching its own documented key space.
     /// [`Self::forget_deleted_paths`] is this method's mirror and must move field-for-field with
     /// it.
@@ -1255,12 +1255,12 @@ impl AdeApp {
             .collect();
 
         // Worktree-*relative*, like `edit_buffers` above and unlike the absolute-keyed sets
-        // further down: `reviewed_files` is keyed by `wt_core::diff::DiffFile::path`
-        // (`Self::toggle_reviewed`'s own argument, straight off a Changes row). An earlier
+        // further down: `staged_files` is keyed by `wt_core::diff::DiffFile::path`
+        // (`Self::toggle_staged`'s own argument, straight off a Changes row). An earlier
         // version passed the absolute pair here, which made this a guaranteed silent no-op -
-        // `strip_prefix` simply failed for every entry - so a file's reviewed checkbox quietly
+        // `strip_prefix` simply failed for every entry - so a file's staged checkbox quietly
         // reset on every rename. Found in review; the regression test below drives it.
-        remap_path_set(&mut self.reviewed_files, &old_relative, &new_relative);
+        remap_path_set(&mut self.staged_files, &old_relative, &new_relative);
         remap_path_set(
             &mut self.file_external_conflict,
             &old_relative,
@@ -2495,19 +2495,19 @@ mod tree_ops_regression_tests {
         use super::*;
         use crate::sidebar::render::RightSidebarView;
 
-        /// `reviewed_files` is keyed by `wt_core::diff::DiffFile::path` - worktree-*relative* -
+        /// `staged_files` is keyed by `wt_core::diff::DiffFile::path` - worktree-*relative* -
         /// while the paths a rename works in are absolute. Remapping it with the absolute pair
         /// was a guaranteed silent no-op (`strip_prefix` failed for every entry), so a file's
-        /// reviewed checkbox quietly reset on every rename and every cut+paste.
+        /// staged checkbox quietly reset on every rename and every cut+paste.
         #[gpui::test]
-        fn a_rename_carries_the_files_reviewed_checkbox_with_it(cx: &mut TestAppContext) {
+        fn a_rename_carries_the_files_staged_checkbox_with_it(cx: &mut TestAppContext) {
             let repo = TempDir::new().expect("tempdir");
             seed(&repo);
             let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
             cx.run_until_parked();
 
             app.update(cx, |app, cx| {
-                app.toggle_reviewed(PathBuf::from("src/main.rs"), cx);
+                app.toggle_staged(PathBuf::from("src/main.rs"), cx);
             });
             app.update_in(cx, |app, window, cx| {
                 app.start_tree_rename(repo.path().join("src/main.rs"), false, window, cx);
@@ -2519,11 +2519,11 @@ mod tree_ops_regression_tests {
 
             app.read_with(cx, |app, _| {
                 assert!(
-                    app.reviewed_files.contains(Path::new("src/renamed.rs")),
-                    "the reviewed mark must follow the rename - got {:?}",
-                    app.reviewed_files
+                    app.staged_files.contains(Path::new("src/renamed.rs")),
+                    "the staged mark must follow the rename - got {:?}",
+                    app.staged_files
                 );
-                assert!(!app.reviewed_files.contains(Path::new("src/main.rs")));
+                assert!(!app.staged_files.contains(Path::new("src/main.rs")));
             });
         }
 

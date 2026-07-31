@@ -3,19 +3,25 @@
 //! and the app-wide `Undo`/`Redo` command-pattern stack ([`undo::UndoStack`]) that makes both
 //! genuinely reversible (Revision R10).
 //!
-//! ## One in-flight flag for all four operations
+//! ## One in-flight flag for all five operations
 //!
 //! [`AdeApp::worktree_history_op_in_flight`] serializes "keep all changes", "discard worktree",
-//! `Undo`, and `Redo`: a click/keystroke for any of the four while the flag is `true` is a no-op,
-//! mirroring [`AdeApp::prune_in_flight`]'s own single-flag-per-feature precedent
-//! (`crate::rail::render`). This is a deliberate simplification of this project's usual
-//! task-slot/generation-guard discipline, not a skip of it: because there can never be more than
-//! one of these four background operations in flight at a time, there is no "a slow undo/redo op
-//! races a newer one" scenario left to guard against with a separate generation counter - full
-//! mutual exclusion already makes it structurally impossible. Every completion handler still
-//! only mutates [`AdeApp`] state from inside `this.update`/`this.update_in`, after its real
-//! `wt_core::undo::*` call has actually resolved, matching every other real git-backed action in
-//! this app.
+//! `Undo`, `Redo`, and (Revision R12 §5) the Changes panel commit composer's "commit staged
+//! files" (`crate::sidebar::render::AdeApp::commit_staged_files`): a click/keystroke for any of
+//! the five while the flag is `true` is a no-op, mirroring [`AdeApp::prune_in_flight`]'s own
+//! single-flag-per-feature precedent (`crate::rail::render`). This is a deliberate
+//! simplification of this project's usual task-slot/generation-guard discipline, not a skip of
+//! it: because there can never be more than one of these five background operations in flight at
+//! a time, there is no "a slow undo/redo op races a newer one" scenario left to guard against
+//! with a separate generation counter - full mutual exclusion already makes it structurally
+//! impossible. Every completion handler still only mutates [`AdeApp`] state from inside
+//! `this.update`/`this.update_in`, after its real `wt_core::undo::*` call has actually resolved,
+//! matching every other real git-backed action in this app.
+//!
+//! `commit_staged_files` is real (`wt_core::undo::commit_paths`: a real `git add -- <paths>` +
+//! `git commit`) but has no `Undo`/`Redo` integration yet - unlike the other four, it pushes
+//! nothing onto [`undo::UndoStack`]. A real, honest gap (see `wt_core::undo::commit_paths`'s own
+//! docs), not a fake "undo" that would only look like it worked.
 //!
 //! ## Undo/redo never depends on the originating agent tab still existing
 //!
@@ -43,7 +49,7 @@
 
 use super::*;
 
-/// Which of the four real, mutually-exclusive-in-flight operations
+/// Which of the five real, mutually-exclusive-in-flight operations
 /// [`AdeApp::worktree_history_op_in_flight`] currently names - see that field's own docs for why
 /// this is a real, named kind rather than a bare `bool`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +58,9 @@ pub(crate) enum WorktreeHistoryOpKind {
     Discard,
     Undo,
     Redo,
+    /// The Changes panel commit composer's "commit staged files" (Revision R12 §5) -
+    /// `crate::sidebar::render::AdeApp::commit_staged_files`.
+    Commit,
 }
 
 /// Whether `a` and `b` refer to the same real path, canonicalizing both sides first - mirrors
@@ -69,7 +78,11 @@ impl AdeApp {
     /// Looks up worktree `path`'s branch name for display (History/status-line text) - falls
     /// back to the path itself if the worktree list doesn't (yet, or any more) have an entry for
     /// it. Display-only: never consulted by a real `wt_core::undo::*` call.
-    fn branch_display_for(&self, path: &Path) -> String {
+    ///
+    /// `pub(crate)`, not private: `crate::sidebar::render::AdeApp::commit_staged_files` (Revision
+    /// R12 §5's commit composer) reuses this same lookup for its own status-line text rather than
+    /// duplicating it.
+    pub(crate) fn branch_display_for(&self, path: &Path) -> String {
         self.worktrees
             .iter()
             .find(|item| item.path == path)

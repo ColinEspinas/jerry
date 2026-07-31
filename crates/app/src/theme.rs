@@ -825,6 +825,10 @@ pub mod toggle {
     pub const TRACK_OFF: ColorToken = hex(0x23272b);
     pub const KNOB_ON: ColorToken = hex(0xc8ecd6);
     pub const KNOB_OFF: ColorToken = hex(0x6b7178);
+    /// The Changes row staging checkbox's hover border (Revision R12 §5) - not in
+    /// `tokens.rs`'s transcribed set (that checkbox previously had no hover treatment at all),
+    /// added here directly.
+    pub const CHECKBOX_HOVER: ColorToken = hex(0x3f7a55);
 }
 
 pub mod tag {
@@ -996,6 +1000,11 @@ pub mod shadow {
     /// The `+` menu popover's own shadow - distinct from [`PALETTE`]'s `0 12 34`.
     pub const PLUS_MENU: (Pixels, Pixels, Pixels) = (px(0.0), px(14.0), px(30.0));
     // rgba(0,0,0,0.55)
+    /// The commit composer's `▾` split-button popover shadow (Revision R12 §5) - a negative `y`
+    /// since, unlike every other popover in this module, it opens *upward* from a button near the
+    /// bottom of the Changes panel.
+    pub const COMMIT_MENU: (Pixels, Pixels, Pixels) = (px(0.0), px(-10.0), px(26.0));
+    // rgba(0,0,0,0.5)
 }
 
 /// Honestly-scoped application of `Settings.appearance.interface_scale_percent` - text-size

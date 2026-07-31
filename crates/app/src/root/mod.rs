@@ -430,10 +430,22 @@ pub struct AdeApp {
     /// letting it finish, and the two have different destinations (each is
     /// `file_ops::unique_destination`-resolved) so they cannot collide with each other.
     pub(crate) _tree_copy_task: Option<Task<()>>,
-    /// Per-file "reviewed" toggle state for the Changes list - a file's path is in this set iff
-    /// its checkbox is checked. No backend "review" concept exists yet; this is purely local UI
-    /// state that `Self::render_changes_header`'s progress bar and count read directly.
-    pub(crate) reviewed_files: HashSet<PathBuf>,
+    /// Per-file staging state for the Changes list (Revision R12 §5: "the checkbox **is**
+    /// staging, not 'reviewed'") - a file's path is in this set iff its checkbox is checked, i.e.
+    /// it would be included in the commit composer's next commit **and is really staged in the
+    /// real git index** (`crate::sidebar::render::AdeApp::toggle_staged` does a real, immediate
+    /// `git add`/unstage - see its own docs). `Self::render_changes_header`'s progress bar/count
+    /// and `Self::render_commit_composer` both read this directly. Keyed by worktree, not agent
+    /// (§5's own "staging is keyed by worktree, not agent") - it holds exactly one set at a time,
+    /// re-derived from the real git index on every worktree switch by
+    /// `crate::root::state::reset_per_worktree_ui_state` rather than merely cleared (see that
+    /// function's own docs for why a live re-query, not a cache, is honest here).
+    pub(crate) staged_files: HashSet<PathBuf>,
+    /// Whether the commit composer's `▾` split-button popover (Revision R12 §5: *Commit and
+    /// push* / *Commit all N files* / *Amend last commit* / *Stash staged files*) is open. Closed
+    /// on every worktree switch (`Self::select_worktree`) since it targets that worktree's own
+    /// staged set.
+    pub(crate) commit_menu_open: bool,
     /// Ordered list of currently-open file tabs, rendered after every agent's own tab by
     /// `Self::render_tab_strip` - **per worktree**, keyed by [`Self::file_tree_root`]
     /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §3: "Switching worktrees

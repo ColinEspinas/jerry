@@ -224,6 +224,53 @@ pub fn commit_all_changes(
     })
 }
 
+/// Stage exactly `paths` (`git add -- <paths>`, never `commit_all_changes`'s `-A`) and commit
+/// them with `message` - the Changes panel commit composer's real backing (Revision R12 §5:
+/// "Commit N files" commits only the staged subset, not the whole worktree diff).
+///
+/// Refuses with [`Error::NothingToCommit`] if `paths` is empty, the same "check first, structured
+/// error" convention [`commit_all_changes`] follows for a clean worktree - the composer's own
+/// primary button already disables itself with nothing staged (see
+/// `crate::sidebar::changes::commit_button_label`), so this is a defensive backstop, not the
+/// primary guard.
+///
+/// Returns the same [`CommitAllChangesOutcome`] shape [`commit_all_changes`] does, but this
+/// function has no `undo_commit_paths`/`redo_commit_paths` counterpart yet - a partial commit
+/// isn't wired into [`crate::undo::UndoableAction`] (a real, honest gap, not a fake "undo" that
+/// would only look like it worked).
+///
+/// Performs blocking I/O.
+pub fn commit_paths(
+    worktree_path: &Path,
+    paths: &[std::path::PathBuf],
+    message: &str,
+) -> Result<CommitAllChangesOutcome, Error> {
+    if paths.is_empty() {
+        return Err(Error::NothingToCommit {
+            path: worktree_path.to_path_buf(),
+        });
+    }
+
+    let mut add_args: Vec<OsString> = vec!["add".into(), "--".into()];
+    add_args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+    let add_output = run_git(worktree_path, &add_args)?;
+    check_success(&add_args, &add_output)?;
+
+    let commit_args: Vec<OsString> = vec!["commit".into(), "-m".into(), message.into()];
+    let commit_output = run_git(worktree_path, &commit_args)?;
+    check_success(&commit_args, &commit_output)?;
+
+    let commit = rev_parse_head(worktree_path)?;
+    let parent = rev_parse_parent_of(worktree_path, &commit)?;
+    let branch = current_branch(worktree_path)?;
+
+    Ok(CommitAllChangesOutcome {
+        branch,
+        commit,
+        parent,
+    })
+}
+
 /// Undo a [`commit_all_changes`] call: real `git reset --soft <parent>`, returning the worktree
 /// to exactly the uncommitted state it was in right before that commit - see this module's own
 /// docs for why `reset --soft`, not `revert`.
@@ -672,6 +719,7 @@ fn apply_stash(worktree_path: &Path, stash: &str) -> Result<UndoDiscardOutcome, 
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -772,6 +820,66 @@ mod tests {
         let repo = init_repo();
         let err = commit_all_changes(repo.path(), "nothing to do").unwrap_err();
         assert!(matches!(err, Error::NothingToCommit { .. }));
+    }
+
+    // --- commit_paths ----------------------------------------------------------------------
+
+    #[test]
+    fn commit_paths_commits_only_the_given_paths_leaving_other_changes_uncommitted() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
+        fs::write(repo.path().join("untouched.txt"), "not staged\n").expect("new file");
+
+        let before_head = git_output(repo.path(), &["rev-parse", "HEAD"]);
+        let outcome = commit_paths(
+            repo.path(),
+            &[PathBuf::from("file.txt")],
+            "ade: commit staged files",
+        )
+        .expect("commit_paths");
+
+        assert_eq!(outcome.parent.as_deref(), Some(before_head.as_str()));
+        assert_eq!(
+            outcome.commit,
+            git_output(repo.path(), &["rev-parse", "HEAD"])
+        );
+        // The committed file is clean...
+        let status = git_output(repo.path(), &["status", "--porcelain", "file.txt"]);
+        assert_eq!(status, "", "file.txt must be committed, not left staged");
+        // ...but the other real change is genuinely untouched - still there, still uncommitted.
+        let untouched_status =
+            git_output(repo.path(), &["status", "--porcelain", "untouched.txt"]);
+        assert!(
+            untouched_status.contains("untouched.txt"),
+            "a path not passed to commit_paths must be left exactly as it was: {untouched_status:?}"
+        );
+        assert!(is_dirty(repo.path()).expect("is_dirty"));
+    }
+
+    #[test]
+    fn commit_paths_refuses_an_empty_path_list() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
+        let err = commit_paths(repo.path(), &[], "nothing selected").unwrap_err();
+        assert!(matches!(err, Error::NothingToCommit { .. }));
+        assert!(
+            is_dirty(repo.path()).expect("is_dirty"),
+            "refusing must not touch the working tree at all"
+        );
+    }
+
+    #[test]
+    fn commit_paths_real_message_becomes_the_real_commit_message() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
+        commit_paths(
+            repo.path(),
+            &[PathBuf::from("file.txt")],
+            "a distinctive real commit message",
+        )
+        .expect("commit_paths");
+        let subject = git_output(repo.path(), &["log", "-1", "--format=%s"]);
+        assert_eq!(subject, "a distinctive real commit message");
     }
 
     #[test]
