@@ -9,7 +9,7 @@ use crate::sidebar::changes;
 use crate::work_surface::render::render_dropdown_menu_row;
 use gpui::{BoxShadow, KeyDownEvent, Pixels};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use wt_core::graph::{DotKind, Elbow, ElbowKind, Graph, GraphRow, GraphScope, RefKind};
+use wt_core::graph::{DotKind, ElbowKind, Graph, GraphRow, GraphScope, RefKind};
 
 impl AdeApp {
     /// Opens the git graph tab (the tab strip's own entry, the `+` menu's "Git graph" row, the
@@ -884,23 +884,7 @@ impl AdeApp {
             .min_h_0()
             .overflow_y_scroll();
         for (index, row) in graph.rows.iter().enumerate() {
-            let elbows_of = |i: Option<usize>| -> &[Elbow] {
-                i.and_then(|i| graph.rows.get(i))
-                    .map(|r| r.elbows.as_slice())
-                    .unwrap_or_default()
-            };
-            let neighbours = RowNeighbours {
-                above: elbows_of(index.checked_sub(1)),
-                below: elbows_of(Some(index + 1)),
-            };
-            list = list.child(self.render_graph_row(
-                index,
-                row,
-                neighbours,
-                graph.lane_count,
-                now,
-                cx,
-            ));
+            list = list.child(self.render_graph_row(index, row, graph.lane_count, now, cx));
         }
         if graph.truncated {
             list = list.child(
@@ -926,7 +910,6 @@ impl AdeApp {
         &self,
         index: usize,
         row: &GraphRow,
-        neighbours: RowNeighbours<'_>,
         lane_count: usize,
         now_unix: i64,
         cx: &mut Context<Self>,
@@ -989,7 +972,7 @@ impl AdeApp {
             .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                 this.select_graph_row(index, cx);
             }))
-            .child(render_graph_lane_canvas(index, row, neighbours, lane_count))
+            .child(render_graph_lane_canvas(index, row, lane_count))
             .child(render_graph_ref_chips(row))
             .child(
                 div()
@@ -1833,22 +1816,6 @@ struct ElbowGeometry {
     exit: CurveBox,
 }
 
-/// How far one elbow curve reaches past its own row's edge, into the neighbouring row where that
-/// lane's *own* `LaneSegment` is also painted. Both curves together stand `2 * ELBOW_CURVE_SIZE`
-/// tall but only `ROW / 2` of the row is available beyond the dot, so the far curve always
-/// overshoots by the difference.
-///
-/// `render_graph_lane_canvas` uses this to inset the neighbouring row's own lane segment by the
-/// same amount, so that stretch of line is painted by exactly one element. Letting both paint it
-/// is not merely redundant: at a fractional device scale the two are snapped to device pixels
-/// independently (a border inset from a rounded box's edge, versus a filled rect positioned by its
-/// own left edge) and can disagree by one device pixel, which renders as a visibly doubled,
-/// 2px-wide stretch of lane line. That was measured directly in a real user screenshot at 1.25x -
-/// see this module's `elbow_geometry_tests` and the BUILD-LOG entry for the numbers.
-/// `Pixels` has no const arithmetic, so this is written out and pinned to its real definition by
-/// `elbow_geometry_tests::the_overshoot_constant_matches_the_geometry_it_stands_for`.
-const ELBOW_OVERSHOOT: Pixels = px(7.0);
-
 /// Computes one elbow's S-curve geometry. Pure and GPUI-element-free, so it is testable with plain
 /// `Pixels` values. `x_from`/`x_to` are `lane_x(elbow.from_lane)`/`lane_x(elbow.to_lane)`.
 ///
@@ -1864,13 +1831,24 @@ const ELBOW_OVERSHOOT: Pixels = px(7.0);
 /// that tells them apart geometrically - both use the same entry/exit border-edge pattern.
 fn elbow_geometry(kind: ElbowKind, x_from: Pixels, x_to: Pixels, row_h: Pixels) -> ElbowGeometry {
     let curve_size = theme::graph::ELBOW_CURVE_SIZE;
+    let radius = theme::graph::ELBOW_RADIUS;
     let rightward = x_to >= x_from;
 
     // The single pixel row all three pieces paint their horizontal stroke on: one curve away from
-    // the dot, below it for `Diverging` and above it for `Converging`.
+    // the dot, below it for `Diverging` and above it for `Converging` - but never so far that the
+    // far curve's own *arc* would fall outside this row's own box.
+    //
+    // That clamp is what makes `render_graph_lane_canvas`'s clip safe. The far curve is always
+    // `ELBOW_CURVE_SIZE` tall while only `ELBOW_RADIUS` of that is arc (see [`CurveBox`]), so the
+    // stretch it reaches past the row edge is pure *straight vertical stroke*, sitting on exactly
+    // the column the neighbouring row's own `LaneSegment` continues the line on. Clipping it away
+    // therefore loses nothing: the neighbour redraws the identical pixels. Let the waist sit one
+    // full curve from the dot instead (`ROW / 2 + CURVE_SIZE` = 23 against `ROW` = 26) and the clip
+    // would cut the arc mid-sweep, 2px before it has finished turning onto the lane's own column -
+    // a visible kink at every row boundary.
     let waist_y = match kind {
-        ElbowKind::Diverging => row_h / 2.0 + curve_size,
-        ElbowKind::Converging => row_h / 2.0 - curve_size,
+        ElbowKind::Diverging => (row_h / 2.0 + curve_size).min(row_h - radius),
+        ElbowKind::Converging => (row_h / 2.0 - curve_size).max(radius),
     };
     let (entry_join, exit_join) = match kind {
         ElbowKind::Diverging => (LaneJoin::LeavesDot, LaneJoin::ContinuesLane),
@@ -1893,9 +1871,22 @@ fn elbow_geometry(kind: ElbowKind, x_from: Pixels, x_to: Pixels, row_h: Pixels) 
     );
     let exit = CurveBox::anchored(x_to, waist_y, HorizontalEdge::Top, exit_vertical, exit_join);
 
-    // The bridge runs between the two boxes, reaching `ELBOW_RADIUS` into each so it covers their
-    // straight border lead-ins (see `StraightSegment`). Adjacent lanes leave no real gap at all -
-    // the boxes overlap outright - so the width floors at that minimum rather than going negative.
+    // The bridge runs from where the left curve's own arc *ends* to where the right curve's own
+    // arc *begins* - `ELBOW_RADIUS` inside each box, since the arc only ever fills an
+    // `ELBOW_RADIUS` corner square (see [`CurveBox`]). That covers each curve's whole straight
+    // border lead-in and nothing else (see [`StraightSegment`] for why the lead-ins must be
+    // covered).
+    //
+    // Both ends have to be clamped that way, not just the near one. Adjacent lanes are only
+    // `LANE_STEP` = 14px apart while the two boxes together want `2 * ELBOW_CURVE_SIZE` = 20px, so
+    // the boxes genuinely overlap and the raw span comes out *shorter* than the wide-gap case.
+    // Flooring the width at a fixed minimum (what this used to do) then pushed the bridge's far end
+    // straight past the far curve's arc - a real user-reported glitch on every one-lane-wide elbow,
+    // both at a branch start and at a merge back: a 1px horizontal stub dangling in mid-air past
+    // the corner, with the arc itself flattened under the fill that ran across it. Wider elbows
+    // were unaffected, which is exactly why it read as "only when it merges back just below".
+    // Clamp to zero instead: the two curves' own straight lead-ins already overlap when the boxes
+    // do, so there is nothing left for a bridge to cover.
     let overlap = theme::graph::ELBOW_RADIUS;
     let (left_curve, right_curve) = if rightward {
         (&entry, &exit)
@@ -1903,7 +1894,7 @@ fn elbow_geometry(kind: ElbowKind, x_from: Pixels, x_to: Pixels, row_h: Pixels) 
         (&exit, &entry)
     };
     let straight_left = left_curve.right() - overlap;
-    let straight_width = (right_curve.left + overlap - straight_left).max(overlap * 2.0);
+    let straight_width = (right_curve.left + overlap - straight_left).max(px(0.0));
 
     ElbowGeometry {
         entry,
@@ -1935,58 +1926,22 @@ fn elbow_color_lane(kind: ElbowKind, from_lane: usize, to_lane: usize) -> usize 
 
 /// The vertical span (`top`, `height`) one plain lane segment occupies in its row.
 ///
-/// Pure and GPUI-element-free, like `elbow_geometry`/`elbow_color_lane`, so the neighbouring-row
-/// reasoning here is directly testable rather than only reachable through a real painted repo.
+/// Pure and GPUI-element-free, like `elbow_geometry`/`elbow_color_lane`, so it is directly testable
+/// rather than only reachable through a real painted repo.
 ///
-/// Beyond the obvious half/full-height cases, this enforces the module's "one element per lane per
-/// row" rule *across* row boundaries. An elbow stands taller than the half-row it starts in and
-/// reaches [`ELBOW_OVERSHOOT`] into the neighbouring row, where it paints the very same stretch of
-/// the very same lane line this segment would. Only a plain through-lane can ever be affected: the
-/// lane a neighbouring elbow points at necessarily starts (or ends) in *that* row, so in this one
-/// it always runs the full height.
-fn lane_segment_span(
-    segment: &wt_core::graph::LaneSegment,
-    row_h: Pixels,
-    neighbours: RowNeighbours<'_>,
-) -> (Pixels, Pixels) {
-    let (top, height) = match (segment.starts_here, segment.ends_here) {
+/// A through-lane always runs the *full* row height, edge to edge. That is what lets an elbow's own
+/// straight lead-out be clipped at the row boundary (see `render_graph_lane_canvas`): the stretch
+/// the clip removes is exactly the stretch the neighbouring row's own segment starts at, so the
+/// line stays continuous while still being painted by exactly one element per lane per row. This
+/// used to inset the neighbour by an `ELBOW_OVERSHOOT` constant instead, because the elbow really
+/// did paint into the neighbouring row back then; clipping removes the overlap at its source, so
+/// there is nothing left to inset for.
+fn lane_segment_span(segment: &wt_core::graph::LaneSegment, row_h: Pixels) -> (Pixels, Pixels) {
+    match (segment.starts_here, segment.ends_here) {
         (true, _) => (row_h / 2.0, row_h / 2.0),
         (false, true) => (px(0.0), row_h / 2.0),
         (false, false) => (px(0.0), row_h),
-    };
-    if segment.starts_here || segment.ends_here {
-        return (top, height);
     }
-    // A `Diverging` elbow in the row above reaches down into this row; a `Converging` elbow in the
-    // row below reaches up into it.
-    let trim = |present: bool| if present { ELBOW_OVERSHOOT } else { px(0.0) };
-    let trim_top = trim(
-        neighbours
-            .above
-            .iter()
-            .any(|e| e.kind == ElbowKind::Diverging && e.to_lane == segment.lane),
-    );
-    let trim_bottom = trim(
-        neighbours
-            .below
-            .iter()
-            .any(|e| e.kind == ElbowKind::Converging && e.from_lane == segment.lane),
-    );
-    (top + trim_top, height - trim_top - trim_bottom)
-}
-
-/// The elbows of the rows immediately above and below the one being drawn. Needed because an elbow
-/// is taller than the half-row it starts in and reaches [`ELBOW_OVERSHOOT`] past its row's edge, so
-/// a neighbouring row's elbow can already be painting part of *this* row's lane line.
-///
-/// Deliberately just the elbows rather than whole `GraphRow`s: it is all this needs, and it keeps
-/// the rule directly testable without standing up two complete rows.
-#[derive(Clone, Copy, Default)]
-struct RowNeighbours<'a> {
-    /// Elbows of the row rendered directly above. A `Diverging` one reaches *down* into this row.
-    above: &'a [Elbow],
-    /// Elbows of the row rendered directly below. A `Converging` one reaches *up* into this row.
-    below: &'a [Elbow],
 }
 
 /// Draws one row's lane canvas: full-height verticals for every lane passing through, half-height
@@ -1995,19 +1950,32 @@ struct RowNeighbours<'a> {
 /// stacked halves per row", so a `starts_here`/`ends_here` segment renders as a single half-height
 /// rect anchored to the correct edge, never two.
 ///
-/// That "one element per lane per row" rule is enforced across row boundaries too, via
-/// `neighbours` - see [`ELBOW_OVERSHOOT`] for why letting two elements paint one stretch of line is
-/// actively harmful rather than merely wasteful.
+/// That "one element per lane per row" rule holds across row boundaries too, and `overflow_hidden()`
+/// is what enforces it. An elbow's far curve is `ELBOW_CURVE_SIZE` tall against only `ROW / 2` of
+/// row past the dot, so it always reaches past this row's own box; `elbow_geometry` guarantees the
+/// part that spills over is nothing but the curve's *straight* vertical lead-out, on exactly the
+/// column the neighbouring row's own full-height `LaneSegment` already draws.
+///
+/// Clipping it is not merely tidiness. Each row is its own `div()` and rows paint in order, so a
+/// later row's opaque `surface::ROW_HOVER`/`ROW_SELECTED` background paints *over* anything an
+/// earlier row spilled into its rectangle - which is precisely the reported "lines disappear at
+/// elbow connections when hovering" bug: hovering row N erased the tail of row N-1's branch-start
+/// elbow. GPUI clips nothing by default (`Style::overflow_mask` returns `None` for the default
+/// `Overflow::Visible`, `gpui/src/style.rs`), so this has to be asked for. Note GPUI's content mask
+/// is a single rectangle, so this bounds x at the canvas' own width as well - safe because
+/// `graph_lane_canvas_width` always reserves `LANE_X_BASE` past the rightmost lane while no elbow
+/// piece ever reaches more than one stroke past it (pinned by
+/// `elbow_geometry_tests::no_elbow_piece_ever_reaches_past_the_lane_canvas_own_width`).
 fn render_graph_lane_canvas(
     row_index: usize,
     row: &GraphRow,
-    neighbours: RowNeighbours<'_>,
     lane_count: usize,
 ) -> impl IntoElement {
     let row_h = theme::graph::ROW;
     let mut canvas = div()
         .relative()
         .flex_none()
+        .overflow_hidden()
         .w(graph_lane_canvas_width(lane_count))
         .h(row_h)
         .debug_selector(move || format!("graph-row-{row_index}-lane-canvas"));
@@ -2042,7 +2010,7 @@ fn render_graph_lane_canvas(
 
         let x = lane_x(segment.lane);
         let color = lane_color(segment.lane);
-        let (top, height) = lane_segment_span(segment, row_h, neighbours);
+        let (top, height) = lane_segment_span(segment, row_h);
         let lane = segment.lane;
         let mut line = div()
             .absolute()
@@ -2843,6 +2811,9 @@ mod elbow_geometry_tests {
     const ROW_H: Pixels = theme::graph::ROW;
     const RADIUS: Pixels = theme::graph::ELBOW_RADIUS;
     const CURVE_SIZE: Pixels = theme::graph::ELBOW_CURVE_SIZE;
+    /// The smallest disc a row's own dot can be painted at, and so the tightest bound on how far an
+    /// elbow's dot end may run before it stops being hidden underneath that dot.
+    const SMALLEST_DOT: Pixels = theme::graph::DOT_COMMIT;
 
     #[test]
     fn elbow_curve_size_is_exactly_double_the_radius_so_gpuis_own_clamp_never_kicks_in() {
@@ -2976,6 +2947,23 @@ mod elbow_geometry_tests {
         (ElbowKind::Converging, px(9.0), px(51.0)),
     ];
 
+    /// Every shape in [`ALL_SHAPES`] at both a wide gap (three lane steps, `lane_x(0)`/`lane_x(3)`)
+    /// and the *minimum* one-lane-step gap (`lane_x(0)`/`lane_x(1)`). The narrow gap is its own
+    /// distinct case rather than just a smaller number: `LANE_STEP` (14px) is less than
+    /// `2 * ELBOW_CURVE_SIZE` (20px), so the two curve boxes genuinely overlap, and a real
+    /// user-reported glitch lived in exactly that regime - see
+    /// `the_straight_bridge_never_runs_past_the_far_curves_own_arc`.
+    const ALL_SHAPES_AND_GAPS: [(ElbowKind, Pixels, Pixels); 8] = [
+        (ElbowKind::Diverging, px(9.0), px(51.0)),
+        (ElbowKind::Diverging, px(51.0), px(9.0)),
+        (ElbowKind::Converging, px(51.0), px(9.0)),
+        (ElbowKind::Converging, px(9.0), px(51.0)),
+        (ElbowKind::Diverging, px(9.0), px(23.0)),
+        (ElbowKind::Diverging, px(23.0), px(9.0)),
+        (ElbowKind::Converging, px(23.0), px(9.0)),
+        (ElbowKind::Converging, px(9.0), px(23.0)),
+    ];
+
     #[test]
     fn a_lane_continuing_curve_paints_its_stroke_on_that_lanes_own_column() {
         // The real regression test for the horizontal counterpart of the border-box off-by-one.
@@ -3043,18 +3031,26 @@ mod elbow_geometry_tests {
         // both use the same entry/exit border-edge pattern. `Diverging`'s `from_lane` is always
         // `own_lane` (`layout_lanes` Step 4), so its entry is the dot end.
         let geo = elbow_geometry(ElbowKind::Diverging, px(9.0), px(23.0), ROW_H);
-        assert_eq!(geo.entry.top, ROW_H / 2.0, "entry must start at the dot");
+        // The entry's own vertical stroke has to start under the dot's own disc, so no gap opens
+        // between the dot and the line leaving it. It may start above the dot's centre - the dot is
+        // painted last and hides that stretch - but never below the disc's own bottom edge, and
+        // never so far above that it pokes out of the smallest dot this row can have.
+        assert!(
+            (ROW_H / 2.0 - SMALLEST_DOT / 2.0..=ROW_H / 2.0).contains(&geo.entry.top),
+            "entry must start under the dot's own disc: {:?}",
+            geo.entry.top
+        );
         assert_eq!(geo.entry.horizontal, HorizontalEdge::Bottom);
         assert_eq!(geo.entry.vertical, VerticalEdge::Left);
         assert_eq!(geo.exit.horizontal, HorizontalEdge::Top);
         assert_eq!(geo.exit.vertical, VerticalEdge::Right);
-        // The exit must reach past the row's own edge, into the next row where `to_lane`'s own
-        // segment picks up - by exactly `ELBOW_OVERSHOOT`, which that constant's own docs explain
-        // `render_graph_lane_canvas` then insets the neighbouring segment by.
-        assert_eq!(
-            geo.exit.top + geo.exit.height - ROW_H,
-            ELBOW_OVERSHOOT,
-            "the exit curve's overshoot must be exactly the amount the next row insets by"
+        // The exit still reaches past the row's own edge, into the next row where `to_lane`'s own
+        // full-height segment picks the line up - `render_graph_lane_canvas` clips that stretch
+        // away rather than letting it paint over the neighbour.
+        assert!(
+            geo.exit.top + geo.exit.height > ROW_H,
+            "the exit curve must reach the row's own bottom edge: {:?}",
+            geo.exit.top + geo.exit.height
         );
     }
 
@@ -3075,27 +3071,20 @@ mod elbow_geometry_tests {
         );
         assert_eq!(geo.exit.horizontal, HorizontalEdge::Top);
         assert_eq!(geo.exit.vertical, VerticalEdge::Left);
-        assert_eq!(
-            geo.exit.top + geo.exit.height,
-            ROW_H / 2.0,
-            "the exit curve must land exactly on own_lane's own dot"
-        );
-        // And it must reach back past the row's own top edge, into the row above where the ending
-        // lane's own segment left off.
-        assert_eq!(-geo.entry.top, ELBOW_OVERSHOOT);
-    }
-
-    #[test]
-    fn the_overshoot_constant_matches_the_geometry_it_stands_for() {
-        // `Pixels` has no const arithmetic, so `ELBOW_OVERSHOOT` is written out; this is what keeps
-        // it honest. Both curves together stand `2 * CURVE_SIZE` tall, but only half a row is
-        // available beyond the dot - the difference is what spills into the neighbouring row.
-        assert_eq!(ELBOW_OVERSHOOT, CURVE_SIZE * 2.0 - ROW_H / 2.0);
+        // The mirror of the Diverging entry above: the dot end has to finish under the dot's own
+        // disc - at or past its centre, but not out the far side of the smallest dot.
+        let exit_bottom = geo.exit.top + geo.exit.height;
         assert!(
-            ELBOW_OVERSHOOT > px(0.0),
-            "if the elbow ever fits inside its own half-row this constant, and the neighbouring-row \
-             inset in `render_graph_lane_canvas` that uses it, should be deleted rather than left \
-             silently doing nothing"
+            (ROW_H / 2.0..=ROW_H / 2.0 + SMALLEST_DOT / 2.0).contains(&exit_bottom),
+            "the exit curve must land under own_lane's own dot: {exit_bottom:?}"
+        );
+        // And it must reach back past the row's own top edge, to where the ending lane's own
+        // full-height segment in the row above left off - `render_graph_lane_canvas` clips that
+        // stretch away rather than letting it paint over the neighbour.
+        assert!(
+            geo.entry.top < px(0.0),
+            "the entry curve must reach the row's own top edge: {:?}",
+            geo.entry.top
         );
     }
 
@@ -3123,26 +3112,230 @@ mod elbow_geometry_tests {
     }
 
     #[test]
-    fn adjacent_lanes_still_get_a_minimal_overlapping_straight_bridge() {
-        // Exactly one lane step apart (14px, `LANE_STEP`) is now genuinely *less* than
-        // `2 * CURVE_SIZE` (20px) - the two curves' own boxes actually overlap by 6px, not just
-        // touch, given `ELBOW_CURVE_SIZE`'s own docs on why the box had to grow to avoid GPUI's
-        // radius clamp. `raw_width` floors at zero either way, so the straight bridge still comes
-        // out to a minimal `2 * RADIUS`, anchored to entry's own side. Unlike the wide-gap case,
-        // its far end does not land exactly `RADIUS` past exit's own tangent point - it lands well
-        // *inside* exit's own box instead (the two curve boxes overlap each other directly here),
-        // which is harmless: the real invariant is just that the bridge never falls short of
-        // reaching exit's own box.
-        let geo = elbow_geometry(ElbowKind::Diverging, px(9.0), px(23.0), ROW_H);
-        assert_eq!(geo.straight.width, RADIUS * 2.0);
-        assert_eq!(geo.straight.left, geo.entry.left + RADIUS);
+    fn the_straight_bridge_never_runs_past_the_far_curves_own_arc() {
+        // The real regression test for a user-reported glitch on **one-lane-wide** elbows, seen at
+        // both ends of a branch: "when a branch merges back into a branch that is just one below"
+        // and "also happening at the start of branches". Two screenshots showed a 1px horizontal
+        // stub dangling in mid-air past the corner, with the corner itself flattened.
+        //
+        // Adjacent lanes are `LANE_STEP` = 14px apart while the two curve boxes together want
+        // `2 * CURVE_SIZE` = 20px, so they genuinely overlap and the honest bridge span is
+        // *shorter* than in the wide-gap case. Flooring the width at `2 * RADIUS` (what this used
+        // to do) then ran the fill 2px past where the far curve's arc begins, straight over the arc
+        // and out the other side. The invariant that has to hold for every gap: the bridge starts
+        // exactly where the near curve's arc ends and stops exactly where the far curve's arc
+        // begins - never a pixel further, so it can neither paint over an arc nor stick out past
+        // the lane line the arc turns onto.
+        for (kind, x_from, x_to) in ALL_SHAPES_AND_GAPS {
+            let geo = elbow_geometry(kind, x_from, x_to, ROW_H);
+            let (near, far) = if x_to >= x_from {
+                (&geo.entry, &geo.exit)
+            } else {
+                (&geo.exit, &geo.entry)
+            };
+            let label = format!("{kind:?} {x_from:?}->{x_to:?}");
+            assert_eq!(
+                geo.straight.left,
+                near.right() - RADIUS,
+                "{label}: the bridge must start where the near curve's own arc ends"
+            );
+            assert_eq!(
+                geo.straight.left + geo.straight.width,
+                far.left + RADIUS,
+                "{label}: the bridge must stop where the far curve's own arc begins"
+            );
+            // The consequence that was actually visible on screen: the fill must never reach past
+            // the column the far curve's own vertical stroke sits on.
+            assert!(
+                geo.straight.left + geo.straight.width
+                    <= painted_vertical_column(far) + ELBOW_STROKE,
+                "{label}: the bridge ran past the far curve's own vertical stroke - that is the \
+                 reported dangling stub: bridge end {:?}, stroke column {:?}",
+                geo.straight.left + geo.straight.width,
+                painted_vertical_column(far)
+            );
+            assert!(
+                geo.straight.width >= px(0.0),
+                "{label}: a negative width would render as nothing at all: {:?}",
+                geo.straight.width
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_lanes_get_a_real_but_shorter_bridge_than_a_wide_gap() {
+        // Pins the concrete numbers behind the invariant above, so a future change that quietly
+        // reintroduces a minimum width has to face them. One lane step apart: the two boxes overlap
+        // by `2 * CURVE_SIZE - LANE_STEP` = 6px, and the bridge that survives is 4px - real, but
+        // less than the `2 * RADIUS` = 10px floor that used to be forced on it.
+        let adjacent = elbow_geometry(ElbowKind::Diverging, px(9.0), px(23.0), ROW_H);
+        assert_eq!(adjacent.straight.width, px(4.0));
+        let wide = elbow_geometry(ElbowKind::Diverging, px(9.0), px(9.0 + 3.0 * 14.0), ROW_H);
         assert!(
-            geo.straight.left + geo.straight.width >= geo.exit.left,
-            "the straight bridge must reach at least as far as exit's own box: bridge end {:?}, \
-             exit.left {:?}",
-            geo.straight.left + geo.straight.width,
-            geo.exit.left
+            adjacent.straight.width < wide.straight.width,
+            "an adjacent-lane bridge must be shorter than a wide-gap one, not clamped up to a \
+             fixed minimum: {:?} vs {:?}",
+            adjacent.straight.width,
+            wide.straight.width
         );
+    }
+
+    /// The vertical span one curve's own *arc* sweeps: it always fills exactly an `ELBOW_RADIUS`
+    /// corner square of the box, anchored at the bordered corner (see [`CurveBox`]). The rest of
+    /// the box's bordered vertical edge is straight stroke.
+    fn arc_span(curve: &CurveBox) -> (Pixels, Pixels) {
+        match curve.horizontal {
+            HorizontalEdge::Top => (curve.top, curve.top + RADIUS),
+            HorizontalEdge::Bottom => {
+                let bottom = curve.top + curve.height;
+                (bottom - RADIUS, bottom)
+            }
+        }
+    }
+
+    #[test]
+    fn every_arc_sweeps_entirely_inside_its_own_rows_box() {
+        // The invariant `render_graph_lane_canvas`'s `overflow_hidden()` depends on, and the real
+        // regression test for the reported "lines disappearing at elbow connections when hovering".
+        //
+        // Root cause: each row is its own `div()` and rows paint in order, so a later row's opaque
+        // hover background painted over whatever an earlier row had spilled into its rectangle. The
+        // fix clips each row's canvas to its own box - which is only lossless if the stretch being
+        // clipped is pure *straight* vertical stroke, sitting on exactly the column the
+        // neighbouring row's own full-height `LaneSegment` continues the line on. If an arc were
+        // cut mid-sweep the two would not line up and every row boundary would show a kink, so this
+        // is what `elbow_geometry`'s `waist_y` clamp exists to guarantee.
+        for (kind, x_from, x_to) in ALL_SHAPES_AND_GAPS {
+            let geo = elbow_geometry(kind, x_from, x_to, ROW_H);
+            for (part, curve) in [("entry", geo.entry), ("exit", geo.exit)] {
+                let (arc_top, arc_bottom) = arc_span(&curve);
+                assert!(
+                    arc_top >= px(0.0) && arc_bottom <= ROW_H,
+                    "{kind:?} {x_from:?}->{x_to:?}: the {part} curve's arc sweeps \
+                     {arc_top:?}..{arc_bottom:?}, outside its own row's 0..{ROW_H:?} box - the \
+                     canvas clip would cut it mid-turn"
+                );
+            }
+            assert!(
+                geo.straight.top >= px(0.0) && geo.straight.top < ROW_H,
+                "{kind:?} {x_from:?}->{x_to:?}: the bridge's own row {:?} must be inside the row",
+                geo.straight.top
+            );
+        }
+    }
+
+    #[test]
+    fn what_the_row_clip_removes_is_exactly_what_the_neighbouring_row_paints() {
+        // The other half of the same argument: the part of an elbow that *does* fall outside the
+        // row must be the far curve's straight vertical lead-out, painted on the very column that
+        // lane's own line uses - so the neighbouring row's full-height segment resumes it pixel for
+        // pixel and nothing is actually lost to the clip.
+        for (kind, x_from, x_to) in ALL_SHAPES_AND_GAPS {
+            let geo = elbow_geometry(kind, x_from, x_to, ROW_H);
+            // `Diverging` spills out of the bottom via its exit, `Converging` out of the top via
+            // its entry - the two ends that continue a lane rather than leaving the dot.
+            let (spilling, lane_x, spill) = match kind {
+                ElbowKind::Diverging => (
+                    geo.exit,
+                    x_to,
+                    geo.exit.top + geo.exit.height - ROW_H, // past the bottom edge
+                ),
+                ElbowKind::Converging => (geo.entry, x_from, -geo.entry.top), // past the top edge
+            };
+            assert!(
+                spill > px(0.0),
+                "{kind:?} {x_from:?}->{x_to:?}: sanity check - this end really must spill out of \
+                 the row, or the clip has nothing to remove and this test proves nothing"
+            );
+            assert_eq!(
+                spill,
+                CURVE_SIZE - RADIUS,
+                "{kind:?} {x_from:?}->{x_to:?}: the spill must be exactly the curve's own straight \
+                 lead-out, never any part of its arc"
+            );
+            assert_eq!(
+                painted_vertical_column(&spilling),
+                lane_x,
+                "{kind:?} {x_from:?}->{x_to:?}: the clipped-away stroke must sit on that lane's own \
+                 column, which the neighbouring row's own segment continues"
+            );
+        }
+        // And that neighbouring segment really does run the full row, edge to edge - it is no
+        // longer inset for an overshoot, because there is no longer an overshoot to inset for.
+        let through = wt_core::graph::LaneSegment {
+            lane: 1,
+            starts_here: false,
+            ends_here: false,
+            dashed: false,
+        };
+        assert_eq!(lane_segment_span(&through, ROW_H), (px(0.0), ROW_H));
+    }
+
+    #[test]
+    fn a_lane_that_starts_or_ends_here_gets_exactly_one_half_height_stub() {
+        // The plain half/half cases, unchanged: anchored to the correct edge, one element each,
+        // never two stacked halves (design spec §2).
+        let mut segment = wt_core::graph::LaneSegment {
+            lane: 1,
+            starts_here: true,
+            ends_here: false,
+            dashed: false,
+        };
+        assert_eq!(
+            lane_segment_span(&segment, ROW_H),
+            (ROW_H / 2.0, ROW_H / 2.0),
+            "a lane starting here runs from the dot down to the row's bottom edge"
+        );
+        segment.starts_here = false;
+        segment.ends_here = true;
+        assert_eq!(
+            lane_segment_span(&segment, ROW_H),
+            (px(0.0), ROW_H / 2.0),
+            "a lane ending here runs from the row's top edge down to the dot"
+        );
+    }
+
+    #[test]
+    fn no_elbow_piece_ever_reaches_past_the_lane_canvas_own_width() {
+        // GPUI's content mask is a single rectangle, so `render_graph_lane_canvas`'s
+        // `overflow_hidden()` bounds x as well as y. That is only safe while every piece stays
+        // inside the canvas' own width - otherwise the clip added for the hover bug would silently
+        // amputate the rightmost elbow instead. Checked against real widths, over every lane pair a
+        // repository with that many lanes can produce.
+        for lane_count in 2..=12usize {
+            let width = graph_lane_canvas_width(lane_count);
+            for from_lane in 0..lane_count {
+                for to_lane in 0..lane_count {
+                    // A same-lane elbow is a degenerate shape `layout_lanes` never emits (an elbow
+                    // exists precisely because a line changes lane); its two curves would sit on top
+                    // of each other and reach a stroke past the lane they share. Left out here
+                    // rather than widening the canvas for a case that cannot occur.
+                    if from_lane == to_lane {
+                        continue;
+                    }
+                    for kind in [ElbowKind::Diverging, ElbowKind::Converging] {
+                        let geo = elbow_geometry(kind, lane_x(from_lane), lane_x(to_lane), ROW_H);
+                        let right = geo
+                            .entry
+                            .right()
+                            .max(geo.exit.right())
+                            .max(geo.straight.left + geo.straight.width);
+                        assert!(
+                            geo.entry.left >= px(0.0) && geo.exit.left >= px(0.0),
+                            "{kind:?} lane {from_lane}->{to_lane}: a piece started left of the \
+                             canvas ({:?}, {:?})",
+                            geo.entry.left,
+                            geo.exit.left
+                        );
+                        assert!(
+                            right <= width,
+                            "{kind:?} lane {from_lane}->{to_lane} of {lane_count}: a piece reached \
+                             {right:?}, past the canvas' own {width:?} - the row clip would cut it"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -3155,144 +3348,35 @@ mod elbow_geometry_tests {
         // as broken as the original bug" failure mode an earlier adversarial audit was asked to
         // rule out - just via position now, since border-edge choice alone can no longer tell them
         // apart in this two-curve design.
+        // Stated on the *waist* - the single row all three pieces paint their horizontal stroke on,
+        // and the one thing that is unambiguously on one side of the dot or the other. The curve
+        // boxes themselves each straddle the dot by design (their dot end has to finish underneath
+        // it, see `a_diverging_elbow_leaves_this_rows_dot_and_lands_on_the_other_lanes_line`), so a
+        // box edge is the wrong thing to measure this with.
         for (x_from, x_to) in [(px(9.0), px(23.0)), (px(23.0), px(9.0)), (px(9.0), px(9.0))] {
             let diverging = elbow_geometry(ElbowKind::Diverging, x_from, x_to, ROW_H);
             let converging = elbow_geometry(ElbowKind::Converging, x_from, x_to, ROW_H);
             assert!(
-                diverging.entry.top >= ROW_H / 2.0,
-                "Diverging's entry must stay in the row's bottom half: top was {:?}",
-                diverging.entry.top
+                diverging.straight.top > ROW_H / 2.0,
+                "Diverging's waist must sit below the dot: {:?}",
+                diverging.straight.top
             );
             assert!(
-                converging.exit.top + converging.exit.height <= ROW_H / 2.0 + px(0.5),
-                "Converging's exit must stay in the row's top half: bottom was {:?}",
-                converging.exit.top + converging.exit.height
+                converging.straight.top < ROW_H / 2.0,
+                "Converging's waist must sit above the dot: {:?}",
+                converging.straight.top
+            );
+            // And each kind's own far curve must reach out of the row on the matching side, since
+            // that is the row whose lane segment continues the line.
+            assert!(
+                diverging.exit.top + diverging.exit.height > ROW_H,
+                "Diverging must reach into the row below"
+            );
+            assert!(
+                converging.entry.top < px(0.0),
+                "Converging must reach into the row above"
             );
         }
-    }
-
-    fn through_lane(lane: usize) -> wt_core::graph::LaneSegment {
-        wt_core::graph::LaneSegment {
-            lane,
-            starts_here: false,
-            ends_here: false,
-            dashed: false,
-        }
-    }
-
-    fn elbow(kind: ElbowKind, from_lane: usize, to_lane: usize) -> [Elbow; 1] {
-        [Elbow {
-            from_lane,
-            to_lane,
-            kind,
-        }]
-    }
-
-    #[test]
-    fn a_through_lane_yields_the_stretch_a_neighbouring_rows_elbow_already_paints() {
-        // The real regression test for a doubled lane line measured directly in a user screenshot:
-        // an elbow overshoots `ELBOW_OVERSHOOT` into the neighbouring row, and that row's own
-        // through-segment was painting the same stretch of the same line. Two elements for one 1px
-        // line is not merely redundant - at a fractional device scale they are snapped to device
-        // pixels independently and can disagree by a pixel, rendering as a visibly 2px-wide band.
-        let above = elbow(ElbowKind::Diverging, 0, 1);
-        let below = elbow(ElbowKind::Converging, 1, 0);
-        let seg = through_lane(1);
-
-        let (top, height) = lane_segment_span(
-            &seg,
-            ROW_H,
-            RowNeighbours {
-                above: &above,
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            top, ELBOW_OVERSHOOT,
-            "the row above reaches down into this one"
-        );
-        assert_eq!(height, ROW_H - ELBOW_OVERSHOOT);
-
-        let (top, height) = lane_segment_span(
-            &seg,
-            ROW_H,
-            RowNeighbours {
-                below: &below,
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            top,
-            px(0.0),
-            "an elbow below never moves this segment's top"
-        );
-        assert_eq!(height, ROW_H - ELBOW_OVERSHOOT);
-
-        // Both at once: a lane can be reached from above and left from below in the same row.
-        let (top, height) = lane_segment_span(
-            &seg,
-            ROW_H,
-            RowNeighbours {
-                above: &above,
-                below: &below,
-            },
-        );
-        assert_eq!(top, ELBOW_OVERSHOOT);
-        assert_eq!(height, ROW_H - ELBOW_OVERSHOOT * 2.0);
-    }
-
-    #[test]
-    fn only_the_lane_a_neighbouring_elbow_actually_points_at_is_trimmed() {
-        // The trim keys on the elbow's own lane and direction, not merely on "a neighbour has an
-        // elbow" - trimming an unrelated lane would leave a real, visible gap in its line.
-        let above = elbow(ElbowKind::Diverging, 0, 1);
-        let neighbours = RowNeighbours {
-            above: &above,
-            ..Default::default()
-        };
-        assert_eq!(
-            lane_segment_span(&through_lane(2), ROW_H, neighbours),
-            (px(0.0), ROW_H),
-            "lane 2 is untouched by an elbow pointing at lane 1"
-        );
-        // A `Converging` elbow above reaches *up*, away from this row, so it must not trim either.
-        let above_converging = elbow(ElbowKind::Converging, 1, 0);
-        assert_eq!(
-            lane_segment_span(
-                &through_lane(1),
-                ROW_H,
-                RowNeighbours {
-                    above: &above_converging,
-                    ..Default::default()
-                }
-            ),
-            (px(0.0), ROW_H),
-            "a Converging elbow in the row above reaches away from this row, not into it"
-        );
-    }
-
-    #[test]
-    fn a_half_height_stub_is_never_trimmed_by_a_neighbouring_elbow() {
-        // A lane that starts or ends in this row is exactly the lane a *same-row* elbow covers,
-        // and `render_graph_lane_canvas` already skips it outright. It can never also be the lane a
-        // neighbouring row's elbow points at, so trimming it would only ever shorten a real line.
-        let above = elbow(ElbowKind::Diverging, 0, 1);
-        let neighbours = RowNeighbours {
-            above: &above,
-            ..Default::default()
-        };
-        let mut starts = through_lane(1);
-        starts.starts_here = true;
-        assert_eq!(
-            lane_segment_span(&starts, ROW_H, neighbours),
-            (ROW_H / 2.0, ROW_H / 2.0)
-        );
-        let mut ends = through_lane(1);
-        ends.ends_here = true;
-        assert_eq!(
-            lane_segment_span(&ends, ROW_H, neighbours),
-            (px(0.0), ROW_H / 2.0)
-        );
     }
 
     #[test]
@@ -3521,6 +3605,24 @@ mod graph_elbow_render_tests {
             let exit_bounds = cx
                 .debug_bounds(exit_selector)
                 .unwrap_or_else(|| panic!("{exit_selector} must be painted"));
+            // Measured on the *waist* - the painted horizontal run itself, which is the piece that
+            // is unambiguously on one side of the dot or the other. Each curve box straddles the
+            // dot by design (its dot end has to finish underneath it), so a box edge is the wrong
+            // thing to read a "which half" claim off.
+            let straight_selector: &'static str = Box::leak(
+                format!("graph-row-{root_row_index}-elbow-{elbow_index}-converging-straight")
+                    .into_boxed_str(),
+            );
+            let straight_bounds = cx
+                .debug_bounds(straight_selector)
+                .unwrap_or_else(|| panic!("{straight_selector} must be painted"));
+            assert!(
+                straight_bounds.origin.y < row_center_y,
+                "a Converging elbow's horizontal run must sit above the row's vertical centre \
+                 {row_center_y:?}, not the bottom half where a Diverging elbow would render: was \
+                 {:?}",
+                straight_bounds.origin.y
+            );
             assert!(
                 entry_bounds.origin.y < row_center_y,
                 "a Converging elbow's entry curve must start in the row's top half (entry top \
@@ -3528,11 +3630,14 @@ mod graph_elbow_render_tests {
                  half where a Diverging elbow would render",
                 entry_bounds.origin.y
             );
+            // The exit lands *on* the dot, so it may finish a little past the centre - but never
+            // further than the dot's own disc hides.
             assert!(
-                exit_bounds.origin.y + exit_bounds.size.height <= row_center_y + px(1.5),
-                "a Converging elbow's exit curve must land at (or right before) the row's \
-                 vertical centre {row_center_y:?}, not extend into the bottom half like a \
-                 Diverging elbow would: bottom was {:?}",
+                exit_bounds.origin.y + exit_bounds.size.height
+                    <= row_center_y + theme::graph::DOT_COMMIT / 2.0,
+                "a Converging elbow's exit curve must finish under the row's own dot, not extend \
+                 into the bottom half like a Diverging elbow would: bottom was {:?}, centre \
+                 {row_center_y:?}",
                 exit_bounds.origin.y + exit_bounds.size.height
             );
             // Real x coverage against the *painted* stroke, not merely the box: an adversarial
@@ -3632,11 +3737,26 @@ mod graph_elbow_render_tests {
         let exit_bounds = cx
             .debug_bounds(exit_selector)
             .unwrap_or_else(|| panic!("{exit_selector} must be painted"));
+        // Measured on the waist, for the reason spelled out in the Converging test above.
+        let straight_selector: &'static str = Box::leak(
+            format!("graph-row-{merge_row_index}-elbow-0-diverging-straight").into_boxed_str(),
+        );
+        let straight_bounds = cx
+            .debug_bounds(straight_selector)
+            .unwrap_or_else(|| panic!("{straight_selector} must be painted"));
         assert!(
-            entry_bounds.origin.y >= row_center_y - px(1.5),
-            "a Diverging elbow's entry curve must start at (or right after) the row's vertical \
-             centre {row_center_y:?}, not the top half where a Converging elbow would render: \
-             top was {:?}",
+            straight_bounds.origin.y > row_center_y,
+            "a Diverging elbow's horizontal run must sit below the row's vertical centre \
+             {row_center_y:?}, not the top half where a Converging elbow would render: was {:?}",
+            straight_bounds.origin.y
+        );
+        // The entry leaves the dot, so it starts under the dot's own disc - at or above the centre,
+        // but never further above than that disc hides.
+        assert!(
+            entry_bounds.origin.y >= row_center_y - theme::graph::DOT_COMMIT / 2.0
+                && entry_bounds.origin.y <= row_center_y,
+            "a Diverging elbow's entry curve must start under the row's own dot: top was {:?}, \
+             centre {row_center_y:?}",
             entry_bounds.origin.y
         );
         assert!(
@@ -3740,6 +3860,65 @@ mod graph_elbow_render_tests {
             "the Diverging elbow itself must still be painted - lane 1's connection must not be \
              lost, only de-duplicated"
         );
+    }
+
+    /// The layout fact `render_graph_lane_canvas`'s `overflow_hidden()` rests on, and the real
+    /// paint-level regression for the "lines disappearing at elbow connections when hovering"
+    /// report. That clip is what stops an elbow's straight lead-out from spilling into the next
+    /// row's rectangle, where that row's own opaque hover background - painted later, since rows
+    /// are siblings drawn in order - would cover it.
+    ///
+    /// Clipping is only *lossless* because consecutive lane canvases tile exactly: each is `ROW`
+    /// tall and each sits `ROW` below the last, so the pixel row where one canvas' clip cuts the
+    /// line is the very pixel row where the next canvas' own full-height `LaneSegment` resumes it.
+    /// A gap or an overlap here would turn the clip into a visible dash (or bring back the doubled
+    /// line an earlier round fixed), and neither is visible from geometry alone - it depends on the
+    /// real flex layout of a row whose `border_b_1()` makes its content box shorter than `ROW`.
+    #[gpui::test]
+    fn consecutive_lane_canvases_tile_exactly_so_the_row_clip_loses_no_line(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded(cx, seed_converging_history);
+        let row_count = app.read_with(cx, |app, _| {
+            let GraphLoadState::Loaded(graph) = &app.graph_state.load else {
+                panic!("graph must have loaded");
+            };
+            graph.rows.len()
+        });
+        assert!(
+            row_count >= 4,
+            "sanity check: this fixture must produce several real rows to compare, got {row_count}"
+        );
+
+        let mut previous: Option<gpui::Bounds<Pixels>> = None;
+        for index in 0..row_count {
+            let selector: &'static str =
+                Box::leak(format!("graph-row-{index}-lane-canvas").into_boxed_str());
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must be painted"));
+            assert_eq!(
+                bounds.size.height,
+                theme::graph::ROW,
+                "row {index}'s lane canvas must be exactly one row tall - the clip box is this \
+                 box, so anything else clips at the wrong pixel"
+            );
+            if let Some(previous) = previous {
+                assert_eq!(
+                    bounds.origin.y - previous.origin.y,
+                    theme::graph::ROW,
+                    "row {index}'s lane canvas must start exactly where row {}'s ends, or the \
+                     clipped-off lead-out and the next row's own segment do not meet",
+                    index - 1
+                );
+                assert_eq!(
+                    bounds.origin.x, previous.origin.x,
+                    "every lane canvas must share one x origin, or lane columns would not line up \
+                     across the clip boundary"
+                );
+            }
+            previous = Some(bounds);
+        }
     }
 }
 
