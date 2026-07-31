@@ -1,5 +1,33 @@
 # Assessment
 
+> **Addendum (inline git blame, GitHub issue #29):** the rest of this document is a
+> point-in-time snapshot from an earlier, much smaller phase of this project (see its own
+> line counts below) and is left as-is rather than rewritten. What follows is an honest,
+> narrowly-scoped note on the one subsystem added in this session, not a refresh of the
+> whole picture.
+>
+> **Real, end to end:** `wt_core::blame::blame_file`/`commit_message` run real `git blame
+> --line-porcelain`/`git log` against real repositories (9 tests, real tempdir repos, no
+> mocking) and correctly distinguish "not a repo"/"untracked file" from a genuine failure.
+> The app-side current-line inline blame is wired to that real data, not a placeholder: it
+> runs off the GPUI foreground thread, is cached per file and revision, recomputes via a
+> throttled freshness poll (verified to cover a save; verified in code, not by hand-testing
+> a real `git commit`/checkout from inside a running app window, that the same poll also
+> catches a commit or branch switch - a real but slightly weaker chain of evidence than the
+> save path, which has an explicit, direct trigger and its own docs say so). The hover
+> tooltip's full commit message is real and lazily fetched, not truncated/faked.
+> **Not built:** the issue's secondary gutter/full-file blame view - no settings field or UI
+> element pretends to offer it. **Not independently visually verified:** unlike this
+> document's own "watched it run, not just read code that claims it runs" standard for
+> earlier steps, this session had no interactive GPUI window available to click into and
+> screenshot - `cargo test`/`cargo clippy` on the two crates this change touches
+> (`wt-core`, `app`) are the actual evidence; a full `cargo test --workspace` run in this
+> session's sandbox hit a large number of pre-existing, unrelated failures (real `/proc`
+> reads, real PTY behavior, real language-server process spawns, a Windows path-separator
+> assertion in recently-rebased code) that reproduce identically with this change's files
+> stashed out, so they're excluded from this feature's own verification rather than
+> papered over.
+
 Written at the end of an autonomous, multi-agent build session: ~10h40m of wall-clock
 time (first commit 00:43, last commit 11:24, same day), roughly 2.4M+ tokens of subagent
 work across builder/checker/finder delegations, 10 commits, 5546 lines of hand-written
