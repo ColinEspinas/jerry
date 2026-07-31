@@ -938,11 +938,6 @@ pub mod graph {
     /// A lane's vertical sits at `x = 9 + lane * 14` (§2).
     pub const LANE_X_BASE: Pixels = px(9.0);
     pub const LANE_STEP: Pixels = px(14.0);
-    /// Combined vertical span of one elbow's entry + exit curve boxes (§2 originally specified
-    /// "a 14px-tall box" for the whole elbow as a single corner; the S-curve redesign splits that
-    /// into two curves, each its own `ELBOW_CURVE_SIZE`-square box, so this is `2 * ELBOW_CURVE_SIZE`
-    /// now, not the original spec's literal 14).
-    pub const ELBOW_HEIGHT: Pixels = px(20.0);
     /// Each S-curve piece's own box width, and its base height (`crate::graph_view::render`'s
     /// `CurveBox::height` adds exactly one stroke to the bottom-edged curve's own height, so that
     /// GPUI's inside-painted bottom border lands on the waist row rather than one row above it -
