@@ -708,7 +708,10 @@ pub(in crate::code_surface) fn render_file_view_line(
     let hovered_byte_range = hover_entry
         .and_then(|entry| (entry.line_number == line_number).then(|| entry.byte_range.clone()));
 
-    let mut text_row = div().flex();
+    // The code runs (and the inline diagnostic message) keep their natural width in their own
+    // `flex_none` box, so they never shrink; only the blame span placed beside them below yields
+    // and truncates at the pane's right edge.
+    let mut runs = div().flex().flex_none();
     let mut byte_cursor = 0usize;
     for (run_text, kind, is_diagnostic) in
         diagnostics_view::overlay_diagnostic_runs(&line.runs, diagnostics)
@@ -767,7 +770,7 @@ pub(in crate::code_surface) fn render_file_view_line(
                 ));
             }
         }
-        text_row = text_row.child(run);
+        runs = runs.child(run);
     }
     if let Some(first) = diagnostics.first() {
         // Only the message's first line is shown inline: `uniform_list` measures one row's
@@ -775,15 +778,19 @@ pub(in crate::code_surface) fn render_file_view_line(
         // `\n`s are routine) would otherwise clip or overlap the row below. The full message is
         // still shown in `render_diagnostics_card` below, which isn't height-constrained.
         let first_line = first.message.lines().next().unwrap_or_default();
-        text_row = text_row.child(
+        runs = runs.child(
             div()
                 .pl(px(10.0))
                 .text_color(diagnostic_inline_message_color(first.severity))
                 .child(first_line.to_string()),
         );
     }
-    // GitHub issue #29: the current line's real inline git blame, dimmed, at the end of the
-    // row - `inline_blame` is only ever `Some` on the current line (see
+    // `flex_1` + `min_w_0` so the text row fills the pane's remaining width and the blame span
+    // below (the only shrinkable child) truncates exactly at its right edge.
+    let mut text_row = div().flex().flex_1().min_w_0().child(runs);
+    // GitHub issue #29: the current line's dimmed inline git blame, placed in-flow immediately
+    // after the code text so it begins right at the end of the line and is truncated at the
+    // pane's right edge. `inline_blame` is only ever `Some` on the current line (see
     // `HoverRenderContext::inline_blame`'s own docs).
     if let Some(label) = inline_blame {
         text_row = text_row.child(blame_view::render_inline_blame_span(label, line_number));

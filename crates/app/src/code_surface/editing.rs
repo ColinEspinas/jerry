@@ -1251,14 +1251,26 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
     .absolute()
     .size_full();
 
-    let text_row = gpui::div()
+    let mut text_row = gpui::div()
         .id(("file-view-editable-text", line_number))
         .relative()
         .flex_1()
         .min_w_0()
         .h(row_line_height)
         .flex()
-        .children(visible_runs)
+        // The code runs keep their natural width in their own `flex_none` box, so they never
+        // shrink; only the blame span placed beside them below yields and truncates.
+        .child(gpui::div().flex_none().flex().children(visible_runs));
+    // GitHub issue #29: the current line's dimmed inline git blame, placed *in-flow* immediately
+    // after the code text so it begins right at the end of the line and is truncated at the
+    // pane's right edge - rather than pinned to the far right of the row (a flex sibling of the
+    // `flex_1` text wrapper), where it used to be painted on top of a long line's own overflowing
+    // glyphs. `inline_blame` is only ever `Some` on the current line (see
+    // `EditableLineContext::inline_blame`'s own docs), so this never appears on any other row.
+    if let Some(label) = inline_blame {
+        text_row = text_row.child(render_inline_blame_span(label, line_number));
+    }
+    let text_row = text_row
         .child(cursor_overlay)
         .on_mouse_down(
             gpui::MouseButton::Left,
@@ -1407,12 +1419,8 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
         );
     }
 
-    // GitHub issue #29: the current line's real inline git blame, dimmed, at the very end of
-    // the row - `inline_blame` is only ever `Some` on the current line (see
-    // `EditableLineContext::inline_blame`'s own docs), so this never appears on any other row.
-    if let Some(label) = inline_blame {
-        row = row.child(render_inline_blame_span(label, line_number));
-    }
+    // NB: the current line's inline git blame is rendered *inside* `text_row` above (right after
+    // the code runs), not appended here at the end of the row - see that construction's own docs.
 
     row.into_any_element()
 }

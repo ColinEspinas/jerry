@@ -349,17 +349,17 @@ impl AdeApp {
 /// carrying the sha/full message. `line_number` only seeds the element id, so two rows never
 /// collide.
 ///
-/// `min_w_0()` + `max_w()` + `truncate()` (the same combination `crate::status_bar`'s own
-/// `render_status_worktree_history_notice` uses for its long, load-bearing text) let this span
-/// shrink and ellipsize instead of demanding its full natural width: `EditableLineContext::
-/// inline_blame`'s caller only ever attaches this to the *current* line, whose `text_row` is a
-/// real, unclamped `.w_full()` element (deliberately, for click hit-testing - see that div's own
-/// docs) with no `overflow_hidden()` of its own, so a real code line longer than the available
-/// row width paints past its own box on a narrow window/pane. Without a background here, that
-/// bled-through code text and this span's own text occupied the same pixels - a real, visually
-/// broken double-text overlap, not just a layout nitpick. `bg(theme::surface::CURRENT_LINE)`
-/// matches the current-line highlight `row` itself already carries on every row this ever
-/// renders on, so the backdrop is seamless and masks any bleed instead of showing through it.
+/// This span is placed *in-flow*, immediately after the current line's code runs inside the same
+/// `text_row` (see the caller's own docs in `editing::render_editable_file_view_line` and
+/// `file_view::render_file_view_line`): the runs sit in their own `flex_none` box and keep their
+/// natural width, so this span is the only shrinkable sibling. `min_w_0()` + `max_w()` +
+/// `truncate()` (the same combination `crate::status_bar`'s own
+/// `render_status_worktree_history_notice` uses for its long, load-bearing text) therefore let it
+/// begin right at the end of the line's text and ellipsize exactly when it would reach the pane's
+/// right edge, instead of being pinned to the far right of the row where a long line's own
+/// overflowing glyphs used to paint through it. `pl()` gives the small gap after the code text;
+/// `bg(theme::surface::CURRENT_LINE)` matches the current-line highlight `row` already carries on
+/// every row this renders on, so the backdrop stays seamless.
 pub(in crate::code_surface) fn render_inline_blame_span(
     label: &blame::InlineBlameLabel,
     line_number: usize,
