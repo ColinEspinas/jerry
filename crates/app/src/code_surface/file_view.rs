@@ -388,6 +388,7 @@ impl AdeApp {
         // handler further down (see its own docs) needs its own independent copy of both.
         let has_buffer = self.edit_buffers.contains_key(&relative_path_buf);
         let below_content_click_path = relative_path_buf.clone();
+        let minimap_relative_path = relative_path_buf.clone();
 
         let mut code = uniform_list(
             "file-view-code",
@@ -623,10 +624,38 @@ impl AdeApp {
                 &marks,
                 cx,
             ));
-        body = body.child(zoom_scoped(
-            self.effective_code_rem_px(),
-            code_with_scrollbar,
-        ));
+        // GitHub issue #30's real minimap (`crate::code_surface::minimap`) - reads the exact
+        // same highlighted lines this view itself renders from (a live edit buffer's, or the
+        // read-only parsed cache's - the same `has_buffer`/fallback split `code`'s own row
+        // builder above already makes), and the same real git-changed-line set the gutter stripe
+        // and scrollbar marks above already use. `None` (no minimap) is a real, structural
+        // outcome (the setting is off, or the file is too large - see that module's own docs),
+        // not a placeholder.
+        let minimap_lines: Option<&[code_view::RenderedLine]> =
+            if let Some(buffer) = self.edit_buffers.get(&minimap_relative_path) {
+                Some(buffer.lines.as_slice())
+            } else {
+                self.file_view_cache
+                    .as_ref()
+                    .map(|parsed| parsed.lines.as_slice())
+            };
+        let minimap = match minimap_lines {
+            Some(lines) => self.render_minimap(
+                lines,
+                &self.file_view_changed_lines,
+                row_line_height.as_f32(),
+                cx,
+            ),
+            None => None,
+        };
+        let code_row = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .child(code_with_scrollbar)
+            .children(minimap);
+        body = body.child(zoom_scoped(self.effective_code_rem_px(), code_row));
 
         if truncated {
             body = body.child(render_sidebar_message(

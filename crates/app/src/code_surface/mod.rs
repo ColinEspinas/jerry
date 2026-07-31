@@ -26,11 +26,16 @@
 //!   card, and go-to-definition. (The client itself lives in `crate::lsp`.)
 //! - [`editing`] - the `EntityInputHandler`/action wiring that drives [`edit_buffer`] from
 //!   real keystrokes.
+//! - [`minimap`] - the real reduced-scale, syntax-colored minimap to the right of the code
+//!   column: draggable viewport slider, click-to-jump, and the git-diff overlay.
 //!
-//! Every GPUI-facing file here except [`editing`] glob-imports this module (`use super::*`),
-//! which is why the shared imports they need live here rather than at the top of each file -
-//! the same convention `crate::root` established for its own submodules. [`editing`] is the
-//! exception: it arrived with its own explicit import block and kept it.
+//! Every GPUI-facing file here except [`editing`]/[`minimap`] glob-imports this module
+//! (`use super::*`), which is why the shared imports they need live here rather than at the
+//! top of each file - the same convention `crate::root` established for its own submodules.
+//! [`editing`]/[`minimap`] are the exceptions: each needs `gpui` symbols outside the shared
+//! subset this module re-exports (canvas/fill/point/size/`Bounds` for [`minimap`],
+//! `EntityInputHandler`/`UTF16Selection`/etc for [`editing`]), so each keeps its own explicit
+//! `use gpui::{...};` block instead.
 
 use crate::code_surface::state::{
     BlameCacheEntry, BlameLoadState, CommitMessageState, DiffLoadState, FileLoadState, HoverEntry,
@@ -67,6 +72,7 @@ pub(crate) mod diff_view;
 pub(crate) mod editing;
 pub(crate) mod file_view;
 pub(crate) mod lsp_ui;
+pub(crate) mod minimap;
 pub(crate) mod render;
 pub(crate) mod state;
 pub(crate) mod tabs;

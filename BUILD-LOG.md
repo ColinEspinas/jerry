@@ -3085,7 +3085,13 @@ simulated output" violation `CONTRIBUTING.md` exists to prevent. Documented dire
   so `render_vertical_scrollbar` only (no horizontal variant) shipped this pass, rather than an
   untested, unreachable horizontal one with no real overflowing content anywhere to exercise it.
 
-## Minimap: scoped out this pass, not shipped fake
+## Minimap: scoped out this pass, not shipped fake (superseded below)
+
+**Update, follow-up change:** the gap this section documents was closed - see "Minimap: a real,
+canvas-rendered overview (GitHub issue #30, completing the #14 editor-polish umbrella)" further
+down for what actually shipped. Left below unedited as the real historical record of *why* it
+was deferred rather than rushed, per this file's own "living record, not changelog trivia"
+convention - only the heading above and this note are new.
 
 GitHub issue #30's second half (a VS-Code-style minimap: reduced-scale syntax-colored rendering,
 a draggable viewport slider, click-to-jump, search/git overlays, an `editor.minimap.enabled`
@@ -3121,3 +3127,119 @@ This is a real, honestly-scoped gap, not an oversight: GitHub issue #30 explicit
 default for very large files" as an escape hatch for the minimap's own scope, and the task framing
 this issue was built under was explicit that landing the scrollbar audit solidly, with the minimap
 left as a documented gap, beats shipping a fake/non-functional minimap alongside it.
+
+## Minimap: a real, canvas-rendered overview (GitHub issue #30, completing the #14 editor-polish umbrella)
+
+The follow-up this branch's own earlier "scoped out this pass" section above flagged: a real,
+VS-Code-style minimap to the right of the File view's code column. `crates/app/src/code_surface/minimap.rs`
+is the whole feature - pure geometry/color-bar math plus the one `AdeApp::render_minimap` GPUI
+call site, wired into `crate::code_surface::file_view::render_file_view` as a new sibling of the
+code column (both now live inside one `.flex_row()` wrapper, itself still the single child
+`zoom_scoped` scopes rem-size through, unchanged).
+
+**Real syntax colors, not a second palette.** The minimap reads the exact same
+`code_view::RenderedLine` runs (`(SharedString, HighlightKind)` pairs) the File view's own rows
+already paint from - whichever of a live `EditBuffer::lines` or the read-only `ParsedFile::lines`
+`render_file_view` already resolved that render, passed in rather than re-derived. One honest
+correction to this branch's own earlier docs: those docs (and the task this follow-up was done
+under) referenced "22 real scope buckets" from a sibling PR extending `HighlightKind`. That PR
+hasn't landed on `master`/this branch as of this change (`code_view.rs`'s own module docs still
+say "the six buckets `design_handoff_jerry_ade/README.md`'s File view colour table actually
+defines", and `HighlightKind` itself still has exactly six variants) - so the minimap renders
+with the six real kinds that exist today, not a number that doesn't match this codebase yet.
+
+**A real, draggable viewport slider and click-to-jump**, both driving the exact same
+`AdeApp::file_view_scroll_handle` the code column's own overlay scrollbar
+(`crate::root::scrollbar`) and go-to-definition already drive - not a second, disconnected notion
+of scroll position. The slider is a real `on_drag`/`on_drag_move` target
+(`MinimapSliderDrag`, a distinct payload type for the same real reason
+`crate::root::scrollbar::ScrollbarDrag` needs one - `on_drag_move` dispatches by the active drag's
+`TypeId` alone, and both the code column's scrollbar thumb and this slider can be mounted at
+once); the track's plain click handler jumps/centers instead.
+
+**A real git-diff overlay**, reusing `AdeApp::file_view_changed_lines` (the same on-disk diff
+already backing the gutter stripe and the scrollbar's own decoration marks) - not a second diff
+computed here. **Search-match overlays are honestly not implemented**, for the identical reason
+this branch's scrollbar work already documented for its own decoration marks: this app has no
+find-in-file feature anywhere (grep for SearchMatch/find_in_file in crates/app/src still matches
+nothing), and inventing a fake match set to paint ticks for would be exactly the "no simulated
+output" violation `CONTRIBUTING.md` exists to prevent.
+
+**The canvas-rendering approach.** Two plain `gpui::canvas` elements (the same primitive
+`crate::code_surface::editing`'s cursor overlay already uses for its own per-row paint, and the
+checkout's own `crates/gpui/examples/painting.rs` demonstrates for raw quad painting) - one a
+bounds-measuring canvas (mirrors the established `AdeApp::body_bounds`/`AdeApp::plus_button_bounds`/
+`TerminalPane::content_bounds` one-frame-lag idiom, needed because the slider's own pixel geometry
+needs the panel's real rendered height, which is only knowable after layout), the other paints
+every line's real color bar plus the git overlay strip via `window.paint_quad(fill(...))` calls
+built from a plain `Vec<(f32, f32, f32, f32, Rgba)>` computed just before the canvas is
+constructed - never re-highlighting anything, just reading already-computed run colors/lengths.
+Real glyphs are never shaped or painted at this scale (a 2-3px-tall shaped line would be illegible
+and wasteful); each token becomes a solid color bar sized by character count instead, the same
+"silhouette, not readable text" approximation real minimaps use.
+
+**Compress-to-fit, not pan - a deliberate, documented simplification.** A fully faithful
+VS-Code-style minimap lets its own drawn region pan independently of a fixed per-line height once
+a file is too long to fit at that height. This implementation instead always draws every line,
+compressing the per-line height below its natural 3px (at 100% scale) whenever the whole file
+would otherwise be taller than the panel - trading fidelity on a long file (many lines blur into
+an averaged color band, the same cost a real editor's own "fit to viewport" minimap setting has)
+for one code path with no second scroll offset of its own to keep synced with the main editor.
+`MAX_MINIMAP_LINES` (2000) is picked so that trade stays legible - well beyond it, the compression
+would already be a sub-pixel-per-line smear, which is exactly why the large-file gate sits close
+to that same number rather than much higher.
+
+**The settings schema.** `crate::settings::store::EditorSettings { minimap_enabled: bool,
+minimap_scale_percent: u16 }`, a new `Settings.editor` field alongside `window`/`appearance`/
+`theme`/`keymap`/`file_tree`, following the exact same percentage-multiplier convention
+`AppearanceSettings::editor_zoom_percent` already established (min/max/default/step = 50/200/100/25,
+sanitized on load the same way a hand-edited `editor_zoom_percent` or `file_tree.max_entries`
+already is). `minimap_enabled` defaults to `true` - real editors ship minimaps on by default, and
+the large-file gate below is what keeps that default honest for huge files, not a defensively-off
+setting. Wired into a real settings page for the first time: `SettingsPage::Editor` moves from
+`crate::settings::state`'s documented nav-only-placeholder list into the real, implemented set (now
+eight pages, not seven) - it is a **partial** graduation, not a full one: the minimap toggle/scale
+stepper are real and round-trip through `settings.toml` (a new `ConfigPage::Editor` config
+banner/snippet block, following General/Appearance/Theme's existing pattern exactly), but
+indentation/soft-wrap/whitespace-display still have no real backing anywhere in this codebase and
+stay left off the page entirely, per that module's own "only what's real" discipline -
+`crate::settings::state`'s module docs and `SettingsPage::Editor::subtitle` say so explicitly
+rather than showing an inert control.
+
+**The large-file threshold decision.** `should_render_minimap` gates on `enabled &&
+0 < line_count <= MAX_MINIMAP_LINES` (2000), independent of the setting - turning the setting on
+can never light up a minimap for a file where "compress to fit" has already degenerated into an
+unreadable smear. This is a structural gate, not a user-overridable escape hatch: GitHub issue
+#30 only asks for "hidden by default for very large files", not a way to force one back on for a
+huge file, so no such override was built (a real, disclosed scope cut, not an oversight).
+
+**Not off the main thread, honestly - an explicit non-claim.** The original scoped-out section's
+GPUI-single-foreground-thread reasoning still holds: the actual paint runs on the same foreground
+thread `render_file_view` itself runs on; only highlighting (already off-thread, unrelated to this
+module) genuinely isn't. What changed is the risk calculus, not the architecture - this module
+never re-highlights anything and the large-file gate bounds the per-render rect-building cost - but
+that calculus was **not** backed by a real `gpui::FrameTiming` measurement the way this project's
+own terminal-poll-cadence and file-tree-virtualization work was. Recorded here as a real, disclosed
+gap in this change's own rigor rather than an implied benchmark that wasn't actually run.
+
+**Tests**: `crates/app/src/code_surface/minimap.rs`'s own `geometry_tests` module covers every
+pure function (the large-file gate, panel width/line-height/char-width scaling, compression math,
+visible-line-range derivation, slider geometry and its floor/clamp behavior, click/drag-to-line
+math, and the color-bar/git-overlay builders) without any live GPUI window - the same
+`root::scrollbar_geometry`-style discipline this codebase already established for the scrollbar's
+own thumb math. `crates/app/src/settings/store.rs` gets new coverage for `EditorSettings`' real
+defaults, its sanitize-on-load clamping (round-tripped through an actual `settings.toml` file, not
+just called directly), and the pre-minimap-era `settings.toml` fallback (`[editor]` section
+missing entirely still loads real defaults via `#[serde(default)]`, the same proof
+`an_old_settings_toml_missing_the_keymap_section_entirely_still_loads_cleanly` already gives for
+`[keymap]`). `crates/app/src/settings/state.rs`'s existing implemented-pages/placeholder-subtitle
+tests were updated in place (renamed to "eight", and the placeholder-subtitle reference page moved
+from `Editor` - no longer nav-only - to `Notifications`, which still genuinely is) rather than left
+to silently start asserting something false.
+
+Verified locally on this Windows machine, scoped to the crates/modules this change touched (the
+same scoping this umbrella issue's other agents - scrollbars, git-blame, caret, multi-cursor,
+theme - all independently found necessary, per their own `BUILD-LOG.md` entries, because a full
+`cargo test --workspace`/`cargo clippy --workspace` hits pre-existing, environment-specific
+failures unrelated to any of these changes): `cargo build --workspace`, `cargo test -p app`,
+`cargo clippy -p app --all-targets -- -D warnings`, `cargo fmt --all -- --check` all pass.

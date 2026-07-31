@@ -97,6 +97,7 @@ impl AdeApp {
             file_view_last_freshness_check: None,
             file_load_state: FileLoadState::Idle,
             file_view_changed_lines: HashSet::new(),
+            minimap_panel_bounds: gpui::Bounds::default(),
             code_cursor: None,
             blame_cache: HashMap::new(),
             blame_state: HashMap::new(),

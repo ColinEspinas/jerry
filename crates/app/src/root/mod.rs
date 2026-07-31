@@ -449,6 +449,13 @@ pub struct AdeApp {
     /// [`Self::open_diff_file_cache`] holds - recomputed only by
     /// [`Self::refresh_open_diff_file_cache`], never per render.
     pub(crate) file_view_changed_lines: HashSet<usize>,
+    /// The real minimap panel's most recently measured bounds (`crate::code_surface::minimap`) -
+    /// updated every render by a small measuring `gpui::canvas` child, the same established
+    /// one-frame-lag idiom [`Self::body_bounds`]/[`Self::plus_button_bounds`] already use for the
+    /// same real reason (an absolutely-positioned sibling - here, the viewport slider - needs a
+    /// real pixel height that's only known after layout). `gpui::Bounds::default()` (zero) until
+    /// the first real measurement lands.
+    pub(crate) minimap_panel_bounds: gpui::Bounds<Pixels>,
     /// The File view's "last click" cursor line (1-indexed), set by
     /// [`Self::render_file_view_line`]'s click handler and reset to `1` on a fresh file load.
     /// No column tracking: per-character hit-testing against a monospace run wasn't implemented

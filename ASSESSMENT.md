@@ -62,6 +62,16 @@ the parts that don't reflect well on the process.
   the wrong filename, a bug that silently hid every untracked file, and a bug that broke
   under a common (not obscure) git config setting. All three are fixed and covered by
   regression tests built from the actual reproduction, not from guessing at a fix.
+- **The code editor's minimap** (GitHub issue #30, added well after this document's original
+  session - see `BUILD-LOG.md`'s "Minimap: a real, canvas-rendered overview" entry for the full
+  design record) is real, not a decorative panel: it renders the open file's actual syntax-colored
+  content at reduced scale from the same highlighted data the editor itself paints from, its
+  viewport slider is genuinely draggable and click-to-jump genuinely scrolls the real editor, and
+  its git-diff overlay reads the same real on-disk diff the gutter stripe does. Two disclosed,
+  narrower limits, not fabricated ones: search-match overlays aren't implemented (this app has no
+  find-in-file feature to source real matches from at all), and the "doesn't cost frames while
+  scrolling" requirement was met structurally (a large-file gate, no re-highlighting) rather than
+  proven with an actual `gpui::FrameTiming` measurement.
 
 ## What does not run, or is genuinely rough
 

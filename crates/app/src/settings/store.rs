@@ -86,6 +86,7 @@ pub struct Settings {
     pub keymap: KeymapSettings,
     pub file_tree: FileTreeSettings,
     pub blame: BlameSettings,
+    pub editor: EditorSettings,
 }
 
 /// `crate::root::AdeApp::window_controls_style`'s persisted backing - see
@@ -306,6 +307,48 @@ impl FileTreeSettings {
     }
 }
 
+/// Surface C's minimap - `crate::code_surface::minimap`'s own real, persisted settings
+/// (GitHub issue #30's `editor.minimap.enabled`). This is the one field in the `Editor` settings
+/// page that's genuinely backed by real behaviour today (see `crate::settings::state`'s own
+/// module docs on why the rest of that page still stays a placeholder) - `minimap_enabled`
+/// toggles `crate::code_surface::minimap::AdeApp::render_minimap` on/off directly, and
+/// `minimap_scale_percent` is the real multiplier that module's own `panel_width`/`char_width`/
+/// `effective_line_height` apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorSettings {
+    pub minimap_enabled: bool,
+    pub minimap_scale_percent: u16,
+}
+
+impl Default for EditorSettings {
+    fn default() -> Self {
+        Self {
+            minimap_enabled: true,
+            minimap_scale_percent: MINIMAP_SCALE_PERCENT_DEFAULT,
+        }
+    }
+}
+
+/// [`EditorSettings::minimap_scale_percent`]'s real bounds/default/step - the same
+/// percentage-multiplier convention [`EDITOR_ZOOM_PERCENT_MIN`]/`_MAX`/`_DEFAULT`/`_STEP` already
+/// established for [`AppearanceSettings::editor_zoom_percent`].
+pub const MINIMAP_SCALE_PERCENT_MIN: u16 = 50;
+pub const MINIMAP_SCALE_PERCENT_MAX: u16 = 200;
+pub const MINIMAP_SCALE_PERCENT_DEFAULT: u16 = 100;
+pub const MINIMAP_SCALE_PERCENT_STEP: u16 = 25;
+
+impl EditorSettings {
+    /// Clamps a hand-edited `minimap_scale_percent` into its documented range - the same
+    /// [`AppearanceSettings::sanitize`] discipline applied here, called once at load time (see
+    /// [`Settings::load_or_init_at`]).
+    pub fn sanitize(&mut self) {
+        self.minimap_scale_percent = self
+            .minimap_scale_percent
+            .clamp(MINIMAP_SCALE_PERCENT_MIN, MINIMAP_SCALE_PERCENT_MAX);
+    }
+}
+
 /// The config banner's `TOML | JSON` segment state (`CHANGELOG.md`'s change 3) - a display-only
 /// choice, not a [`Settings`] field (switching it never touches the file) - see the module docs'
 /// "TOML is the real file; JSON is a read-only alternate view" section.
@@ -366,6 +409,7 @@ impl Settings {
                 Ok(mut settings) => {
                     settings.appearance.sanitize();
                     settings.file_tree.sanitize();
+                    settings.editor.sanitize();
                     settings
                 }
                 Err(err) => {
@@ -420,7 +464,7 @@ impl Settings {
     }
 }
 
-/// Which settings page a [`snippet_lines`]/[`config_keys_line`] call is for - only the three
+/// Which settings page a [`snippet_lines`]/[`config_keys_line`] call is for - only the four
 /// pages `crate::settings::render` shows a config banner/snippet block on. Every other page
 /// `Jerry.dc.html`'s own `cfgKeys` fixture lists isn't backed by a [`Settings`] field, so a
 /// banner for it would describe a file section that doesn't exist.
@@ -429,6 +473,7 @@ pub enum ConfigPage {
     General,
     Appearance,
     Theme,
+    Editor,
 }
 
 /// The config banner's dot-joined key list for `page` - rewritten from `Jerry.dc.html`'s own
@@ -445,6 +490,7 @@ pub fn config_keys_line(page: ConfigPage) -> &'static str {
         ConfigPage::Theme => {
             "theme.name \u{b7} theme.follow_system \u{b7} theme.high_contrast_diff"
         }
+        ConfigPage::Editor => "editor.minimap_enabled \u{b7} editor.minimap_scale_percent",
     }
 }
 
@@ -482,6 +528,11 @@ struct ThemeSnippetDoc<'a> {
     theme: &'a ThemeSettings,
 }
 
+#[derive(Serialize)]
+struct EditorSnippetDoc<'a> {
+    editor: &'a EditorSettings,
+}
+
 /// Renders `page`'s slice of `settings` (the currently-loaded struct, never mockup fixture text)
 /// as TOML or JSON via the same serializers [`Settings::save_at`]/[`Settings::to_json_string`]
 /// use, so this can't drift from what the file (or its JSON preview) actually contains. Each
@@ -515,6 +566,14 @@ pub fn snippet_lines(settings: &Settings, page: ConfigPage, format: CfgFormat) -
         .unwrap_or_default(),
         (ConfigPage::Theme, CfgFormat::Json) => serde_json::to_string_pretty(&ThemeSnippetDoc {
             theme: &settings.theme,
+        })
+        .unwrap_or_default(),
+        (ConfigPage::Editor, CfgFormat::Toml) => toml::to_string_pretty(&EditorSnippetDoc {
+            editor: &settings.editor,
+        })
+        .unwrap_or_default(),
+        (ConfigPage::Editor, CfgFormat::Json) => serde_json::to_string_pretty(&EditorSnippetDoc {
+            editor: &settings.editor,
         })
         .unwrap_or_default(),
     };
@@ -560,6 +619,14 @@ mod tests {
             settings.file_tree.max_entries,
             FILE_TREE_MAX_ENTRIES_DEFAULT
         );
+        assert!(
+            settings.editor.minimap_enabled,
+            "the minimap is on by default"
+        );
+        assert_eq!(
+            settings.editor.minimap_scale_percent,
+            MINIMAP_SCALE_PERCENT_DEFAULT
+        );
     }
 
     #[test]
@@ -584,6 +651,66 @@ mod tests {
             Settings::load_or_init_at(&path).file_tree.max_entries,
             FILE_TREE_MAX_ENTRIES_MIN,
             "a cap too small to render a usable tree is clamped up, not honoured"
+        );
+    }
+
+    #[test]
+    fn a_hand_edited_minimap_scale_round_trips_and_an_out_of_range_one_is_clamped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "[editor]\nminimap_enabled = false\nminimap_scale_percent = 150\n",
+        )
+        .expect("write");
+        let loaded = Settings::load_or_init_at(&path);
+        assert!(!loaded.editor.minimap_enabled);
+        assert_eq!(loaded.editor.minimap_scale_percent, 150);
+
+        std::fs::write(
+            &path,
+            "[editor]\nminimap_enabled = true\nminimap_scale_percent = 9000\n",
+        )
+        .expect("write");
+        assert_eq!(
+            Settings::load_or_init_at(&path)
+                .editor
+                .minimap_scale_percent,
+            MINIMAP_SCALE_PERCENT_MAX,
+            "an absurdly large scale is clamped down, not honoured"
+        );
+
+        std::fs::write(
+            &path,
+            "[editor]\nminimap_enabled = true\nminimap_scale_percent = 1\n",
+        )
+        .expect("write");
+        assert_eq!(
+            Settings::load_or_init_at(&path)
+                .editor
+                .minimap_scale_percent,
+            MINIMAP_SCALE_PERCENT_MIN,
+            "an absurdly small scale is clamped up, not honoured"
+        );
+    }
+
+    /// An old `settings.toml` written before the minimap existed has no `[editor]` section at
+    /// all - `#[serde(default)]` must fall back to the real defaults (minimap on) rather than
+    /// failing the whole parse, the same real fallback
+    /// `an_old_settings_toml_missing_the_keymap_section_entirely_still_loads_cleanly` already
+    /// proves for `[keymap]`.
+    #[test]
+    fn an_old_settings_toml_missing_the_editor_section_entirely_still_loads_cleanly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[window]\ncontrols = \"system\"\n").expect("write old file");
+
+        let loaded = Settings::load_or_init_at(&path);
+
+        assert!(loaded.editor.minimap_enabled);
+        assert_eq!(
+            loaded.editor.minimap_scale_percent,
+            MINIMAP_SCALE_PERCENT_DEFAULT
         );
     }
 

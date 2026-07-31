@@ -7,12 +7,15 @@
 //!
 //! ## Which pages are real
 //!
-//! General, Agents, Worktrees, Appearance, Themes, Keybindings, and Language servers render
-//! real, live-derived content (see [`SettingsPage::is_implemented`]). Editor, Notifications,
+//! General, Agents, Worktrees, Appearance, Themes, Keybindings, Editor, and Language servers
+//! render real, live-derived content (see [`SettingsPage::is_implemented`]). Notifications,
 //! Integrations, and About are honest nav-only placeholders - `Jerry.dc.html`'s own `setStub`
-//! copy, "not designed in this mockup". Editor in particular has no real backing anywhere in
-//! this codebase for indentation/soft-wrap/whitespace-display, so it stays a placeholder rather
-//! than growing controls bound to nothing.
+//! copy, "not designed in this mockup". Editor is a partial exception, not a full one: its one
+//! real row is the minimap (`crate::code_surface::minimap`, GitHub issue #30's
+//! `editor.minimap.enabled`) - indentation/soft-wrap/whitespace-display still have no real
+//! backing anywhere in this codebase, so those stay left off the page entirely rather than
+//! growing controls bound to nothing, the same "only what's real" discipline every other page
+//! here already follows.
 //!
 //! ## Why the Agents/Worktrees "Behaviour"/"Policy" toggle sections are left out
 //!
@@ -105,6 +108,7 @@ impl SettingsPage {
                 | SettingsPage::Appearance
                 | SettingsPage::Theme
                 | SettingsPage::Keymap
+                | SettingsPage::Editor
                 | SettingsPage::LanguageServers
         )
     }
@@ -136,6 +140,9 @@ impl SettingsPage {
             }
             SettingsPage::LanguageServers => {
                 "One row per language server this app knows how to spawn, detected live on PATH - not configured."
+            }
+            SettingsPage::Editor => {
+                "The minimap (right of the code column) is real: syntax-colored overview, a draggable viewport slider, git-change ticks - saved for real and applied live. Search-match overlays, indentation, soft-wrap and whitespace display aren't built yet, so they're left off this page rather than shown inert."
             }
             _ => "Not designed yet - this page has no real content in this build.",
         }
@@ -693,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_seven_documented_pages_are_implemented() {
+    fn exactly_the_eight_documented_pages_are_implemented() {
         for page in SettingsPage::ALL {
             let expected = matches!(
                 page,
@@ -703,6 +710,7 @@ mod tests {
                     | SettingsPage::Appearance
                     | SettingsPage::Theme
                     | SettingsPage::Keymap
+                    | SettingsPage::Editor
                     | SettingsPage::LanguageServers
             );
             assert_eq!(
@@ -716,7 +724,7 @@ mod tests {
 
     #[test]
     fn nav_only_pages_share_the_same_honest_placeholder_subtitle() {
-        let placeholder = SettingsPage::Editor.subtitle();
+        let placeholder = SettingsPage::Notifications.subtitle();
         for page in SettingsPage::ALL {
             if page.is_implemented() {
                 assert_ne!(

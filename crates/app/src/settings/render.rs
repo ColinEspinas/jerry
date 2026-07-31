@@ -435,6 +435,9 @@ impl AdeApp {
                                         SettingsPage::LanguageServers => {
                                             self.render_settings_lsp_page(cx).into_any_element()
                                         }
+                                        SettingsPage::Editor => {
+                                            self.render_settings_editor_page(cx).into_any_element()
+                                        }
                                         _ => render_settings_placeholder_page().into_any_element(),
                                     }),
                             ),
@@ -1977,6 +1980,68 @@ impl AdeApp {
             })
     }
 
+    /// *Editor* - the one real row on this page is the minimap (GitHub issue #30,
+    /// `crate::code_surface::minimap`) - see `crate::settings::state`'s own module docs on why
+    /// the rest of this page (indentation/soft-wrap/whitespace-display) still has no real
+    /// backing and stays left off entirely, rather than shown as an inert control.
+    pub(in crate::settings) fn render_settings_editor_page(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let minimap_enabled = self.settings.editor.minimap_enabled;
+        let minimap_row = self.render_settings_row(
+            "Minimap",
+            "A reduced-scale, syntax-colored overview of the file to the right of the code \
+             column - drag its slider or click it to jump around. Hidden automatically for very \
+             large files regardless of this toggle.",
+            self.render_toggle_control(
+                "settings-minimap-enabled",
+                minimap_enabled,
+                cx,
+                |this, cx| this.toggle_minimap_enabled(cx),
+            ),
+        );
+        let minimap_scale_row = self.render_settings_row(
+            "Minimap scale",
+            "Panel width and per-line height together.",
+            self.render_stepper_control(
+                "settings-minimap-scale",
+                format!("{}%", self.settings.editor.minimap_scale_percent),
+                cx,
+                |this, cx| {
+                    this.adjust_minimap_scale_percent(
+                        -(settings_store::MINIMAP_SCALE_PERCENT_STEP as i32),
+                        cx,
+                    )
+                },
+                |this, cx| {
+                    this.adjust_minimap_scale_percent(
+                        settings_store::MINIMAP_SCALE_PERCENT_STEP as i32,
+                        cx,
+                    )
+                },
+            ),
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .child(self.render_config_banner(settings_store::ConfigPage::Editor, cx))
+            .child(
+                div()
+                    .pt(px(20.0))
+                    .pb(px(4.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Minimap"),
+            )
+            .child(minimap_row)
+            .child(minimap_scale_row)
+            .child(self.render_snippet_block(settings_store::ConfigPage::Editor))
+    }
+
     fn set_interface_scale_percent(&mut self, percent: u16, cx: &mut Context<Self>) {
         self.settings.appearance.interface_scale_percent = percent;
         self.persist_settings(cx);
@@ -2025,6 +2090,29 @@ impl AdeApp {
     fn toggle_follow_system_text_size(&mut self, cx: &mut Context<Self>) {
         self.settings.appearance.follow_system_text_size =
             !self.settings.appearance.follow_system_text_size;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// The Editor page's minimap toggle - `crate::code_surface::minimap::AdeApp::render_minimap`
+    /// reads this directly every render.
+    fn toggle_minimap_enabled(&mut self, cx: &mut Context<Self>) {
+        self.settings.editor.minimap_enabled = !self.settings.editor.minimap_enabled;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// The Editor page's minimap scale stepper - clamped the same
+    /// [`settings_store::AppearanceSettings::sanitize`]-style way a hand-edited
+    /// `settings.toml` value already is (`settings_store::EditorSettings::sanitize`), so a UI
+    /// edit and a hand-edited file can never disagree about the real bounds.
+    fn adjust_minimap_scale_percent(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let current = self.settings.editor.minimap_scale_percent as i32;
+        let updated = (current + delta).clamp(
+            settings_store::MINIMAP_SCALE_PERCENT_MIN as i32,
+            settings_store::MINIMAP_SCALE_PERCENT_MAX as i32,
+        );
+        self.settings.editor.minimap_scale_percent = updated as u16;
         self.persist_settings(cx);
         cx.notify();
     }
