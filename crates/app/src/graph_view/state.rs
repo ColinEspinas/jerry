@@ -30,6 +30,18 @@ pub(crate) enum GraphLoadState {
     Error(String),
 }
 
+/// An open row `⋯`/right-click context menu: which row it targets, and the already-resolved
+/// window-space origin its popover paints at - captured once at open time from the real click (a
+/// right-click anywhere on the row) or the `⋯` trigger button's own captured bounds, never
+/// recomputed from the row's index or a per-row-index formula. Mirrors
+/// `crate::sidebar::tree_ops::TreeContextMenu`'s identical "resolve once, at open time" shape.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GraphRowMenu {
+    pub row_index: usize,
+    pub origin_x: Pixels,
+    pub origin_y: Pixels,
+}
+
 /// The graph tab's own UI state: what's loaded, which scope/panel is selected, and the row `⋯`/
 /// Push `▾` menu popovers' anchors. One instance, owned by [`AdeApp::graph_state`].
 pub(crate) struct GraphTabState {
@@ -48,14 +60,17 @@ pub(crate) struct GraphTabState {
         String,
         Result<Vec<wt_core::graph::CommitFileChange>, String>,
     )>,
-    /// Which row's `⋯` context menu is open, if any (an index into `rows`, not a stateful id -
-    /// see `super::render`'s docs on why this is safe: the menu closes on any reload).
-    pub row_menu_open: Option<usize>,
+    /// Which row's `⋯`/right-click context menu is open, if any, and the real position it was
+    /// opened at (see [`GraphRowMenu`]) - not a stateful id (see `super::render`'s docs on why an
+    /// index is safe: the menu closes on any reload).
+    pub row_menu_open: Option<GraphRowMenu>,
     /// Every currently-rendered row's own `⋯` trigger bounds, captured by a `gpui::canvas` child
     /// each render - keyed by row index, unlike `AdeApp::plus_button_bounds`'s single field,
     /// because (unlike the tab strip's one `+` button) every row's trigger paints every frame
     /// simultaneously; a single shared field would be overwritten by whichever row happened to
-    /// paint last, not necessarily the row whose menu is actually open.
+    /// paint last, not necessarily the row whose menu is actually open. Used to anchor the popover
+    /// when the menu is opened from the `⋯` button itself; a right-click instead anchors off the
+    /// real click position (`GraphRowMenu::origin_x`/`origin_y`), which needs no bounds lookup.
     pub row_menu_bounds: HashMap<usize, Bounds<Pixels>>,
     pub push_menu_open: bool,
     pub push_button_bounds: Bounds<Pixels>,

@@ -136,6 +136,16 @@ impl AdeApp {
             .forget_target(&self.graph_state.branches_filter_focus_handle);
         self.code_focus
             .forget_target(&self.graph_state.branches_filter_focus_handle);
+        // Real, reachable-without-Settings bug an adversarial audit of this exact change found:
+        // `open_git_graph` only calls `load_graph` (which is what actually clears
+        // `row_menu_open`/`push_menu_open`) while `GraphLoadState` is still `NotLoaded` - so
+        // switching away from an already-loaded graph tab with a row menu open, then back (no
+        // reload in between), left the stale menu's `graph_tab_active`-gated overlay
+        // (`crate::root::AdeApp::render`) reappear the instant the tab became active again, with
+        // no click at all. Dismissing both here, the same way `close_git_graph_tab` already does
+        // for an outright close, closes the gap for the "switch tabs and back" path too.
+        self.graph_state.row_menu_open = None;
+        self.graph_state.push_menu_open = false;
     }
 
     /// Loads (or reloads) the graph and its upstream ahead/behind counts, off the UI thread -
@@ -250,17 +260,100 @@ impl AdeApp {
         cx.notify();
     }
 
-    pub(crate) fn toggle_graph_row_menu(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.graph_state.row_menu_open = if self.graph_state.row_menu_open == Some(index) {
-            None
-        } else {
-            Some(index)
-        };
+    /// The `⋯` button's own click handler: toggles the menu for `index` closed if it was already
+    /// open for that same row, otherwise opens it anchored off that row's own trigger bounds
+    /// (`graph_state.row_menu_bounds`, captured by the button's own `gpui::canvas` child every
+    /// render - the same mechanism `Self::render_graph_push_button` uses for its own popover).
+    /// The popover's right edge aligns with the button's right edge (opening left-and-down from
+    /// it) since the button sits at the row's own trailing edge, and a menu anchored to its left
+    /// edge would run off the window - [`Self::open_graph_row_menu_at`] still clamps this back
+    /// inside the window if the row itself is near an edge.
+    pub(crate) fn toggle_graph_row_menu(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let already_open_here = matches!(
+            self.graph_state.row_menu_open,
+            Some(menu) if menu.row_index == index
+        );
+        if already_open_here {
+            self.graph_state.row_menu_open = None;
+            cx.notify();
+            return;
+        }
+        let bounds = self
+            .graph_state
+            .row_menu_bounds
+            .get(&index)
+            .copied()
+            .unwrap_or_default();
+        let anchor_x = bounds.origin.x + bounds.size.width - theme::graph::ROW_MENU_WIDTH;
+        let anchor_y = bounds.origin.y + bounds.size.height + px(2.0);
+        self.open_graph_row_menu_at(index, anchor_x, anchor_y, window, cx);
+    }
+
+    /// Opens row `index`'s menu at `origin_x`/`origin_y` - either a right-click's own real
+    /// `event.position` (GitHub issue #19's file-tree context menu -
+    /// `crate::sidebar::tree_ops::AdeApp::open_tree_context_menu` - established this project's
+    /// real right-click pattern; this mirrors it for a graph row), or [`Self::toggle_graph_row_menu`]'s
+    /// button-anchored point above. Always (re)opens at the given position, even if a menu - for
+    /// this row or another - was already open, so a second right-click never leaves a stale
+    /// popover at the old position or two popovers open at once.
+    ///
+    /// Two things `open_tree_context_menu` also does that a first draft of this method missed
+    /// (an adversarial audit of this exact change caught both):
+    /// - **Clamped inside the window**, via the same `context_menu::clamp_menu_origin` the tree
+    ///   menu uses, rather than painting off-screen for any row in the lower half of a
+    ///   reasonably tall list - `theme::graph::ROW_MENU_WIDTH`/`ROW_MENU_HEIGHT` are this menu's
+    ///   own real, fixed painted size (its content never varies).
+    /// - **Explicitly focused**, via `window.focus`. The row's own right-click handler
+    ///   (`Self::render_graph_row`) calls `cx.stop_propagation()` so a right-click doesn't also
+    ///   select the row underneath it, but that same `stop_propagation` also preempts the graph
+    ///   container's own auto-focus-on-mousedown listener that a left-click would otherwise get
+    ///   for free - so without this explicit call, a right-click opened the menu but left
+    ///   keyboard focus wherever it was before. Mirrors `open_tree_context_menu`'s own
+    ///   `self.focus_file_tree(window, cx)` call, made for the identical reason.
+    pub(crate) fn open_graph_row_menu_at(
+        &mut self,
+        index: usize,
+        origin_x: gpui::Pixels,
+        origin_y: gpui::Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let viewport = window.bounds().size;
+        let (clamped_x, clamped_y) = crate::sidebar::context_menu::clamp_menu_origin(
+            f32::from(origin_x),
+            f32::from(origin_y),
+            f32::from(theme::graph::ROW_MENU_WIDTH),
+            f32::from(theme::graph::ROW_MENU_HEIGHT),
+            f32::from(viewport.width),
+            f32::from(viewport.height),
+        );
+        self.graph_state.row_menu_open = Some(GraphRowMenu {
+            row_index: index,
+            origin_x: px(clamped_x),
+            origin_y: px(clamped_y),
+        });
+        // An adversarial audit's own finding: this menu and the Push `▾` menu
+        // (`Self::toggle_graph_push_menu`) are independent booleans/options with no shared
+        // "only one overlay open" invariant, so without this a right-click while the Push menu
+        // was open left both painted at once (and this menu's own scrim, which *does*
+        // `stop_propagation` on a left-click, then ate the next click meant to dismiss the Push
+        // menu). Pre-existing gap, not introduced by this change - fixed here since it's the same
+        // "which overlay owns the next click" property this change is already about.
+        self.graph_state.push_menu_open = false;
+        window.focus(&self.graph_focus_handle, cx);
         cx.notify();
     }
 
     pub(crate) fn toggle_graph_push_menu(&mut self, cx: &mut Context<Self>) {
         self.graph_state.push_menu_open = !self.graph_state.push_menu_open;
+        if self.graph_state.push_menu_open {
+            self.graph_state.row_menu_open = None;
+        }
         cx.notify();
     }
 
@@ -800,6 +893,7 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let selected = self.graph_state.selected_row == Some(index);
+        let is_working_tree = row.commit.id.is_empty();
         let relative = if row.commit.id.is_empty() {
             "now".to_string()
         } else {
@@ -823,6 +917,26 @@ impl AdeApp {
             })
             .when(!selected, |el| {
                 el.hover(|el| el.bg(theme::surface::ROW_HOVER))
+            })
+            // The row's own right-click (mirrors the file tree's real right-click pattern,
+            // GitHub issue #19 §1 - `crate::sidebar::render::AdeApp::render_file_tree_row`).
+            // `cx.stop_propagation()` keeps it from also reaching any ancestor click handler.
+            // Gated the same way the `⋯` button itself is: the honestly-empty working-tree row
+            // has no context menu at all, so a right-click on it is a no-op.
+            .when(!is_working_tree, |el| {
+                el.on_mouse_down(
+                    gpui::MouseButton::Right,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.open_graph_row_menu_at(
+                            index,
+                            event.position.x,
+                            event.position.y,
+                            window,
+                            cx,
+                        );
+                    }),
+                )
             })
             .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                 this.select_graph_row(index, cx);
@@ -885,6 +999,7 @@ impl AdeApp {
         let is_working_tree = row.commit.id.is_empty();
         div()
             .id(("graph-row-menu-button", index))
+            .debug_selector(move || format!("graph-row-menu-button-{index}"))
             .relative()
             .w(px(22.0))
             .h(px(22.0))
@@ -914,31 +1029,29 @@ impl AdeApp {
                         .absolute()
                         .size_full()
                     })
-                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                         cx.stop_propagation();
-                        this.toggle_graph_row_menu(index, cx);
+                        this.toggle_graph_row_menu(index, window, cx);
                     }))
             })
     }
 
     /// The row `⋯` context menu (design spec §4): grouped Branch / Apply / Reset / Copy. Every
     /// entry that would perform a real git mutation is disabled - only Copy's entries are wired.
-    /// Anchored to the open row's own captured bounds (`AdeApp::graph_state.row_menu_bounds`),
-    /// the same `gpui::canvas`-bounds-capture mechanism `crate::work_surface::render::AdeApp::
-    /// render_plus_menu` uses.
+    /// Anchored to [`GraphRowMenu::origin_x`]/`origin_y` - the real position it was opened at
+    /// (either a right-click's own `event.position`, or the `⋯` button's own captured bounds via
+    /// `AdeApp::graph_state.row_menu_bounds`, the same `gpui::canvas`-bounds-capture mechanism
+    /// `crate::work_surface::render::AdeApp::render_plus_menu` uses), resolved once at open time
+    /// in `AdeApp::open_graph_row_menu_at`/`toggle_graph_row_menu` - never recomputed here from
+    /// the row's index, so a scrolled row's menu is never mispositioned.
     pub(crate) fn render_graph_row_menu(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some(index) = self.graph_state.row_menu_open else {
+        let Some(menu) = self.graph_state.row_menu_open else {
             return gpui::Empty.into_any_element();
         };
+        let index = menu.row_index;
         let Some(row) = self.current_graph_row(index) else {
             return gpui::Empty.into_any_element();
         };
-        let bounds = self
-            .graph_state
-            .row_menu_bounds
-            .get(&index)
-            .copied()
-            .unwrap_or_default();
         let (shadow_x, shadow_y, shadow_blur) = theme::shadow::PLUS_MENU;
         let sha = row.commit.id.clone();
         let short_sha = row.commit.short_id.clone();
@@ -951,16 +1064,40 @@ impl AdeApp {
             .left(px(0.0))
             .right(px(0.0))
             .bottom(px(0.0))
+            // `cx.stop_propagation()` here (an adversarial audit's own finding) is what stops a
+            // click on the *same* row's now-open `⋯` button from re-opening the menu it just
+            // dismissed: this scrim paints on top of that button (it is a later, sibling child of
+            // the same root - `AdeApp::render`'s own docs above `Self::render_graph_row_menu`),
+            // so without this a single click ran *both* this dismiss and the button's own
+            // re-open, in that order, for the same `MouseUpEvent`.
             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
                 this.graph_state.row_menu_open = None;
                 cx.notify();
             }))
+            // A right-click elsewhere must dismiss too (mirrors `crate::sidebar::render::AdeApp::
+            // render_tree_context_menu`'s own scrim - "otherwise the next right-click anywhere
+            // would land on the scrim and do nothing at all"). Deliberately does *not*
+            // `cx.stop_propagation()`, unlike the left-click dismiss above: a right-click that
+            // lands on a *different* row must still reach that row's own `on_mouse_down(Right, ..)`
+            // handler afterwards so it opens fresh there in the same click, rather than requiring
+            // a second right-click the way the tree menu does - `Self::open_graph_row_menu_at`
+            // unconditionally overwrites `row_menu_open`, so this dismiss is a harmless no-op
+            // whenever a row's own handler goes on to run right after it.
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(|this, _event: &gpui::MouseDownEvent, _window, cx| {
+                    this.graph_state.row_menu_open = None;
+                    cx.notify();
+                }),
+            )
             .child(
                 div()
                     .id("graph-row-menu-popover")
+                    .debug_selector(|| "graph-row-menu-popover".to_string())
                     .absolute()
-                    .left(px(140.0))
-                    .top(bounds.origin.y - bounds.size.height)
+                    .left(menu.origin_x)
+                    .top(menu.origin_y)
                     .w(theme::graph::ROW_MENU_WIDTH)
                     .py(px(4.0))
                     .bg(theme::surface::PALETTE)
@@ -969,6 +1106,17 @@ impl AdeApp {
                     .rounded(theme::radius::CARD)
                     .shadow(vec![BoxShadow::new(shadow_x, shadow_y, gpui::black().opacity(0.55))
                         .blur_radius(shadow_blur)])
+                    // Occludes so a right-click *inside* the popover's own bounds can never fall
+                    // through to whatever row it happens to be painted on top of (a real,
+                    // adversarial-audit-found bug: the popover opens *over* the row list, and
+                    // without this a right-click on the panel itself retargeted the menu to
+                    // whichever row was underneath it). Scoped to the panel alone, not the whole
+                    // scrim above - the panel is a small, content-sized rectangle that never
+                    // reaches the title bar, so (unlike `render_tree_context_menu`'s own
+                    // full-window occluding scrim, which had to start below the title bar for
+                    // exactly this reason - see that method's docs) no caption-button interaction
+                    // is possible here.
+                    .occlude()
                     .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
                         cx.stop_propagation();
                     }))
@@ -1651,6 +1799,598 @@ fn render_graph_ref_chips(row: &GraphRow) -> impl IntoElement {
 
 fn lane_for_ref(row: &GraphRow, _chip: &wt_core::graph::RefChip) -> usize {
     row.lane
+}
+
+/// Real coverage for the row `⋯`/right-click context menu's positioning - a follow-up refinement
+/// to the git graph tab (GitHub issue #1) fixing two real user reports: the menu only opened via
+/// the `⋯` button, never a right-click anywhere on the row; and wherever it did open was computed
+/// from a fixed per-row formula (`left(px(140.0))`, `top(bounds.origin.y - bounds.size.height)`)
+/// rather than any real click or button position. Mirrors `crate::sidebar::tree_ops`'s own real
+/// right-click coverage (`right_clicking_a_folder_row_opens_the_folder_menu_at_a_clamped_origin`):
+/// `cx.simulate_event`/`cx.simulate_click` drive genuine mouse events through the real dispatch
+/// path, not direct method calls, so these also cover real interactions between the row's own
+/// handler and the scrim/popover it opens (an adversarial audit's own two findings:
+/// `a_real_second_click_on_the_same_dots_button_closes_the_menu` and
+/// `right_clicking_inside_the_open_popover_does_not_retarget_to_the_row_underneath`).
+#[cfg(test)]
+mod graph_row_menu_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::{Bounds, Entity, Pixels, Point, Size, TestAppContext};
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Three real commits, clean working tree at the end - `build_graph` yields exactly three
+    /// real commit rows (indices 0..=2, newest first), with no "Uncommitted changes" row to
+    /// throw off the indices these tests target.
+    fn seed_three_commits(dir: &std::path::Path) {
+        git(dir, &["init", "-b", "main"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "Test User"]);
+        std::fs::write(dir.join("a.txt"), "1\n").expect("write a.txt");
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "first"]);
+        std::fs::write(dir.join("a.txt"), "2\n").expect("write a.txt");
+        git(dir, &["commit", "-am", "second"]);
+        std::fs::write(dir.join("a.txt"), "3\n").expect("write a.txt");
+        git(dir, &["commit", "-am", "third"]);
+    }
+
+    fn open_seeded_graph(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        Entity<AdeApp>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        seed_three_commits(repo.path());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        (repo, app, cx)
+    }
+
+    fn right_click(cx: &mut gpui::VisualTestContext, position: gpui::Point<Pixels>) {
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn right_clicking_a_row_opens_its_menu_at_the_real_click_position(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        let row = cx
+            .debug_bounds("graph-row-0")
+            .expect("the first commit row must be painted");
+        right_click(cx, row.center());
+
+        app.read_with(cx, |app, _| {
+            let menu = app
+                .graph_state
+                .row_menu_open
+                .expect("a real right-click on a commit row must open its menu");
+            assert_eq!(
+                menu.row_index, 0,
+                "the row under the cursor, not some other row"
+            );
+            assert_eq!(
+                (menu.origin_x, menu.origin_y),
+                (row.center().x, row.center().y),
+                "anchored at the real click position, not a per-row-index formula"
+            );
+        });
+        let painted = cx
+            .debug_bounds("graph-row-menu-popover")
+            .expect("and it must genuinely paint there");
+        app.read_with(cx, |app, _| {
+            let menu = app.graph_state.row_menu_open.expect("menu");
+            assert_eq!(
+                (painted.origin.x, painted.origin.y),
+                (menu.origin_x, menu.origin_y),
+                "the popover must paint at exactly the position captured when it opened"
+            );
+        });
+    }
+
+    /// `theme::graph::ROW_MENU_HEIGHT` is a hand-measured constant (this menu's content is fixed,
+    /// so unlike `crate::sidebar::context_menu::menu_height` it has no analytical formula to
+    /// compute it from - see that constant's own docs) that `AdeApp::open_graph_row_menu_at`'s
+    /// edge clamp relies on being accurate. If the menu's real content ever changes (a row added
+    /// or removed, a header renamed to wrap onto two lines), this is what catches the constant
+    /// having quietly gone stale - a menu clamped against the wrong height can still paint
+    /// off-screen, the exact bug this whole change fixed.
+    #[gpui::test]
+    fn the_row_menu_pins_the_real_height_this_edge_clamp_relies_on(cx: &mut TestAppContext) {
+        let (_repo, _app, cx) = open_seeded_graph(cx);
+
+        let row = cx.debug_bounds("graph-row-0").expect("row 0 painted");
+        right_click(cx, row.center());
+        let painted = cx
+            .debug_bounds("graph-row-menu-popover")
+            .expect("the popover must genuinely paint");
+
+        assert_eq!(
+            (painted.size.width, painted.size.height),
+            (theme::graph::ROW_MENU_WIDTH, theme::graph::ROW_MENU_HEIGHT),
+            "the real painted size must match the constants the edge clamp uses - re-measure and \
+             update ROW_MENU_HEIGHT if this menu's content genuinely changed"
+        );
+    }
+
+    /// The scenario the design conversation flagged by name: right-clicking a different,
+    /// unobscured row while another row's menu is already open must close the old one and open
+    /// the new one at the new position - never leave the stale popover up, and never open the
+    /// new one at the old row's position.
+    ///
+    /// Opens on row 2 (the *last* row) first and right-clicks row 0 (well above it) second -
+    /// deliberately in that order, not row 0 then row 1: this popover's real painted height
+    /// (`theme::graph::ROW_MENU_HEIGHT`) is far taller than the gap between two adjacent rows in
+    /// this small fixture, so a menu opened on an *earlier* row would visually cover a *later*
+    /// one, and right-clicking through an open popover onto whatever it covers is a different,
+    /// separately-covered scenario (see
+    /// `right_clicking_inside_the_open_popover_does_not_retarget_to_the_row_underneath`) with a
+    /// deliberately different outcome (occluded, not retargeted). Row 0 sits above row 2's click
+    /// point, so its own popover never reaches back up over it.
+    #[gpui::test]
+    fn right_clicking_a_different_unobscured_row_replaces_the_open_menu_at_the_new_position(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        let row2 = cx.debug_bounds("graph-row-2").expect("row 2 painted");
+        right_click(cx, row2.center());
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state.row_menu_open.map(|m| m.row_index),
+                Some(2),
+                "premise: row 2's menu really is open first"
+            );
+        });
+
+        let row0 = cx.debug_bounds("graph-row-0").expect("row 0 painted");
+        assert!(
+            row0.center().y < row2.center().y,
+            "premise: row 0 sits above row 2, so row 2's own downward-opening popover cannot \
+             cover it"
+        );
+        right_click(cx, row0.center());
+
+        app.read_with(cx, |app, _| {
+            let menu = app
+                .graph_state
+                .row_menu_open
+                .expect("row 0's right-click must open a menu");
+            assert_eq!(
+                menu.row_index, 0,
+                "the new row's menu must win - not still row 2's stale one"
+            );
+            assert_eq!(
+                (menu.origin_x, menu.origin_y),
+                (row0.center().x, row0.center().y),
+                "anchored at row 0's own click position, not row 2's leftover one"
+            );
+        });
+    }
+
+    /// `gpui`'s own `on_click` only ever fires for `MouseButton::Left`
+    /// (`~/.cargo/git/checkouts/zed-*/*/crates/gpui/src/elements/div.rs`, the
+    /// `event.button == MouseButton::Left` gate around its mouse-down tracking), so this is
+    /// structurally guaranteed rather than something `cx.stop_propagation()` in the row's own
+    /// right-click handler achieves - still worth a real assertion, since it is exactly the kind
+    /// of "surely that's fine" gap an adversarial audit exists to catch.
+    #[gpui::test]
+    fn right_clicking_a_row_does_not_also_select_it(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state.selected_row,
+                Some(0),
+                "premise: loading the graph really does select the first row"
+            );
+        });
+
+        let row1 = cx.debug_bounds("graph-row-1").expect("row 1 painted");
+        right_click(cx, row1.center());
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state.selected_row,
+                Some(0),
+                "a right-click must open the menu without also changing the selected row"
+            );
+            assert_eq!(app.graph_state.row_menu_open.map(|m| m.row_index), Some(1));
+        });
+    }
+
+    /// Critical fix: unlike a left-click, `MouseDownEvent::is_focusing()` is `false` for a
+    /// right-click (`vendor` `gpui`'s own default), so `gpui`'s automatic click-to-focus never
+    /// ran for it - an adversarial audit found a right-click opened the menu but left keyboard
+    /// focus wherever it was before. `AdeApp::open_graph_row_menu_at`'s own explicit
+    /// `window.focus` is the fix, mirroring `crate::sidebar::tree_ops::AdeApp::
+    /// open_tree_context_menu`'s identical `self.focus_file_tree(window, cx)` call for the same
+    /// reason.
+    #[gpui::test]
+    fn right_clicking_a_row_focuses_the_graph_view(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+        // `open_git_graph` already focuses `graph_focus_handle` by default, so proving a
+        // right-click *moves* focus there needs it to genuinely start somewhere else first - the
+        // Branches filter box, the same real, independently-focusable surface
+        // `leaving_the_graph_tab_from_the_branches_filter_lands_on_the_real_session_pane` (in
+        // `graph_focus_tests` below) uses for the identical reason.
+        app.update_in(cx, |app, _window, cx| {
+            app.set_graph_right_panel(GraphRightPanel::Branches, cx);
+        });
+        let (focused_before, graph_handle, filter_handle) = app.update_in(cx, |app, window, cx| {
+            window.focus(&app.graph_state.branches_filter_focus_handle, cx);
+            (
+                window.focused(cx),
+                app.graph_focus_handle.clone(),
+                app.graph_state.branches_filter_focus_handle.clone(),
+            )
+        });
+        assert_eq!(
+            focused_before.as_ref(),
+            Some(&filter_handle),
+            "premise: focus really did move to the filter box first"
+        );
+        assert_ne!(focused_before.as_ref(), Some(&graph_handle));
+
+        let row0 = cx.debug_bounds("graph-row-0").expect("row 0 painted");
+        right_click(cx, row0.center());
+
+        let focused_after = app.update_in(cx, |_app, window, cx| window.focused(cx));
+        assert_eq!(
+            focused_after.as_ref(),
+            Some(&graph_handle),
+            "a right-click that opens the row menu must also move real keyboard focus onto the \
+             graph view"
+        );
+    }
+
+    /// The `⋯` button's own anchor: derived from that row's real captured trigger bounds
+    /// (`row_menu_bounds`), not a formula involving the row's index - proven here with a bounds
+    /// value far down the y axis, standing in for a row deep in a scrolled list, which a fixed
+    /// `index * row_height` formula would get wrong (the real, adversarial-audit-relevant case).
+    #[gpui::test]
+    fn the_dots_button_anchors_off_its_own_real_captured_bounds(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        seed_three_commits(repo.path());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let scrolled_bounds = Bounds {
+            origin: Point::new(px(500.0), px(2000.0)),
+            size: Size::new(px(22.0), px(22.0)),
+        };
+        app.update_in(cx, |app, window, cx| {
+            app.graph_state.row_menu_bounds.insert(2, scrolled_bounds);
+            app.toggle_graph_row_menu(2, window, cx);
+        });
+
+        let viewport = cx.update(|window, _cx| window.bounds().size);
+        // `y = 2000` is past the (real, 1080px-tall) test viewport, so the real edge-clamp must
+        // have kicked in - computed here via the exact same real `clamp_menu_origin` the
+        // implementation calls, not a second, hand-derived formula that could quietly drift from
+        // it.
+        let unclamped_x =
+            scrolled_bounds.origin.x + scrolled_bounds.size.width - theme::graph::ROW_MENU_WIDTH;
+        let unclamped_y = scrolled_bounds.origin.y + scrolled_bounds.size.height + px(2.0);
+        let (expected_x, expected_y) = crate::sidebar::context_menu::clamp_menu_origin(
+            f32::from(unclamped_x),
+            f32::from(unclamped_y),
+            f32::from(theme::graph::ROW_MENU_WIDTH),
+            f32::from(theme::graph::ROW_MENU_HEIGHT),
+            f32::from(viewport.width),
+            f32::from(viewport.height),
+        );
+        app.read_with(cx, |app, _| {
+            let menu = app.graph_state.row_menu_open.expect("the menu must open");
+            assert_eq!(menu.row_index, 2);
+            assert_eq!(
+                (menu.origin_x, menu.origin_y),
+                (px(expected_x), px(expected_y)),
+                "x/y both come from the button's own real bounds (run through the real edge \
+                 clamp), not row_index * a row height - a formula that would put this \
+                 2000px-deep row's menu at roughly 48px"
+            );
+            assert_ne!(
+                menu.origin_y, unclamped_y,
+                "premise: y=2000 really is past the viewport, so the clamp really did something"
+            );
+        });
+    }
+
+    /// Real dispatch, not a direct method call: an adversarial audit of an earlier draft of this
+    /// change found that a *real* second click on the same button did not close the menu the way
+    /// a direct `toggle_graph_row_menu` call in a test claimed - the already-open menu's own
+    /// scrim paints on top of the button (see `Self::render_graph_row_menu`'s docs) and, without
+    /// `cx.stop_propagation()` in the scrim's dismiss handler, that same click *also* reached the
+    /// button underneath and reopened what the scrim had just closed. This exercises the real fix
+    /// through the real click path.
+    #[gpui::test]
+    fn a_real_second_click_on_the_same_dots_button_closes_the_menu(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        let button = cx
+            .debug_bounds("graph-row-menu-button-0")
+            .expect("row 0's ⋯ button must be painted");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state.row_menu_open.map(|m| m.row_index),
+                Some(0),
+                "the first real click opens it"
+            );
+        });
+
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.row_menu_open.is_none(),
+                "a second real click on the same button must close it, not reopen it"
+            );
+        });
+    }
+
+    /// `toggle_graph_row_menu`'s own decision logic, given manually-seeded `row_menu_bounds` -
+    /// deliberately a direct-call, pure-state test (not a claim about real click dispatch; see
+    /// `a_real_second_click_on_the_same_dots_button_closes_the_menu` above for that): it proves
+    /// the `already_open_here` branch keys off `row_index`, not "any menu is open at all", so
+    /// switching to a different row's button reanchors rather than toggling the first one closed.
+    #[gpui::test]
+    fn toggle_graph_row_menu_reanchors_for_a_different_row_rather_than_toggling_closed(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        seed_three_commits(repo.path());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.graph_state.row_menu_bounds.insert(
+                0,
+                Bounds {
+                    origin: Point::new(px(10.0), px(10.0)),
+                    size: Size::new(px(22.0), px(22.0)),
+                },
+            );
+            app.graph_state.row_menu_bounds.insert(
+                1,
+                Bounds {
+                    origin: Point::new(px(10.0), px(40.0)),
+                    size: Size::new(px(22.0), px(22.0)),
+                },
+            );
+            app.toggle_graph_row_menu(0, window, cx);
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.toggle_graph_row_menu(1, window, cx);
+        });
+
+        app.read_with(cx, |app, _| {
+            let menu = app
+                .graph_state
+                .row_menu_open
+                .expect("row 1's button must open a menu, not close row 0's");
+            assert_eq!(menu.row_index, 1);
+            assert_eq!(menu.origin_y, px(40.0) + px(22.0) + px(2.0));
+        });
+    }
+
+    /// Critical fix: a right-click *inside the open popover's own painted bounds* (but not on any
+    /// actual menu row) must not fall through to whatever graph row the popover happens to be
+    /// painted on top of - an adversarial audit reproduced exactly this by right-clicking inside
+    /// an open menu and getting a *different commit's* menu back at the cursor. `.occlude()` on
+    /// the popover panel (`Self::render_graph_row_menu`) is the fix; this proves it holds via a
+    /// real click, not by reading the code and trusting it.
+    #[gpui::test]
+    fn right_clicking_inside_the_open_popover_does_not_retarget_to_the_row_underneath(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        let row0 = cx.debug_bounds("graph-row-0").expect("row 0 painted");
+        right_click(cx, row0.center());
+        let (before_index, before_origin) = app.read_with(cx, |app, _| {
+            let menu = app
+                .graph_state
+                .row_menu_open
+                .expect("premise: row 0's menu really is open");
+            (menu.row_index, (menu.origin_x, menu.origin_y))
+        });
+        assert_eq!(before_index, 0);
+
+        let popover = cx
+            .debug_bounds("graph-row-menu-popover")
+            .expect("premise: the popover really is painted");
+        // The popover opens *over* the row list in this small, three-row fixture (its real
+        // painted height is far taller than three rows), so its own centre genuinely sits on top
+        // of another row's hitbox - exactly the geometry the original bug needed.
+        right_click(cx, popover.center());
+
+        app.read_with(cx, |app, _| {
+            let menu = app
+                .graph_state
+                .row_menu_open
+                .expect("still open - occluded, not dismissed by this click");
+            assert_eq!(
+                (menu.row_index, (menu.origin_x, menu.origin_y)),
+                (before_index, before_origin),
+                "a right-click inside the popover must not retarget it to whatever row is \
+                 underneath, and must not move it either"
+            );
+        });
+    }
+
+    /// A real, adversarial-audit-found gap in this change (pre-existing, not introduced by it):
+    /// the row `⋯`/right-click menu and the Push `▾` menu are independent state, with nothing
+    /// stopping both from being open at once - opening one left the other's own full-window scrim
+    /// painted underneath it, silently eating the next click aimed at dismissing it.
+    /// `Self::open_graph_row_menu_at` and `Self::toggle_graph_push_menu` now each close the other.
+    #[gpui::test]
+    fn opening_the_row_menu_closes_an_open_push_menu(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        app.update_in(cx, |app, _window, cx| {
+            app.toggle_graph_push_menu(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.push_menu_open,
+                "premise: the Push menu really is open"
+            );
+        });
+
+        let row0 = cx.debug_bounds("graph-row-0").expect("row 0 painted");
+        right_click(cx, row0.center());
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.graph_state.row_menu_open.map(|m| m.row_index), Some(0));
+            assert!(
+                !app.graph_state.push_menu_open,
+                "opening the row menu must close the Push menu, not paint both at once"
+            );
+        });
+    }
+
+    /// The other direction of the same fix: opening the Push menu while a row menu is open must
+    /// close the row menu.
+    #[gpui::test]
+    fn opening_the_push_menu_closes_an_open_row_menu(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        let row0 = cx.debug_bounds("graph-row-0").expect("row 0 painted");
+        right_click(cx, row0.center());
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.row_menu_open.is_some(),
+                "premise: the row menu really is open"
+            );
+        });
+
+        app.update_in(cx, |app, _window, cx| {
+            app.toggle_graph_push_menu(cx);
+        });
+
+        app.read_with(cx, |app, _| {
+            assert!(app.graph_state.push_menu_open);
+            assert!(
+                app.graph_state.row_menu_open.is_none(),
+                "opening the Push menu must close the row menu, not paint both at once"
+            );
+        });
+    }
+
+    /// Real, reachable-without-Settings bug an adversarial audit found: `open_git_graph` only
+    /// calls `load_graph` (which is what actually clears `row_menu_open`) while the graph is
+    /// still `NotLoaded`, so switching away from an *already-loaded* graph tab with a row menu
+    /// open and then back does not reload - and, before this fix, left the stale menu's
+    /// `graph_tab_active`-gated overlay (`crate::root::AdeApp::render`) reappear the instant the
+    /// tab became active again, with no click at all. `Self::leave_graph_tab` now clears it.
+    #[gpui::test]
+    fn switching_away_from_the_graph_tab_and_back_does_not_resurrect_a_stale_row_menu(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        let row0 = cx.debug_bounds("graph-row-0").expect("row 0 painted");
+        right_click(cx, row0.center());
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.row_menu_open.is_some(),
+                "premise: the row menu really is open"
+            );
+        });
+
+        // Calls `leave_graph_tab` directly, not through `select_session` - `select_session` can
+        // also route through `Self::select_worktree` (when the target session belongs to a
+        // worktree not already selected), which calls `Self::load_graph` unconditionally on its
+        // own and would clear `row_menu_open` for an unrelated reason, confounding what this test
+        // means to isolate: `leave_graph_tab`'s *own* clear, for the plain "leave the tab, same
+        // worktree, same session, tab was already loaded" path.
+        app.update_in(cx, |app, window, cx| {
+            app.leave_graph_tab(window, cx);
+        });
+        assert!(
+            !app.read_with(cx, |app, _| app.graph_tab_active),
+            "premise: the graph tab really was left"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| matches!(
+                app.graph_state.load,
+                GraphLoadState::Loaded(_)
+            )),
+            "premise: re-opening reused the already-loaded graph rather than reloading it, so \
+             load_graph's own row_menu_open clear did not run"
+        );
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.row_menu_open.is_none(),
+                "a stale row menu must not resurrect itself just from re-activating the tab"
+            );
+        });
+    }
+
+    /// Real, adversarial-audit-found bug: opening Settings does not clear `graph_tab_active` (the
+    /// graph tab, if showing, is still "active" underneath Settings), so an open row or Push menu
+    /// kept painting its full-window scrim over the Settings surface, swallowing the first click
+    /// aimed at it. `Self::open_settings` now dismisses both.
+    #[gpui::test]
+    fn opening_settings_dismisses_an_open_row_menu(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        let row0 = cx.debug_bounds("graph-row-0").expect("row 0 painted");
+        right_click(cx, row0.center());
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.row_menu_open.is_some(),
+                "premise: the row menu really is open"
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_settings(window, cx);
+        });
+
+        app.read_with(cx, |app, _| {
+            assert!(app.settings_open, "premise: Settings really did open");
+            assert!(
+                app.graph_state.row_menu_open.is_none(),
+                "an open row menu must not keep painting its scrim over Settings"
+            );
+        });
+    }
 }
 
 /// Real focus-handling regression coverage for the git graph tab, mirroring `crate::root::focus`'s

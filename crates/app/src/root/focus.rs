@@ -146,6 +146,15 @@ impl AdeApp {
         // Settings is up rather than silently disarming it.
         self.tree_context_menu = None;
         self.tree_inline_edit = None;
+        // Same reason, for the git graph tab's own two window-positioned overlays (GitHub issue
+        // #1's row `⋯`/right-click menu and Push `▾` menu): unlike opening a *different* tab,
+        // opening Settings does not clear `graph_tab_active` (the graph tab, if it was showing,
+        // is still "active" underneath Settings - `crate::graph_view::render::AdeApp::
+        // leave_graph_tab` is not called here), so without this an open row or Push menu kept
+        // painting its full-window scrim over the Settings surface, swallowing the first click a
+        // user aimed at it (an adversarial audit's own finding).
+        self.graph_state.row_menu_open = None;
+        self.graph_state.push_menu_open = false;
         self.settings_open = true;
         self.settings_focus.capture(window, &self.agents, cx);
         self.prune_confirm_armed = false;
