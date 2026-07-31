@@ -62,8 +62,68 @@ use serde::{Deserialize, Serialize};
 use crate::settings::state::THEME_DEFS;
 
 /// A defensive upper bound on a single theme file's size - see
-/// [`load_custom_themes_from_dir`]'s own docs for why.
+/// [`load_custom_themes_from_dir`]'s own docs for why. [`import_theme_file`] enforces this same
+/// cap against the *source* file it's about to import, not just files already sitting in a
+/// custom-themes directory - a concurrency incident on this branch (two agent sessions
+/// accidentally run against the same shared worktree) lost the original fix for this gap before
+/// it was ever committed; this is that fix, re-implemented and verified against the real
+/// committed diff rather than taken on trust.
 const MAX_THEME_FILE_BYTES: u64 = 64 * 1024;
+
+/// Jerry Dark's own five swatches, transcribed verbatim from `assets/themes/jerry-dark.toml` -
+/// pinned as this module's own real `u32` values rather than re-derived from
+/// `crate::settings::state::THEME_DEFS` at runtime. That distinction matters: `THEME_DEFS` is a
+/// `std::sync::LazyLock` whose own initializer parses (and therefore validates - see
+/// [`CustomThemeFile::validate_with_builtin_check`]) all six built-in theme files, so a
+/// readability check reachable from that validation path that itself read `THEME_DEFS` would
+/// deadlock on `std::sync::Once` the first time any code touched `THEME_DEFS` at all (a real,
+/// reproduced hang during this branch's own history, not a hypothetical) - `THEME_DEFS`'s
+/// initializer would be blocked waiting on a readability check that is itself blocked waiting for
+/// `THEME_DEFS` to finish initializing. Using this pinned copy instead sidesteps that entirely.
+///
+/// `custom_theme::tests::
+/// jerry_dark_baseline_swatches_const_matches_the_real_initialized_theme_defs_0_swatches` is the
+/// real regression test keeping this copy honest against `THEME_DEFS[0]`'s actual initialized
+/// value - safe to call from an ordinary `#[test]` (never from inside another `LazyLock`'s own
+/// initializer), so a future edit to Jerry Dark's own swatches can't silently desync the two
+/// without a test catching it.
+const JERRY_DARK_BASELINE_SWATCHES: [u32; 5] = [0x0e0f11, 0x1a1e21, 0x5cb87f, 0xe2a336, 0x74ade8];
+
+/// Standard ITU-R BT.709 luma weighting - the same "how bright does this actually look" mix most
+/// contrast-ratio formulas use, not a naive `(r+g+b)/3` average that would treat blue as visually
+/// as bright as green. Scaled to a per-mille (0-1000) `u32` rather than left as a bare `f64` so
+/// [`ThemeFileError::LowReadability`] can stay `#[derive(Eq)]` like every other variant (bare
+/// `f64` cannot implement `Eq`), and so tests compare exact integers instead of float epsilons.
+fn relative_luma_per_mille(hex: u32) -> u32 {
+    let r = ((hex >> 16) & 0xff) as f64 / 255.0;
+    let g = ((hex >> 8) & 0xff) as f64 / 255.0;
+    let b = (hex & 0xff) as f64 / 255.0;
+    let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    (luma * 1000.0).round() as u32
+}
+
+/// The real, concrete readability signal this module checks: how far apart `background` and
+/// `panel` actually look, in perceptual brightness - a `panel` that's barely distinguishable from
+/// `background` (or identical to it) is unreadable regardless of what the three accent colours
+/// are. `u32::abs_diff` rather than signed subtraction since a lighter-panel-on-dark-background
+/// theme and a darker-panel-on-light-background theme (e.g. "Paper") are equally valid - only the
+/// magnitude of the difference matters, not its sign.
+fn panel_background_luma_delta_per_mille(swatches: &[u32; 5]) -> u32 {
+    relative_luma_per_mille(swatches[0]).abs_diff(relative_luma_per_mille(swatches[1]))
+}
+
+/// The minimum real `panel`-vs-`background` luma difference (see
+/// [`panel_background_luma_delta_per_mille`]) [`CustomThemeFile::validate_with_builtin_check`]
+/// requires before accepting any theme, built-in or custom - half of
+/// [`JERRY_DARK_BASELINE_SWATCHES`]' own real shipped contrast. Half, not the full baseline
+/// value, so this is a real but generous floor: every one of the six built-in theme files clears
+/// it with room to spare (`custom_theme::tests::every_built_in_theme_clears_the_readability_floor`;
+/// the tightest of the six, Slate, clears it by roughly 1.4x) while still catching the concrete
+/// unreadable-theme case this exists for: a hand-authored `panel` that's the same colour as
+/// `background`, or only a couple of hex digits off from it.
+fn readability_floor_per_mille() -> u32 {
+    panel_background_luma_delta_per_mille(&JERRY_DARK_BASELINE_SWATCHES) / 2
+}
 
 /// The real on-disk shape of one `~/.config/jerry/themes/<slug>.toml` file - see the module docs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -100,8 +160,24 @@ pub enum ThemeFileError {
     Io(String),
     Parse(String),
     EmptyName,
-    InvalidColor { field: &'static str, value: String },
+    InvalidColor {
+        field: &'static str,
+        value: String,
+    },
     NameCollidesWithBuiltin(String),
+    /// `panel` is too close in perceptual brightness to `background` to read comfortably - see
+    /// [`readability_floor_per_mille`]'s own docs for how the floor is derived.
+    LowReadability {
+        delta_per_mille: u32,
+        floor_per_mille: u32,
+    },
+    /// The *source* file [`import_theme_file`] was asked to import is over
+    /// [`MAX_THEME_FILE_BYTES`] - checked before that file is ever read or written, the same real
+    /// cap [`load_custom_themes_from_dir`] already enforces against files already on disk.
+    TooLarge {
+        bytes: u64,
+        max_bytes: u64,
+    },
 }
 
 impl std::fmt::Display for ThemeFileError {
@@ -117,6 +193,18 @@ impl std::fmt::Display for ThemeFileError {
             ThemeFileError::NameCollidesWithBuiltin(name) => write!(
                 f,
                 "\"{name}\" is already a built-in theme name - choose a different name"
+            ),
+            ThemeFileError::LowReadability {
+                delta_per_mille,
+                floor_per_mille,
+            } => write!(
+                f,
+                "`panel` is too close in brightness to `background` to read comfortably \
+                 ({delta_per_mille} per-mille luma difference, need at least {floor_per_mille})"
+            ),
+            ThemeFileError::TooLarge { bytes, max_bytes } => write!(
+                f,
+                "theme file is {bytes} bytes, over the {max_bytes}-byte limit for a theme file"
             ),
         }
     }
@@ -216,6 +304,19 @@ impl CustomThemeFile {
             parse("accent_amber", &self.accent_amber)?,
             parse("accent_blue", &self.accent_blue)?,
         ];
+        // Readability floor - deliberately checked against a pinned `JERRY_DARK_BASELINE_SWATCHES`
+        // const, never `crate::settings::state::THEME_DEFS`: this function runs for every built-in
+        // theme file too (via `parse_builtin_theme_file_str`, called from *inside* `THEME_DEFS`'s
+        // own `LazyLock` initializer), so reading `THEME_DEFS` here would deadlock - see
+        // `JERRY_DARK_BASELINE_SWATCHES`'s own docs.
+        let delta = panel_background_luma_delta_per_mille(&swatches);
+        let floor = readability_floor_per_mille();
+        if delta < floor {
+            return Err(ThemeFileError::LowReadability {
+                delta_per_mille: delta,
+                floor_per_mille: floor,
+            });
+        }
         Ok(CustomTheme {
             name: name.to_string(),
             subtitle: self.subtitle.trim().to_string(),
@@ -412,6 +513,19 @@ pub fn import_theme_file(
     source_path: &Path,
     dest_dir: &Path,
 ) -> Result<CustomTheme, ThemeFileError> {
+    // The same real cap `load_custom_themes_from_dir` already enforces against files already
+    // sitting in a custom-themes directory, applied here against the *source* file before it's
+    // ever read into memory or written anywhere - a pathologically large "theme" file picked in a
+    // real file-open dialog should be rejected with a real, specific error, not silently read in
+    // full (or truncated) first.
+    let metadata =
+        std::fs::metadata(source_path).map_err(|err| ThemeFileError::Io(err.to_string()))?;
+    if metadata.len() > MAX_THEME_FILE_BYTES {
+        return Err(ThemeFileError::TooLarge {
+            bytes: metadata.len(),
+            max_bytes: MAX_THEME_FILE_BYTES,
+        });
+    }
     let contents =
         std::fs::read_to_string(source_path).map_err(|err| ThemeFileError::Io(err.to_string()))?;
     let mut theme = parse_theme_file_str(&contents)?;
@@ -427,15 +541,27 @@ pub fn import_theme_file(
 /// [`import_theme_file`]'s own docs for the bug this exists to fix. Starts from the plain
 /// `{slugify(name)}.toml` path; if something is already there, reads and validates it - an exact
 /// `name` match means it's genuinely the same theme being re-imported (real "update" behaviour,
-/// intentionally overwritten), anything else (a different theme, or a file that doesn't even
-/// parse as one) means the slug is taken by something unrelated, so this tries
-/// `{slug}-2.toml`, `{slug}-3.toml`, ... until it finds either a free path or one already holding
-/// this same theme.
+/// intentionally overwritten - including when that path is a real symlink to a legitimate theme
+/// file elsewhere, a genuine way to share one across machines), anything else (a different theme,
+/// a file that doesn't even parse as one, or a *dangling* symlink) means the slug is taken by
+/// something unrelated, so this tries `{slug}-2.toml`, `{slug}-3.toml`, ... until it finds either
+/// a free path or one already holding this same theme.
+///
+/// `symlink_metadata`, not `Path::exists` - an adversarial audit caught the original
+/// `candidate.exists()` here as a real vulnerability, not just a style nit: `exists()` follows
+/// symlinks and reports `false` for a *dangling* `{slug}.toml -> /some/other/path` symlink sitting
+/// in `dest_dir`, so this loop would treat that path as free, and [`import_theme_file`]'s own
+/// `std::fs::write` (which also follows symlinks) would then write straight through it into
+/// whatever it points at - a real clobber of an unrelated file, just staged via a symlink instead
+/// of a same-named regular file. `symlink_metadata` reports the symlink's own presence without
+/// following it, so a dangling (or unrelated-target) symlink here is treated as a real collision
+/// like any other occupied path, while a symlink that genuinely points at a file already holding
+/// *this same* theme is still correctly reused below.
 fn non_colliding_dest_path(dest_dir: &Path, name: &str) -> PathBuf {
     let base_slug = slugify(name);
     let mut candidate = dest_dir.join(format!("{base_slug}.toml"));
     let mut suffix = 2;
-    while candidate.exists() {
+    while candidate.symlink_metadata().is_ok() {
         let same_theme = std::fs::read_to_string(&candidate)
             .ok()
             .and_then(|contents| parse_theme_file_str(&contents).ok())
@@ -750,6 +876,106 @@ mod tests {
         assert!(names.contains(&"Midnight Coral"));
     }
 
+    /// Regression for a real, concurrency-incident-lost fix: a *dangling* symlink planted at the
+    /// exact path `import_theme_file` would otherwise write to must not be followed. Before this
+    /// fix, `non_colliding_dest_path`'s `candidate.exists()` reported `false` for a dangling
+    /// symlink (it follows symlinks and the *target* doesn't exist), so the loop treated the path
+    /// as free and `std::fs::write` then wrote straight through the symlink into whatever it
+    /// pointed at.
+    #[cfg(unix)]
+    #[test]
+    fn import_theme_file_does_not_follow_a_dangling_symlink_planted_at_the_slug_path() {
+        let source_dir = tempfile::tempdir().expect("tempdir");
+        let dest_dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        // The symlink's target deliberately does not exist - a dangling symlink.
+        let attacker_target = outside.path().join("does-not-exist-yet.toml");
+        std::os::unix::fs::symlink(
+            &attacker_target,
+            dest_dir.path().join("midnight-coral.toml"),
+        )
+        .expect("create dangling symlink");
+
+        let source_path = source_dir.path().join("picked.toml");
+        std::fs::write(&source_path, valid_file().to_toml_string_for_test()).expect("write");
+
+        let imported = import_theme_file(&source_path, dest_dir.path()).expect("should import");
+
+        assert_ne!(
+            imported.source_path,
+            Some(dest_dir.path().join("midnight-coral.toml")),
+            "must not have written through the dangling symlink"
+        );
+        assert!(
+            !attacker_target.exists(),
+            "must never have created the symlink's target by following it"
+        );
+    }
+
+    /// A companion guard, not itself a regression test for the dangling-symlink fix (a symlink to
+    /// a real, *existing* file was already correctly treated as a collision by the old
+    /// `candidate.exists()` check too - `exists()` only misreports a *dangling* symlink as absent,
+    /// which is what
+    /// [`import_theme_file_does_not_follow_a_dangling_symlink_planted_at_the_slug_path`] actually
+    /// regression-tests). Kept anyway as real, independent coverage that a symlink pointing at a
+    /// real, *unrelated* (differently-named) theme file is treated as a collision (redirected to a
+    /// new candidate name), exactly like an ordinary same-named regular file already is, and that
+    /// the unrelated file it points at survives untouched.
+    #[cfg(unix)]
+    #[test]
+    fn import_theme_file_does_not_follow_a_symlink_to_an_unrelated_theme_file() {
+        let source_dir = tempfile::tempdir().expect("tempdir");
+        let dest_dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+
+        let mut ocean = valid_file();
+        ocean.name = "Ocean".to_string();
+        let real_file = outside.path().join("ocean.toml");
+        std::fs::write(&real_file, ocean.to_toml_string_for_test()).expect("write real file");
+        std::os::unix::fs::symlink(&real_file, dest_dir.path().join("midnight-coral.toml"))
+            .expect("create symlink to unrelated theme");
+
+        let source_path = source_dir.path().join("picked.toml");
+        std::fs::write(&source_path, valid_file().to_toml_string_for_test()).expect("write");
+
+        let imported = import_theme_file(&source_path, dest_dir.path()).expect("should import");
+
+        assert_eq!(imported.name, "Midnight Coral");
+        assert_ne!(
+            imported.source_path,
+            Some(dest_dir.path().join("midnight-coral.toml")),
+            "must not have written through the symlink into Ocean's real file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real_file).expect("Ocean's file should still be readable"),
+            ocean.to_toml_string_for_test(),
+            "Ocean's real file must survive completely untouched"
+        );
+    }
+
+    /// The flip side: a symlink that genuinely points at a file already holding *this same*
+    /// theme (a real, legitimate way to share one across machines) is a real re-import-to-update,
+    /// not a collision - it must be reused, not redirected to a `-2` sibling.
+    #[cfg(unix)]
+    #[test]
+    fn non_colliding_dest_path_reuses_a_symlink_that_points_at_a_file_holding_the_same_theme() {
+        let dest_dir = tempfile::tempdir().expect("tempdir");
+        let real_file_dir = tempfile::tempdir().expect("tempdir");
+        let real_file = real_file_dir.path().join("shared-theme.toml");
+        std::fs::write(&real_file, valid_file().to_toml_string_for_test())
+            .expect("write real file");
+        let symlink_path = dest_dir.path().join("midnight-coral.toml");
+        std::os::unix::fs::symlink(&real_file, &symlink_path).expect("create symlink");
+
+        let candidate = non_colliding_dest_path(dest_dir.path(), "Midnight Coral");
+
+        assert_eq!(
+            candidate, symlink_path,
+            "a symlink to a file already holding this exact theme is a legitimate re-import \
+             target, not a collision"
+        );
+    }
+
     /// A second import of the *same* theme (by name) is a real, intentional update - it must
     /// land back at the exact same path, not spawn a `-2` sibling.
     #[test]
@@ -804,6 +1030,38 @@ mod tests {
         let missing_source = dest_dir.path().join("does-not-exist.toml");
         let err = import_theme_file(&missing_source, dest_dir.path()).unwrap_err();
         assert!(matches!(err, ThemeFileError::Io(_)));
+    }
+
+    /// Regression for a real, concurrency-incident-lost fix: [`load_custom_themes_from_dir`]
+    /// already capped a directory's own files at [`MAX_THEME_FILE_BYTES`], but
+    /// [`import_theme_file`] (the user-facing "import this file" action) had no matching check
+    /// against the *source* file it's about to import - an oversized source would previously have
+    /// been read into memory in full before validation ever rejected it as malformed TOML. This
+    /// must reject it before reading or writing anything at all.
+    #[test]
+    fn import_theme_file_rejects_an_oversized_source_before_reading_or_writing_it() {
+        let source_dir = tempfile::tempdir().expect("tempdir");
+        let dest_dir = tempfile::tempdir().expect("tempdir");
+        let source_path = source_dir.path().join("huge.toml");
+        let oversized_len = MAX_THEME_FILE_BYTES + 1;
+        std::fs::write(&source_path, "x".repeat(oversized_len as usize))
+            .expect("write huge source");
+
+        let err = import_theme_file(&source_path, dest_dir.path()).unwrap_err();
+
+        assert_eq!(
+            err,
+            ThemeFileError::TooLarge {
+                bytes: oversized_len,
+                max_bytes: MAX_THEME_FILE_BYTES,
+            }
+        );
+        assert!(
+            std::fs::read_dir(dest_dir.path())
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true),
+            "a rejected oversized import must not write any file"
+        );
     }
 
     #[test]
@@ -987,6 +1245,97 @@ mod tests {
             empty_name.validate_with_builtin_check(false),
             Err(ThemeFileError::EmptyName),
             "an empty name must still be rejected even with the collision check off"
+        );
+    }
+
+    /// Regression for a real, concurrency-incident-lost fix: a `panel` swatch with zero real
+    /// contrast against `background` (here, literally the same colour) must be rejected - the
+    /// concrete unreadable-theme case the readability floor exists to catch.
+    #[test]
+    fn a_panel_swatch_with_no_real_contrast_against_background_is_rejected() {
+        let mut file = valid_file();
+        file.panel = file.background.clone();
+        let err = file.validate().unwrap_err();
+        assert_eq!(
+            err,
+            ThemeFileError::LowReadability {
+                delta_per_mille: 0,
+                floor_per_mille: readability_floor_per_mille(),
+            }
+        );
+    }
+
+    /// [`JERRY_DARK_BASELINE_SWATCHES`] is a pinned copy of Jerry Dark's own swatches, kept
+    /// deliberately independent of `crate::settings::state::THEME_DEFS` at runtime (see that
+    /// const's own docs for the reentrant `LazyLock` deadlock this avoids). This is the real
+    /// regression test that keeps the pinned copy honest: a future edit to Jerry Dark's own
+    /// swatches (`assets/themes/jerry-dark.toml`) that forgets to update this copy fails here,
+    /// loudly, in an ordinary `#[test]` - never from inside another `LazyLock`'s own initializer,
+    /// which is the one context this exact comparison must never run in.
+    #[test]
+    fn jerry_dark_baseline_swatches_const_matches_the_real_initialized_theme_defs_0_swatches() {
+        assert_eq!(
+            JERRY_DARK_BASELINE_SWATCHES,
+            crate::settings::state::THEME_DEFS[0].swatches
+        );
+    }
+
+    /// Real regression: the readability floor (derived from [`JERRY_DARK_BASELINE_SWATCHES`])
+    /// must not accidentally reject any of the six real, shipped built-in theme files -
+    /// `parse_builtin_theme_file_str` already panics on any validation failure, including a
+    /// `LowReadability` rejection, so reaching the end of this loop at all is the real assertion.
+    #[test]
+    fn every_built_in_theme_clears_the_readability_floor() {
+        let files = [
+            include_str!("../../../../assets/themes/jerry-dark.toml"),
+            include_str!("../../../../assets/themes/jerry-dim.toml"),
+            include_str!("../../../../assets/themes/slate.toml"),
+            include_str!("../../../../assets/themes/ember.toml"),
+            include_str!("../../../../assets/themes/moss.toml"),
+            include_str!("../../../../assets/themes/paper.toml"),
+        ];
+        let floor = readability_floor_per_mille();
+        for contents in files {
+            // `parse_builtin_theme_file_str` already panics on any validation failure - including
+            // a `LowReadability` rejection - so it alone would prove this passes, but a bare panic
+            // there names neither the theme nor the actual margin. Recomputing the real delta here
+            // too and asserting it directly gives a real, specific failure message instead.
+            let theme = parse_builtin_theme_file_str(contents);
+            let delta = panel_background_luma_delta_per_mille(&theme.swatches);
+            assert!(
+                delta >= floor,
+                "{}: panel/background luma delta {delta} is below the readability floor {floor}",
+                theme.name
+            );
+        }
+    }
+
+    /// Pins the readability floor's actual real, computed magnitude - not just its existence.
+    /// Every other test in this suite only proves the floor rejects a *zero*-contrast panel and
+    /// accepts the six real built-in themes; none of them would catch a future edit that quietly
+    /// weakens [`readability_floor_per_mille`] (e.g. dividing by `50` instead of `2`) while still
+    /// passing every other assertion. This is the one test that would.
+    #[test]
+    fn readability_floor_per_mille_is_pinned_to_a_real_computed_value() {
+        assert_eq!(readability_floor_per_mille(), 28);
+    }
+
+    /// A real near-miss, not just the zero-contrast extreme
+    /// [`a_panel_swatch_with_no_real_contrast_against_background_is_rejected`] already covers:
+    /// `panel` here is a visibly different hex string from `background` (a hand-author could
+    /// easily mistake this for "different enough"), but still well under the floor - real
+    /// per-mille values transcribed from a real luma computation, not hand-waved.
+    #[test]
+    fn a_panel_swatch_only_a_few_hex_digits_off_from_background_is_still_rejected() {
+        let mut file = valid_file();
+        file.panel = "#0e0f12".to_string();
+        let err = file.validate().unwrap_err();
+        assert_eq!(
+            err,
+            ThemeFileError::LowReadability {
+                delta_per_mille: 8,
+                floor_per_mille: 28,
+            }
         );
     }
 }

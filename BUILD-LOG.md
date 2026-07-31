@@ -4352,3 +4352,109 @@ work. All four gates clean after the deadlock fix: `cargo fmt --all -- --check`,
 failed. A separate full run earlier hit the same known
 `code_surface::diff_view::diff_render_tests` flake documented above (that file has zero diff on
 this branch); re-run in isolation, all 7 of that module's tests passed.
+
+## Re-implementing three lost custom-theme safety fixes after a real concurrency data-loss incident
+
+The paragraphs immediately above this one - describing `custom_theme_shift_preserves_readability`,
+a `JERRY_DARK_BASE_SWATCHES` const, and a
+`jerry_dark_base_swatches_matches_the_real_initialized_theme_defs_entry` regression test - do not
+correspond to anything in the code as committed. Grepping the current tree for all three names
+returns zero matches. Earlier in this branch's history, two agent sessions were accidentally run
+concurrently against this same shared (non-isolated) worktree directory - a coordinator mistake,
+not a code one. One of those sessions built three real, correct safety fixes for
+`crates/app/src/settings/custom_theme.rs` and left them uncommitted; the other concurrent session's
+own file writes silently clobbered them before they were ever committed, and the commit message
+recorded above was itself written against a version of the file that no longer matches what
+actually landed. This entry is the honest re-implementation, done from a clean read of the real
+current file (not from trusting the description above), and independently verified against the
+real committed diff by a fresh adversarial checker sub-agent rather than taken on this session's own
+word.
+
+The three real gaps, and what actually landed for each, by name:
+
+1. **Symlink-based unrelated-file-clobber in `non_colliding_dest_path`.** The collision-check loop
+   used `while candidate.exists() { ... }`. `Path::exists()` follows symlinks and reports `false`
+   for a *dangling* `{slug}.toml -> /some/other/path` symlink sitting in the destination directory,
+   so the loop treated that path as free, and `import_theme_file`'s own `std::fs::write` (which also
+   follows symlinks) would then write straight through it into whatever it pointed at - a real
+   clobber of an unrelated file, staged via a symlink instead of a same-named regular file. Fixed by
+   changing the loop condition to `candidate.symlink_metadata().is_ok()`, which detects the
+   symlink's own presence without following it, while a symlink that genuinely points at a file
+   already holding *this same* theme is still correctly reused rather than rejected. New tests:
+   `import_theme_file_does_not_follow_a_dangling_symlink_planted_at_the_slug_path`,
+   `import_theme_file_does_not_follow_a_symlink_to_an_unrelated_theme_file` (a real symlink via
+   `std::os::unix::fs::symlink`, `#[cfg(unix)]`), and
+   `non_colliding_dest_path_reuses_a_symlink_that_points_at_a_file_holding_the_same_theme`.
+
+2. **No file-size cap at import time.** `load_custom_themes_from_dir` already enforced
+   `MAX_THEME_FILE_BYTES` against files already sitting in a custom-themes directory, but
+   `import_theme_file` (the user-facing "import this file" action) had no matching check against
+   the *source* file being imported. Fixed by checking `std::fs::metadata(source_path).len()`
+   against the same `MAX_THEME_FILE_BYTES` constant before ever calling `read_to_string`, returning
+   a new `ThemeFileError::TooLarge { bytes, max_bytes }` variant. New test:
+   `import_theme_file_rejects_an_oversized_source_before_reading_or_writing_it`.
+
+3. **No readability-floor validation for custom theme swatches.** There was no check that a custom
+   theme's `panel` swatch is meaningfully different in brightness from `background` - a theme with
+   `panel == background` (or nearly so) validated and loaded cleanly. Fixed inside
+   `CustomThemeFile::validate_with_builtin_check` (so both `validate()` and the built-in-parsing
+   path run it) with three new functions - `relative_luma_per_mille` (standard ITU-R BT.709 luma,
+   scaled to an integer per-mille so the new error variant can stay `#[derive(Eq)]`),
+   `panel_background_luma_delta_per_mille`, and `readability_floor_per_mille` (half of Jerry Dark's
+   own real panel/background delta) - and a new `ThemeFileError::LowReadability { delta_per_mille,
+   floor_per_mille }` variant. The critical ordering constraint: this check must never read
+   `crate::settings::state::THEME_DEFS`, because `validate_with_builtin_check(false)` is called from
+   *inside* `THEME_DEFS`'s own `std::sync::LazyLock` initializer while parsing the six built-in
+   embedded theme files - reading `THEME_DEFS` from there would re-enter the still-initializing
+   `LazyLock` and hang forever on `std::sync::Once` (a real, previously-reproduced deadlock in this
+   branch's history, not a hypothetical). Solved by pinning a new `JERRY_DARK_BASELINE_SWATCHES`
+   const (`[0x0e0f11, 0x1a1e21, 0x5cb87f, 0xe2a336, 0x74ade8]`, transcribed by hand from
+   `assets/themes/jerry-dark.toml`, confirmed byte-for-byte against that file) as the readability
+   baseline instead of reading `THEME_DEFS` at runtime. A new regression test,
+   `jerry_dark_baseline_swatches_const_matches_the_real_initialized_theme_defs_0_swatches`, asserts
+   this pinned copy stays equal to `THEME_DEFS[0].swatches` - called from an ordinary `#[test]`,
+   never from inside another `LazyLock`'s own initializer, which is the one context that assertion
+   must never run in. Also added: `every_built_in_theme_clears_the_readability_floor` (asserts the
+   real per-theme delta against the floor by name, not just that validation didn't panic),
+   `readability_floor_per_mille_is_pinned_to_a_real_computed_value` (locks the floor at its actual
+   computed value, `28`, so a future edit can't silently weaken the check while every other test
+   stays green), `a_panel_swatch_with_no_real_contrast_against_background_is_rejected`, and
+   `a_panel_swatch_only_a_few_hex_digits_off_from_background_is_still_rejected` (a real near-miss,
+   not just the zero-contrast extreme).
+
+One existing test needed a fixture change, not a behavior change: `render.rs`'s
+`reimporting_the_currently_active_theme_immediately_reskins_the_app` re-imported Midnight Coral with
+its background swatch changed to `#301010`, which - now that the readability floor is enforced - is
+too close in brightness to that theme's own `#181a1e` panel (delta 12, floor 28) and was correctly
+rejected, breaking the test's own premise of exercising a live re-skin. Changed the fixture's new
+background to `#050505` (delta 81 against the same panel) instead; the test still proves the same
+live-re-skin behavior with a swatch that legitimately clears the floor.
+
+An independent, adversarial checker sub-agent was dispatched against the finished diff before
+committing, instructed explicitly to verify by direct `grep`/reading the real committed diff rather
+than trusting this session's own summary, and to run the actual test suite itself rather than take
+"tests pass" on faith. It confirmed all three fixes present with exact line numbers and ran the
+relevant tests itself, then flagged three real, legitimate weaknesses this session then fixed before
+committing: `every_built_in_theme_clears_the_readability_floor` originally only relied on a generic
+`expect`-panic inside `parse_builtin_theme_file_str` (duplicate coverage of an existing test, no
+real per-theme assertion) - now asserts the real delta against the floor by theme name;
+`import_theme_file_does_not_follow_a_symlink_to_an_unrelated_theme_file`'s doc comment incorrectly
+framed it as testing the same regression as the dangling-symlink fix, when a symlink to a real,
+existing file was already handled correctly by the old `candidate.exists()` check too - doc comment
+corrected to describe it as independent coverage, not a regression test for the fix itself; and
+`readability_floor_per_mille`'s magnitude was previously unpinned by any test (only proven `> 0`),
+so a future edit weakening the floor divisor would have passed the whole suite - added
+`readability_floor_per_mille_is_pinned_to_a_real_computed_value` and the near-miss test above to
+close that gap. The checker also correctly noted this is a real, disclosed compatibility change: an
+existing on-disk custom theme file with `panel`/`background` delta below the floor will now fail to
+load - not silently, though, since `load_custom_themes_from_dir` already surfaces a per-file
+validation error through the existing `custom_theme_load_errors` list the Themes page renders, the
+same path any other malformed theme file already goes through.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, and a full `cargo test --workspace --lib --
+--test-threads=1` at 981 app + 42 lsp-core + 14 pty-core + 98 wt-core, 0 failed (9 new tests in
+`settings::custom_theme::tests` specifically, plus the one fixture change in
+`settings::render::custom_theme_settings_tests`). One full run hit the known
+`code_surface::diff_view::diff_render_tests::switching_the_open_diff_to_a_different_file_recomputes_the_highlight_cache`
+flake noted above; re-run alone immediately afterward, it passed.

@@ -3867,12 +3867,16 @@ mod custom_theme_settings_tests {
         });
         let original = theme::surface::WINDOW.resolve();
 
-        // Re-import the same theme under a different background swatch.
+        // Re-import the same theme under a different background swatch - deliberately near-black
+        // (`#050505`), not an arbitrary colour: it must still clear the real panel/background
+        // readability floor `CustomThemeFile::validate_with_builtin_check` enforces (see
+        // `custom_theme::readability_floor_per_mille`'s own docs), or this re-import would be a
+        // real, correct rejection rather than the re-skin this test means to exercise.
         let source_dir = tempfile::tempdir().expect("tempdir");
         let source_path = source_dir.path().join("picked.toml");
         std::fs::write(
             &source_path,
-            MIDNIGHT_CORAL_TOML.replace("#0c0d10", "#301010"),
+            MIDNIGHT_CORAL_TOML.replace("#0c0d10", "#050505"),
         )
         .expect("write updated source");
         let result = custom_theme::import_theme_file(&source_path, &dest_dir).map(|imported| {
