@@ -1,4 +1,4 @@
-//! The command palette (⌘K): everything about one feature, in one folder.
+//! The command palette (⌘P): everything about one feature, in one folder.
 //!
 //! Split the way every feature folder in this crate is split - pure, GPUI-window-free logic
 //! separate from the `gpui::Div`-building code that draws it:

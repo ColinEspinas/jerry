@@ -93,8 +93,10 @@ impl AdeApp {
     /// there is no `gpui::KeyBinding` for it in `crate::default_key_bindings`. That's a
     /// deliberate scope decision: this project has repeatedly hit real, live-reproduced bugs
     /// where a *global* keybinding stole a keystroke a focused terminal/agent session needed
-    /// (`crate::default_key_bindings`'s own docs cover several - `secondary-p`, unscoped `"]"`,
-    /// unscoped `secondary-z`). A title-bar menu has no conventional shortcut of its own to
+    /// (`crate::default_key_bindings`'s own docs cover several it scoped away from this exact
+    /// way - unscoped `"]"`, unscoped `secondary-z` - and one, `secondary-p`, it ultimately
+    /// accepted stealing anyway as a deliberate, discussed tradeoff). A title-bar menu has no
+    /// conventional shortcut of its own to
     /// conflict with anything, so the safest way to avoid adding an eighth instance of that bug
     /// class is simply not adding a keybinding at all - every row it offers is already reachable
     /// some other real way (a keybinding of its own, the `+` menu, or the command palette).
@@ -421,12 +423,12 @@ impl AdeApp {
 
         let mut rows = vec![
             render_dropdown_menu_row(
-                "K",
+                "P",
                 theme::palette::COMMAND_CHIP.0.into(),
                 theme::palette::COMMAND_CHIP.1.into(),
                 "Command Palette",
                 "search everything".to_string(),
-                keymap::resolve_combo("mod+K", self.window_controls_style().is_macos()),
+                keymap::resolve_combo("mod+P", self.window_controls_style().is_macos()),
                 true,
             )
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {

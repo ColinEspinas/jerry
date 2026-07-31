@@ -21,7 +21,7 @@ impl AdeApp {
         window.focus(&self.code_focus_handle, cx);
     }
 
-    /// Opens the command palette (⌘K): resets query/scope/selection to a fresh "browse
+    /// Opens the command palette (⌘P): resets query/scope/selection to a fresh "browse
     /// everything" state, captures the pre-open focus target into [`Self::palette_focus`], and
     /// moves focus onto [`Self::palette_focus_handle`]. Also disarms a pending rail prune
     /// confirmation ([`Self::prune_confirm_armed`]) - opening the palette counts as "did
@@ -110,7 +110,7 @@ impl AdeApp {
     }
 }
 
-/// Interactive regression coverage for the palette's ⌘K entry point, driven through GPUI's
+/// Interactive regression coverage for the palette's ⌘P entry point, driven through GPUI's
 /// `TestAppContext`/`VisualTestContext` harness (a real window, focus tracking, action dispatch
 /// and keystroke simulation). A plain unit test can't catch this bug class: it requires a real
 /// window with real GPUI dispatch to reproduce a dangling `Window::focus`.
@@ -140,7 +140,7 @@ pub(crate) mod palette_focus_tests {
     }
 
     /// Without a focus restore in `close_palette`, `Window::focus` stayed on the untracked
-    /// `palette_focus_handle` and every action dispatch after that - including the next ⌘K -
+    /// `palette_focus_handle` and every action dispatch after that - including the next ⌘P -
     /// fell back to the dispatch root, so the palette could never be reopened without a manual
     /// click first.
     #[gpui::test]
@@ -151,26 +151,26 @@ pub(crate) mod palette_focus_tests {
         cx.dispatch_action(TogglePalette);
         assert!(
             app.read_with(cx, |app, _| app.palette_open),
-            "first secondary-k should open the palette"
+            "first secondary-p should open the palette"
         );
 
         cx.dispatch_action(TogglePalette);
         assert!(
             !app.read_with(cx, |app, _| app.palette_open),
-            "second secondary-k should close the palette"
+            "second secondary-p should close the palette"
         );
 
         cx.dispatch_action(TogglePalette);
         assert!(
             app.read_with(cx, |app, _| app.palette_open),
-            "third secondary-k - reopening after a close - is exactly the case that was broken: \
+            "third secondary-p - reopening after a close - is exactly the case that was broken: \
              without restoring real focus in close_palette, this dispatch had nowhere real to \
              land and silently did nothing"
         );
     }
 
     /// A fresh window starts with `Window::focus == None` - without `AdeApp::new` giving the
-    /// initial session's pane focus up front, the very first ⌘K would silently do nothing.
+    /// initial session's pane focus up front, the very first ⌘P would silently do nothing.
     #[gpui::test]
     fn toggle_palette_works_on_a_fresh_window_with_nothing_clicked_yet(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -180,7 +180,7 @@ pub(crate) mod palette_focus_tests {
 
         assert!(
             app.read_with(cx, |app, _| app.palette_open),
-            "secondary-k on a completely fresh window (nothing clicked yet) should still open the \
+            "secondary-p on a completely fresh window (nothing clicked yet) should still open the \
              palette"
         );
     }
@@ -215,7 +215,7 @@ pub(crate) mod palette_focus_tests {
         cx.dispatch_action(TogglePalette);
         assert!(
             app.read_with(cx, |app, _| app.palette_open),
-            "secondary-k after a palette-spawned New Shell should still open the palette - the \
+            "secondary-p after a palette-spawned New Shell should still open the palette - the \
              center pane now renders a different session's terminal pane than the one focus \
              was captured from, so close_palette must not restore that now-stale handle"
         );
@@ -260,11 +260,11 @@ pub(crate) mod palette_focus_tests {
     /// binds `crate::default_key_bindings()` via `App::bind_keys`
     /// (`vendor/zed/crates/gpui/src/app.rs:2130`) and simulates the real keystroke via
     /// `VisualTestContext::simulate_keystrokes` (`vendor/zed/crates/gpui/src/app/
-    /// test_context.rs:794`) - so a wrong keystroke spec in `default_key_bindings` (e.g. `cmd-k`,
+    /// test_context.rs:794`) - so a wrong keystroke spec in `default_key_bindings` (e.g. `cmd-p`,
     /// which GPUI resolves to Super/Windows on Linux, never Ctrl) fails this test even though a
-    /// direct `dispatch_action` test would stay green. `secondary_k` tracks the same
+    /// direct `dispatch_action` test would stay green. `secondary_p` tracks the same
     /// `cfg!(target_os = "macos")` resolution `default_key_bindings` itself uses, rather than
-    /// hardcoding `ctrl-k`.
+    /// hardcoding `ctrl-p`.
     #[gpui::test]
     fn secondary_keystroke_opens_the_palette_through_the_real_key_bindings(
         cx: &mut TestAppContext,
@@ -273,16 +273,16 @@ pub(crate) mod palette_focus_tests {
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
 
-        let secondary_k = if cfg!(target_os = "macos") {
-            "cmd-k"
+        let secondary_p = if cfg!(target_os = "macos") {
+            "cmd-p"
         } else {
-            "ctrl-k"
+            "ctrl-p"
         };
-        cx.simulate_keystrokes(secondary_k);
+        cx.simulate_keystrokes(secondary_p);
 
         assert!(
             app.read_with(cx, |app, _| app.palette_open),
-            "a real, simulated {secondary_k} keystroke - not a direct TogglePalette action \
+            "a real, simulated {secondary_p} keystroke - not a direct TogglePalette action \
              dispatch - must open the palette through crate::default_key_bindings' real \
              KeyBinding registration; this is exactly the path the old \"cmd-k\" binding broke \
              on Linux (Ctrl+K did nothing) without any test catching it"
@@ -411,43 +411,55 @@ mod tab_strip_keybinding_tests {
         );
     }
 
-    /// The `+` menu's "Open file…" row has no global `secondary-p` binding (see
-    /// `crate::default_key_bindings`'s docs: GPUI dispatches a matched `KeyBinding` before a
-    /// focused element's own `on_key_down`, so a global binding would swallow readline's Ctrl+P
-    /// out of every focused terminal). This only proves the palette didn't open;
-    /// `crate::terminal::pane`'s `keystroke_tests` covers the pty-forwarding half.
+    /// `secondary-p` is now `TogglePalette`'s own real global keybinding (see
+    /// `crate::default_key_bindings`'s docs for the full tradeoff), deliberately unscoped rather
+    /// than `!terminal`-scoped - GPUI dispatches a matched `KeyBinding` before a focused
+    /// element's own `on_key_down`, so this global binding really does swallow readline's
+    /// `previous-history` Ctrl+P out of every focused terminal, a known, explicit, accepted
+    /// tradeoff rather than an oversight. This proves the palette *does* now open even with a
+    /// terminal focused; `crate::terminal::pane`'s `keystroke_tests` covers the (now-unreachable
+    /// in practice) pty-forwarding half of `Ctrl+P`.
     #[gpui::test]
-    fn ctrl_p_does_not_open_the_palette_while_a_terminal_is_focused(cx: &mut TestAppContext) {
+    fn ctrl_p_opens_the_palette_even_while_a_terminal_is_focused(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
+        // Explicitly focus the initial shell session - the real, concrete "a terminal pane
+        // genuinely has keyboard focus" state this test's own name promises, rather than relying
+        // on whatever `AdeApp::new_with_settings` happens to leave focus on by default.
+        app.update_in(cx, |app, window, cx| {
+            app.sessions.focus_active(window, cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.sessions.active_id().is_some()),
+            "sanity check: a real terminal session must be focused for this test to mean anything"
+        );
         assert!(
             !app.read_with(cx, |app, _| app.palette_open),
             "sanity check: the palette must start closed"
         );
 
-        let secondary_p = if cfg!(target_os = "macos") {
-            "cmd-p"
-        } else {
-            "ctrl-p"
-        };
+        let secondary_p = secondary_p();
         cx.simulate_keystrokes(secondary_p);
 
         assert!(
-            !app.read_with(cx, |app, _| app.palette_open),
-            "a real, simulated {secondary_p} keystroke must NOT open the palette - there is no \
-             real global keybinding for it anymore (crate::default_key_bindings' own docs), so \
-             it must be free to reach the focused terminal pane as literal input instead of \
-             being intercepted at the dispatch level"
+            app.read_with(cx, |app, _| app.palette_open),
+            "a real, simulated {secondary_p} keystroke must open the palette - it is now the \
+             real, unscoped global TogglePalette binding (crate::default_key_bindings' own \
+             docs), even with a terminal focused; the terminal's own readline Ctrl+P is \
+             shadowed as a deliberate, accepted tradeoff, not a bug"
         );
     }
 
-    fn secondary_k() -> &'static str {
+    /// The palette's real global shortcut, matching `crate::default_key_bindings`' own
+    /// `cfg!(target_os = "macos")` resolution for `"secondary-p"` rather than hardcoding
+    /// `ctrl-p`/`cmd-p`.
+    fn secondary_p() -> &'static str {
         if cfg!(target_os = "macos") {
-            "cmd-k"
+            "cmd-p"
         } else {
-            "ctrl-k"
+            "ctrl-p"
         }
     }
 
@@ -456,7 +468,7 @@ mod tab_strip_keybinding_tests {
     /// isn't rendered anywhere that frame - `Sessions::spawn` used to move focus there
     /// unconditionally, silently killing every bound shortcut until the next click.
     #[gpui::test]
-    fn ctrl_k_still_works_after_ctrl_shift_t_with_a_file_tab_active(cx: &mut TestAppContext) {
+    fn ctrl_p_still_works_after_ctrl_shift_t_with_a_file_tab_active(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         std::fs::write(repo.path().join("a.txt"), "hello\n").expect("write a.txt");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
@@ -477,7 +489,7 @@ mod tab_strip_keybinding_tests {
             "sanity check: ctrl-shift-t should have spawned a real new session"
         );
 
-        let key = secondary_k();
+        let key = secondary_p();
         cx.simulate_keystrokes(key);
 
         assert!(
@@ -493,7 +505,7 @@ mod tab_strip_keybinding_tests {
     /// active session but must also move focus onto it, or every bound shortcut dies until the
     /// next click.
     #[gpui::test]
-    fn ctrl_k_still_works_after_closing_the_active_session_tab(cx: &mut TestAppContext) {
+    fn ctrl_p_still_works_after_closing_the_active_session_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
@@ -523,7 +535,7 @@ mod tab_strip_keybinding_tests {
             app.close_session(first_id, window, cx);
         });
 
-        let key = secondary_k();
+        let key = secondary_p();
         cx.simulate_keystrokes(key);
 
         assert!(
@@ -537,7 +549,7 @@ mod tab_strip_keybinding_tests {
     /// The other path to the same `Sessions::close` gap: archiving the active session from the
     /// rail (`AdeApp::archive_session`, which delegates to `Self::close_session`).
     #[gpui::test]
-    fn ctrl_k_still_works_after_archiving_the_active_session(cx: &mut TestAppContext) {
+    fn ctrl_p_still_works_after_archiving_the_active_session(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
@@ -567,7 +579,7 @@ mod tab_strip_keybinding_tests {
             app.archive_session(first_id, window, cx);
         });
 
-        let key = secondary_k();
+        let key = secondary_p();
         cx.simulate_keystrokes(key);
 
         assert!(
@@ -876,7 +888,7 @@ mod settings_focus_tests {
     /// `secondary-,` opens Settings, a real Esc keystroke (`VisualTestContext::
     /// simulate_keystrokes("escape")`, the same lowercase-string precedent
     /// `vendor/zed/crates/editor/src/edit_prediction_tests.rs` uses) closes it, and a
-    /// subsequent `secondary-k` still reaches [`AdeApp::handle_toggle_palette_action`].
+    /// subsequent `secondary-p` still reaches [`AdeApp::handle_toggle_palette_action`].
     #[gpui::test]
     fn toggle_settings_action_opens_then_real_escape_closes_it_and_focus_stays_live(
         cx: &mut TestAppContext,
@@ -901,7 +913,7 @@ mod settings_focus_tests {
         cx.dispatch_action(TogglePalette);
         assert!(
             app.read_with(cx, |app, _| app.palette_open),
-            "secondary-k after closing Settings must still reach handle_toggle_palette_action - the \
+            "secondary-p after closing Settings must still reach handle_toggle_palette_action - the \
              exact bug class this module exists to catch is close_settings leaving \
              Window::focus dangling on settings_focus_handle instead of restoring it"
         );
@@ -1241,7 +1253,7 @@ mod code_focus_tests {
         cx.dispatch_action(TogglePalette);
         assert!(
             app.read_with(cx, |app, _| app.palette_open),
-            "secondary-k must still reach handle_toggle_palette_action once a File view is mounted, \
+            "secondary-p must still reach handle_toggle_palette_action once a File view is mounted, \
              for exactly the same real reason secondary-, must"
         );
     }

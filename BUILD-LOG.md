@@ -3683,3 +3683,116 @@ binaries aren't installed on this sandbox) that reproduce identically on `master
 change and are unrelated to it. A literal full-workspace `cargo test`/`cargo clippy --workspace`
 was not run to completion for the same reason `ac8e6cd` (already on `master`) narrowed CI itself
 to build-only on non-Linux platforms.
+
+## Three real post-merge regressions on `master`: a keybinding collision, a dirty-tab confirm gate leaking into a different button, and a stale collision-checker test
+
+A fresh `origin/master` checkout (commit `92d229a`, the merge of the multi-cursor work, PR #40)
+failed three tests that all passed on their own feature branches before merging. All three are
+real, independently-diagnosed regressions - not flakes, not sandbox artifacts - and none of them
+share a root cause with either of the other two.
+
+**Bug 1 - a genuine keybinding collision, not a focus bug.** The multi-cursor work (Revision R13,
+issue #28) added a real `"ctrl-k ctrl-d"` chord binding (`EditorSkipOccurrence`, `file-editor`
+scope) alongside the pre-existing global `"secondary-k"` → `TogglePalette` binding. Registering
+`"ctrl-k"` as a chord *prefix* in the file-editor context means GPUI's own dispatch
+(`window.rs`'s `pending_input` mechanism) now makes a lone Ctrl+K in that context wait through a
+real ~1s timeout before replaying it as a plain keystroke and reaching `TogglePalette` - a real,
+newly-introduced UX delay, not a functional break, but enough to fail a test that asserts
+immediately with no wait
+(`root::focus::tab_strip_keybinding_tests::ctrl_k_still_works_after_ctrl_shift_t_with_a_file_tab_active`,
+since renamed to `ctrl_p_still_works_after_ctrl_shift_t_with_a_file_tab_active`).
+
+The fix, discussed at length and decided before implementation: the command palette's global
+keybinding moved from `"secondary-k"` to `"secondary-p"` (`Ctrl+P`/`Cmd+P`, the VS Code/Sublime
+"command palette" convention) in `crates/app/src/lib.rs`'s `default_key_bindings()` - a real
+replacement, not an alias, with `"secondary-k"` fully removed. This was explicitly discussed and
+decided as a genuine tradeoff: `"secondary-p"` stays deliberately unscoped (not `!terminal`),
+which means a focused terminal's own readline `Ctrl+P` (`previous-history`) is now shadowed by the
+app-level palette shortcut instead of reaching the shell. Two alternatives were explicitly
+considered and rejected: scoping the new binding `!terminal` (which would have preserved the
+terminal's own `Ctrl+P`, but the palette must stay reachable from a focused terminal - the same
+constraint that already keeps `"secondary-z"`/`"secondary-shift-z"` and `"]"` unscoped or narrowly
+scoped rather than blanket-excluded), and rebinding the terminal's own readline config to free up
+`Ctrl+P` (judged too much hassle for right now). See `default_key_bindings`'s own doc comment on
+the `"secondary-p"` entry for the full reasoning, preserved there rather than only here.
+
+Every other place in the codebase that assumed `"secondary-k"`/`Ctrl+K` was the palette's shortcut
+needed updating to match: the tab-strip/new-file/tree/worktree "focus didn't dangle" regression
+tests that use a real keystroke as a proxy for "some global binding still reaches its handler"
+(`root::focus`, `sidebar::tree_ops`, `work_surface::render`, `root::new_file` - renamed
+`ctrl_k_still_works_after_*` → `ctrl_p_still_works_after_*` throughout, since the proxy keystroke
+changed), the rebind-persistence test in `settings::render`, the status bar's `⌘P commands` hint
+and the View menu's "Command Palette" row (both previously rendered a `mod+K`/`"K"` keycap that
+would have been actively wrong), and a `crate::terminal::pane::keystroke_tests` doc comment that
+had claimed there was deliberately no global Ctrl+P binding (now false) - updated to explain that
+the pure `keystroke_to_bytes` mapping is unchanged but is no longer reachable in practice for a
+focused terminal, since GPUI's dispatch now intercepts Ctrl+P first. One test
+(`tab_strip_keybinding_tests::ctrl_p_does_not_open_the_palette_while_a_terminal_is_focused`) was
+asserting the literal opposite of the new intended behavior and was flipped, not just renamed, to
+`ctrl_p_opens_the_palette_even_while_a_terminal_is_focused`.
+
+**Bug 2 - a real functional regression, unrelated to Bug 1.**
+`root::focus::text_undo_scoping_tests::secondary_z_with_a_terminal_focused_reaches_neither_undo_system`
+opens a file, dirties it, calls `AdeApp::close_change_diff` (the code-surface toolbar's own "×
+close", distinct from the tab strip's), and expects `Self::open_change` to be `None` afterward.
+The same editor-keybindings PR that added `Ctrl+W`'s shared `request_close_file_tab` entry point
+(GitHub issue #26) also routed `close_change_diff` through it "so every close affordance shares
+the same real unsaved-changes confirmation" - but that PR's own `BUILD-LOG.md` entry only lists
+"the global `Ctrl+W` binding, the tab strip's own `×`, and middle-click" as the affordances it
+meant to cover, and its own verification was scoped to `code_surface::`/`settings::`/`keymap*`
+tests, which never included `root::focus::text_undo_scoping_tests`. The result: a dirty file's
+first click on the code-surface toolbar's "× close" silently armed `close_tab_confirm_armed` with
+zero on-screen feedback (unlike the tab strip's own `×`, which does render a visible "close
+without saving?" cue for the same state) - a real, silent first-click-does-nothing regression.
+Fixed by having `close_change_diff` call `Self::close_file_tab` directly again, bypassing the
+confirm-arm gate for this one affordance; nothing is actually destroyed either way, since the edit
+buffer and its undo history stay alive in `Self::edit_buffers` regardless of which close path ran,
+and reopening the same path restores it.
+
+**Bug 3 - a keymap-collision test invalidated by Bug 1's own fix.**
+`settings::render::keybinding_rebind_tests::recording_a_chord_that_collides_with_a_real_global_binding_is_rejected`
+recorded `EditorLeft` (`file-editor` scope) onto `"secondary-k"`, expecting it to be rejected as
+colliding with the (then-global) `TogglePalette` binding. Once `TogglePalette` moved to
+`"secondary-p"`, `"ctrl-k"` alone no longer collides with anything `find_colliding_binding`
+examines: that checker only ever flags a candidate against another *single-keystroke* binding
+(`crate::keymap_overrides`'s own docs), and `"ctrl-k"` is now only a *prefix* of the real
+two-keystroke `"ctrl-k ctrl-d"` chord, which the checker doesn't look at at all. The test's
+candidate keystroke was updated to `"secondary-p"` - the one real, single-keystroke global binding
+now available to prove a genuine rejection with - and its doc comment records why `"ctrl-k"`
+couldn't be reused.
+
+**Adversarial check.** A fresh checker agent, briefed on all three fixes but not on this
+narrative, re-swept the whole repo for any remaining `"ctrl-k"`/`"secondary-k"`/`mod+K`/`⌘K`
+reference still connected to the palette specifically (found none live), read GPUI's real
+`pending_input`/chord-replay code directly (`window.rs`'s timeout-then-`Replay` path,
+`key_dispatch.rs`'s `replay_prefix`) to confirm an abandoned lone Ctrl+K in the file-editor context
+now just gets silently absorbed after its own ~1s timeout - no panic, no double-fire, no leaked
+pending-chord UI, since this app has no `pending_input` observers at all - and confirmed
+`close_change_diff`'s bypass doesn't break any other currently-passing test. It found four real,
+smaller gaps, all fixed: four renamed regression tests (`root::focus`,
+`work_surface::render::ctrl_k_still_works_after_switching_to_a_worktree_with_no_open_session`)
+still named `ctrl_k_*` despite exercising Ctrl+P; the new
+`ctrl_p_opens_the_palette_even_while_a_terminal_is_focused` test relying implicitly on default
+focus instead of explicitly focusing a terminal session and asserting it; and five doc comments
+(`lib.rs` twice, `work_surface::render` twice, `work_surface::state`, `title_bar::menu`) that cited
+`"secondary-p"` alongside `"]"`/`"secondary-z"`/`Undo`/`Redo` as if all of them avoided the
+"app-level shortcut steals terminal input" bug class, when `"secondary-p"` is now the one
+deliberate *exception* that accepts it instead - reworded to say so explicitly rather than imply a
+false precedent. The checker also flagged, as a real but non-blocking gap outside this fix's own
+scope, that a user's already-persisted `settings.toml` override recorded against the old
+`default_keystrokes = "ctrl-k"` for `TogglePalette` would silently stop applying once the real
+default changed (`keymap_overrides.rs` matches overrides on `action + context +
+default_keystrokes`) - noted here rather than fixed, since this project has no shipped installs
+with such an override yet and a real fix needs its own design pass, not a bolt-on in this change.
+
+**Verification**, from a Linux sandbox (this project's usual environment, unlike several recent
+entries): `export LIBRARY_PATH=/tmp/x11-deps/prefix/usr/lib/x86_64-linux-gnu` (the real X11 link
+fix this sandbox needs), then `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo
+clippy --workspace --all-targets -- -D warnings`, all clean. `cargo test --workspace --lib
+--test-threads=1`: **1221 passed, 0 failed** across all four crates (`app` 1056, `lsp-core` 44,
+`pty-core` 14, `wt-core` 107) on the final run, including all three originally-failing tests and
+everything the checker's own fixes touched. The known pre-existing `code_surface::diff_view::
+diff_render_tests` flake (a real, unrelated timing race, already documented in this file) was
+reproduced once in an earlier full run and confirmed flaky - not a regression - by re-running that
+module alone three times (2 clean, 1 failure on a different test within the same module each
+time).

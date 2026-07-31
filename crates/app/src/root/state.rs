@@ -560,7 +560,7 @@ impl AdeApp {
         // keeps the focused `FocusId` genuinely findable in the next rendered frame, which is the
         // actual invariant this exists to protect: a dangling `FocusId` makes GPUI's action
         // dispatch fall back to a disconnected root with no real `on_action` handlers at all, not
-        // just this worktree's own missing ones - silently breaking every global keybinding (⌘K
+        // just this worktree's own missing ones - silently breaking every global keybinding (⌘P
         // included) until the next click.
         if self.sessions.active_id().is_none() && self.open_change.is_none() && !self.settings_open
         {

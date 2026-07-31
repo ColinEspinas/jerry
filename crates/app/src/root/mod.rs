@@ -610,7 +610,7 @@ pub struct AdeApp {
     /// a path is in this set - see that method's own docs for why silently overwriting the
     /// external change, or silently discarding the user's own unsaved edits, are both wrong.
     pub(crate) file_external_conflict: HashSet<PathBuf>,
-    /// Whether the command palette (⌘K) overlay is open.
+    /// Whether the command palette (⌘P) overlay is open.
     pub(crate) palette_open: bool,
     /// The palette's own real overlay scrollbar handle (GitHub issue #30) - a plain
     /// `gpui::ScrollHandle`: `crate::palette::render::AdeApp::render_palette_groups` renders

@@ -284,12 +284,25 @@ impl AdeApp {
     }
 
     /// Closes the currently active file tab, if any (the code surface toolbar's own "× close",
-    /// distinct from the tab strip's). Delegates to [`Self::request_close_file_tab`] (GitHub issue
-    /// #26) so every close affordance shares the same real unsaved-changes confirmation, not just
-    /// the same underlying close behavior.
+    /// distinct from the tab strip's). Calls [`Self::close_file_tab`] directly - **not**
+    /// [`Self::request_close_file_tab`]'s dirty-tab confirm-arm gate. GitHub issue #26 briefly
+    /// routed this button through that gate too, but never gave it a matching visible "close
+    /// without saving?" cue the way `crate::work_surface::render`'s tab-strip `×` has
+    /// (`Self::close_tab_confirm_armed`'s own docs) - that issue's own `BUILD-LOG.md` entry lists
+    /// "the global `Ctrl+W` binding, the tab strip's own `×`, and middle-click" as the real
+    /// affordances sharing the gate, and doesn't mention this one, and its own verification was
+    /// scoped to `code_surface::`/`settings::`/`keymap*` tests, which never included
+    /// `root::focus::text_undo_scoping_tests` - so a dirty file's first click here silently armed
+    /// an invisible confirm state with zero on-screen feedback, unnoticed. Per
+    /// [`Self::close_file_tab`]'s own docs, nothing is actually destroyed by closing either way -
+    /// the edit buffer (and its whole undo history) stays alive in [`Self::edit_buffers`], and
+    /// reopening the same path restores it - so skipping the confirm here trades a real but minor
+    /// inconsistency (this button behaving differently from the tab strip's own `×`) for avoiding
+    /// a real, silent, first-click-does-nothing regression, which this project's own bug-class
+    /// history (this file's module docs) already treats as the worse failure mode.
     pub(crate) fn close_change_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = self.open_change.clone() {
-            self.request_close_file_tab(path, window, cx);
+            self.close_file_tab(path, window, cx);
         }
     }
 

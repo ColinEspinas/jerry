@@ -367,7 +367,7 @@ mod tests {
     /// Real, live-reproduced regression coverage for the self-audit finding: cancelling the
     /// "New file" prompt while a file tab is showing must not leave `Window::focus` dangling on
     /// the now-hidden prompt field - proven the same way this project's other dangling-focus
-    /// fixes are (`root::focus::tab_strip_keybinding_tests`' own precedent): a real ⌘K keystroke
+    /// fixes are (`root::focus::tab_strip_keybinding_tests`' own precedent): a real ⌘P keystroke
     /// afterward must still reach `TogglePalette`.
     #[gpui::test]
     fn cancelling_new_file_while_a_file_tab_is_open_does_not_leave_focus_dangling(
@@ -385,9 +385,9 @@ mod tests {
         });
 
         let key = if cfg!(target_os = "macos") {
-            "cmd-k"
+            "cmd-p"
         } else {
-            "ctrl-k"
+            "ctrl-p"
         };
         cx.simulate_keystrokes(key);
         assert!(
@@ -430,9 +430,9 @@ mod tests {
         });
 
         let key = if cfg!(target_os = "macos") {
-            "cmd-k"
+            "cmd-p"
         } else {
-            "ctrl-k"
+            "ctrl-p"
         };
         cx.simulate_keystrokes(key);
         assert!(

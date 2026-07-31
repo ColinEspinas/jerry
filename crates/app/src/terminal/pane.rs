@@ -1421,8 +1421,12 @@ impl Render for TerminalPane {
             // (`0x1a`) every interactive terminal program relies on to suspend - a global,
             // unscoped `Undo` binding would swallow that keystroke before it ever reached this
             // pane's own `on_key_down`, the same "app-level shortcut steals terminal input" bug
-            // class `crate::default_key_bindings`'s own docs already document for `secondary-p`/
-            // Ctrl+P, just for a far more disruptive keystroke to lose silently.
+            // class `crate::default_key_bindings`'s own docs discuss for `secondary-p`/Ctrl+P -
+            // unlike that case, which the project ultimately accepted as a deliberate, discussed
+            // tradeoff (`TogglePalette` now deliberately claims Ctrl+P unscoped, shadowing
+            // readline's own `previous-history`), `Undo` instead avoids the collision entirely
+            // via this real `!terminal` scoping, since a lost `SIGTSTP` is a far more disruptive
+            // keystroke to lose silently than a lost `previous-history`.
             .key_context("terminal")
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
@@ -1932,14 +1936,17 @@ mod keystroke_tests {
         assert_eq!(keystroke_to_bytes(&ks), Some(b"n".to_vec()));
     }
 
-    /// Direct proof of the control-byte mapping the `secondary-p`/Ctrl+P finding depends on:
-    /// `crate::default_key_bindings` deliberately has no global keybinding for Ctrl+P (see
-    /// that function's docs) because this mapping sends the standard readline "previous
-    /// history" control byte (`0x10`) a focused terminal needs to receive. Mirrors
+    /// Direct proof of the control-byte mapping alone: this mapping sends the standard readline
+    /// "previous history" control byte (`0x10`) a focused terminal needs to receive, independent
+    /// of whether GPUI's own dispatch ever actually lets a Ctrl+P keystroke reach this pane's
+    /// `on_key_down` to be mapped. It no longer does in practice: `secondary-p` is now
+    /// `TogglePalette`'s own real, unscoped global keybinding (see
+    /// `crate::default_key_bindings`'s docs for the accepted tradeoff), so GPUI's action dispatch
+    /// intercepts a focused terminal's Ctrl+P before this mapping is ever consulted. Mirrors
     /// `crate::root::focus::tab_strip_keybinding_tests::
-    /// ctrl_p_does_not_open_the_palette_while_a_terminal_is_focused`: that test proves the
-    /// app-level dispatch doesn't intercept it; this one proves what reaches the pty once it
-    /// doesn't.
+    /// ctrl_p_opens_the_palette_even_while_a_terminal_is_focused`: that test proves the app-level
+    /// dispatch *does* now intercept it; this one just pins that the pure byte-mapping function
+    /// itself is unchanged, for whatever unmodified-by-a-global-binding context still reaches it.
     #[test]
     fn ctrl_p_maps_to_the_real_readline_previous_history_control_byte() {
         let modifiers = Modifiers {

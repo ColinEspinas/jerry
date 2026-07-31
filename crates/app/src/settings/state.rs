@@ -1419,7 +1419,7 @@ mod tests {
     fn filter_keybinding_rows_matches_command_case_insensitively() {
         let rows = keymap_page_rows();
         let filtered = filter_keybinding_rows(&rows, "PALETTE");
-        // Exactly one row matches - `secondary-k` is the only keystroke bound to TogglePalette.
+        // Exactly one row matches - `secondary-p` is the only keystroke bound to TogglePalette.
         assert_eq!(filtered.len(), 1);
         assert!(filtered.iter().all(|row| row.command == "Command palette"));
     }

@@ -68,16 +68,11 @@ use gpui::{
 /// - `"ctrl-shift-t"` (New terminal in worktree) is deliberately a literal Ctrl on every OS,
 ///   including macOS, matching the mockup's own `ctrl+shift+T` spec - unlike every other binding
 ///   here, which uses `"secondary-"`.
-/// - The `+` menu's "Open file…" row has **no** global keybinding, despite the mockup's own
-///   `mod+P` spec - a real conflict found in audit: `crate::terminal::pane::keystroke_to_bytes`
-///   maps an unmodified `Ctrl+<letter>` to the terminal control byte a focused shell expects, and
-///   Ctrl+P (`0x10`) is a standard readline binding (`previous-history`) shells rely on. GPUI
-///   dispatches a matched `KeyBinding`'s action before a focused element's own `on_key_down`, so
-///   a global `"secondary-p"` would swallow that keystroke in every focused terminal on
-///   Linux/Windows - the same "app-level shortcut steals terminal input" bug class already fixed
-///   once for `secondary-,`. Unlike `"]"` below, there's no narrower `key_context` available
-///   (the palette must be openable from any focus target, including a focused terminal). The `+`
-///   menu row itself is still a working, click-only way to open the palette scoped to files.
+/// - The `+` menu's "Open file…" row has **no** global keybinding of its own, despite the
+///   mockup's own `mod+P` spec: `"secondary-p"` is now claimed by `TogglePalette` (below) instead
+///   of this narrower action - see that entry's own docs for the real terminal-readline tradeoff
+///   that decision accepts. The `+` menu row itself is still a working, click-only way to open
+///   the palette scoped to files.
 /// - `"]"` (Next changed file) has no modifier, and is scoped to `Some("diff && !file-editor")`
 ///   rather than global - the only one of this app's bindings with a non-`'rail'`/`'session'`
 ///   context. A global `"]"` would swallow a literal `]` typed into any focused terminal/agent
@@ -212,7 +207,19 @@ use gpui::{
 pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
     vec![
         gpui::KeyBinding::new("secondary-n", root::NewSession, None),
-        gpui::KeyBinding::new("secondary-k", root::TogglePalette, None),
+        // The palette's real shortcut, matching the VS Code/Sublime "command palette" convention
+        // directly rather than reusing "secondary-k". "secondary-k" was the original binding, but
+        // the file-editor's real `"ctrl-k ctrl-d"` chord (multi-cursor "skip occurrence",
+        // Revision R13) registers `"ctrl-k"` as a real chord *prefix* in that context - a lone
+        // Ctrl+K there now waits through gpui's real ~1s prefix-timeout (`Window`'s own
+        // `pending_input` timer) before replaying as a plain keystroke and reaching
+        // `TogglePalette`, a real, noticeable delay a second, unambiguous shortcut avoids
+        // entirely. Deliberately unscoped (not `!terminal`) and a real, accepted replacement, not
+        // an alias alongside "secondary-k": a focused terminal's own `Ctrl+P` (readline
+        // `previous-history`, `0x10`) is now shadowed by this binding rather than reaching the
+        // shell - an explicit, known tradeoff, not an oversight (a terminal's own Up-arrow history
+        // navigation is unaffected either way).
+        gpui::KeyBinding::new("secondary-p", root::TogglePalette, None),
         gpui::KeyBinding::new("secondary-,", root::ToggleSettings, None),
         gpui::KeyBinding::new("secondary-z", root::Undo, Some("!terminal && !text-input")),
         gpui::KeyBinding::new(
@@ -467,7 +474,9 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         // scope would claim the control bytes `crate::terminal::pane::keystroke_to_bytes` hands
         // a focused shell (Ctrl+C is SIGINT - binding it globally would risk making it
         // impossible to interrupt a running agent CLI), the exact bug class this list's `"]"`
-        // and `secondary-p` entries above already document; `!tree-editing` is what keeps them
+        // and `secondary-z` entries above already document (`secondary-p` is a deliberate
+        // *exception* to it, not a precedent for avoiding it - see that binding's own docs);
+        // `!tree-editing` is what keeps them
         // from firing while one of the tree's own inline name editors has the keystroke; and
         // `!tree-delete-confirm` the same while the modal delete confirmation is up (`F2` or
         // `Shift+F10` firing *behind* a modal scrim was a real finding in this change's own
@@ -513,8 +522,10 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         // `unix-word-rerase` control byte (`0x17`), a standard readline word-backspace a focused
         // shell needs unclaimed - a global binding here would swallow it in every focused
         // terminal/agent session on Linux/Windows, the same bug class this list's own
-        // `secondary-p`/`"]"`/`secondary-z` entries already document. A terminal/agent tab is
-        // still always closeable via the tab strip's own `×` or middle-click regardless.
+        // `"]"`/`secondary-z` entries already document (`secondary-p` deliberately accepts this
+        // exact class of collision instead - see that binding's own docs for why). A
+        // terminal/agent tab is still always closeable via the tab strip's own `×` or
+        // middle-click regardless.
         gpui::KeyBinding::new("ctrl-w", root::CloseFocusedTab, Some("!terminal")),
     ]
 }

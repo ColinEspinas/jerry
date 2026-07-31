@@ -1,4 +1,4 @@
-//! Pure, GPUI-free data model for the command palette (⌘K): scope/matching/ranking/grouping
+//! Pure, GPUI-free data model for the command palette (⌘P): scope/matching/ranking/grouping
 //! over already-real app state (open sessions, the loaded file tree, a fixed command list),
 //! kept unit-testable without a live GPUI window. `crate::palette::render` turns the
 //! result into `gpui::Div` trees and real click/key handlers, since it owns the `Context<AdeApp>`

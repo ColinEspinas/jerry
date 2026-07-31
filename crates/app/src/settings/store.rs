@@ -839,7 +839,7 @@ mod tests {
         settings.keymap.overrides.push(KeybindingOverride {
             action: "app::TogglePalette".to_string(),
             context: "global".to_string(),
-            default_keystrokes: "ctrl-k".to_string(),
+            default_keystrokes: "ctrl-p".to_string(),
             keystrokes: "ctrl-shift-p".to_string(),
         });
 

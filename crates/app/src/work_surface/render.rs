@@ -87,10 +87,11 @@ impl AdeApp {
     /// Scoped to `Some("!terminal")` in `crate::default_key_bindings` (not global) - plain
     /// `Ctrl+W` is `crate::terminal::pane::keystroke_to_bytes`'s own real `unix-word-rerase`
     /// control byte (`0x17`) a focused shell needs for its own word-backspace; see that list's
-    /// own docs (and its `secondary-z`/`secondary-p`/`"]"` entries) for this project's established
-    /// precedent for exactly this "app-level shortcut steals terminal input" conflict class - a
-    /// live terminal pane keeps `Ctrl+W`, and closing a *terminal* tab this way stays reachable
-    /// through the tab strip's own `×`/middle-click instead.
+    /// own docs (and its `secondary-z`/`"]"` entries) for this project's established precedent
+    /// for exactly this "app-level shortcut steals terminal input" conflict class (`secondary-p`
+    /// is the one deliberate exception to that precedent, not a further example of it - see that
+    /// binding's own docs) - a live terminal pane keeps `Ctrl+W`, and closing a *terminal* tab
+    /// this way stays reachable through the tab strip's own `×`/middle-click instead.
     pub(crate) fn handle_close_focused_tab_action(
         &mut self,
         _action: &CloseFocusedTab,
@@ -666,9 +667,10 @@ impl AdeApp {
     /// file* ([`Self::next_changed_file`]). *New terminal*, *New agent pane*, and *Next changed
     /// file* each dispatch the same method their own global keybinding does
     /// (`crate::default_key_bindings`) and show that binding's keycap; *New file* and *Open
-    /// file…* have no global keybinding of their own (the latter's own docs cover a real
-    /// Ctrl+P/readline conflict that ruled one out; *New file* simply has no design-specified
-    /// shortcut) and so show no keycap. Every row's click handler also closes the menu.
+    /// file…* have no global keybinding of their own (the latter's own real `mod+P` spec is now
+    /// claimed by `TogglePalette` instead - see `crate::default_key_bindings`'s own docs for that
+    /// tradeoff; *New file* simply has no design-specified shortcut) and so show no keycap. Every
+    /// row's click handler also closes the menu.
     pub(crate) fn render_plus_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let macos = self.window_controls_style().is_macos();
         let bounds = self.plus_button_bounds;
@@ -1294,8 +1296,11 @@ impl AdeApp {
     /// `clear` is click-only, not a global keybinding, even though the design shows `mod+K`:
     /// `Ctrl+K` is a standard readline binding (`kill-line`) every focused shell relies on, and
     /// `"mod"` resolves to plain `Ctrl` on Linux/Windows (`crate::keymap`'s docs) - binding it
-    /// globally would repeat the same "app-level shortcut steals terminal input" class of bug
-    /// `crate::default_key_bindings` already documents for `secondary-p`/Ctrl+P. Zed's own
+    /// globally would risk the same "app-level shortcut steals terminal input" class of bug
+    /// `crate::default_key_bindings`'s own `"]"`/`secondary-z` entries deliberately scope away
+    /// from - unlike `secondary-p`, which the project ultimately accepted eating a focused
+    /// terminal's own Ctrl+P as a deliberate, discussed tradeoff (see that binding's own docs),
+    /// there's no equivalent case made here for doing the same to `kill-line`. Zed's own
     /// keymaps confirm this isn't overcaution: `terminal::Clear` is bound to `ctrl-shift-l` on
     /// Linux/Windows and reserved for `cmd-k` on macOS alone, where a platform-modified keystroke
     /// never reaches the pty in the first place (`crate::terminal::pane::keystroke_to_bytes`).
@@ -2035,11 +2040,11 @@ mod tab_scoping_tests {
     /// open session leaves `Sessions::focus_active` with nothing to focus (a genuine no-op), so
     /// a previously-focused session's pane - now unrendered once the tab strip's own
     /// per-worktree filter applies - would otherwise leave `Window::focus` dangling, breaking
-    /// every global keybinding (including ⌘K itself) until the next click.
+    /// every global keybinding (including ⌘P itself) until the next click.
     /// `Self::select_worktree`'s own fallback (redirecting focus to `Self::filter_focus_handle`
     /// whenever the newly selected worktree has no session to focus) closes this.
     #[gpui::test]
-    fn ctrl_k_still_works_after_switching_to_a_worktree_with_no_open_session(
+    fn ctrl_p_still_works_after_switching_to_a_worktree_with_no_open_session(
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2060,9 +2065,9 @@ mod tab_scoping_tests {
         });
 
         let key = if cfg!(target_os = "macos") {
-            "cmd-k"
+            "cmd-p"
         } else {
-            "ctrl-k"
+            "ctrl-p"
         };
         cx.simulate_keystrokes(key);
 
@@ -2194,7 +2199,7 @@ mod tab_scoping_tests {
     /// left pointing at something unrendered" bug class (see `crate::root::focus`'s module doc):
     /// before the fix, `Self::close_session` left `Window::focus` dangling on the
     /// just-`shutdown()` `TerminalPane` in this exact case (`self.sessions.active = None`, and
-    /// `Sessions::focus_active` is a real no-op with nothing active) - so a real ⌘K afterward,
+    /// `Sessions::focus_active` is a real no-op with nothing active) - so a real ⌘P afterward,
     /// not just checking `active_id() == None`, is what actually proves focus isn't dangling,
     /// matching every other test for this bug class in this project.
     #[gpui::test]
@@ -2244,9 +2249,9 @@ mod tab_scoping_tests {
         );
 
         let key = if cfg!(target_os = "macos") {
-            "cmd-k"
+            "cmd-p"
         } else {
-            "ctrl-k"
+            "ctrl-p"
         };
         cx.simulate_keystrokes(key);
         assert!(

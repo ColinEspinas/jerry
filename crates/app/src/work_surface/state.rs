@@ -259,8 +259,9 @@ pub fn footer_actions(status: Status) -> Vec<FooterAction> {
                 // global keybinding for it - see `crate::default_key_bindings`'s own docs on
                 // why a global `Ctrl+Enter`/`Cmd+Enter` isn't safe to add casually (the same
                 // "app-level shortcut steals terminal input" risk class already documented
-                // there for `secondary-p`/`Undo`/`Redo`; this app's whole domain is running
-                // agent CLIs in terminals, and Ctrl+Enter/Cmd+Enter is a plausible binding one
+                // there for `Undo`/`Redo`, which scope themselves away from a focused terminal
+                // rather than accept the collision; this app's whole domain is running agent
+                // CLIs in terminals, and Ctrl+Enter/Cmd+Enter is a plausible binding one
                 // of them could reasonably use for its own "submit" gesture). An audit caught
                 // this row still advertising the keycap after being promoted from
                 // `implemented: false` - a real keycap must never render for a keystroke that

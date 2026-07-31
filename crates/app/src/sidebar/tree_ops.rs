@@ -2643,9 +2643,9 @@ mod tree_ops_regression_tests {
             });
 
             let key = if cfg!(target_os = "macos") {
-                "cmd-k"
+                "cmd-p"
             } else {
-                "ctrl-k"
+                "ctrl-p"
             };
             cx.simulate_keystrokes(key);
             assert!(

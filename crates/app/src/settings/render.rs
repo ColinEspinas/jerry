@@ -2665,9 +2665,9 @@ mod keybinding_rebind_tests {
         );
 
         let old_chord = if cfg!(target_os = "macos") {
-            "cmd-k"
+            "cmd-p"
         } else {
-            "ctrl-k"
+            "ctrl-p"
         };
         let new_chord = "ctrl-shift-p";
 
@@ -2764,9 +2764,14 @@ mod keybinding_rebind_tests {
     }
 
     /// A real, live-dispatched collision: recording `EditorLeft` (scoped `"file-editor"`) onto
-    /// `secondary-k` - the real, currently-global `TogglePalette` chord - must be rejected with a
+    /// `secondary-p` - the real, currently-global `TogglePalette` chord - must be rejected with a
     /// real, visible error, and must leave both bindings' real dispatch behavior completely
-    /// unchanged.
+    /// unchanged. `find_colliding_binding` only ever flags a single-keystroke candidate against
+    /// another single-keystroke binding (`crate::keymap_overrides`'s own docs), so `"ctrl-k"`
+    /// alone can't be used here any more either: it's now only a *prefix* of the real, two-
+    /// keystroke `"ctrl-k ctrl-d"` chord (`EditorSkipOccurrence`), which this checker doesn't
+    /// examine at all - `secondary-p` is the one real, single-keystroke global binding left to
+    /// prove a genuine rejection with.
     #[gpui::test]
     fn recording_a_chord_that_collides_with_a_real_global_binding_is_rejected(
         cx: &mut TestAppContext,
@@ -2796,12 +2801,12 @@ mod keybinding_rebind_tests {
         app.update(cx, |app, cx| {
             app.start_recording_keybinding(editor_left_identity.clone(), cx);
         });
-        let secondary_k = if cfg!(target_os = "macos") {
-            "cmd-k"
+        let secondary_p = if cfg!(target_os = "macos") {
+            "cmd-p"
         } else {
-            "ctrl-k"
+            "ctrl-p"
         };
-        cx.simulate_keystrokes(secondary_k);
+        cx.simulate_keystrokes(secondary_p);
         cx.run_until_parked();
 
         assert!(
@@ -2821,7 +2826,7 @@ mod keybinding_rebind_tests {
         );
 
         // The real, original TogglePalette binding must still work, completely undisturbed.
-        cx.simulate_keystrokes(secondary_k);
+        cx.simulate_keystrokes(secondary_p);
         assert!(app.read_with(cx, |app, _| app.palette_open));
     }
 }

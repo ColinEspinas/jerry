@@ -412,7 +412,7 @@ impl AdeApp {
             }))
     }
 
-    /// The `⌘K commands` hint: clicking it (or pressing the bound `secondary-k` - see
+    /// The `⌘P commands` hint: clicking it (or pressing the bound `secondary-p` - see
     /// [`TogglePalette`]) opens the command palette.
     fn render_status_palette_hint(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -422,7 +422,7 @@ impl AdeApp {
             .items_center()
             .gap(px(6.0))
             .child(render_keycap_row(
-                &keymap::resolve_combo("mod+K", self.window_controls_style().is_macos()),
+                &keymap::resolve_combo("mod+P", self.window_controls_style().is_macos()),
                 KeycapSize::Standard,
             ))
             .child(

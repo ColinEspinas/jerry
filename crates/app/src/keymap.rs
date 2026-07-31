@@ -22,8 +22,8 @@
 //! startup, and `"secondary"` resolves to its per-OS modifier via `cfg!(target_os = "macos")` -
 //! a **compile-time** fact. No runtime toggle, including this one, can change which physical key
 //! actually triggers a shortcut on this process's real OS. So overriding
-//! [`WindowControlsStyle`] to `MacosStyle` on Linux renders `⌘K` everywhere, but the key that
-//! actually opens the palette is still Ctrl+K - a real, permanent mismatch between what's shown
+//! [`WindowControlsStyle`] to `MacosStyle` on Linux renders `⌘P` everywhere, but the key that
+//! actually opens the palette is still Ctrl+P - a real, permanent mismatch between what's shown
 //! and what works while the override is active.
 //!
 //! This is accepted rather than fixed by decoupling entirely (which would gut the "preview

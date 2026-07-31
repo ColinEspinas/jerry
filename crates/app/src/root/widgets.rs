@@ -1,7 +1,7 @@
 use super::*;
 
 /// The two keycap sizes: `Standard` (primary shortcuts - the rail's `+`/⌘N, the status bar's
-/// `⌘K`) and `Hint` (smaller, for hint-row contexts like footers and empty-state hint lists).
+/// `⌘P`) and `Hint` (smaller, for hint-row contexts like footers and empty-state hint lists).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeycapSize {
     Standard,

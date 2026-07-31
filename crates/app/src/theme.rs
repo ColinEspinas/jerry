@@ -1018,7 +1018,7 @@ pub mod font {
     pub const MONO: &str = "IBM Plex Mono";
 }
 
-/// Palette-only (⌘K) colours read directly from `Jerry.dc.html`'s inline literals for the
+/// Palette-only (⌘P) colours read directly from `Jerry.dc.html`'s inline literals for the
 /// `paletteOpen` block - real values missing from `tokens.rs`'s transcription (predates the
 /// palette section).
 pub mod palette {
