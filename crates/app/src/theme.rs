@@ -993,10 +993,25 @@ pub mod graph {
     /// A lane's vertical sits at `x = 9 + lane * 14` (§2).
     pub const LANE_X_BASE: Pixels = px(9.0);
     pub const LANE_STEP: Pixels = px(14.0);
-    /// The elbow box's height, in the row's lower half (§2: "a 14px-tall box").
-    pub const ELBOW_HEIGHT: Pixels = px(14.0);
-    /// The elbow box's corner radius (§2: "7px corner radius").
-    pub const ELBOW_RADIUS: Pixels = px(7.0);
+    /// Combined vertical span of one elbow's entry + exit curve boxes (§2 originally specified
+    /// "a 14px-tall box" for the whole elbow as a single corner; the S-curve redesign splits that
+    /// into two curves, each its own `ELBOW_CURVE_SIZE`-square box, so this is `2 * ELBOW_CURVE_SIZE`
+    /// now, not the original spec's literal 14).
+    pub const ELBOW_HEIGHT: Pixels = px(20.0);
+    /// Each S-curve piece's own box width, and its base height (`crate::graph_view::render`'s
+    /// `CurveBox::height` adds exactly one stroke to the bottom-edged curve's own height, so that
+    /// GPUI's inside-painted bottom border lands on the waist row rather than one row above it -
+    /// see that field's own docs). Must be at least `2 * ELBOW_RADIUS` - GPUI
+    /// (`Corners::clamp_radii_for_quad_size`, `vendor/zed/crates/gpui/src/style.rs`) clamps every
+    /// requested corner radius to half the box's own shorter side, so a smaller box would silently
+    /// render a smaller radius than requested (this is exactly what happened before this constant
+    /// existed: a 7px-square box with a 7px radius request rendered at an effective 3.5px, a real
+    /// user-reported vertical-alignment bug traced back to this GPUI behavior).
+    pub const ELBOW_CURVE_SIZE: Pixels = px(10.0);
+    /// Each S-curve piece's real, rendered corner radius - always exactly half of
+    /// `ELBOW_CURVE_SIZE`, so GPUI's own clamp (see that constant's docs) never kicks in and this
+    /// value renders unclamped, not silently halved again.
+    pub const ELBOW_RADIUS: Pixels = px(5.0);
 
     /// The tab chip's own background (§1: "`#2a2030` bg").
     pub const TAB_CHIP_BG: ColorToken = hex(0x2a2030);
