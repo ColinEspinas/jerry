@@ -5941,3 +5941,40 @@ wt-core, up from 967/42/14/115 at the prior entry's own baseline (+8 app tests: 
 coverage, + 1 `graph_selection_render_tests` for the border fix; +3 wt-core tests: the two
 `Converging`-elbow scenarios plus the new self-loop regression). A full, clean run showed zero
 failures this time - no `diff_render_tests` or other flake reappeared.
+
+## Fix: a Converging elbow's vertical stroke was anchored on the wrong side
+
+Real, direct user feedback on the git graph tab (after the fixes above landed): "curve the start and
+end of branch lines to make them join the horizontal lines instead of continuing" - a branch line
+kept running straight through the exact spot where it should have bent into a curve, with the curve
+itself appearing as a disconnected shape nearby rather than the actual path the line took.
+
+Root cause, in `elbow_geometry`'s `Converging` case (`crates/app/src/graph_view/render.rs`):
+`from_lane` is the *ending* lane (confirmed directly in `crates/wt-core/src/graph.rs` -
+`Elbow { from_lane: index, to_lane: own_lane, kind: Converging }`), which already has its own real,
+separately-painted `ends_here` stub occupying this row's top half at `from_lane`'s own x. The elbow's
+own vertical stroke has to land on that exact same side to visually continue it - but the code had
+`vertical: if own_right_of_ending { Right } else { Left }`, anchoring at `to_lane` (own_lane)'s side
+instead: the *destination* dot, which has no incoming line there to continue at all. The result: the
+ending lane's straight stub simply stopped, unconnected, while a separate L-shaped curve rendered
+near own_lane's side, never actually bending from the stub it was supposed to be continuing - exactly
+the reported symptom. Flipped both branches of the ternary to match `from_lane`'s side instead,
+mirroring the already-correct `Diverging` case's own `rightward`/`Left` pairing (which anchors at
+`from_lane` too - `Diverging`'s `from_lane` plays the same "already has a real line here" role
+`Converging`'s `from_lane` does, just for the opposite direction).
+
+This exact bug had already shipped through a real, previously-dispatched adversarial checker
+undetected, for two real, compounding reasons: the paint-based `graph_elbow_render_tests` (added in
+the prior entry) only asserted the elbow box's *bounding rectangle* (top/height/left/width), which is
+byte-for-byte identical regardless of which side gets the border - only the *painted border/corner*
+differs, and `debug_bounds` cannot see styling. The pure `elbow_geometry_tests` unit tests *did* assert
+the `vertical` field directly - but with the wrong expected value, confidently reasoning "the vertical
+stroke must be anchored at own_lane (to_lane), not from_lane" in their own comments, backwards from
+the truth in the same way as the implementation bug itself, so they never had a chance to catch it.
+Fixed both wrong assertions to match the corrected geometry, with comments explaining why this side
+is correct this time - real user-visible feedback made the actual answer unambiguous.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+975 app + 42 lsp-core + 14 pty-core + 118 wt-core, 0 failed - counts unchanged from the prior entry
+since this fix corrected two existing tests' expectations rather than adding new ones.

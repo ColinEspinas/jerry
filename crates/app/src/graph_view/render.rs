@@ -1708,6 +1708,12 @@ fn elbow_geometry(kind: ElbowKind, x_from: Pixels, x_to: Pixels, row_h: Pixels) 
             }
         }
         ElbowKind::Converging => {
+            // `x_from` is the *ending* lane - its own plain `ends_here` stub (drawn separately,
+            // full top-half) sits at exactly this x. The vertical stroke below has to sit on
+            // that same side and continue it, or the curve renders as a disconnected shape next
+            // to a straight line that never actually bends - not a mirror of `x_to` (own_lane's
+            // dot), which is the *destination*, not where the incoming line already is. Mirrors
+            // `Diverging`'s own `rightward`/`Left` pairing exactly, just for the opposite lane.
             let own_right_of_ending = x_to >= x_from;
             let (left, width) = if own_right_of_ending {
                 (x_from, x_to - x_from)
@@ -1721,9 +1727,9 @@ fn elbow_geometry(kind: ElbowKind, x_from: Pixels, x_to: Pixels, row_h: Pixels) 
                 height: theme::graph::ELBOW_HEIGHT,
                 horizontal: HorizontalEdge::Top,
                 vertical: if own_right_of_ending {
-                    VerticalEdge::Right
-                } else {
                     VerticalEdge::Left
+                } else {
+                    VerticalEdge::Right
                 },
             }
         }
@@ -2549,15 +2555,22 @@ mod elbow_geometry_tests {
     }
 
     #[test]
-    fn converging_with_own_lane_right_of_the_ending_lane_anchors_the_vertical_on_the_right() {
-        // from_lane (the ending lane) is left of to_lane (own_lane) - the vertical stroke must
-        // still land on `to_lane`'s side (the right, here), not `from_lane`'s.
+    fn converging_with_own_lane_right_of_the_ending_lane_anchors_the_vertical_on_the_left() {
+        // from_lane (the ending lane) is left of to_lane (own_lane). The ending lane already has
+        // its own plain `ends_here` stub painted at `from_lane`'s x (this row's top half) - the
+        // elbow's own vertical stroke must land on that *same* side and continue it seamlessly,
+        // not `to_lane`'s (own_lane's) side, where there is no incoming line to continue at all
+        // (own_lane's x is the *destination*, reached via the horizontal top edge, not a second
+        // vertical stroke). A previous version of this test asserted the opposite and was wrong -
+        // confirmed by a real user report that the curve rendered disconnected from the straight
+        // line it was supposed to continue ("the line doesn't actually bend").
         let geo = elbow_geometry(ElbowKind::Converging, px(9.0), px(23.0), ROW_H);
         assert_eq!(geo.horizontal, HorizontalEdge::Top);
         assert_eq!(
             geo.vertical,
-            VerticalEdge::Right,
-            "the vertical stroke must be anchored at own_lane (to_lane), not from_lane"
+            VerticalEdge::Left,
+            "the vertical stroke must continue from_lane's own already-painted stub, not anchor \
+             at to_lane (own_lane), which has no incoming line to continue"
         );
         assert_eq!(geo.left, px(9.0));
         assert_eq!(geo.width, px(15.0));
@@ -2565,17 +2578,19 @@ mod elbow_geometry_tests {
     }
 
     #[test]
-    fn converging_with_own_lane_left_of_the_ending_lane_anchors_the_vertical_on_the_left() {
+    fn converging_with_own_lane_left_of_the_ending_lane_anchors_the_vertical_on_the_right() {
         // This is the shape this repository's own real row 9 produces: own_lane (lane 0) sits to
         // the left of the ending lanes (lanes 1, 2) - `from_lane` (ending) is on the right,
-        // `to_lane` (own_lane) is on the left, so the vertical stroke - anchored at `to_lane` -
-        // must be `Left`, matching the box's own left edge where `to_lane`'s x sits.
+        // `to_lane` (own_lane) is on the left, so the vertical stroke - continuing `from_lane`'s
+        // own already-painted stub - must be `Right`, matching the box's own right edge where
+        // `from_lane`'s x sits. See the sibling test above for the real reasoning this corrects.
         let geo = elbow_geometry(ElbowKind::Converging, px(23.0), px(9.0), ROW_H);
         assert_eq!(geo.horizontal, HorizontalEdge::Top);
         assert_eq!(
             geo.vertical,
-            VerticalEdge::Left,
-            "the vertical stroke must be anchored at own_lane (to_lane), not from_lane"
+            VerticalEdge::Right,
+            "the vertical stroke must continue from_lane's own already-painted stub, not anchor \
+             at to_lane (own_lane), which has no incoming line to continue"
         );
         assert_eq!(geo.left, px(9.0));
         assert_eq!(geo.width, px(15.0));
