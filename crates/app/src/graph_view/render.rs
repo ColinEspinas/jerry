@@ -1722,8 +1722,13 @@ fn elbow_geometry(kind: ElbowKind, x_from: Pixels, x_to: Pixels, row_h: Pixels) 
     // Raw gap between where the two curves' own arcs meet - can be zero or even negative for
     // adjacent lanes, where the curves already touch (or would overlap) with no straight run
     // between them at all. `.max(px(0.0))` floors that at zero rather than an invalid negative
-    // width; the always-added 1px-per-side overlap below (see `StraightSegment`'s own docs) then
-    // guarantees a real, visible bridge even in that adjacent-lane case.
+    // width; the always-added overlap below (see `StraightSegment`'s own docs) then guarantees a
+    // real, visible bridge even in that adjacent-lane case. A real user screenshot showed a
+    // hairline gap surviving a first attempt at only 1px of overlap per side - widened to 2px:
+    // this coordinate math cannot account for whatever the actual display's own pixel-rounding or
+    // anti-aliasing does with these values at render time, so the fix is to make the margin
+    // generous enough to absorb that uncertainty rather than to keep chasing an exact value.
+    const OVERLAP: Pixels = px(2.0);
     let (straight_left, raw_width) = if rightward {
         let left = entry_x + radius;
         (left, exit_x - radius - left)
@@ -1731,8 +1736,8 @@ fn elbow_geometry(kind: ElbowKind, x_from: Pixels, x_to: Pixels, row_h: Pixels) 
         let left = exit_x + radius;
         (left, entry_x - radius - left)
     };
-    let straight_left = straight_left - px(1.0);
-    let straight_width = raw_width.max(px(0.0)) + px(2.0);
+    let straight_left = straight_left - OVERLAP;
+    let straight_width = raw_width.max(px(0.0)) + OVERLAP * 2.0;
 
     match kind {
         ElbowKind::Diverging => {
@@ -2754,17 +2759,19 @@ mod elbow_geometry_tests {
     }
 
     #[test]
-    fn a_wide_lane_gap_gets_a_real_straight_middle_segment_overlapping_1px_into_each_curve() {
+    fn a_wide_lane_gap_gets_a_real_straight_middle_segment_overlapping_2px_into_each_curve() {
         // Three lane steps apart (42px) is comfortably past 2*RADIUS (14px) - a real straight
-        // segment must bridge the two curves, each end reaching 1px *past* the natural tangent
+        // segment must bridge the two curves, each end reaching 2px *past* the natural tangent
         // point and into the neighbouring curve's own box (see `StraightSegment`'s own docs for
         // why: a border-radius arc and a filled rect are different rendering paths, and a real
-        // user report found a hairline gap where GPUI left them merely touching, not overlapping).
+        // user screenshot found a hairline gap surviving even a first, 1px-per-side attempt at
+        // this overlap - widened to 2px per side since exact pixel math can't account for the
+        // real display's own rounding/anti-aliasing).
         let geo = elbow_geometry(ElbowKind::Diverging, px(9.0), px(9.0 + 3.0 * 14.0), ROW_H);
-        assert_eq!(geo.straight.left, geo.entry.left + RADIUS - px(1.0));
+        assert_eq!(geo.straight.left, geo.entry.left + RADIUS - px(2.0));
         assert_eq!(
             geo.straight.left + geo.straight.width,
-            geo.exit.left + px(1.0)
+            geo.exit.left + px(2.0)
         );
         assert_eq!(geo.straight.top, geo.entry.top + RADIUS);
         assert_eq!(geo.straight.top, geo.exit.top);
@@ -2775,14 +2782,14 @@ mod elbow_geometry_tests {
         // Exactly one lane step apart (14px) equals 2*RADIUS exactly - the two curves' own arcs
         // would already touch with no straight segment mathematically needed, but a real user
         // report found a visible hairline gap right at that tangent point (the same rendering-path
-        // mismatch `StraightSegment`'s docs explain). A minimal 2px bridge - 1px overlapping into
+        // mismatch `StraightSegment`'s docs explain). A minimal 4px bridge - 2px overlapping into
         // each curve's own box - closes that gap even in this "curves already touch" case.
         let geo = elbow_geometry(ElbowKind::Diverging, px(9.0), px(23.0), ROW_H);
-        assert_eq!(geo.straight.width, px(2.0));
-        assert_eq!(geo.straight.left, geo.entry.left + RADIUS - px(1.0));
+        assert_eq!(geo.straight.width, px(4.0));
+        assert_eq!(geo.straight.left, geo.entry.left + RADIUS - px(2.0));
         assert_eq!(
             geo.straight.left + geo.straight.width,
-            geo.exit.left + px(1.0)
+            geo.exit.left + px(2.0)
         );
     }
 

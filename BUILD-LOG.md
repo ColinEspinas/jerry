@@ -6116,3 +6116,26 @@ All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `
 928/98 reflects those earlier numbers having been read from a stale or partially-built test binary in
 this sandbox, not any change to those crates in this round - confirmed by grepping the wt-core source
 directly for `#[test]`, which independently counts 127, matching this run exactly).
+
+## Seam still visible after the 1px overlap - widened to 2px
+
+A follow-up real screenshot showed the hairline gap at each curve-to-straight junction survived the
+1px-per-side overlap above. This coordinate-level fix cannot see (or control) whatever the real
+display's own anti-aliasing or sub-pixel rounding does with these values once GPUI actually paints
+them - a border-radius arc and a filled rect are still two different rendering paths regardless of
+how exactly their coordinates line up on paper. Rather than keep chasing an exact value analytically
+(twice already insufficient), widened the overlap to 2px per side (a `const OVERLAP: Pixels = px(2.0)`
+now drives both the shift and the added width) - a value with enough margin to absorb a reasonable
+amount of that uncertainty, still imperceptible on a 1px-wide line. Updated
+`a_wide_lane_gap_gets_a_real_straight_middle_segment_overlapping_2px_into_each_curve` and
+`adjacent_lanes_still_get_a_minimal_overlapping_straight_bridge` to pin the new 2px/4px-minimum shape.
+
+Flagged honestly in the PR comment: if this still doesn't fully close the gap, the likely next step is
+asking for a tighter description of exactly where the gap sits (at the dot, at the curve's own
+45-degree midpoint, or specifically at this straight-segment seam) rather than a fourth blind
+coordinate guess, since this sandbox still cannot render the result to check directly.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+1111 app + 44 lsp-core + 14 pty-core + 127 wt-core, 0 failed (test count unchanged - same two tests,
+updated in place to assert the new 2px/4px values).
