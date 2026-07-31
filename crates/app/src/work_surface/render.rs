@@ -432,11 +432,77 @@ impl AdeApp {
         })
     }
 
+    /// Whether the *currently selected* worktree has zero real agents - at most a default
+    /// `Shell` tab (Revision R12 §3: "a bare worktree shows only the shell tab"). One predicate
+    /// shared by [`Self::current_worktree_agent_tab_labels`]'s `zsh \u{b7} <branch>` shell-tab
+    /// label and [`Self::render_agent_context_bar`]'s `Merge`/`Archive` -> `Start an agent`
+    /// swap, so the two can never disagree about what "bare" means. Vacuously `true` when the
+    /// worktree has no agent at all - callers that reach a context bar or a tab strip already
+    /// know at least one agent exists ([`Self::render_center_pane`]'s `None` branch handles the
+    /// empty case separately).
+    pub(crate) fn current_worktree_is_bare(&self) -> bool {
+        !self
+            .current_worktree_agents()
+            .any(|agent| agent.kind != AgentKind::Shell)
+    }
+
+    /// The branch label for the currently selected worktree, if any is recorded for it - shared
+    /// by [`Self::current_worktree_agent_tab_labels`]'s bare-shell label and
+    /// [`Self::render_agent_context_bar`]'s own branch lookup so both read the same fact the
+    /// same way.
+    fn current_worktree_branch(&self) -> Option<String> {
+        let cwd = self.active_agent_cwd();
+        self.worktrees
+            .iter()
+            .find(|item| item.path == cwd)
+            .and_then(|item| item.branch.clone())
+    }
+
+    /// The tab label each of `agent_ids` (already filtered to the currently selected worktree)
+    /// should render, in the same order - real `TerminalPane::program_label` facts (the
+    /// bare-worktree shell gets `work_surface::bare_worktree_shell_label` instead of the generic
+    /// `"terminal"`) run through `work_surface::disambiguate_tab_labels`, computed once so
+    /// [`Self::render_tab_strip`] and this method (also used directly by tests) can never
+    /// disagree about what's actually rendered. Any id not found in `Self::agents` is skipped
+    /// rather than panicking - `render_tab_strip` re-does the same lookup per id and simply
+    /// omits a tab for it too.
+    pub(crate) fn current_worktree_agent_tab_labels(
+        &self,
+        agent_ids: &[AgentId],
+        cx: &mut Context<Self>,
+    ) -> Vec<String> {
+        let is_bare = self.current_worktree_is_bare();
+        let branch = self.current_worktree_branch();
+        let raw: Vec<String> = agent_ids
+            .iter()
+            .filter_map(|id| self.agents.iter().find(|agent| agent.id == *id))
+            .map(|agent| match work_surface::tab_chip_kind(agent.kind) {
+                work_surface::TabChipKind::Cli => agent.pane.read(cx).program_label(),
+                work_surface::TabChipKind::Term => {
+                    if is_bare {
+                        work_surface::bare_worktree_shell_label(
+                            &agent.pane.read(cx).program_label(),
+                            branch.as_deref(),
+                        )
+                    } else {
+                        "terminal".to_string()
+                    }
+                }
+            })
+            .collect();
+        work_surface::disambiguate_tab_labels(raw)
+    }
+
     /// The tab strip: one tab per entry of [`Self::combined_tab_order`], in that exact order -
     /// [`Self::render_agent_tab`] for a `TabRef::Agent`, [`Self::render_file_tab`] for a
     /// `TabRef::File` - so an agent tab and a file tab can sit side by side in either order
     /// (GitHub issue #16), rather than always "every agent, then every file" - followed by the
     /// `+` menu button ([`Self::render_tab_strip_plus`]) and right-aligned agent-jump keycaps.
+    ///
+    /// Agent labels are computed once, for every agent tab in this worktree together
+    /// (`Self::current_worktree_agent_tab_labels`), *before* rendering any individual tab - the
+    /// ordinal-disambiguation pass (Revision R12 §3) needs every label in hand up front to tell
+    /// which ones repeat, so it can't be done tab-by-tab inside the loop below.
     pub(in crate::work_surface) fn render_tab_strip(
         &self,
         cx: &mut Context<Self>,
@@ -451,11 +517,24 @@ impl AdeApp {
             .border_b_1()
             .border_color(theme::border::ZONE);
 
-        for tab_ref in self.combined_tab_order() {
+        let order = self.combined_tab_order();
+        let agent_ids: Vec<AgentId> = order
+            .iter()
+            .filter_map(|tab_ref| match tab_ref {
+                work_surface::TabRef::Agent(id) => Some(*id),
+                work_surface::TabRef::File(_) => None,
+            })
+            .collect();
+        let labels = self.current_worktree_agent_tab_labels(&agent_ids, cx);
+        let mut label_by_id: std::collections::HashMap<AgentId, String> =
+            agent_ids.into_iter().zip(labels).collect();
+
+        for tab_ref in order {
             match tab_ref {
                 work_surface::TabRef::Agent(id) => {
                     if let Some(agent) = self.agents.iter().find(|agent| agent.id == id) {
-                        bar = bar.child(self.render_agent_tab(agent, cx));
+                        let label = label_by_id.remove(&id).unwrap_or_default();
+                        bar = bar.child(self.render_agent_tab(agent, label, cx));
                     }
                 }
                 work_surface::TabRef::File(path) => {
@@ -1077,26 +1156,24 @@ impl AdeApp {
     agent_jump_action_handler!(handle_jump_to_agent_7_action, JumpToAgent7, 7);
     agent_jump_action_handler!(handle_jump_to_agent_8_action, JumpToAgent8, 8);
 
-    /// One tab: a 14×14 kind chip, the label (resolved binary name for an agent CLI tab, or
-    /// `terminal` for a shell tab), and a `×` that closes it (`Agents::close`, tearing down
-    /// the process). Split into a `flex_1` clickable content row plus a `flex_none` 1px
-    /// underline bar, rather than a single div with two differently-coloured borders, because
-    /// GPUI's `Style::border_color` is one colour for every edge
-    /// (`vendor/zed/crates/gpui/src/style.rs`) - it can't give the right border (always
+    /// One tab: a 14×14 kind chip, `label` (already resolved and, if it repeats within this
+    /// worktree, ordinal-disambiguated by the caller - `Self::render_tab_strip`'s own docs on why
+    /// that has to happen before this per-tab call, not inside it), and a `×` that closes it
+    /// (`Agents::close`, tearing down the process). Split into a `flex_1` clickable content row
+    /// plus a `flex_none` 1px underline bar, rather than a single div with two
+    /// differently-coloured borders, because GPUI's `Style::border_color` is one colour for every
+    /// edge (`vendor/zed/crates/gpui/src/style.rs`) - it can't give the right border (always
     /// `theme::border::INNER`) and the active/inactive-dependent underline two different colours
     /// on the same div.
     pub(in crate::work_surface) fn render_agent_tab(
         &self,
         agent: &Agent,
+        label: String,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let id = agent.id;
         let is_active = self.agents.active_id() == Some(id);
         let chip_kind = work_surface::tab_chip_kind(agent.kind);
-        let label = match chip_kind {
-            work_surface::TabChipKind::Cli => agent.pane.read(cx).program_label(),
-            work_surface::TabChipKind::Term => "terminal".to_string(),
-        };
         let is_mono = matches!(chip_kind, work_surface::TabChipKind::Cli);
         let colors = work_surface::tab_colors(is_active);
         let tab_ref = work_surface::TabRef::Agent(id);
@@ -1198,7 +1275,9 @@ impl AdeApp {
 
     /// The agent context bar: agent badge/name, a divider, branch, the worktree path (the one
     /// flexible, ellipsising child - every other child is `flex_none` and non-wrapping, so the
-    /// bar never wraps when the centre narrows), a status pill, and `Merge`/`Archive`.
+    /// bar never wraps when the centre narrows), a status pill, and `Merge`/`Archive` - or, for a
+    /// bare worktree (Revision R12 §3: [`Self::current_worktree_is_bare`]), the agent name greyed
+    /// to `no agent` and a single blue `Start an agent` button in `Merge`/`Archive`'s place.
     pub(in crate::work_surface) fn render_agent_context_bar(
         &self,
         agent: &Agent,
@@ -1207,10 +1286,23 @@ impl AdeApp {
         let status_value = self.agent_status(agent, cx);
         let (agent_fg, agent_bg) = work_surface::agent_tint(agent.kind);
         let agent_initial = work_surface::agent_initial(agent.kind);
+        let is_bare = self.current_worktree_is_bare();
         // `AgentKind` only tracks which CLI binary is running, not which model it's
         // configured to use, so `agent.kind.label()` ("Claude"/"Codex"/"Shell") is the
-        // closest honest substitute for a model name this app never actually observes.
-        let agent_label = agent.kind.label();
+        // closest honest substitute for a model name this app never actually observes. A bare
+        // worktree (no real agent at all - `is_bare` is only ever true while `agent.kind`
+        // really is `Shell`, since that's the only tab a bare worktree can be showing) reads
+        // `no agent` instead, greyed to `theme::text::FAINT` rather than the normal `MUTED`.
+        let agent_label = if is_bare {
+            "no agent"
+        } else {
+            agent.kind.label()
+        };
+        let agent_label_color = if is_bare {
+            theme::text::FAINT
+        } else {
+            theme::text::MUTED
+        };
         let branch = self
             .worktrees
             .iter()
@@ -1219,7 +1311,7 @@ impl AdeApp {
         let worktree_path = agent.cwd.display().to_string();
         let id = agent.id;
 
-        div()
+        let bar = div()
             .id("agent-context-bar")
             .flex()
             .flex_none()
@@ -1252,7 +1344,7 @@ impl AdeApp {
                     .font(font(theme::font::SANS))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_size(px(11.0))
-                    .text_color(theme::text::MUTED)
+                    .text_color(agent_label_color)
                     .child(agent_label),
             )
             .child(
@@ -1280,9 +1372,59 @@ impl AdeApp {
                     .text_color(theme::text::PATH)
                     .child(worktree_path),
             )
-            .child(render_status_pill(status_value))
-            .child(self.render_merge_button(id, cx))
-            .child(self.render_archive_button(id, cx))
+            .child(render_status_pill(status_value));
+
+        if is_bare {
+            bar.child(self.render_start_agent_button(cx))
+        } else {
+            bar.child(self.render_merge_button(id, cx))
+                .child(self.render_archive_button(id, cx))
+        }
+    }
+
+    /// A bare worktree's context bar action (Revision R12 §3): a filled blue `Start an agent`
+    /// button with a `mod+shift+N` keycap hint, replacing `Merge`/`Archive` outright rather than
+    /// sitting alongside them - neither has anything to act on yet in a worktree with no agent.
+    /// Real, not decorative: dispatches [`Self::new_agent_pane`], the same entry point the tab
+    /// strip's `+` menu row and its own global `secondary-shift-n` keybinding already use.
+    pub(in crate::work_surface) fn render_start_agent_button(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let colors = work_surface::action_button_colors(work_surface::ActionStyle::PrimaryBlue);
+        let macos = self.window_controls_style().is_macos();
+        let parts = keymap::resolve_combo("mod+shift+N", macos);
+
+        div()
+            .id("context-bar-start-agent")
+            .flex_none()
+            .cursor_pointer()
+            .h(px(20.0))
+            .px(px(8.0))
+            .gap(px(6.0))
+            .rounded(theme::radius::BUTTON)
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.bg)
+            .flex()
+            .items_center()
+            .hover(|el| el.bg(theme::button::BLUE_BG_HOVER))
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(10.5))
+                    .text_color(colors.fg)
+                    .child("Start an agent"),
+            )
+            .child(render_action_keycap_row(
+                &parts,
+                colors.keycap_fg,
+                colors.keycap_border,
+            ))
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                this.new_agent_pane(cx);
+            }))
     }
 
     /// The context bar's `Merge` button - starts [`Self::start_merge`]. Disabled (dimmed,
@@ -2643,6 +2785,151 @@ mod tab_scoping_tests {
             app.read_with(cx, |app, _| app.tab_drag_insertion.clone()),
             None,
             "a handled drop must clear the now-stale insertion-caret state"
+        );
+    }
+
+    /// Revision R12 §3, proven end to end: two real `Claude` agents spawned into the same
+    /// worktree both resolve `program_label()` to the same literal `"claude"`, so without
+    /// disambiguation the tab strip would render two identical tabs.
+    /// `current_worktree_agent_tab_labels` must give them distinct ordinals, in the order they
+    /// were spawned.
+    #[gpui::test]
+    fn two_agents_of_the_same_kind_in_one_worktree_get_distinct_ordinal_tab_labels(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_a = tempfile::tempdir().expect("tempdir a");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
+        });
+        let (first_id, second_id) = app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            let first_id = app.agents.spawn(
+                AgentKind::Claude,
+                wt_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            let second_id = app.agents.spawn(
+                AgentKind::Claude,
+                wt_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            (first_id, second_id)
+        });
+
+        let labels = app.update(cx, |app, cx| {
+            app.current_worktree_agent_tab_labels(&[first_id, second_id], cx)
+        });
+        assert_eq!(
+            labels,
+            vec!["claude #1".to_string(), "claude #2".to_string()],
+            "two agents of the same kind must never render two identical tab labels"
+        );
+    }
+
+    /// Revision R12 §3: a worktree with only its default `Shell` agent is "bare" -
+    /// `current_worktree_is_bare` must say so - and stops being bare the moment a real agent
+    /// spawns into it, proven through the same live `Agents`/`AdeApp` plumbing every other test
+    /// in this module uses (not just the pure `AgentKind` match this reads off of).
+    #[gpui::test]
+    fn a_worktree_with_only_its_default_shell_is_bare_until_a_real_agent_spawns(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_a = tempfile::tempdir().expect("tempdir a");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            app.agents.spawn(
+                AgentKind::Shell,
+                wt_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+        });
+
+        assert!(
+            app.read_with(cx, |app, _| app.current_worktree_is_bare()),
+            "a worktree with only a Shell agent must be reported bare"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Claude,
+                wt_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+        });
+
+        assert!(
+            !app.read_with(cx, |app, _| app.current_worktree_is_bare()),
+            "spawning a real agent must clear bare status - it's not just a snapshot taken once \
+             at worktree creation"
+        );
+    }
+
+    /// Revision R12 §3: a bare worktree's `Shell` tab reads `program \u{b7} branch` (via
+    /// `work_surface::bare_worktree_shell_label`), not the generic `"terminal"` every non-bare
+    /// shell tab uses - proven here against a real `TerminalPane`'s own resolved
+    /// `program_label()`, not a hardcoded `"zsh"`.
+    #[gpui::test]
+    fn a_bare_worktrees_shell_tab_label_joins_the_real_program_with_its_branch(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_a = tempfile::tempdir().expect("tempdir a");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
+        });
+        let shell_id = app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            app.agents.spawn(
+                AgentKind::Shell,
+                wt_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            )
+        });
+
+        let (label, program) = app.update(cx, |app, cx| {
+            let label = app
+                .current_worktree_agent_tab_labels(&[shell_id], cx)
+                .remove(0);
+            let program = app
+                .agents
+                .iter()
+                .find(|agent| agent.id == shell_id)
+                .expect("shell agent")
+                .pane
+                .read(cx)
+                .program_label();
+            (label, program)
+        });
+        assert_eq!(
+            label,
+            work_surface::bare_worktree_shell_label(&program, Some("wt-a")),
+            "a bare worktree's shell tab must show its real resolved program joined with its \
+             branch, not the generic \"terminal\" label"
+        );
+        assert_ne!(
+            label, "terminal",
+            "the bare-worktree shell label must never fall back to the generic non-bare label"
         );
     }
 }
