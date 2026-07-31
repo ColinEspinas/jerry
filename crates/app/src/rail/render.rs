@@ -117,6 +117,9 @@ impl AdeApp {
                     del: diff.map(|summary| summary.del).unwrap_or(0),
                     question_preview,
                     exit_code: pane.exit_status().map(|status| status.exit_code()),
+                    // See `SessionRow::activity`'s own docs: no real PTY-activity heuristic is
+                    // wired up yet, so every row threads `None` through for now.
+                    activity: None,
                 }
             })
             .collect()
@@ -268,7 +271,7 @@ impl AdeApp {
     ///   backstop for changes with no filesystem-watchable signature at all (a worktree
     ///   directory deleted by hand - see [`crate::rail::worktree_watch`]'s module docs).
     pub(crate) fn start_worktree_watch(&mut self, cx: &mut Context<Self>) {
-        let repo_path = self.repo_path.clone();
+        let repo_path = self.focused_repo_path();
         let dirty: worktree_watch::DirtyFlag = Arc::new(AtomicBool::new(false));
         self._worktree_watcher = worktree_watch::spawn_worktree_watcher(&repo_path, dirty.clone());
 
@@ -375,7 +378,7 @@ impl AdeApp {
             cx.notify();
             return;
         }
-        let repo_path = self.repo_path.clone();
+        let repo_path = self.focused_repo_path();
         self.prune_in_flight = true;
         self.prune_status = Some(format!("pruning {} worktree(s)...", candidates.len()));
         cx.notify();
@@ -797,10 +800,9 @@ impl AdeApp {
         }
 
         let project_name = self
-            .repo_path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.repo_path.display().to_string());
+            .focused_repo()
+            .map(|repo| repo.name.clone())
+            .unwrap_or_else(|| self.focused_repo_path().display().to_string());
         let project_branch = self
             .worktrees
             .iter()

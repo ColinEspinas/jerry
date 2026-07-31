@@ -41,6 +41,33 @@ impl AdeApp {
         // time, which for a worktree this file has never seen (including a freshly created one)
         // is nothing at all.
 
+        // The repo-list file mirrors the fold-state file's own resolution one line up (see
+        // `rail::repo`'s module docs for why it's the identical pattern): a sibling of whatever
+        // settings path this instance was given, `None` (and so no persistence at all) for a test
+        // that doesn't opt into a real one. Every repo this user has previously added is restored
+        // here - not just the one `repo_path` names below - so "which repos are added" genuinely
+        // survives a restart; nothing yet *renders* more than the focused one (see
+        // `Self::worktrees`'s own docs), so a returning user with several repos added in a
+        // previous session sees exactly the same single-repo view they always have, just with the
+        // rest of their repos already known to `Self::repos` for the rail-rendering phase that
+        // will actually show them.
+        let repo_state_path = settings_path.as_deref().map(repo::repo_state_path_for);
+        let loaded_repo_state = repo_state_path
+            .as_deref()
+            .map(repo::RepoState::load_at)
+            .unwrap_or_default();
+        let mut repos: Vec<Repo> = Vec::with_capacity(loaded_repo_state.repos.len());
+        let mut next_repo_id: u64 = 0;
+        for (key, record) in &loaded_repo_state.repos {
+            repos.push(Repo {
+                id: RepoId(next_repo_id),
+                path: PathBuf::from(key),
+                name: record.name.clone(),
+                worktrees: Vec::new(),
+            });
+            next_repo_id += 1;
+        }
+
         // Built before the `Self` literal below (rather than inline as `cx.focus_handle()` at
         // their own field positions, as every other focus handle in this literal is) because
         // `AdeApp::wire_caret_blink` needs real, already-constructed handles to subscribe to -
@@ -83,7 +110,16 @@ impl AdeApp {
         let mut this = Self {
             file_tree_root: repo_path.clone(),
             diff_root: repo_path.clone(),
-            repo_path: repo_path.clone(),
+            repos,
+            // Resolved just below the literal, via `Self::add_repo`/`Self::focus_repo` - there is
+            // no `self` yet at this point in construction to call them against.
+            focused_repo: None,
+            next_repo_id,
+            repo_state_path,
+            repo_state_owned: std::collections::BTreeSet::new(),
+            _repo_state_save_task: None,
+            repo_state_save_pending: false,
+            repo_state_save_running: false,
             worktrees: Vec::new(),
             worktrees_error: None,
             worktree_selection_notice: None,
@@ -97,6 +133,7 @@ impl AdeApp {
             changes_rows_scroll_handle: UniformListScrollHandle::new(),
             diff_state: DiffLoadState::Loading,
             diff_totals: None,
+            file_authorship: changes::Authorship::default(),
             // Both are filled in immediately after this literal, through the same single
             // chokepoints every later change uses (`set_file_tree_root` +
             // `reload_expanded_dirs_from_fold_state`) - a second, constructor-only copy of that
@@ -295,6 +332,17 @@ impl AdeApp {
             _custom_theme_create_task: None,
             custom_theme_remove_armed: None,
         };
+        // Real "add this one repo on startup" (Revision R12 Phase 0): the CLI argument (or a
+        // test's own `repo_path`) becomes the first, focused entry of `Self::repos` rather than a
+        // separate field - `Self::add_repo` is idempotent against whatever `loaded_repo_state`
+        // above already restored, so a repeat launch of the same path never duplicates it. Every
+        // other single-repo-scoped field below (`file_tree_root`/`diff_root`/the initial shell's
+        // cwd/`load_worktrees`) still reads `repo_path` directly rather than
+        // `Self::focused_repo_path()` - they're the same value here by construction, and `Self::
+        // focused_repo_path()` becomes the real accessor once a repo switch is more than "one repo
+        // was ever set".
+        let focused_repo_id = this.add_repo(repo_path.clone(), cx);
+        this.focus_repo(focused_repo_id);
         // See the `expanded_dirs`/`fold_state_root_key` note in the literal above: resolving the
         // worktree key here, through the one function that ever resolves it, is what keeps the
         // startup path and every later worktree switch structurally identical.
@@ -351,7 +399,7 @@ impl AdeApp {
     /// effect; gone or newly broken → falls back to the main worktree and sets
     /// [`Self::worktree_selection_notice`]. See that function's docs for the full state machine.
     pub(crate) fn load_worktrees(&mut self, cx: &mut Context<Self>) {
-        let repo_path = self.repo_path.clone();
+        let repo_path = self.focused_repo_path();
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -396,7 +444,7 @@ impl AdeApp {
                         let new_root = new_index
                             .and_then(|index| this.worktrees.get(index))
                             .map(|item| item.path.clone())
-                            .unwrap_or_else(|| this.repo_path.clone());
+                            .unwrap_or_else(|| this.focused_repo_path());
                         this.set_file_tree_root(new_root.clone());
                         this.file_tree = Vec::new();
                         this.reload_expanded_dirs_from_fold_state();
@@ -534,7 +582,7 @@ impl AdeApp {
     pub(crate) fn active_session_cwd(&self) -> PathBuf {
         match self.selected.and_then(|index| self.worktrees.get(index)) {
             Some(item) if item.error.is_none() => item.path.clone(),
-            _ => self.repo_path.clone(),
+            _ => self.focused_repo_path(),
         }
     }
 
@@ -1166,7 +1214,7 @@ mod load_worktrees_integration_tests {
                 app.worktrees.iter().position(|item| item.path == feature)
             })
             .expect("the added worktree must be in the list");
-        let main_path = app.read_with(cx, |app, _| app.repo_path.clone());
+        let main_path = app.read_with(cx, |app, _| app.focused_repo_path());
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(feature_index, window, cx);
         });

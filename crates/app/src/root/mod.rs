@@ -67,6 +67,7 @@ use crate::keymap_overrides;
 use crate::lsp::diagnostics as diagnostics_view;
 use crate::merge::state as merge;
 use crate::palette::state as palette;
+use crate::rail::repo::{self as repo, Repo, RepoId};
 use crate::rail::state::{self as rail, RailMode};
 use crate::rail::worktrees::{self, WorktreeItem};
 use crate::settings::custom_theme;
@@ -259,7 +260,50 @@ pub(crate) const LSP_DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_millis
 pub(crate) const LSP_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct AdeApp {
-    pub(crate) repo_path: PathBuf,
+    /// Every git repository the user has added (Revision R12 Phase 0 - see [`repo`]'s
+    /// module docs). Zero-to-many: the app's *current* single-repo-per-window behaviour is just
+    /// the common case of this list holding exactly one entry, not a separate code path - see
+    /// [`Self::add_repo`]. Order is insertion order and carries no meaning of its own (a later
+    /// rail-rendering phase orders *groups* by urgency, not by this `Vec`'s order -
+    /// `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.0).
+    pub(crate) repos: Vec<Repo>,
+    /// Which of [`Self::repos`] is "the" repo for every currently-single-repo-scoped piece of
+    /// state this app still has (the file tree, the diff, a fresh session's cwd, `worktrees`
+    /// below) - see [`Self::focused_repo`]/[`Self::focused_repo_path`]. `None` only when
+    /// [`Self::repos`] is empty, which nothing in this phase's startup path (`Self::
+    /// new_with_settings`) ever produces - it always adds and focuses exactly one repo, mirroring
+    /// today's single-CLI-argument launch.
+    pub(crate) focused_repo: Option<RepoId>,
+    /// The next [`RepoId`] [`Self::add_repo`] will assign - a plain, process-local monotonic
+    /// counter (see [`RepoId`]'s own docs for why it's never derived from a path or persisted).
+    /// Seeded past every id already assigned while restoring [`Self::repos`] from
+    /// [`repo::RepoState`] at startup, so a freshly-added repo can never collide with one
+    /// just loaded from disk.
+    pub(crate) next_repo_id: u64,
+    /// The resolved path [`Self::persist_repo_state`] writes to - a sibling of
+    /// [`Self::settings_path`]/[`Self::fold_state_path`], `None` for the same tests that get a
+    /// `None` settings path (see [`repo::repo_state_path_for`]).
+    pub(crate) repo_state_path: Option<PathBuf>,
+    /// The [`repo::repo_key`]s this instance has added a repo under (and, once a later phase
+    /// adds a way to remove one, would mark removed too - [`repo::RepoState::save_merged_at`]'s
+    /// own contract already covers both) - what [`Self::persist_repo_state`] hands
+    /// `RepoState::save_merged_at` as "mine to overwrite". See [`Self::fold_state_owned`]'s
+    /// identical role for the equivalent whole-file-clobber this prevents when a second `jerry`
+    /// process (open against a different repo) is writing the same `repos.toml` at the same
+    /// time.
+    pub(crate) repo_state_owned: std::collections::BTreeSet<String>,
+    /// The repo-list file's own serial writer loop task - see [`Self::_fold_state_save_task`]'s
+    /// identical role/reasoning, just for `repos.toml` instead of `file-tree-state.toml`.
+    pub(crate) _repo_state_save_task: Option<Task<()>>,
+    /// See [`Self::fold_state_save_pending`] - same contract, for the repo-list file.
+    pub(crate) repo_state_save_pending: bool,
+    /// See [`Self::fold_state_save_running`] - same contract, for the repo-list file.
+    pub(crate) repo_state_save_running: bool,
+    /// Every worktree of [`Self::focused_repo`], as read by `wt_core::list_worktrees` -
+    /// deliberately still a flat, single-repo list rather than living on the [`Repo`] itself
+    /// (see [`Repo::worktrees`]'s own docs): this phase is data-model-and-persistence only, and
+    /// rewiring every consumer of "the worktree list" onto a per-repo one is the rail-rendering
+    /// phase's job, not this one's.
     pub(crate) worktrees: Vec<WorktreeItem>,
     pub(crate) worktrees_error: Option<String>,
     /// GitHub issue #12's "the user is notified" half of selection recovery - set by
@@ -305,6 +349,13 @@ pub struct AdeApp {
     /// [`Self::current_diff`]'s docs for exactly which [`DiffLoadState`]/[`DiffBase`]
     /// combinations count).
     pub(crate) diff_totals: Option<(u32, u32)>,
+    /// Which agent session(s) wrote each file in [`Self::diff_state`]'s currently loaded diff
+    /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §4's `by: 's1'`/`by:
+    /// ['s1','s9']` record) - see [`changes::Authorship`]'s own docs for why this is always empty
+    /// today (no real authorship tracking exists yet; this phase only defines the shape a later
+    /// one populates). Reset alongside [`Self::diff_state`] on every reload
+    /// (`crate::code_surface::tabs::AdeApp::load_diff`), never carried across one.
+    pub(crate) file_authorship: changes::Authorship,
     /// Real expand/collapse state for the file tree - a directory's absolute path is in this set
     /// iff it is expanded (see `crate::sidebar::file_tree::visible_entries`, which this set feeds
     /// directly). **Absence means collapsed**, so a worktree opened for the first time shows only
@@ -1468,6 +1519,143 @@ impl AdeApp {
         });
         self._fold_state_save_task = Some(task);
     }
+
+    /// The repo currently focused for every single-repo-scoped piece of state ([`Self::
+    /// focused_repo_path`], and - for now - [`Self::worktrees`]/[`Self::file_tree_root`]/
+    /// [`Self::diff_root`] alike) - `None` only when [`Self::repos`] is empty.
+    pub(crate) fn focused_repo(&self) -> Option<&Repo> {
+        self.focused_repo
+            .and_then(|id| self.repos.iter().find(|repo| repo.id == id))
+    }
+
+    /// [`Self::focused_repo`]'s path, falling back to [`Self::repos`]' first entry (defensive,
+    /// should [`Self::focused_repo`] ever point at an id no longer in the list) and finally to an
+    /// empty path when [`Self::repos`] itself is empty - not reachable today (every real startup
+    /// path, [`Self::new_with_settings`], always adds and focuses one repo first, and this phase
+    /// has no way to remove one afterward), but an honest fallback rather than a panic if that
+    /// ever changes.
+    pub(crate) fn focused_repo_path(&self) -> PathBuf {
+        self.focused_repo()
+            .map(|repo| repo.path.clone())
+            .or_else(|| self.repos.first().map(|repo| repo.path.clone()))
+            .unwrap_or_default()
+    }
+
+    /// Adds `path` as a repo the user has open, or returns the id of an already-added repo at the
+    /// same real (canonicalized) path - adding the same repo twice (e.g. two `app <path>`
+    /// launches sharing one `~/.config/jerry`, or a redundant call from a future "add repo" UI)
+    /// is idempotent, never a duplicate rail group. Does **not** change [`Self::focused_repo`] -
+    /// see [`Self::focus_repo`] for that half, kept as a separate call so a caller that only
+    /// wants "make sure this repo is known" (startup, before deciding what's focused) doesn't get
+    /// an unwanted focus side effect.
+    ///
+    /// Calls [`repo::repo_key`] synchronously (a single `std::fs::canonicalize`, not offloaded to
+    /// the background executor) - safe here the same way [`Settings::load_or_init`]'s own
+    /// single-file-read constructor exception is safe (see [`Self::new`]'s docs): this only ever
+    /// runs from a real, infrequent user action or once at startup, never a render or per-
+    /// keystroke path, unlike [`repo::repo_key`]'s hot-path sibling
+    /// `crate::sidebar::fold_state::worktree_key`.
+    pub(crate) fn add_repo(&mut self, path: PathBuf, cx: &mut Context<Self>) -> RepoId {
+        let key = repo::repo_key(&path);
+        if let Some(key) = key.as_deref() {
+            if let Some(existing) = self
+                .repos
+                .iter()
+                .find(|repo| repo::repo_key(&repo.path).as_deref() == Some(key))
+            {
+                return existing.id;
+            }
+        }
+        let id = RepoId(self.next_repo_id);
+        self.next_repo_id += 1;
+        self.repos.push(Repo::new(id, path));
+        if let Some(key) = key {
+            self.repo_state_owned.insert(key);
+        }
+        self.persist_repo_state(cx);
+        cx.notify();
+        id
+    }
+
+    /// Makes `id` [`Self::focused_repo`] - a no-op if `id` isn't (or is no longer) in
+    /// [`Self::repos`], so a stale id from a closed-over click handler can never point focus at
+    /// nothing. Deliberately synchronous and cheap: unlike [`Self::select_worktree`], changing
+    /// which *repo* is focused doesn't yet reload anything (the file tree/diff/sessions are still
+    /// single-repo-scoped fields this phase doesn't rewire - see [`Self::worktrees`]'s own docs),
+    /// so there is nothing to kick off here beyond the assignment itself.
+    pub(crate) fn focus_repo(&mut self, id: RepoId) {
+        if self.repos.iter().any(|repo| repo.id == id) {
+            self.focused_repo = Some(id);
+        }
+    }
+
+    /// [`Self::repos`], reduced to the on-disk shape [`repo::RepoState::save_merged_at`] expects -
+    /// every repo whose path resolves to a real [`repo::repo_key`] (a non-UTF-8 path is silently
+    /// omitted here, the identical refusal `crate::sidebar::fold_state::FoldState`'s own key
+    /// functions apply, rather than stored under a lossily-mangled key that could collide).
+    fn repo_state_snapshot(&self) -> repo::RepoState {
+        let mut state = repo::RepoState::default();
+        for r in &self.repos {
+            if let Some(key) = repo::repo_key(&r.path) {
+                state.repos.insert(
+                    key,
+                    repo::RepoRecord {
+                        name: r.name.clone(),
+                    },
+                );
+            }
+        }
+        state
+    }
+
+    /// Queues a background-executor save of the current repo list to [`Self::repo_state_path`],
+    /// called from [`Self::add_repo`] (and, once a later phase adds a way to remove one, would be
+    /// called from there too - [`Self::repo_state_owned`]/[`repo::RepoState::save_merged_at`]
+    /// already carry a real deletion-on-absence contract, unused only for lack of a caller).
+    /// `None` path (every GPUI test that hasn't asked for a real one) makes this a no-op; a save
+    /// failure is logged, not surfaced - the same simpler shape [`Self::persist_settings`] uses (a
+    /// single retry-free attempt per pending write), not [`Self::persist_fold_state`]'s elaborate
+    /// bounded-retry loop: losing one `repos.toml` write is a rare, low-stakes miss a user would
+    /// notice and just re-add the repo for, unlike a silently-dropped file-tree expand/collapse
+    /// edit that issue #18 specifically called out as needing to survive a transient failure.
+    pub(crate) fn persist_repo_state(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.repo_state_path.clone() else {
+            return;
+        };
+        self.repo_state_save_pending = true;
+        if self.repo_state_save_running {
+            // The loop below already re-checks `repo_state_save_pending` before writing or
+            // stopping - see `Self::persist_settings`'s identical comment for why spawning a
+            // second loop here would let two real `save_merged_at` calls overlap.
+            return;
+        }
+        self.repo_state_save_running = true;
+        let task = cx.spawn(async move |this, cx| loop {
+            let step = this.update(cx, |this, _cx| {
+                if this.repo_state_save_pending {
+                    this.repo_state_save_pending = false;
+                    Some((this.repo_state_snapshot(), this.repo_state_owned.clone()))
+                } else {
+                    this.repo_state_save_running = false;
+                    None
+                }
+            });
+            let Ok(Some((state, owned))) = step else {
+                break;
+            };
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let path = path.clone();
+                    async move { state.save_merged_at(&path, &owned) }
+                })
+                .await;
+            if let Err(err) = result {
+                log::warn!("failed to save {}: {err}", path.display());
+            }
+        });
+        self._repo_state_save_task = Some(task);
+    }
 }
 
 impl Render for AdeApp {
@@ -1920,6 +2108,215 @@ mod settings_persist_tests {
             on_disk.appearance.editor_font_size, 20.0,
             "the file must hold the LAST edit's value, never an earlier, longer-delayed edit's \
              stale one landing on top of it afterward"
+        );
+    }
+}
+
+/// Real, `Context<AdeApp>`-driven coverage for [`AdeApp::add_repo`]/[`AdeApp::focus_repo`]/
+/// [`AdeApp::persist_repo_state`] (Revision R12 Phase 0) - the restructured multi-repo-capable
+/// state this revision's rail-rendering/authorship-heuristic/worktree-watcher sibling work
+/// depends on. `crate::rail::repo`'s own module carries the pure `RepoState` persistence-format
+/// tests (including the deletion-on-absence half `save_merged_at` already supports); these
+/// exercise the same behaviour through a real `AdeApp` entity, the way [`settings_persist_tests`]
+/// does for settings. No `AdeApp::remove_repo` exists yet - there is no real (non-test) caller
+/// for one until a later phase adds a "remove repo" affordance, so it isn't defined here rather
+/// than kept as unreachable scaffolding; `Self::repo_state_owned`/`RepoState::save_merged_at`'s
+/// contract is already shaped to support it when that phase adds the method and its own tests.
+#[cfg(test)]
+mod repo_list_tests {
+    use super::*;
+    use crate::rail::repo::RepoState;
+    use gpui::TestAppContext;
+
+    fn open_test_app_with_real_settings_path(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        settings_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                repo_path,
+                settings_store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        })
+    }
+
+    /// A fresh window's own startup path already exercises the common single-repo case: exactly
+    /// one repo, focused, matching the CLI-given path - "a user launching `app <path>` today must
+    /// keep working exactly as before" is this test.
+    #[gpui::test]
+    fn a_fresh_window_starts_with_exactly_one_focused_repo(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.repos.len(), 1);
+            assert_eq!(app.repos[0].path, repo.path());
+            assert_eq!(app.focused_repo().map(|r| r.id), Some(app.repos[0].id));
+            assert_eq!(app.focused_repo_path(), repo.path());
+        });
+    }
+
+    #[gpui::test]
+    fn add_repo_appends_a_new_entry_without_changing_focus(cx: &mut TestAppContext) {
+        let repo_a = tempfile::tempdir().expect("tempdir");
+        let repo_b = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let focused_before = app.read_with(cx, |app, _| app.focused_repo_path());
+
+        app.update(cx, |app, cx| {
+            app.add_repo(repo_b.path().to_path_buf(), cx);
+        });
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.repos.len(), 2);
+            assert!(app.repos.iter().any(|r| r.path == repo_b.path()));
+            assert_eq!(
+                app.focused_repo_path(),
+                focused_before,
+                "add_repo must not change which repo is focused"
+            );
+        });
+    }
+
+    /// Adding the same real path twice (e.g. a repeat `app <path>` launch sharing one
+    /// `~/.config/jerry`) must not produce a second rail group for the same repo.
+    #[gpui::test]
+    fn add_repo_is_idempotent_for_the_same_path(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let (first_id, second_id) = app.update(cx, |app, cx| {
+            let first = app.repos[0].id;
+            let second = app.add_repo(repo.path().to_path_buf(), cx);
+            (first, second)
+        });
+
+        assert_eq!(
+            first_id, second_id,
+            "re-adding the same path must return the same id"
+        );
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.repos.len(),
+                1,
+                "re-adding the same path must not duplicate it"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn focus_repo_moves_focus_to_a_known_repo(cx: &mut TestAppContext) {
+        let repo_a = tempfile::tempdir().expect("tempdir");
+        let repo_b = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+
+        let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
+        app.update(cx, |app, _cx| app.focus_repo(repo_b_id));
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.focused_repo_path(), repo_b.path());
+        });
+    }
+
+    /// A stale/unknown id must not blank out focus - the same "refuse rather than corrupt state"
+    /// shape `crate::sidebar::fold_state::FoldState::set_expanded` uses for an out-of-worktree
+    /// path.
+    #[gpui::test]
+    fn focus_repo_with_an_unknown_id_is_a_no_op(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let focused_before = app.read_with(cx, |app, _| app.focused_repo_path());
+
+        app.update(cx, |app, _cx| app.focus_repo(RepoId(u64::MAX)));
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.focused_repo_path(), focused_before);
+        });
+    }
+
+    /// The persistence half: adding a repo with a real settings path must, once the background
+    /// writer loop settles, leave a real `repos.toml` on disk that a fresh load recovers - "which
+    /// repos are currently added should survive an app restart".
+    #[gpui::test]
+    fn adding_a_repo_persists_to_a_real_repos_toml(cx: &mut TestAppContext) {
+        let repo_a = tempfile::tempdir().expect("tempdir");
+        let repo_b = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo_a.path().to_path_buf(),
+            settings_path.clone(),
+        );
+        app.update(cx, |app, cx| {
+            app.add_repo(repo_b.path().to_path_buf(), cx);
+        });
+        cx.run_until_parked();
+
+        let repo_state_path = repo::repo_state_path_for(&settings_path);
+        let on_disk = RepoState::load_at(&repo_state_path);
+        let canonical_a = repo::repo_key(repo_a.path()).expect("repo a key");
+        let canonical_b = repo::repo_key(repo_b.path()).expect("repo b key");
+        assert!(
+            on_disk.repos.contains_key(&canonical_a),
+            "the startup repo must be persisted too, not just later additions"
+        );
+        assert!(on_disk.repos.contains_key(&canonical_b));
+    }
+
+    /// A window opened against `repo_a`, sharing a real `~/.config/jerry` that *another* running
+    /// `jerry` instance already recorded `repo_b` into, must not erase `repo_b` the moment it
+    /// saves anything of its own - the identical multi-instance guarantee
+    /// `crate::sidebar::fold_state` already provides for the file-tree fold state, proven here
+    /// through one real `AdeApp` entity's startup-and-save cycle against a `repos.toml` seeded as
+    /// if a second instance had already written to it (`crate::rail::repo`'s own tests already
+    /// cover the pure `RepoState::save_merged_at` half; this proves the real `AdeApp` wiring
+    /// reaches it correctly end to end).
+    #[gpui::test]
+    fn opening_against_one_repo_does_not_erase_another_instances_already_persisted_repo(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = tempfile::tempdir().expect("tempdir");
+        let repo_b = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        // Simulate a second `jerry` instance that already added `repo_b` and saved it.
+        let repo_state_path = repo::repo_state_path_for(&settings_path);
+        let mut seed = RepoState::default();
+        let canonical_b = repo::repo_key(repo_b.path()).expect("repo b key");
+        seed.repos.insert(
+            canonical_b.clone(),
+            crate::rail::repo::RepoRecord {
+                name: "repo-b".to_string(),
+            },
+        );
+        seed.save_at(&repo_state_path).expect("seed save");
+
+        // This instance opens against a different repo, sharing the same `repos.toml`.
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo_a.path().to_path_buf(),
+            settings_path.clone(),
+        );
+        cx.run_until_parked();
+        let _ = app;
+
+        let on_disk = RepoState::load_at(&repo_state_path);
+        let canonical_a = repo::repo_key(repo_a.path()).expect("repo a key");
+        assert!(
+            on_disk.repos.contains_key(&canonical_a),
+            "this instance's own repo must be persisted"
+        );
+        assert!(
+            on_disk.repos.contains_key(&canonical_b),
+            "this instance's own save must not have erased the other instance's already-\
+             persisted repo"
         );
     }
 }
