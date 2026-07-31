@@ -348,13 +348,29 @@ impl AdeApp {
 /// `crate::sidebar`/`crate::status_bar` already use for their own truncated-text tooltips)
 /// carrying the sha/full message. `line_number` only seeds the element id, so two rows never
 /// collide.
+///
+/// `min_w_0()` + `max_w()` + `truncate()` (the same combination `crate::status_bar`'s own
+/// `render_status_worktree_history_notice` uses for its long, load-bearing text) let this span
+/// shrink and ellipsize instead of demanding its full natural width: `EditableLineContext::
+/// inline_blame`'s caller only ever attaches this to the *current* line, whose `text_row` is a
+/// real, unclamped `.w_full()` element (deliberately, for click hit-testing - see that div's own
+/// docs) with no `overflow_hidden()` of its own, so a real code line longer than the available
+/// row width paints past its own box on a narrow window/pane. Without a background here, that
+/// bled-through code text and this span's own text occupied the same pixels - a real, visually
+/// broken double-text overlap, not just a layout nitpick. `bg(theme::surface::CURRENT_LINE)`
+/// matches the current-line highlight `row` itself already carries on every row this ever
+/// renders on, so the backdrop is seamless and masks any bleed instead of showing through it.
 pub(in crate::code_surface) fn render_inline_blame_span(
     label: &blame::InlineBlameLabel,
     line_number: usize,
 ) -> gpui::AnyElement {
     let mut el = div()
         .id(("file-view-blame", line_number))
+        .min_w_0()
+        .max_w(px(320.0))
+        .truncate()
         .pl(px(16.0))
+        .bg(theme::surface::CURRENT_LINE)
         .text_size(px(10.5))
         .text_color(theme::text::GHOST)
         .child(label.inline_text.clone());
