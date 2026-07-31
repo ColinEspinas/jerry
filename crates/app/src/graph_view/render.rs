@@ -1513,23 +1513,36 @@ fn render_graph_lane_canvas(row: &GraphRow, lane_count: usize) -> impl IntoEleme
     for elbow in &row.elbows {
         let x_from = lane_x(elbow.from_lane);
         let x_to = lane_x(elbow.to_lane);
-        let (left, width) = if x_to >= x_from {
+        // `from_lane` is this row's own dot, at the vertical centre of the row - which is
+        // exactly this box's *top* edge (`top` below sits at `row_h / 2`, see the dot's own
+        // `top` a few lines down). `to_lane` is where the line continues in the row below, at
+        // this box's *bottom* edge. So the vertical stroke belongs on whichever side `from_lane`
+        // sits on, the horizontal stroke belongs on the *bottom* edge (not the top - a lane
+        // starting here draws its own bottom-half segment the same way, see `lane_segments`
+        // above), and the curve is wherever those two meet.
+        let rightward = x_to >= x_from;
+        let (left, width) = if rightward {
             (x_from, x_to - x_from)
         } else {
             (x_to, x_from - x_to)
         };
-        canvas = canvas.child(
-            div()
-                .absolute()
-                .left(left)
-                .top(row_h - theme::graph::ELBOW_HEIGHT + px(1.0))
-                .w(width + px(1.0))
-                .h(theme::graph::ELBOW_HEIGHT)
-                .border_t_1()
+        let elbow_box = div()
+            .absolute()
+            .left(left)
+            .top(row_h - theme::graph::ELBOW_HEIGHT + px(1.0))
+            .w(width + px(1.0))
+            .h(theme::graph::ELBOW_HEIGHT)
+            .border_b_1()
+            .border_color(lane_color(elbow.from_lane));
+        canvas = canvas.child(if rightward {
+            elbow_box
                 .border_l_1()
-                .border_color(lane_color(elbow.from_lane))
-                .rounded_tl(theme::graph::ELBOW_RADIUS),
-        );
+                .rounded_bl(theme::graph::ELBOW_RADIUS)
+        } else {
+            elbow_box
+                .border_r_1()
+                .rounded_br(theme::graph::ELBOW_RADIUS)
+        });
     }
 
     let dot_lane = row.lane;
