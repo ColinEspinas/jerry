@@ -3602,13 +3602,31 @@ lines after a real paint pass), so Alt+click's own wiring follows the same estab
 relies on the `add_cursor_at` unit test plus code review.
 
 **Environment note**: this work was done from a Windows sandbox, not this project's usual
-Linux/WSL2 environment (see README.md/BUILD-LOG.md's own repeated notes on this). Two pre-existing,
-platform-specific gaps blocked a full, clean local `cargo clippy --workspace --all-targets -- -D
-warnings`/`cargo test --workspace` run identical to CI's own Linux-only gate (`.github/workflows/
-ci.yml` only runs clippy/tests on Linux; macOS/Windows are build-only jobs) - neither caused by, or
-touched by, this change: `status_bar/mod.rs` imports `Session` only for a `#[cfg(target_os =
-"linux")]` function, an unused-import warning on Windows only; and `lsp-core`'s own test target
-fails to compile on Windows because a `#[cfg(unix)]`-gated `proc` module is referenced
-unconditionally from a Unix-only code path. Verified against both `cargo build --workspace`
-(clean) and `cargo clippy -p app --all-targets -- -D warnings`/`cargo test -p app --lib` scoped to
-this crate (clean except those two pre-existing issues), plus every test above passing.
+Linux/WSL2 environment (see README.md/BUILD-LOG.md's own repeated notes on this, and CI - now
+build-only everywhere per the immediately preceding CI-simplification commit - for why that gap is
+real and not just theoretical). What was actually verified, cleanly, on this machine:
+`cargo build --workspace`; `cargo fmt --all -- --check`; `cargo clippy --workspace --exclude
+lsp-core --all-targets -- -D warnings` (see below for why `lsp-core` itself is excluded);
+`cargo test -p app --lib code_surface::` (235 tests, 0 failed - every test this change actually
+touches or added, including all 25 new ones and the pre-existing suite around them); and a large,
+though not complete, slice of the rest of the `app` crate's own suite (everything reachable before
+this sandbox's own process-spawning tests below, run in several passes).
+
+Two classes of pre-existing gap, neither caused by or reachable from this change's own files,
+account for what couldn't be run to completion. First, `lsp-core`'s own test target does not
+compile on Windows at all (a `#[cfg(unix)]`-gated `proc` module referenced unconditionally),
+confirmed pre-existing by reproducing it against a stash of the pre-rebase commit too - this alone
+makes a literal `cargo test --workspace`/`cargo clippy --workspace --all-targets` impossible on this
+machine, not just slow. Second, and more surprising: several tests scattered through modules this
+change never touches (`root::focus::tab_strip_keybinding_tests`, `merge::flow::
+merge_regression_tests`, `code_surface::lsp_ui`'s real-language-server wiring tests) either hang
+indefinitely or crash the whole test binary under this sandbox specifically - every one of them
+spawns a real child process (a shell, `rust-analyzer`/`typescript-language-server`, a `git`
+worktree operation) or a real language server, and this sandbox's own process/toolchain setup
+differs enough from the project's native Linux/WSL2 environment (missing `rust-analyzer` for the
+pinned toolchain, confirmed separately; Windows process teardown behaving differently from the
+Unix signal-based teardown `pty-core`'s own tests already assume) that this class of test is simply
+not reliably runnable here today, in isolation from this change or not. Every individual test in
+this category that could be run alone (e.g. `stale_completions_popup_tests`, the diff-rendering
+flake) passed cleanly - the failure mode is specific to this sandbox's behavior under a long,
+sequential, real-process-heavy run, not a logic bug anywhere.

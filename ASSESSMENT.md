@@ -259,15 +259,20 @@ BUILD-LOG.md's own entry for this work. Undo/redo's own single-selection limitat
 real, live gap for the specific case of undoing a multi-cursor edit, not a hypothetical one.
 
 **Independent verification note**: this work was built from a Windows sandbox instead of this
-project's usual Linux/WSL2 environment. `lsp-core`'s own test target does not compile on Windows
-at all (a pre-existing, unrelated `#[cfg(unix)]` gap, confirmed unaffected by this change by
-reproducing it against a clean stash of the base commit too), which blocks a literal
-`cargo test --workspace`/`cargo clippy --workspace --all-targets` run on this machine outright;
-verified instead with `--workspace --exclude lsp-core` (clean) plus `-p app` on its own. Three of
-this crate's own real-language-server-spawning test modules
-(`lsp_hover_wiring_tests`/`lsp_diagnostics_wiring_tests`/`vue_two_server_wiring_tests`) also
-couldn't run - `rust-analyzer` is not installed for the pinned toolchain here - and one real,
-timing-sensitive fake-LSP-server test flaked under this sandbox's own resource constraints; none of
-the four are anywhere near this change's own files. Every test this change actually added was run
-and passed, and the rest of the `app` crate's suite passed in full alongside it - see BUILD-LOG.md's
-own entry for the exact numbers and commands.
+project's usual Linux/WSL2 environment, and that gap turned out to be real, not theoretical.
+`lsp-core`'s own test target does not compile on Windows at all (a pre-existing `#[cfg(unix)]` gap,
+confirmed unaffected by this change by reproducing it against a stash of the pre-rebase commit
+too), which blocks a literal `cargo test --workspace`/`cargo clippy --workspace --all-targets` run
+outright. Beyond that, a class of test scattered through modules this change never touches - real
+language-server wiring, real `git` worktree operations, real terminal session spawn/close - either
+crashed the whole test binary or hung indefinitely under this sandbox specifically, seemingly tied
+to how this sandbox's process/toolchain setup differs from the project's native Linux/WSL2 one
+(confirmed missing `rust-analyzer` for the pinned toolchain; likely different process-teardown
+behavior from the Unix-signal-based teardown `pty-core`'s own tests assume). Every one of those
+tests that could be run in isolation passed cleanly, so this reads as sandbox-specific flakiness
+under a long, sequential, real-process-heavy run, not a logic bug - but it does mean the full
+`cargo test --workspace` this project's own `CONTRIBUTING.md` asks for could not be completed here,
+end to end, for reasons unrelated to this change. What could be verified cleanly: every test this
+change actually added or touches (`cargo test -p app --lib code_surface::`, 235 tests, 0 failed),
+`cargo build --workspace`, `cargo fmt --all -- --check`, and `cargo clippy --workspace --exclude
+lsp-core --all-targets -- -D warnings` - see BUILD-LOG.md's own entry for the exact commands.
