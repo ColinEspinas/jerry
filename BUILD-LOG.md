@@ -6283,3 +6283,113 @@ fully clean at 0 failed; an earlier run in this same round flaked on
 `code_surface::diff_view::diff_render_tests::opening_a_real_diff_renders_real_syntax_highlighted_rows`,
 the known timing-sensitive async-highlight test in an unrelated file, which passed in isolation
 immediately afterwards and then passed again in the final full run. Untouched by this change.
+
+## The horizontal counterpart: per-edge anchoring, and a doubled lane line only visible on odd lanes
+
+The vertical fix above was confirmed live by the user. The next report was horizontal, with a
+specific and initially puzzling qualifier: "horizontal misalignment seems only on odds lines."
+
+**Measuring first.** The new screenshot turned out to be at a **1.25x device scale**, unlike the
+three before it (all 1.0x) - lane columns sat 17.5px apart rather than `LANE_STEP`'s 14. Fitting
+`device_x = round(lane_x * 1.25) + 70` to the five measured lane columns (81, 99, 116, 134, 151)
+reproduced all five exactly, which pinned the scale before any conclusion was drawn from the image.
+
+That scale matters, because `LANE_STEP * 1.25 = 17.5` is a *half*-integer: consecutive lanes land on
+alternating sub-pixel phases, and GPUI snaps each element's bounds to whole device pixels
+independently (`round_to_device_pixel` on each of left/top/right/bottom, `window.rs`). So a lane's
+own line and an elbow's border stroke - the same logical span, but one positioned by its own left
+edge and the other inset from a rounded box's right edge - can round to different device columns,
+and whether they do depends on the lane's parity. That is exactly the "odd lines" pattern, and it is
+not something a logical-coordinate fix can control.
+
+**What was actually wrong.** Scanning every lane column and its two neighbours for full-strength
+runs of the lane's own colour separated the real defect from the DPI artefact:
+
+* lane 1 (pink): column 98 carried solid runs at rows 52-59, 128-133 and 372-379, alongside lane 1's
+  own line at column 99 - a **2px-wide doubled line**, both columns at the exact pure lane colour
+  (`(201,143,191)`), so two fully-opaque elements, not anti-aliasing;
+* lane 3 (amber): the same, at column 133 against its line at 134;
+* lanes 0, 2 and 4 (even): nothing but their commit dots on the neighbouring columns.
+
+The doubled stretches are the elbow's **overshoot**. Both curves together stand
+`2 * ELBOW_CURVE_SIZE` = 20px tall, but only `ROW / 2` = 13px of the row exists past the dot, so the
+far curve always reaches 7px into the neighbouring row - where that lane's *own* `LaneSegment` is
+already painting the identical line. Two elements for one 1px line: harmless at 1.0x, where they
+snap identically, and a visibly doubled band at 1.25x on the lanes whose phase makes them disagree.
+Worth noting how this got here: the overshoot was ~1px under the old 14px elbow and only became 7px
+when `ELBOW_CURVE_SIZE` grew from 7 to 10 to defeat GPUI's radius clamp - the clamp fix quietly
+seven-folded a pre-existing overlap.
+
+**Fix 1: per-edge anchoring, replacing `ELBOW_NUDGE_RIGHT`.** The horizontal face of the same
+border-box rule: `border_l` paints the column at `left`, `border_r` the column at `right - stroke`.
+No single uniform shift can anchor both, so the uniform nudge was replaced by
+`CurveBox::anchored`, which positions each curve from its *painted* stroke on both axes. That needed
+one real distinction the old code did not have, now `LaneJoin`:
+
+* `ContinuesLane` - the curve's stroke *is* that lane's line for this half-row (the plain stub is
+  skipped for exactly this lane), so it must land on `lane_x` itself;
+* `LeavesDot` - the curve departs from, or arrives at, this row's dot while `own_lane`'s own line
+  runs straight through the same rows, so it belongs one stroke to the side the elbow travels,
+  beside that through-line rather than erasing a stroke's width of it.
+
+Every shape currently reachable from `layout_lanes` comes out **bit-for-bit identical** to what the
+nudge produced, so nothing the user already confirmed moves. The shape that changes is the leftward
+`Diverging` elbow, which was landing a column off the lane line it is supposed to continue, and
+whose dot end was painting on top of `own_lane` instead of beside it. Checking `layout_lanes`
+directly also corrected an over-claim in the previous entry: rightward `Converging` is **not**
+reachable (Step 2 takes `own_lane` as the lowest lane expecting the commit, so every other
+converging lane has a higher index), while leftward `Diverging` genuinely is, via either Step 4's
+`position` lookup or `allocate_fresh_lane` reusing a lower free slot.
+
+**Fix 2: never paint one stretch of lane line twice.** `render_graph_lane_canvas` already refused to
+draw a plain stub *and* an elbow over the same half-row; that rule now extends across the row
+boundary. `lane_segment_span` (pure, in the same spirit as `elbow_geometry`/`elbow_color_lane`)
+insets a through-lane's span by `ELBOW_OVERSHOOT` when a neighbouring row's elbow already covers it -
+a `Diverging` elbow above reaches down, a `Converging` elbow below reaches up. Only through-lanes can
+ever be affected, since the lane a neighbouring elbow points at necessarily starts or ends in *that*
+row. `render_graph_row`/`render_graph_lane_canvas` take a new `RowNeighbours`, deliberately carrying
+just the neighbours' `&[Elbow]` rather than whole `GraphRow`s.
+
+**Clarity pass.** The elbow section had accumulated a running commentary of reverted attempts. The
+two GPUI behaviours that actually drive the numbers (radius clamped to half the shorter side; borders
+painted inside the box) are now stated once, on `CurveBox`, with the corollary that matters - the arc
+only ever fills an `ELBOW_RADIUS` corner, so each bordered edge always carries exactly
+`ELBOW_RADIUS` of straight lead-in - and everything else refers to that instead of re-litigating.
+`elbow_geometry` lost its duplicated per-kind arms (both kinds now differ only in `waist_y` and
+`LaneJoin`, which is what actually distinguishes them) and its post-hoc nudge rewrap. The bridge is
+computed from the two boxes via a new `CurveBox::right()` rather than re-deriving lane arithmetic.
+`theme::graph::ELBOW_HEIGHT` was deleted outright: after the S-curve redesign it was always exactly
+`2 * ELBOW_CURVE_SIZE`, its own doc comment already conceded it no longer meant what the design spec
+said, and nothing but tests referenced it.
+
+**Tests.** `a_lane_continuing_curve_paints_its_stroke_on_that_lanes_own_column` and
+`a_dot_leaving_curve_paints_one_stroke_clear_of_its_lanes_own_line` assert the *painted* column (via
+a `painted_vertical_column` helper deriving it the way GPUI lays a border out) across all four
+shapes, including the previously-untested leftward `Diverging` and rightward `Converging`. The first
+was confirmed non-vacuous by reproducing the old uniform-nudge position and watching only that test
+fail. Three tests cover `lane_segment_span`: the trim itself, that it keys on the specific lane and
+direction rather than merely "a neighbour has an elbow", and that half-height stubs are never
+trimmed. `the_overshoot_constant_matches_the_geometry_it_stands_for` pins `ELBOW_OVERSHOOT` to
+`2 * CURVE_SIZE - ROW / 2` (`Pixels` has no const arithmetic) and asserts it is still positive, so
+that if the elbow ever fits its own half-row the constant and the inset get deleted rather than left
+silently doing nothing. The two paint-based `gpui::test`s now assert painted stroke columns derived
+independently from each elbow's own lanes and the documented rules, rather than from
+`elbow_geometry`'s internals.
+
+**Confidence.** The measurements are solid: scale, lane columns, the doubled runs and their absence
+on even lanes are all read directly off the user's screenshot, and the per-edge rule follows from
+GPUI's own source. What is *not* fully derived is the exact snapping arithmetic - an analytical model
+of `round_to_device_pixel` over these particular bounds did not reproduce the observed columns, so
+the parity behaviour is characterised empirically rather than predicted. Fix 2 does not depend on
+that arithmetic being understood: it removes the second element entirely, so there is nothing left
+to disagree. What remains possible, and is worth saying plainly, is a residual **1px seam** where the
+elbow's stroke hands off to the lane's own rect at fractional scale - a border inset from a rounded
+box and a filled rect are still two different elements. Removing that class of seam completely would
+mean drawing the whole lane canvas as one path primitive rather than per-element divs, which is a
+redesign, not a fix. And as every round on this feature: GPUI's headless renderer is macOS-only at
+this pinned revision and this sandbox's X11 capture is broken, so none of this was seen rendered.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+1119 app + 44 lsp-core + 14 pty-core + 127 wt-core, 0 failed (+3 app tests net: six new, three
+positional tests folded into the painted-column ones that supersede them).
