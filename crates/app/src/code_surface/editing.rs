@@ -2583,8 +2583,6 @@ mod editing_tests {
             "Escape should collapse back to a single real cursor"
         );
     }
-        );
-    }
 
     /// Real test (d): real Backspace/Delete through the real, bound key bindings.
     #[gpui::test]
