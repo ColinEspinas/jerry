@@ -115,6 +115,19 @@ pub(crate) fn lane_x(lane: usize) -> Pixels {
     theme::graph::LANE_X_BASE + theme::graph::LANE_STEP * (lane as f32)
 }
 
+/// The real, per-graph lane canvas width - `theme::graph::LANE_CANVAS`'s fixed 100px only fits
+/// up to `lane_count == 7` (`lane_x(6) == 93`, plus a little breathing room past the last lane's
+/// own dot); a repository with more concurrent branches than that previously had its rightmost
+/// lanes' dots and elbows painted past the canvas's own right edge, directly overlapping the ref
+/// chips and subject text columns next to it (a real user report). Grows past the fixed default
+/// exactly as far as `lane_count` actually needs, and never shrinks below it - a graph with few
+/// lanes keeps the same familiar width it always had.
+pub(crate) fn graph_lane_canvas_width(lane_count: usize) -> Pixels {
+    let last_lane = lane_count.saturating_sub(1);
+    let needed = lane_x(last_lane) + theme::graph::LANE_X_BASE;
+    needed.max(theme::graph::LANE_CANVAS)
+}
+
 /// One of the six lane colours, cycled by `lane % 6` (design spec §2).
 pub(crate) fn lane_color(lane: usize) -> gpui::Rgba {
     theme::graph::LANES[lane % theme::graph::LANES.len()].into()
@@ -173,6 +186,40 @@ mod tests {
         assert_eq!(
             lane_x(1),
             theme::graph::LANE_X_BASE + theme::graph::LANE_STEP
+        );
+    }
+
+    #[test]
+    fn graph_lane_canvas_width_never_shrinks_below_the_fixed_default() {
+        assert_eq!(graph_lane_canvas_width(0), theme::graph::LANE_CANVAS);
+        assert_eq!(graph_lane_canvas_width(1), theme::graph::LANE_CANVAS);
+        // Real, currently-fitting lane counts must not grow the canvas past its familiar
+        // default - only a repository with genuinely more concurrent lanes than that should.
+        for lane_count in 2..=6 {
+            assert_eq!(
+                graph_lane_canvas_width(lane_count),
+                theme::graph::LANE_CANVAS,
+                "lane_count {lane_count} should still fit inside the existing default width"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_lane_canvas_width_grows_to_fit_more_lanes_than_the_default_holds() {
+        // A real user report: with enough concurrent branches, the fixed 100px canvas let the
+        // rightmost lanes' dots/elbows paint past its own right edge, directly overlapping the
+        // ref chips and subject text columns next to it.
+        let width = graph_lane_canvas_width(12);
+        assert!(
+            width > theme::graph::LANE_CANVAS,
+            "12 real concurrent lanes must grow the canvas past its fixed default: got {width:?}"
+        );
+        // The widened canvas must actually fit the rightmost lane's own dot, not just be "wider
+        // than default" by an arbitrary amount - real coverage past `lane_x(11)`.
+        assert!(
+            width > lane_x(11),
+            "canvas width {width:?} must extend past the rightmost lane's own x position {:?}",
+            lane_x(11)
         );
     }
 

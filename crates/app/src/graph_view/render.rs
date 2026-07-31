@@ -1750,11 +1750,38 @@ fn render_graph_lane_canvas(
     let mut canvas = div()
         .relative()
         .flex_none()
-        .w(theme::graph::LANE_CANVAS)
+        .w(graph_lane_canvas_width(lane_count))
         .h(row_h)
         .debug_selector(move || format!("graph-row-{row_index}-lane-canvas"));
 
     for segment in &row.lane_segments {
+        // A lane that *exclusively* starts or ends here (not a plain through-lane, which never
+        // matches either check below) and has a real elbow at this exact same row already gets
+        // that half painted by the elbow box itself (`ElbowGeometry`'s own vertical stroke,
+        // anchored at the exact same x - see `elbow_geometry`'s docs): a Converging elbow's
+        // `from_lane` is the ending lane, a Diverging elbow's `to_lane` is the lane that starts
+        // here. Drawing the plain stub *as well* doubles up on the exact same pixels the elbow
+        // already covers, which reads as the vertical line running further than it should (a
+        // real user report: "the vertical lines are going too far at the end and at the start").
+        // Skip the plain stub in that case rather than draw it twice - the module's own "do not
+        // draw two stacked halves per row" principle, extended to also mean "do not draw a plain
+        // half *and* an elbow over the same half."
+        let ends_here_has_elbow = segment.ends_here
+            && !segment.starts_here
+            && row
+                .elbows
+                .iter()
+                .any(|e| e.kind == ElbowKind::Converging && e.from_lane == segment.lane);
+        let starts_here_has_elbow = segment.starts_here
+            && !segment.ends_here
+            && row
+                .elbows
+                .iter()
+                .any(|e| e.kind == ElbowKind::Diverging && e.to_lane == segment.lane);
+        if ends_here_has_elbow || starts_here_has_elbow {
+            continue;
+        }
+
         let x = lane_x(segment.lane);
         let color = lane_color(segment.lane);
         let (top, height) = match (segment.starts_here, segment.ends_here) {
@@ -1763,13 +1790,15 @@ fn render_graph_lane_canvas(
             (false, true) => (px(0.0), row_h / 2.0),
             (false, false) => (px(0.0), row_h),
         };
+        let lane = segment.lane;
         let mut line = div()
             .absolute()
             .w(px(1.0))
             .left(x)
             .top(top)
             .h(height)
-            .bg(color);
+            .bg(color)
+            .debug_selector(move || format!("graph-row-{row_index}-segment-{lane}"));
         if segment.dashed {
             // GPUI has no dashed-border primitive on a plain rect; approximate with a lighter,
             // narrower fill rather than a solid line, so it still reads as visually distinct.
@@ -2916,6 +2945,87 @@ mod graph_elbow_render_tests {
             (elbow_bounds.size.width - expected_width).abs() < px(0.5),
             "elbow width was {:?}, expected {expected_width:?}",
             elbow_bounds.size.width
+        );
+    }
+
+    /// Real regression for a real user report against the two tests above: "the vertical lines
+    /// are going too far at the end and at the start" - a lane that starts (or ends) here *and*
+    /// has a real elbow at this same row was getting both a plain `starts_here`/`ends_here` stub
+    /// *and* the elbow's own vertical stroke painted over the exact same pixels, at the exact
+    /// same x - not visually distinguishable from one continuous line running further than it
+    /// should. Reuses the same real Diverging-merge fixture as the test above: lane 1 both
+    /// `starts_here` at the merge row (a real `new_lane_segments` push, `layout_lanes` Step 4)
+    /// and has a real Diverging elbow (`to_lane: 1`) there - the plain segment for lane 1 must
+    /// not be painted at all once the elbow already covers it.
+    #[gpui::test]
+    fn a_lane_with_a_diverging_elbow_does_not_also_paint_a_plain_starts_here_stub(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded(cx, |dir| {
+            init_repo(dir);
+            commit_at(dir, "base.txt", "1", "base", 1_700_000_000);
+            git(dir, &["checkout", "-b", "feature"]);
+            commit_at(dir, "feature.txt", "1", "feature work", 1_700_000_100);
+            git(dir, &["checkout", "main"]);
+            let date = "1700000200 +0000";
+            let output = std::process::Command::new("git")
+                .current_dir(dir)
+                .args([
+                    "merge",
+                    "--no-ff",
+                    "feature",
+                    "-m",
+                    "Merge branch 'feature'",
+                ])
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .output()
+                .expect("failed to spawn git merge");
+            assert!(output.status.success());
+        });
+
+        let merge_row_index = app.read_with(cx, |app, _| {
+            let GraphLoadState::Loaded(graph) = &app.graph_state.load else {
+                panic!("graph must have loaded");
+            };
+            graph
+                .rows
+                .iter()
+                .position(|row| row.commit.subject == "Merge branch 'feature'")
+                .expect("merge row present")
+        });
+        let lane_1_starts_here = app.read_with(cx, |app, _| {
+            let GraphLoadState::Loaded(graph) = &app.graph_state.load else {
+                panic!("graph must have loaded");
+            };
+            graph.rows[merge_row_index]
+                .lane_segments
+                .iter()
+                .any(|s| s.lane == 1 && s.starts_here)
+        });
+        assert!(
+            lane_1_starts_here,
+            "sanity check: lane 1 must really start_here at the merge row, or this test would \
+             pass for the wrong reason"
+        );
+
+        let selector: &'static str =
+            Box::leak(format!("graph-row-{merge_row_index}-segment-1").into_boxed_str());
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "a plain starts_here stub for lane 1 must not be painted at all once its Diverging \
+             elbow already covers that exact same span - painting both doubles up on the same \
+             pixels, which is exactly the reported \"line goes too far\" bug"
+        );
+
+        // The elbow itself must still be there - this isn't testing that lane 1 lost its
+        // connection entirely, only that it's represented once, not twice.
+        let elbow_selector: &'static str =
+            Box::leak(format!("graph-row-{merge_row_index}-elbow-0-diverging").into_boxed_str());
+        assert!(
+            cx.debug_bounds(elbow_selector).is_some(),
+            "the Diverging elbow itself must still be painted - lane 1's connection must not be \
+             lost, only de-duplicated"
         );
     }
 }
