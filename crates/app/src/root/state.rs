@@ -159,7 +159,8 @@ impl AdeApp {
             file_tree_bounds: gpui::Bounds::default(),
             _tree_delete_task: None,
             _tree_copy_task: None,
-            reviewed_files: HashSet::new(),
+            staged_files: HashSet::new(),
+            commit_menu_open: false,
             open_files_by_worktree: HashMap::new(),
             open_change: None,
             close_tab_confirm_armed: None,
@@ -615,8 +616,12 @@ impl AdeApp {
         // `Self::request_prune`'s docs.
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
+        // Same reasoning for the commit composer's own split-button popover (Revision R12 §5) -
+        // it targets the *previously* selected worktree's staged set, so it must not stay open
+        // pointed at the wrong one.
+        self.commit_menu_open = false;
         // Reset per-worktree UI state (see `reset_per_worktree_ui_state`'s docs) so switching
-        // worktrees never leaks a "reviewed" checkbox, open diff, or collapsed-dir entry from
+        // worktrees never leaks a staged checkbox, open diff, or collapsed-dir entry from
         // the worktree just left. Deliberately runs *before* the focus-fallback block below: both
         // `focus_newly_spawned_agent` and the `filter_focus_handle` fallback branch on
         // `self.open_change`, and until this call runs, `open_change` can still reflect the
@@ -626,7 +631,7 @@ impl AdeApp {
         // `Window::focus` dangling on `code_focus_handle` once `open_change` was cleared one
         // statement later.
         reset_per_worktree_ui_state(
-            &mut self.reviewed_files,
+            &mut self.staged_files,
             &mut self.open_change,
             &mut self.expanded_dirs,
             &mut self.selected_tree_path,
@@ -900,11 +905,11 @@ impl AdeApp {
 }
 
 /// Clears every piece of per-worktree UI state that would otherwise survive a worktree switch -
-/// called from [`AdeApp::select_worktree`] on every switch. `reviewed_files`/`open_change` are
-/// keyed by repo-relative paths with no per-worktree scoping of their own, so without this reset
-/// a file reviewed or opened in worktree A would read as already-reviewed (or reopen) in worktree
-/// B if it shares the same relative path. `expanded_dirs` is keyed by absolute path, so it
-/// doesn't bleed the same way - but it must still be emptied here, because
+/// called from [`AdeApp::select_worktree`] on every switch. `open_change` is keyed by
+/// repo-relative paths with no per-worktree scoping of its own, so without this reset a file
+/// opened in worktree A would reopen in worktree B if it shares the same relative path.
+/// `expanded_dirs` is keyed by absolute path, so it doesn't bleed the same way - but it must
+/// still be emptied here, because
 /// [`AdeApp::select_worktree`] re-derives it from the *new* worktree's own persisted fold state
 /// immediately afterwards, and a leftover entry from the worktree just left would otherwise
 /// survive that (its absolute path simply never matches anything in the new tree, so nothing
@@ -923,12 +928,12 @@ impl AdeApp {
 /// makes the old worktree's entries stop being "current" - nothing here needs to delete them, and
 /// deleting them would be exactly the silent data loss this revision set out to fix.
 pub(super) fn reset_per_worktree_ui_state(
-    reviewed_files: &mut HashSet<PathBuf>,
+    staged_files: &mut HashSet<PathBuf>,
     open_change: &mut Option<PathBuf>,
     expanded_dirs: &mut HashSet<PathBuf>,
     selected_tree_path: &mut Option<PathBuf>,
 ) {
-    reviewed_files.clear();
+    staged_files.clear();
     *open_change = None;
     expanded_dirs.clear();
     *selected_tree_path = None;
@@ -939,47 +944,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reset_per_worktree_ui_state_clears_reviewed_files_and_open_change() {
-        let mut reviewed_files = HashSet::new();
-        reviewed_files.insert(PathBuf::from("src/main.rs"));
-        reviewed_files.insert(PathBuf::from("Cargo.toml"));
+    fn reset_per_worktree_ui_state_clears_staged_files_and_open_change() {
+        let mut staged_files = HashSet::new();
+        staged_files.insert(PathBuf::from("src/main.rs"));
+        staged_files.insert(PathBuf::from("Cargo.toml"));
         let mut open_change = Some(PathBuf::from("src/main.rs"));
         let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
 
         reset_per_worktree_ui_state(
-            &mut reviewed_files,
+            &mut staged_files,
             &mut open_change,
             &mut expanded_dirs,
             &mut selected_tree_path,
         );
 
-        assert!(reviewed_files.is_empty());
+        assert!(staged_files.is_empty());
         assert_eq!(open_change, None);
     }
 
     #[test]
     fn reset_per_worktree_ui_state_is_a_no_op_when_already_empty() {
-        let mut reviewed_files = HashSet::new();
+        let mut staged_files = HashSet::new();
         let mut open_change = None;
         let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
 
         reset_per_worktree_ui_state(
-            &mut reviewed_files,
+            &mut staged_files,
             &mut open_change,
             &mut expanded_dirs,
             &mut selected_tree_path,
         );
 
-        assert!(reviewed_files.is_empty());
+        assert!(staged_files.is_empty());
         assert_eq!(open_change, None);
         assert!(expanded_dirs.is_empty());
     }
 
     #[test]
     fn reset_per_worktree_ui_state_clears_expanded_dirs_too() {
-        let mut reviewed_files = HashSet::new();
+        let mut staged_files = HashSet::new();
         let mut open_change = None;
         let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
@@ -987,7 +992,7 @@ mod tests {
         expanded_dirs.insert(PathBuf::from("/repo/worktree-a/tests"));
 
         reset_per_worktree_ui_state(
-            &mut reviewed_files,
+            &mut staged_files,
             &mut open_change,
             &mut expanded_dirs,
             &mut selected_tree_path,
@@ -998,13 +1003,13 @@ mod tests {
 
     #[test]
     fn reset_per_worktree_ui_state_clears_selected_tree_path() {
-        let mut reviewed_files = HashSet::new();
+        let mut staged_files = HashSet::new();
         let mut open_change = None;
         let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = Some(PathBuf::from("/repo/worktree-a/src/main.rs"));
 
         reset_per_worktree_ui_state(
-            &mut reviewed_files,
+            &mut staged_files,
             &mut open_change,
             &mut expanded_dirs,
             &mut selected_tree_path,

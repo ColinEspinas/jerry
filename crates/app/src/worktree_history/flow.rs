@@ -1,31 +1,56 @@
 //! Real backing for the work surface footer's `Keep all`/`Discard worktree` buttons
-//! ([`work_surface::ActionKind::KeepAllChanges`]/[`work_surface::ActionKind::DiscardWorktree`]).
+//! ([`work_surface::ActionKind::KeepAllChanges`]/[`work_surface::ActionKind::DiscardWorktree`])
+//! and, since Revision R12 §5, the Changes panel commit composer's "commit staged files"
+//! (`crate::sidebar::render::AdeApp::commit_staged_files`).
 //!
-//! ## One in-flight flag for both operations
+//! ## One in-flight flag for all three operations
 //!
-//! [`AdeApp::worktree_history_op_in_flight`] serializes "keep all changes" and "discard
-//! worktree": a click for either while the flag is `true` is a no-op, mirroring
-//! [`AdeApp::prune_in_flight`]'s own single-flag-per-feature precedent (`crate::rail::render`).
-//! Every completion handler still only mutates [`AdeApp`] state from inside
-//! `this.update`/`this.update_in`, after its real `wt_core::undo::*` call has actually resolved,
-//! matching every other real git-backed action in this app.
+//! [`AdeApp::worktree_history_op_in_flight`] serializes "keep all changes", "discard worktree",
+//! and "commit staged files": a click for any of the three while the flag is `true` is a no-op,
+//! mirroring [`AdeApp::prune_in_flight`]'s own single-flag-per-feature precedent
+//! (`crate::rail::render`). Every completion handler still only mutates [`AdeApp`] state from
+//! inside `this.update`/`this.update_in`, after its real `wt_core::undo::*` call has actually
+//! resolved, matching every other real git-backed action in this app.
+//!
+//! `commit_staged_files` is real (`wt_core::undo::commit_paths`: a real `git add -- <paths>` +
+//! `git commit`), and, like `Keep`/`Discard`, has no undo integration - this project's
+//! worktree-level undo/redo action was removed outright (GitHub issue #47), not merely left
+//! unwired here.
 
 use super::*;
 
-/// Which of the two real, mutually-exclusive-in-flight operations
+/// Which of the three real, mutually-exclusive-in-flight operations
 /// [`AdeApp::worktree_history_op_in_flight`] currently names - see that field's own docs for why
 /// this is a real, named kind rather than a bare `bool`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorktreeHistoryOpKind {
     Keep,
     Discard,
+    /// The Changes panel commit composer's "commit staged files" (Revision R12 §5) -
+    /// `crate::sidebar::render::AdeApp::commit_staged_files`.
+    Commit,
+}
+
+/// Whether `a` and `b` refer to the same real path, canonicalizing both sides first - mirrors
+/// `wt_core::undo::is_main_worktree`'s own canonicalization (see its docs) so a relative,
+/// symlinked, or otherwise differently-spelled path still matches correctly rather than silently
+/// failing closed. Falls back to a raw comparison if either side can't be canonicalized (e.g. it
+/// no longer exists) - the same fallback `is_main_worktree` itself uses.
+fn canonical_paths_match(a: &Path, b: &Path) -> bool {
+    let a_canon = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
+    let b_canon = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+    a_canon == b_canon
 }
 
 impl AdeApp {
-    /// Looks up worktree `path`'s branch name for display (status-line text) - falls back to the
-    /// path itself if the worktree list doesn't (yet, or any more) have an entry for it.
-    /// Display-only: never consulted by a real `wt_core::undo::*` call.
-    fn branch_display_for(&self, path: &Path) -> String {
+    /// Looks up worktree `path`'s branch name for display (History/status-line text) - falls
+    /// back to the path itself if the worktree list doesn't (yet, or any more) have an entry for
+    /// it. Display-only: never consulted by a real `wt_core::undo::*` call.
+    ///
+    /// `pub(crate)`, not private: `crate::sidebar::render::AdeApp::commit_staged_files` (Revision
+    /// R12 §5's commit composer) reuses this same lookup for its own status-line text rather than
+    /// duplicating it.
+    pub(crate) fn branch_display_for(&self, path: &Path) -> String {
         self.worktrees
             .iter()
             .find(|item| item.path == path)
