@@ -153,6 +153,12 @@ impl AdeApp {
         if self.settings_open {
             self.close_settings(window, cx);
         }
+        // The git graph tab, if showing, replaces this exact centre-pane slot (`Self::
+        // render_center_pane`'s own `graph_tab_active` check) - leaving it *before*
+        // `focus_code_surface` below moves real keyboard focus off `graph_focus_handle` first, so
+        // its own `code_focus.capture()` never captures a handle that's about to stop being
+        // rendered. See `crate::graph_view::render::AdeApp::leave_graph_tab`'s own docs.
+        self.leave_graph_tab(window, cx);
         self.focus_code_surface(window, cx);
         self.push_open_file(&relative);
         self.open_change = Some(relative);
@@ -260,6 +266,9 @@ impl AdeApp {
             return;
         }
 
+        // See `Self::open_and_focus_file`'s identical call for why this must run before
+        // `focus_code_surface` below.
+        self.leave_graph_tab(window, cx);
         self.focus_code_surface(window, cx);
         let has_diff = self
             .current_diff()

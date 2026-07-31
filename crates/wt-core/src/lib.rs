@@ -22,6 +22,7 @@
 pub mod blame;
 pub mod diff;
 mod error;
+pub mod graph;
 pub mod merge;
 pub mod stage;
 pub mod undo;

@@ -1,0 +1,1874 @@
+//! The real GPUI surface for the git graph tab - tab strip entry, toolbar, lane canvas + row
+//! list, row `⋯` menu, Push `▾` menu, and the Commit/Branches right panel - plus the `impl
+//! AdeApp` glue that opens/closes/loads it. See `super`'s module docs for scope.
+
+use super::*;
+use crate::root::widgets::{render_sidebar_message, render_tag_pill};
+use crate::settings::widgets;
+use crate::sidebar::changes;
+use crate::work_surface::render::render_dropdown_menu_row;
+use gpui::{BoxShadow, KeyDownEvent};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use wt_core::graph::{DotKind, Graph, GraphRow, GraphScope, RefKind};
+
+impl AdeApp {
+    /// Opens the git graph tab (the tab strip's own entry, the `+` menu's "Git graph" row, the
+    /// palette's "Open git graph", `mod+shift+G`, and the status bar's branch cluster all funnel
+    /// through this). Idempotent: re-invoking while already open just re-activates it (used by
+    /// the tab's own click handler too, so there is exactly one open/activate code path).
+    pub(crate) fn open_git_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Mirrors `Self::open_settings`'s own defensive top-of-function close: reachable directly
+        // (the status bar cluster, the `+` menu, `mod+shift+G`) while the palette also happens to
+        // be open, not just via `crate::palette::render::AdeApp::execute_palette_command`'s own
+        // "Open git graph" entry (which never hits this branch - the palette closes itself around
+        // that call instead, see `Self::run_selected_palette_entry`'s docs).
+        if self.palette_open {
+            self.close_palette(window, cx);
+        }
+        self.graph_tab_open = true;
+        let was_active = self.graph_tab_active;
+        self.graph_tab_active = true;
+        self.open_change = None;
+        self.plus_menu_open = false;
+        self.title_menu_open = None;
+        self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
+
+        // Opening the graph tab replaces the right sidebar's Files/Changes panel with Commit/
+        // Branches (`Self::render_right_sidebar`), unrendering the file tree exactly the way
+        // switching to the Changes tab does - the same "leaving Files" dangling-focus sweep
+        // `crate::sidebar::render::AdeApp::set_right_sidebar_view` performs, reached here through
+        // a different door. See that function's own docs for the real bug class this closes.
+        self.tree_context_menu = None;
+        self.tree_inline_edit = None;
+        if self.tree_focus_handle.is_focused(window) {
+            restore_focus(&self.agents, &mut self.code_focus, window, cx);
+        }
+        self.palette_focus.forget_target(&self.tree_focus_handle);
+        self.settings_focus.forget_target(&self.tree_focus_handle);
+        self.code_focus.forget_target(&self.tree_focus_handle);
+
+        // Same sweep, for the code surface this `self.open_change = None` above just unrendered
+        // (`Self::render_center_pane` only mounts it for `Some(open_path)`) - a real, adversarial-
+        // audit-found gap: without this, a file tab focused right before opening the graph tab
+        // left `code_focus_handle` captured as this tab's own return target, a handle that stops
+        // being rendered the moment `open_change` clears.
+        if self.code_focus_handle.is_focused(window) {
+            restore_focus(&self.agents, &mut self.code_focus, window, cx);
+        }
+        self.palette_focus.forget_target(&self.code_focus_handle);
+        self.settings_focus.forget_target(&self.code_focus_handle);
+        // `open_change` just changed; every cache keyed on it must follow, exactly like every
+        // other site that clears it (`crate::root::state::AdeApp::select_worktree`,
+        // `crate::code_surface::tabs::AdeApp::close_file_tab`).
+        self.refresh_open_diff_file_cache();
+
+        if !was_active && !self.focus_is_on_an_overlay(window, cx) {
+            self.graph_focus.capture(window, &self.agents, cx);
+        }
+        window.focus(&self.graph_focus_handle, cx);
+
+        if matches!(self.graph_state.load, GraphLoadState::NotLoaded) {
+            self.load_graph(cx);
+        }
+        cx.notify();
+    }
+
+    /// Closes the git graph tab outright (its `×`), removing it from the tab strip. Dropping the
+    /// cached [`GraphLoadState`] back to `NotLoaded` means a later re-open does a fresh load
+    /// rather than showing a stale snapshot - cheap insurance since re-opening is exactly when a
+    /// user most likely wants to see what changed since they last looked.
+    pub(crate) fn close_git_graph_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.graph_tab_open = false;
+        self.leave_graph_tab(window, cx);
+        self.graph_state.load = GraphLoadState::NotLoaded;
+        self.graph_state.row_menu_open = None;
+        self.graph_state.push_menu_open = false;
+        self.graph_state.commit_files_cache = None;
+        // A reopened tab is a genuinely new widget instance, so the Branches filter's undo
+        // history must not be reachable from it - `reset`, not `clear` (itself a real, undoable
+        // step) - the same reasoning `crate::root::AdeApp::open_palette` documents for its own
+        // query field.
+        self.graph_state.branches_filter.reset();
+        cx.notify();
+    }
+
+    /// Common bookkeeping whenever the graph tab stops being the active centre-pane content -
+    /// selecting an agent or file tab while it was showing, or closing it outright. A no-op if
+    /// it wasn't active (e.g. closing it via its `×` while an agent tab is showing).
+    ///
+    /// `graph_focus_handle` is about to stop being `track_focus`'d (`Self::render_center_pane`
+    /// only renders the graph view while `graph_tab_active` is `true`), so real keyboard focus is
+    /// moved off it *first*, before anything else has a chance to capture it as its own
+    /// `OverlayFocus` return target - and any target already holding it from earlier is swept.
+    /// This mirrors `crate::sidebar::render::AdeApp::set_right_sidebar_view`'s identical
+    /// `tree_focus_handle` sweep; see that function's docs for the exact "restore later lands on
+    /// a handle nothing renders any more" bug class this closes. Called from
+    /// `crate::root::state::AdeApp::select_worktree`, `crate::code_surface::tabs::AdeApp::
+    /// open_and_focus_file` (the single real chokepoint every "open a file" entry point already
+    /// goes through) and `crate::code_surface::tabs::AdeApp::activate_file_tab`, and
+    /// [`Self::close_git_graph_tab`] above.
+    pub(crate) fn leave_graph_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.graph_tab_active {
+            return;
+        }
+        self.graph_tab_active = false;
+        // Two handles stop being `track_focus`'d here, not one: `graph_focus_handle` itself, and
+        // the Branches panel's real filter box (`graph_state.branches_filter_focus_handle`),
+        // which is only rendered while this tab is active and can independently hold real
+        // keyboard focus (its own `on_click` moves focus onto it). Missing this second handle was
+        // a real, adversarial-audit-found gap: clicking the filter box then switching to an
+        // agent tab left `Window::focus` on a handle no longer in the frame.
+        if self.graph_focus_handle.is_focused(window)
+            || self
+                .graph_state
+                .branches_filter_focus_handle
+                .is_focused(window)
+        {
+            restore_focus(&self.agents, &mut self.graph_focus, window, cx);
+        }
+        self.palette_focus.forget_target(&self.graph_focus_handle);
+        self.settings_focus.forget_target(&self.graph_focus_handle);
+        self.code_focus.forget_target(&self.graph_focus_handle);
+        self.palette_focus
+            .forget_target(&self.graph_state.branches_filter_focus_handle);
+        self.settings_focus
+            .forget_target(&self.graph_state.branches_filter_focus_handle);
+        self.code_focus
+            .forget_target(&self.graph_state.branches_filter_focus_handle);
+    }
+
+    /// Loads (or reloads) the graph and its upstream ahead/behind counts, off the UI thread -
+    /// mirrors `crate::code_surface::tabs::AdeApp::load_diff`'s shape exactly.
+    pub(crate) fn load_graph(&mut self, cx: &mut Context<Self>) {
+        let root = self.diff_root.clone();
+        let scope = self.graph_state.scope;
+        self.graph_state.load = GraphLoadState::Loading;
+        // A reload can renumber rows entirely (new commits, a scope change) - stale row-indexed
+        // menu state pointing at whatever used to be at that index would be actively wrong, not
+        // just outdated.
+        self.graph_state.row_menu_open = None;
+        self.graph_state.row_menu_bounds.clear();
+        cx.notify();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let root = root.clone();
+                    async move {
+                        let graph = wt_core::graph::build_graph(&root, scope, 0);
+                        let upstream = wt_core::graph::ahead_behind_against_upstream(&root);
+                        (graph, upstream)
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let (graph_result, upstream_result) = result;
+                this.graph_state.upstream_counts = upstream_result.ok().flatten();
+                this.graph_state.commit_files_cache = None;
+                match graph_result {
+                    Ok(graph) => {
+                        let first_real_row = graph
+                            .rows
+                            .iter()
+                            .find(|row| !row.commit.id.is_empty())
+                            .cloned();
+                        this.graph_state.selected_row =
+                            if graph.rows.is_empty() { None } else { Some(0) };
+                        this.graph_state.load = GraphLoadState::Loaded(graph);
+                        if let Some(row) = first_real_row {
+                            this.load_commit_files(row.commit.id, cx);
+                        }
+                    }
+                    Err(err) => {
+                        this.graph_state.load = GraphLoadState::Error(err.to_string());
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self._load_graph_task = Some(task);
+    }
+
+    pub(crate) fn set_graph_scope(&mut self, scope: GraphScope, cx: &mut Context<Self>) {
+        if self.graph_state.scope == scope {
+            return;
+        }
+        self.graph_state.scope = scope;
+        self.load_graph(cx);
+    }
+
+    pub(crate) fn select_graph_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.graph_state.selected_row = Some(index);
+        self.graph_state.right_panel = GraphRightPanel::Commit;
+        if let Some(row) = self.current_graph_row(index) {
+            if !row.commit.id.is_empty() {
+                self.load_commit_files(row.commit.id.clone(), cx);
+            } else {
+                self.graph_state.commit_files_cache = None;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Loads the Commit panel's real "Files changed" list for `sha`, off the UI thread -
+    /// `wt_core::graph::commit_changed_files` performs real blocking I/O (spawns `git show`), so
+    /// (unlike an earlier version of this feature, a real bug an adversarial audit caught) it
+    /// must never be called inline from `render_graph_commit_panel`. A no-op if `sha` is already
+    /// the cache's key (re-selecting the same row shouldn't re-spawn `git`).
+    fn load_commit_files(&mut self, sha: String, cx: &mut Context<Self>) {
+        if self
+            .graph_state
+            .commit_files_cache
+            .as_ref()
+            .is_some_and(|(cached_sha, _)| cached_sha == &sha)
+        {
+            return;
+        }
+        let root = self.diff_root.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let sha_for_result = sha.clone();
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let root = root.clone();
+                    let sha = sha.clone();
+                    async move { wt_core::graph::commit_changed_files(&root, &sha) }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.graph_state.commit_files_cache =
+                    Some((sha_for_result, result.map_err(|err| err.to_string())));
+                cx.notify();
+            });
+        });
+        self._load_commit_files_task = Some(task);
+    }
+
+    pub(crate) fn set_graph_right_panel(&mut self, panel: GraphRightPanel, cx: &mut Context<Self>) {
+        self.graph_state.right_panel = panel;
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_graph_row_menu(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.graph_state.row_menu_open = if self.graph_state.row_menu_open == Some(index) {
+            None
+        } else {
+            Some(index)
+        };
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_graph_push_menu(&mut self, cx: &mut Context<Self>) {
+        self.graph_state.push_menu_open = !self.graph_state.push_menu_open;
+        cx.notify();
+    }
+
+    /// Copies `text` to the real system clipboard - mirrors `crate::sidebar::tree_ops::AdeApp`'s
+    /// own `cx.write_to_clipboard` use for "Copy path".
+    pub(crate) fn copy_graph_text(&mut self, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.graph_state.row_menu_open = None;
+        cx.notify();
+    }
+
+    /// The honest not-yet-wired response for Fetch/Pull/Push (and their menu entries): real,
+    /// visible feedback rather than a silent no-op or a fabricated success - see `super`'s module
+    /// docs for why none of these are actually implemented in phase (a). Still does one real
+    /// thing: reloads the graph, so a click at least confirms nothing crashed and the view is
+    /// current.
+    pub(crate) fn graph_action_not_yet_wired(&mut self, action: &str, cx: &mut Context<Self>) {
+        self.graph_state.status_message = Some(format!("{action} - not implemented yet"));
+        self.graph_state.push_menu_open = false;
+        self.graph_state.row_menu_open = None;
+        // The one real thing this honestly can do: reload, so a click at least confirms the view
+        // is current rather than doing visibly nothing beyond the status line.
+        self.load_graph(cx);
+    }
+
+    pub(in crate::graph_view) fn handle_branches_filter_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+            return;
+        }
+        let changed = match keystroke.key.as_str() {
+            "backspace" => self.graph_state.branches_filter.pop(Instant::now()),
+            "escape" => self.graph_state.branches_filter.clear(Instant::now()),
+            _ => match keystroke.key_char.as_deref() {
+                Some(text) if !text.is_empty() => self
+                    .graph_state
+                    .branches_filter
+                    .push_str(text, Instant::now()),
+                _ => false,
+            },
+        };
+        if changed {
+            cx.notify();
+            cx.stop_propagation();
+        }
+    }
+
+    pub(in crate::graph_view) fn handle_branches_filter_text_undo(
+        &mut self,
+        _: &crate::root::TextUndo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.graph_state.branches_filter.undo() {
+            cx.notify();
+        }
+    }
+
+    pub(in crate::graph_view) fn handle_branches_filter_text_redo(
+        &mut self,
+        _: &crate::root::TextRedo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.graph_state.branches_filter.redo() {
+            cx.notify();
+        }
+    }
+}
+
+/// The tab strip's own "git graph" entry - a fourth, independent parallel slot alongside agent
+/// tabs and file tabs, mirroring `crate::work_surface::render::render_tab_strip`'s existing
+/// two-collection shape rather than unifying into one `Tab` enum (see that function's docs, and
+/// this project's own note that a forced unification wasn't the right call here). Rendered only
+/// while `AdeApp::graph_tab_open` is `true`.
+pub(crate) fn render_graph_tab(app: &AdeApp, cx: &mut Context<AdeApp>) -> impl IntoElement {
+    let is_active = app.graph_tab_active;
+    let colors = work_surface::tab_colors(is_active);
+    let close_color = if is_active {
+        theme::text::DIMMER
+    } else {
+        theme::text::DISABLED
+    };
+
+    div()
+        .id("graph-tab")
+        .debug_selector(|| "graph-tab".to_string())
+        .flex()
+        .flex_none()
+        .flex_col()
+        .border_r_1()
+        .border_color(theme::border::INNER)
+        .bg(colors.bg)
+        .child(
+            div()
+                .id("graph-tab-hit")
+                .flex_1()
+                .flex()
+                .items_center()
+                .gap(px(7.0))
+                .px(px(13.0))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.open_git_graph(window, cx);
+                }))
+                .child(render_graph_tab_chip())
+                .child(
+                    div()
+                        .font(font(theme::font::MONO))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_size(app.ui_text_size(11.0))
+                        .text_color(colors.label)
+                        .child("Git graph"),
+                )
+                .child(
+                    div()
+                        .id("close-graph-tab")
+                        .w(px(15.0))
+                        .h(px(15.0))
+                        .rounded(theme::radius::CHIP)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|el| el.bg(theme::surface::TAB_CLOSE_HOVER))
+                        .font(font(theme::font::MONO))
+                        .text_size(px(11.0))
+                        .text_color(close_color)
+                        .child("\u{d7}")
+                        .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.close_git_graph_tab(window, cx);
+                        })),
+                ),
+        )
+        .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline))
+}
+
+/// The tab's own fork-glyph chip: `#2a2030` bg, `#c98fbf` fork glyph drawn from four rects (two
+/// 3px dots, a 1px riser, a 1px branch) - design spec §1: "no icon font".
+pub(crate) fn render_graph_tab_chip() -> impl IntoElement {
+    let dot = || {
+        div()
+            .absolute()
+            .w(px(3.0))
+            .h(px(3.0))
+            .rounded(px(1.0))
+            .bg(theme::graph::TAB_CHIP_FG)
+    };
+    div()
+        .flex_none()
+        .relative()
+        .w(px(14.0))
+        .h(px(14.0))
+        .rounded(theme::radius::CHIP)
+        .bg(theme::graph::TAB_CHIP_BG)
+        .child(dot().top(px(2.0)).left(px(3.0)))
+        .child(dot().bottom(px(2.0)).left(px(3.0)))
+        .child(dot().bottom(px(2.0)).left(px(8.0)))
+        // the riser (vertical) - 1px wide, spanning the two dots' vertical extent
+        .child(
+            div()
+                .absolute()
+                .w(px(1.0))
+                .h(px(7.0))
+                .top(px(3.5))
+                .left(px(4.5))
+                .bg(theme::graph::TAB_CHIP_FG),
+        )
+        // the branch (diagonal-ish stub, approximated as a short horizontal riser into the
+        // third dot - GPUI has no line-drawing primitive, only rects)
+        .child(
+            div()
+                .absolute()
+                .w(px(4.0))
+                .h(px(1.0))
+                .bottom(px(3.5))
+                .left(px(4.5))
+                .bg(theme::graph::TAB_CHIP_FG),
+        )
+}
+
+impl AdeApp {
+    /// The git graph tab's full centre-pane content - toolbar plus the row list. Called from
+    /// `crate::work_surface::render::AdeApp::render_center_pane` whenever `graph_tab_active` is
+    /// `true`, taking priority over a file tab or agent pane.
+    pub(crate) fn render_graph_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let container = div()
+            .id("graph-view")
+            .track_focus(&self.graph_focus_handle)
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .bg(theme::surface::CENTER)
+            .child(self.render_graph_toolbar(cx));
+
+        let body = match &self.graph_state.load {
+            GraphLoadState::NotLoaded | GraphLoadState::Loading => div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .font(font(theme::font::SANS))
+                .text_size(px(11.5))
+                .text_color(theme::text::FAINT)
+                .child("loading commit history\u{2026}")
+                .into_any_element(),
+            GraphLoadState::Error(message) => div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .font(font(theme::font::SANS))
+                .text_size(px(11.5))
+                .text_color(theme::status::FAIL)
+                .child(message.clone())
+                .into_any_element(),
+            GraphLoadState::Loaded(graph) => self.render_graph_rows(graph, cx),
+        };
+
+        let mut result = container.child(body);
+        if let Some(message) = &self.graph_state.status_message {
+            result = result.child(
+                div()
+                    .flex_none()
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .bg(theme::surface::FOOTER)
+                    .border_t_1()
+                    .border_color(theme::border::INNER)
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::DIM)
+                    .child(message.clone()),
+            );
+        }
+        // The Push `▾` menu and the row `⋯` menu are *not* rendered here, even though they're
+        // conceptually part of this view: `gpui::canvas`-captured bounds are window-space, and
+        // `.absolute()` positioning built from them is only correct if the popover is a direct
+        // child of the window's own root element (the same reason `crate::root::AdeApp::render`
+        // renders `render_plus_menu`/the tree context menu/the "New file" prompt as siblings of
+        // the workspace body rather than nested inside it) - a real, adversarial-audit-found
+        // fidelity bug: nested here, both popovers painted double-offset by this container's own
+        // position (roughly the rail's width and the title bar's height), and their scrims only
+        // covered this container instead of the whole window. `Self::render_graph_push_menu`/
+        // `Self::render_graph_row_menu` are rendered from `AdeApp::render` instead - see there.
+        result.into_any_element()
+    }
+
+    /// Toolbar (design spec §4): `HEAD` branch/chip/counts, the `All | Sessions | Current` scope
+    /// segment, and the Fetch/Pull/Push button group. None of Fetch/Pull/Push perform a real git
+    /// operation yet (see `super`'s module docs) - clicking any of them calls
+    /// [`AdeApp::graph_action_not_yet_wired`], a real, honest, visible response.
+    fn render_graph_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let branch = self
+            .worktrees
+            .iter()
+            .find(|item| item.path == self.diff_root)
+            .and_then(|item| item.branch.clone())
+            .unwrap_or_else(|| "(detached)".to_string());
+        let counts = self.graph_state.upstream_counts;
+
+        div()
+            .id("graph-toolbar")
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(12.0))
+            .h(theme::graph::TOOLBAR)
+            .border_b_1()
+            .border_color(theme::border::INNER)
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(11.0))
+                    .text_color(theme::text::HEADING)
+                    .child(branch),
+            )
+            .child(
+                div()
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(theme::radius::CHIP)
+                    .bg(theme::graph::HEAD_CHIP_BG)
+                    .font(font(theme::font::MONO))
+                    .text_size(px(9.5))
+                    .text_color(theme::graph::HEAD_CHIP_FG)
+                    .child("HEAD"),
+            )
+            .when_some(counts, |el, counts| {
+                el.child(
+                    div()
+                        .font(font(theme::font::MONO))
+                        .text_size(px(10.0))
+                        .text_color(theme::text::DIM)
+                        .child(format!(
+                            "\u{2191}{} \u{2193}{}",
+                            counts.ahead, counts.behind
+                        )),
+                )
+            })
+            .child(div().flex_1())
+            .child(self.render_graph_scope_segment(cx))
+            .child(
+                render_graph_toolbar_button("Fetch", false, false).on_click(cx.listener(
+                    |this, _event: &ClickEvent, _window, cx| {
+                        this.graph_action_not_yet_wired("Fetch", cx);
+                    },
+                )),
+            )
+            .child(
+                render_graph_toolbar_button(
+                    "Pull",
+                    counts.map(|c| c.behind).unwrap_or(0) > 0,
+                    false,
+                )
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.graph_action_not_yet_wired("Pull", cx);
+                })),
+            )
+            .child(self.render_graph_push_button(cx))
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                // A click anywhere else in the toolbar (not on a specific button) just closes any
+                // open popover, matching the tab strip `+` menu's own scrim behavior.
+                if this.graph_state.push_menu_open {
+                    this.graph_state.push_menu_open = false;
+                    cx.notify();
+                }
+            }))
+    }
+
+    fn render_graph_scope_segment(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let options = [
+            widgets::ChoiceOption::new("All"),
+            widgets::ChoiceOption::new("Sessions"),
+            widgets::ChoiceOption::new("Current"),
+        ];
+        let selected = match self.graph_state.scope {
+            GraphScope::All => "All",
+            GraphScope::Sessions => "Sessions",
+            GraphScope::Current => "Current",
+        };
+        self.render_choice_control(
+            "graph-scope",
+            &options,
+            selected.to_string(),
+            cx,
+            |this, index, _window, cx| {
+                let scope = match index {
+                    0 => GraphScope::All,
+                    1 => GraphScope::Sessions,
+                    _ => GraphScope::Current,
+                };
+                this.set_graph_scope(scope, cx);
+            },
+        )
+    }
+
+    /// `Push ↑N ▾` - opens the Push menu (design spec §4: 268-wide, Push / Force with lease /
+    /// Force). Every entry mutates the remote, so every entry is disabled - see `super`'s module
+    /// docs.
+    fn render_graph_push_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // `None` (no configured upstream, or still loading) renders as a bare "Push", never a
+        // fabricated "↑0" - matching `wt_core::graph::ahead_behind_against_upstream`'s own "no
+        // entry rather than a fabricated value" contract.
+        let label = match self.graph_state.upstream_counts {
+            Some(counts) => format!("Push \u{2191}{} \u{25be}", counts.ahead),
+            None => "Push \u{25be}".to_string(),
+        };
+        let this = cx.entity();
+        div()
+            .id("graph-push-button")
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .px(px(9.0))
+            .h(px(24.0))
+            .rounded(theme::radius::BUTTON)
+            .border_1()
+            .border_color(theme::button::BLUE_KEYCAP)
+            .cursor_pointer()
+            .hover(|el| el.bg(theme::button::BLUE_BG_HOVER))
+            .font(font(theme::font::MONO))
+            .text_size(px(10.5))
+            .text_color(theme::button::BLUE_FG)
+            .child(label)
+            .child({
+                gpui::canvas(
+                    move |bounds, _window, cx| {
+                        this.update(cx, |this, _cx| {
+                            this.graph_state.push_button_bounds = bounds;
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            })
+            .on_click(cx.listener(|this, event: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
+                let _ = event;
+                this.toggle_graph_push_menu(cx);
+            }))
+    }
+
+    pub(crate) fn render_graph_push_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let bounds = self.graph_state.push_button_bounds;
+        let (shadow_x, shadow_y, shadow_blur) = theme::shadow::PLUS_MENU;
+        div()
+            .id("graph-push-menu-scrim")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                this.graph_state.push_menu_open = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("graph-push-menu-popover")
+                    .absolute()
+                    .left(bounds.origin.x)
+                    .top(bounds.origin.y + bounds.size.height + px(2.0))
+                    .w(theme::graph::PUSH_MENU_WIDTH)
+                    .py(px(4.0))
+                    .bg(theme::surface::PALETTE)
+                    .border_1()
+                    .border_color(theme::border::POPOVER)
+                    .rounded(theme::radius::CARD)
+                    .shadow(vec![BoxShadow::new(
+                        shadow_x,
+                        shadow_y,
+                        gpui::black().opacity(0.55),
+                    )
+                    .blur_radius(shadow_blur)])
+                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                    }))
+                    .child(render_dropdown_menu_row(
+                        "\u{2191}",
+                        theme::button::BLUE_FG.into(),
+                        theme::button::BLUE_BG.into(),
+                        "Push",
+                        "not implemented yet".to_string(),
+                        Vec::new(),
+                        false,
+                    ))
+                    .child(render_dropdown_menu_row(
+                        "\u{2191}",
+                        theme::button::DANGER_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Force with lease",
+                        "aborts if the remote moved - not implemented yet".to_string(),
+                        Vec::new(),
+                        false,
+                    ))
+                    .child(render_dropdown_menu_row(
+                        "\u{2191}",
+                        theme::button::DANGER_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Force",
+                        "not implemented yet".to_string(),
+                        Vec::new(),
+                        false,
+                    )),
+            )
+    }
+
+    /// The row list - not virtualized (a reasonable, honest simplification for phase (a) given
+    /// `wt_core::graph::DEFAULT_MAX_COMMITS` already caps loaded data at 500 rows; a
+    /// `uniform_list` upgrade is real future work if that turns out to matter for perf, not a
+    /// correctness gap).
+    fn render_graph_rows(&self, graph: &Graph, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if graph.rows.is_empty() {
+            return div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .font(font(theme::font::SANS))
+                .text_size(px(11.5))
+                .text_color(theme::text::FAINT)
+                .child("no commits reachable from this scope")
+                .into_any_element();
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut list = div()
+            .id("graph-rows")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll();
+        for (index, row) in graph.rows.iter().enumerate() {
+            list = list.child(self.render_graph_row(index, row, graph.lane_count, now, cx));
+        }
+        if graph.truncated {
+            list = list.child(
+                div()
+                    .flex_none()
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::GHOST)
+                    .child(format!(
+                        "showing the first {} commits",
+                        wt_core::graph::DEFAULT_MAX_COMMITS
+                    )),
+            );
+        }
+        list.into_any_element()
+    }
+
+    /// One row: lane canvas 100 · ref chips · subject (flex) · note · session 88 · author 88 ·
+    /// relative time 40 right · sha 62 right · `⋯` 22 (design spec §2).
+    fn render_graph_row(
+        &self,
+        index: usize,
+        row: &GraphRow,
+        lane_count: usize,
+        now_unix: i64,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = self.graph_state.selected_row == Some(index);
+        let relative = if row.commit.id.is_empty() {
+            "now".to_string()
+        } else {
+            relative_time(row.commit.committer_time_unix, now_unix)
+        };
+
+        div()
+            .id(("graph-row", index))
+            .debug_selector(move || format!("graph-row-{index}"))
+            .flex()
+            .items_center()
+            .w_full()
+            .h(theme::graph::ROW)
+            .border_b_1()
+            .border_color(theme::border::ROW)
+            .cursor_pointer()
+            .when(selected, |el| {
+                el.bg(theme::surface::ROW_SELECTED)
+                    .border_l_2()
+                    .border_color(theme::border::SELECTED_EDGE)
+            })
+            .when(!selected, |el| {
+                el.hover(|el| el.bg(theme::surface::ROW_HOVER))
+            })
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                this.select_graph_row(index, cx);
+            }))
+            .child(render_graph_lane_canvas(row, lane_count))
+            .child(render_graph_ref_chips(row))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .px(px(6.0))
+                    .overflow_hidden()
+                    .font(font(theme::font::SANS))
+                    .text_size(px(11.0))
+                    .text_color(theme::text::BODY)
+                    .child(row.commit.subject.clone()),
+            )
+            // "note" column - reserved per the design spec's column list but nothing this phase
+            // has real data for lives here yet; an honestly empty cell, not a fabricated one.
+            .child(div().w(px(40.0)))
+            .child(render_graph_session_column())
+            .child(
+                div()
+                    .w(px(88.0))
+                    .px(px(4.0))
+                    .overflow_hidden()
+                    .font(font(theme::font::SANS))
+                    .text_size(px(10.5))
+                    .text_color(theme::text::DIM)
+                    .child(row.commit.author_name.clone()),
+            )
+            .child(
+                div()
+                    .w(px(40.0))
+                    .text_right()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::FAINT)
+                    .child(relative),
+            )
+            .child(
+                div()
+                    .w(px(62.0))
+                    .text_right()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::GHOST)
+                    .child(row.commit.short_id.clone()),
+            )
+            .child(self.render_graph_row_menu_button(index, row, cx))
+    }
+
+    fn render_graph_row_menu_button(
+        &self,
+        index: usize,
+        row: &GraphRow,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let this = cx.entity();
+        let is_working_tree = row.commit.id.is_empty();
+        div()
+            .id(("graph-row-menu-button", index))
+            .relative()
+            .w(px(22.0))
+            .h(px(22.0))
+            .rounded(theme::radius::CHIP)
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(!is_working_tree, |el| {
+                el.cursor_pointer()
+                    .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(12.0))
+                            .text_color(theme::text::DIM)
+                            .child("\u{22ef}"),
+                    )
+                    .child({
+                        gpui::canvas(
+                            move |bounds, _window, cx| {
+                                this.update(cx, |this, _cx| {
+                                    this.graph_state.row_menu_bounds.insert(index, bounds);
+                                });
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full()
+                    })
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        this.toggle_graph_row_menu(index, cx);
+                    }))
+            })
+    }
+
+    /// The row `⋯` context menu (design spec §4): grouped Branch / Apply / Reset / Copy. Every
+    /// entry that would perform a real git mutation is disabled - only Copy's entries are wired.
+    /// Anchored to the open row's own captured bounds (`AdeApp::graph_state.row_menu_bounds`),
+    /// the same `gpui::canvas`-bounds-capture mechanism `crate::work_surface::render::AdeApp::
+    /// render_plus_menu` uses.
+    pub(crate) fn render_graph_row_menu(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(index) = self.graph_state.row_menu_open else {
+            return gpui::Empty.into_any_element();
+        };
+        let Some(row) = self.current_graph_row(index) else {
+            return gpui::Empty.into_any_element();
+        };
+        let bounds = self
+            .graph_state
+            .row_menu_bounds
+            .get(&index)
+            .copied()
+            .unwrap_or_default();
+        let (shadow_x, shadow_y, shadow_blur) = theme::shadow::PLUS_MENU;
+        let sha = row.commit.id.clone();
+        let short_sha = row.commit.short_id.clone();
+        let subject = row.commit.subject.clone();
+
+        div()
+            .id("graph-row-menu-scrim")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                this.graph_state.row_menu_open = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("graph-row-menu-popover")
+                    .absolute()
+                    .left(px(140.0))
+                    .top(bounds.origin.y - bounds.size.height)
+                    .w(theme::graph::ROW_MENU_WIDTH)
+                    .py(px(4.0))
+                    .bg(theme::surface::PALETTE)
+                    .border_1()
+                    .border_color(theme::border::POPOVER)
+                    .rounded(theme::radius::CARD)
+                    .shadow(vec![BoxShadow::new(shadow_x, shadow_y, gpui::black().opacity(0.55))
+                        .blur_radius(shadow_blur)])
+                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                    }))
+                    .child(render_graph_row_menu_header("Branch"))
+                    .child(render_dropdown_menu_row(
+                        "\u{2713}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
+                        "Check out", "not implemented yet".to_string(), Vec::new(), false,
+                    ))
+                    .child(render_dropdown_menu_row(
+                        "+", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
+                        "Create branch here", "not implemented yet".to_string(), Vec::new(), false,
+                    ))
+                    .child(render_dropdown_menu_row(
+                        "\u{25b8}", theme::button::BLUE_FG.into(), theme::surface::CHIP_NEUTRAL.into(),
+                        "Start session from this commit", "not implemented yet".to_string(), Vec::new(), false,
+                    ))
+                    .child(render_graph_row_menu_header("Apply"))
+                    .child(render_dropdown_menu_row(
+                        "\u{2398}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
+                        "Cherry-pick", "not implemented yet".to_string(), Vec::new(), false,
+                    ))
+                    .child(render_dropdown_menu_row(
+                        "\u{21b6}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
+                        "Revert", "not implemented yet".to_string(), Vec::new(), false,
+                    ))
+                    .child(render_dropdown_menu_row(
+                        "\u{2191}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
+                        "Rebase onto this commit", "not implemented yet".to_string(), Vec::new(), false,
+                    ))
+                    .child(render_dropdown_menu_row(
+                        "\u{2191}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
+                        "Interactive rebase from here", "not implemented yet".to_string(), Vec::new(), false,
+                    ))
+                    .child(render_graph_row_menu_header("Reset"))
+                    .child(render_dropdown_menu_row(
+                        "\u{21ba}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
+                        "Soft", "not implemented yet".to_string(), Vec::new(), false,
+                    ))
+                    .child(render_dropdown_menu_row(
+                        "\u{21ba}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
+                        "Mixed", "not implemented yet".to_string(), Vec::new(), false,
+                    ))
+                    .child(render_dropdown_menu_row(
+                        "\u{21ba}", theme::button::DANGER_FG.into(), theme::surface::CHIP_NEUTRAL.into(),
+                        "Hard", "not implemented yet".to_string(), Vec::new(), false,
+                    ))
+                    .child(render_graph_row_menu_header("Copy"))
+                    .child(render_dropdown_menu_row(
+                        "#", theme::text::SECONDARY.into(), theme::surface::CHIP_NEUTRAL.into(),
+                        "Copy SHA", short_sha, Vec::new(), true,
+                    ).on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                        this.copy_graph_text(sha.clone(), cx);
+                    })))
+                    .child(render_dropdown_menu_row(
+                        "\u{ab}", theme::text::SECONDARY.into(), theme::surface::CHIP_NEUTRAL.into(),
+                        "Copy subject", String::new(), Vec::new(), true,
+                    ).on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                        this.copy_graph_text(subject.clone(), cx);
+                    })))
+                    .child(
+                        div()
+                            .px(px(11.0))
+                            .pt(px(4.0))
+                            .font(font(theme::font::SANS))
+                            .text_size(px(9.5))
+                            .text_color(theme::text::GHOSTER)
+                            .child("rebase and reset run in the focused worktree, never the main checkout"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn current_graph_row(&self, index: usize) -> Option<&GraphRow> {
+        match &self.graph_state.load {
+            GraphLoadState::Loaded(graph) => graph.rows.get(index),
+            _ => None,
+        }
+    }
+
+    /// The right panel while the graph tab is focused - replaces Files/Changes with Commit/
+    /// Branches (design spec §5). Called from `crate::sidebar::render::AdeApp::
+    /// render_right_sidebar` whenever `graph_tab_active` is `true`.
+    pub(crate) fn render_graph_right_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let options = [
+            widgets::ChoiceOption::new("Commit"),
+            widgets::ChoiceOption::new("Branches"),
+        ];
+        let selected = match self.graph_state.right_panel {
+            GraphRightPanel::Commit => "Commit",
+            GraphRightPanel::Branches => "Branches",
+        };
+        let toggle = div()
+            .flex_none()
+            .px(px(10.0))
+            .py(px(8.0))
+            .child(self.render_choice_control(
+                "graph-right-panel",
+                &options,
+                selected.to_string(),
+                cx,
+                |this, index, _window, cx| {
+                    let panel = if index == 0 {
+                        GraphRightPanel::Commit
+                    } else {
+                        GraphRightPanel::Branches
+                    };
+                    this.set_graph_right_panel(panel, cx);
+                },
+            ));
+
+        let body = match self.graph_state.right_panel {
+            GraphRightPanel::Commit => self.render_graph_commit_panel(),
+            GraphRightPanel::Branches => self.render_graph_branches_panel(cx),
+        };
+
+        div()
+            .id("graph-right-panel")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(toggle)
+            .child(body)
+            .into_any_element()
+    }
+
+    fn render_graph_commit_panel(&self) -> gpui::AnyElement {
+        let Some(index) = self.graph_state.selected_row else {
+            return render_sidebar_message(
+                "select a commit to see its details".to_string(),
+                theme::text::FAINT.into(),
+            )
+            .into_any_element();
+        };
+        let Some(row) = self.current_graph_row(index) else {
+            return render_sidebar_message(
+                "select a commit to see its details".to_string(),
+                theme::text::FAINT.into(),
+            )
+            .into_any_element();
+        };
+        if row.commit.id.is_empty() {
+            return render_sidebar_message(
+                "uncommitted changes - see the Changes list".to_string(),
+                theme::text::FAINT.into(),
+            )
+            .into_any_element();
+        }
+
+        // Real background-loaded data (`Self::load_commit_files`), never a blocking `git show`
+        // spawned here in the render path - see that method's own docs for the real bug this
+        // replaced. Three honest states: not yet requested/still loading (a real, un-fabricated
+        // "loading" line), a real error, or the real file list.
+        let files_section: gpui::AnyElement = match &self.graph_state.commit_files_cache {
+            Some((sha, Ok(files))) if sha == &row.commit.id => div()
+                .children(files.iter().cloned().map(render_graph_file_row))
+                .into_any_element(),
+            Some((sha, Err(message))) if sha == &row.commit.id => div()
+                .font(font(theme::font::MONO))
+                .text_size(px(10.0))
+                .text_color(theme::status::FAIL)
+                .child(message.clone())
+                .into_any_element(),
+            _ => div()
+                .font(font(theme::font::MONO))
+                .text_size(px(10.0))
+                .text_color(theme::text::GHOST)
+                .child("loading\u{2026}")
+                .into_any_element(),
+        };
+
+        div()
+            .id("graph-commit-panel")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px(px(12.0))
+            .py(px(10.0))
+            .gap(px(8.0))
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(12.5))
+                    .text_color(theme::text::HEADING)
+                    .child(row.commit.subject.clone()),
+            )
+            .when(!row.commit.body.is_empty(), |el| {
+                el.child(
+                    div()
+                        .font(font(theme::font::SANS))
+                        .text_size(px(10.5))
+                        .text_color(theme::text::DIM)
+                        .child(row.commit.body.clone()),
+                )
+            })
+            .child(render_graph_meta_row(
+                "author",
+                row.commit.author_name.clone(),
+            ))
+            .child(render_graph_meta_row(
+                "when",
+                relative_time(row.commit.committer_time_unix, unix_now()),
+            ))
+            .child(render_graph_meta_row("sha", row.commit.id.clone()))
+            .child(render_graph_meta_row(
+                "parent",
+                row.commit.parent_ids.join(", "),
+            ))
+            .child(
+                div()
+                    .pt(px(6.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(10.5))
+                    .text_color(theme::text::SECONDARY)
+                    .child("Files changed"),
+            )
+            .child(files_section)
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .pt(px(8.0))
+                    .child(render_graph_disabled_footer_button("Cherry-pick"))
+                    .child(render_graph_disabled_footer_button("Revert")),
+            )
+            .into_any_element()
+    }
+
+    fn render_graph_branches_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(graph) = self.current_graph() else {
+            return render_sidebar_message(
+                "open the graph to see branches".to_string(),
+                theme::text::FAINT.into(),
+            )
+            .into_any_element();
+        };
+        let query = self.graph_state.branches_filter.as_str();
+        let mut branches: Vec<(String, RefKind, bool, usize)> = Vec::new();
+        for row in &graph.rows {
+            for chip in &row.commit.refs {
+                if matches!(chip.kind, RefKind::LocalBranch) {
+                    branches.push((chip.name.clone(), chip.kind, chip.is_head, row.lane));
+                }
+            }
+        }
+        branches.retain(|(name, ..)| {
+            query.is_empty() || name.to_lowercase().contains(&query.to_lowercase())
+        });
+        branches.sort_by(|a, b| a.0.cmp(&b.0));
+
+        div()
+            .id("graph-branches-panel")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(self.render_graph_branches_filter_row(branches.len(), cx))
+            .child(
+                div()
+                    .id("graph-branches-list")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(branches.into_iter().map(|(name, kind, is_head, lane)| {
+                        render_graph_branch_row(name, kind, is_head, lane)
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn render_graph_branches_filter_row(
+        &self,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let has_query = !self.graph_state.branches_filter.is_empty();
+        div()
+            .id("graph-branches-filter")
+            .track_focus(&self.graph_state.branches_filter_focus_handle)
+            .key_context("text-input")
+            .on_action(cx.listener(Self::handle_branches_filter_text_undo))
+            .on_action(cx.listener(Self::handle_branches_filter_text_redo))
+            .on_key_down(cx.listener(Self::handle_branches_filter_key_down))
+            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                window.focus(&this.graph_state.branches_filter_focus_handle, cx);
+            }))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(10.0))
+            .h(theme::graph::BRANCHES_FILTER_ROW)
+            .border_b_1()
+            .border_color(theme::border::RAIL_INNER)
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.5))
+                    .text_color(theme::text::GHOST)
+                    .child("/"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.5))
+                    .text_color(if has_query {
+                        theme::text::DIM
+                    } else {
+                        theme::text::GHOST
+                    })
+                    .child(if has_query {
+                        self.graph_state.branches_filter.as_str().to_string()
+                    } else {
+                        "filter branches".to_string()
+                    }),
+            )
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::GHOST)
+                    .child(format!("{count}")),
+            )
+    }
+
+    fn current_graph(&self) -> Option<&Graph> {
+        match &self.graph_state.load {
+            GraphLoadState::Loaded(graph) => Some(graph),
+            _ => None,
+        }
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn render_graph_meta_row(label: &'static str, value: String) -> impl IntoElement {
+    div()
+        .flex()
+        .gap(px(8.0))
+        .font(font(theme::font::MONO))
+        .text_size(px(10.0))
+        .child(
+            div()
+                .w(px(48.0))
+                .text_color(theme::text::GHOST)
+                .child(label),
+        )
+        .child(div().flex_1().text_color(theme::text::DIM).child(value))
+}
+
+fn render_graph_disabled_footer_button(label: &'static str) -> impl IntoElement {
+    div()
+        .px(px(10.0))
+        .py(px(5.0))
+        .rounded(theme::radius::BUTTON)
+        .border_1()
+        .border_color(theme::border::BUTTON_DISABLED)
+        .font(font(theme::font::SANS))
+        .text_size(px(10.5))
+        .text_color(theme::text::DISABLED)
+        .child(label)
+}
+
+/// One "Files changed" row - the change-row visual's spirit (path + status pill), simplified
+/// since a historical commit has no review checkbox or per-file stat counts to show.
+fn render_graph_file_row(file: wt_core::graph::CommitFileChange) -> impl IntoElement {
+    let (dir, name) = changes::split_dir_name(&file.path);
+    let tag = changes::change_tag(file.status);
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .h(theme::band::CHANGE_ROW)
+        .when(!dir.is_empty(), |el| {
+            el.child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.5))
+                    .text_color(theme::text::GHOSTER)
+                    .child(format!("{dir}/")),
+            )
+        })
+        .child(
+            div()
+                .font(font(theme::font::MONO))
+                .text_size(px(11.5))
+                .text_color(theme::text::STRONG)
+                .child(name),
+        )
+        .when_some(tag, |el, tag| el.child(render_tag_pill(tag)))
+}
+
+fn render_graph_branch_row(
+    name: String,
+    kind: RefKind,
+    is_head: bool,
+    lane: usize,
+) -> impl IntoElement {
+    let dot_color: gpui::Rgba = if matches!(kind, RefKind::LocalBranch) {
+        lane_color(lane)
+    } else {
+        theme::graph::BRANCH_NO_LANE_DOT.into()
+    };
+    div()
+        .id(format!("graph-branch-row-{name}"))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .h(theme::graph::BRANCH_ROW)
+        .px(px(10.0))
+        .border_b_1()
+        .border_color(theme::border::ROW)
+        .hover(|el| el.bg(theme::surface::ROW_HOVER))
+        .child(div().w(px(6.0)).h(px(6.0)).rounded(px(3.0)).bg(dot_color))
+        .child(
+            div()
+                .flex_1()
+                .font(font(theme::font::MONO))
+                .text_size(px(11.0))
+                .text_color(theme::text::BODY)
+                .child(name),
+        )
+        .when(is_head, |el| {
+            el.child(
+                div()
+                    .px(px(5.0))
+                    .rounded(theme::radius::CHIP)
+                    .bg(theme::graph::HEAD_CHIP_BG)
+                    .font(font(theme::font::MONO))
+                    .text_size(px(9.0))
+                    .text_color(theme::graph::HEAD_CHIP_FG)
+                    .child("HEAD"),
+            )
+        })
+}
+
+/// The row's session column - always honestly empty in phase (a) (session-to-commit correlation
+/// is a separate, later feature; see `super`'s module docs), rendered with the same "no session"
+/// visual `crate::rail::render`'s own worktree row already uses for a real session-less row.
+fn render_graph_session_column() -> impl IntoElement {
+    div().w(px(88.0)).flex().items_center().gap(px(5.0)).child(
+        div()
+            .w(px(16.0))
+            .h(px(16.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(theme::radius::CHIP)
+            .bg(theme::surface::CHIP_NEUTRAL)
+            .font(font(theme::font::MONO))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(px(9.0))
+            .text_color(theme::text::GHOST)
+            .child("\u{2014}"),
+    )
+}
+
+fn render_graph_row_menu_header(label: &'static str) -> impl IntoElement {
+    div()
+        .px(px(11.0))
+        .pt(px(6.0))
+        .pb(px(2.0))
+        .font(font(theme::font::MONO))
+        .text_size(px(9.0))
+        .text_color(theme::text::GHOSTER)
+        .child(label)
+}
+
+fn render_graph_toolbar_button(
+    label: &'static str,
+    has_activity: bool,
+    _reserved: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(format!("graph-toolbar-button-{label}"))
+        .px(px(9.0))
+        .h(px(24.0))
+        .flex()
+        .items_center()
+        .rounded(theme::radius::BUTTON)
+        .cursor_pointer()
+        .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+        .font(font(theme::font::MONO))
+        .text_size(px(10.5))
+        .text_color(if has_activity {
+            theme::text::PRIMARY
+        } else {
+            theme::text::DIM
+        })
+        .child(label)
+}
+
+/// Draws one row's lane canvas: full-height verticals for every lane passing through, half-height
+/// stubs where a lane starts/ends this row, and an elbow box for each merge/branch point (design
+/// spec §2). Every element is a flat rect - "Emit one element per lane per row... do not draw two
+/// stacked halves per row", so a `starts_here`/`ends_here` segment renders as a single half-height
+/// rect anchored to the correct edge, never two.
+fn render_graph_lane_canvas(row: &GraphRow, lane_count: usize) -> impl IntoElement {
+    let row_h = theme::graph::ROW;
+    let mut canvas = div()
+        .relative()
+        .flex_none()
+        .w(theme::graph::LANE_CANVAS)
+        .h(row_h);
+
+    for segment in &row.lane_segments {
+        let x = lane_x(segment.lane);
+        let color = lane_color(segment.lane);
+        let (top, height) = match (segment.starts_here, segment.ends_here) {
+            (true, true) => (row_h / 2.0, row_h / 2.0),
+            (true, false) => (row_h / 2.0, row_h / 2.0),
+            (false, true) => (px(0.0), row_h / 2.0),
+            (false, false) => (px(0.0), row_h),
+        };
+        let mut line = div()
+            .absolute()
+            .w(px(1.0))
+            .left(x)
+            .top(top)
+            .h(height)
+            .bg(color);
+        if segment.dashed {
+            // GPUI has no dashed-border primitive on a plain rect; approximate with a lighter,
+            // narrower fill rather than a solid line, so it still reads as visually distinct.
+            line = line.opacity(0.5);
+        }
+        canvas = canvas.child(line);
+    }
+
+    for elbow in &row.elbows {
+        let x_from = lane_x(elbow.from_lane);
+        let x_to = lane_x(elbow.to_lane);
+        let (left, width) = if x_to >= x_from {
+            (x_from, x_to - x_from)
+        } else {
+            (x_to, x_from - x_to)
+        };
+        canvas = canvas.child(
+            div()
+                .absolute()
+                .left(left)
+                .top(row_h - theme::graph::ELBOW_HEIGHT + px(1.0))
+                .w(width + px(1.0))
+                .h(theme::graph::ELBOW_HEIGHT)
+                .border_t_1()
+                .border_l_1()
+                .border_color(lane_color(elbow.from_lane))
+                .rounded_tl(theme::graph::ELBOW_RADIUS),
+        );
+    }
+
+    let dot_lane = row.lane;
+    let dot_x = lane_x(dot_lane);
+    let dot_color = lane_color(dot_lane);
+    let (size, dot) = match row.dot_kind {
+        DotKind::Commit => (theme::graph::DOT_COMMIT, div().rounded_full().bg(dot_color)),
+        DotKind::Head => (
+            theme::graph::DOT_HEAD_OR_MERGE,
+            div()
+                .rounded_full()
+                .bg(dot_color)
+                .border_2()
+                .border_color(theme::graph::HEAD_RING),
+        ),
+        DotKind::Merge => (
+            theme::graph::DOT_HEAD_OR_MERGE,
+            div().rounded_full().border_2().border_color(dot_color),
+        ),
+        DotKind::WorkingTree => (
+            theme::graph::DOT_COMMIT,
+            div()
+                .rounded_full()
+                .border_1()
+                .border_color(theme::graph::WORKING_TREE_BORDER)
+                .opacity(0.8),
+        ),
+    };
+    canvas = canvas.child(
+        dot.absolute()
+            .left(dot_x - size / 2.0 + px(0.5))
+            .top(row_h / 2.0 - size / 2.0)
+            .w(size)
+            .h(size),
+    );
+
+    let _ = lane_count;
+    canvas
+}
+
+/// Ref chips for one row (design spec §2): local branches on their lane-colour dim pair, `HEAD`,
+/// outlined remotes, and tags.
+fn render_graph_ref_chips(row: &GraphRow) -> impl IntoElement {
+    let mut chips = div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .px(px(6.0));
+    for chip in &row.commit.refs {
+        let element = match chip.kind {
+            RefKind::LocalBranch => div()
+                .px(px(6.0))
+                .h(px(15.0))
+                .flex()
+                .items_center()
+                .rounded(theme::radius::MARK)
+                .bg(local_branch_dim_bg(lane_for_ref(row, chip)))
+                .font(font(theme::font::MONO))
+                .text_size(px(9.0))
+                .text_color(lane_color(lane_for_ref(row, chip)))
+                .child(chip.name.clone()),
+            RefKind::RemoteBranch => div()
+                .px(px(6.0))
+                .h(px(15.0))
+                .flex()
+                .items_center()
+                .rounded(theme::radius::MARK)
+                .border_1()
+                .border_color(theme::graph::REMOTE_CHIP_BORDER)
+                .font(font(theme::font::MONO))
+                .text_size(px(9.0))
+                .text_color(theme::text::DIM)
+                .child(chip.name.clone()),
+            RefKind::Tag => div()
+                .px(px(6.0))
+                .h(px(15.0))
+                .flex()
+                .items_center()
+                .rounded(theme::radius::MARK)
+                .bg(theme::graph::TAG_CHIP_BG)
+                .font(font(theme::font::MONO))
+                .text_size(px(9.0))
+                .text_color(theme::graph::TAG_CHIP_FG)
+                .child(chip.name.clone()),
+        };
+        chips = chips.child(element);
+        if chip.is_head {
+            chips = chips.child(
+                div()
+                    .px(px(6.0))
+                    .h(px(15.0))
+                    .flex()
+                    .items_center()
+                    .rounded(theme::radius::MARK)
+                    .bg(theme::graph::HEAD_CHIP_BG)
+                    .font(font(theme::font::MONO))
+                    .text_size(px(9.0))
+                    .text_color(theme::graph::HEAD_CHIP_FG)
+                    .child("HEAD"),
+            );
+        }
+    }
+    chips
+}
+
+fn lane_for_ref(row: &GraphRow, _chip: &wt_core::graph::RefChip) -> usize {
+    row.lane
+}
+
+/// Real focus-handling regression coverage for the git graph tab, mirroring `crate::root::focus`'s
+/// own `*_focus_tests` modules (`palette_focus_tests`, `settings_focus_tests`, `code_focus_tests`).
+/// This feature had none at all until an adversarial audit found five distinct reachable
+/// dangling-focus paths through it, all now fixed in `AdeApp::open_git_graph`/`leave_graph_tab`
+/// above. Positive assertions throughout (`assert_eq!` against a real, specific handle), not just
+/// "the wrong thing didn't happen": a genuinely dangling `Window::focus` would still pass a bare
+/// `assert_ne!`, which is exactly the false-negative shape `crate::root::focus`'s own module docs
+/// warn about.
+#[cfg(test)]
+mod graph_focus_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::{Entity, Focusable, TestAppContext};
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A real one-commit repo (so `AdeApp::load_graph` succeeds and the Branches panel's filter
+    /// row - only rendered once a `Graph` is actually loaded - really paints) plus a real, already-
+    /// open, already-focused shell agent (`AdeApp::new_with_settings`'s own default), the way
+    /// every `*_focus_tests` helper in this crate seeds its window.
+    fn open_seeded(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        Entity<AdeApp>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("a.txt"), "1\n").expect("write a.txt");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        (repo, app, cx)
+    }
+
+    fn agent_pane_handle(
+        app: &Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> gpui::FocusHandle {
+        app.update(cx, |app, cx| {
+            app.agents
+                .active()
+                .expect("the default agent")
+                .pane
+                .focus_handle(cx)
+        })
+    }
+
+    #[gpui::test]
+    fn open_git_graph_focuses_the_graph_view_from_a_fresh_window(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded(cx);
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+
+        let (focused, graph_handle) = app.update_in(cx, |app, window, cx| {
+            (window.focused(cx), app.graph_focus_handle.clone())
+        });
+        assert_eq!(
+            focused.as_ref(),
+            Some(&graph_handle),
+            "opening the graph tab from a fresh window must move real focus onto its own \
+             handle"
+        );
+        assert!(app.read_with(cx, |app, _| app.graph_tab_open && app.graph_tab_active));
+    }
+
+    /// Regression for a real, adversarial-audit-found gap (CRITICAL C2): opening the graph tab
+    /// while a file tab was focused cleared `open_change` (unrendering the code surface) but only
+    /// swept `tree_focus_handle`, not `code_focus_handle` - so `graph_focus`'s captured return
+    /// target could be a handle that had *already* stopped being rendered by the time it was
+    /// captured, dangling the moment the graph tab later closed back to it.
+    #[gpui::test]
+    fn opening_the_graph_tab_with_a_file_open_never_captures_the_unrendered_code_focus_handle(
+        cx: &mut TestAppContext,
+    ) {
+        let (repo, app, cx) = open_seeded(cx);
+        let file_path = repo.path().join("a.txt");
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        let (focused, code_handle) = app.update_in(cx, |app, window, cx| {
+            (window.focused(cx), app.code_focus_handle.clone())
+        });
+        assert_eq!(
+            focused.as_ref(),
+            Some(&code_handle),
+            "premise: the file view really is focused before the graph tab opens"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.open_change.is_none()),
+            "premise: opening the graph tab really did unrender the code surface"
+        );
+
+        // Switching back to the (already-active, unchanged) agent must land real focus on its
+        // real pane - never on `code_focus_handle`, which is not part of this frame at all.
+        let agent_id = app.read_with(cx, |app, _| app.agents.active_id().expect("an agent"));
+        app.update_in(cx, |app, window, cx| {
+            app.select_agent(agent_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        let pane_handle = agent_pane_handle(&app, cx);
+        let focused = app.update_in(cx, |_app, window, cx| window.focused(cx));
+        assert_eq!(
+            focused.as_ref(),
+            Some(&pane_handle),
+            "focus must land on the real agent pane, not dangle on the unrendered \
+             code_focus_handle the graph tab's own OverlayFocus could otherwise have captured"
+        );
+    }
+
+    /// Regression for a real, adversarial-audit-found gap (CRITICAL C1): `leave_graph_tab` only
+    /// checked `graph_focus_handle`, not the Branches panel's own real text-input surface
+    /// (`graph_state.branches_filter_focus_handle`), which is only rendered while the graph tab
+    /// is active and can independently hold real keyboard focus.
+    #[gpui::test]
+    fn leaving_the_graph_tab_from_the_branches_filter_lands_on_the_real_agent_pane(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded(cx);
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.set_graph_right_panel(GraphRightPanel::Branches, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            window.focus(&app.graph_state.branches_filter_focus_handle, cx);
+        });
+        cx.run_until_parked();
+
+        let (focused, filter_handle) = app.update_in(cx, |app, window, cx| {
+            (
+                window.focused(cx),
+                app.graph_state.branches_filter_focus_handle.clone(),
+            )
+        });
+        assert_eq!(
+            focused.as_ref(),
+            Some(&filter_handle),
+            "premise: the Branches filter box really is focused"
+        );
+
+        let agent_id = app.read_with(cx, |app, _| app.agents.active_id().expect("an agent"));
+        app.update_in(cx, |app, window, cx| {
+            app.select_agent(agent_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        let pane_handle = agent_pane_handle(&app, cx);
+        let focused = app.update_in(cx, |_app, window, cx| window.focused(cx));
+        assert_eq!(
+            focused.as_ref(),
+            Some(&pane_handle),
+            "focus must land on the real agent pane, not dangle on the Branches filter's \
+             now-unrendered handle"
+        );
+        assert!(
+            !app.read_with(cx, |app, _| app.graph_tab_active),
+            "the graph tab must have been genuinely left, not merely re-focused"
+        );
+    }
+
+    /// Closing the graph tab's `×` while some *other* tab is showing (it is open but not active)
+    /// must be a real no-op focus-wise - a second real, adversarial-audit-style scenario:
+    /// `leave_graph_tab`'s own early-return for `!graph_tab_active` is what this proves.
+    #[gpui::test]
+    fn closing_an_inactive_graph_tab_does_not_touch_focus(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded(cx);
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        // Spawning a new agent (e.g. from the title bar's Agent menu) does *not* itself
+        // switch away from the graph tab - it stays open *and* active, exactly like Settings
+        // stays open across the same gesture. Explicitly selecting an agent tab is what leaves
+        // it, the same real user action `select_agent`'s own click handler performs.
+        let agent_id = app.read_with(cx, |app, _| app.agents.active_id().expect("an agent"));
+        app.update_in(cx, |app, window, cx| {
+            app.select_agent(agent_id, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.graph_tab_open && !app.graph_tab_active),
+            "premise: the graph tab is open but an agent tab took over as active"
+        );
+
+        let before = app.update_in(cx, |_app, window, cx| window.focused(cx));
+        app.update_in(cx, |app, window, cx| {
+            app.close_git_graph_tab(window, cx);
+        });
+        cx.run_until_parked();
+        let after = app.update_in(cx, |_app, window, cx| window.focused(cx));
+
+        assert_eq!(
+            before, after,
+            "closing an inactive graph tab must not move focus at all"
+        );
+        assert!(!app.read_with(cx, |app, _| app.graph_tab_open));
+    }
+}

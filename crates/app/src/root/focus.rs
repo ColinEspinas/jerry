@@ -35,7 +35,13 @@ impl AdeApp {
     /// Whether keyboard focus is currently on one of this app's overlay handles - the palette,
     /// Settings, or the "New file" prompt. See [`Self::focus_code_surface`] for why capturing one
     /// as a return target is always wrong.
-    fn focus_is_on_an_overlay(&self, window: &Window, cx: &App) -> bool {
+    ///
+    /// `pub(crate)`, not private: `crate::graph_view::render::AdeApp::open_git_graph` reuses this
+    /// exact check for its own pre-open focus capture (the git graph tab is real tab-strip
+    /// content, the same shape as [`Self::code_focus_handle`] - not a fourth entry in this list -
+    /// but it still must never capture the palette/Settings/new-file handles as its own return
+    /// target, for the same reason [`Self::focus_code_surface`] mustn't).
+    pub(crate) fn focus_is_on_an_overlay(&self, window: &Window, cx: &App) -> bool {
         window.focused(cx).is_some_and(|focused| {
             focused == self.palette_focus_handle
                 || focused == self.settings_focus_handle

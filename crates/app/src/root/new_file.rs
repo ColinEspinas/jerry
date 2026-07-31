@@ -62,7 +62,13 @@ impl AdeApp {
         // deliberately the rail's root, not its filter field, which this used to target; see that
         // handle's own docs for the real keystroke-swallowing bug that was - rather
         // than leaving `Window::focus` dangling on the just-closed prompt field.
-        if self.open_change.is_some() {
+        if self.graph_tab_active {
+            // The graph tab (like a file tab) occupies the centre pane instead of an agent's
+            // pane - a real, adversarial-audit-found gap: falling through to
+            // `agents.focus_active` here would focus a pane `Self::render_center_pane` isn't
+            // drawing while the graph tab is showing.
+            window.focus(&self.graph_focus_handle, cx);
+        } else if self.open_change.is_some() {
             window.focus(&self.code_focus_handle, cx);
         } else if self.agents.active_id().is_some() {
             self.agents.focus_active(window, cx);
@@ -340,6 +346,12 @@ impl AdeApp {
         self.new_file_error = None;
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
+        // A second real "open a file" path that doesn't go through
+        // `crate::code_surface::tabs::AdeApp::open_and_focus_file` - a real, adversarial-audit-
+        // found gap: without this, creating a file while the graph tab was active left it
+        // `graph_tab_active` (so `Self::render_center_pane` kept showing the graph, not this new
+        // file) with `Window::focus` on `code_focus_handle`, which isn't in that frame either.
+        self.leave_graph_tab(window, cx);
         self.focus_code_surface(window, cx);
         self.pending_cursor_line = None;
         if !self
