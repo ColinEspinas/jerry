@@ -6139,3 +6139,29 @@ All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `
 --workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
 1111 app + 44 lsp-core + 14 pty-core + 127 wt-core, 0 failed (test count unchanged - same two tests,
 updated in place to assert the new 2px/4px values).
+
+## Middle-click didn't close the graph tab
+
+A real user report: "the git graph tab can't be closed with middle mouse, this should be the case
+for every tab." GitHub issue #26 already wired middle-click close for both file tabs
+(`work_surface/render.rs`'s file-tab div) and session/terminal tabs (its session-tab div), each via
+`.on_mouse_down(MouseButton::Middle, ...)` calling the same real close path the `×` button uses. The
+graph tab's own `render_graph_tab` had simply never been given the same treatment - its outer div had
+only `.on_click` on the inner hit-target, no middle-click handler at all on the tab itself. Fixed by
+adding the identical `on_mouse_down(MouseButton::Middle, ...)` wiring to the graph tab's own div,
+calling `close_git_graph_tab` (the same real teardown the `×` button already uses - the graph tab has
+no dirty-state confirmation to bypass, unlike a file tab, so no extra gating is needed).
+
+Confirmed the Settings surface has no tab-strip entry at all (it replaces the whole workspace body,
+not a tab), so it was correctly out of scope for this audit - the graph tab was the only real gap.
+
+Added `middle_clicking_the_graph_tab_closes_it_like_every_other_tab_kind`, a real `gpui::test` driving
+a genuine `MouseDownEvent` (`MouseButton::Middle`) at the graph tab's own painted bounds via
+`cx.simulate_event` (mirroring `graph_row_menu_tests`' own `right_click` helper) and asserting
+`graph_tab_open` flips to `false`. Confirmed non-vacuous by temporarily reverting the fix and watching
+it fail first.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+1112 app + 44 lsp-core + 14 pty-core + 127 wt-core, 0 failed (+1 app test: the new middle-click
+regression).
