@@ -17,6 +17,7 @@
 //! docs for why it must also move real keyboard focus in the same step.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use gpui::{App, AppContext as _, Context, Entity, Focusable as _, Subscription, Window};
 
@@ -82,6 +83,12 @@ pub struct Session {
     /// label/title; `TerminalPane` doesn't expose its own `cwd` back out.
     pub cwd: PathBuf,
     pub pane: Entity<TerminalPane>,
+    /// When this session was spawned - the rail agent row's real elapsed-time trailing text
+    /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.3: "elapsed 9.5px mono
+    /// right"). Set once, here, and never mutated afterwards - this app has no
+    /// pause/resume-with-a-fresh-clock concept (see `crate::work_surface::state::pty_state_label`'s
+    /// docs), so "elapsed" is simply wall-clock time since this real process was spawned.
+    pub spawned_at: Instant,
     /// Keeps [`Sessions::spawn`]'s link-click-opens-a-file subscription (see
     /// [`TerminalPaneEvent`]) alive for this session's lifetime - never read, only held.
     _link_subscription: Subscription,
@@ -179,6 +186,7 @@ impl Sessions {
             kind,
             cwd: cwd.clone(),
             pane,
+            spawned_at: Instant::now(),
             _link_subscription: link_subscription,
         });
         self.active = Some(id);

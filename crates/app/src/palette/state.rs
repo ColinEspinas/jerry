@@ -129,8 +129,6 @@ pub enum PaletteCommand {
     NewCodexSession,
     /// `crate::root::AdeApp::set_right_sidebar_view`, same as the `Files | Changes` control.
     ToggleFilesChanges,
-    /// `crate::root::AdeApp::toggle_rail_mode`, same as the rail header's grouping control.
-    ToggleRailGrouping,
     /// `crate::root::AdeApp::request_prune` - goes through the same two-click confirmation gate
     /// as the rail footer's own `prune` button, never bypassing it.
     PruneWorktrees,
@@ -149,12 +147,11 @@ pub enum PaletteCommand {
 }
 
 impl PaletteCommand {
-    pub const ALL: [PaletteCommand; 10] = [
+    pub const ALL: [PaletteCommand; 9] = [
         PaletteCommand::NewShell,
         PaletteCommand::NewClaudeSession,
         PaletteCommand::NewCodexSession,
         PaletteCommand::ToggleFilesChanges,
-        PaletteCommand::ToggleRailGrouping,
         PaletteCommand::PruneWorktrees,
         PaletteCommand::OpenSettings,
         PaletteCommand::WindowControlsSystem,
@@ -168,7 +165,6 @@ impl PaletteCommand {
             PaletteCommand::NewClaudeSession => "New Claude Session",
             PaletteCommand::NewCodexSession => "New Codex Session",
             PaletteCommand::ToggleFilesChanges => "Toggle Files / Changes",
-            PaletteCommand::ToggleRailGrouping => "Toggle Rail Grouping",
             PaletteCommand::PruneWorktrees => "Prune Worktrees",
             PaletteCommand::OpenSettings => "Open Settings",
             PaletteCommand::WindowControlsSystem => "Window Controls: System Default",
@@ -185,7 +181,6 @@ impl PaletteCommand {
             PaletteCommand::NewClaudeSession => "claude agent spawn session cli",
             PaletteCommand::NewCodexSession => "codex agent spawn session cli",
             PaletteCommand::ToggleFilesChanges => "files changes panel sidebar switch",
-            PaletteCommand::ToggleRailGrouping => "rail grouping urgency project sessions",
             PaletteCommand::PruneWorktrees => "prune worktree remove delete cleanup merged",
             PaletteCommand::OpenSettings => "settings preferences agents worktrees config",
             PaletteCommand::WindowControlsSystem => {

@@ -96,10 +96,6 @@ impl AdeApp {
                 secondary: format!("switch the right panel to {next_sidebar_view}"),
             },
             palette::CommandCandidate {
-                command: palette::PaletteCommand::ToggleRailGrouping,
-                secondary: format!("switch to {}", self.rail_mode.toggled().label()),
-            },
-            palette::CommandCandidate {
                 command: palette::PaletteCommand::PruneWorktrees,
                 secondary: format!(
                     "{} prunable worktree(s)",
@@ -273,7 +269,6 @@ impl AdeApp {
                 };
                 self.set_right_sidebar_view(next, window, cx);
             }
-            palette::PaletteCommand::ToggleRailGrouping => self.toggle_rail_mode(cx),
             palette::PaletteCommand::PruneWorktrees => self.request_prune(cx),
             palette::PaletteCommand::OpenSettings => self.open_settings(window, cx),
             // Also reachable from the Settings "General" page - both entry points call

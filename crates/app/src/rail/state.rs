@@ -1,41 +1,23 @@
-//! The session rail's data model: pure, GPUI-free types and functions for grouping,
-//! filtering, and the "by project" worktree-without-a-session inclusion logic
-//! (`design_handoff_jerry_ade/README.md`'s Zone 1). No `gpui` dependency, so this logic is
-//! unit-testable without a real window, terminal, or git state. `crate::root` gathers the
-//! real signals (`TerminalPane`, `wt_core::list_worktrees`, `wt_core::diff::diff_against_base`)
-//! into the plain types this module operates on, and renders the result as GPUI elements.
+//! The session rail's data model: pure, GPUI-free types and functions for grouping and
+//! filtering (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md`'s Zone 1). No `gpui`
+//! dependency, so this logic is unit-testable without a real window, terminal, or git state.
+//! `crate::root` gathers the real signals (`TerminalPane`, `wt_core::list_worktrees`,
+//! `wt_core::diff::diff_against_base`) into the plain types this module operates on, and renders
+//! the result as GPUI elements.
+//!
+//! Two levels, always (§2.1): **repo group → worktree → agents** - no rail mode toggle. There
+//! used to be a second, `RailMode`-switched "by project" structure; the revision that redesigned
+//! the rail around repo grouping removed it (§7: "`groupSessions`, `railMode` and `railSort` are
+//! all gone").
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use crate::rail::repo::RepoId;
 use crate::rail::status::Status;
 use crate::work_surface::sessions::SessionKind;
 use wt_core::diff::{AheadBehind, DiffBase, DiffLineKind, WorktreeDiff, WorktreeMergeStatus};
-
-/// Which of the two rail grouping modes is active - `design_handoff_jerry_ade/README.md`'s
-/// `by urgency ▾ / by project ▾` control. Urgency is the documented default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RailMode {
-    #[default]
-    Urgency,
-    Project,
-}
-
-impl RailMode {
-    pub fn toggled(self) -> Self {
-        match self {
-            RailMode::Urgency => RailMode::Project,
-            RailMode::Project => RailMode::Urgency,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            RailMode::Urgency => "by urgency",
-            RailMode::Project => "by project",
-        }
-    }
-}
 
 /// One session, reduced to exactly what the rail row needs to render - built in `crate::root`
 /// from a `crate::work_surface::sessions::Session` plus a `wt_core::diff::diff_against_base` result for its
@@ -76,6 +58,19 @@ pub struct SessionRow {
     /// [`crate::rail::render::AdeApp::build_session_rows`] is where a live value would be filled
     /// in, the same real construction site [`Self::question_preview`] is already filled in from.
     pub activity: Option<String>,
+    /// Wall-clock time since `crate::work_surface::sessions::Session::spawned_at` - the agent
+    /// row's line-1 elapsed time (§2.3: "elapsed 9.5px mono right"). See [`format_elapsed`] for
+    /// how this becomes the rendered `4m`/`1h` text.
+    pub elapsed: Duration,
+    /// How many files this session is a recorded author of, for a [`Status::Review`] row only -
+    /// §2.3's "review ready" trailing text (`12 files`), sourced from
+    /// `crate::sidebar::changes::Authorship::file_count_for`. `None` for every other status (§2.3:
+    /// "Do not put a per-agent file count here" - review-ready is the one documented exception),
+    /// and also `None` for a review-ready row whose worktree diff isn't the one currently loaded
+    /// in Zone 3 - `crate::root::AdeApp::file_authorship` is scoped to that single loaded diff
+    /// (see its own docs), not tracked per-worktree yet, so a row outside it genuinely has no
+    /// authorship data to report rather than a fabricated count.
+    pub review_file_count: Option<usize>,
 }
 
 impl SessionRow {
@@ -136,7 +131,7 @@ pub fn sum_diff_stat(diff: &WorktreeDiff) -> (usize, usize) {
 
 /// Real per-status counts across every session row, in [`Status::ORDER`] - the status bar's
 /// five urgency-counter squares (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 7).
-/// Unlike [`group_worktrees_by_urgency`], a status with zero matching rows still gets a real `0`
+/// Unlike [`group_worktrees_by_repo`], a status with zero matching rows still gets a real `0`
 /// entry rather than being omitted, since the status bar always shows all five squares. Built
 /// from the
 /// same per-session [`Status`] every [`SessionRow`] already carries - not a second, independent
@@ -230,6 +225,20 @@ fn format_utc_hhmm(unix_seconds: i64) -> String {
     format!("{hours:02}:{minutes:02}")
 }
 
+/// Formats a real elapsed [`Duration`] as the rail's short `Ns`/`Nm`/`Nh` label - the agent row's
+/// line-1 elapsed time and the `paused` state word's `resumable · Nh` trailing text (§2.3).
+/// Whole units only (no `4m 12s`), matching the mockup's own `4m`/`1m`/`3h` examples.
+pub fn format_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
+}
+
 /// One worktree, as input to [`build_worktree_rows`] - `crate::root`'s reduction of
 /// `wt_core::WorktreeResult` (via `crate::rail::worktrees::WorktreeItem`) plus its separately
 /// computed [`WorktreeNote`].
@@ -278,6 +287,33 @@ impl WorktreeRow {
             .map(|row| row.status)
             .min_by_key(|status| status.urgency_rank())
             .unwrap_or(Status::Idle)
+    }
+
+    /// This row's rank for sorting *inside* a repo group (and, via [`RepoGroup::rank`], the
+    /// groups themselves) - `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.1's
+    /// full seven-step order: `input → failed → review → running → idle → bare → prunable`.
+    /// Lower sorts first (more urgent).
+    ///
+    /// The first five steps are exactly [`Status::urgency_rank`] (§2.3's own agent state words -
+    /// `needs input`/`failed`/`review ready`/`running`/`paused` - map one-to-one onto
+    /// [`Status::Ask`]/[`Status::Fail`]/[`Status::Review`]/[`Status::Run`]/[`Status::Idle`], see
+    /// that enum's own docs), reused rather than re-derived. The last two only apply to a
+    /// session-less row, which [`Self::aggregate_status`] alone can't distinguish from a row
+    /// whose one open session is genuinely [`Status::Idle`] - both would otherwise rank 4. A
+    /// worktree with no agents at all is never the "same kind of quiet" as one with an idle
+    /// agent still attached, so this splits that case using [`WorktreeNote::is_prunable`], the
+    /// same real merged/clean/locked facts §2.2's "Bare worktrees `#22262a`, prunable
+    /// `#2f353a`" left-edge colours already key off.
+    pub fn urgency_rank(&self) -> u8 {
+        if self.sessions.is_empty() {
+            if self.note.is_prunable() {
+                6
+            } else {
+                5
+            }
+        } else {
+            self.aggregate_status().urgency_rank()
+        }
     }
 
     /// The real `+added -deleted` totals summed across every open session's own diff summary -
@@ -350,39 +386,87 @@ pub fn filter_worktree_rows<'a>(rows: &'a [WorktreeRow], query: &str) -> Vec<&'a
         .collect()
 }
 
-/// One group in "by urgency" mode, now grouping [`WorktreeRow`]s (one per worktree) rather than
-/// individual sessions - `crate::rail::state::WorktreeRow::aggregate_status` is each row's sort key, so
-/// a worktree with several sessions in different states sorts under its single most-urgent one,
-/// and a worktree with no sessions at all sorts under [`Status::Idle`].
+/// One repo, with its already-built [`WorktreeRow`]s - `crate::root`'s reduction of one
+/// [`crate::rail::repo::Repo`] plus (for the currently focused repo only) live worktree rows,
+/// as input to [`group_worktrees_by_repo`]. See that function's own docs for why every other
+/// repo currently supplies an empty `rows`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct UrgencyWorktreeGroup {
-    pub status: Status,
+pub struct RepoWorktrees {
+    pub repo_id: RepoId,
+    pub repo_name: String,
     pub rows: Vec<WorktreeRow>,
 }
 
-/// Groups `rows` by [`WorktreeRow::aggregate_status`], in [`Status::ORDER`] - the same "needs
-/// input → failed → review ready → running → idle" order [`urgency_counts`] uses for individual
-/// sessions, adapted to worktree rows now that a rail row represents a whole worktree's tabs
-/// rather than one session. Empty groups are omitted.
-pub fn group_worktrees_by_urgency(rows: &[WorktreeRow]) -> Vec<UrgencyWorktreeGroup> {
-    Status::ORDER
+/// One repo group in the rail - `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md`
+/// §2.0-2.1: the rail's only grouping axis, always present (even for a single repo), with its
+/// own worktree rows ranked most-urgent-first inside it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepoGroup {
+    pub repo_id: RepoId,
+    pub repo_name: String,
+    /// Ranked by [`WorktreeRow::urgency_rank`], most urgent first - see
+    /// [`group_worktrees_by_repo`].
+    pub rows: Vec<WorktreeRow>,
+}
+
+impl RepoGroup {
+    /// The group header's right-aligned amber `N worktrees waiting` (§2.1: "counting worktrees
+    /// in that repo holding an asking or failed agent, hidden at zero"). Deliberately worktree-
+    /// level, not agent-level: a worktree with two asking agents still counts once, since the
+    /// header is answering "how many rows in this group want me", not "how many agents".
+    pub fn waiting_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|row| {
+                !row.sessions.is_empty()
+                    && matches!(row.aggregate_status(), Status::Ask | Status::Fail)
+            })
+            .count()
+    }
+
+    /// This group's own rank for ordering groups - its most urgent worktree's
+    /// [`WorktreeRow::urgency_rank`] (§2.0: "repos are ordered by their own most urgent
+    /// worktree, using the same rank function as the rows"). A worktree-less repo (no data
+    /// loaded for it yet - see [`group_worktrees_by_repo`]'s docs) sorts last, behind every repo
+    /// that has at least one real row.
+    fn rank(&self) -> u8 {
+        self.rows
+            .iter()
+            .map(WorktreeRow::urgency_rank)
+            .min()
+            .unwrap_or(u8::MAX)
+    }
+}
+
+/// Builds the rail's repo groups: each [`RepoWorktrees`]' rows sorted by
+/// [`WorktreeRow::urgency_rank`] (§2.1's "worktrees are ranked by their most urgent agent"), then
+/// the groups themselves sorted by [`RepoGroup::rank`] (§2.0's "repos are ordered by their own
+/// most urgent worktree") - **never** alphabetically or by insertion order, per that section's
+/// explicit warning. Both sorts are stable (`slice::sort_by_key`), so two rows/groups tied on
+/// rank keep their caller-supplied relative order rather than reshuffling on every render.
+///
+/// A repo currently supplies an empty `rows` unless it's the focused one:
+/// `crate::rail::repo::Repo::worktrees` isn't wired to live `wt_core::list_worktrees` data yet
+/// for any *other* repo (see that field's own docs) - there is no UI to add a second repo yet
+/// either (this revision deliberately doesn't build one), so in practice `repos` holds exactly
+/// one entry and this is a no-op in every real session; the general mechanism is still built
+/// correctly so a later phase that wires up multi-repo data has a real, tested place to plug
+/// into rather than a single-repo special case to unwind.
+pub fn group_worktrees_by_repo(repos: Vec<RepoWorktrees>) -> Vec<RepoGroup> {
+    let mut groups: Vec<RepoGroup> = repos
         .into_iter()
-        .filter_map(|status| {
-            let matching: Vec<WorktreeRow> = rows
-                .iter()
-                .filter(|row| row.aggregate_status() == status)
-                .cloned()
-                .collect();
-            if matching.is_empty() {
-                None
-            } else {
-                Some(UrgencyWorktreeGroup {
-                    status,
-                    rows: matching,
-                })
+        .map(|repo| {
+            let mut rows = repo.rows;
+            rows.sort_by_key(WorktreeRow::urgency_rank);
+            RepoGroup {
+                repo_id: repo.repo_id,
+                repo_name: repo.repo_name,
+                rows,
             }
         })
-        .collect()
+        .collect();
+    groups.sort_by_key(RepoGroup::rank);
+    groups
 }
 
 /// Whether a bare worktree row (no open session) matches a rail filter query - the "by
@@ -604,6 +688,8 @@ mod tests {
             question_preview: None,
             exit_code: None,
             activity: None,
+            elapsed: Duration::ZERO,
+            review_file_count: None,
         }
     }
 
@@ -885,36 +971,178 @@ mod tests {
     }
 
     #[test]
-    fn group_worktrees_by_urgency_groups_by_aggregate_status_and_omits_empty_groups() {
+    fn urgency_rank_matches_status_rank_for_a_worktree_with_sessions() {
         let worktrees = vec![
             worktree_entry("/repo-wt/asking", clean_note(false)),
             worktree_entry("/repo-wt/running", clean_note(false)),
-            worktree_entry("/repo-wt/idle-no-sessions", clean_note(false)),
         ];
         let sessions = vec![
             row(1, Status::Ask, "ask", "/repo-wt/asking"),
             row(2, Status::Run, "run", "/repo-wt/running"),
         ];
         let rows = build_worktree_rows(&worktrees, &sessions);
-        let groups = group_worktrees_by_urgency(&rows);
-        let statuses: Vec<Status> = groups.iter().map(|g| g.status).collect();
-        assert_eq!(
-            statuses,
-            vec![Status::Ask, Status::Run, Status::Idle],
-            "a session-less worktree groups under Idle, matching Status::ORDER"
-        );
-        assert!(
-            !statuses.contains(&Status::Fail),
-            "Fail has no rows, so it's omitted"
-        );
-        assert_eq!(groups.iter().map(|g| g.rows.len()).sum::<usize>(), 3);
+        assert_eq!(rows[0].urgency_rank(), Status::Ask.urgency_rank());
+        assert_eq!(rows[1].urgency_rank(), Status::Run.urgency_rank());
     }
 
     #[test]
-    fn rail_mode_toggles_and_defaults_to_urgency() {
-        assert_eq!(RailMode::default(), RailMode::Urgency);
-        assert_eq!(RailMode::Urgency.toggled(), RailMode::Project);
-        assert_eq!(RailMode::Project.toggled(), RailMode::Urgency);
+    fn urgency_rank_splits_bare_and_prunable_below_every_session_status() {
+        let mut prunable_note = clean_note(false);
+        prunable_note.merge = Some(WorktreeMergeStatus {
+            base_branch: "main".to_string(),
+            merged: true,
+            head_committer_unix_seconds: Some(0),
+        });
+        assert!(prunable_note.is_prunable(), "sanity check");
+
+        let worktrees = vec![
+            worktree_entry("/repo-wt/bare", clean_note(false)),
+            worktree_entry("/repo-wt/prunable", prunable_note),
+        ];
+        let rows = build_worktree_rows(&worktrees, &[]);
+
+        assert_eq!(
+            rows[0].urgency_rank(),
+            5,
+            "a session-less, non-prunable worktree ranks 'bare' - below every real session \
+             status but above prunable"
+        );
+        assert_eq!(
+            rows[1].urgency_rank(),
+            6,
+            "a session-less, prunable worktree ranks last of all - §2.1's \
+             'input → failed → review → running → idle → bare → prunable'"
+        );
+        assert!(
+            rows[0].urgency_rank() < rows[1].urgency_rank(),
+            "bare must outrank prunable"
+        );
+        assert!(
+            Status::ORDER
+                .iter()
+                .all(|status| status.urgency_rank() < rows[0].urgency_rank()),
+            "every real session status must outrank a bare worktree"
+        );
+    }
+
+    fn repo_worktrees(id: u64, name: &str, rows: Vec<WorktreeRow>) -> RepoWorktrees {
+        RepoWorktrees {
+            repo_id: RepoId(id),
+            repo_name: name.to_string(),
+            rows,
+        }
+    }
+
+    #[test]
+    fn group_worktrees_by_repo_sorts_rows_inside_a_group_by_urgency_rank() {
+        let worktrees = vec![
+            worktree_entry("/repo-wt/bare", clean_note(false)),
+            worktree_entry("/repo-wt/asking", clean_note(false)),
+            worktree_entry("/repo-wt/running", clean_note(false)),
+        ];
+        let sessions = vec![
+            row(1, Status::Run, "run", "/repo-wt/running"),
+            row(2, Status::Ask, "ask", "/repo-wt/asking"),
+        ];
+        // Deliberately built in a non-urgency order, so a passing test proves the function
+        // itself sorts rather than merely preserving input order.
+        let rows = build_worktree_rows(&worktrees, &sessions);
+
+        let groups = group_worktrees_by_repo(vec![repo_worktrees(0, "jerry-core", rows)]);
+        assert_eq!(groups.len(), 1);
+        let labels: Vec<&str> = groups[0]
+            .rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["asking", "running", "bare"],
+            "asking (rank 0) before running (rank 3) before a session-less bare row (rank 5)"
+        );
+    }
+
+    #[test]
+    fn group_worktrees_by_repo_orders_groups_by_their_own_most_urgent_worktree() {
+        let quiet_worktrees = vec![worktree_entry("/quiet-repo/main", clean_note(true))];
+        let quiet_rows = build_worktree_rows(&quiet_worktrees, &[]);
+
+        let urgent_worktrees = vec![worktree_entry("/urgent-repo/wt", clean_note(false))];
+        let urgent_sessions = vec![row(1, Status::Ask, "ask", "/urgent-repo/wt")];
+        let urgent_rows = build_worktree_rows(&urgent_worktrees, &urgent_sessions);
+
+        // Built with the quiet (less urgent) repo listed first, so a passing test proves this
+        // is a real sort, not insertion order surviving by coincidence.
+        let groups = group_worktrees_by_repo(vec![
+            repo_worktrees(1, "quiet-repo", quiet_rows),
+            repo_worktrees(2, "urgent-repo", urgent_rows),
+        ]);
+
+        let names: Vec<&str> = groups.iter().map(|g| g.repo_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["urgent-repo", "quiet-repo"],
+            "the repo holding the asking agent must sort first, never alphabetically or by \
+             insertion order"
+        );
+    }
+
+    #[test]
+    fn group_worktrees_by_repo_still_renders_a_single_repo_with_no_worktrees() {
+        let groups = group_worktrees_by_repo(vec![repo_worktrees(0, "jerry-core", Vec::new())]);
+        assert_eq!(
+            groups.len(),
+            1,
+            "a repo group must render even with zero worktree rows - §2.0 says not to \
+             special-case a single (or empty) repo away"
+        );
+        assert_eq!(groups[0].repo_name, "jerry-core");
+        assert!(groups[0].rows.is_empty());
+    }
+
+    #[test]
+    fn repo_group_waiting_count_counts_worktrees_asking_or_failed_hiding_zero_otherwise() {
+        let worktrees = vec![
+            worktree_entry("/repo-wt/asking", clean_note(false)),
+            worktree_entry("/repo-wt/failed", clean_note(false)),
+            worktree_entry("/repo-wt/running", clean_note(false)),
+            worktree_entry("/repo-wt/bare", clean_note(false)),
+        ];
+        let sessions = vec![
+            row(1, Status::Ask, "ask", "/repo-wt/asking"),
+            row(2, Status::Fail, "fail", "/repo-wt/failed"),
+            row(3, Status::Run, "run", "/repo-wt/running"),
+        ];
+        let rows = build_worktree_rows(&worktrees, &sessions);
+        let groups = group_worktrees_by_repo(vec![repo_worktrees(0, "jerry-core", rows)]);
+        assert_eq!(
+            groups[0].waiting_count(),
+            2,
+            "counts the asking and the failed worktree, not the running or bare ones"
+        );
+
+        let all_quiet = build_worktree_rows(
+            &[worktree_entry("/repo-wt/running-only", clean_note(false))],
+            &[row(1, Status::Run, "run", "/repo-wt/running-only")],
+        );
+        let quiet_groups = group_worktrees_by_repo(vec![repo_worktrees(0, "quiet", all_quiet)]);
+        assert_eq!(
+            quiet_groups[0].waiting_count(),
+            0,
+            "hidden at zero - no asking or failed worktrees"
+        );
+    }
+
+    #[test]
+    fn format_elapsed_picks_the_largest_whole_unit() {
+        assert_eq!(format_elapsed(Duration::from_secs(0)), "0s");
+        assert_eq!(format_elapsed(Duration::from_secs(42)), "42s");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
+        assert_eq!(format_elapsed(Duration::from_secs(60)), "1m");
+        assert_eq!(format_elapsed(Duration::from_secs(4 * 60)), "4m");
+        assert_eq!(format_elapsed(Duration::from_secs(3599)), "59m");
+        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1h");
+        assert_eq!(format_elapsed(Duration::from_secs(3 * 3600 + 1800)), "3h");
     }
 
     #[test]

@@ -435,6 +435,27 @@ pub mod status {
     pub const BANNER_BORDER: ColorToken = hex(0x33291a);
 }
 
+/// Tokens used only by the Revision R12 rail rewrite (`design_handoff_jerry_ade/revision 3/
+/// REVISION-2026-07-31.md` §2) that have no exact match elsewhere in this module - every other
+/// colour that section calls for (the branch/note/model/activity greys, the amber flag, the
+/// spine/selection edges) already has one, reused directly at the call site rather than
+/// duplicated here under a second name.
+pub mod rail {
+    use super::{hex, ColorToken};
+
+    /// Repo group header's uppercase name (§2.1: "name in 9.5px uppercase Plex Sans `#787f86`").
+    pub const REPO_HEADER_NAME: ColorToken = hex(0x787f86);
+    /// Active worktree row header background (§2.2: "Active worktree header background
+    /// `#181c1f`").
+    pub const WORKTREE_ACTIVE_BG: ColorToken = hex(0x181c1f);
+    /// Worktree row hover background (§2.2: "hover `#16191c`").
+    pub const WORKTREE_HOVER_BG: ColorToken = hex(0x16191c);
+    /// A prunable (merged, clean, session-less) worktree's 2px left edge (§2.2: "prunable
+    /// `#2f353a`"). A bare-but-not-prunable worktree reuses [`super::status::IDLE_BG`]
+    /// (`#22262a`), an exact match for the spec's "Bare worktrees `#22262a`".
+    pub const PRUNABLE_EDGE: ColorToken = hex(0x2f353a);
+}
+
 pub mod diff {
     use super::{hex, ColorToken};
 

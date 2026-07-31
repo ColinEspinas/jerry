@@ -21,7 +21,7 @@
 
 use crate::keymap;
 use crate::rail::state::{
-    self as rail, RailMode, SessionRow, WorktreeEntry, WorktreeNote, WorktreeRow,
+    self as rail, RepoGroup, RepoWorktrees, SessionRow, WorktreeEntry, WorktreeNote, WorktreeRow,
 };
 use crate::rail::status::Status;
 #[cfg(test)]
@@ -33,8 +33,6 @@ use crate::work_surface::sessions::SessionKind;
 use crate::work_surface::state as work_surface;
 use gpui::{div, font, prelude::*, px, App, ClickEvent, Context, KeyDownEvent, Window};
 use std::collections::{HashMap, HashSet};
-#[cfg(test)]
-use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
