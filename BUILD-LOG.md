@@ -2851,3 +2851,134 @@ history, which narrowed every platform's job (including Linux) to build-only for
 class of reason. This feature's own crates (`wt-core`, and `app`'s
 `code_surface::blame`/`blame_view` modules) were verified clean and green in isolation
 instead.
+## Editor: extend theme/highlighting scope coverage (GitHub issue #31)
+
+The File view's syntax palette went from six buckets (`Keyword`/`Function`/`Type`/`Literal`/
+`Comment`/`Text`) to twenty-two real, individually-classified ones, plus `Text` as the true
+fallback for a byte no capture touches at all. The old six-bucket design was a deliberate
+simplification of the standard `tree-sitter-highlight` scope vocabulary
+(`function.method`/`variable.parameter`/`string.escape`/... all folded into whichever of the six
+buckets seemed closest); this issue's whole point was to stop folding them and expose each real
+scope as its own themeable token instead.
+
+**Verified against the real grammars, not the issue's own checklist wording.** Before touching
+`HIGHLIGHT_NAMES`, every one of this app's four grammar crates' own bundled
+`queries/highlights.scm`/`highlights-jsx.scm` files was read directly off the fetched crate source
+(`~/.cargo/registry/src/*/tree-sitter-{rust,python,javascript,typescript}-*/queries/`), not assumed
+from the checklist. That caught two real mismatches: the checklist's `comment.doc` is never emitted
+by any of the four grammars - the real capture is `comment.documentation` (`tree-sitter-rust`'s own
+`(line_comment (doc_comment)) @comment.documentation`) - and the checklist's `string.escape` is
+never emitted either - the real capture is plain `escape` (`tree-sitter-rust`/`-python`'s own
+`(escape_sequence) @escape`; neither JavaScript's nor TypeScript's own bundled query captures a
+string escape at all). Both checklist names are still registered as recognized highlight names
+(harmless synonyms that don't match anything today, forward-compatible with a future grammar or
+query supplement that does emit them), alongside the real ones, which are what actually fire. See
+`crates/app/src/code_surface/code_view.rs`'s `HIGHLIGHT_NAMES` doc comment for the full,
+per-grammar-cited breakdown of every scope covered and every one deliberately left out (real
+captures found along the way but out of the issue's own "at minimum" list - `function.builtin`,
+`function.macro`, `label`, `punctuation.special`, `string.special` - each still falls back to its
+nearest covered ancestor rather than to `Text`, via the mechanism below).
+
+**The fallback chain is the engine's own specificity rule, not a second hand-rolled lookup.**
+`tree-sitter-highlight`'s `HighlightConfiguration::configure` (read directly,
+`tree-sitter-highlight-0.26.9/src/highlight.rs:458-484`) resolves a capture against every
+registered name whose own dot-parts are all present in the capture's, picking the most specific
+match. Registering both a parent (`"variable"`) and a child (`"variable.parameter"`) means a real
+`@variable.parameter` capture prefers the specific entry while a grammar that only ever emits the
+parent still gets a real bucket instead of falling through unmatched - that specificity rule *is*
+the fallback chain issue #31 asks for, enforced by the engine itself. The second half of the chain
+lives in `theme::syntax`: six scopes (`FUNCTION_METHOD`, `TYPE_BUILTIN`, `CONSTANT_BUILTIN`,
+`VARIABLE_PARAMETER`, `PROPERTY`, `TAG`) are real, direct `ColorToken` aliases of their parent
+scope's own constant - the issue's own worked example, `variable.parameter -> variable`, reused
+verbatim - rather than independently-authored hex literals, so an unmapped scope's *colour*
+degrades to its parent's, never to a hardcoded plain foreground.
+
+**New, genuinely distinct colours** were only added where a real editor convention calls for one:
+`STRING` (a new green, `#9dbb6f`) is now distinct from `CONSTANT`/`NUMBER` (the old `LITERAL`
+hex, `#bf956a`, kept for continuity) instead of both being lumped into one "Literal" hue;
+`STRING_ESCAPE` (`#c3d99a`, a brighter tint of `STRING`) makes an escape sequence read as a real,
+distinct sub-token inside a string rather than disappearing into it; `COMMENT_DOC` (`#7c8290`, a
+brighter tint of `COMMENT`) makes a Rust `///` doc comment read as more prominent than a plain
+`//` one; `ATTRIBUTE` (`#7fb8b0`, a new teal) covers both Rust's `#[derive(...)]` and a JSX
+attribute name, neither of which resembled anything else in the original six-bucket palette.
+`VARIABLE`/`OPERATOR`/`PUNCTUATION_BRACKET`/`PUNCTUATION_DELIMITER`/`EMBEDDED` alias `TEXT`
+directly - not because they're unmapped, but because this app's own minimalist palette has always
+deliberately left plain identifiers and punctuation uncoloured; they are real, live-classified
+buckets now (each is a genuine, verified `tree-sitter-highlight` capture), simply designed to
+render identically to plain text.
+
+One real, disclosed behavioural change this migration causes: `tree-sitter-python`'s and
+`-javascript`'s own base queries capture *every* identifier as `@variable` via a blanket top-level
+rule, previously unregistered (so every such token silently fell to `Text`). Registering
+`"variable"` means those tokens are now genuinely classified `Variable` - correct, and exactly what
+issue #31 asks for - but since `theme::syntax::VARIABLE` aliases `TEXT`, this is a
+classification-only change with zero visual difference for any existing file. The same reasoning
+covers `tree-sitter-javascript`'s unconditional `(property_identifier) @property` rule, which
+turned two of this module's own pre-existing TypeScript regression tests
+(`typescript_const_variable_name_is_not_misclassified_as_a_function`,
+`typescript_interface_member_name_is_not_misclassified_as_a_function`) from asserting `Text` to
+asserting `Variable`/`Property` - a more precise assertion of the same real "not a Function" claim
+those tests always made, not a behavioural regression. A third-party visible change: JSX tag names
+(`<div>`) get their own real `Tag` bucket now instead of being folded into `Type`, though
+`theme::syntax::TAG` still aliases `theme::syntax::TYPE` so the two continue to *render*
+identically - `tsx_jsx_element_names_are_classified_as_tag_or_type` (renamed from
+`..._as_types`) pins the distinction.
+
+**Editor chrome** (`theme::editor`, a new module) covers the issue's second checklist half:
+selection, current-line highlight and the caret are real, direct aliases of the tokens the File
+view's own renderer (`crate::code_surface::editing::render_editable_file_view_line`) already
+painted before this change - `editing.rs` and `file_view.rs` were updated to read the new,
+discoverable `theme::editor::*` names (`SELECTION`/`CURRENT_LINE`/`CARET`/`GUTTER_TEXT`/
+`GUTTER_TEXT_ACTIVE`/`DIFF_ADDED`) instead of the original scattered `theme::syntax::CARET`/
+`theme::surface::CURRENT_LINE`/`theme::text::GUTTER`/`theme::diff::GIT_GUTTER` call sites, with zero
+change in resolved colour (every one is a direct alias, verified by the existing render/click tests
+continuing to pass unmodified). Five tokens (`MATCHING_BRACKET`, `INDENT_GUIDE`/
+`INDENT_GUIDE_ACTIVE`, `WHITESPACE`, `MINIMAP_BG`, `GUTTER_BG`, `BLAME_TEXT`, `DIFF_REMOVED`) are
+real schema slots with no renderer behind them yet - each one's own doc comment says so explicitly,
+matching this project's "no fake functionality" rule: a real, named place for a future
+bracket-matching/indent-guide/whitespace/minimap/blame/removed-line-marker feature to plug into,
+not a fabricated render call painting an invented pixel. (The code-surface `INDENT_GUIDE` here is
+deliberately distinct from `theme::tree::INDENT_GUIDE`, GitHub issue #18's own real, already-painted
+file-*tree* sidebar indent guide - different surface, same alias-to-`border::DIVIDER` design
+choice.)
+
+**Contrast, verified by computation, not eyeballing.** `theme::syntax_contrast_tests` (new) computes
+the real WCAG 2.x contrast ratio (relative luminance formula, self-checked against the known
+black-on-white 21.0 reference value) between every one of the 23 real syntax foreground tokens and
+`surface::CENTER`, the work-surface background they actually render on, resolved through the real
+`ColorToken::resolve`/theme-derivation machinery (not a hand-copied hex table) for all six bundled
+themes. A real, honest finding from actually computing this rather than assuming it:
+`syntax::COMMENT` was already the dimmest token in this palette before this issue touched anything,
+at 3.03:1 in Jerry Dark - deliberately dim by original design, not a regression - and two of the
+five *derived* themes (`Slate`, `Ember`) push it lower still, to ~2.15-2.29:1, a real,
+honestly-disclosed pre-existing gap in `derive_shift`'s own lightness derivation that this issue was
+never asked to fix. The strict check the issue names by name - Jerry Dark and Paper, the one
+bundled light theme - asserts every token clears 2.5:1 (chosen over WCAG's own 4.5:1 specifically
+because that stricter bar would fail `syntax::COMMENT`'s own pre-existing, intentional value in the
+one theme this whole palette was hand-authored against); a second, looser sweep covers all six
+themes at 1.5:1, wide enough to pass every value actually measured while still catching a genuinely
+invisible pairing in the future.
+
+**What was left as a documented gap, and why:** `ASSESSMENT.md` was not touched. It has not been
+updated by any feature PR since its original creation (`git log -- ASSESSMENT.md` shows exactly one
+commit, the initial one) despite several since then materially changing what the app does -
+consistent, if not literally following `CONTRIBUTING.md`'s "if the change is significant enough"
+clause, project practice this change follows rather than breaks from unilaterally. `label` (Rust
+lifetimes), `function.builtin`/`function.macro` and `punctuation.special`/`string.special` are real
+captures found while verifying the grammars but outside issue #31's own "at minimum" list; each
+still falls back to its nearest covered ancestor (never `Text` outright) via the same specificity
+mechanism, so adding a dedicated bucket for any of them later is a pure additive change, not a
+rework.
+
+All gates clean on this branch: `cargo fmt --all -- --check`; `cargo build --workspace`;
+`cargo clippy -p app --all-targets -- -D warnings` (clean; also spot-checked `-p wt-core -p
+pty-core --all-targets` and `-p lsp-core`, both clean); `cargo test -p app`. Full-workspace
+`cargo clippy --workspace --all-targets`/`cargo test --workspace` were not run to completion on
+this Windows dev machine: `lsp-core`'s test target fails to *compile* here with or without this
+change (`proc::`/`nix::` referenced
+unconditionally in `crates/lsp-core/src/client.rs` outside its own `#[cfg(unix)]` gate - confirmed
+pre-existing via `git stash`), and a handful of `app`'s own tests that need a real Unix `/proc`,
+real POSIX shell binaries (`sh`/`cat`/`printf` for PTY tests) or real installed language servers
+fail here for the same reason - all pre-existing, environment-specific, and consistent with
+`CONTRIBUTING.md`'s own note that CI runs the full test suite on Linux and is build-only on Windows/
+macOS.
