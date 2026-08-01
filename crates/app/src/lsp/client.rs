@@ -1273,7 +1273,6 @@ impl AdeApp {
                         // (Revision R8.5b audit finding 6's fix) - an earlier version wrote
                         // `lsp_last_synced_content` at *plan* time, before the send was even
                         // attempted, which meant a failed send still left this bookkeeping
-                        // (and thus `Self::render_file_view`'s own `sync_pending` banner)
                         // confidently, wrongly claiming the server had content it never actually
                         // received.
                         let record_path = relative_path.clone();
@@ -1355,11 +1354,9 @@ impl AdeApp {
                 // no-op for a server that never advertises the capability, so it's skipped
                 // rather than always attempted. Errors are intentionally swallowed here (not
                 // surfaced as a user-facing failure): a failed pull just means diagnostics
-                // stay whatever they were until the *next* sync tick tries again, which
-                // `Self::render_file_view`'s own `sync_pending` banner already communicates
-                // honestly - this app has no separate "diagnostics refresh failed" affordance
-                // for this phase's scope, and inventing one for a single best-effort
-                // background refresh isn't worth it.
+                // stay whatever they were until the *next* sync tick tries again - this app has
+                // no separate "diagnostics refresh failed" affordance for this phase's scope,
+                // and inventing one for a single best-effort background refresh isn't worth it.
                 if client.supports_diagnostic_pull() {
                     // The companion's own independent pull, fired exactly **once** per sync tick
                     // (not once per retry attempt below) as a real, tracked task rather than a
@@ -1429,9 +1426,8 @@ impl AdeApp {
                         if outcome.is_some() {
                             // A real, successful pull answer landed for this exact version - the
                             // real "the server has genuinely answered for this edit" confirmation
-                            // `Self::render_file_view`'s own `sync_pending` banner now waits on
-                            // (Revision R8.5b audit finding 6), not just the send itself.
-                            // `.max(..)` so a real, late-arriving confirmation for an older
+                            // recorded here (Revision R8.5b audit finding 6), not just the send
+                            // itself. `.max(..)` so a real, late-arriving confirmation for an older
                             // version (the same reordering finding 5 guards `pull_diagnostics`'s
                             // own map against) can never regress this back down either.
                             let record_path = relative_path.clone();

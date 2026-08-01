@@ -963,17 +963,14 @@ pub struct AdeApp {
     /// recently *successfully* sent via a real `didChange`, keyed the same worktree-relative way
     /// as [`Self::lsp_last_synced_content`] (written alongside it, same real "the send genuinely
     /// succeeded" moment - Revision R8.5b audit finding 6). Compared against [`Self::
-    /// lsp_diagnostics_confirmed_version`] by [`Self::render_file_view`]'s own `sync_pending`
-    /// banner to answer a stronger question than "was the content sent": "has the server actually
-    /// *answered* for it yet".
+    /// lsp_diagnostics_confirmed_version`] to answer a stronger question than "was the content
+    /// sent": "has the server actually *answered* for it yet".
     pub(crate) lsp_synced_version: HashMap<PathBuf, i32>,
     /// The highest real document version [`Self::schedule_lsp_sync`]'s diagnostics-pull sequence
     /// (or, for a server with no real pull support, the send itself) has *confirmed* an actual
     /// answer for - keyed the same worktree-relative way as [`Self::lsp_last_synced_content`]
     /// (Revision R8.5b audit findings 5/6). While this trails [`Self::lsp_synced_version`], the
-    /// server genuinely has the latest edit but hasn't answered for it yet - the real gap
-    /// [`Self::render_file_view`]'s own `sync_pending` banner now stays honestly "pending"
-    /// through, not just through the `didChange` send itself. Written with `.max(..)`, never a
+    /// server genuinely has the latest edit but hasn't answered for it yet. Written with `.max(..)`, never a
     /// bare overwrite, so a real, late-arriving confirmation for an older version (the same
     /// reordering [`lsp_core::LspClient::pull_diagnostics`]'s own version guard protects against
     /// for the diagnostics map itself) can never regress this back down.
