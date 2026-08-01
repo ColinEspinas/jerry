@@ -15,13 +15,13 @@
 //!
 //! This is read-only. The row `⋯` menu's Branch/Apply/Reset groups are real, visible menu rows
 //! (per the design spec) but every entry that would perform a destructive git operation (check
-//! out, cherry-pick, revert, rebase, reset, force-push, "start a session from this commit") is
+//! out, cherry-pick, revert, rebase, reset, force-push, "start an agent from this commit") is
 //! rendered **disabled** - `crate::work_surface::render::render_dropdown_menu_row`'s existing
 //! `enabled: false` treatment, with no `.on_click` attached - because none of those operations
 //! exist in `wt_core` yet (that's a separate, later phase). Only the Copy group's entries
 //! (real clipboard writes of already-loaded data) and the toolbar's read-only scope segment are
-//! actually wired. Session-to-commit correlation (which agent session authored a commit) is a
-//! separate, later feature too; a first draft carried an always-empty per-commit session column
+//! actually wired. Agent-to-commit correlation (which agent authored a commit) is a
+//! separate, later feature too; a first draft carried an always-empty per-commit agent column
 //! for it, but `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §6.2 removed that
 //! column outright rather than leave it honestly empty - a commit belongs to a worktree, which
 //! can hold several agents, so pinning one agent's live status to a past commit was imprecise on
