@@ -432,6 +432,28 @@ impl AdeApp {
         self.run_graph_remote_op(action, cx, move |root| wt_core::remote::push(&root, force));
     }
 
+    /// The row menu's "Cherry-pick" action - GitHub issue #1's own "cherry pick". Applies
+    /// `sha`'s changes as a new commit on top of the current worktree's branch
+    /// (`wt_core::rewrite::cherry_pick`). A real conflict surfaces through
+    /// [`Self::run_graph_remote_op`]'s own status-message path exactly like a conflicting
+    /// [`Self::request_graph_pull`] does: the worktree is left in the real conflicted state for
+    /// the user to resolve, not silently rolled back.
+    pub(crate) fn request_graph_cherry_pick(&mut self, sha: String, cx: &mut Context<Self>) {
+        self.run_graph_remote_op("Cherry-pick", cx, move |root| {
+            wt_core::rewrite::cherry_pick(&root, &sha)
+        });
+    }
+
+    /// The row menu's "Revert" action - GitHub issue #1's own "revert commit". Creates a new
+    /// commit undoing `sha`'s changes (`wt_core::rewrite::revert`); see
+    /// [`Self::request_graph_cherry_pick`]'s own docs on real-conflict handling, which applies
+    /// identically here.
+    pub(crate) fn request_graph_revert(&mut self, sha: String, cx: &mut Context<Self>) {
+        self.run_graph_remote_op("Revert", cx, move |root| {
+            wt_core::rewrite::revert(&root, &sha)
+        });
+    }
+
     /// Shared plumbing behind [`Self::request_graph_fetch`]/[`Self::request_graph_pull`]/
     /// [`Self::request_graph_push`]: guards against a double-click starting a second, overlapping
     /// git subprocess (`GraphTabState::remote_op_in_flight`), runs `op` on the background
@@ -1294,13 +1316,23 @@ impl AdeApp {
                     ))
                     .child(render_graph_row_menu_header("Apply"))
                     .child(render_dropdown_menu_row(
-                        "\u{2398}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Cherry-pick", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
+                        "\u{2398}", theme::button::BLUE_FG.into(), theme::surface::CHIP_NEUTRAL.into(),
+                        "Cherry-pick", String::new(), Vec::new(), true,
+                    ).on_click(cx.listener({
+                        let sha = sha.clone();
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.request_graph_cherry_pick(sha.clone(), cx);
+                        }
+                    })))
                     .child(render_dropdown_menu_row(
-                        "\u{21b6}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Revert", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
+                        "\u{21b6}", theme::button::AMBER_FG.into(), theme::surface::CHIP_NEUTRAL.into(),
+                        "Revert", String::new(), Vec::new(), true,
+                    ).on_click(cx.listener({
+                        let sha = sha.clone();
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.request_graph_revert(sha.clone(), cx);
+                        }
+                    })))
                     .child(render_dropdown_menu_row(
                         "\u{2191}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
                         "Rebase onto this commit", "not implemented yet".to_string(), Vec::new(), false,
@@ -1387,7 +1419,7 @@ impl AdeApp {
             ));
 
         let body = match self.graph_state.right_panel {
-            GraphRightPanel::Commit => self.render_graph_commit_panel(),
+            GraphRightPanel::Commit => self.render_graph_commit_panel(cx),
             GraphRightPanel::Branches => self.render_graph_branches_panel(cx),
         };
 
@@ -1402,7 +1434,7 @@ impl AdeApp {
             .into_any_element()
     }
 
-    fn render_graph_commit_panel(&self) -> gpui::AnyElement {
+    fn render_graph_commit_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(index) = self.graph_state.selected_row else {
             return render_sidebar_message(
                 "select a commit to see its details".to_string(),
@@ -1502,8 +1534,32 @@ impl AdeApp {
                     .flex()
                     .gap(px(8.0))
                     .pt(px(8.0))
-                    .child(render_graph_disabled_footer_button("Cherry-pick"))
-                    .child(render_graph_disabled_footer_button("Revert")),
+                    .child(
+                        render_graph_footer_action_button(
+                            "graph-commit-panel-cherry-pick",
+                            "Cherry-pick",
+                            theme::button::BLUE_FG.into(),
+                        )
+                        .on_click(cx.listener({
+                            let sha = row.commit.id.clone();
+                            move |this, _event: &ClickEvent, _window, cx| {
+                                this.request_graph_cherry_pick(sha.clone(), cx);
+                            }
+                        })),
+                    )
+                    .child(
+                        render_graph_footer_action_button(
+                            "graph-commit-panel-revert",
+                            "Revert",
+                            theme::button::AMBER_FG.into(),
+                        )
+                        .on_click(cx.listener({
+                            let sha = row.commit.id.clone();
+                            move |this, _event: &ClickEvent, _window, cx| {
+                                this.request_graph_revert(sha.clone(), cx);
+                            }
+                        })),
+                    ),
             )
             .into_any_element()
     }
@@ -1664,16 +1720,28 @@ fn render_graph_meta_row(label: &'static str, value: String) -> impl IntoElement
         .child(div().flex_1().text_color(theme::text::DIM).child(value))
 }
 
-fn render_graph_disabled_footer_button(label: &'static str) -> impl IntoElement {
+/// The commit detail panel's own Cherry-pick/Revert buttons - a real, clickable twin of the
+/// row menu's "Apply" section rows (`Self::render_graph_row_menu`) for the currently-selected
+/// commit, since a commit already open in this panel is a real, common place to want the same
+/// action from without reopening the `⋯` menu.
+fn render_graph_footer_action_button(
+    id: &'static str,
+    label: &'static str,
+    color: gpui::Rgba,
+) -> gpui::Stateful<gpui::Div> {
     div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .cursor_pointer()
         .px(px(10.0))
         .py(px(5.0))
         .rounded(theme::radius::BUTTON)
         .border_1()
-        .border_color(theme::border::BUTTON_DISABLED)
+        .border_color(theme::border::BUTTON)
+        .hover(move |el| el.bg(theme::surface::ROW_HOVER_ALT))
         .font(font(theme::font::SANS))
         .text_size(px(10.5))
-        .text_color(theme::text::DISABLED)
+        .text_color(color)
         .child(label)
 }
 
@@ -5292,6 +5360,115 @@ mod graph_remote_action_tests {
         assert!(
             !app.read_with(cx, |app, _| app.graph_state.remote_op_in_flight),
             "the in-flight guard must still clear even when the operation fails"
+        );
+    }
+
+    /// A real local repo (no remote needed) with a `main` branch and a `feature` branch that
+    /// diverged from it - `Self::request_graph_cherry_pick`/`Self::request_graph_revert`'s own
+    /// tests only ever need one worktree, unlike the push/pull tests above.
+    fn open_seeded_local_repo(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        Entity<AdeApp>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let local = tempfile::tempdir().expect("tempdir");
+        git(local.path(), &["init", "-b", "main"]);
+        git(local.path(), &["config", "user.email", "test@example.com"]);
+        git(local.path(), &["config", "user.name", "Test User"]);
+        commit(local.path(), "a.txt", "base", "base");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, local.path().to_path_buf());
+        (local, app, cx)
+    }
+
+    #[gpui::test]
+    async fn cherry_pick_really_applies_the_commit_and_reports_success(cx: &mut TestAppContext) {
+        let (local, app, cx) = open_seeded_local_repo(cx);
+        git(local.path(), &["checkout", "-b", "feature"]);
+        commit(local.path(), "b.txt", "feature content", "feature work");
+        let feature_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+        git(local.path(), &["checkout", "main"]);
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_cherry_pick(feature_sha, cx);
+        });
+        cx.run_until_parked();
+
+        let head_subject = git_output(local.path(), &["log", "-1", "--format=%s"]);
+        assert_eq!(
+            head_subject, "feature work",
+            "the real click must have run a real git cherry-pick onto the current branch"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
+            Some("Cherry-pick".to_string()),
+            "a successful cherry-pick must report real success, not the old 'not implemented \
+             yet' stub text"
+        );
+        assert!(
+            !app.read_with(cx, |app, _| app.graph_state.remote_op_in_flight),
+            "the in-flight guard must clear once the real cherry-pick completes"
+        );
+    }
+
+    #[gpui::test]
+    async fn cherry_pick_a_real_conflict_surfaces_as_a_real_status_message_not_a_crash(
+        cx: &mut TestAppContext,
+    ) {
+        let (local, app, cx) = open_seeded_local_repo(cx);
+        git(local.path(), &["checkout", "-b", "feature"]);
+        commit(local.path(), "a.txt", "feature change", "feature work");
+        let feature_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+        git(local.path(), &["checkout", "main"]);
+        commit(
+            local.path(),
+            "a.txt",
+            "conflicting main change",
+            "main diverges",
+        );
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_cherry_pick(feature_sha, cx);
+        });
+        cx.run_until_parked();
+
+        let status = app.read_with(cx, |app, _| app.graph_state.status_message.clone());
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Cherry-pick failed:")),
+            "a real conflicting cherry-pick must surface as a real, visible failure message, \
+             not a silent success or a panic - got {status:?}"
+        );
+        assert!(
+            local.path().join(".git/CHERRY_PICK_HEAD").exists(),
+            "the worktree must be left in the real conflicted state for the user to resolve"
+        );
+    }
+
+    #[gpui::test]
+    async fn revert_really_creates_an_undo_commit_and_reports_success(cx: &mut TestAppContext) {
+        let (local, app, cx) = open_seeded_local_repo(cx);
+        commit(local.path(), "a.txt", "changed", "the change to undo");
+        let to_revert = git_output(local.path(), &["rev-parse", "HEAD"]);
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_revert(to_revert, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            std::fs::read_to_string(local.path().join("a.txt")).expect("read a.txt"),
+            "base",
+            "the real click must have run a real git revert restoring the file's prior content"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
+            Some("Revert".to_string()),
+            "a successful revert must report real success, not the old 'not implemented yet' \
+             stub text"
         );
     }
 }
