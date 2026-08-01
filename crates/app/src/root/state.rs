@@ -349,6 +349,8 @@ impl AdeApp {
             _tab_order_save_task: None,
             tab_drag_insertion: None,
             dragging_tab: None,
+            dropped_tab_settle: None,
+            next_tab_settle_id: 0,
             custom_themes,
             custom_theme_load_errors,
             custom_theme_status: None,
