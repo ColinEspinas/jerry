@@ -218,6 +218,18 @@ pub(crate) const WORKTREE_WATCH_TICK: Duration = Duration::from_millis(300);
 /// the one refresh that follows it, rather than each one triggering its own.
 pub(crate) const WORKTREE_WATCH_SETTLE: Duration = Duration::from_millis(200);
 
+/// GitHub issue #13's own "keep a low-frequency polling fallback" - the file tree is re-walked
+/// at least this often even if [`AdeApp::_file_tree_watcher`] never fires (setup failed, or an
+/// OS-level watch-descriptor budget was exhausted on a very large tree - see
+/// `crate::sidebar::file_tree_watch::spawn_file_tree_watcher`'s own docs). Same interval as
+/// [`WORKTREE_WATCH_POLL_INTERVAL`], not independently tuned - there's no reason the two should
+/// disagree about what an acceptable "worst case, no watcher at all" staleness looks like.
+pub(crate) const FILE_TREE_WATCH_POLL_INTERVAL: Duration = WORKTREE_WATCH_POLL_INTERVAL;
+
+/// [`AdeApp::start_file_tree_watch`]'s own [`WORKTREE_WATCH_TICK`]/[`WORKTREE_WATCH_SETTLE`].
+pub(crate) const FILE_TREE_WATCH_TICK: Duration = WORKTREE_WATCH_TICK;
+pub(crate) const FILE_TREE_WATCH_SETTLE: Duration = WORKTREE_WATCH_SETTLE;
+
 /// How often [`AdeApp::render_file_view`] calls `std::fs::metadata` for its freshness check -
 /// throttled rather than unconditional-per-render (see
 /// [`AdeApp::file_view_last_freshness_check`]).
@@ -1064,6 +1076,15 @@ pub struct AdeApp {
     /// [`Self::load_worktrees`] - see that method's own docs.
     pub(crate) _worktree_watch_task: Option<Task<()>>,
     pub(crate) _load_file_tree_task: Option<Task<()>>,
+    /// The live `notify` filesystem watcher on [`Self::file_tree_root`] (GitHub issue #13,
+    /// `crate::sidebar::file_tree_watch`) - re-armed on a fresh root every real
+    /// [`Self::set_file_tree_root`] call, unlike [`Self::_worktree_watcher`]'s "once, for the
+    /// whole app lifetime" own scope. Same "`None` on honest setup failure, poll fallback still
+    /// runs" contract as that field.
+    pub(crate) _file_tree_watcher: Option<notify::RecommendedWatcher>,
+    /// The debounced-watcher-plus-poll-fallback refresh loop (`Self::start_file_tree_watch`) that
+    /// calls [`Self::load_file_tree`] - see that method's own docs.
+    pub(crate) _file_tree_watch_task: Option<Task<()>>,
     pub(crate) _load_diff_task: Option<Task<()>>,
     /// The in-flight `code_view::load_file` task for whichever path [`FileLoadState::Loading`]
     /// names - dropping it (a fresh assignment, or `Self::select_worktree`'s reset) cancels that

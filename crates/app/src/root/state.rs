@@ -349,6 +349,8 @@ impl AdeApp {
             _worktree_watcher: None,
             _worktree_watch_task: None,
             _load_file_tree_task: None,
+            _file_tree_watcher: None,
+            _file_tree_watch_task: None,
             _load_diff_task: None,
             _file_load_task: None,
             _status_poll_task: None,
@@ -471,7 +473,7 @@ impl AdeApp {
             // See the `expanded_dirs`/`fold_state_root_key` note in the literal above: resolving
             // the worktree key here, through the one function that ever resolves it, is what
             // keeps the startup path and every later worktree switch structurally identical.
-            this.set_file_tree_root(path.clone());
+            this.set_file_tree_root(path.clone(), cx);
             this.reload_expanded_dirs_from_fold_state();
         }
         // Applies `this.settings.keymap.overrides` on top of `crate::default_key_bindings()` -
@@ -593,7 +595,7 @@ impl AdeApp {
                             .and_then(|index| this.worktrees.get(index))
                             .map(|item| item.path.clone())
                             .unwrap_or_else(|| this.focused_repo_path());
-                        this.set_file_tree_root(new_root.clone());
+                        this.set_file_tree_root(new_root.clone(), cx);
                         this.file_tree = Vec::new();
                         this.reload_expanded_dirs_from_fold_state();
                         this.load_file_tree(new_root.clone(), cx);
@@ -663,16 +665,20 @@ impl AdeApp {
         };
     }
 
-    pub(crate) fn set_file_tree_root(&mut self, root: PathBuf) {
+    pub(crate) fn set_file_tree_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         if self.file_tree_root == root && self.fold_state_root_key.is_some() {
             return;
         }
         self.fold_state_root_key = fold_state::worktree_key(&root);
         self.file_tree_root = root;
+        // Re-arms the real filesystem watch on the *new* root (GitHub issue #13) - see
+        // `Self::start_file_tree_watch`'s own docs on why this only happens on a genuine root
+        // change, guarded by the early return above, rather than on every `load_file_tree` call.
+        self.start_file_tree_watch(cx);
     }
 
     pub(crate) fn load_file_tree(&mut self, root: PathBuf, cx: &mut Context<Self>) {
-        self.set_file_tree_root(root.clone());
+        self.set_file_tree_root(root.clone(), cx);
         // Always a real bound - see [`Self::file_tree_limit_override`] for why even the "load
         // more" escape hatch raises the cap rather than removing it.
         let limit = Some(
@@ -721,6 +727,88 @@ impl AdeApp {
             });
         });
         self._load_file_tree_task = Some(task);
+    }
+
+    /// Starts (or, via [`Self::set_file_tree_root`], re-starts on a new worktree) the real
+    /// filesystem-watch-plus-poll-fallback loop behind GitHub issue #13's "the file list...
+    /// drifts out of sync with the actual state on disk" - the same debounced-watcher-plus-
+    /// poll-fallback shape `Self::start_worktree_watch` already established for the worktree
+    /// list, just scoped to [`Self::file_tree_root`] and reloading via [`Self::load_file_tree`]
+    /// instead. Assigning fresh values to [`Self::_file_tree_watcher`]/
+    /// [`Self::_file_tree_watch_task`] drops (and so silently stops) whatever watcher/loop was
+    /// previously watching the worktree just left - `Self::set_file_tree_root`'s own early
+    /// return is what keeps this from happening on every unrelated `load_file_tree` call, not
+    /// this method itself re-checking anything.
+    ///
+    /// A no-op (clearing both fields rather than starting anything) unless both:
+    /// - `root` is really part of a git worktree (production never has a non-git
+    ///   [`Self::file_tree_root`] - see
+    ///   `crate::sidebar::file_tree_watch::spawn_file_tree_watcher`'s own docs on that gate), and
+    /// - [`Self::settings_path`] is real (`Some`) - the same "this is a real, persisted session,
+    ///   not a throwaway test instance" signal [`Self::persist_settings`] already gates its own
+    ///   real disk write on (see that method's own docs).
+    ///
+    /// Both checks matter operationally, not just semantically: a real, reproduced regression
+    /// found while building this - a real `notify::RecommendedWatcher` OS thread/instance spun
+    /// up for essentially every one of this crate's own GPUI tests (the overwhelming majority
+    /// construct an `AdeApp` against a real git repo purely for unrelated reasons, e.g. `wt_core`
+    /// diff/merge/undo coverage, with a `None` settings path per `root::focus::palette_focus_
+    /// tests::open_test_app`'s own docs) - was enough cumulative resource pressure, across a full
+    /// `cargo test` run, to start starving `crate::rail::worktree_watch`'s own real-OS-thread-
+    /// driven tests past their real-time budget. The `settings_path` check alone would already
+    /// fix that (it's `None` for effectively every test but the handful that deliberately opt
+    /// into a real settings path to test real persistence), but the git-repo check is kept too
+    /// since it's independently correct for production, matching
+    /// `crate::rail::worktree_watch::spawn_worktree_watcher`'s own identical gate.
+    pub(crate) fn start_file_tree_watch(&mut self, cx: &mut Context<Self>) {
+        let root = self.file_tree_root.clone();
+        if self.settings_path.is_none() || wt_core::git_common_dir(&root).is_err() {
+            self._file_tree_watcher = None;
+            self._file_tree_watch_task = None;
+            return;
+        }
+        let dirty: crate::rail::worktree_watch::DirtyFlag =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self._file_tree_watcher =
+            crate::sidebar::file_tree_watch::spawn_file_tree_watcher(&root, dirty.clone());
+
+        let task = cx.spawn(async move |this, cx| {
+            let mut last_refresh = Instant::now();
+            loop {
+                cx.background_executor().timer(FILE_TREE_WATCH_TICK).await;
+
+                let watcher_fired = dirty.load(std::sync::atomic::Ordering::SeqCst);
+                if watcher_fired {
+                    // Let a burst of events from one save/build/checkout settle before acting,
+                    // then clear whatever accumulated during the settle window too - see
+                    // `Self::start_worktree_watch`'s identical own reasoning.
+                    cx.background_executor().timer(FILE_TREE_WATCH_SETTLE).await;
+                    dirty.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                let poll_due = last_refresh.elapsed() >= FILE_TREE_WATCH_POLL_INTERVAL;
+
+                if !watcher_fired && !poll_due {
+                    continue;
+                }
+                last_refresh = Instant::now();
+
+                let updated = this.update(cx, |this, cx| {
+                    // The active worktree may have changed since this loop's own last tick (a
+                    // fresh loop for the new root already started - see this method's own docs -
+                    // so this one only needs to stop cleanly rather than reload the wrong root).
+                    if this.file_tree_root != root {
+                        return false;
+                    }
+                    this.load_file_tree(root.clone(), cx);
+                    true
+                });
+                match updated {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => break,
+                }
+            }
+        });
+        self._file_tree_watch_task = Some(task);
     }
 
     /// The worktree a *new* agent should be spawned into: the selected worktree's real
@@ -826,7 +914,7 @@ impl AdeApp {
         // new root's expanded set - and a click on one of those stale rows would reach
         // `set_dir_expanded` with a path from an entirely different worktree/repo. Clearing
         // `file_tree` makes that window render an honestly empty tree instead.
-        self.set_file_tree_root(new_root.clone());
+        self.set_file_tree_root(new_root.clone(), cx);
         self.file_tree = Vec::new();
         self.reload_expanded_dirs_from_fold_state();
         // Every one of these holds an absolute path in whatever was just left (GitHub issue #19):
@@ -1576,6 +1664,129 @@ mod load_worktrees_integration_tests {
             app.read_with(cx, |app, _| app.worktree_selection_notice.clone()),
             None,
             "a real user re-selection must clear the stale fallback notice"
+        );
+    }
+}
+
+/// GitHub issue #13's own real, end-to-end wiring proof: opening the app arms a real file-tree
+/// watcher, and switching worktrees re-arms it onto the new root rather than leaking the old
+/// one. The watcher's own OS-level event delivery/`.git/`-filtering already has real, non-`gpui`
+/// coverage in `crate::sidebar::file_tree_watch`'s own test module - see
+/// `load_worktrees_integration_tests`'s identical own docs for why the debounced polling loop
+/// itself isn't driven end to end through a `gpui` test's deterministic clock.
+#[cfg(test)]
+mod file_tree_watch_integration_tests {
+    use crate::root::AdeApp;
+    use crate::settings::store as settings_store;
+    use gpui::TestAppContext;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}",
+            args,
+            dir
+        );
+    }
+
+    fn init_repo() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "user.name", "Test User"]);
+        fs::write(dir.path().join("base.txt"), "base\n").expect("write");
+        git(dir.path(), &["add", "base.txt"]);
+        git(dir.path(), &["commit", "-m", "initial"]);
+        dir
+    }
+
+    /// `Self::start_file_tree_watch` only ever arms a real watcher for a real, `Some` settings
+    /// path (see that method's own docs on why) - `root::focus::palette_focus_tests::
+    /// open_test_app`'s own `None` path would make every assertion in this module vacuous, so
+    /// these tests need their own real-settings-path open helper instead.
+    fn open_test_app_with_real_settings_path(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = config_dir.path().join("settings.toml");
+        // Leaked deliberately: `config_dir` must outlive the returned `AdeApp`, and this helper
+        // has no later point to drop it at - the OS reclaims it at process exit either way, the
+        // same real tradeoff `tempfile::TempDir::into_path` documents for this exact situation.
+        std::mem::forget(config_dir);
+        cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                repo_path,
+                settings_store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn opening_the_app_arms_a_real_file_tree_watcher(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let (app, cx) = open_test_app_with_real_settings_path(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app._file_tree_watcher.is_some()),
+            "startup must arm a real watcher on the initial file tree root"
+        );
+    }
+
+    #[gpui::test]
+    fn selecting_a_different_worktree_re_arms_the_watcher_on_the_new_root(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let container = TempDir::new().expect("tempdir");
+        let linked_path = container.path().join("added-wt");
+        drop(container);
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                linked_path.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let (app, cx) = open_test_app_with_real_settings_path(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        app.update(cx, |app, cx| app.load_worktrees(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.worktrees.len()),
+            2,
+            "premise: the linked worktree above must really be there to select"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(1, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.file_tree_root.clone()),
+            linked_path,
+            "premise: selecting the linked worktree must really move the file tree root"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app._file_tree_watcher.is_some()),
+            "switching worktrees must re-arm a real watcher on the newly selected root, not \
+             leave the previous worktree's watcher (or none at all) in place"
         );
     }
 }
