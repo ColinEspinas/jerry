@@ -1200,88 +1200,101 @@ impl AdeApp {
             .h(theme::band::PANEL_HEADER)
             .flex()
             .items_center()
-            .justify_between()
             .px(px(10.0))
             .border_b_1()
             .border_color(theme::border::INNER)
             .child(toggle)
-            .when_some(totals, |el, (add, del)| {
-                el.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .font(font(theme::font::MONO))
-                        .text_size(self.ui_text_size(10.0))
-                        .child(
+            // Everything below is one right-aligned action cluster - a `flex_1` spacer, not
+            // `justify_between`, keeps it pinned to the trailing edge instead of spreading
+            // apart (and stranding the collapse-all caret alone in the middle) whenever fewer
+            // than all four children are present.
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .when_some(totals, |el, (add, del)| {
+                        el.child(
                             div()
-                                .text_color(theme::diff::STAT_ADD)
-                                .child(format!("+{add}")),
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .font(font(theme::font::MONO))
+                                .text_size(self.ui_text_size(10.0))
+                                .child(
+                                    div()
+                                        .text_color(theme::diff::STAT_ADD)
+                                        .child(format!("+{add}")),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(theme::diff::STAT_DEL)
+                                        .child(format!("\u{2212}{del}")),
+                                ),
                         )
-                        .child(
+                    })
+                    // "Collapse all" (issue #18 §1) - resets the tree *and* this worktree's
+                    // saved fold state in one step, so it genuinely undoes the expansions rather
+                    // than hiding them until the next launch. Files view only, like the "+"
+                    // beside it.
+                    .when(self.right_sidebar_view == RightSidebarView::Files, |el| {
+                        el.child(
                             div()
-                                .text_color(theme::diff::STAT_DEL)
-                                .child(format!("\u{2212}{del}")),
-                        ),
-                )
-            })
-            // "Collapse all" (issue #18 §1) - resets the tree *and* this worktree's saved fold
-            // state in one step, so it genuinely undoes the expansions rather than hiding them
-            // until the next launch. Files view only, like the "+" beside it.
-            .when(self.right_sidebar_view == RightSidebarView::Files, |el| {
-                el.child(
-                    div()
-                        .id("file-tree-collapse-all")
-                        .debug_selector(|| "file-tree-collapse-all".to_string())
-                        .flex_none()
-                        .cursor_pointer()
-                        .px(px(5.0))
-                        .rounded(theme::radius::CHIP)
-                        .font(font(theme::font::MONO))
-                        .text_size(self.ui_text_size(12.0))
-                        .text_color(theme::text::GHOST)
-                        .hover(|el| {
-                            el.bg(theme::surface::ROW_HOVER_ALT)
-                                .text_color(theme::text::PRIMARY)
-                        })
-                        .tooltip(text_tooltip(
-                            "Collapse all folders (also clears the saved fold state)",
-                        ))
-                        // The same "\u{25be} pointing down" glyph `render_tree_caret` uses for an
-                        // open folder, since this is the action that closes every one of them.
-                        .child("\u{25be}")
-                        .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                            this.collapse_all_dirs(cx);
-                        })),
-                )
-            })
-            // Root-level "New file" - creates directly in the worktree root, the one location
-            // the per-directory "+" on `Self::render_file_tree_row` can't reach (the root itself
-            // has no row of its own to attach to). Only shown for the Files view - the Changes
-            // list has no directory concept to anchor a "new file" affordance to.
-            .when(self.right_sidebar_view == RightSidebarView::Files, |el| {
-                let root = self.file_tree_root.clone();
-                el.child(
-                    div()
-                        .id("file-tree-new-file-root")
-                        .flex_none()
-                        .cursor_pointer()
-                        .px(px(5.0))
-                        .rounded(theme::radius::CHIP)
-                        .font(font(theme::font::MONO))
-                        .text_size(self.ui_text_size(12.0))
-                        .text_color(theme::text::GHOST)
-                        .hover(|el| {
-                            el.bg(theme::surface::ROW_HOVER_ALT)
-                                .text_color(theme::text::PRIMARY)
-                        })
-                        .tooltip(text_tooltip("New file in worktree root"))
-                        .child("+")
-                        .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                            this.start_new_file(root.clone(), window, cx);
-                        })),
-                )
-            })
+                                .id("file-tree-collapse-all")
+                                .debug_selector(|| "file-tree-collapse-all".to_string())
+                                .flex_none()
+                                .cursor_pointer()
+                                .px(px(5.0))
+                                .rounded(theme::radius::CHIP)
+                                .font(font(theme::font::MONO))
+                                .text_size(self.ui_text_size(12.0))
+                                .text_color(theme::text::GHOST)
+                                .hover(|el| {
+                                    el.bg(theme::surface::ROW_HOVER_ALT)
+                                        .text_color(theme::text::PRIMARY)
+                                })
+                                .tooltip(text_tooltip(
+                                    "Collapse all folders (also clears the saved fold state)",
+                                ))
+                                // The same "\u{25be} pointing down" glyph `render_tree_caret`
+                                // uses for an open folder, since this is the action that closes
+                                // every one of them.
+                                .child("\u{25be}")
+                                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                    this.collapse_all_dirs(cx);
+                                })),
+                        )
+                    })
+                    // Root-level "New file" - creates directly in the worktree root, the one
+                    // location the per-directory "+" on `Self::render_file_tree_row` can't reach
+                    // (the root itself has no row of its own to attach to). Only shown for the
+                    // Files view - the Changes list has no directory concept to anchor a
+                    // "new file" affordance to.
+                    .when(self.right_sidebar_view == RightSidebarView::Files, |el| {
+                        let root = self.file_tree_root.clone();
+                        el.child(
+                            div()
+                                .id("file-tree-new-file-root")
+                                .flex_none()
+                                .cursor_pointer()
+                                .px(px(5.0))
+                                .rounded(theme::radius::CHIP)
+                                .font(font(theme::font::MONO))
+                                .text_size(self.ui_text_size(12.0))
+                                .text_color(theme::text::GHOST)
+                                .hover(|el| {
+                                    el.bg(theme::surface::ROW_HOVER_ALT)
+                                        .text_color(theme::text::PRIMARY)
+                                })
+                                .tooltip(text_tooltip("New file in worktree root"))
+                                .child("+")
+                                .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                                    this.start_new_file(root.clone(), window, cx);
+                                })),
+                        )
+                    }),
+            )
     }
 
     /// Zone 3's whole real body: the `Files | Changes` header, then either the scrollable file
