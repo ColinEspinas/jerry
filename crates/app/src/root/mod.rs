@@ -467,10 +467,29 @@ pub struct AdeApp {
     /// `git add`/unstage - see its own docs). `Self::render_changes_header`'s progress bar/count
     /// and `Self::render_commit_composer` both read this directly. Keyed by worktree, not agent
     /// (§5's own "staging is keyed by worktree, not agent") - it holds exactly one set at a time,
-    /// re-derived from the real git index on every worktree switch by
-    /// `crate::root::state::reset_per_worktree_ui_state` rather than merely cleared (see that
-    /// function's own docs for why a live re-query, not a cache, is honest here).
+    /// cleared synchronously on every worktree switch by
+    /// `crate::root::state::reset_per_worktree_ui_state` (so nothing from the worktree just left
+    /// can flash before the new one's real state lands) and then genuinely re-derived from the
+    /// real git index (`wt_core::stage::staged_paths`) inside `Self::load_diff`'s own background
+    /// task - see that method's docs for why this is a live re-query on every diff load rather
+    /// than a per-worktree cache, and why that means a worktree with something already staged in
+    /// real git before Jerry ever opened it still reads as staged once loaded.
     pub(crate) staged_files: HashSet<PathBuf>,
+    /// The most recent real staging/unstaging failure from [`Self::toggle_staged`] - `(path,
+    /// message)`. Surfaced next to the commit composer (`Self::render_staging_error`) the same
+    /// honest way [`Self::tree_op_error`] surfaces a failed tree operation, rather than silently
+    /// swallowing a real `git add`/`git reset` failure behind an optimistic UI update that
+    /// quietly reverts. Cleared on dismiss, on the next successful toggle of the same path, and
+    /// (implicitly, since it names a worktree-relative path) whenever a worktree switch clears
+    /// [`Self::staged_files`] out from under it.
+    pub(crate) staging_error: Option<(PathBuf, String)>,
+    /// Every in-flight [`Self::toggle_staged`] background `git add`/`git reset` - a [`TaskPool`],
+    /// not a single slot, for the same "independent operations" reason as
+    /// [`Self::_merge_write_tasks`]: two different Changes rows' checkboxes clicked in quick
+    /// succession are two genuinely independent real git operations, and a shared single slot
+    /// would silently cancel (and so leave un-applied) whichever one didn't win the race for the
+    /// slot.
+    pub(crate) _stage_tasks: TaskPool,
     /// Whether the commit composer's `▾` split-button popover (Revision R12 §5: *Commit and
     /// push* / *Commit all N files* / *Amend last commit* / *Stash staged files*) is open. Closed
     /// on every worktree switch (`Self::select_worktree`) since it targets that worktree's own

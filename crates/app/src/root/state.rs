@@ -160,6 +160,8 @@ impl AdeApp {
             _tree_delete_task: None,
             _tree_copy_task: None,
             staged_files: HashSet::new(),
+            staging_error: None,
+            _stage_tasks: TaskPool::new(),
             commit_menu_open: false,
             open_files_by_worktree: HashMap::new(),
             open_change: None,
@@ -915,6 +917,17 @@ impl AdeApp {
 /// survive that (its absolute path simply never matches anything in the new tree, so nothing
 /// would ever remove it). A free, `gpui`-free function so this is unit-testable without constructing an
 /// `AdeApp`.
+///
+/// `staged_files` is cleared here too, but only as the *synchronous* half of a two-step reset:
+/// this stops the worktree just left's staged set from flashing on screen for the frame or two
+/// before the new worktree's own diff lands, but it is not itself where the new worktree's real
+/// staged set comes from. `AdeApp::select_worktree` calls `AdeApp::load_diff` immediately after
+/// this function returns, and `load_diff`'s own background task re-derives `staged_files` from a
+/// real `git diff --cached --name-only` (`wt_core::stage::staged_paths`) against the worktree
+/// being switched *to* - so a file already staged in the real index before Jerry ever opened this
+/// worktree reads as staged once the load lands, rather than this reset leaving it looking
+/// unstaged forever (see `load_diff`'s own docs for why this is a live re-query on every diff
+/// load, not a per-worktree cache).
 ///
 /// **Deliberately does *not* touch `open_files`/`edit_buffers` anymore.** Both moved to real,
 /// per-worktree-keyed storage (`AdeApp::open_files_by_worktree`, keyed by
