@@ -1380,6 +1380,15 @@ pub struct AdeApp {
     /// outside any drop target) can't leave a stale caret painted on a tab no drag is over
     /// anymore.
     pub(crate) tab_drag_insertion: Option<(work_surface::TabRef, bool)>,
+    /// The unified tab strip's real drag-ghost state (GitHub issue #16's "the original slot
+    /// renders dimmed" ask): `Some(tab_ref)` for exactly the tab currently being dragged, from
+    /// its own `on_drag` constructor callback (`Self::render_file_tab`/`Self::render_agent_tab`)
+    /// until either a real drop (`Self::drop_dragged_tab`) or a cancelled drag (the same
+    /// workspace-body `on_mouse_up` that clears [`Self::tab_drag_insertion`] on a cancel clears
+    /// this too). Never two tabs at once: a new drag's own `on_drag` overwrites whatever was
+    /// here, which only matters if a previous drag's cancel-cleanup somehow missed - a defensive
+    /// property, not a real multi-drag scenario GPUI itself allows.
+    pub(crate) dragging_tab: Option<work_surface::TabRef>,
     /// User-authored themes loaded from `~/.config/jerry/themes/*.toml` at construction time
     /// (GitHub issue #5) - real, additional `crate::settings::custom_theme::CustomTheme` entries
     /// layered on top of the six built-in `settings::THEME_DEFS`, not a replacement for them. See
@@ -1920,17 +1929,17 @@ impl AdeApp {
                     this.apply_pane_resize(target, event.event.position.x, cx);
                 },
             ))
-            // Defensive cleanup for `Self::tab_drag_insertion`: unlike `PaneResizeDrag` above,
-            // this one *does* need an explicit mouse-up handler, because it isn't derived fresh
-            // from the cursor position on every tick - it's the last tab strip
-            // `on_drag_move::<DraggedTab>` claimed, which stays stale if the drag ends by
-            // releasing outside any tab's own hitbox (a cancelled drag) rather than through a
-            // real `on_drop`. The body spans virtually the whole window below the title bar, so
-            // this reaches almost every real release point.
+            // Defensive cleanup for `Self::tab_drag_insertion`/[`Self::dragging_tab`]: unlike
+            // `PaneResizeDrag` above, these *do* need an explicit mouse-up handler, because
+            // neither is derived fresh from the cursor position on every tick - they're the last
+            // tab strip `on_drag_move::<DraggedTab>`/`on_drag` claimed, which stays stale if the
+            // drag ends by releasing outside any tab's own hitbox (a cancelled drag) rather than
+            // through a real `on_drop`. The body spans virtually the whole window below the
+            // title bar, so this reaches almost every real release point.
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _event: &gpui::MouseUpEvent, _window, cx| {
-                    if this.tab_drag_insertion.take().is_some() {
+                    if this.cancel_any_tab_drag() {
                         cx.notify();
                     }
                 }),

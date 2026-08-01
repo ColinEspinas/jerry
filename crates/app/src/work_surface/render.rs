@@ -509,6 +509,34 @@ impl AdeApp {
             .is_some_and(|(hovered, after)| *hovered == target && *after);
         self.reorder_tab(dragged, target, insert_after, cx);
         self.tab_drag_insertion = None;
+        self.dragging_tab = None;
+    }
+
+    /// One tab's own `on_drag` constructor callback (both [`Self::render_agent_tab`] and
+    /// [`Self::render_file_tab`] call this) - records `tab_ref` into [`Self::dragging_tab`] so
+    /// that tab's own slot can dim itself while its ghost is the real thing following the
+    /// cursor. A plain method (not inlined into the closure) so it's directly testable without
+    /// simulating a real GPUI drag gesture, matching [`Self::update_tab_drag_insertion`]/
+    /// [`Self::drop_dragged_tab`]'s own precedent.
+    pub(in crate::work_surface) fn start_dragging_tab(
+        &mut self,
+        tab_ref: work_surface::TabRef,
+        cx: &mut Context<Self>,
+    ) {
+        self.dragging_tab = Some(tab_ref);
+        cx.notify();
+    }
+
+    /// Clears any in-progress tab drag's tracked state - the real cancelled-drag path (Esc, or
+    /// releasing outside any tab's own drop target) that GPUI gives no dedicated callback for
+    /// (see [`Self::dragging_tab`]'s own docs). `crate::root::AdeApp`'s workspace-body
+    /// `on_mouse_up` is this method's only real caller; returns whether anything was actually
+    /// cleared so that caller only `cx.notify()`s when something changed, rather than on every
+    /// unrelated click in the window.
+    pub(crate) fn cancel_any_tab_drag(&mut self) -> bool {
+        let cleared_insertion = self.tab_drag_insertion.take().is_some();
+        let cleared_dragging = self.dragging_tab.take().is_some();
+        cleared_insertion || cleared_dragging
     }
 
     /// Every agent open in the *currently selected* worktree (`Self::active_agent_cwd`), in
@@ -733,6 +761,9 @@ impl AdeApp {
             Some((target, insert_after)) if *target == tab_ref => Some(*insert_after),
             _ => None,
         };
+        let is_dragging = self.dragging_tab.as_ref() == Some(&tab_ref);
+        let this_entity = cx.entity();
+        let tab_ref_for_drag = tab_ref.clone();
 
         div()
             .id(format!("file-tab-{key}"))
@@ -743,6 +774,11 @@ impl AdeApp {
             .border_r_1()
             .border_color(theme::border::INNER)
             .bg(colors.bg)
+            // The original slot dims while its own drag ghost (`DraggedTab::render`) is the real
+            // thing following the cursor (GitHub issue #16's "the original slot renders dimmed"
+            // ask) - `Self::dragging_tab`'s own docs on why this can't be derived from GPUI's
+            // `has_active_drag()` alone (no public access to *which* tab is being dragged).
+            .when(is_dragging, |el| el.opacity(0.4))
             // Middle-click closes any file tab outright (GitHub issue #26), same real
             // `request_close_file_tab` entry point as `×`/`Ctrl+W` - so a dirty tab still gets the
             // real unsaved-changes confirmation rather than a middle-click silently bypassing it.
@@ -754,8 +790,14 @@ impl AdeApp {
                 }),
             )
             // Real drag-to-reorder, unified across agent and file tabs (GitHub issue #16) -
-            // see `DraggedTab`'s own docs for the shared mechanism.
-            .on_drag(drag_value, |dragged, _position, _window, cx| {
+            // see `DraggedTab`'s own docs for the shared mechanism. Also records
+            // `Self::dragging_tab` so this tab's own slot can dim itself above - `on_drag`'s own
+            // constructor callback only receives `&mut App`, not `Context<Self>`, hence the
+            // captured `this_entity` handle to reach back into `AdeApp` from it.
+            .on_drag(drag_value, move |dragged, _position, _window, cx| {
+                this_entity.update(cx, |this, cx| {
+                    this.start_dragging_tab(tab_ref_for_drag.clone(), cx);
+                });
                 cx.new(|_| dragged.clone())
             })
             .on_drag_move(cx.listener({
@@ -1296,6 +1338,9 @@ impl AdeApp {
             Some((target, insert_after)) if *target == tab_ref => Some(*insert_after),
             _ => None,
         };
+        let is_dragging = self.dragging_tab.as_ref() == Some(&tab_ref);
+        let this_entity = cx.entity();
+        let tab_ref_for_drag = tab_ref.clone();
 
         div()
             .id(("agent-tab", id))
@@ -1306,6 +1351,9 @@ impl AdeApp {
             .border_r_1()
             .border_color(theme::border::INNER)
             .bg(colors.bg)
+            // The original slot dims while its own drag ghost is the real thing following the
+            // cursor - see `Self::render_file_tab`'s identical `is_dragging` handling for why.
+            .when(is_dragging, |el| el.opacity(0.4))
             // Middle-click closes any agent/terminal tab too (GitHub issue #26) - the same
             // `Self::close_agent` real teardown (`TerminalPane::shutdown`'s SIGHUP/grace/
             // SIGKILL - see that method's own docs) every other close path already uses.
@@ -1320,8 +1368,12 @@ impl AdeApp {
             // Real drag-to-reorder, unified across agent and file tabs (GitHub issue #16) -
             // see `DraggedTab`'s own docs for the shared mechanism. No `can_drop` predicate
             // needed - the `on_drop::<DraggedTab>` type parameter alone already rejects a drop of
-            // any other dragged-value type.
-            .on_drag(drag_value, |dragged, _position, _window, cx| {
+            // any other dragged-value type. Also records `Self::dragging_tab` - see
+            // `Self::render_file_tab`'s identical wiring for why `this_entity` is captured.
+            .on_drag(drag_value, move |dragged, _position, _window, cx| {
+                this_entity.update(cx, |this, cx| {
+                    this.start_dragging_tab(tab_ref_for_drag.clone(), cx);
+                });
                 cx.new(|_| dragged.clone())
             })
             .on_drag_move(cx.listener({
@@ -2253,7 +2305,11 @@ impl DraggedTab {
 
 impl Render for DraggedTab {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // `.opacity(..)` (GitHub issue #16's "a semi-transparent snapshot of the tab") applies to
+        // the whole subtree, so the border/text fade along with the fill rather than staying
+        // full-strength inside a see-through box.
         div()
+            .opacity(0.85)
             .px(px(10.0))
             .py(px(4.0))
             .rounded(theme::radius::CHIP)
@@ -2907,6 +2963,104 @@ mod tab_scoping_tests {
             app.read_with(cx, |app, _| app.tab_drag_insertion.clone()),
             None,
             "a handled drop must clear the now-stale insertion-caret state"
+        );
+    }
+
+    /// `Self::start_dragging_tab` (the real `on_drag` constructor callback's body, GitHub issue
+    /// #16's "the original slot renders dimmed" ask) must record exactly the tab that started
+    /// the drag, so `Self::render_file_tab`/`Self::render_agent_tab`'s own `is_dragging` check
+    /// dims the right slot and no other.
+    #[gpui::test]
+    fn start_dragging_tab_records_exactly_the_tab_that_started_the_drag(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let initial_id = app.read_with(cx, |app, _| app.agents.active_id().expect("shell agent"));
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.dragging_tab.clone()),
+            None,
+            "premise: nothing is being dragged yet"
+        );
+
+        app.update(cx, |app, cx| {
+            app.start_dragging_tab(work_surface::TabRef::Agent(initial_id), cx);
+        });
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.dragging_tab.clone()),
+            Some(work_surface::TabRef::Agent(initial_id)),
+            "starting a drag must record exactly the tab that started it"
+        );
+    }
+
+    /// A real drop must clear `Self::dragging_tab` alongside `Self::tab_drag_insertion` - a
+    /// dropped tab's slot must never stay dimmed once the drag it was dimmed for is over.
+    #[gpui::test]
+    fn dropping_a_tab_clears_dragging_tab(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
+            let initial_id = app.agents.active_id().expect("initial shell agent");
+            let second_id = app.agents.spawn(
+                AgentKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            (initial_id, second_id)
+        });
+
+        app.update(cx, |app, cx| {
+            app.start_dragging_tab(work_surface::TabRef::Agent(initial_id), cx);
+        });
+        app.update(cx, |app, cx| {
+            app.drop_dragged_tab(
+                work_surface::TabRef::Agent(initial_id),
+                work_surface::TabRef::Agent(second_id),
+                cx,
+            );
+        });
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.dragging_tab.clone()),
+            None,
+            "a handled drop must clear the now-stale dragging-tab state"
+        );
+    }
+
+    /// `Self::cancel_any_tab_drag` (the workspace body's real cancelled-drag cleanup - GPUI gives
+    /// no dedicated callback for Esc/release-outside-any-target, see `AdeApp::dragging_tab`'s own
+    /// docs) must clear both drag-tracking fields together and report whether it actually did
+    /// anything, so a click that was never a drag doesn't force an unnecessary re-render.
+    #[gpui::test]
+    fn cancel_any_tab_drag_clears_both_fields_and_reports_whether_anything_changed(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let initial_id = app.read_with(cx, |app, _| app.agents.active_id().expect("shell agent"));
+
+        assert!(
+            !app.update(cx, |app, _cx| app.cancel_any_tab_drag()),
+            "with nothing in progress, cancelling must report that nothing changed"
+        );
+
+        app.update(cx, |app, cx| {
+            app.start_dragging_tab(work_surface::TabRef::Agent(initial_id), cx);
+            app.tab_drag_insertion = Some((work_surface::TabRef::Agent(initial_id), true));
+        });
+
+        assert!(
+            app.update(cx, |app, _cx| app.cancel_any_tab_drag()),
+            "with a real in-progress drag, cancelling must report that it actually cleared \
+             something"
+        );
+        assert_eq!(app.read_with(cx, |app, _| app.dragging_tab.clone()), None);
+        assert_eq!(
+            app.read_with(cx, |app, _| app.tab_drag_insertion.clone()),
+            None
         );
     }
 
