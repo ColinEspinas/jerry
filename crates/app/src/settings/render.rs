@@ -1745,7 +1745,10 @@ impl AdeApp {
                     // before the placeholder (real cursor position 0) while the filter is empty,
                     // never appended after it.
                     .when(!has_query, |el| {
-                        el.child(self.render_simple_input_caret("settings-keymap-filter-caret"))
+                        el.child(self.render_simple_input_caret(
+                            "settings-keymap-filter-caret",
+                            &self.settings_keymap_filter_focus_handle,
+                        ))
                     })
                     .child(
                         div()
@@ -1764,7 +1767,10 @@ impl AdeApp {
                             .debug_selector(|| "settings-keymap-filter-text".to_string()),
                     )
                     .when(has_query, |el| {
-                        el.child(self.render_simple_input_caret("settings-keymap-filter-caret"))
+                        el.child(self.render_simple_input_caret(
+                            "settings-keymap-filter-caret",
+                            &self.settings_keymap_filter_focus_handle,
+                        ))
                     }),
             )
             .child(

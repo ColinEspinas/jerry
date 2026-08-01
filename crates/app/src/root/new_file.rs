@@ -273,7 +273,10 @@ impl AdeApp {
                             // before-placeholder / after-text placement as
                             // `crate::rail::render::AdeApp::render_rail_filter_row`.
                             .when(!has_name, |el| {
-                                el.child(self.render_simple_input_caret("new-file-caret"))
+                                el.child(self.render_simple_input_caret(
+                                    "new-file-caret",
+                                    &self.new_file_focus_handle,
+                                ))
                             })
                             .child(
                                 div()
@@ -285,7 +288,10 @@ impl AdeApp {
                                     }),
                             )
                             .when(has_name, |el| {
-                                el.child(self.render_simple_input_caret("new-file-caret"))
+                                el.child(self.render_simple_input_caret(
+                                    "new-file-caret",
+                                    &self.new_file_focus_handle,
+                                ))
                             })
                     })
                     .when_some(self.new_file_error.clone(), |el, error| {

@@ -275,13 +275,69 @@ impl AdeApp {
     /// `settings::render::settings_keymap_filter_caret_tests`,
     /// `graph_view::render::graph_focus_tests`, and `root::new_file::new_file_caret_tests` for
     /// that coverage.
-    pub(crate) fn render_simple_input_caret(&self, selector: &'static str) -> impl IntoElement {
+    ///
+    /// `focus_handle` is `caret_blink_visible`'s missing other half (GitHub issue #45's own
+    /// title, re-audited): every one of these simple inputs used to paint from
+    /// [`AdeApp::caret_blink_visible`] alone, with no check of its *own* focus at all. Since that
+    /// flag is one shared bool driven by whichever caret-bearing handle is currently focused
+    /// (`crate::root::caret_blink`'s own docs), and these simple inputs are never modal - the
+    /// rail filter row, for one, is mounted on screen at the same time as the code editor - an
+    /// *unfocused* simple input kept blinking in exact sync whenever the user was simply typing
+    /// somewhere else entirely. Painted through a real `gpui::canvas` (the same idiom
+    /// `crate::code_surface::editing::caret_paint_quad`'s own caller uses) rather than a plain
+    /// `.when(...).bg(...)` specifically so `focus_handle.is_focused(window)` can be read at
+    /// paint time - `Window` isn't threaded through every one of this helper's several render-
+    /// tree ancestors, and a canvas's paint closures always receive it regardless of what the
+    /// surrounding `render_*` call chain's own signatures carry. Mirrors `caret_paint_quad`'s own
+    /// rule exactly: focused *and* blink-visible paints solid, focused-but-blinked-off paints
+    /// nothing, unfocused paints a dim, non-blinking caret (`theme::syntax::
+    /// CARET_UNFOCUSED_OPACITY` - the same constant the code editor's own caret uses, not a
+    /// second, independently-chosen value for this surface) rather than vanishing outright -
+    /// consistent with every other caret-bearing surface's unfocused treatment in this app.
+    pub(crate) fn render_simple_input_caret(
+        &self,
+        selector: &'static str,
+        focus_handle: &FocusHandle,
+    ) -> impl IntoElement {
+        let caret_blink_visible = self.caret_blink_visible;
+        let focus_handle = focus_handle.clone();
         div()
             .flex_none()
             .w(px(1.5))
             .h(px(14.0))
-            .when(self.caret_blink_visible, |el| el.bg(theme::term::CURSOR))
             .debug_selector(move || selector.to_string())
+            .child(
+                gpui::canvas(
+                    move |bounds, window, _cx| {
+                        let is_focused = focus_handle.is_focused(window);
+                        simple_input_caret_opacity(is_focused, caret_blink_visible).map(|opacity| {
+                            gpui::fill(bounds, theme::term::CURSOR.resolve().opacity(opacity))
+                        })
+                    },
+                    |_bounds, quad, window, _cx| {
+                        if let Some(quad) = quad {
+                            window.paint_quad(quad);
+                        }
+                    },
+                )
+                .size_full(),
+            )
+    }
+}
+
+/// [`AdeApp::render_simple_input_caret`]'s paint decision, pulled out as a pure function so it's
+/// directly unit-testable without a real GPUI window/focus simulation - mirrors
+/// `crate::code_surface::editing::caret_paint_quad`'s own three-way rule (focused-and-blinking
+/// solid / focused-and-blinked-off nothing / unfocused dim-and-steady) exactly, just returning an
+/// opacity instead of a ready-made [`gpui::PaintQuad`] since this caller's color/bounds aren't
+/// available outside the canvas paint closure.
+fn simple_input_caret_opacity(is_focused: bool, blink_visible: bool) -> Option<f32> {
+    if is_focused && !blink_visible {
+        None
+    } else if is_focused {
+        Some(1.0)
+    } else {
+        Some(theme::syntax::CARET_UNFOCUSED_OPACITY)
     }
 }
 
@@ -368,3 +424,44 @@ pub(crate) fn render_menu_group_divider() -> gpui::AnyElement {
 
 /// The divider's own rule thickness - the rest of [`MENU_GROUP_DIVIDER_HEIGHT`] is its margins.
 const MENU_GROUP_DIVIDER_RULE: Pixels = px(1.0);
+
+#[cfg(test)]
+mod simple_input_caret_opacity_tests {
+    use super::simple_input_caret_opacity;
+
+    /// GitHub issue #45's own title, taken literally and pinned at the unit level: a focused
+    /// input's caret must actually blink (opacity toggles with `blink_visible`), and an
+    /// unfocused input's caret must never depend on the shared blink flag at all - the exact
+    /// cross-input bleed the issue reported, where an unfocused simple input kept blinking in
+    /// sync with whichever *other* caret-bearing surface was actually focused.
+    #[test]
+    fn only_a_focused_input_s_opacity_depends_on_the_shared_blink_flag() {
+        assert_eq!(
+            simple_input_caret_opacity(true, true),
+            Some(1.0),
+            "focused and blink-on must paint solid"
+        );
+        assert_eq!(
+            simple_input_caret_opacity(true, false),
+            None,
+            "focused and blink-off must paint nothing - the real blink"
+        );
+        assert_eq!(
+            simple_input_caret_opacity(false, true),
+            simple_input_caret_opacity(false, false),
+            "an unfocused input's opacity must be identical regardless of the shared blink \
+             flag's current phase - this is the exact bug: an unfocused input must never blink \
+             just because some other input is focused and blinking"
+        );
+    }
+
+    #[test]
+    fn an_unfocused_input_paints_dim_not_invisible() {
+        assert_eq!(
+            simple_input_caret_opacity(false, true),
+            Some(crate::theme::syntax::CARET_UNFOCUSED_OPACITY),
+            "unfocused must still show a real, dim, non-blinking caret - matching every other \
+             caret-bearing surface's unfocused treatment in this app - not vanish outright"
+        );
+    }
+}
