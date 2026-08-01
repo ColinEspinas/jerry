@@ -1,0 +1,7 @@
+name = "Jerry Dark"
+subtitle = "default"
+background   = "#0e0f11"
+panel        = "#1a1e21"
+accent_green = "#5cb87f"
+accent_amber = "#e2a336"
+accent_blue  = "#74ade8"

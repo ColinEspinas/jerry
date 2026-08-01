@@ -4174,3 +4174,352 @@ test in the module each time. Because this change touches `open_change_diff`, th
 the flakiest test was run 55 times on this branch and 55 times on the untouched base, interleaved,
 giving 3/55 here against 4/55 there - the same rate, and load-dependent rather than
 change-dependent.
+## Custom theme support (GitHub issue #5)
+
+User-authored themes, loaded from `~/.config/jerry/themes/*.toml`, layered on top of the six
+built-in `settings::THEME_DEFS` rather than replacing them. A hand-written file supplies exactly
+the same five swatches (`background`, `panel`, `accent_green`, `accent_amber`, `accent_blue`) a
+built-in `ThemeDef` does, and is run through the exact same `derive_shift`/`apply_shift` machinery
+every built-in non-Jerry-Dark theme already goes through - a new thread-local,
+`CURRENT_CUSTOM_SHIFT`, overrides the existing `CURRENT_THEME_INDEX` mechanism in `ColorToken::
+resolve` whenever a custom theme is the live selection, and `AdeApp::apply_theme_selection` is the
+one place that ever writes both together. Icon colours ride along for free: this app's "icons"
+(`sidebar::render::render_folder_icon`/`render_lang_chip`) are `div`-composed rectangles and
+letter chips coloured entirely by ordinary `ColorToken`s, not a separate image/glyph-pack system,
+so no second mechanism was needed for them.
+
+The Themes settings page gained a "Custom themes" section - built-in and custom themes render as
+the same card (`render_theme_card`, now taking raw name/subtitle/swatches instead of a
+`&ThemeDef`), with real `Import theme…`/`Export current theme…` actions via genuine native file
+dialogs (`gpui::App::prompt_for_paths`/`prompt_for_new_path`, verified against
+`vendor/zed/crates/agent_ui/src/threads_archive_view.rs` and `miniprofiler_ui` before writing this)
+and a `Remove` action per custom card.
+
+### What the independent adversarial audit found, and what was fixed
+
+One audit round ran over the finished feature, reading the code directly rather than trusting a
+summary, and ran clippy/tests itself. It found two CRITICAL issues, both real:
+
+**Import could silently destroy an unrelated file.** `import_theme_file` joined the destination
+directory with the incoming theme's own slug unconditionally, so importing a theme whose slug
+happened to collide with an existing, differently-named file on disk (a real, reachable case - a
+hand-authored `themes/my-theme.toml` holding `"Ocean"`, then importing something that also
+slugifies to `my-theme`) silently overwrote it, with the in-memory list left holding two entries
+pointing at the same now-wrong file. Fixed with `non_colliding_dest_path`: the plain slug path is
+used when free or when it already holds *this same* theme (the intentional "re-import to update"
+case), otherwise `{slug}-2.toml`, `{slug}-3.toml`, … until a free or matching path is found -
+proven by a regression test that imports over a pre-existing, differently-named file and asserts
+it survives untouched.
+
+**"Remove" deleted the user's file on a single click**, unlike every other destructive action in
+this app (`prune_confirm_armed`, `discard_confirm_armed`, `tree_delete_confirm`). Fixed with a real
+two-click confirmation (`custom_theme_remove_armed`/`request_remove_custom_theme`), mirroring
+`request_discard_worktree`'s identical shape, disarmed on leaving the Themes page or reopening
+Settings. The same audit had flagged the *first* version of this as hiding the Remove affordance
+whenever the theme was currently selected, making the active theme's own file permanently
+undeletable from the UI - dropped that gate too, since the two-click confirm is itself the guard
+against an accidental click.
+
+Four MAJOR findings, also fixed: re-importing the theme currently in use didn't re-skin the app
+until restart (`apply_custom_theme_import_result` now calls `apply_theme_selection` when the
+imported name matches the active one); removing a theme could leave `Settings.theme.
+last_dark_theme` dangling, which a later real OS-dark `follow_system` signal would have written
+straight back into `theme.name`, resolving to nothing (now reset alongside `theme.name` in the
+same fallback); exporting a built-in theme under its own bare name produced a file
+`CustomThemeFile::validate` unconditionally rejects on import - `crate::settings::render::
+export_theme_name_for` (a pure, directly-tested function) now renames it to `"<name> (copy)"` so
+the exported file is actually importable; and `custom_theme_load_errors`/`custom_themes` were
+manually spliced after import/remove instead of re-read from disk, so a stale load error (e.g. a
+since-fixed duplicate-name warning) stayed pinned on screen forever - both actions now reload the
+registry wholesale from what's actually on disk.
+
+Six MINOR findings, also fixed: import/remove ran blocking filesystem I/O on the foreground thread
+(moved to the background executor, matching `start_export_custom_theme`'s own existing
+convention); `CustomTheme::to_toml_string`'s `unwrap_or_default()` would have silently written a
+zero-byte file on a hypothetical serialization failure (now `expect`s, since a plain struct of
+`String` fields cannot genuinely fail to serialize - a real failure should panic loudly, not ship
+an empty theme file); `load_custom_themes_from_dir` had no size cap on a theme file (added a 64
+KiB defensive limit, since this read runs on the foreground thread at `AdeApp` construction);
+the `.toml` extension match was case-sensitive (now `eq_ignore_ascii_case`); the export dialog's
+suggested filename re-implemented slugify by hand and could disagree with the real one (now reuses
+`custom_theme::slugify`, made `pub(crate)`); and the empty-state hint hardcoded
+`~/.config/jerry/themes/` instead of the real, `settings_path`-derived directory.
+
+The audit also verified several suspected issues were *not* bugs by reading real source rather than
+guessing: no path traversal via a crafted theme name (`slugify` maps every non-alphanumeric
+character to `-`); no arbitrary-file delete via a symlinked theme file (`remove_file` unlinks the
+symlink, not its target); no stale `CURRENT_CUSTOM_SHIFT` leak between selections or across test
+instances (`apply_theme_selection` always writes both thread-locals together, in all three
+branches); and - read directly from `vendor/zed/crates/gpui/src/{elements/div.rs,window.rs}` -
+that a nested "Remove" button's `cx.stop_propagation()` genuinely does suppress the card's own
+`on_click` during GPUI's bubble-phase dispatch, not just in theory. That last one was re-verified
+with a real, click-driven test (`cx.simulate_click` against the button's own painted bounds, not
+just calling the method directly) rather than left as a source-reading conclusion, alongside
+similar real-click tests for the Import/Export buttons - the audit had separately noted that
+nothing exercised those three buttons as rendered, clickable elements, only as directly-invoked
+methods.
+
+38 new tests, all in the touched modules (`settings::custom_theme`, `settings::render::
+custom_theme_settings_tests`, `settings::render::export_theme_name_tests`, `theme::
+theme_runtime_tests`). All four gates clean: `cargo fmt --all -- --check`, `cargo build
+--workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace
+--lib -- --test-threads=1` run twice end-to-end (969 app + 42 lsp-core + 14 pty-core + 98 wt-core,
+0 failed, both times). One single-threaded run separately hit
+`code_surface::diff_view::diff_render_tests::opening_a_real_diff_renders_real_syntax_highlighted_rows`
+- confirmed pre-existing and unrelated: that file has zero diff on this branch, and the same test
+run three times in complete isolation with nothing else running failed once on its own, an
+already-known timing flake in that module, not a regression from this work.
+
+## Built-in themes as real files, not a hardcoded array (GitHub issue #5 follow-up)
+
+A distinct follow-up to the "Custom theme support" entry above, not a duplicate of it: the app's
+six *built-in* themes moved from a hardcoded `const THEME_DEFS: [ThemeDef; 6]` array of Rust
+struct literals in `crates/app/src/settings/state.rs` to six real, checked-in files at
+`assets/themes/{jerry-dark,jerry-dim,slate,ember,moss,paper}.toml` - the exact same five-swatch
+format a user's own custom theme file already used - embedded via `include_str!` and parsed
+through the exact same `CustomThemeFile` deserialization and validation core
+(`crate::settings::custom_theme::parse_builtin_theme_file_str`, a thin wrapper that skips only the
+self-referential built-in-name-collision half of the check) that GitHub issue #5's user-authored
+themes already go through, not a second, parallel parser. `THEME_DEFS` itself became a
+`std::sync::LazyLock<[ThemeDef; 6]>` in place of the old `const`, computed once on first access;
+every existing call site across the crate only ever indexed or iterated it, so none needed to
+change. The five swatch values themselves are untouched, transcribed verbatim from the old array -
+this was a "where do these six live" change, not a "what do they look like" change - and the
+existing `derive_shift`/`apply_shift` HSL-shift machinery that turns Jerry Dark's tokens into the
+other five themes' tokens was not touched at all.
+
+### Self-review and what it found
+
+Before this file's own work started, an existing user's `settings.toml` persists a theme choice by
+*name* (`ThemeSettings::name`, a plain `String`), never by array index - `theme_swatches_for` and
+`apply_theme_selection` in `crate::settings::render` both resolve it with
+`THEME_DEFS.iter().find(|def| def.name == name)`, which a `LazyLock`'s `Deref` serves identically
+to the old `const`. Traced end to end (and pinned by
+`every_documented_built_in_theme_name_still_resolves_by_name_lookup` in `state.rs` and the
+existing click-driven `selecting_a_real_theme_card_...`/`follow_system_selects_paper_on_light_...`
+tests in `render.rs`), this still resolves correctly for all six built-in names - an existing
+user's settings file keeps loading and re-skinning the app exactly as before. Built-ins also stay
+correctly protected from the Remove/import paths issue #5 added: built-in cards render with
+`is_custom: false` (no Remove affordance at all), `execute_remove_custom_theme` only ever touches
+`Self::custom_themes`, and `import_theme_file`'s validation path rejects any file whose name
+collides with a built-in (`NameCollidesWithBuiltin`) before anything is written to disk.
+
+An independent, adversarial checker sub-agent was then dispatched against the finished diff with
+instructions to verify those same three things itself (not trust this description of them) plus a
+general pass over the rest of the change. It confirmed all three by reading the real code and
+running its own tests, and separately caught two real, distinct problems this session then fixed:
+
+**A real formatting/lint break left over from a prior, interrupted session.** `cargo fmt --all --
+--check` and `cargo clippy --workspace --all-targets -- -D warnings` both failed outright before
+being touched here: two unformatted blocks (an inline `enum` variant and a wrapped `symlink()`
+call) plus eight `clippy::doc_lazy_continuation` errors from a doc comment on
+`custom_theme_shift_preserves_readability` whose second line started with `- ` in a way rustdoc's
+markdown parser reads as an unindented list continuation. Both fixed - `cargo fmt --all` for the
+former, a reflow that removes the leading dash for the latter.
+
+**A real reentrant-deadlock bug, not just a lint issue.** `custom_theme_shift_preserves_readability`
+(added earlier in this same uncommitted diff, gating every candidate theme's swatches against a
+readability floor before `validate()` accepts them) read
+`crate::settings::state::THEME_DEFS[0].swatches` as its comparison base. But that function's one
+real caller into `CustomThemeFile::validate_with_builtin_check` runs *inside* `THEME_DEFS`'s own
+`LazyLock` initializer while parsing `jerry-dark.toml` itself - so reading `THEME_DEFS[0]` from
+there re-enters the still-initializing `LazyLock` and hangs forever on `std::sync::Once`, not a
+panic. This meant the app could never start, and every test that touched a theme (`cargo test
+--workspace --lib -- --test-threads=1` in full) hung indefinitely - confirmed with a real repro
+(the checker's own isolated invocations timed out at exit code 124, and this session independently
+found and had to `kill -9` several minutes-stuck `cargo test`/`app-*` processes still running from
+the same underlying cause). Fixed by introducing `JERRY_DARK_BASE_SWATCHES`, a real, pinned `const`
+copy of Jerry Dark's five swatches used as the comparison base instead of reading through the
+`LazyLock` - with a new regression test,
+`jerry_dark_base_swatches_matches_the_real_initialized_theme_defs_entry`, asserting it stays equal
+to the real, safely-initialized `THEME_DEFS[0].swatches` from an ordinary test context where
+reading it is no longer reentrant.
+
+The checker also flagged, as a non-blocking observation rather than a bug to fix here: the
+readability-floor validation (bundled into this same diff ahead of this session, alongside a
+theme-file size cap and a dangling-symlink import fix) now also runs on every custom theme file
+`load_custom_themes_from_dir` reads from disk at startup, so a pre-existing hand-authored file with
+`panel` no lighter than `background` would newly fail to load. This isn't silent, though - that
+loader already reports a validation failure per file, prefixed with the file name, through the
+existing `custom_theme_load_errors` list the Themes page renders, the same path any other malformed
+custom theme file already goes through.
+
+14 new tests in this follow-up specifically (`settings::custom_theme::tests`,
+`settings::state::tests`, `theme::theme_runtime_tests`), on top of the 38 from the base custom-theme
+work. All four gates clean after the deadlock fix: `cargo fmt --all -- --check`, `cargo build
+--workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and a full `cargo test
+--workspace --lib -- --test-threads=1` at 983 app + 42 lsp-core + 14 pty-core + 98 wt-core, 0
+failed. A separate full run earlier hit the same known
+`code_surface::diff_view::diff_render_tests` flake documented above (that file has zero diff on
+this branch); re-run in isolation, all 7 of that module's tests passed.
+
+## Re-implementing three lost custom-theme safety fixes after a real concurrency data-loss incident
+
+The paragraphs immediately above this one - describing `custom_theme_shift_preserves_readability`,
+a `JERRY_DARK_BASE_SWATCHES` const, and a
+`jerry_dark_base_swatches_matches_the_real_initialized_theme_defs_entry` regression test - do not
+correspond to anything in the code as committed. Grepping the current tree for all three names
+returns zero matches. Earlier in this branch's history, two agent sessions were accidentally run
+concurrently against this same shared (non-isolated) worktree directory - a coordinator mistake,
+not a code one. One of those sessions built three real, correct safety fixes for
+`crates/app/src/settings/custom_theme.rs` and left them uncommitted; the other concurrent session's
+own file writes silently clobbered them before they were ever committed, and the commit message
+recorded above was itself written against a version of the file that no longer matches what
+actually landed. This entry is the honest re-implementation, done from a clean read of the real
+current file (not from trusting the description above), and independently verified against the
+real committed diff by a fresh adversarial checker sub-agent rather than taken on this session's own
+word.
+
+The three real gaps, and what actually landed for each, by name:
+
+1. **Symlink-based unrelated-file-clobber in `non_colliding_dest_path`.** The collision-check loop
+   used `while candidate.exists() { ... }`. `Path::exists()` follows symlinks and reports `false`
+   for a *dangling* `{slug}.toml -> /some/other/path` symlink sitting in the destination directory,
+   so the loop treated that path as free, and `import_theme_file`'s own `std::fs::write` (which also
+   follows symlinks) would then write straight through it into whatever it pointed at - a real
+   clobber of an unrelated file, staged via a symlink instead of a same-named regular file. Fixed by
+   changing the loop condition to `candidate.symlink_metadata().is_ok()`, which detects the
+   symlink's own presence without following it, while a symlink that genuinely points at a file
+   already holding *this same* theme is still correctly reused rather than rejected. New tests:
+   `import_theme_file_does_not_follow_a_dangling_symlink_planted_at_the_slug_path`,
+   `import_theme_file_does_not_follow_a_symlink_to_an_unrelated_theme_file` (a real symlink via
+   `std::os::unix::fs::symlink`, `#[cfg(unix)]`), and
+   `non_colliding_dest_path_reuses_a_symlink_that_points_at_a_file_holding_the_same_theme`.
+
+2. **No file-size cap at import time.** `load_custom_themes_from_dir` already enforced
+   `MAX_THEME_FILE_BYTES` against files already sitting in a custom-themes directory, but
+   `import_theme_file` (the user-facing "import this file" action) had no matching check against
+   the *source* file being imported. Fixed by checking `std::fs::metadata(source_path).len()`
+   against the same `MAX_THEME_FILE_BYTES` constant before ever calling `read_to_string`, returning
+   a new `ThemeFileError::TooLarge { bytes, max_bytes }` variant. New test:
+   `import_theme_file_rejects_an_oversized_source_before_reading_or_writing_it`.
+
+3. **No readability-floor validation for custom theme swatches.** There was no check that a custom
+   theme's `panel` swatch is meaningfully different in brightness from `background` - a theme with
+   `panel == background` (or nearly so) validated and loaded cleanly. Fixed inside
+   `CustomThemeFile::validate_with_builtin_check` (so both `validate()` and the built-in-parsing
+   path run it) with three new functions - `relative_luma_per_mille` (standard ITU-R BT.709 luma,
+   scaled to an integer per-mille so the new error variant can stay `#[derive(Eq)]`),
+   `panel_background_luma_delta_per_mille`, and `readability_floor_per_mille` (half of Jerry Dark's
+   own real panel/background delta) - and a new `ThemeFileError::LowReadability { delta_per_mille,
+   floor_per_mille }` variant. The critical ordering constraint: this check must never read
+   `crate::settings::state::THEME_DEFS`, because `validate_with_builtin_check(false)` is called from
+   *inside* `THEME_DEFS`'s own `std::sync::LazyLock` initializer while parsing the six built-in
+   embedded theme files - reading `THEME_DEFS` from there would re-enter the still-initializing
+   `LazyLock` and hang forever on `std::sync::Once` (a real, previously-reproduced deadlock in this
+   branch's history, not a hypothetical). Solved by pinning a new `JERRY_DARK_BASELINE_SWATCHES`
+   const (`[0x0e0f11, 0x1a1e21, 0x5cb87f, 0xe2a336, 0x74ade8]`, transcribed by hand from
+   `assets/themes/jerry-dark.toml`, confirmed byte-for-byte against that file) as the readability
+   baseline instead of reading `THEME_DEFS` at runtime. A new regression test,
+   `jerry_dark_baseline_swatches_const_matches_the_real_initialized_theme_defs_0_swatches`, asserts
+   this pinned copy stays equal to `THEME_DEFS[0].swatches` - called from an ordinary `#[test]`,
+   never from inside another `LazyLock`'s own initializer, which is the one context that assertion
+   must never run in. Also added: `every_built_in_theme_clears_the_readability_floor` (asserts the
+   real per-theme delta against the floor by name, not just that validation didn't panic),
+   `readability_floor_per_mille_is_pinned_to_a_real_computed_value` (locks the floor at its actual
+   computed value, `28`, so a future edit can't silently weaken the check while every other test
+   stays green), `a_panel_swatch_with_no_real_contrast_against_background_is_rejected`, and
+   `a_panel_swatch_only_a_few_hex_digits_off_from_background_is_still_rejected` (a real near-miss,
+   not just the zero-contrast extreme).
+
+One existing test needed a fixture change, not a behavior change: `render.rs`'s
+`reimporting_the_currently_active_theme_immediately_reskins_the_app` re-imported Midnight Coral with
+its background swatch changed to `#301010`, which - now that the readability floor is enforced - is
+too close in brightness to that theme's own `#181a1e` panel (delta 12, floor 28) and was correctly
+rejected, breaking the test's own premise of exercising a live re-skin. Changed the fixture's new
+background to `#050505` (delta 81 against the same panel) instead; the test still proves the same
+live-re-skin behavior with a swatch that legitimately clears the floor.
+
+An independent, adversarial checker sub-agent was dispatched against the finished diff before
+committing, instructed explicitly to verify by direct `grep`/reading the real committed diff rather
+than trusting this session's own summary, and to run the actual test suite itself rather than take
+"tests pass" on faith. It confirmed all three fixes present with exact line numbers and ran the
+relevant tests itself, then flagged three real, legitimate weaknesses this session then fixed before
+committing: `every_built_in_theme_clears_the_readability_floor` originally only relied on a generic
+`expect`-panic inside `parse_builtin_theme_file_str` (duplicate coverage of an existing test, no
+real per-theme assertion) - now asserts the real delta against the floor by theme name;
+`import_theme_file_does_not_follow_a_symlink_to_an_unrelated_theme_file`'s doc comment incorrectly
+framed it as testing the same regression as the dangling-symlink fix, when a symlink to a real,
+existing file was already handled correctly by the old `candidate.exists()` check too - doc comment
+corrected to describe it as independent coverage, not a regression test for the fix itself; and
+`readability_floor_per_mille`'s magnitude was previously unpinned by any test (only proven `> 0`),
+so a future edit weakening the floor divisor would have passed the whole suite - added
+`readability_floor_per_mille_is_pinned_to_a_real_computed_value` and the near-miss test above to
+close that gap. The checker also correctly noted this is a real, disclosed compatibility change: an
+existing on-disk custom theme file with `panel`/`background` delta below the floor will now fail to
+load - not silently, though, since `load_custom_themes_from_dir` already surfaces a per-file
+validation error through the existing `custom_theme_load_errors` list the Themes page renders, the
+same path any other malformed theme file already goes through.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, and a full `cargo test --workspace --lib --
+--test-threads=1` at 981 app + 42 lsp-core + 14 pty-core + 98 wt-core, 0 failed (9 new tests in
+`settings::custom_theme::tests` specifically, plus the one fixture change in
+`settings::render::custom_theme_settings_tests`). One full run hit the known
+`code_surface::diff_view::diff_render_tests::switching_the_open_diff_to_a_different_file_recomputes_the_highlight_cache`
+flake noted above; re-run alone immediately afterward, it passed.
+
+## Custom theme template and docs (GitHub issue #5 follow-up)
+
+A user asked, after the custom-theme work above landed, for "something like a theme template and
+docs so we can know how they work" - both in the app and in the repository, not just an external
+file someone would have to go find.
+
+Added `assets/themes/template.toml`: a real, well-commented starting-point theme file, embedded
+into the binary as `custom_theme::CUSTOM_THEME_TEMPLATE_TOML` and parsed through the exact same
+`parse_theme_file_str` validation path a user-supplied file goes through - not a second, informally
+-maintained example that could quietly drift out of sync with what the app actually accepts. Every
+claim its own comments make (the five-swatch format, the `#rrggbb` requirement, the readability
+floor's real `28`-per-mille threshold) is read from the real code, not guessed.
+
+The Themes settings page gets a third real action, `New from template…`
+(`AdeApp::start_create_theme_from_template`), alongside the existing `Import theme…`/`Export
+current theme…`. It writes `CUSTOM_THEME_TEMPLATE_TOML` straight into the real custom-themes
+directory via a new `custom_theme::write_template_theme`, then reloads the registry from disk -
+the same real background-executor write-then-reload shape `start_import_custom_theme` already
+uses, sharing its result-applying code (`apply_custom_theme_load_result`, factored out of what was
+previously import-specific handling) rather than duplicating the success/failure bookkeeping.
+`write_template_theme` is idempotent and non-destructive: clicking the action again refreshes the
+same file only if its contents still match the template verbatim; if a user has since edited it,
+the file is left alone and the existing (now user-owned) theme is handed back instead of being
+silently overwritten - covered by `write_template_theme_a_second_time_refreshes_the_same_file_not_a_new_one`
+and `write_template_theme_never_clobbers_a_file_the_user_has_since_edited`.
+
+`README.md` gets a new "Custom themes" section: the file format with a real example, where files
+live, that the six built-ins are themselves just files now (cross-referencing the follow-up
+above), and the three real in-app actions - matching this project's existing documentation depth
+rather than writing a separate, longer guide.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, and `cargo test --workspace --lib -- --test-threads=1`
+at 989 app + 42 lsp-core + 14 pty-core + 98 wt-core, 0 failed.
+
+## "Open theme folder" action, and a real per-character-wrap rendering bug
+
+Two more real fixes, reported directly against the built app: the theme card's `subtitle` text
+had `.overflow_hidden()` alone, the same missing-`.truncate()` gap the git graph tab's row text
+had (`.truncate()` is really `overflow_hidden() + whitespace_nowrap() + text_ellipsis()` -
+without the middle one, wrapped text is still legal layout). Here it manifested far more visibly
+than in the graph tab, because the subtitle is a `flex_1().min_w_0()` item competing against three
+`flex_none()` siblings (name, an "in use" badge, Remove) inside one narrow 212px card - with
+almost no space left over, `min_w_0()` let it shrink toward zero width, and with no
+`whitespace_nowrap()` the text wrapped at every available character boundary: the template
+theme's own subtitle rendered as one character per line, dozens of lines tall. Fixed the same way
+as the graph tab: `.truncate()` in place of the bare `.overflow_hidden()`.
+
+Added a fourth real action to the Themes page's "Custom themes" toolbar, `Open theme folder`
+(`AdeApp::start_open_custom_themes_folder`), reusing `Self::open_path_with_os_handler` - the same
+real per-platform default-open handler (`xdg-open`/`open`/`cmd /c start`) the file tree's "Reveal
+in file manager" already uses - rather than growing a second one. Creates the real directory
+first if it doesn't exist yet (a user who has never imported or created a custom theme has
+nothing there otherwise), via `std::fs::create_dir_all` on the background executor, never the
+GPUI foreground thread, matching every other real I/O in this module.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, and `cargo test --workspace --lib -- --test-threads=1`
+at 989 app + 42 lsp-core + 14 pty-core + 98 wt-core, 0 failed (unchanged counts - both fixes reuse
+already-tested primitives: `open_command_for`/`spawn_open_command` already have real coverage, and
+`.truncate()` is GPUI's own tested method, not new logic here - no new subprocess-spawning test
+was added for the folder-open action itself, since actually invoking `xdg-open` from a test would
+risk real flakiness in this sandbox with no established precedent elsewhere in the codebase for
+doing so).

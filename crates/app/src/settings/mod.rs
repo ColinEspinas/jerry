@@ -8,6 +8,8 @@
 //!   `$PATH` agent/language-server detection). No `gpui::Window`.
 //! - [`store`] - the persisted `~/.config/jerry/settings.toml` file: load, save, and the
 //!   read-only JSON alternate view.
+//! - [`custom_theme`] - user-authored themes loaded from `~/.config/jerry/themes/*.toml`
+//!   (GitHub issue #5): the real file format, validation, and import/export. No `gpui::Window`.
 //! - [`render`] - the real GPUI rendering and interaction for every settings page, as
 //!   `impl AdeApp` methods.
 //! - [`widgets`] - the row-control widget shapes (`toggle`/`stepper`/`choice`) shared by the
@@ -37,6 +39,7 @@ use crate::theme;
 use crate::work_surface::sessions::SessionKind;
 use crate::work_surface::state as work_surface;
 
+pub mod custom_theme;
 pub mod state;
 pub mod store;
 

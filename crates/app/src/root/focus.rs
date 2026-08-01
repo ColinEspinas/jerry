@@ -144,6 +144,7 @@ impl AdeApp {
         self.settings_focus.capture(window, &self.sessions, cx);
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
+        self.custom_theme_remove_armed = None;
         window.focus(&self.settings_focus_handle, cx);
         self.load_agent_rows(cx);
         self.load_lsp_rows(cx);

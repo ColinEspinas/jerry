@@ -1,0 +1,7 @@
+name = "Moss"
+subtitle = "green-tinted"
+background   = "#0f1310"
+panel        = "#1a201b"
+accent_green = "#7fc79a"
+accent_amber = "#c8b45a"
+accent_blue  = "#6f9bb5"

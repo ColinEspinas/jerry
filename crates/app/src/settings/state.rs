@@ -310,41 +310,49 @@ pub struct ThemeDef {
     pub swatches: [u32; 5],
 }
 
-/// The Themes page's six cards, transcribed verbatim from `Jerry.dc.html`'s `themeDefs`.
+/// The Themes page's six cards - real `assets/themes/*.toml` files (repo root, alongside
+/// `assets/fonts/` - see `crate::fonts`' own module docs for the established "embed a real,
+/// checked-in asset at compile time via `include_str!`/`include_bytes!`" convention this
+/// mirrors), embedded into the binary and parsed through the exact same
+/// `CustomThemeFile`/`validate` deserialization and validation path GitHub issue #5's
+/// user-authored custom themes already use (`crate::settings::custom_theme::
+/// parse_builtin_theme_file_str`) - not a second, parallel parser. Follow-up to GitHub issue #5:
+/// before this, these six were a hardcoded `const` array of Rust struct literals; the *values*
+/// are unchanged (transcribed verbatim - see `custom_theme::tests::
+/// parse_builtin_theme_file_str_parses_every_embedded_built_in_theme_file_into_the_exact_documented_swatches`
+/// and this module's own `theme_defs_match_the_documented_exact_names_subtitles_and_hex_swatches`
+/// for the regression pins), only *where they live* changed.
+///
+/// A `std::sync::LazyLock`, not a `const`, since parsing TOML is real runtime work - computed
+/// exactly once, on first access, and cached for the rest of the process; every existing call
+/// site across this crate (`crate::theme`, `crate::root`, `crate::settings::render`,
+/// `crate::settings::store`) already only ever indexes (`THEME_DEFS[i]`) or iterates
+/// (`THEME_DEFS.iter()`) this array, both of which `LazyLock`'s `Deref` impl serves exactly like
+/// the old `const` did, so none of them needed to change for this. `name`/`subtitle` are each
+/// leaked once (`Box::leak`) into real `&'static str`s, so [`ThemeDef`] keeps its existing
+/// `Copy`-friendly shape rather than growing owned `String` fields just for six values that live
+/// for the process's entire lifetime anyway.
+///
 /// `crate::settings::store::ThemeSettings::name` - not this fixture's own `on` field, which this
 /// app never reads - is the persisted source of truth for which one is selected.
-pub const THEME_DEFS: [ThemeDef; 6] = [
-    ThemeDef {
-        name: "Jerry Dark",
-        subtitle: "default",
-        swatches: [0x0e0f11, 0x1a1e21, 0x5cb87f, 0xe2a336, 0x74ade8],
-    },
-    ThemeDef {
-        name: "Jerry Dim",
-        subtitle: "lower contrast",
-        swatches: [0x15181b, 0x20252a, 0x6ab97f, 0xd8a94a, 0x7f9ad4],
-    },
-    ThemeDef {
-        name: "Slate",
-        subtitle: "cool greys",
-        swatches: [0x0d1117, 0x161b22, 0x57a773, 0xc9a227, 0x6b9bd1],
-    },
-    ThemeDef {
-        name: "Ember",
-        subtitle: "warm",
-        swatches: [0x12100e, 0x1e1a16, 0x8fae6b, 0xd98b3a, 0xc4713f],
-    },
-    ThemeDef {
-        name: "Moss",
-        subtitle: "green-tinted",
-        swatches: [0x0f1310, 0x1a201b, 0x7fc79a, 0xc8b45a, 0x6f9bb5],
-    },
-    ThemeDef {
-        name: "Paper",
-        subtitle: "light \u{b7} beta",
-        swatches: [0xf4f1ea, 0xe4e0d6, 0x3f7a52, 0xa8752a, 0x3d6c9c],
-    },
-];
+pub static THEME_DEFS: std::sync::LazyLock<[ThemeDef; 6]> = std::sync::LazyLock::new(|| {
+    const FILES: [&str; 6] = [
+        include_str!("../../../../assets/themes/jerry-dark.toml"),
+        include_str!("../../../../assets/themes/jerry-dim.toml"),
+        include_str!("../../../../assets/themes/slate.toml"),
+        include_str!("../../../../assets/themes/ember.toml"),
+        include_str!("../../../../assets/themes/moss.toml"),
+        include_str!("../../../../assets/themes/paper.toml"),
+    ];
+    FILES.map(|contents| {
+        let theme = crate::settings::custom_theme::parse_builtin_theme_file_str(contents);
+        ThemeDef {
+            name: Box::leak(theme.name.into_boxed_str()),
+            subtitle: Box::leak(theme.subtitle.into_boxed_str()),
+            swatches: theme.swatches,
+        }
+    })
+});
 
 /// One Language servers page row's static, per-language identity - the binary name
 /// [`detect_lsp_rows`] searches `$PATH` for. Sourced from `crate::language`'s canonical registry
@@ -922,6 +930,73 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), original_len, "duplicate theme name");
         assert_eq!(THEME_DEFS[0].name, "Jerry Dark");
+    }
+
+    /// The real regression guard for the built-in-themes-as-files refactor (GitHub issue #5
+    /// follow-up): `THEME_DEFS` is now built at runtime from `assets/themes/*.toml` rather than a
+    /// hardcoded `const` array, so this pins the exact same names/subtitles/hex swatches the old
+    /// array held, transcribed verbatim - a single-digit typo made while writing one of those
+    /// `.toml` files would silently change the app's real default appearance, and this is what
+    /// would catch it. `custom_theme::tests::
+    /// parse_builtin_theme_file_str_parses_every_embedded_built_in_theme_file_into_the_exact_documented_swatches`
+    /// pins the same values one layer lower, straight off each file's own `include_str!`; this
+    /// test instead goes through the real, public `THEME_DEFS` every other call site in this
+    /// crate actually reads.
+    #[test]
+    fn theme_defs_match_the_documented_exact_names_subtitles_and_hex_swatches() {
+        let expected: [(&str, &str, [u32; 5]); 6] = [
+            (
+                "Jerry Dark",
+                "default",
+                [0x0e0f11, 0x1a1e21, 0x5cb87f, 0xe2a336, 0x74ade8],
+            ),
+            (
+                "Jerry Dim",
+                "lower contrast",
+                [0x15181b, 0x20252a, 0x6ab97f, 0xd8a94a, 0x7f9ad4],
+            ),
+            (
+                "Slate",
+                "cool greys",
+                [0x0d1117, 0x161b22, 0x57a773, 0xc9a227, 0x6b9bd1],
+            ),
+            (
+                "Ember",
+                "warm",
+                [0x12100e, 0x1e1a16, 0x8fae6b, 0xd98b3a, 0xc4713f],
+            ),
+            (
+                "Moss",
+                "green-tinted",
+                [0x0f1310, 0x1a201b, 0x7fc79a, 0xc8b45a, 0x6f9bb5],
+            ),
+            (
+                "Paper",
+                "light \u{b7} beta",
+                [0xf4f1ea, 0xe4e0d6, 0x3f7a52, 0xa8752a, 0x3d6c9c],
+            ),
+        ];
+        assert_eq!(THEME_DEFS.len(), expected.len());
+        for (def, (name, subtitle, swatches)) in THEME_DEFS.iter().zip(expected.iter()) {
+            assert_eq!(def.name, *name, "name mismatch");
+            assert_eq!(def.subtitle, *subtitle, "subtitle mismatch for {name}");
+            assert_eq!(def.swatches, *swatches, "swatch mismatch for {name}");
+        }
+    }
+
+    /// A hand-edited `settings.toml` from before this refactor persists a built-in theme
+    /// selection purely by its `name` (`crate::settings::store::ThemeSettings::name`'s own docs) -
+    /// this proves that lookup still resolves for every one of the six real names after built-ins
+    /// moved from a `const` array to `assets/themes/*.toml` files, so an existing user's settings
+    /// file keeps loading and resolving exactly as it did before.
+    #[test]
+    fn every_documented_built_in_theme_name_still_resolves_by_name_lookup() {
+        for name in ["Jerry Dark", "Jerry Dim", "Slate", "Ember", "Moss", "Paper"] {
+            assert!(
+                THEME_DEFS.iter().any(|def| def.name == name),
+                "{name:?} must still resolve by name lookup"
+            );
+        }
     }
 
     /// [`lsp_languages`] now derives its length directly from

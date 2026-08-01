@@ -77,6 +77,51 @@ design_handoff_jerry_ade/
               something to port markup from, and not itself part of the app.
 ```
 
+## Custom themes
+
+Besides the six built-in themes (Jerry Dark, Jerry Dim, Slate, Ember, Moss, Paper), the Themes
+settings page (Settings → Themes) supports user-authored ones too (GitHub issue #5) — built-in
+and custom themes are shown as the same kind of card, not a first-class set and a second-tier
+list. In fact, the six built-ins are themselves just files: `assets/themes/*.toml` in this
+repository, embedded into the binary and parsed through the exact same code path a custom
+theme's own file goes through, not a separate hardcoded palette.
+
+**File format.** One `.toml` file per theme, five hex colours plus a name/subtitle:
+
+```toml
+name = "Midnight Coral"
+subtitle = "warm accent, dark base"
+background   = "#0c0d10"
+panel        = "#181a1e"
+accent_green = "#5cb87f"
+accent_amber = "#e2a336"
+accent_blue  = "#e07a5f"
+```
+
+Colours are `#rrggbb` — a `#` plus exactly six hex digits; no `#rgb` shorthand, alpha channel, or
+named CSS colours. `name` must be unique (it can't reuse a built-in theme's own name); `subtitle`
+is optional. Those five swatches are the same five every built-in theme is defined by — the rest
+of the app's roughly 200 colour tokens are derived from how they differ from Jerry Dark's own
+five (see `derive_shift` in `crates/app/src/theme.rs` for the actual HSL transform — it's a
+private function, so this means reading the source, not generated rustdoc), so authoring five
+colours re-skins the whole app, not just a preview card. `panel` also has to actually read as a
+different shade from `background`: a real perceptual-brightness check rejects a `panel` that's
+the same colour as (or only a couple of hex digits off from) `background`.
+
+**Where files live.** `~/.config/jerry/themes/*.toml` — a `themes` directory sitting next to
+`~/.config/jerry/settings.toml`. Every `.toml` file directly inside it is loaded as a theme at
+startup; a file that fails to parse or validate is skipped with a real, specific error shown on
+the Themes page (the rest of the directory still loads normally).
+
+**Getting started without leaving the app.** The Themes page's "Custom themes" section has three
+real actions: **New from template…** writes a real, well-commented starting-point file straight
+into that directory (the same file checked into this repository at
+[`assets/themes/template.toml`](assets/themes/template.toml) — copying it by hand works exactly
+as well as clicking the button); **Import theme…** validates and copies in any `.toml` file you
+already have, via a native file picker; **Export current theme…** saves whichever theme is
+currently active to a file you can hand to someone else. Every custom theme card also has a
+two-click **Remove** action that deletes its backing file.
+
 ## Building and running it
 
 ### GPUI version pin

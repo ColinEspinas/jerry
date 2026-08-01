@@ -62,6 +62,12 @@ impl AdeApp {
         if self.settings_page == SettingsPage::Keymap && page != SettingsPage::Keymap {
             window.focus(&self.settings_focus_handle, cx);
         }
+        if page != SettingsPage::Theme {
+            // See `Self::custom_theme_remove_armed`'s own docs - the confirm-arm is scoped to
+            // this one page, so leaving it (even to come straight back) must not leave a stale
+            // arm ready to fire on whatever card happens to render in the same position.
+            self.custom_theme_remove_armed = None;
+        }
         self.settings_page = page;
         cx.notify();
     }
@@ -268,7 +274,11 @@ impl AdeApp {
                 // Live counts, not Jerry.dc.html's fabricated sample badges (Keybindings' mockup
                 // `48` doesn't match this app's real, smaller count - see
                 // `crate::settings::state::keybinding_rows`'s own docs).
-                SettingsPage::Theme => Some(settings::THEME_DEFS.len().to_string()),
+                // Built-in + real, disk-loaded custom themes (GitHub issue #5) - one combined
+                // count, matching `Self::render_settings_theme_page`'s own combined card list.
+                SettingsPage::Theme => {
+                    Some((settings::THEME_DEFS.len() + self.custom_themes.len()).to_string())
+                }
                 SettingsPage::Keymap => Some(
                     settings::keybinding_rows(
                         &crate::default_key_bindings(),
@@ -1206,11 +1216,14 @@ impl AdeApp {
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let cards = div().flex().flex_wrap().gap(px(8.0)).children(
-            settings::THEME_DEFS
-                .iter()
-                .map(|def| self.render_theme_card(def, cx)),
-        );
+        let builtin_cards =
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(8.0))
+                .children(settings::THEME_DEFS.iter().map(|def| {
+                    self.render_theme_card(def.name, def.subtitle, def.swatches, false, cx)
+                }));
 
         let follow_system_row = self.render_settings_row(
             "Follow system appearance",
@@ -1247,7 +1260,8 @@ impl AdeApp {
                     .text_color(theme::palette::GROUP_HEADER)
                     .child("Installed themes"),
             )
-            .child(cards)
+            .child(builtin_cards)
+            .child(self.render_custom_themes_section(cx))
             .child(
                 div()
                     .pt(px(20.0))
@@ -1263,16 +1277,189 @@ impl AdeApp {
             .child(self.render_snippet_block(settings_store::ConfigPage::Theme))
     }
 
+    /// GitHub issue #5: the "Custom themes" block - every real, disk-loaded
+    /// [`custom_theme::CustomTheme`] as a card (same [`Self::render_theme_card`] used for the six
+    /// built-ins, so a custom theme is visually a first-class citizen, not a second-tier list),
+    /// the real `New from template…`/`Import theme…`/`Export current theme…` actions
+    /// ([`Self::start_create_theme_from_template`]/[`Self::start_import_custom_theme`]/
+    /// [`Self::start_export_custom_theme`]), any real load errors from the last time
+    /// `Self::custom_themes` was populated, and the most recent action's own real result.
+    fn render_custom_themes_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_custom = !self.custom_themes.is_empty();
+
+        let header_row = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .pt(px(20.0))
+            .pb(px(6.0))
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Custom themes"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(6.0))
+                    .child(self.render_theme_action_button(
+                        "settings-theme-new-from-template",
+                        "New from template\u{2026}",
+                        cx,
+                        |this, cx| this.start_create_theme_from_template(cx),
+                    ))
+                    .child(self.render_theme_action_button(
+                        "settings-theme-import",
+                        "Import theme\u{2026}",
+                        cx,
+                        |this, cx| this.start_import_custom_theme(cx),
+                    ))
+                    .child(self.render_theme_action_button(
+                        "settings-theme-export",
+                        "Export current theme\u{2026}",
+                        cx,
+                        |this, cx| this.start_export_custom_theme(cx),
+                    ))
+                    .child(self.render_theme_action_button(
+                        "settings-theme-open-folder",
+                        "Open theme folder",
+                        cx,
+                        |this, cx| this.start_open_custom_themes_folder(cx),
+                    )),
+            );
+
+        let cards = div()
+            .flex()
+            .flex_wrap()
+            .gap(px(8.0))
+            .children(self.custom_themes.iter().map(|theme| {
+                self.render_theme_card(&theme.name, &theme.subtitle, theme.swatches, true, cx)
+            }));
+
+        let empty_state = (!has_custom).then(|| {
+            // The real directory this instance actually loads from
+            // (`crate::settings::custom_theme::custom_themes_dir_for`, derived from
+            // `Self::settings_path`) - not a hardcoded `~/.config/jerry/themes/` string, which
+            // would have been wrong for anything other than the one real production settings
+            // path.
+            let themes_dir = self
+                .settings_path
+                .as_deref()
+                .map(|path| {
+                    custom_theme::custom_themes_dir_for(path)
+                        .display()
+                        .to_string()
+                })
+                .unwrap_or_else(|| "~/.config/jerry/themes".to_string());
+            div()
+                .py(px(10.0))
+                .font(font(theme::font::MONO))
+                .text_size(px(10.5))
+                .text_color(theme::text::DISABLED)
+                .child(format!(
+                    "No custom themes yet - click \u{201c}New from template\u{2026}\u{201d} for a \
+                     real, well-commented starting point, Import a `.toml` theme file, or drop \
+                     one into {themes_dir}/."
+                ))
+        });
+
+        let load_errors = (!self.custom_theme_load_errors.is_empty()).then(|| {
+            div().flex().flex_col().gap(px(2.0)).pt(px(6.0)).children(
+                self.custom_theme_load_errors.iter().map(|message| {
+                    div()
+                        .font(font(theme::font::MONO))
+                        .text_size(px(10.0))
+                        .text_color(theme::status::ASK)
+                        .child(format!("skipped: {message}"))
+                }),
+            )
+        });
+
+        let status = self.custom_theme_status.as_ref().map(|result| {
+            let (text, color) = match result {
+                Ok(message) => (message.clone(), theme::status::REVIEW),
+                Err(message) => (message.clone(), theme::status::FAIL),
+            };
+            div()
+                .pt(px(6.0))
+                .font(font(theme::font::MONO))
+                .text_size(px(10.0))
+                .text_color(color)
+                .child(text)
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .child(header_row)
+            .children(empty_state)
+            .child(cards)
+            .children(load_errors)
+            .children(status)
+    }
+
+    /// A small bordered text button, matching [`Self::render_config_banner`]'s own `Open file`
+    /// button shape - the real trigger for [`Self::start_import_custom_theme`]/
+    /// [`Self::start_export_custom_theme`].
+    fn render_theme_action_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .debug_selector(move || id.to_string())
+            .cursor_pointer()
+            .h(px(20.0))
+            .px(px(8.0))
+            .rounded(theme::radius::BUTTON)
+            .border_1()
+            .border_color(theme::border::BUTTON)
+            .flex()
+            .items_center()
+            .font(font(theme::font::SANS))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(px(10.5))
+            .text_color(theme::text::MUTED)
+            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+            .child(label)
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                on_click(this, cx);
+            }))
+    }
+
+    /// Renders one Themes-page card - shared by built-in (`settings::THEME_DEFS`) and real,
+    /// disk-loaded custom (`Self::custom_themes`) themes alike, so the two read as one combined
+    /// list rather than a first-class set and a second-tier one (GitHub issue #5). `is_custom`
+    /// only controls whether a `Remove` affordance is shown - `crate::settings::custom_theme`'s
+    /// own validation already guarantees a custom theme's `name` can never collide with a
+    /// built-in's, so no other branch needs it.
     fn render_theme_card(
         &self,
-        def: &settings::ThemeDef,
+        name: &str,
+        subtitle: &str,
+        swatches: [u32; 5],
+        is_custom: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let is_selected = def.name == self.settings.theme.name;
-        let name = def.name;
+        let is_selected = name == self.settings.theme.name;
+        let is_remove_armed = self.custom_theme_remove_armed.as_deref() == Some(name);
+        let name = name.to_string();
+        let name_for_click = name.clone();
+        let name_for_remove = name.clone();
+        let name_for_selector = name.clone();
 
         div()
             .id(format!("settings-theme-card-{name}"))
+            // Test-only, no-op in release builds - lets `VisualTestContext::debug_bounds` (keyed
+            // by this, not `.id`) confirm a real theme (built-in or custom) actually renders as
+            // its own card, matching `Self::render_settings_lsp_row`'s identical convention.
+            .debug_selector(move || format!("settings-theme-card-{name_for_selector}"))
             .cursor_pointer()
             .w(px(212.0))
             .rounded(theme::radius::CARD)
@@ -1293,7 +1480,7 @@ impl AdeApp {
             })
             .child(
                 div().h(px(34.0)).flex().children(
-                    def.swatches
+                    swatches
                         .iter()
                         .map(|hex| div().flex_1().bg(gpui::rgb(*hex))),
                 ),
@@ -1317,17 +1504,17 @@ impl AdeApp {
                             } else {
                                 theme::text::BODY
                             })
-                            .child(name),
+                            .child(name.clone()),
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .overflow_hidden()
+                            .truncate()
                             .font(font(theme::font::MONO))
                             .text_size(px(10.0))
                             .text_color(theme::text::FAINTER)
-                            .child(def.subtitle),
+                            .child(subtitle.to_string()),
                     )
                     .when(is_selected, |el| {
                         el.child(
@@ -1339,10 +1526,64 @@ impl AdeApp {
                                 .text_color(theme::status::REVIEW)
                                 .child("in use"),
                         )
+                    })
+                    .when(is_custom, |el| {
+                        // Not `move` - see `crate::settings::render::AdeApp::
+                        // render_settings_lsp_row`'s identical `let install_url = row.install_url;`
+                        // pattern this mirrors: a fresh owned clone taken *inside* the closure
+                        // body, so only the innermost `cx.listener` closure (which really is
+                        // `move`, since a `gpui::Context::listener` callback must own what it
+                        // captures) takes `name_for_remove` by value - the outer `.when` closure
+                        // stays a plain borrow, leaving `cx` itself free for the row's own
+                        // `on_click` below.
+                        //
+                        // Shown even for the currently-*selected* custom theme (an audit caught
+                        // an earlier version that hid this whenever `is_selected`, making the
+                        // active theme's own file permanently undeletable from the UI) - a real
+                        // two-click confirm (`Self::request_remove_custom_theme`) is the guard
+                        // against an accidental single click, not "only show it somewhere less
+                        // reachable".
+                        let name_for_remove = name_for_remove.clone();
+                        let name_for_remove_selector = name_for_remove.clone();
+                        let label = if is_remove_armed {
+                            "Confirm?"
+                        } else {
+                            "Remove"
+                        };
+                        el.child(
+                            div()
+                                .id(format!("settings-theme-card-remove-{name_for_remove}"))
+                                // Test-only, no-op in release builds - lets a real, click-driven
+                                // interaction test (`VisualTestContext::debug_bounds` +
+                                // `simulate_click`) find and click this exact button, proving
+                                // `cx.stop_propagation()` above genuinely beats the card's own
+                                // `on_click` rather than that only being verified by reading
+                                // GPUI's dispatch source.
+                                .debug_selector(move || {
+                                    format!("settings-theme-card-remove-{name_for_remove_selector}")
+                                })
+                                .cursor_pointer()
+                                .flex_none()
+                                .font(font(theme::font::SANS))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_size(px(9.0))
+                                .text_color(theme::button::DANGER_FG)
+                                .hover(|el| el.text_color(theme::button::DANGER_FG_HOVER))
+                                .child(label)
+                                .on_click(cx.listener(
+                                    move |this, _event: &ClickEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                        this.request_remove_custom_theme(
+                                            name_for_remove.clone(),
+                                            cx,
+                                        );
+                                    },
+                                )),
+                        )
                     }),
             )
             .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                this.set_theme_name(name.to_string(), cx);
+                this.set_theme_name(name_for_click.clone(), cx);
             }))
     }
 
@@ -2202,19 +2443,43 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// A real theme card click - persists the name *and* actually re-skins the running app (see
-    /// [`Self::render_settings_theme_page`]'s own docs). Also updates
-    /// `Settings.theme.last_dark_theme` whenever `name` isn't `"Paper"` (the one real light
-    /// theme) - see that field's own docs for the real data-loss bug this fixes for
+    /// A real theme card click (built-in or custom - see
+    /// [`Self::render_settings_theme_page`]'s own docs) - persists the name *and* actually
+    /// re-skins the running app. Also updates `Settings.theme.last_dark_theme` whenever the
+    /// newly selected theme isn't a light one (`crate::theme::theme_is_light`, generalized from
+    /// the old hardcoded `name == "Paper"` check so a custom light theme is remembered correctly
+    /// too) - see that field's own docs for the real data-loss bug this fixes for
     /// `follow_system`.
     fn set_theme_name(&mut self, name: String, cx: &mut Context<Self>) {
-        if name != "Paper" {
+        let is_light = self
+            .theme_swatches_for(&name)
+            .map(theme::theme_is_light)
+            .unwrap_or(false);
+        if !is_light {
             self.settings.theme.last_dark_theme = name.clone();
         }
         self.settings.theme.name = name;
         self.apply_theme_selection(cx);
         self.persist_settings(cx);
         cx.notify();
+    }
+
+    /// Real, single lookup used by both [`Self::apply_theme_selection`] (which colour palette is
+    /// live) and [`Self::set_theme_name`] (is the newly selected theme light, for
+    /// `last_dark_theme` bookkeeping) - looks up `name` first against the six built-in
+    /// `settings::THEME_DEFS`, then against [`Self::custom_themes`], so the two callers can never
+    /// resolve a name differently.
+    fn theme_swatches_for(&self, name: &str) -> Option<[u32; 5]> {
+        settings::THEME_DEFS
+            .iter()
+            .find(|def| def.name == name)
+            .map(|def| def.swatches)
+            .or_else(|| {
+                self.custom_themes
+                    .iter()
+                    .find(|theme| theme.name == name)
+                    .map(|theme| theme.swatches)
+            })
     }
 
     /// Turning this on immediately syncs to the real, current OS appearance
@@ -2238,20 +2503,427 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Applies `self.settings.theme.name` as the real, live-selected theme
-    /// (`crate::theme::set_current_theme_index`) and forces a real full repaint
-    /// (`App::refresh_windows`, `vendor/zed/crates/gpui/src/app.rs:1025`) so every
+    /// Applies `self.settings.theme.name` as the real, live-selected theme and forces a real full
+    /// repaint (`App::refresh_windows`, `vendor/zed/crates/gpui/src/app.rs:1025`) so every
     /// already-rendered surface - not just ones that happen to re-render for some other reason -
-    /// picks up the new colours on the very next frame. An unrecognized `theme.name` (only
-    /// reachable via a hand-edited `settings.toml`) falls back to index `0` (Jerry Dark) rather
-    /// than leaving the previous theme's index in place unnoticed.
+    /// picks up the new colours on the very next frame.
+    ///
+    /// Checks the six built-in `settings::THEME_DEFS` first, then [`Self::custom_themes`]
+    /// (GitHub issue #5) - a built-in name always wins if both somehow matched, though
+    /// `crate::settings::custom_theme::CustomThemeFile::validate` already rejects a custom theme
+    /// whose name collides with a built-in one, so that's not actually reachable outside a
+    /// theoretical race with a hand-edited file. A name matching neither (only reachable via a
+    /// hand-edited `settings.toml`, or a custom theme file that's since been deleted) falls back
+    /// to index `0` (Jerry Dark) rather than leaving the previous theme's index in place
+    /// unnoticed. [`crate::theme::set_current_theme_index`]/[`crate::theme::
+    /// set_current_custom_theme`] are always written together here - see the latter's own docs
+    /// for why `crate::theme::ColorToken::resolve` depends on that.
     pub(crate) fn apply_theme_selection(&self, cx: &mut Context<Self>) {
-        let index = settings::THEME_DEFS
+        let name = self.settings.theme.name.as_str();
+        if let Some(index) = settings::THEME_DEFS.iter().position(|def| def.name == name) {
+            theme::set_current_theme_index(index);
+            theme::set_current_custom_theme(None);
+        } else if let Some(swatches) = self
+            .custom_themes
             .iter()
-            .position(|def| def.name == self.settings.theme.name)
-            .unwrap_or(0);
-        theme::set_current_theme_index(index);
+            .find(|theme| theme.name == name)
+            .map(|theme| theme.swatches)
+        {
+            theme::set_current_theme_index(0);
+            theme::set_current_custom_theme(Some(swatches));
+        } else {
+            theme::set_current_theme_index(0);
+            theme::set_current_custom_theme(None);
+        }
         cx.refresh_windows();
+    }
+
+    /// GitHub issue #5's real "Import theme…" action - a genuine native file-open dialog
+    /// (`gpui::App::prompt_for_paths`, `vendor/zed/crates/gpui/src/app.rs:1490` - the same real
+    /// API `vendor/zed/crates/agent_ui/src/threads_archive_view.rs`'s own `open_local_folder`
+    /// uses, verified there before writing this), not a synthetic path. The user picks any real
+    /// `.toml` file on disk; the actual import+reload runs on the background executor (matching
+    /// [`Self::start_export_custom_theme`]'s own convention - an adversarial audit caught the
+    /// first version of this doing synchronous foreground-thread I/O instead), and
+    /// [`Self::apply_custom_theme_import_result`] applies the outcome once it resolves. A
+    /// cancelled dialog (`Ok(Ok(None))`) or a platform error (`Err`/`Ok(Err(_))`) is a real,
+    /// silent no-op - there is nothing wrong to report, the user simply didn't pick a file.
+    /// "Open theme folder" - hands the real custom-themes directory
+    /// ([`custom_theme::custom_themes_dir_for`]) to [`Self::open_path_with_os_handler`], the same
+    /// real per-platform default-open handler the file tree's "Reveal in file manager" already
+    /// uses. Creates the directory first if it doesn't exist yet, on the background executor
+    /// (never the GPUI foreground thread, matching every other real I/O in this module) - a user
+    /// who has never imported or created a custom theme has no real directory there otherwise,
+    /// and handing a nonexistent path to `xdg-open`/`open`/`cmd /c start` would just fail.
+    pub(in crate::settings) fn start_open_custom_themes_folder(&mut self, cx: &mut Context<Self>) {
+        let Some(settings_path) = self.settings_path.clone() else {
+            self.custom_theme_status = Some(Err(
+                "can't open the themes folder: no settings file location is known".to_string(),
+            ));
+            cx.notify();
+            return;
+        };
+        let dest_dir = custom_theme::custom_themes_dir_for(&settings_path);
+        cx.spawn(async move |this, cx| {
+            let mkdir_dir = dest_dir.clone();
+            let mkdir_result = cx
+                .background_executor()
+                .spawn(async move { std::fs::create_dir_all(&mkdir_dir) })
+                .await;
+            if let Err(err) = mkdir_result {
+                log::warn!(
+                    "failed to create the custom themes directory {}: {err}",
+                    dest_dir.display()
+                );
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.open_path_with_os_handler(&dest_dir, cx);
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::settings) fn start_import_custom_theme(&mut self, cx: &mut Context<Self>) {
+        let paths_receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import".into()),
+        });
+        // Same seam `Self::custom_themes` was populated through at construction time
+        // (`crate::root::AdeApp::new_with_settings`) - a test instance (`settings_path == None`)
+        // has nowhere real to import into, matching its own real "no persistence" contract.
+        let settings_path = self.settings_path.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(mut paths))) = paths_receiver.await else {
+                return;
+            };
+            let Some(source_path) = paths.pop() else {
+                return;
+            };
+            let Some(settings_path) = settings_path else {
+                let _ = this.update(cx, |this, cx| {
+                    this.custom_theme_status = Some(Err(
+                        "can't import a theme: no settings file location is known".to_string(),
+                    ));
+                    cx.notify();
+                });
+                return;
+            };
+            let dest_dir = custom_theme::custom_themes_dir_for(&settings_path);
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let imported = custom_theme::import_theme_file(&source_path, &dest_dir)?;
+                    // Reload from disk rather than manually splicing the in-memory list - an
+                    // adversarial audit caught the previous `retain` + `push` version drifting
+                    // from what's actually on disk whenever `import_theme_file` itself resolved
+                    // a slug collision to a *different* path than the naive one (see that
+                    // function's own docs), and it also left stale `custom_theme_load_errors`
+                    // (e.g. a since-fixed duplicate-name warning) on screen forever.
+                    let (themes, errors) = custom_theme::load_custom_themes_from_dir(&dest_dir);
+                    Ok((imported, themes, errors))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_custom_theme_import_result(result, cx);
+            });
+        });
+        self._custom_theme_import_task = Some(task);
+    }
+
+    /// Applies [`Self::start_import_custom_theme`]'s real background-executor result - shared
+    /// with nothing else (there is exactly one real caller). On success, re-loads
+    /// [`Self::custom_themes`]/[`Self::custom_theme_load_errors`] wholesale from what's actually
+    /// on disk (see [`Self::start_import_custom_theme`]'s own docs for why), and - if the
+    /// imported theme is the one currently selected (a real "re-import to update my colours"
+    /// flow) - immediately re-applies it via [`Self::apply_theme_selection`] rather than leaving
+    /// the app rendering the *old* palette until the next restart (a real bug an adversarial
+    /// audit caught: the card would redraw with the new swatches and an "in use" badge while
+    /// every other surface stayed on the stale colours).
+    #[allow(clippy::type_complexity)]
+    fn apply_custom_theme_import_result(
+        &mut self,
+        result: Result<
+            (
+                custom_theme::CustomTheme,
+                Vec<custom_theme::CustomTheme>,
+                Vec<String>,
+            ),
+            custom_theme::ThemeFileError,
+        >,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_custom_theme_load_result(result, |name| format!("Imported \"{name}\"."), cx);
+    }
+
+    /// The real, shared "a background load-or-write-then-reload-from-disk action finished"
+    /// applier both [`Self::apply_custom_theme_import_result`] and
+    /// [`Self::apply_custom_theme_create_from_template_result`] go through - not two
+    /// independently-maintained copies of the same success/failure bookkeeping (registry
+    /// replacement, load-error replacement, status line, and - if the affected theme is the one
+    /// currently selected - an immediate re-skin via [`Self::apply_theme_selection`], matching
+    /// [`Self::apply_custom_theme_import_result`]'s own original "re-import the active theme"
+    /// fix). `success_message` is the one real difference between the two real callers: what the
+    /// status line should say for *this* action having succeeded.
+    #[allow(clippy::type_complexity)]
+    fn apply_custom_theme_load_result(
+        &mut self,
+        result: Result<
+            (
+                custom_theme::CustomTheme,
+                Vec<custom_theme::CustomTheme>,
+                Vec<String>,
+            ),
+            custom_theme::ThemeFileError,
+        >,
+        success_message: impl FnOnce(&str) -> String,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok((theme, themes, errors)) => {
+                let name = theme.name;
+                self.custom_themes = themes;
+                self.custom_theme_load_errors = errors;
+                self.custom_theme_status = Some(Ok(success_message(&name)));
+                if self.settings.theme.name == name {
+                    self.apply_theme_selection(cx);
+                }
+            }
+            Err(err) => {
+                self.custom_theme_status = Some(Err(err.to_string()));
+            }
+        }
+        cx.notify();
+    }
+
+    /// GitHub issue #5 follow-up's real "New from template" action - writes the same real,
+    /// well-commented starting-point file the repository itself ships at
+    /// `assets/themes/template.toml` (`custom_theme::write_template_theme`, which embeds and
+    /// writes `custom_theme::CUSTOM_THEME_TEMPLATE_TOML` verbatim) straight into this instance's
+    /// own real custom-themes directory, then reloads the registry from disk - the same real
+    /// background-executor write-then-reload-from-disk shape
+    /// [`Self::start_import_custom_theme`] already uses, reusing the exact same
+    /// [`custom_theme::load_custom_themes_from_dir`] reload and
+    /// [`Self::apply_custom_theme_load_result`] applier, not a second, parallel path. Unlike
+    /// Import, there's no file-picker dialog to await first - the "file" being written is a
+    /// fixed, embedded constant, not something the user picks - so this goes straight to the
+    /// background executor.
+    pub(in crate::settings) fn start_create_theme_from_template(&mut self, cx: &mut Context<Self>) {
+        let Some(settings_path) = self.settings_path.clone() else {
+            self.custom_theme_status = Some(Err(
+                "can't create a theme: no settings file location is known".to_string(),
+            ));
+            cx.notify();
+            return;
+        };
+        let task = cx.spawn(async move |this, cx| {
+            let dest_dir = custom_theme::custom_themes_dir_for(&settings_path);
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let created = custom_theme::write_template_theme(&dest_dir)?;
+                    let (themes, errors) = custom_theme::load_custom_themes_from_dir(&dest_dir);
+                    Ok((created, themes, errors))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_custom_theme_create_from_template_result(result, cx);
+            });
+        });
+        self._custom_theme_create_task = Some(task);
+    }
+
+    /// Applies [`Self::start_create_theme_from_template`]'s real result - shared with nothing
+    /// else but [`Self::apply_custom_theme_load_result`]'s own common bookkeeping.
+    #[allow(clippy::type_complexity)]
+    fn apply_custom_theme_create_from_template_result(
+        &mut self,
+        result: Result<
+            (
+                custom_theme::CustomTheme,
+                Vec<custom_theme::CustomTheme>,
+                Vec<String>,
+            ),
+            custom_theme::ThemeFileError,
+        >,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_custom_theme_load_result(
+            result,
+            |name| format!("Created \"{name}\" from the template."),
+            cx,
+        );
+    }
+
+    /// GitHub issue #5's real "Export current theme…" action - serializes whichever theme
+    /// (built-in or custom) is currently active to a real file at a location the user picks via a
+    /// genuine native save dialog (`gpui::App::prompt_for_new_path`,
+    /// `vendor/zed/crates/gpui/src/app.rs:1503` - verified against
+    /// `vendor/zed/crates/miniprofiler_ui/src/miniprofiler_ui.rs`'s own real caller before writing
+    /// this). The real file write itself runs on the background executor, matching every other
+    /// disk write in this codebase (`crate::settings::store::Settings::save_at`'s own callers).
+    ///
+    /// A built-in theme is exported under `"<name> (copy)"`, never its own bare built-in name -
+    /// `crate::settings::custom_theme::CustomThemeFile::validate` unconditionally rejects any
+    /// file whose `name` collides with a `settings::THEME_DEFS` entry, so exporting e.g. "Slate"
+    /// verbatim would produce a file this app (the exporter's own, or anyone it's shared with)
+    /// can never actually import back - a real "looks like it worked, quietly can't be used"
+    /// bug an adversarial audit caught. A custom theme keeps its own name, so re-importing an
+    /// unmodified export is a real no-op "update" rather than spawning a `(copy)` duplicate.
+    pub(in crate::settings) fn start_export_custom_theme(&mut self, cx: &mut Context<Self>) {
+        let active_name = self.settings.theme.name.clone();
+        let Some(swatches) = self.theme_swatches_for(&active_name) else {
+            self.custom_theme_status = Some(Err(format!(
+                "can't export: no theme named \"{active_name}\" is currently loaded"
+            )));
+            cx.notify();
+            return;
+        };
+        let export_name = export_theme_name_for(active_name.as_str());
+        let subtitle = self
+            .custom_themes
+            .iter()
+            .find(|theme| theme.name == active_name)
+            .map(|theme| theme.subtitle.clone())
+            .or_else(|| {
+                settings::THEME_DEFS
+                    .iter()
+                    .find(|def| def.name == active_name)
+                    .map(|def| def.subtitle.to_string())
+            })
+            .unwrap_or_default();
+        let export_theme = custom_theme::CustomTheme {
+            name: export_name.clone(),
+            subtitle,
+            swatches,
+            source_path: None,
+        };
+        let default_dir = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        // Reuses `crate::settings::custom_theme::slugify` rather than a second, hand-rolled
+        // implementation - an adversarial audit caught the original inline `.replace(...)` here
+        // disagreeing with the real one on e.g. runs of punctuation, so the suggested filename
+        // and the filename `import_theme_file` would actually pick on re-import could differ.
+        let suggested_name = format!("{}.toml", custom_theme::slugify(&export_name));
+        let path_receiver = cx.prompt_for_new_path(&default_dir, Some(suggested_name.as_str()));
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(dest_path))) = path_receiver.await else {
+                return;
+            };
+            let write_result = cx
+                .background_executor()
+                .spawn(async move {
+                    custom_theme::export_theme_to_path(&export_theme, &dest_path).map(|_| dest_path)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match write_result {
+                    Ok(path) => {
+                        this.custom_theme_status =
+                            Some(Ok(format!("Exported to {}.", path.display())));
+                    }
+                    Err(err) => {
+                        this.custom_theme_status =
+                            Some(Err(format!("couldn't export the theme: {err}")));
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self._custom_theme_export_task = Some(task);
+    }
+
+    /// The Themes page's "Remove" action on a custom theme card - real two-click confirmation via
+    /// [`Self::custom_theme_remove_armed`] (see that field's own docs for why: an adversarial
+    /// audit caught the first version of this deleting the user's file on a single click, unlike
+    /// every other destructive action in this app). The first click on a given `name` only arms
+    /// it; a second click on the *same* name actually deletes
+    /// ([`Self::execute_remove_custom_theme`]) - mirroring
+    /// `crate::worktree_history::flow::AdeApp::request_discard_worktree`'s identical shape.
+    fn request_remove_custom_theme(&mut self, name: String, cx: &mut Context<Self>) {
+        if self.custom_theme_remove_armed.as_deref() != Some(name.as_str()) {
+            self.custom_theme_remove_armed = Some(name);
+            cx.notify();
+            return;
+        }
+        self.custom_theme_remove_armed = None;
+        self.execute_remove_custom_theme(name, cx);
+    }
+
+    /// Runs the real, already-confirmed removal - only ever reached through
+    /// [`Self::request_remove_custom_theme`]'s second click. Deletes the theme's real backing
+    /// file (`crate::settings::custom_theme::remove_custom_theme_file`) on the background
+    /// executor, then reloads [`Self::custom_themes`]/[`Self::custom_theme_load_errors`] fresh
+    /// from disk (same "never manually splice, always re-read" discipline as
+    /// [`Self::apply_custom_theme_import_result`]). If the removed theme was the active
+    /// selection, falls back to `"Jerry Dark"`; if it was also the remembered
+    /// `Settings.theme.last_dark_theme`, that is reset too - an adversarial audit caught the
+    /// first version leaving a dangling `last_dark_theme` that a later real OS-dark
+    /// `follow_system` signal (`Self::apply_follow_system_appearance`) would have written straight
+    /// back into `Settings.theme.name`, resolving to nothing and silently landing back on Jerry
+    /// Dark with no visible error - exactly the "dangling selection" this method's remaining
+    /// fallback logic is meant to prevent.
+    fn execute_remove_custom_theme(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(theme) = self
+            .custom_themes
+            .iter()
+            .find(|theme| theme.name == name)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(settings_path) = self.settings_path.clone() else {
+            self.custom_theme_status = Some(Err(
+                "can't remove a theme: no settings file location is known".to_string(),
+            ));
+            cx.notify();
+            return;
+        };
+        let task = cx.spawn(async move |this, cx| {
+            let dest_dir = custom_theme::custom_themes_dir_for(&settings_path);
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    custom_theme::remove_custom_theme_file(&theme)?;
+                    Ok(custom_theme::load_custom_themes_from_dir(&dest_dir))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_custom_theme_remove_result(name, result, cx);
+            });
+        });
+        self._custom_theme_remove_task = Some(task);
+    }
+
+    /// Applies [`Self::execute_remove_custom_theme`]'s real result - shared with nothing else.
+    #[allow(clippy::type_complexity)]
+    fn apply_custom_theme_remove_result(
+        &mut self,
+        name: String,
+        result: std::io::Result<(Vec<custom_theme::CustomTheme>, Vec<String>)>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok((themes, errors)) => {
+                self.custom_themes = themes;
+                self.custom_theme_load_errors = errors;
+                if self.settings.theme.name == name {
+                    self.settings.theme.name = "Jerry Dark".to_string();
+                    self.apply_theme_selection(cx);
+                }
+                if self.settings.theme.last_dark_theme == name {
+                    self.settings.theme.last_dark_theme = "Jerry Dark".to_string();
+                }
+                self.custom_theme_status = Some(Ok(format!("Removed \"{name}\".")));
+                self.persist_settings(cx);
+            }
+            Err(err) => {
+                self.custom_theme_status = Some(Err(format!("couldn't remove \"{name}\": {err}")));
+            }
+        }
+        cx.notify();
     }
 
     /// The real, shared "follow system" logic both [`Self::toggle_theme_follow_system`] (a
@@ -2305,6 +2977,71 @@ impl AdeApp {
         let appearance = window.appearance();
         self.apply_follow_system_appearance(appearance, cx);
         cx.notify();
+    }
+}
+
+/// The real name [`AdeApp::start_export_custom_theme`] exports `active_name` under - a pure,
+/// directly-`#[test]`-able decision (not a `gpui`-window-touching method) so this can be checked
+/// without a real save dialog. A built-in theme (`settings::THEME_DEFS`) is renamed to `"<name>
+/// (copy)"`; a custom one keeps its own name unchanged. See `AdeApp::start_export_custom_theme`'s
+/// own docs for why this matters: `crate::settings::custom_theme::CustomThemeFile::validate`
+/// unconditionally rejects any file whose `name` collides with a built-in, so exporting a
+/// built-in theme under its own bare name would produce a file nobody - not even this same app -
+/// could ever import back in.
+fn export_theme_name_for(active_name: &str) -> String {
+    if settings::THEME_DEFS
+        .iter()
+        .any(|def| def.name == active_name)
+    {
+        format!("{active_name} (copy)")
+    } else {
+        active_name.to_string()
+    }
+}
+
+#[cfg(test)]
+mod export_theme_name_tests {
+    use super::*;
+
+    #[test]
+    fn a_builtin_theme_is_renamed_to_a_real_importable_copy() {
+        assert_eq!(export_theme_name_for("Slate"), "Slate (copy)");
+        assert_eq!(export_theme_name_for("Jerry Dark"), "Jerry Dark (copy)");
+        assert_eq!(export_theme_name_for("Paper"), "Paper (copy)");
+    }
+
+    #[test]
+    fn a_custom_theme_keeps_its_own_name() {
+        assert_eq!(export_theme_name_for("Midnight Coral"), "Midnight Coral");
+    }
+
+    /// The real, end-to-end proof this fixes the bug it exists for: exporting a built-in under
+    /// its bare name would produce a file `CustomThemeFile::validate` rejects (a real, previously
+    /// shipped "looks like it worked, quietly can't be imported back" bug an adversarial audit
+    /// caught) - the renamed form must actually validate successfully.
+    #[test]
+    fn the_renamed_export_of_a_builtin_actually_validates_as_importable() {
+        let bare = custom_theme::CustomThemeFile {
+            name: "Slate".to_string(),
+            subtitle: String::new(),
+            background: "#0d1117".to_string(),
+            panel: "#161b22".to_string(),
+            accent_green: "#57a773".to_string(),
+            accent_amber: "#c9a227".to_string(),
+            accent_blue: "#6b9bd1".to_string(),
+        };
+        assert!(
+            bare.validate().is_err(),
+            "exporting a builtin under its own bare name must be rejected on import - this is \
+             the real bug being guarded against"
+        );
+
+        let mut renamed = bare;
+        renamed.name = export_theme_name_for("Slate");
+        assert!(
+            renamed.validate().is_ok(),
+            "the renamed export must actually be importable"
+        );
     }
 }
 
@@ -3018,6 +3755,709 @@ mod theme_swap_tests {
             app.read_with(cx, |app, _| app.settings.theme.name.clone()),
             expected_name,
             "turning follow_system on must immediately apply the real current OS appearance"
+        );
+    }
+}
+
+/// GitHub issue #5's real end-to-end wiring coverage: a theme file really written to disk really
+/// gets loaded into a fresh `AdeApp`, really renders as a selectable card, really re-skins the
+/// app when picked, and a real removal really deletes its backing file - each proven the same
+/// way `theme_swap_tests` proves the built-in mechanism, by driving the actual `AdeApp` methods a
+/// real user action invokes, not `crate::settings::custom_theme`'s own already-covered pure
+/// functions directly.
+#[cfg(test)]
+mod custom_theme_settings_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Same real-global-leak discipline `theme_swap_tests::ResetThemeIndexOnDrop` documents, for
+    /// both `CURRENT_THEME_INDEX` and `CURRENT_CUSTOM_SHIFT` together - a custom-theme test can
+    /// leave either non-default.
+    struct ResetThemeStateOnDrop;
+    impl Drop for ResetThemeStateOnDrop {
+        fn drop(&mut self) {
+            theme::set_current_theme_index(0);
+            theme::set_current_custom_theme(None);
+        }
+    }
+
+    fn open_test_app_with_real_settings_path(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        settings: settings_store::Settings,
+        settings_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(repo_path, settings, Some(settings_path), window, cx)
+        })
+    }
+
+    fn write_custom_theme_file(themes_dir: &std::path::Path, file_name: &str, contents: &str) {
+        std::fs::create_dir_all(themes_dir).expect("create themes dir");
+        std::fs::write(themes_dir.join(file_name), contents).expect("write theme file");
+    }
+
+    const MIDNIGHT_CORAL_TOML: &str = "name = \"Midnight Coral\"\n\
+         subtitle = \"warm accent\"\n\
+         background = \"#0c0d10\"\n\
+         panel = \"#181a1e\"\n\
+         accent_green = \"#5cb87f\"\n\
+         accent_amber = \"#e2a336\"\n\
+         accent_blue = \"#e07a5f\"\n";
+
+    /// A real theme file, sitting in the settings-sibling `themes/` directory before the app is
+    /// ever constructed, is loaded at startup (`crate::root::AdeApp::new_with_settings`) and
+    /// really renders as a selectable card on the Themes page - not just present in
+    /// `Self::custom_themes` as data nothing draws.
+    #[gpui::test]
+    fn a_custom_theme_file_on_disk_loads_at_startup_and_renders_as_a_real_card(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        write_custom_theme_file(
+            &settings_dir.path().join("themes"),
+            "midnight-coral.toml",
+            MIDNIGHT_CORAL_TOML,
+        );
+
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path,
+        );
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.custom_themes.len()),
+            1,
+            "the real on-disk theme file must be loaded into the registry at construction"
+        );
+        assert!(app.read_with(cx, |app, _| app.custom_theme_load_errors.is_empty()));
+
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Theme, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("settings-theme-card-Midnight Coral")
+                .is_some(),
+            "the custom theme must actually render as a card on the Themes page, not just exist \
+             as unrendered data"
+        );
+    }
+
+    /// Selecting a real custom theme (`Self::set_theme_name`, the same method a card click
+    /// invokes) must really re-skin the app - a representative colour token resolves to
+    /// something other than Jerry Dark's own value - and persist the selection, exactly like
+    /// `theme_swap_tests::selecting_a_real_theme_card_changes_the_live_selected_index_and_a_representative_color`
+    /// proves for a built-in theme.
+    #[gpui::test]
+    fn selecting_a_custom_theme_really_reskins_the_app_and_persists(cx: &mut TestAppContext) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        write_custom_theme_file(
+            &settings_dir.path().join("themes"),
+            "midnight-coral.toml",
+            MIDNIGHT_CORAL_TOML,
+        );
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path.clone(),
+        );
+
+        let jerry_dark_window_bg = theme::surface::WINDOW.resolve();
+
+        app.update(cx, |app, cx| {
+            app.set_theme_name("Midnight Coral".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.name.clone()),
+            "Midnight Coral"
+        );
+        assert!(
+            theme::surface::WINDOW.resolve() != jerry_dark_window_bg,
+            "selecting a real custom theme must actually change what a representative colour \
+             token resolves to"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.last_dark_theme.clone()),
+            "Midnight Coral",
+            "Midnight Coral's background swatch is dark, so it should be remembered as the last \
+             dark theme"
+        );
+
+        // Persisted for real - reloading the same settings file picks the same theme back up.
+        cx.run_until_parked();
+        let reloaded = settings_store::Settings::load_or_init_at(&settings_path);
+        assert_eq!(reloaded.theme.name, "Midnight Coral");
+    }
+
+    /// The real, synchronous validate-then-apply step (`Self::apply_custom_theme_import_result`)
+    /// behind `Self::start_import_custom_theme`'s async file-picker plumbing - driven directly
+    /// with a real `custom_theme::import_theme_file`/`load_custom_themes_from_dir` result here
+    /// since there is no real headless file dialog to simulate, matching how
+    /// `Self::open_install_url`/`Self::open_settings_file`'s own OS-handoff calls are only ever
+    /// unit-tested at the pure-decision-function layer (`crate::settings::widgets::
+    /// open_command_for`), never through an actual OS dialog. The picker plumbing itself
+    /// (`cx.prompt_for_paths`, `cx.background_executor()`) is real, verified GPUI API usage, not
+    /// re-tested here.
+    #[gpui::test]
+    fn importing_a_real_theme_file_adds_it_to_the_registry_and_writes_a_canonical_copy(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path.clone(),
+        );
+
+        let source_dir = tempfile::tempdir().expect("tempdir");
+        let source_path = source_dir.path().join("picked.toml");
+        std::fs::write(&source_path, MIDNIGHT_CORAL_TOML).expect("write source file");
+        let dest_dir = settings_dir.path().join("themes");
+
+        let result = custom_theme::import_theme_file(&source_path, &dest_dir).map(|imported| {
+            let (themes, errors) = custom_theme::load_custom_themes_from_dir(&dest_dir);
+            (imported, themes, errors)
+        });
+        app.update(cx, |app, cx| {
+            app.apply_custom_theme_import_result(result, cx);
+        });
+
+        assert_eq!(app.read_with(cx, |app, _| app.custom_themes.len()), 1);
+        assert_eq!(
+            app.read_with(cx, |app, _| app.custom_themes[0].name.clone()),
+            "Midnight Coral"
+        );
+        let status = app.read_with(cx, |app, _| app.custom_theme_status.clone());
+        assert!(
+            matches!(status, Some(Ok(_))),
+            "a real successful import should report a real success status, got {status:?}"
+        );
+        let expected_file = dest_dir.join("midnight-coral.toml");
+        assert!(
+            expected_file.exists(),
+            "import must write a real, canonical copy into the settings-sibling themes directory"
+        );
+
+        // A malformed source is rejected with a real error and does not touch the registry.
+        let bad_source = source_dir.path().join("bad.toml");
+        std::fs::write(&bad_source, "name = \"\"\n").expect("write bad source");
+        let bad_result = custom_theme::import_theme_file(&bad_source, &dest_dir).map(|imported| {
+            let (themes, errors) = custom_theme::load_custom_themes_from_dir(&dest_dir);
+            (imported, themes, errors)
+        });
+        app.update(cx, |app, cx| {
+            app.apply_custom_theme_import_result(bad_result, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.custom_themes.len()),
+            1,
+            "a malformed import must not add a bogus entry"
+        );
+        let status = app.read_with(cx, |app, _| app.custom_theme_status.clone());
+        assert!(
+            matches!(status, Some(Err(_))),
+            "a malformed import should report a real, honest error, got {status:?}"
+        );
+    }
+
+    /// Re-importing the theme currently in use must immediately re-skin the app with its updated
+    /// swatches, not leave it rendering the stale palette until a restart - a real bug an
+    /// adversarial audit caught in the first version of `Self::apply_custom_theme_import_result`.
+    #[gpui::test]
+    fn reimporting_the_currently_active_theme_immediately_reskins_the_app(cx: &mut TestAppContext) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let dest_dir = settings_dir.path().join("themes");
+        write_custom_theme_file(&dest_dir, "midnight-coral.toml", MIDNIGHT_CORAL_TOML);
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path,
+        );
+        app.update(cx, |app, cx| {
+            app.set_theme_name("Midnight Coral".to_string(), cx);
+        });
+        let original = theme::surface::WINDOW.resolve();
+
+        // Re-import the same theme under a different background swatch - deliberately near-black
+        // (`#050505`), not an arbitrary colour: it must still clear the real panel/background
+        // readability floor `CustomThemeFile::validate_with_builtin_check` enforces (see
+        // `custom_theme::readability_floor_per_mille`'s own docs), or this re-import would be a
+        // real, correct rejection rather than the re-skin this test means to exercise.
+        let source_dir = tempfile::tempdir().expect("tempdir");
+        let source_path = source_dir.path().join("picked.toml");
+        std::fs::write(
+            &source_path,
+            MIDNIGHT_CORAL_TOML.replace("#0c0d10", "#050505"),
+        )
+        .expect("write updated source");
+        let result = custom_theme::import_theme_file(&source_path, &dest_dir).map(|imported| {
+            let (themes, errors) = custom_theme::load_custom_themes_from_dir(&dest_dir);
+            (imported, themes, errors)
+        });
+        app.update(cx, |app, cx| {
+            app.apply_custom_theme_import_result(result, cx);
+        });
+
+        assert!(
+            theme::surface::WINDOW.resolve() != original,
+            "re-importing the active custom theme with new swatches must re-skin the app \
+             immediately, not require a restart"
+        );
+    }
+
+    /// The Themes page's "Remove" action - real two-click confirmation
+    /// (`Self::request_remove_custom_theme`/`Self::custom_theme_remove_armed`): the first click
+    /// only arms it and touches nothing on disk; the second click actually deletes the real
+    /// backing file and, when the removed theme was the active selection or the remembered
+    /// `last_dark_theme`, falls back to Jerry Dark rather than leaving a dangling name neither
+    /// can resolve.
+    #[gpui::test]
+    fn removing_the_active_custom_theme_requires_two_clicks_then_falls_back_to_jerry_dark(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let themes_dir = settings_dir.path().join("themes");
+        write_custom_theme_file(&themes_dir, "midnight-coral.toml", MIDNIGHT_CORAL_TOML);
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path,
+        );
+
+        app.update(cx, |app, cx| {
+            app.set_theme_name("Midnight Coral".to_string(), cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.name.clone()),
+            "Midnight Coral"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.last_dark_theme.clone()),
+            "Midnight Coral"
+        );
+
+        // First click only arms the confirmation - nothing is deleted yet.
+        app.update(cx, |app, cx| {
+            app.request_remove_custom_theme("Midnight Coral".to_string(), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            themes_dir.join("midnight-coral.toml").exists(),
+            "a single click must not delete anything"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.custom_theme_remove_armed.clone()),
+            Some("Midnight Coral".to_string())
+        );
+        assert_eq!(app.read_with(cx, |app, _| app.custom_themes.len()), 1);
+
+        // Second click on the same name actually removes it.
+        app.update(cx, |app, cx| {
+            app.request_remove_custom_theme("Midnight Coral".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(app.read_with(cx, |app, _| app.custom_themes.is_empty()));
+        assert!(!themes_dir.join("midnight-coral.toml").exists());
+        assert_eq!(
+            app.read_with(cx, |app, _| app.custom_theme_remove_armed.clone()),
+            None
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.name.clone()),
+            "Jerry Dark",
+            "removing the active theme must fall back to Jerry Dark, not leave a dangling \
+             selection"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.last_dark_theme.clone()),
+            "Jerry Dark",
+            "the dangling last_dark_theme must be reset too, or a later real OS-dark \
+             follow_system signal would resolve to nothing"
+        );
+    }
+
+    /// Leaving the Themes page must disarm a pending "Remove" confirmation - otherwise a stray
+    /// click landing back on the same card position later could delete a theme the user never
+    /// actually confirmed removing this time.
+    #[gpui::test]
+    fn leaving_the_themes_page_disarms_a_pending_remove_confirmation(cx: &mut TestAppContext) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        write_custom_theme_file(
+            &settings_dir.path().join("themes"),
+            "midnight-coral.toml",
+            MIDNIGHT_CORAL_TOML,
+        );
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path,
+        );
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Theme, window, cx);
+            app.request_remove_custom_theme("Midnight Coral".to_string(), cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.custom_theme_remove_armed.clone()),
+            Some("Midnight Coral".to_string())
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::General, window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.custom_theme_remove_armed.clone()),
+            None
+        );
+    }
+
+    /// The real, click-driven proof behind [`Self::request_remove_custom_theme`]'s
+    /// `cx.stop_propagation()` (an adversarial audit verified this by reading GPUI's own event
+    /// dispatch source rather than a live test - this closes that gap for real): two genuine
+    /// simulated clicks on the Remove button's own real painted bounds delete the theme, and
+    /// neither click also fires the card's own `on_click` underneath it - if it did, the first
+    /// click would have switched the active theme to "Midnight Coral" instead of just arming the
+    /// confirmation.
+    #[gpui::test]
+    fn clicking_the_real_remove_button_deletes_the_theme_without_selecting_its_card(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let themes_dir = settings_dir.path().join("themes");
+        write_custom_theme_file(&themes_dir, "midnight-coral.toml", MIDNIGHT_CORAL_TOML);
+        let mut settings = settings_store::Settings::default();
+        settings.theme.name = "Slate".to_string();
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings,
+            settings_path,
+        );
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Theme, window, cx);
+        });
+        cx.run_until_parked();
+
+        let remove_bounds = cx
+            .debug_bounds("settings-theme-card-remove-Midnight Coral")
+            .expect("the Remove affordance must have painted on the custom theme's card");
+
+        // First real click: arms the confirmation.
+        cx.simulate_click(remove_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.name.clone()),
+            "Slate",
+            "clicking Remove must not also select the card underneath it via the same click"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.custom_theme_remove_armed.clone()),
+            Some("Midnight Coral".to_string())
+        );
+        assert!(themes_dir.join("midnight-coral.toml").exists());
+
+        // Second real click on the same button (now re-rendered reading "Confirm?", same real
+        // id/`debug_selector`) actually deletes it.
+        let confirm_bounds = cx
+            .debug_bounds("settings-theme-card-remove-Midnight Coral")
+            .expect("the button must still be painted, now reading Confirm?");
+        cx.simulate_click(confirm_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(!themes_dir.join("midnight-coral.toml").exists());
+        assert!(app.read_with(cx, |app, _| app.custom_themes.is_empty()));
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.name.clone()),
+            "Slate",
+            "Slate wasn't the removed theme, so it must stay selected throughout"
+        );
+    }
+
+    /// The real, click-driven proof the Import/Export action buttons themselves are wired to a
+    /// real handler, not just present in the tree - clicking "Import theme…" with no real file
+    /// dialog available in this headless test environment still reaches
+    /// `Self::start_import_custom_theme` (proven by the in-flight picker task actually being
+    /// set), rather than silently doing nothing because the button's `on_click` was never wired.
+    #[gpui::test]
+    fn clicking_the_real_import_button_reaches_the_real_handler(cx: &mut TestAppContext) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path,
+        );
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Theme, window, cx);
+        });
+        cx.run_until_parked();
+
+        let import_bounds = cx
+            .debug_bounds("settings-theme-import")
+            .expect("the Import theme… button must have painted");
+        cx.simulate_click(import_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app._custom_theme_import_task.is_some()),
+            "a real click on the button must actually invoke Self::start_import_custom_theme, \
+             not silently do nothing"
+        );
+    }
+
+    /// Same real-click proof as
+    /// [`clicking_the_real_import_button_reaches_the_real_handler`], for "Export current theme…".
+    #[gpui::test]
+    fn clicking_the_real_export_button_reaches_the_real_handler(cx: &mut TestAppContext) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path,
+        );
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Theme, window, cx);
+        });
+        cx.run_until_parked();
+
+        let export_bounds = cx
+            .debug_bounds("settings-theme-export")
+            .expect("the Export current theme… button must have painted");
+        cx.simulate_click(export_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app._custom_theme_export_task.is_some()),
+            "a real click on the button must actually invoke Self::start_export_custom_theme, \
+             not silently do nothing"
+        );
+    }
+
+    /// The full real, click-driven "New from template" round trip - not just "the handler was
+    /// reached" (unlike the Import/Export click tests above, this action has no file-picker
+    /// dialog to get stuck awaiting, so a real click here really can run to completion under
+    /// `cx.run_until_parked()`): a genuine click on the button writes the real template file to
+    /// disk, the resulting theme actually renders as a selectable Themes-page card (not just data
+    /// sitting unrendered in `Self::custom_themes`), selecting that card really re-skins the app,
+    /// and the two-click Remove affordance on it really deletes the file again - proving this
+    /// isn't a decorative button bound to nothing.
+    #[gpui::test]
+    fn clicking_new_from_template_creates_a_real_selectable_removable_theme_end_to_end(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let themes_dir = settings_dir.path().join("themes");
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path.clone(),
+        );
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Theme, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.custom_themes.is_empty()),
+            "sanity check: no custom theme should exist before the click"
+        );
+
+        // The real click.
+        let create_bounds = cx
+            .debug_bounds("settings-theme-new-from-template")
+            .expect("the New from template… button must have painted");
+        cx.simulate_click(create_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        // The real file landed on disk, at the real settings-sibling themes directory.
+        let written_path = themes_dir.join("my-custom-theme.toml");
+        assert!(
+            written_path.exists(),
+            "a real click must actually write the template file to the real custom-themes \
+             directory, not just update in-memory state"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&written_path).expect("read written template"),
+            custom_theme::CUSTOM_THEME_TEMPLATE_TOML,
+            "the written file must be the real template's own bytes, comments included"
+        );
+        assert_eq!(app.read_with(cx, |app, _| app.custom_themes.len()), 1);
+        let status = app.read_with(cx, |app, _| app.custom_theme_status.clone());
+        assert!(
+            matches!(status, Some(Ok(_))),
+            "a real successful create-from-template should report a real success status, got \
+             {status:?}"
+        );
+
+        // It really renders as a selectable card, not just data.
+        assert!(
+            cx.debug_bounds("settings-theme-card-My Custom Theme")
+                .is_some(),
+            "the created theme must actually render as a card on the Themes page"
+        );
+
+        // Selecting it really re-skins the app and persists.
+        let jerry_dark_window_bg = theme::surface::WINDOW.resolve();
+        let card_bounds = cx
+            .debug_bounds("settings-theme-card-My Custom Theme")
+            .expect("card must still be painted");
+        cx.simulate_click(card_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.name.clone()),
+            "My Custom Theme"
+        );
+        assert!(
+            theme::surface::WINDOW.resolve() != jerry_dark_window_bg,
+            "selecting the template-created theme must really change what a representative \
+             colour token resolves to"
+        );
+
+        // And it's really removable: first click arms, second click deletes.
+        let remove_bounds = cx
+            .debug_bounds("settings-theme-card-remove-My Custom Theme")
+            .expect("the Remove affordance must have painted");
+        cx.simulate_click(remove_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.custom_theme_remove_armed.clone()),
+            Some("My Custom Theme".to_string())
+        );
+        let confirm_bounds = cx
+            .debug_bounds("settings-theme-card-remove-My Custom Theme")
+            .expect("the button must still be painted, now reading Confirm?");
+        cx.simulate_click(confirm_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            !written_path.exists(),
+            "confirming Remove must really delete the real backing file"
+        );
+        assert!(app.read_with(cx, |app, _| app.custom_themes.is_empty()));
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.theme.name.clone()),
+            "Jerry Dark",
+            "removing the currently-selected theme must fall back to Jerry Dark"
+        );
+    }
+
+    /// A second real click on "New from template" refreshes the same on-disk file rather than
+    /// creating a second, differently-suffixed one - matching
+    /// `custom_theme::write_template_theme_a_second_time_refreshes_the_same_file_not_a_new_one`'s
+    /// pure-function proof, exercised here through the real button instead.
+    #[gpui::test]
+    fn clicking_new_from_template_twice_refreshes_the_same_file_not_a_duplicate(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path,
+        );
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Theme, window, cx);
+        });
+        cx.run_until_parked();
+
+        for _ in 0..2 {
+            let create_bounds = cx
+                .debug_bounds("settings-theme-new-from-template")
+                .expect("the New from template… button must have painted");
+            cx.simulate_click(create_bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.custom_themes.len()),
+            1,
+            "clicking New from template twice must not leave two entries behind"
+        );
+    }
+
+    /// A malformed theme file on disk at startup is skipped with a real, honest error - not
+    /// silently dropped, and not a startup crash.
+    #[gpui::test]
+    fn a_malformed_theme_file_on_disk_is_skipped_with_a_real_recorded_error(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        write_custom_theme_file(
+            &settings_dir.path().join("themes"),
+            "broken.toml",
+            "this is not { valid toml",
+        );
+
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path,
+        );
+
+        assert!(app.read_with(cx, |app, _| app.custom_themes.is_empty()));
+        let errors = app.read_with(cx, |app, _| app.custom_theme_load_errors.clone());
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].starts_with("broken.toml:"),
+            "the real error should name the offending file, got: {errors:?}"
         );
     }
 }

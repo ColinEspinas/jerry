@@ -65,6 +65,21 @@ impl AdeApp {
             cx,
         );
 
+        // GitHub issue #5: real, additional themes loaded from disk, before `apply_theme_selection`
+        // (below) needs to resolve `settings.theme.name` against them. Derived from
+        // `settings_path` (`custom_theme::custom_themes_dir_for`), not `$HOME` directly - the same
+        // seam `fold_state_path`/`fold_state` just above use, so a test constructed with a `None`/
+        // temp-dir settings path never touches the real developer machine's own
+        // `~/.config/jerry/themes`. Same "block the foreground thread once, at startup" exception
+        // `Settings::load_or_init` itself already takes - a small, one-time directory read, not a
+        // per-render or per-poll cost.
+        let (custom_themes, custom_theme_load_errors) = match settings_path.as_deref() {
+            Some(path) => custom_theme::load_custom_themes_from_dir(
+                &custom_theme::custom_themes_dir_for(path),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+
         let mut this = Self {
             file_tree_root: repo_path.clone(),
             diff_root: repo_path.clone(),
@@ -269,6 +284,14 @@ impl AdeApp {
             new_file_error: None,
             tab_order: HashMap::new(),
             tab_drag_insertion: None,
+            custom_themes,
+            custom_theme_load_errors,
+            custom_theme_status: None,
+            _custom_theme_import_task: None,
+            _custom_theme_export_task: None,
+            _custom_theme_remove_task: None,
+            _custom_theme_create_task: None,
+            custom_theme_remove_armed: None,
         };
         // See the `expanded_dirs`/`fold_state_root_key` note in the literal above: resolving the
         // worktree key here, through the one function that ever resolves it, is what keeps the

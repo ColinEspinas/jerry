@@ -1,0 +1,55 @@
+# Jerry custom theme template
+#
+# Copy this file (or click "New from template..." on Settings -> Themes, which writes this
+# exact file for you) into your own custom themes directory and edit the values below to
+# author your own Jerry theme. Lines starting with "#" are comments - the TOML parser ignores
+# them, so keep or delete as many as you like.
+#
+# WHERE THIS FILE GOES
+#   ~/.config/jerry/themes/<any-file-name>.toml - a "themes" directory sitting right next to
+#   ~/.config/jerry/settings.toml. Jerry loads every *.toml file directly inside it at startup,
+#   one theme per file. The file's own name doesn't matter to Jerry - only the `name` field
+#   below does, since that's what's shown on the Themes page and what a theme is selected by.
+#
+# FIELDS
+#   name          Required, non-empty, and must not match a built-in theme's name (Jerry Dark,
+#                 Jerry Dim, Slate, Ember, Moss, Paper) - shown as the card title on the Themes
+#                 page.
+#   subtitle      Optional (defaults to empty if omitted) - a short one-line description shown
+#                 under the name on the card.
+#   background    The app's main window background.
+#   panel         Sidebar/panel backgrounds, sitting on top of `background`.
+#   accent_green  The app's "success"-ish accent.
+#   accent_amber  The app's "in-progress / needs attention"-ish accent.
+#   accent_blue   The app's "info / selection"-ish accent.
+#
+# These are the same five swatches every built-in theme is defined by. You are not expected to
+# hand-author all of the app's ~200 individual colour tokens (borders, hover states, syntax
+# highlighting, diff colours, ...) - they're derived automatically from how these five swatches
+# differ from Jerry Dark's own five, the same real derivation every non-Jerry-Dark built-in
+# theme already goes through. Picking these five well re-skins the whole app, not just the
+# preview card.
+#
+# COLOUR FORMAT
+#   Exactly "#rrggbb" - a "#" followed by six hex digits. No "#rgb" shorthand, no alpha
+#   channel, and no named CSS colours (e.g. "black") - any of those are rejected with a real
+#   error naming the offending field.
+#
+# READABILITY FLOOR
+#   `panel` must be clearly different in *perceived brightness* from `background` - specifically
+#   at least 28 per-mille (out of 1000) of standard-weighted (ITU-R BT.709) luma difference,
+#   which is about half of Jerry Dark's own built-in panel/background contrast. (See
+#   `readability_floor_per_mille` in crates/app/src/settings/custom_theme.rs for exactly how
+#   this is computed, in case Jerry Dark's own swatches - and so this number - ever change.) A
+#   `panel` that's the same colour as `background`, or only a couple of hex digits off from it,
+#   is rejected. In practice: make panel a clearly different shade (lighter or darker) than
+#   background, not just a different hue at the same brightness.
+
+name = "My Custom Theme"
+subtitle = "replace this with a short description"
+
+background   = "#0c0d10"
+panel        = "#181a1e"
+accent_green = "#5cb87f"
+accent_amber = "#e2a336"
+accent_blue  = "#e07a5f"
