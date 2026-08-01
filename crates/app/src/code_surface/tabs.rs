@@ -71,8 +71,8 @@ impl AdeApp {
     /// every source that opens a file tab, so the tab list can't drift from what `open_change`
     /// points at.
     fn push_open_file(&mut self, path: &Path) {
-        if !self.open_files.iter().any(|open| open.as_path() == path) {
-            self.open_files.push(path.to_path_buf());
+        if !self.open_files().iter().any(|open| open.as_path() == path) {
+            self.open_files_mut().push(path.to_path_buf());
         }
     }
 
@@ -297,8 +297,7 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let is_dirty = self
-            .edit_buffers
-            .get(&path)
+            .edit_buffer(&path)
             .is_some_and(|buffer| buffer.is_dirty());
         if is_dirty && self.close_tab_confirm_armed.as_deref() != Some(path.as_path()) {
             self.close_tab_confirm_armed = Some(path);
@@ -315,13 +314,13 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.open_files.iter().position(|open| open == &path) else {
+        let Some(index) = self.open_files().iter().position(|open| open == &path) else {
             return;
         };
         if self.close_tab_confirm_armed.as_deref() == Some(path.as_path()) {
             self.close_tab_confirm_armed = None;
         }
-        self.open_files.remove(index);
+        self.open_files_mut().remove(index);
         self._lsp_sync_tasks.remove(&path);
         if self
             .completions
@@ -334,10 +333,10 @@ impl AdeApp {
         if was_active {
             // After removal, the tab that was to the right (if any) has shifted into `index`;
             // fall back to `index - 1` only if there's nothing there.
-            let neighbor = self.open_files.get(index).cloned().or_else(|| {
+            let neighbor = self.open_files().get(index).cloned().or_else(|| {
                 index
                     .checked_sub(1)
-                    .and_then(|left| self.open_files.get(left).cloned())
+                    .and_then(|left| self.open_files().get(left).cloned())
             });
             match neighbor {
                 Some(next_path) => {
@@ -423,6 +422,15 @@ impl AdeApp {
             .strip_prefix(&self.file_tree_root)
             .map(|stripped| stripped.to_path_buf())
             .unwrap_or_else(|_| path.clone());
+        // The *worktree* half of `Self::edit_buffers`' composite key, captured now - before the
+        // real `.await` below - rather than re-read from `self.file_tree_root` once this task
+        // resumes. This load can genuinely outlive a worktree switch (a real background
+        // `std::fs::read_to_string` + tree-sitter parse, not instant), and `self.file_tree_root`
+        // would then already name whatever worktree the user switched *to*; resolving the key
+        // from that at completion time would silently seed or reload the *new* worktree's buffer
+        // for this same relative path instead of the one this load was actually for. See
+        // `Self::edit_buffers`'s own docs for the stale-worktree bug class this prevents.
+        let cwd = self.file_tree_root.clone();
         let extension = path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -470,7 +478,7 @@ impl AdeApp {
                         let save_in_flight = this.file_save_pending.contains(&relative_path)
                             || this.file_save_running.contains(&relative_path);
                         if !parsed.truncated && parsed.is_valid_utf8 {
-                            match this.edit_buffers.get_mut(&relative_path) {
+                            match this.edit_buffer_at_mut(&cwd, &relative_path) {
                                 // An existing buffer with **no** unsaved edits, whose file has
                                 // since been rewritten on disk by someone else (an agent CLI
                                 // running in this very worktree - this app's whole domain - a
@@ -537,7 +545,8 @@ impl AdeApp {
                                 // block's own docs above for why a truncated/invalid-UTF-8 file
                                 // deliberately never reaches here at all.
                                 None => {
-                                    this.edit_buffers.insert(
+                                    this.insert_edit_buffer_at(
+                                        cwd.clone(),
                                         relative_path.clone(),
                                         edit_buffer::EditBuffer::from_highlighted(
                                             path.clone(),
@@ -552,7 +561,7 @@ impl AdeApp {
                             }
                         }
                         if reloaded {
-                            this.schedule_lsp_sync(relative_path.clone(), cx);
+                            this.schedule_lsp_sync(cwd.clone(), relative_path.clone(), cx);
                         }
                         // Whether this load is a *different* file arriving in the view, as
                         // opposed to a freshness re-read of the one already showing. Read before
@@ -1276,7 +1285,7 @@ mod multi_file_tab_tests {
         cx.run_until_parked();
 
         assert_eq!(
-            app.read_with(cx, |app, _| app.open_files.len()),
+            app.read_with(cx, |app, _| app.open_files().len()),
             1,
             "opening an already-open file a second time must activate the existing tab, not \
              append a duplicate"
@@ -1318,7 +1327,7 @@ mod multi_file_tab_tests {
         });
 
         assert_eq!(
-            app.read_with(cx, |app, _| app.open_files.clone()),
+            app.read_with(cx, |app, _| app.open_files().to_vec()),
             vec![a_rel.clone(), c_rel.clone()],
             "b should be gone from the tab list"
         );
@@ -1347,7 +1356,7 @@ mod multi_file_tab_tests {
             app.close_file_tab(active, window, cx);
         });
         assert_eq!(app.read_with(cx, |app, _| app.open_change.clone()), None);
-        assert!(app.read_with(cx, |app, _| app.open_files.is_empty()));
+        assert!(app.read_with(cx, |app, _| app.open_files().is_empty()));
     }
 
     /// Closing a tab that is *not* the active one must not change what's currently active - the
@@ -1384,7 +1393,7 @@ mod multi_file_tab_tests {
             Some(a_rel),
             "closing a tab that wasn't active must leave the active tab unchanged"
         );
-        assert_eq!(app.read_with(cx, |app, _| app.open_files.len()), 1);
+        assert_eq!(app.read_with(cx, |app, _| app.open_files().len()), 1);
     }
 
     /// Clicking an agent tab while a file tab is active deactivates the file (it stops being
@@ -1421,7 +1430,7 @@ mod multi_file_tab_tests {
             "selecting an agent tab should deactivate the file tab"
         );
         assert_eq!(
-            app.read_with(cx, |app, _| app.open_files.clone()),
+            app.read_with(cx, |app, _| app.open_files().to_vec()),
             vec![a_rel],
             "the file tab must still be in open_files, just not active"
         );
@@ -1662,6 +1671,111 @@ mod multi_file_tab_tests {
              view, which always has real content, instead of staying a dead no-op"
         );
     }
+
+    /// Real, live-reproduced coverage for `design_handoff_jerry_ade/revision 3/
+    /// REVISION-2026-07-31.md` §3 ("Switching worktrees swaps the whole strip. Each worktree
+    /// remembers its own ... open files") - the real bug this revision fixes: `AdeApp::
+    /// select_worktree` used to clear `open_files` unconditionally on every switch, so a
+    /// worktree's tabs were lost the moment you navigated away. Drives two *real* worktrees
+    /// (temp directories, real `AdeApp::select_worktree` switches, real `open_file_view` calls),
+    /// not the pure free-function `reset_per_worktree_ui_state` unit tests already covering the
+    /// helper in isolation.
+    #[gpui::test]
+    fn switching_worktrees_and_back_preserves_each_worktree_s_open_file_tabs(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = tempfile::tempdir().expect("tempdir a");
+        let repo_b = tempfile::tempdir().expect("tempdir b");
+        let ((a1, a2, _), (a1_rel, a2_rel, _)) = write_three_files(repo_a.path());
+        let b1 = repo_b.path().join("notes.txt");
+        std::fs::write(&b1, "notes\n").expect("write notes.txt");
+        let b1_rel = PathBuf::from("notes.txt");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![
+                crate::rail::worktrees::WorktreeItem {
+                    path: repo_a.path().to_path_buf(),
+                    label: "wt-a".to_string(),
+                    branch: Some("wt-a".to_string()),
+                    is_main: true,
+                    is_locked: false,
+                    error: None,
+                },
+                crate::rail::worktrees::WorktreeItem {
+                    path: repo_b.path().to_path_buf(),
+                    label: "wt-b".to_string(),
+                    branch: Some("wt-b".to_string()),
+                    is_main: false,
+                    is_locked: false,
+                    error: None,
+                },
+            ];
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+        });
+        cx.run_until_parked();
+
+        // Two real tabs opened in worktree A.
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(a1, window, cx);
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(a2, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_files().to_vec()),
+            vec![a1_rel.clone(), a2_rel.clone()],
+            "sanity check: both real tabs should be open in worktree A"
+        );
+
+        // Switching to worktree B - a worktree that has never opened anything - must show a
+        // real, honest empty tab strip, never worktree A's tabs.
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(1, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.open_files().is_empty()),
+            "a worktree that has never opened a file must show a real empty tab strip, not \
+             worktree A's leftover tabs"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(b1, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_files().to_vec()),
+            vec![b1_rel.clone()],
+            "sanity check: worktree B's own real tab should be open"
+        );
+
+        // Switching back to worktree A must restore its own two tabs exactly - the real fix.
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_files().to_vec()),
+            vec![a1_rel, a2_rel],
+            "switching back to worktree A must restore exactly the tabs it was left with, not \
+             lose them to the switch away and back"
+        );
+
+        // And worktree B's own tab must still be there too, untouched by A's own switch back.
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(1, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_files().to_vec()),
+            vec![b1_rel],
+            "worktree B's own tab must survive being switched away from and back to as well"
+        );
+    }
 }
 
 /// Revision R8.5b audit finding 3's direct regression coverage: a genuine data-corruption bug -
@@ -1790,7 +1904,7 @@ mod stale_completions_popup_tests {
              dangling for a file that's no longer open"
         );
         assert!(
-            app.read_with(cx, |app, _| !app.open_files.contains(&a_rel)),
+            app.read_with(cx, |app, _| !app.open_files().contains(&a_rel)),
             "sanity check: a's tab should genuinely be closed"
         );
 
@@ -1896,10 +2010,10 @@ mod terminal_link_click_tests {
                 "a real mod-held click on the detected link must open the real file as the \
                  active tab - got open_change = {:?}, open_files = {:?}",
                 app.open_change,
-                app.open_files,
+                app.open_files(),
             );
             assert!(
-                app.open_files.contains(&PathBuf::from("src/main.rs")),
+                app.open_files().contains(&PathBuf::from("src/main.rs")),
                 "the opened file must appear in the real tab list too"
             );
         });
@@ -1925,7 +2039,7 @@ mod terminal_link_click_tests {
                 "a bare click (no mod held) on a detected link must not open anything"
             );
             assert!(
-                app.open_files.is_empty(),
+                app.open_files().is_empty(),
                 "a bare click must not add a real tab either"
             );
         });
@@ -1987,7 +2101,7 @@ mod terminal_link_click_tests {
                 app.open_change,
             );
             assert!(
-                app.open_files.is_empty(),
+                app.open_files().is_empty(),
                 "a link to a nonexistent path must not add a real tab either"
             );
         });

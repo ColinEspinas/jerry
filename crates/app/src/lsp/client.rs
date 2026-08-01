@@ -1233,13 +1233,28 @@ impl AdeApp {
     /// answering completions against stale, pre-edit content - a real correctness bug, not just a
     /// latency one; only the diagnostics-*pull* retry loop, the actual multi-second offender, is
     /// being decoupled here.
-    pub(crate) fn schedule_lsp_sync(&mut self, relative_path: PathBuf, cx: &mut Context<Self>) {
+    ///
+    /// `cwd` is the worktree [`AdeApp::edit_buffers`]'s composite key needs to find `relative_
+    /// path`'s buffer - the caller's own current [`AdeApp::file_tree_root`] when called
+    /// synchronously (every direct `crate::code_surface::editing` call site), or a `cwd` that
+    /// caller itself already captured before its own `.await` when this is called from inside
+    /// another real `cx.spawn` continuation (`crate::code_surface::tabs::AdeApp::spawn_file_load`'s
+    /// "reloaded" branch) - never re-derived from `self.file_tree_root` once *this* method's own
+    /// debounce timer resumes below, which could by then name a worktree the user has since
+    /// switched away to. See [`AdeApp::edit_buffers`]'s own docs for the stale-worktree bug class
+    /// this prevents.
+    pub(crate) fn schedule_lsp_sync(
+        &mut self,
+        cwd: PathBuf,
+        relative_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
         let task = cx.spawn({
             let relative_path = relative_path.clone();
             async move |this, cx| {
                 cx.background_executor().timer(LSP_SYNC_DEBOUNCE).await;
                 let Ok(Some(plan)) = this.update(cx, |this, cx| {
-                    this.prepare_lsp_sync(&relative_path, cx, false)
+                    this.prepare_lsp_sync(&cwd, &relative_path, cx, false)
                 }) else {
                     return;
                 };
@@ -1491,7 +1506,12 @@ impl AdeApp {
         relative_path: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        let Some(plan) = self.prepare_lsp_sync(&relative_path, cx, true) else {
+        // Called synchronously (`Ctrl+Space`, no `.await` between here and `Self::
+        // prepare_lsp_sync`'s own read), so `self.file_tree_root` genuinely is "now" - unlike
+        // `Self::schedule_lsp_sync`'s debounced continuation, which must capture its own `cwd`
+        // before waiting out the debounce instead.
+        let cwd = self.file_tree_root.clone();
+        let Some(plan) = self.prepare_lsp_sync(&cwd, &relative_path, cx, true) else {
             return;
         };
         let LspSyncPlan { sync, completion } = plan;
@@ -1582,11 +1602,12 @@ impl AdeApp {
     /// (`force_completion: false`, from [`AdeApp::schedule_lsp_sync`]).
     fn prepare_lsp_sync(
         &mut self,
+        cwd: &Path,
         relative_path: &Path,
         cx: &mut Context<Self>,
         force_completion: bool,
     ) -> Option<LspSyncPlan> {
-        let buffer = self.edit_buffers.get(relative_path)?;
+        let buffer = self.edit_buffer_at(cwd, relative_path)?;
         let absolute_path = buffer.path.clone();
         // A single owned clone, reused for everything below (Revision R8.5b audit finding 7's
         // fix) - see `LspSyncRequest::content`'s own docs for the real, honest minimum this was
@@ -3832,7 +3853,7 @@ mod lsp_diagnostics_wiring_tests {
             let relative = app
                 .active_editable_path()
                 .expect("a real editable File view tab should be active");
-            let buffer = app.edit_buffers.get_mut(&relative).expect("a real buffer");
+            let buffer = app.edit_buffer_mut(&relative).expect("a real buffer");
             buffer.move_to(offset);
             app.replace_text_in_range(None, text, window, cx);
         });
@@ -3934,8 +3955,7 @@ mod lsp_diagnostics_wiring_tests {
         // sequence completing, retrying, or its own timer ever advancing.
         let relative = PathBuf::from("src/main.rs");
         let completion_trigger_offset = app.read_with(cx, |app, _| {
-            app.edit_buffers
-                .get(&relative)
+            app.edit_buffer(&relative)
                 .expect("a real buffer")
                 .content
                 .len()
@@ -3990,11 +4010,7 @@ mod lsp_diagnostics_wiring_tests {
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| {
-            let content = &app
-                .edit_buffers
-                .get(&relative)
-                .expect("a real buffer")
-                .content;
+            let content = &app.edit_buffer(&relative).expect("a real buffer").content;
             assert!(
                 content.contains("println"),
                 "accepting the real completion should have spliced its real text into the \
@@ -4085,8 +4101,7 @@ mod lsp_diagnostics_wiring_tests {
 
         let relative = PathBuf::from("main.ts");
         let completion_trigger_offset = app.read_with(cx, |app, _| {
-            app.edit_buffers
-                .get(&relative)
+            app.edit_buffer(&relative)
                 .expect("a real buffer")
                 .content
                 .len()
@@ -4124,11 +4139,7 @@ mod lsp_diagnostics_wiring_tests {
         });
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
-            let content = &app
-                .edit_buffers
-                .get(&relative)
-                .expect("a real buffer")
-                .content;
+            let content = &app.edit_buffer(&relative).expect("a real buffer").content;
             assert!(
                 content.contains("console"),
                 "accepting the real completion should have spliced its real text into the \
@@ -4193,8 +4204,7 @@ mod lsp_diagnostics_wiring_tests {
 
         let relative = PathBuf::from("main.py");
         let completion_trigger_offset = app.read_with(cx, |app, _| {
-            app.edit_buffers
-                .get(&relative)
+            app.edit_buffer(&relative)
                 .expect("a real buffer")
                 .content
                 .len()
@@ -4232,11 +4242,7 @@ mod lsp_diagnostics_wiring_tests {
         });
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
-            let content = &app
-                .edit_buffers
-                .get(&relative)
-                .expect("a real buffer")
-                .content;
+            let content = &app.edit_buffer(&relative).expect("a real buffer").content;
             assert!(
                 content.contains("print"),
                 "accepting the real completion should have spliced its real text into the \

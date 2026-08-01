@@ -233,7 +233,7 @@ impl AdeApp {
             self.reset_caret_blink(cx);
             return;
         };
-        let Some(buffer) = self.edit_buffers.get_mut(&entry.path) else {
+        let Some(buffer) = self.edit_buffer_mut(&entry.path) else {
             cx.notify();
             self.replace_text_in_range(None, "\n", window, cx);
             self.sync_cursor_and_scroll();
@@ -251,7 +251,7 @@ impl AdeApp {
         buffer.replace_range(Some(range), &text);
         buffer.seal_history();
         self.schedule_rehighlight(path.clone(), cx);
-        self.schedule_lsp_sync(path, cx);
+        self.schedule_lsp_sync(self.file_tree_root.clone(), path, cx);
         self.sync_cursor_and_scroll();
         self.reset_caret_blink(cx);
         cx.notify();
@@ -272,7 +272,7 @@ impl AdeApp {
         if self.active_editable_path().as_deref() != Some(entry.path.as_path()) {
             return None;
         }
-        let buffer = self.edit_buffers.get(&entry.path)?;
+        let buffer = self.edit_buffer(&entry.path)?;
         let (last_path, last_line) = self.file_view_last_layout_for.clone()?;
         if last_path != entry.path {
             return None;

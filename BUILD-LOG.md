@@ -4973,3 +4973,125 @@ user-facing copy that isn't clearly in scope.
 failed** across all four crates, both before and after the final text-only `"SESSIONS"` →
 `"AGENTS"` edit. 54 files touched in `crates/app` (53 modified, one renamed:
 `work_surface/sessions.rs` → `work_surface/agents.rs`); nothing outside `crates/app` changed.
+
+## Worktree-scoping `open_files`/`edit_buffers`, and a scope mismatch on the third assigned bug
+
+Three bugs were assigned, all supposedly rooted in `AdeApp::select_worktree`/
+`reset_per_worktree_ui_state`: `open_files` cleared instead of scoped per worktree, `edit_buffers`
+cleared instead of scoped (real, silent unsaved-edit data loss), and a UI-only `staged_files`
+checkbox that never touched real git and never got re-derived from it. The first two were real and
+are fixed here. The third does not exist in this branch - see its own section below for why, and
+what was done about it instead.
+
+### Root cause
+
+`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §1/§3 are explicit: the open file
+tabs and the active tab are worktree-scoped, and "switching worktrees swaps the whole strip - each
+worktree remembers its own active tab and its own open files." `AdeApp::select_worktree`'s helper
+`reset_per_worktree_ui_state` instead treated `open_files: Vec<PathBuf>` and
+`edit_buffers: HashMap<PathBuf, EditBuffer>` as flat, single-worktree state and unconditionally
+cleared both on every switch - so a worktree's open tabs vanished the instant you clicked away,
+and, far worse, a real unsaved edit sitting in `edit_buffers` was silently discarded with no
+confirm dialog at all. Both fields were keyed by a worktree-*relative* path with no worktree
+component in the key, so there was no way to keep more than one worktree's entries around at once
+without them colliding on a shared relative path (`src/main.rs` in worktree A and `src/main.rs` in
+worktree B are unrelated files).
+
+The user had already ruled out a confirm-before-switching dialog for the `edit_buffers` case - real
+friction in a tool whose whole point is fluidly hopping between worktrees with several agents
+running in parallel. The fix is to make the state genuinely per-worktree instead, mirroring how
+`AdeApp::tab_order: HashMap<PathBuf, Vec<TabRef>>` (same struct, same file) already does this
+correctly for tab ordering.
+
+### The new shapes
+
+- **`open_files`** → `open_files_by_worktree: HashMap<PathBuf, Vec<PathBuf>>`, keyed by
+  `AdeApp::file_tree_root` (the same root every `open_files` entry's relative path is already
+  computed against, via `strip_prefix`). Two new accessors, `AdeApp::open_files()` /
+  `AdeApp::open_files_mut()`, resolve the *current* worktree's slice/`Vec` - an empty slice for a
+  worktree that has never opened a file, never a panic. Every call site (`push_open_file`,
+  `close_file_tab`, `rename_open_paths`, `forget_deleted_paths`, `combined_tab_order`, the palette,
+  ~20 call sites total) now goes through one of these two methods instead of touching a flat field.
+- **`edit_buffers`** → key changed from `PathBuf` to `(PathBuf, PathBuf)` - `(worktree, relative
+  path)` - rather than nesting a second `HashMap` per worktree (`HashMap<PathBuf,
+  HashMap<PathBuf, EditBuffer>>`): a composite tuple key needs no `.entry(cwd).or_default()`
+  ceremony at every read site, and `AdeApp::edit_buffer`/`edit_buffer_mut`/
+  `edit_buffer_contains`/`insert_edit_buffer` (resolving the worktree half from the *current*
+  `file_tree_root`) cover the ~140 synchronous call sites the same way `open_files`'s two methods
+  do.
+- **A second, explicit-key pair for async continuations**: `AdeApp::edit_buffer_at`/
+  `edit_buffer_at_mut` take a `cwd: &Path` argument instead of reading `self.file_tree_root`.
+  Every real `cx.spawn` task that reads or writes an edit buffer *after* an `.await`
+  (`code_surface::tabs::spawn_file_load`, `code_surface::editing::schedule_rehighlight`'s debounce
+  continuation, `code_surface::editing::spawn_file_save_loop`'s per-iteration write, and
+  `lsp::client::schedule_lsp_sync`'s debounce continuation via `prepare_lsp_sync`, which also
+  gained an explicit `cwd` parameter) now captures `cwd = self.file_tree_root.clone()` *before* its
+  first `.await` and threads it through, rather than re-deriving the worktree half of the key from
+  whatever `file_tree_root` happens to be once the task resumes - which could by then name a
+  worktree the user switched to while the task was in flight, silently corrupting a *different*
+  worktree's buffer. This mirrors the identity-guard discipline `load_file_tree` already uses for
+  `file_tree_root` itself, applied here to a keyed map instead of a single field.
+
+  Worth being honest about: `AdeApp::select_worktree` already drops (and so cancels, since a GPUI
+  `Task` cancels on drop unless detached) every task-holding field these continuations live in -
+  `_file_load_task`, `_rehighlight_tasks`, `_file_save_tasks`, `_lsp_sync_tasks` - on every switch,
+  and does so synchronously, so none of these specific continuations can actually resume with a
+  stale `file_tree_root` *today*. The explicit-`cwd` plumbing is real defense-in-depth, not a fix
+  for a currently-live race - it's what keeps this correct if any of those tasks is ever detached
+  later (e.g. to let an in-flight save finish on disk even after the user switches away, which is a
+  plausible thing to want), rather than silently becoming exploitable then.
+
+- **`reset_per_worktree_ui_state`** no longer touches either field at all. Once both are looked up
+  *through* the worktree they belong to, the reassignment of `file_tree_root` a few lines later in
+  `select_worktree` is itself what makes the worktree just left stop being "current" - nothing
+  needs to delete its entries, and deleting them was exactly the bug. The function's signature
+  shrank from six parameters to four (`reviewed_files`, `open_change`, `expanded_dirs`,
+  `selected_tree_path` - none of which were in scope for this fix).
+
+New tests: `open_files_by_worktree_keeps_each_worktree_s_tabs_independent`/
+`edit_buffers_composite_key_never_collides_across_worktrees` (`root/state.rs`, pure data-shape
+proofs) plus two real, `AdeApp`-driven regression tests through genuine `select_worktree` switches
+across two real temp-directory worktrees: `code_surface::tabs::multi_file_tab_tests::
+switching_worktrees_and_back_preserves_each_worktree_s_open_file_tabs` and
+`code_surface::editing::editing_tests::
+switching_worktrees_and_back_preserves_unsaved_edits_without_cross_worktree_collision` - the
+second deliberately gives both worktrees a file at the *identical* relative path (`sample.txt`)
+with different real unsaved content in each, and proves neither a switch-and-back nor the shared
+relative path ever merges or overwrites the other's buffer.
+
+**Left alone, flagged rather than silently expanded**: `AdeApp::reviewed_files`/`open_change`
+still clear on every switch, same as before. `reviewed_files` exhibits the identical "flat state
+that should probably be per-worktree" shape `open_files` had, and `open_change` (which tab is
+*active*) is the other half of §3's "own active tab" - but neither was named in the three assigned
+bugs, and expanding scope to them wasn't asked for. Worth a follow-up.
+
+### The third bug does not exist on this branch
+
+The assigned bug named `AdeApp::staged_files: HashSet<PathBuf>`, `toggle_staged` in
+`sidebar/render.rs`, `wt_core::undo::commit_paths`, `commit_staged_files`, and a test named
+`commit_paths_never_commits_a_path_that_was_staged_by_something_else`. None of these identifiers
+exist anywhere in this repository (`grep -rn` across `crates/app` and `crates/wt-core` for every
+one of them: zero matches). What exists instead is `AdeApp::reviewed_files: HashSet<PathBuf>` and
+`sidebar::render::toggle_reviewed` - a real, but *different*, feature: a purely local "mark this
+Changes row reviewed" checkbox with no relationship to git staging at all, predating this
+revision's design and still matching the base `README.md`'s own "dimmed once reviewed" framing
+(not the revision doc's "the checkbox **is** staging").
+
+The described staging/commit-composer infrastructure is real, but lives on a **sibling, unmerged
+branch** - `revision-r12-tabs-changes` (commits `dd9cf6b`/`10a8452`/`d66adff`, the last one
+literally titled "rebasing the commit composer onto rail-rewrite"). That branch shares this one's
+own base (`f6df444`, the rail rewrite) but the two have diverged since and neither is an ancestor
+of the other - `git merge-base --is-ancestor dd9cf6b HEAD` fails. Implementing the assigned fix
+here would have meant either building a second, competing staging/commit-composer implementation
+from scratch (duplicate work, guaranteed to conflict messily whichever branch merges second) or
+merging an entire sibling feature branch's worth of unrelated, in-progress work into a PR scoped
+to three named worktree-state bugs. Neither is a defensible substitute for "fix the bug as
+described," so this PR does not touch staging at all - it fixes the two bugs that are real on this
+branch and reports this one as a scope mismatch rather than silently reinterpreting or fabricating
+it. `AdeApp::reviewed_files` was left exhibiting the same per-switch-clearing pattern `open_files`
+had (see above) since it wasn't part of either the real or the described third bug.
+
+**Verification**: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings` - all clean.
+`cargo test --workspace --lib -- --test-threads=1`: **1100 + 44 + 14 + 107 = 1265 passed, 0
+failed** across all four crates (1263 baseline + 2 new tests). No flakes observed in this run.

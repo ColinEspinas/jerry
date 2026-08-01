@@ -337,7 +337,7 @@ impl AdeApp {
             .iter_for_cwd(cwd.clone())
             .map(|agent| agent.id)
             .collect();
-        work_surface::reconcile_tab_order(stored, &agent_ids, &self.open_files)
+        work_surface::reconcile_tab_order(stored, &agent_ids, self.open_files())
     }
 
     /// The unified tab strip's real drag-to-reorder entry point (GitHub issue #16) - moves
@@ -541,8 +541,7 @@ impl AdeApp {
         // tab with no buffer yet (still loading, or a truncated/read-only file - see
         // `AdeApp::edit_buffers`' own docs), never a fabricated placeholder.
         let is_dirty = self
-            .edit_buffers
-            .get(path)
+            .edit_buffer(path)
             .is_some_and(|buffer| buffer.is_dirty());
         let tab_ref = work_surface::TabRef::File(path.to_path_buf());
         let drag_value = DraggedTab::File {
@@ -1007,9 +1006,10 @@ impl AdeApp {
     /// (a real, live-reproduced bug found in this revision's own self-audit: an earlier version
     /// cycled `self.agents` directly, so "Next Agent" could jump to a *different* worktree's
     /// agent, which [`Self::select_agent`] then silently promotes into a full
-    /// [`Self::select_worktree`] switch - discarding any unsaved `edit_buffers` content for the
-    /// worktree just left via `reset_per_worktree_ui_state`. A menu row labeled "cycle tabs" must
-    /// never have that side effect) - wrapping around both ends (mirroring
+    /// [`Self::select_worktree`] switch - landing the user on the wrong worktree entirely (a menu
+    /// row labeled "cycle tabs" must never have that side effect), including its `edit_buffers`
+    /// entries, which are real, live per-worktree state (see that field's own docs) rather than
+    /// something a switch discards - wrapping around both ends (mirroring
     /// [`Self::next_changed_file`]'s own cyclic-index convention for "next" over an existing
     /// ordered list), via the same real [`Self::select_agent`] every tab-strip click and jump
     /// keycap already goes through - no separate "next agent" subsystem, just a cyclic index

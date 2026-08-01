@@ -160,7 +160,7 @@ impl AdeApp {
             _tree_delete_task: None,
             _tree_copy_task: None,
             reviewed_files: HashSet::new(),
-            open_files: Vec::new(),
+            open_files_by_worktree: HashMap::new(),
             open_change: None,
             close_tab_confirm_armed: None,
             open_diff_file_cache: None,
@@ -627,11 +627,9 @@ impl AdeApp {
         // statement later.
         reset_per_worktree_ui_state(
             &mut self.reviewed_files,
-            &mut self.open_files,
             &mut self.open_change,
             &mut self.expanded_dirs,
             &mut self.selected_tree_path,
-            &mut self.edit_buffers,
         );
         // The tree's fold state is per-worktree *persisted* state, not merely per-worktree
         // transient state: the reset above clears the live set, and this re-derives it from the
@@ -774,6 +772,117 @@ impl AdeApp {
         cx.notify();
     }
 
+    /// The current worktree's open file tabs (`design_handoff_jerry_ade/revision 3/
+    /// REVISION-2026-07-31.md` §3) - an empty slice for a worktree that has never opened one,
+    /// never a panic or a fabricated default. See [`Self::open_files_by_worktree`]'s own docs for
+    /// why this is keyed by [`Self::file_tree_root`] rather than a flat, unscoped `Vec`.
+    pub(crate) fn open_files(&self) -> &[PathBuf] {
+        self.open_files_by_worktree
+            .get(&self.file_tree_root)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// The current worktree's open file tabs, mutably - creates an empty entry for a worktree
+    /// that has never opened one rather than requiring a separate seeding step. Every real
+    /// mutation of [`Self::open_files_by_worktree`] (push/remove/rename-remap) goes through this,
+    /// matching [`Self::open_files`]'s own read-side resolution.
+    pub(crate) fn open_files_mut(&mut self) -> &mut Vec<PathBuf> {
+        self.open_files_by_worktree
+            .entry(self.file_tree_root.clone())
+            .or_default()
+    }
+
+    /// The `(worktree, worktree-relative path)` composite key [`Self::edit_buffers`] is keyed by,
+    /// resolved from whatever [`Self::file_tree_root`] is *right now* - safe for any synchronous
+    /// call site, but never for a real `cx.spawn` task resuming after an `.await` (see
+    /// [`Self::edit_buffers`]'s own docs on why; use [`Self::edit_buffer_at`]/
+    /// [`Self::edit_buffer_at_mut`] there instead, with a `cwd` captured before the await).
+    fn edit_buffer_key(&self, path: &std::path::Path) -> (PathBuf, PathBuf) {
+        (self.file_tree_root.clone(), path.to_path_buf())
+    }
+
+    /// The current worktree's edit buffer for `path`, if one exists. See [`Self::edit_buffer_key`]
+    /// for why this is only safe from a synchronous call site.
+    pub(crate) fn edit_buffer(&self, path: &std::path::Path) -> Option<&edit_buffer::EditBuffer> {
+        self.edit_buffers.get(&self.edit_buffer_key(path))
+    }
+
+    /// Mutable sibling of [`Self::edit_buffer`] - same synchronous-only caveat.
+    pub(crate) fn edit_buffer_mut(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Option<&mut edit_buffer::EditBuffer> {
+        let key = self.edit_buffer_key(path);
+        self.edit_buffers.get_mut(&key)
+    }
+
+    /// `true` iff the current worktree has a real edit buffer for `path`. Same synchronous-only
+    /// caveat as [`Self::edit_buffer`].
+    pub(crate) fn edit_buffer_contains(&self, path: &std::path::Path) -> bool {
+        self.edit_buffers.contains_key(&self.edit_buffer_key(path))
+    }
+
+    /// Inserts (or replaces) `buffer` for `path` in the *current* worktree - the same
+    /// synchronous-only caveat as [`Self::edit_buffer`] applies to which worktree "current" means.
+    pub(crate) fn insert_edit_buffer(
+        &mut self,
+        path: PathBuf,
+        buffer: edit_buffer::EditBuffer,
+    ) -> Option<edit_buffer::EditBuffer> {
+        let key = self.edit_buffer_key(&path);
+        self.edit_buffers.insert(key, buffer)
+    }
+
+    /// Explicit-key read for a real `cx.spawn` task resuming after an `.await` - `cwd` must be
+    /// captured **before** the await (typically alongside `path` itself, in the same closure
+    /// capture list), never re-derived from [`Self::file_tree_root`] once the task resumes. See
+    /// [`Self::edit_buffers`]'s own docs for the stale-worktree bug this exists to prevent.
+    pub(crate) fn edit_buffer_at(
+        &self,
+        cwd: &std::path::Path,
+        path: &std::path::Path,
+    ) -> Option<&edit_buffer::EditBuffer> {
+        self.edit_buffers
+            .get(&(cwd.to_path_buf(), path.to_path_buf()))
+    }
+
+    /// Mutable sibling of [`Self::edit_buffer_at`] - same "capture `cwd` before the await" rule.
+    pub(crate) fn edit_buffer_at_mut(
+        &mut self,
+        cwd: &std::path::Path,
+        path: &std::path::Path,
+    ) -> Option<&mut edit_buffer::EditBuffer> {
+        self.edit_buffers
+            .get_mut(&(cwd.to_path_buf(), path.to_path_buf()))
+    }
+
+    /// Removes and returns the current worktree's edit buffer for `path`, if any. Same
+    /// synchronous-only caveat as [`Self::edit_buffer`]. Test-only seam (no real production call
+    /// site removes a single buffer directly - see [`Self::edit_buffers`]'s own "deliberately not
+    /// removed" docs for why): used to simulate a buffer vanishing mid-flight, e.g. in
+    /// `crate::code_surface::editing::editing_tests`'s writer-loop coverage.
+    #[cfg(test)]
+    pub(crate) fn remove_edit_buffer(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Option<edit_buffer::EditBuffer> {
+        let key = self.edit_buffer_key(path);
+        self.edit_buffers.remove(&key)
+    }
+
+    /// Explicit-key insert, the [`Self::insert_edit_buffer`] sibling for a real `cx.spawn` task
+    /// resuming after an `.await` - same "capture `cwd` before the await" rule as
+    /// [`Self::edit_buffer_at`].
+    pub(crate) fn insert_edit_buffer_at(
+        &mut self,
+        cwd: PathBuf,
+        path: PathBuf,
+        buffer: edit_buffer::EditBuffer,
+    ) -> Option<edit_buffer::EditBuffer> {
+        self.edit_buffers.insert((cwd, path), buffer)
+    }
+
     /// Selects a worktree by its real path (rather than an index into
     /// [`Self::worktrees`], which project-mode rows don't carry) - used by a plain worktree
     /// row's click handler in "by project" mode. Falls back to doing nothing if the path
@@ -791,33 +900,38 @@ impl AdeApp {
 }
 
 /// Clears every piece of per-worktree UI state that would otherwise survive a worktree switch -
-/// called from [`AdeApp::select_worktree`] on every switch. `reviewed_files`/`open_files`/
-/// `open_change` are keyed by repo-relative paths with no per-worktree scoping of their own, so
-/// without this reset a file reviewed or opened in worktree A would read as already-reviewed (or
-/// reopen) in worktree B if it shares the same relative path. `expanded_dirs` is keyed by
-/// absolute path, so it doesn't bleed the same way - but it must still be emptied here, because
+/// called from [`AdeApp::select_worktree`] on every switch. `reviewed_files`/`open_change` are
+/// keyed by repo-relative paths with no per-worktree scoping of their own, so without this reset
+/// a file reviewed or opened in worktree A would read as already-reviewed (or reopen) in worktree
+/// B if it shares the same relative path. `expanded_dirs` is keyed by absolute path, so it
+/// doesn't bleed the same way - but it must still be emptied here, because
 /// [`AdeApp::select_worktree`] re-derives it from the *new* worktree's own persisted fold state
 /// immediately afterwards, and a leftover entry from the worktree just left would otherwise
 /// survive that (its absolute path simply never matches anything in the new tree, so nothing
 /// would ever remove it). A free, `gpui`-free function so this is unit-testable without constructing an
 /// `AdeApp`.
+///
+/// **Deliberately does *not* touch `open_files`/`edit_buffers` anymore.** Both moved to real,
+/// per-worktree-keyed storage (`AdeApp::open_files_by_worktree`, keyed by
+/// [`AdeApp::file_tree_root`]; `AdeApp::edit_buffers`, keyed by `(file_tree_root, path)`) -
+/// `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §1/§3's explicit requirement that
+/// each worktree remembers its own open files, and that an unsaved edit must survive fluidly
+/// hopping between worktrees rather than being silently discarded. Clearing them here used to be
+/// how this function kept one worktree's tabs/buffers from leaking into another's; now that both
+/// are looked up *through* the worktree they belong to, the worktree switch happening around this
+/// call (`AdeApp::select_worktree` reassigning `file_tree_root` a few lines below) is itself what
+/// makes the old worktree's entries stop being "current" - nothing here needs to delete them, and
+/// deleting them would be exactly the silent data loss this revision set out to fix.
 pub(super) fn reset_per_worktree_ui_state(
     reviewed_files: &mut HashSet<PathBuf>,
-    open_files: &mut Vec<PathBuf>,
     open_change: &mut Option<PathBuf>,
     expanded_dirs: &mut HashSet<PathBuf>,
     selected_tree_path: &mut Option<PathBuf>,
-    edit_buffers: &mut HashMap<PathBuf, edit_buffer::EditBuffer>,
 ) {
     reviewed_files.clear();
-    open_files.clear();
     *open_change = None;
     expanded_dirs.clear();
     *selected_tree_path = None;
-    // Real, live unsaved-edit state (Revision R8.5a) is just as worktree-relative-path-keyed as
-    // `open_files` above - without this, a same-named file in a different worktree could
-    // silently inherit another worktree's in-memory buffer/cursor/selection.
-    edit_buffers.clear();
 }
 
 #[cfg(test)]
@@ -829,71 +943,33 @@ mod tests {
         let mut reviewed_files = HashSet::new();
         reviewed_files.insert(PathBuf::from("src/main.rs"));
         reviewed_files.insert(PathBuf::from("Cargo.toml"));
-        let mut open_files = Vec::new();
         let mut open_change = Some(PathBuf::from("src/main.rs"));
         let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
-        let mut edit_buffers = HashMap::new();
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
-            &mut open_files,
             &mut open_change,
             &mut expanded_dirs,
             &mut selected_tree_path,
-            &mut edit_buffers,
         );
 
         assert!(reviewed_files.is_empty());
         assert_eq!(open_change, None);
     }
 
-    /// Every open tab from the worktree just left must be gone, not just deactivated.
-    #[test]
-    fn reset_per_worktree_ui_state_clears_every_open_file_tab() {
-        let mut reviewed_files = HashSet::new();
-        let mut open_files = vec![
-            PathBuf::from("src/main.rs"),
-            PathBuf::from("Cargo.toml"),
-            PathBuf::from("README.md"),
-        ];
-        let mut open_change = Some(PathBuf::from("Cargo.toml"));
-        let mut expanded_dirs = HashSet::new();
-        let mut selected_tree_path = None;
-        let mut edit_buffers = HashMap::new();
-
-        reset_per_worktree_ui_state(
-            &mut reviewed_files,
-            &mut open_files,
-            &mut open_change,
-            &mut expanded_dirs,
-            &mut selected_tree_path,
-            &mut edit_buffers,
-        );
-
-        assert!(
-            open_files.is_empty(),
-            "every open file tab from the worktree just left must be cleared, not just \
-             deactivated"
-        );
-    }
-
     #[test]
     fn reset_per_worktree_ui_state_is_a_no_op_when_already_empty() {
         let mut reviewed_files = HashSet::new();
-        let mut open_files = Vec::new();
         let mut open_change = None;
         let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
-        let mut edit_buffers = HashMap::new();
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
-            &mut open_files,
             &mut open_change,
             &mut expanded_dirs,
             &mut selected_tree_path,
-            &mut edit_buffers,
         );
 
         assert!(reviewed_files.is_empty());
@@ -904,21 +980,17 @@ mod tests {
     #[test]
     fn reset_per_worktree_ui_state_clears_expanded_dirs_too() {
         let mut reviewed_files = HashSet::new();
-        let mut open_files = Vec::new();
         let mut open_change = None;
         let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
-        let mut edit_buffers = HashMap::new();
         expanded_dirs.insert(PathBuf::from("/repo/worktree-a/src"));
         expanded_dirs.insert(PathBuf::from("/repo/worktree-a/tests"));
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
-            &mut open_files,
             &mut open_change,
             &mut expanded_dirs,
             &mut selected_tree_path,
-            &mut edit_buffers,
         );
 
         assert!(expanded_dirs.is_empty());
@@ -927,56 +999,99 @@ mod tests {
     #[test]
     fn reset_per_worktree_ui_state_clears_selected_tree_path() {
         let mut reviewed_files = HashSet::new();
-        let mut open_files = Vec::new();
         let mut open_change = None;
         let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = Some(PathBuf::from("/repo/worktree-a/src/main.rs"));
-        let mut edit_buffers = HashMap::new();
 
         reset_per_worktree_ui_state(
             &mut reviewed_files,
-            &mut open_files,
             &mut open_change,
             &mut expanded_dirs,
             &mut selected_tree_path,
-            &mut edit_buffers,
         );
 
         assert_eq!(selected_tree_path, None);
     }
 
-    /// `edit_buffers` is keyed the same way as `open_files`; without this reset, a same-named
-    /// file's real unsaved edits from one worktree could silently reappear (or be silently
-    /// overwritten by) an unrelated file in a different worktree.
+    /// [`AdeApp::open_files`]/[`AdeApp::open_files_mut`] resolve through
+    /// [`AdeApp::open_files_by_worktree`], keyed by [`AdeApp::file_tree_root`] - a worktree that
+    /// has never opened a file reads as a real empty slice, and two different worktree keys never
+    /// see each other's entries.
     #[test]
-    fn reset_per_worktree_ui_state_clears_edit_buffers() {
-        let mut reviewed_files = HashSet::new();
-        let mut open_files = Vec::new();
-        let mut open_change = None;
-        let mut expanded_dirs = HashSet::new();
-        let mut selected_tree_path = None;
-        let mut edit_buffers = HashMap::new();
+    fn open_files_by_worktree_keeps_each_worktree_s_tabs_independent() {
+        let mut open_files_by_worktree: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        let worktree_a = PathBuf::from("/repo/worktree-a");
+        let worktree_b = PathBuf::from("/repo/worktree-b");
+
+        open_files_by_worktree
+            .entry(worktree_a.clone())
+            .or_default()
+            .push(PathBuf::from("src/main.rs"));
+
+        assert_eq!(
+            open_files_by_worktree
+                .get(&worktree_a)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            &[PathBuf::from("src/main.rs")][..],
+            "worktree A must see the tab it opened"
+        );
+        assert_eq!(
+            open_files_by_worktree
+                .get(&worktree_b)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            <&[PathBuf]>::default(),
+            "an unrelated worktree that never opened anything must read as a real empty slice, \
+             never worktree A's tabs"
+        );
+    }
+
+    /// `edit_buffers` is keyed by `(worktree, worktree-relative path)` - a same-named file open
+    /// with different unsaved content in two worktrees must never collide or merge.
+    #[test]
+    fn edit_buffers_composite_key_never_collides_across_worktrees() {
+        let mut edit_buffers: HashMap<(PathBuf, PathBuf), edit_buffer::EditBuffer> = HashMap::new();
+        let worktree_a = PathBuf::from("/repo/worktree-a");
+        let worktree_b = PathBuf::from("/repo/worktree-b");
+        let relative = PathBuf::from("src/main.rs");
+
         edit_buffers.insert(
-            PathBuf::from("src/main.rs"),
+            (worktree_a.clone(), relative.clone()),
             edit_buffer::EditBuffer::new(
-                PathBuf::from("/repo/worktree-a/src/main.rs"),
-                "fn main() {}".to_string(),
+                worktree_a.join(&relative),
+                "fn main() { a() }".to_string(),
                 Some("rs".to_string()),
                 None,
-                13,
+                17,
+            ),
+        );
+        edit_buffers.insert(
+            (worktree_b.clone(), relative.clone()),
+            edit_buffer::EditBuffer::new(
+                worktree_b.join(&relative),
+                "fn main() { b() }".to_string(),
+                Some("rs".to_string()),
+                None,
+                17,
             ),
         );
 
-        reset_per_worktree_ui_state(
-            &mut reviewed_files,
-            &mut open_files,
-            &mut open_change,
-            &mut expanded_dirs,
-            &mut selected_tree_path,
-            &mut edit_buffers,
+        assert_eq!(
+            edit_buffers
+                .get(&(worktree_a.clone(), relative.clone()))
+                .map(|buffer| buffer.content.as_str()),
+            Some("fn main() { a() }"),
+            "worktree A's buffer for this relative path must stay worktree A's own content"
         );
-
-        assert!(edit_buffers.is_empty());
+        assert_eq!(
+            edit_buffers
+                .get(&(worktree_b, relative))
+                .map(|buffer| buffer.content.as_str()),
+            Some("fn main() { b() }"),
+            "worktree B's buffer for the identical relative path must never merge with or \
+             overwrite worktree A's"
+        );
     }
 }
 
