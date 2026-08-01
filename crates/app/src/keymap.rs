@@ -31,7 +31,7 @@
 //! itself start working as a live shortcut on Linux (not possible - GPUI resolves `"secondary"`
 //! once, at compile time, per `cfg!`). The mismatch only exists behind a deliberate, explicit,
 //! opt-in command-palette action whose own label says "preview", not a promise that this
-//! session's keys changed - a materially different risk profile than the original bug below,
+//! agent's keys changed - a materially different risk profile than the original bug below,
 //! which silently mismatched every user's default, un-opted-into experience.
 //!
 //! ## Real platform detection

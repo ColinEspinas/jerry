@@ -768,7 +768,7 @@ mod lsp_hover_wiring_tests {
     ///
     /// Mounting a File view via `render_center_pane` was found, while writing this test, to leave
     /// `TestAppContext::dispatch_action` unable to reach any `on_action` handler at all:
-    /// `render_center_pane` stops rendering the active session's terminal pane the instant a File
+    /// `render_center_pane` stops rendering the active agent's terminal pane the instant a File
     /// view mounts, leaving `Window::focus` dangling on a `FocusId` the last frame no longer
     /// contains - the same bug class [`palette_focus_tests`]/[`settings_focus_tests`] describe,
     /// fixed for Surface C by [`AdeApp::code_focus_handle`] (see [`code_focus_tests`] for

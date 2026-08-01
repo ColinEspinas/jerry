@@ -24,19 +24,19 @@ fn agent_state_word(status: Status) -> &'static str {
 /// input` (the dot and state word are the whole message), the live activity for `running`, the
 /// exit code for `failed`, the review's file count for `review ready`, and `resumable · Nh` for
 /// `paused`.
-fn agent_trailing_text(session: &SessionRow) -> String {
-    match session.status {
+fn agent_trailing_text(agent: &AgentRow) -> String {
+    match agent.status {
         Status::Ask => String::new(),
-        Status::Run => session.activity.clone().unwrap_or_default(),
-        Status::Fail => session
+        Status::Run => agent.activity.clone().unwrap_or_default(),
+        Status::Fail => agent
             .exit_code
             .map(|code| format!("exit {code}"))
             .unwrap_or_default(),
-        Status::Review => session
+        Status::Review => agent
             .review_file_count
             .map(|count| format!("{count} file{}", if count == 1 { "" } else { "s" }))
             .unwrap_or_default(),
-        Status::Idle => format!("resumable \u{b7} {}", rail::format_elapsed(session.elapsed)),
+        Status::Idle => format!("resumable \u{b7} {}", rail::format_elapsed(agent.elapsed)),
     }
 }
 
@@ -103,23 +103,23 @@ impl AdeApp {
         }
     }
 
-    /// Builds the rail's per-session rows from live state: each session's `TerminalPane`
+    /// Builds the rail's per-agent rows from live state: each agent's `TerminalPane`
     /// (process signal, question preview), the matching worktree's branch name, and the diff
     /// summary from [`Self::diff_cache`] (refreshed by the periodic task started in
-    /// `Self::new`). A session with no diff data yet simply shows `0`/`0` until the next
+    /// `Self::new`). An agent with no diff data yet simply shows `0`/`0` until the next
     /// status-poll tick fills it in.
-    pub(crate) fn build_session_rows(&self, cx: &App) -> Vec<SessionRow> {
-        self.sessions
+    pub(crate) fn build_agent_rows(&self, cx: &App) -> Vec<AgentRow> {
+        self.agents
             .iter()
-            .map(|session| {
-                let status_value = self.session_status(session, cx);
-                let pane = session.pane.read(cx);
-                let diff = self.diff_cache.get(&session.cwd).copied();
+            .map(|agent| {
+                let status_value = self.agent_status(agent, cx);
+                let pane = agent.pane.read(cx);
+                let diff = self.diff_cache.get(&agent.cwd).copied();
 
                 let branch = self
                     .worktrees
                     .iter()
-                    .find(|item| item.path == session.cwd)
+                    .find(|item| item.path == agent.cwd)
                     .and_then(|item| item.branch.clone());
 
                 let question_preview = if status_value == Status::Ask {
@@ -131,26 +131,23 @@ impl AdeApp {
                     None
                 };
 
-                let title = match session.cwd.file_name() {
+                let title = match agent.cwd.file_name() {
                     Some(name) => name.to_string_lossy().into_owned(),
-                    None => session.cwd.display().to_string(),
+                    None => agent.cwd.display().to_string(),
                 };
 
-                // See `SessionRow::review_file_count`'s own docs: a review-ready session outside
+                // See `AgentRow::review_file_count`'s own docs: a review-ready agent outside
                 // the one worktree currently loaded in Zone 3 (`Self::diff_root`) has no diff data
                 // to report and stays `None` rather than a fabricated count. Within that worktree,
-                // the count is only unambiguous when this session is the sole agent there - with
+                // the count is only unambiguous when this agent is the sole agent there - with
                 // more than one agent sharing the worktree, attributing which files are "this
-                // session's" needs real per-agent authorship tracking, which doesn't exist yet (see
+                // agent's" needs real per-agent authorship tracking, which doesn't exist yet (see
                 // `crate::sidebar::changes::Authorship`'s own docs), so that case also stays `None`
                 // rather than reporting every agent's row as authoring zero files.
                 let review_file_count =
-                    if status_value == Status::Review && session.cwd == self.diff_root {
-                        let agents_in_worktree = self
-                            .sessions
-                            .iter()
-                            .filter(|s| s.cwd == session.cwd)
-                            .count();
+                    if status_value == Status::Review && agent.cwd == self.diff_root {
+                        let agents_in_worktree =
+                            self.agents.iter().filter(|s| s.cwd == agent.cwd).count();
                         if agents_in_worktree <= 1 {
                             self.current_diff().map(|diff| diff.files.len())
                         } else {
@@ -160,32 +157,32 @@ impl AdeApp {
                         None
                     };
 
-                SessionRow {
-                    id: session.id,
-                    kind: session.kind,
+                AgentRow {
+                    id: agent.id,
+                    kind: agent.kind,
                     title,
-                    cwd: session.cwd.clone(),
+                    cwd: agent.cwd.clone(),
                     status: status_value,
                     branch,
                     add: diff.map(|summary| summary.add).unwrap_or(0),
                     del: diff.map(|summary| summary.del).unwrap_or(0),
                     question_preview,
                     exit_code: pane.exit_status().map(|status| status.exit_code()),
-                    // See `SessionRow::activity`'s own docs: no real PTY-activity heuristic is
+                    // See `AgentRow::activity`'s own docs: no real PTY-activity heuristic is
                     // wired up yet, so every row threads `None` through for now.
                     activity: None,
-                    elapsed: session.spawned_at.elapsed(),
+                    elapsed: agent.spawned_at.elapsed(),
                     review_file_count,
                 }
             })
             .collect()
     }
 
-    /// Builds one [`WorktreeRow`] per worktree, folding in every currently open session
+    /// Builds one [`WorktreeRow`] per worktree, folding in every currently open agent
     /// (`crate::rail::state::build_worktree_rows`) - the single real per-render source both rail modes
     /// now build their list from (see [`Self::render_rail_list`]).
     pub(in crate::rail) fn build_worktree_rows(&self, cx: &App) -> Vec<WorktreeRow> {
-        rail::build_worktree_rows(&self.build_worktree_entries(), &self.build_session_rows(cx))
+        rail::build_worktree_rows(&self.build_worktree_entries(), &self.build_agent_rows(cx))
     }
 
     /// Builds the worktree list: every worktree `wt_core::list_worktrees` reported, including
@@ -237,8 +234,8 @@ impl AdeApp {
     }
 
     /// Starts the rail's periodic status background refresh (see [`STATUS_POLL_INTERVAL`]'s
-    /// docs). Every tick: snapshots the current worktree paths, open sessions' cwds, and open
-    /// sessions' real pids on the foreground thread (cheap, no I/O), computes a
+    /// docs). Every tick: snapshots the current worktree paths, open agents' cwds, and open
+    /// agents' real pids on the foreground thread (cheap, no I/O), computes a
     /// [`rail::StatusSnapshot`] *and* a real [`process_stats::sample_processes`] reading on the
     /// background executor, then writes both results back into
     /// [`Self::diff_cache`]/[`Self::worktree_notes`]/[`Self::ahead_behind_cache`]/
@@ -269,15 +266,12 @@ impl AdeApp {
                             is_locked: item.is_locked,
                         })
                         .collect();
-                    let diff_paths: Vec<PathBuf> = this
-                        .sessions
-                        .iter()
-                        .map(|session| session.cwd.clone())
-                        .collect();
+                    let diff_paths: Vec<PathBuf> =
+                        this.agents.iter().map(|agent| agent.cwd.clone()).collect();
                     let pids: Vec<u32> = this
-                        .sessions
+                        .agents
                         .iter()
-                        .filter_map(|session| session.pane.read(cx).pid())
+                        .filter_map(|agent| agent.pane.read(cx).pid())
                         .collect();
                     (worktrees, diff_paths, pids)
                 }) else {
@@ -363,7 +357,7 @@ impl AdeApp {
     }
 
     /// The prune candidate list: every worktree that is a prune candidate on its own merits
-    /// ([`rail::is_prunable`]) **and** has no live session running with its cwd inside it -
+    /// ([`rail::is_prunable`]) **and** has no live agent running with its cwd inside it -
     /// see [`rail::prunable_worktree_paths`]'s docs for why that second condition matters.
     /// Shared by the footer's displayed count and [`Self::execute_prune`], so what's shown
     /// always matches what a click will do.
@@ -374,12 +368,9 @@ impl AdeApp {
             .filter(|item| item.error.is_none())
             .map(|item| item.path.clone())
             .collect();
-        let live_session_cwds: HashSet<PathBuf> = self
-            .sessions
-            .iter()
-            .map(|session| session.cwd.clone())
-            .collect();
-        rail::prunable_worktree_paths(&worktree_paths, &self.worktree_notes, &live_session_cwds)
+        let live_agent_cwds: HashSet<PathBuf> =
+            self.agents.iter().map(|agent| agent.cwd.clone()).collect();
+        rail::prunable_worktree_paths(&worktree_paths, &self.worktree_notes, &live_agent_cwds)
     }
 
     /// The footer `prune` button's click handler. Destructive, so this is deliberately a
@@ -477,13 +468,13 @@ impl AdeApp {
         self._prune_task = Some(task);
     }
 
-    /// The whole session rail (`design_handoff_jerry_ade/README.md`'s Zone 1): header,
-    /// filter row, the real scrollable session/worktree list, and the footer - see the
+    /// The whole agent rail (`design_handoff_jerry_ade/README.md`'s Zone 1): header,
+    /// filter row, the real scrollable agent/worktree list, and the footer - see the
     /// README's "Rail chrome" section for the exact band heights this composes
     /// (`theme::band::{RAIL_HEADER,FILTER_ROW,SURFACE_FOOTER}`).
     pub(crate) fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .id("session-rail")
+            .id("agent-rail")
             // The app's real "nowhere else to put focus" fallback target - see
             // `AdeApp::rail_focus_handle`'s own docs for why the fallback lives on this
             // deliberately context-less root rather than on the filter row below it.
@@ -509,7 +500,7 @@ impl AdeApp {
                     .min_h_0()
                     .child(
                         div()
-                            .id("session-rail-list")
+                            .id("agent-rail-list")
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
@@ -528,7 +519,7 @@ impl AdeApp {
 
     /// A visible error banner for [`Self::worktrees_error`] (`wt_core::list_worktrees_porcelain`
     /// failing outright, e.g. a corrupt repository) - shown as a standing banner rather than
-    /// replacing the whole session list, so already-open sessions stay usable even when the
+    /// replacing the whole agent list, so already-open agents stay usable even when the
     /// worktree listing itself is broken.
     pub(in crate::rail) fn render_worktrees_error_banner(&self) -> Option<impl IntoElement> {
         let error = self.worktrees_error.as_ref()?;
@@ -584,7 +575,7 @@ impl AdeApp {
         )
     }
 
-    /// Header 36 (`Sessions` label, grouping toggle, `+`/⌘N) - README's "Rail chrome".
+    /// Header 36 (`Agents` label, grouping toggle, `+`/⌘N) - README's "Rail chrome".
     pub(in crate::rail) fn render_rail_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("rail-header")
@@ -602,27 +593,27 @@ impl AdeApp {
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::FAINT)
-                    .child("SESSIONS"),
+                    .child("AGENTS"),
             )
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(8.0))
-                    .child(self.render_new_session_button(cx)),
+                    .child(self.render_new_agent_button(cx)),
             )
     }
 
     /// The `+` control with its real, platform-resolved `mod+N` keycap pair (`⌘N` on macOS,
     /// `Ctrl N` on Windows/Linux - `crate::keymap::resolve_combo`) - spawns a real new shell
-    /// session (see [`NewSession`]'s docs for the judgment call on the keybinding side of
+    /// agent (see [`NewAgent`]'s docs for the judgment call on the keybinding side of
     /// this).
-    pub(in crate::rail) fn render_new_session_button(
+    pub(in crate::rail) fn render_new_agent_button(
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
-            .id("rail-new-session")
+            .id("rail-new-agent")
             .flex()
             .items_center()
             .gap(px(4.0))
@@ -642,7 +633,7 @@ impl AdeApp {
                 KeycapSize::Standard,
             ))
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                this.new_session(SessionKind::Shell, window, cx);
+                this.new_agent(AgentKind::Shell, window, cx);
             }))
     }
 
@@ -700,7 +691,7 @@ impl AdeApp {
                             .child(if has_query {
                                 self.filter_query.as_str().to_string()
                             } else {
-                                "filter sessions".to_string()
+                                "filter agents".to_string()
                             }),
                     )
                     .child(self.render_simple_input_caret()),
@@ -832,8 +823,8 @@ impl AdeApp {
     /// Whether `row`'s agent rows are currently shown - an explicit per-worktree override in
     /// [`Self::rail_collapse_overrides`] if the caret has ever been clicked for this path,
     /// otherwise the real default (§2.2: "Worktrees whose most urgent agent is idle start
-    /// collapsed"). A session-less row has no caret at all, so this is only ever consulted
-    /// (via [`Self::render_worktree_row`]) when `row.sessions` is non-empty.
+    /// collapsed"). An agent-less row has no caret at all, so this is only ever consulted
+    /// (via [`Self::render_worktree_row`]) when `row.agents` is non-empty.
     pub(in crate::rail) fn worktree_is_expanded(&self, row: &WorktreeRow) -> bool {
         match self.rail_collapse_overrides.get(&row.path) {
             Some(expanded) => *expanded,
@@ -918,8 +909,8 @@ impl AdeApp {
                 .into_any_element();
         }
 
-        let is_selected = self.active_session_cwd() == row.path;
-        let has_agents = !row.sessions.is_empty();
+        let is_selected = self.active_agent_cwd() == row.path;
+        let has_agents = !row.agents.is_empty();
         let is_expanded = has_agents && self.worktree_is_expanded(row);
         let status = row.aggregate_status();
 
@@ -983,7 +974,7 @@ impl AdeApp {
         if has_agents {
             if !is_expanded {
                 let mut dot_statuses: Vec<Status> =
-                    row.sessions.iter().map(|session| session.status).collect();
+                    row.agents.iter().map(|agent| agent.status).collect();
                 dot_statuses.sort_by_key(|status| status.urgency_rank());
                 trailing = trailing.child(div().flex().items_center().gap(px(3.0)).children(
                     dot_statuses.into_iter().map(|status| {
@@ -1058,8 +1049,8 @@ impl AdeApp {
             .flex_col()
             .child(header);
         if is_expanded {
-            for session in &row.sessions {
-                container = container.child(self.render_agent_row(session, cx));
+            for agent in &row.agents {
+                container = container.child(self.render_agent_row(agent, cx));
             }
         }
 
@@ -1086,14 +1077,14 @@ impl AdeApp {
             container = container.tooltip(text_tooltip(tooltip_text));
         }
 
-        // The most urgently-waiting open session's own question preview, if any - matches the
-        // old per-session row's card exactly, just picked from among this worktree's several
+        // The most urgently-waiting open agent's own question preview, if any - matches the
+        // old per-agent row's card exactly, just picked from among this worktree's several
         // possible tabs rather than always having exactly one to show.
         let question_preview = row
-            .sessions
+            .agents
             .iter()
-            .filter(|session| session.status == Status::Ask)
-            .find_map(|session| session.question_preview.as_ref());
+            .filter(|agent| agent.status == Status::Ask)
+            .find_map(|agent| agent.question_preview.as_ref());
         if let Some(preview) = question_preview {
             container = container.child(
                 div()
@@ -1115,30 +1106,30 @@ impl AdeApp {
     }
 
     /// One agent row (§2.3): indented 13, a 1px spine (2px and status-coloured when this is the
-    /// globally active session - `Self::sessions::active_id`), exactly two lines - chip/title/
+    /// globally active agent - `Self::agents::active_id`), exactly two lines - chip/title/
     /// elapsed, then status dot/state word/trailing text/model. Clicking it selects this
-    /// session's tab *and* its worktree (`Self::select_session` - already does both: it's the
-    /// same real entry point the palette/tab-strip use to jump straight to one session).
+    /// agent's tab *and* its worktree (`Self::select_agent` - already does both: it's the
+    /// same real entry point the palette/tab-strip use to jump straight to one agent).
     pub(in crate::rail) fn render_agent_row(
         &self,
-        session: &SessionRow,
+        agent: &AgentRow,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let is_selected = self.sessions.active_id() == Some(session.id);
-        let status = session.status;
-        let (chip_fg, chip_bg) = work_surface::agent_tint(session.kind);
-        let chip_glyph = work_surface::agent_initial(session.kind);
+        let is_selected = self.agents.active_id() == Some(agent.id);
+        let status = agent.status;
+        let (chip_fg, chip_bg) = work_surface::agent_tint(agent.kind);
+        let chip_glyph = work_surface::agent_initial(agent.kind);
         let state_color: gpui::Rgba = match status {
             Status::Ask | Status::Fail => status.color(),
             _ => theme::text::FAINT.into(),
         };
-        let trailing_text = agent_trailing_text(session);
+        let trailing_text = agent_trailing_text(agent);
         let trailing_color: gpui::Rgba = if status == Status::Fail {
             theme::button::DANGER_FG.into()
         } else {
             theme::text::FAINT.into()
         };
-        let id = session.id;
+        let id = agent.id;
 
         div()
             .id(("agent-row", id))
@@ -1160,7 +1151,7 @@ impl AdeApp {
                 el.hover(|el| el.bg(theme::rail::WORKTREE_HOVER_BG))
             })
             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                this.select_session(id, window, cx);
+                this.select_agent(id, window, cx);
             }))
             .child(
                 // Line 1: chip · task title · elapsed.
@@ -1196,7 +1187,7 @@ impl AdeApp {
                             } else {
                                 theme::text::BODY
                             })
-                            .child(session.title.clone()),
+                            .child(agent.title.clone()),
                     )
                     .child(
                         div()
@@ -1204,7 +1195,7 @@ impl AdeApp {
                             .font(font(theme::font::MONO))
                             .text_size(self.ui_text_size(9.5))
                             .text_color(theme::text::GHOST)
-                            .child(rail::format_elapsed(session.elapsed)),
+                            .child(rail::format_elapsed(agent.elapsed)),
                     ),
             )
             .child(
@@ -1247,7 +1238,7 @@ impl AdeApp {
                             .font(font(theme::font::MONO))
                             .text_size(self.ui_text_size(9.5))
                             .text_color(theme::text::PATH)
-                            .child(session.kind.label()),
+                            .child(agent.kind.label()),
                     ),
             )
     }
@@ -1420,7 +1411,7 @@ mod prune_regression_tests {
 
     /// Wires up `app.worktrees`/`app.worktree_notes` directly with one prunable worktree,
     /// bypassing the periodic status-poll computation - `Self::prunable_worktree_paths` only
-    /// reads these two fields plus `self.sessions`, so this exercises the same code
+    /// reads these two fields plus `self.agents`, so this exercises the same code
     /// `Self::request_prune`/`Self::execute_prune` run in production.
     fn seed_one_prunable_worktree(app: &mut AdeApp, path: PathBuf, branch: &str) {
         app.worktrees.push(WorktreeItem {
@@ -1532,7 +1523,7 @@ mod prune_regression_tests {
 /// Real, `Context<AdeApp>`-driven coverage for Revision R12's rail rewrite: the repo-group →
 /// worktree-row → agent-row structure (`design_handoff_jerry_ade/revision 3/
 /// REVISION-2026-07-31.md` §2), the per-worktree collapse memory, and the agent row's "select
-/// the worktree and raise this session's tab" click behaviour.
+/// the worktree and raise this agent's tab" click behaviour.
 #[cfg(test)]
 mod rail_row_tests {
     use super::*;
@@ -1558,7 +1549,7 @@ mod rail_row_tests {
     }
 
     /// §2.2: "Worktrees whose most urgent agent is idle start collapsed" - proven here against
-    /// a real running session (never collapsed by default) and a real idle one (collapsed by
+    /// a real running agent (never collapsed by default) and a real idle one (collapsed by
     /// default), through `Self::worktree_is_expanded`, the single real place that default lives.
     #[gpui::test]
     fn worktree_is_expanded_defaults_to_the_real_idle_rooted_rule(cx: &mut TestAppContext) {
@@ -1571,13 +1562,8 @@ mod rail_row_tests {
         });
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
-            app.sessions.spawn(
-                SessionKind::Shell,
-                wt.path().to_path_buf(),
-                12.0,
-                window,
-                cx,
-            );
+            app.agents
+                .spawn(AgentKind::Shell, wt.path().to_path_buf(), 12.0, window, cx);
         });
         // The pty spawn itself is async (`TerminalPane::spawn_process`), so the process isn't
         // observably running yet the instant `spawn` returns - let it actually start before
@@ -1600,12 +1586,12 @@ mod rail_row_tests {
             "a worktree whose most urgent agent is running must default to expanded"
         );
 
-        // Force the same row into Idle without waiting on a real clock: a session-less
-        // `WorktreeRow` (same path, no sessions) aggregates to `Status::Idle` exactly the way a
+        // Force the same row into Idle without waiting on a real clock: an agent-less
+        // `WorktreeRow` (same path, no agents) aggregates to `Status::Idle` exactly the way a
         // real shell does once it goes quiet past `status::RUN_RECENT_OUTPUT_WINDOW` - the same
         // `aggregate_status` code path `Self::worktree_is_expanded` itself reads.
         let idle_row = rail::WorktreeRow {
-            sessions: Vec::new(),
+            agents: Vec::new(),
             ..running_row
         };
         assert_eq!(idle_row.aggregate_status(), Status::Idle, "sanity check");
@@ -1629,13 +1615,8 @@ mod rail_row_tests {
         });
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
-            app.sessions.spawn(
-                SessionKind::Shell,
-                wt.path().to_path_buf(),
-                12.0,
-                window,
-                cx,
-            );
+            app.agents
+                .spawn(AgentKind::Shell, wt.path().to_path_buf(), 12.0, window, cx);
         });
         // See the identical `run_until_parked` call/comment in
         // `worktree_is_expanded_defaults_to_the_real_idle_rooted_rule` just above.
@@ -1672,12 +1653,12 @@ mod rail_row_tests {
     }
 
     /// §2.3: "Clicking an agent selects its worktree **and** raises that agent's tab." -
-    /// `Self::render_agent_row`'s own click handler calls exactly `Self::select_session`, so this
+    /// `Self::render_agent_row`'s own click handler calls exactly `Self::select_agent`, so this
     /// exercises that same real call: starting from worktree A selected/focused, selecting a
-    /// session that lives in worktree B must move the rail's selection to B *and* make that
-    /// exact session the active tab - not just one half of the pair.
+    /// agent that lives in worktree B must move the rail's selection to B *and* make that
+    /// exact agent the active tab - not just one half of the pair.
     #[gpui::test]
-    fn selecting_an_agent_session_selects_its_worktree_and_raises_its_tab(cx: &mut TestAppContext) {
+    fn selecting_an_agent_selects_its_worktree_and_raises_its_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let wt_a = tempfile::tempdir().expect("tempdir a");
         let wt_b = tempfile::tempdir().expect("tempdir b");
@@ -1689,18 +1670,18 @@ mod rail_row_tests {
                 worktree_item(wt_b.path().to_path_buf(), "wt-b"),
             ];
         });
-        let session_in_b = app.update_in(cx, |app, window, cx| {
+        let agent_in_b = app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
-            app.sessions.spawn(
-                SessionKind::Shell,
+            app.agents.spawn(
+                AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 window,
                 cx,
             );
             app.select_worktree(0, window, cx);
-            app.sessions.spawn(
-                SessionKind::Shell,
+            app.agents.spawn(
+                AgentKind::Shell,
                 wt_b.path().to_path_buf(),
                 12.0,
                 window,
@@ -1716,18 +1697,18 @@ mod rail_row_tests {
         assert_eq!(app.read_with(cx, |app, _| app.selected), Some(0));
 
         app.update_in(cx, |app, window, cx| {
-            app.select_session(session_in_b, window, cx);
+            app.select_agent(agent_in_b, window, cx);
         });
 
         assert_eq!(
             app.read_with(cx, |app, _| app.selected),
             Some(1),
-            "selecting a session in worktree B must select worktree B in the rail"
+            "selecting an agent in worktree B must select worktree B in the rail"
         );
         assert_eq!(
-            app.read_with(cx, |app, _| app.sessions.active_id()),
-            Some(session_in_b),
-            "and that exact session must become the active tab"
+            app.read_with(cx, |app, _| app.agents.active_id()),
+            Some(agent_in_b),
+            "and that exact agent must become the active tab"
         );
     }
 
@@ -1753,15 +1734,15 @@ mod rail_row_tests {
         });
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(1, window, cx);
-            app.sessions.spawn(
-                SessionKind::Claude,
+            app.agents.spawn(
+                AgentKind::Claude,
                 busy_wt.path().to_path_buf(),
                 12.0,
                 window,
                 cx,
             );
-            app.sessions.spawn(
-                SessionKind::Codex,
+            app.agents.spawn(
+                AgentKind::Codex,
                 busy_wt.path().to_path_buf(),
                 12.0,
                 window,

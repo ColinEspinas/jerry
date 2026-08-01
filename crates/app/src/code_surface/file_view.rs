@@ -366,7 +366,7 @@ impl AdeApp {
                     // but was never pruned per-frame, only cleared wholesale on a worktree
                     // switch - a real, measured unbounded-growth risk (one `(Bounds, ShapedLine)`
                     // retained per line ever scrolled past, for the life of the worktree
-                    // session). Pruned here to just this frame's own visible range (1-based, to
+                    // agent). Pruned here to just this frame's own visible range (1-based, to
                     // match the map's own key convention): any entry this drops for a row that's
                     // about to be rebuilt below is harmless - that row's own real paint, moments
                     // later this same pass, reinserts it fresh anyway.

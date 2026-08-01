@@ -505,7 +505,7 @@ pub mod rail {
     pub const WORKTREE_ACTIVE_BG: ColorToken = hex(0x181c1f);
     /// Worktree row hover background (§2.2: "hover `#16191c`").
     pub const WORKTREE_HOVER_BG: ColorToken = hex(0x16191c);
-    /// A prunable (merged, clean, session-less) worktree's 2px left edge (§2.2: "prunable
+    /// A prunable (merged, clean, agent-less) worktree's 2px left edge (§2.2: "prunable
     /// `#2f353a`"). A bare-but-not-prunable worktree reuses [`super::status::IDLE_BG`]
     /// (`#22262a`), an exact match for the spec's "Bare worktrees `#22262a`".
     pub const PRUNABLE_EDGE: ColorToken = hex(0x2f353a);
@@ -939,7 +939,7 @@ pub mod settings {
     /// distinct from [`super::border::CARD_FIELD`] (`#22272b`).
     pub const CARD_ROW_SEP: ColorToken = hex(0x1f2327);
     /// A binary-found status dot on the Agents page. Same hex as [`super::status::REVIEW`],
-    /// kept as its own token: the session `Status` palette is reserved for session urgency
+    /// kept as its own token: the agent `Status` palette is reserved for agent urgency
     /// (`README.md`'s "Status vocabulary — use nowhere else"), and "this binary resolved on
     /// `$PATH`" is a different fact that just happens to want the same green.
     pub const AGENT_READY: ColorToken = hex(0x5cb87f);
@@ -965,7 +965,7 @@ pub mod settings {
 /// invisible browser/OS scrolling), so these are a deliberate, judgment-call derivation from
 /// existing neutral tokens rather than a transcription. `THUMB` aliases [`text::GUTTER`] (the
 /// line-number gutter's own muted grey - already the UI's "quiet structural chrome" colour) and
-/// `THUMB_HOVER` aliases [`status::IDLE`] (a session's resting-state grey, one step brighter) so
+/// `THUMB_HOVER` aliases [`status::IDLE`] (an agent's resting-state grey, one step brighter) so
 /// the two states read as "the same neutral family, one step apart" rather than inventing a third
 /// hex pair. Both are painted at reduced opacity (see `crate::root::scrollbar`) rather than full
 /// strength, matching the "overlay, not a solid rail" requirement.
@@ -1002,7 +1002,7 @@ pub mod band {
     pub const SURFACE_FOOTER: Pixels = px(28.0);
     pub const PTY_HEADER: Pixels = px(27.0);
     /// The terminal pane's info footer band (`pid` · grid dimensions · environment chip ·
-    /// right-aligned static copy) - distinct from [`SURFACE_FOOTER`] (the session-level
+    /// right-aligned static copy) - distinct from [`SURFACE_FOOTER`] (the agent-level
     /// Interrupt/Retry/Archive action footer, rendered separately below it).
     pub const PTY_INFO_FOOTER: Pixels = px(26.0);
     pub const BREADCRUMB: Pixels = px(26.0);
@@ -1061,10 +1061,10 @@ pub mod shadow {
 ///
 /// ## Which real surfaces read this
 ///
-/// Scaled: the session rail (`crate::rail::render`); the title bar/status bar
+/// Scaled: the agent rail (`crate::rail::render`); the title bar/status bar
 /// (`crate::status_bar::render`); the command palette's row labels/hints
 /// (`crate::palette::render`); the Files/Changes sidebar's row labels, footer hint, and
-/// tree caret (`crate::sidebar::render`); the file/session tab strip's tab labels
+/// tree caret (`crate::sidebar::render`); the file/agent tab strip's tab labels
 /// (`crate::work_surface::render`); and every Settings row's label/hint *and* control
 /// (stepper value, choice-segment labels, config banner text, snippet block text - all in
 /// `crate::settings::widgets`).
@@ -1074,7 +1074,7 @@ pub mod shadow {
 /// `Settings.appearance.terminal_font_size`) that a second multiplier would compound with;
 /// chips/badges/keycaps/close-tab glyphs app-wide are small, fixed-size shapes the design treats
 /// as part of a component rather than running text; and the rest of `crate::work_surface::render`'s own
-/// chrome (session context bar, toolbar buttons, `+` menu, footer action buttons) is real,
+/// chrome (agent context bar, toolbar buttons, `+` menu, footer action buttons) is real,
 /// currently out of scope.
 pub mod ui_scale {
     use super::px;

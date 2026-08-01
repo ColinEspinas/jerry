@@ -4901,3 +4901,75 @@ infrastructure for one narrow change. Flagged here rather than silently skipped.
 `cargo clippy --workspace --all-targets -- -D warnings` - all clean.
 `cargo test --workspace --lib --test-threads=1`: **1098 + 44 + 14 + 107 = 1263 passed, 0 failed**
 across all four crates.
+
+## Renaming `Session` to `Agent` throughout `crates/app` (Revision R12)
+
+A pure rename, zero behavior change: `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md`
+§1 states the new model plainly - "Previously a 'session' fused agent and worktree into one
+object, so two agents on one branch showed as two unrelated rows with the same branch name...
+**Agents are processes inside a worktree** - several can run in one." The code's actual semantics
+already matched this (a `Session`'s `cwd` is the worktree it runs in; several already shared one
+`cwd` without incident - see the R12 rail rewrite's own `build_session_rows`, which already
+grouped multiple sessions per worktree row). Only the name was stale, left over from the
+pre-redesign model this same revision's rail rewrite (`crates/app/src/rail/`) already replaced.
+Carrying "Session" forward would keep every doc comment, test name, and the rail's own literal
+`"SESSIONS"` header lying about a model this app no longer has.
+
+**Scope**: `Session` → `Agent`, `SessionId` → `AgentId`, `SessionKind` → `AgentKind`, `SessionRow`
+→ `AgentRow`, `SessionCandidate` → `AgentCandidate`, the `Sessions` collection → `Agents`; the
+module `work_surface::sessions` → `work_surface::agents` (`git mv`, `mod` declaration and every
+`use`/path reference updated); every function/method with "session" in its name that operates on
+this concept (`new_session` → `new_agent`, `session_status` → `agent_status`,
+`build_session_rows` → `build_agent_rows`, `render_session_tab` → `render_agent_tab`,
+`current_worktree_sessions` → `current_worktree_agents`, `active_session_cwd` →
+`active_agent_cwd`, `focus_newly_spawned_session` → `focus_newly_spawned_agent`,
+`render_new_session_button` → `render_new_agent_button`, `session_jump_keys`/`jump_to_session_at`
+→ `agent_jump_keys`/`jump_to_agent_at`, and dozens more in the same vein); every field
+(`self.sessions` → `self.agents`); every doc comment describing this concept, in every file that
+touches it, not just the obviously-named ones; every test name, including collapsing the several
+places a test already said "agent" *and* redundantly said "session" for the same thing (e.g.
+`secondary_shift_n_spawns_a_real_agent_session_through_the_real_key_bindings` →
+`..._spawns_a_real_agent_through_...`) down to saying it once. The rail header's own literal
+`"SESSIONS"` label (`crates/app/src/rail/render.rs`) was also updated to `"AGENTS"` - not called
+out by name in the rename's own scope note, but the same stale terminology the whole rename exists
+to remove, on the exact rail whose rows this revision's own design doc calls agent rows throughout
+§2.3.
+
+**What deliberately did not change**: `SessionKind::Shell`/`Claude`/`Codex` variant names (only
+the enum's own name changed); anything outside `crates/app`; and, inside
+`crates/app/src/terminal/pane.rs` and `terminal/grid.rs`, every reference to the literal
+`pty_core::PtySession` type and to `TerminalPane`'s own `session: Option<PtySession>` field (plus
+`ResizeLatch`'s parallel `session: Option<GridDims>` field tracking the same live-pty concept at
+one remove) - these name a different, lower-level thing: the raw OS process handle one pane's
+`Agent` currently owns, not the `Agent` itself. A `TerminalPane` can exist with `session: None`
+(mid-spawn) while still belonging to a real, already-tabbed `Agent`, so collapsing the two names
+would have made that distinction unreadable. Doc comments in the same file that referred to the
+*outer* `Agent`/tab concept in passing (`"a pane whose session isn't the globally active tab"`,
+`"a wall of background sessions"`, the rail's `"new session"` shortcut mentioned in a keystroke
+comment, a cross-reference to a test renamed elsewhere) were still renamed - only the pty-handle
+field and its direct usages were left alone. Three literal strings were protected from the
+mechanical pass and left as-is because they're not this concept: `pty_core::PtySession` (a real
+type name from a different crate), `window.restore_sessions` (a quoted external settings key
+mentioned only in a comment about what this app does *not* implement), and `groupSessions` (a
+direct quote of the design doc's own §7 naming an old, already-removed prop).
+
+**The rail's `+` button's tooltip - flagged, not guessed.** The task briefing for this rename
+assumed `render_new_agent_button`'s existing tooltip/label text needed updating to say "New agent"
+to match the tab strip's own `+` menu. Checked both before touching it: the button has no text
+label at all today (just a `+` glyph and a `mod+N` keycap pair - no `.tooltip()` call anywhere in
+its body), and its real click handler spawns `AgentKind::Shell` specifically
+(`this.new_agent(AgentKind::Shell, window, cx)`), which is the tab strip's own `+` menu's *"New
+terminal"* row, not its separate *"New agent pane"* row (which spawns the resolved Claude/Codex
+kind instead, per `render_tab_strip_plus`'s docs). Design doc §3 lists a single `New agent` menu
+item, but the code's own `+` menu already distinguishes "terminal" from "agent" as two different
+offers - so labeling this Shell-spawning rail button "New agent" would contradict the app's own
+existing vocabulary, not just rename it. Left the button's render body untouched beyond the
+already-completed identifier rename, per this task's own instruction to flag rather than guess at
+user-facing copy that isn't clearly in scope.
+
+**Gates**, from this project's usual Linux sandbox: `cargo fmt --all -- --check`,
+`cargo build --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` all clean.
+`cargo test --workspace --lib -- --test-threads=1`: **1098 + 44 + 14 + 107 = 1263 passed, 0
+failed** across all four crates, both before and after the final text-only `"SESSIONS"` →
+`"AGENTS"` edit. 54 files touched in `crates/app` (53 modified, one renamed:
+`work_surface/sessions.rs` → `work_surface/agents.rs`); nothing outside `crates/app` changed.

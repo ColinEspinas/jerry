@@ -1,4 +1,4 @@
-//! The session rail's data model: pure, GPUI-free types and functions for grouping and
+//! The agent rail's data model: pure, GPUI-free types and functions for grouping and
 //! filtering (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md`'s Zone 1). No `gpui`
 //! dependency, so this logic is unit-testable without a real window, terminal, or git state.
 //! `crate::root` gathers the real signals (`TerminalPane`, `wt_core::list_worktrees`,
@@ -16,16 +16,16 @@ use std::time::Duration;
 
 use crate::rail::repo::RepoId;
 use crate::rail::status::Status;
-use crate::work_surface::sessions::SessionKind;
+use crate::work_surface::agents::AgentKind;
 use wt_core::diff::{AheadBehind, DiffBase, DiffLineKind, WorktreeDiff, WorktreeMergeStatus};
 
-/// One session, reduced to exactly what the rail row needs to render - built in `crate::root`
-/// from a `crate::work_surface::sessions::Session` plus a `wt_core::diff::diff_against_base` result for its
+/// One agent, reduced to exactly what the rail row needs to render - built in `crate::root`
+/// from a `crate::work_surface::agents::Agent` plus a `wt_core::diff::diff_against_base` result for its
 /// worktree. See `crate::rail::status::derive_status` for how `status` was computed.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SessionRow {
-    pub id: crate::work_surface::sessions::SessionId,
-    pub kind: SessionKind,
+pub struct AgentRow {
+    pub id: crate::work_surface::agents::AgentId,
+    pub kind: AgentKind,
     pub title: String,
     pub cwd: PathBuf,
     pub status: Status,
@@ -34,7 +34,7 @@ pub struct SessionRow {
     /// every changed file. Both `0` if the diff hasn't loaded yet or there are no changes.
     pub add: usize,
     pub del: usize,
-    /// Tail-of-pty text for a waiting session (`TerminalPane::visible_text_lines`, trimmed to
+    /// Tail-of-pty text for a waiting agent (`TerminalPane::visible_text_lines`, trimmed to
     /// the last non-blank line) - the design's "question preview". Only populated for
     /// [`Status::Ask`] rows.
     pub question_preview: Option<String>,
@@ -55,10 +55,10 @@ pub struct SessionRow {
     /// **Always `None` today.** The real PTY-output-to-activity-text heuristic is a separate,
     /// parallel piece of work (this revision's Phase 0 is data-model-and-persistence only); this
     /// field exists so that work has a real, already-plumbed-through place to write into -
-    /// [`crate::rail::render::AdeApp::build_session_rows`] is where a live value would be filled
+    /// [`crate::rail::render::AdeApp::build_agent_rows`] is where a live value would be filled
     /// in, the same real construction site [`Self::question_preview`] is already filled in from.
     pub activity: Option<String>,
-    /// Wall-clock time since `crate::work_surface::sessions::Session::spawned_at` - the agent
+    /// Wall-clock time since `crate::work_surface::agents::Agent::spawned_at` - the agent
     /// row's line-1 elapsed time (§2.3: "elapsed 9.5px mono right"). See [`format_elapsed`] for
     /// how this becomes the rendered `4m`/`1h` text.
     pub elapsed: Duration,
@@ -70,17 +70,17 @@ pub struct SessionRow {
     /// whose worktree diff isn't the one currently loaded in Zone 3 (`crate::root::AdeApp::
     /// diff_root` only tracks one diff at a time, so a row outside it has no diff data at all),
     /// or a worktree with more than one agent sharing it - attributing which of the diff's files
-    /// are "this session's" needs real per-agent authorship tracking, which doesn't exist yet
+    /// are "this agent's" needs real per-agent authorship tracking, which doesn't exist yet
     /// (see `crate::sidebar::changes::Authorship`'s own docs), so every agent sharing that
     /// worktree would otherwise report the same full count, or - if sourced from `Authorship`
     /// instead - a uniformly fabricated zero. With exactly one agent in the worktree there's no
-    /// such ambiguity: every file in the diff is unambiguously that session's.
+    /// such ambiguity: every file in the diff is unambiguously that agent's.
     pub review_file_count: Option<usize>,
 }
 
-impl SessionRow {
+impl AgentRow {
     /// Whether this row matches a rail filter query - case-insensitive substring match
-    /// against the title, branch name, and session kind label.
+    /// against the title, branch name, and agent kind label.
     pub fn matches_filter(&self, query: &str) -> bool {
         let query = query.trim();
         if query.is_empty() {
@@ -96,15 +96,15 @@ impl SessionRow {
     }
 }
 
-/// Filters `rows` down to those matching `query` - see [`SessionRow::matches_filter`]. A
+/// Filters `rows` down to those matching `query` - see [`AgentRow::matches_filter`]. A
 /// blank query matches everything.
-pub fn filter_sessions<'a>(rows: &'a [SessionRow], query: &str) -> Vec<&'a SessionRow> {
+pub fn filter_agents<'a>(rows: &'a [AgentRow], query: &str) -> Vec<&'a AgentRow> {
     rows.iter()
         .filter(|row| row.matches_filter(query))
         .collect()
 }
 
-/// `+added -deleted` totals for one worktree/session cwd, summed across every changed file's
+/// `+added -deleted` totals for one worktree/agent cwd, summed across every changed file's
 /// hunks via [`sum_diff_stat`]. `has_changes` mirrors `crate::rail::status::derive_status`'s
 /// `has_reviewable_diff` input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -134,14 +134,14 @@ pub fn sum_diff_stat(diff: &WorktreeDiff) -> (usize, usize) {
     (add, del)
 }
 
-/// Real per-status counts across every session row, in [`Status::ORDER`] - the status bar's
+/// Real per-status counts across every agent row, in [`Status::ORDER`] - the status bar's
 /// five urgency-counter squares (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 7).
 /// Unlike [`group_worktrees_by_repo`], a status with zero matching rows still gets a real `0`
 /// entry rather than being omitted, since the status bar always shows all five squares. Built
 /// from the
-/// same per-session [`Status`] every [`SessionRow`] already carries - not a second, independent
+/// same per-agent [`Status`] every [`AgentRow`] already carries - not a second, independent
 /// status classification.
-pub fn urgency_counts(rows: &[SessionRow]) -> [(Status, usize); 5] {
+pub fn urgency_counts(rows: &[AgentRow]) -> [(Status, usize); 5] {
     Status::ORDER.map(|status| {
         (
             status,
@@ -174,7 +174,7 @@ impl WorktreeNote {
     /// `wt_core::remove_worktree`'s own dirty-tree refusal up front), and merged into its
     /// detected base.
     ///
-    /// Not sufficient on its own to remove a worktree - says nothing about a live session
+    /// Not sufficient on its own to remove a worktree - says nothing about a live agent
     /// running inside it. See [`prunable_worktree_paths`] for that additional exclusion.
     pub fn is_prunable(&self) -> bool {
         !self.is_main
@@ -183,7 +183,7 @@ impl WorktreeNote {
             && self.merge.as_ref().is_some_and(|status| status.merged)
     }
 
-    /// The real note text shown on a session-less worktree row.
+    /// The real note text shown on an agent-less worktree row.
     pub fn label(&self) -> String {
         let locked_suffix = if self.is_locked { " · locked" } else { "" };
 
@@ -259,35 +259,35 @@ pub struct WorktreeEntry {
     pub error: Option<String>,
 }
 
-/// One rail row: a single worktree, with **every** session currently open in it (not just the
-/// first one found) folded in as tabs - the real "one worktree = one rail entry, N sessions =
+/// One rail row: a single worktree, with **every** agent currently open in it (not just the
+/// first one found) folded in as tabs - the real "one worktree = one rail entry, N agents =
 /// N tabs" model this revision introduces, replacing the old `ProjectChild` shape whose
-/// `sessions.iter().find(...)` silently hid every session past the first in the same worktree.
+/// `agents.iter().find(...)` silently hid every agent past the first in the same worktree.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorktreeRow {
     pub path: PathBuf,
     pub label: String,
     pub branch: Option<String>,
-    /// Clean/merged note - only meaningful (and only ever shown) when [`Self::sessions`] is
-    /// empty; a worktree with an open session shows its sessions' own real status instead.
+    /// Clean/merged note - only meaningful (and only ever shown) when [`Self::agents`] is
+    /// empty; a worktree with an open agent shows its agents' own real status instead.
     pub note: WorktreeNote,
     /// `Some(message)` if this worktree's metadata failed to read - see [`WorktreeEntry::error`]'s
     /// own docs; a worktree row in this state is never interactive.
     pub error: Option<String>,
-    /// Every session currently open in this worktree, in tab-strip order (creation order,
-    /// matching `crate::work_surface::sessions::Sessions::iter_for_cwd`).
-    pub sessions: Vec<SessionRow>,
+    /// Every agent currently open in this worktree, in tab-strip order (creation order,
+    /// matching `crate::work_surface::agents::Agents::iter_for_cwd`).
+    pub agents: Vec<AgentRow>,
 }
 
 impl WorktreeRow {
-    /// The aggregate status shown on this row: the most urgent status among its open sessions
+    /// The aggregate status shown on this row: the most urgent status among its open agents
     /// (`Status::urgency_rank`, lower = more urgent - the same ranking the old
-    /// `status_dot_cluster` already used to sort a worktree's per-session dots), or
-    /// [`Status::Idle`] when no session is open at all - mirroring
+    /// `status_dot_cluster` already used to sort a worktree's per-agent dots), or
+    /// [`Status::Idle`] when no agent is open at all - mirroring
     /// `crate::rail::status::derive_status`'s own `ProcessSignal::NoProcess => Status::Idle`, since
-    /// "no process running" is exactly what a session-less worktree is.
+    /// "no process running" is exactly what an agent-less worktree is.
     pub fn aggregate_status(&self) -> Status {
-        self.sessions
+        self.agents
             .iter()
             .map(|row| row.status)
             .min_by_key(|status| status.urgency_rank())
@@ -303,14 +303,14 @@ impl WorktreeRow {
     /// `needs input`/`failed`/`review ready`/`running`/`paused` - map one-to-one onto
     /// [`Status::Ask`]/[`Status::Fail`]/[`Status::Review`]/[`Status::Run`]/[`Status::Idle`], see
     /// that enum's own docs), reused rather than re-derived. The last two only apply to a
-    /// session-less row, which [`Self::aggregate_status`] alone can't distinguish from a row
-    /// whose one open session is genuinely [`Status::Idle`] - both would otherwise rank 4. A
+    /// agent-less row, which [`Self::aggregate_status`] alone can't distinguish from a row
+    /// whose one open agent is genuinely [`Status::Idle`] - both would otherwise rank 4. A
     /// worktree with no agents at all is never the "same kind of quiet" as one with an idle
     /// agent still attached, so this splits that case using [`WorktreeNote::is_prunable`], the
     /// same real merged/clean/locked facts §2.2's "Bare worktrees `#22262a`, prunable
     /// `#2f353a`" left-edge colours already key off.
     pub fn urgency_rank(&self) -> u8 {
-        if self.sessions.is_empty() {
+        if self.agents.is_empty() {
             if self.note.is_prunable() {
                 6
             } else {
@@ -321,20 +321,20 @@ impl WorktreeRow {
         }
     }
 
-    /// The real `+added -deleted` totals summed across every open session's own diff summary -
-    /// double-counting is impossible since every session in [`Self::sessions`] shares this same
+    /// The real `+added -deleted` totals summed across every open agent's own diff summary -
+    /// double-counting is impossible since every agent in [`Self::agents`] shares this same
     /// worktree's `cwd`, so they'd all report the identical per-worktree diff anyway; this just
     /// reads the first one rather than literally summing duplicates.
     pub fn diff_totals(&self) -> (usize, usize) {
-        self.sessions
+        self.agents
             .first()
             .map(|row| (row.add, row.del))
             .unwrap_or((0, 0))
     }
 
     /// Whether this row matches a rail filter query - its own label/branch/path (see
-    /// [`matches_filter_worktree_entry`]) or any of its open sessions' own title/branch/kind
-    /// (see [`SessionRow::matches_filter`]).
+    /// [`matches_filter_worktree_entry`]) or any of its open agents' own title/branch/kind
+    /// (see [`AgentRow::matches_filter`]).
     pub fn matches_filter(&self, query: &str) -> bool {
         let trimmed = query.trim();
         if trimmed.is_empty() {
@@ -349,25 +349,22 @@ impl WorktreeRow {
                     .is_some_and(|branch| branch.to_lowercase().contains(&query))
                 || self.path.to_string_lossy().to_lowercase().contains(&query)
         };
-        entry_matches || self.sessions.iter().any(|row| row.matches_filter(trimmed))
+        entry_matches || self.agents.iter().any(|row| row.matches_filter(trimmed))
     }
 }
 
-/// Builds one [`WorktreeRow`] per worktree, in the given order, folding in **every** session
+/// Builds one [`WorktreeRow`] per worktree, in the given order, folding in **every** agent
 /// whose `cwd` matches that worktree's path (not just the first one - the real fix for the bug
-/// the old `ProjectChild`-based `build_project_children` had: `sessions.iter().find(...)` only
-/// ever surfaced one session per worktree, silently hiding any additional ones). Every worktree
-/// appears here, including ones with no session (e.g. `main`, or a merged/prunable leftover).
-pub fn build_worktree_rows(
-    worktrees: &[WorktreeEntry],
-    sessions: &[SessionRow],
-) -> Vec<WorktreeRow> {
+/// the old `ProjectChild`-based `build_project_children` had: `agents.iter().find(...)` only
+/// ever surfaced one agent per worktree, silently hiding any additional ones). Every worktree
+/// appears here, including ones with no agent (e.g. `main`, or a merged/prunable leftover).
+pub fn build_worktree_rows(worktrees: &[WorktreeEntry], agents: &[AgentRow]) -> Vec<WorktreeRow> {
     worktrees
         .iter()
         .map(|worktree| {
-            let sessions: Vec<SessionRow> = sessions
+            let agents: Vec<AgentRow> = agents
                 .iter()
-                .filter(|session| session.cwd == worktree.path)
+                .filter(|agent| agent.cwd == worktree.path)
                 .cloned()
                 .collect();
             WorktreeRow {
@@ -376,15 +373,15 @@ pub fn build_worktree_rows(
                 branch: worktree.branch.clone(),
                 note: worktree.note.clone(),
                 error: worktree.error.clone(),
-                sessions,
+                agents,
             }
         })
         .collect()
 }
 
 /// Filters a [`WorktreeRow`] list down to those matching `query` - applied *after*
-/// [`build_worktree_rows`], so which worktrees have open sessions folded in is always decided
-/// from the complete, unfiltered session list first.
+/// [`build_worktree_rows`], so which worktrees have open agents folded in is always decided
+/// from the complete, unfiltered agent list first.
 pub fn filter_worktree_rows<'a>(rows: &'a [WorktreeRow], query: &str) -> Vec<&'a WorktreeRow> {
     rows.iter()
         .filter(|row| row.matches_filter(query))
@@ -423,7 +420,7 @@ impl RepoGroup {
         self.rows
             .iter()
             .filter(|row| {
-                !row.sessions.is_empty()
+                !row.agents.is_empty()
                     && matches!(row.aggregate_status(), Status::Ask | Status::Fail)
             })
             .count()
@@ -454,7 +451,7 @@ impl RepoGroup {
 /// `crate::rail::repo::Repo::worktrees` isn't wired to live `wt_core::list_worktrees` data yet
 /// for any *other* repo (see that field's own docs) - there is no UI to add a second repo yet
 /// either (this revision deliberately doesn't build one), so in practice `repos` holds exactly
-/// one entry and this is a no-op in every real session; the general mechanism is still built
+/// one entry and this is a no-op in every real agent; the general mechanism is still built
 /// correctly so a later phase that wires up multi-repo data has a real, tested place to plug
 /// into rather than a single-repo special case to unwind.
 pub fn group_worktrees_by_repo(repos: Vec<RepoWorktrees>) -> Vec<RepoGroup> {
@@ -474,8 +471,8 @@ pub fn group_worktrees_by_repo(repos: Vec<RepoWorktrees>) -> Vec<RepoGroup> {
     groups
 }
 
-/// Whether a bare worktree row (no open session) matches a rail filter query - the "by
-/// project" equivalent of [`SessionRow::matches_filter`], matched against its label, branch,
+/// Whether a bare worktree row (no open agent) matches a rail filter query - the "by
+/// project" equivalent of [`AgentRow::matches_filter`], matched against its label, branch,
 /// and full filesystem path. The path is an additional search target because
 /// `crate::rail::worktrees::WorktreeItem::label` is always a short name (never a full path), so a
 /// query for an ancestor directory component would otherwise never match.
@@ -494,16 +491,16 @@ pub fn matches_filter_worktree_entry(entry: &WorktreeEntry, query: &str) -> bool
 }
 
 /// One completed round of the rail's periodic background refresh: `+N -M` diff totals for
-/// every session's worktree, and clean/merged notes for every listed worktree. Performs
+/// every agent's worktree, and clean/merged notes for every listed worktree. Performs
 /// blocking I/O (`git diff`/`git status`, `gix` object-database reads) - always run via a
 /// background executor, never on the GPUI foreground thread.
 pub struct StatusSnapshot {
-    /// Keyed by worktree/session cwd - deduplicated by path since more than one open session
+    /// Keyed by worktree/agent cwd - deduplicated by path since more than one open agent
     /// can share a worktree.
     pub diffs: HashMap<PathBuf, DiffSummary>,
     /// Keyed by worktree path.
     pub worktree_notes: HashMap<PathBuf, WorktreeNote>,
-    /// Real `wt_core::diff::ahead_behind_against_base` result per worktree/session cwd - the
+    /// Real `wt_core::diff::ahead_behind_against_base` result per worktree/agent cwd - the
     /// status bar's `↑2 ↓0` indicator. Keyed and deduplicated the same way as [`Self::diffs`];
     /// a path with no detectable base (or whose `ahead_behind_against_base` call itself failed)
     /// simply has no entry, rather than a fabricated `{0, 0}`.
@@ -585,8 +582,8 @@ pub fn compute_status_snapshot(
 }
 
 /// Whether `path` is a prune candidate on its own merits - see [`WorktreeNote::is_prunable`].
-/// Does **not** know about live sessions; see [`prunable_worktree_paths`] for the function
-/// that combines this with the live-session exclusion before anything is offered for removal.
+/// Does **not** know about live agents; see [`prunable_worktree_paths`] for the function
+/// that combines this with the live-agent exclusion before anything is offered for removal.
 pub fn is_prunable(worktree_notes: &HashMap<PathBuf, WorktreeNote>, path: &Path) -> bool {
     worktree_notes
         .get(path)
@@ -595,9 +592,9 @@ pub fn is_prunable(worktree_notes: &HashMap<PathBuf, WorktreeNote>, path: &Path)
 
 /// The final list of worktree paths `crate::root::AdeApp::prune_worktrees` is allowed to
 /// remove: every path that is a prune candidate per [`is_prunable`] **and** has no live
-/// session running with its cwd inside it.
+/// agent running with its cwd inside it.
 ///
-/// The live-session check isn't implied by `is_prunable`'s dirty check: a running process
+/// The live-agent check isn't implied by `is_prunable`'s dirty check: a running process
 /// with no uncommitted changes still leaves a clean tree, but removing its worktree directory
 /// out from under it is real data loss - `wt_core::remove_worktree`'s own safety check has no
 /// way to catch that. This exclusion happens once here, before `remove_worktree` is called
@@ -605,12 +602,12 @@ pub fn is_prunable(worktree_notes: &HashMap<PathBuf, WorktreeNote>, path: &Path)
 pub fn prunable_worktree_paths(
     worktree_paths: &[PathBuf],
     worktree_notes: &HashMap<PathBuf, WorktreeNote>,
-    live_session_cwds: &HashSet<PathBuf>,
+    live_agent_cwds: &HashSet<PathBuf>,
 ) -> Vec<PathBuf> {
     worktree_paths
         .iter()
         .filter(|path| is_prunable(worktree_notes, path))
-        .filter(|path| !live_session_cwds.contains(*path))
+        .filter(|path| !live_agent_cwds.contains(*path))
         .cloned()
         .collect()
 }
@@ -680,10 +677,10 @@ pub fn format_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
 
-    fn row(id: u64, status: Status, title: &str, cwd: &str) -> SessionRow {
-        SessionRow {
+    fn row(id: u64, status: Status, title: &str, cwd: &str) -> AgentRow {
+        AgentRow {
             id,
-            kind: SessionKind::Claude,
+            kind: AgentKind::Claude,
             title: title.to_string(),
             cwd: PathBuf::from(cwd),
             status,
@@ -698,7 +695,7 @@ mod tests {
         }
     }
 
-    /// [`SessionRow::activity`] is a plain, independent field - carrying a value must not change
+    /// [`AgentRow::activity`] is a plain, independent field - carrying a value must not change
     /// filtering (it isn't title/branch/kind text) or anything else about the row's identity.
     #[test]
     fn activity_is_independent_of_filtering_and_defaults_to_none() {
@@ -736,38 +733,38 @@ mod tests {
     }
 
     #[test]
-    fn urgency_counts_with_no_sessions_is_all_zero_not_omitted() {
+    fn urgency_counts_with_no_agents_is_all_zero_not_omitted() {
         let counts = urgency_counts(&[]);
         assert_eq!(counts.len(), 5);
         assert!(counts.iter().all(|(_, count)| *count == 0));
     }
 
     #[test]
-    fn filter_sessions_matches_title_branch_and_kind_case_insensitively() {
+    fn filter_agents_matches_title_branch_and_kind_case_insensitively() {
         let rows = vec![
             row(1, Status::Run, "Fix Rate Limiter", "/a"),
             row(2, Status::Run, "Unrelated Work", "/b"),
         ];
 
-        assert_eq!(filter_sessions(&rows, "rate").len(), 1);
-        assert_eq!(filter_sessions(&rows, "RATE").len(), 1);
+        assert_eq!(filter_agents(&rows, "rate").len(), 1);
+        assert_eq!(filter_agents(&rows, "RATE").len(), 1);
         assert_eq!(
-            filter_sessions(&rows, "feature-x").len(),
+            filter_agents(&rows, "feature-x").len(),
             2,
             "both share the same branch"
         );
         assert_eq!(
-            filter_sessions(&rows, "claude").len(),
+            filter_agents(&rows, "claude").len(),
             2,
-            "both are Claude sessions"
+            "both are Claude agents"
         );
-        assert_eq!(filter_sessions(&rows, "nonexistent").len(), 0);
+        assert_eq!(filter_agents(&rows, "nonexistent").len(), 0);
         assert_eq!(
-            filter_sessions(&rows, "  ").len(),
+            filter_agents(&rows, "  ").len(),
             2,
             "blank query matches everything"
         );
-        assert_eq!(filter_sessions(&rows, "").len(), 2);
+        assert_eq!(filter_agents(&rows, "").len(), 2);
     }
 
     #[test]
@@ -914,60 +911,60 @@ mod tests {
     }
 
     #[test]
-    fn build_worktree_rows_includes_worktrees_with_no_session_as_empty_rows() {
+    fn build_worktree_rows_includes_worktrees_with_no_agent_as_empty_rows() {
         let worktrees = vec![
             worktree_entry("/repo", clean_note(true)),
             worktree_entry("/repo-wt/leftover", clean_note(false)),
         ];
-        let sessions: Vec<SessionRow> = Vec::new();
+        let agents: Vec<AgentRow> = Vec::new();
 
-        let rows = build_worktree_rows(&worktrees, &sessions);
+        let rows = build_worktree_rows(&worktrees, &agents);
         assert_eq!(rows.len(), 2);
-        assert!(rows[0].sessions.is_empty());
-        assert!(rows[1].sessions.is_empty());
+        assert!(rows[0].agents.is_empty());
+        assert!(rows[1].agents.is_empty());
         assert_eq!(rows[0].aggregate_status(), Status::Idle);
     }
 
     #[test]
-    fn build_worktree_rows_folds_every_session_in_a_worktree_not_just_the_first() {
+    fn build_worktree_rows_folds_every_agent_in_a_worktree_not_just_the_first() {
         let worktrees = vec![
             worktree_entry("/repo", clean_note(true)),
             worktree_entry("/repo-wt/active", clean_note(false)),
         ];
-        // Two sessions in the SAME worktree - the real bug the old `ProjectChild`-based
-        // `build_project_children` had: `sessions.iter().find(...)` only ever surfaced the
+        // Two agents in the SAME worktree - the real bug the old `ProjectChild`-based
+        // `build_project_children` had: `agents.iter().find(...)` only ever surfaced the
         // first, silently hiding the second.
-        let sessions = vec![
+        let agents = vec![
             row(1, Status::Run, "Fix bug", "/repo-wt/active"),
             row(2, Status::Ask, "Second tab", "/repo-wt/active"),
         ];
 
-        let rows = build_worktree_rows(&worktrees, &sessions);
+        let rows = build_worktree_rows(&worktrees, &agents);
         assert_eq!(
             rows.len(),
             2,
             "every worktree still produces exactly one row"
         );
-        assert!(rows[0].sessions.is_empty());
+        assert!(rows[0].agents.is_empty());
         assert_eq!(
-            rows[1].sessions.len(),
+            rows[1].agents.len(),
             2,
-            "both sessions in the same worktree must be folded into its one row, not just the \
+            "both agents in the same worktree must be folded into its one row, not just the \
              first one found"
         );
-        assert_eq!(rows[1].sessions[0].id, 1);
-        assert_eq!(rows[1].sessions[1].id, 2);
+        assert_eq!(rows[1].agents[0].id, 1);
+        assert_eq!(rows[1].agents[1].id, 2);
     }
 
     #[test]
-    fn aggregate_status_picks_the_most_urgent_contained_session() {
+    fn aggregate_status_picks_the_most_urgent_contained_agent() {
         let worktrees = vec![worktree_entry("/repo-wt/a", clean_note(false))];
-        let sessions = vec![
+        let agents = vec![
             row(1, Status::Run, "run", "/repo-wt/a"),
             row(2, Status::Ask, "ask", "/repo-wt/a"),
             row(3, Status::Idle, "idle", "/repo-wt/a"),
         ];
-        let rows = build_worktree_rows(&worktrees, &sessions);
+        let rows = build_worktree_rows(&worktrees, &agents);
         assert_eq!(
             rows[0].aggregate_status(),
             Status::Ask,
@@ -976,22 +973,22 @@ mod tests {
     }
 
     #[test]
-    fn urgency_rank_matches_status_rank_for_a_worktree_with_sessions() {
+    fn urgency_rank_matches_status_rank_for_a_worktree_with_agents() {
         let worktrees = vec![
             worktree_entry("/repo-wt/asking", clean_note(false)),
             worktree_entry("/repo-wt/running", clean_note(false)),
         ];
-        let sessions = vec![
+        let agents = vec![
             row(1, Status::Ask, "ask", "/repo-wt/asking"),
             row(2, Status::Run, "run", "/repo-wt/running"),
         ];
-        let rows = build_worktree_rows(&worktrees, &sessions);
+        let rows = build_worktree_rows(&worktrees, &agents);
         assert_eq!(rows[0].urgency_rank(), Status::Ask.urgency_rank());
         assert_eq!(rows[1].urgency_rank(), Status::Run.urgency_rank());
     }
 
     #[test]
-    fn urgency_rank_splits_bare_and_prunable_below_every_session_status() {
+    fn urgency_rank_splits_bare_and_prunable_below_every_agent_status() {
         let mut prunable_note = clean_note(false);
         prunable_note.merge = Some(WorktreeMergeStatus {
             base_branch: "main".to_string(),
@@ -1009,13 +1006,13 @@ mod tests {
         assert_eq!(
             rows[0].urgency_rank(),
             5,
-            "a session-less, non-prunable worktree ranks 'bare' - below every real session \
+            "an agent-less, non-prunable worktree ranks 'bare' - below every real agent \
              status but above prunable"
         );
         assert_eq!(
             rows[1].urgency_rank(),
             6,
-            "a session-less, prunable worktree ranks last of all - §2.1's \
+            "an agent-less, prunable worktree ranks last of all - §2.1's \
              'input → failed → review → running → idle → bare → prunable'"
         );
         assert!(
@@ -1026,7 +1023,7 @@ mod tests {
             Status::ORDER
                 .iter()
                 .all(|status| status.urgency_rank() < rows[0].urgency_rank()),
-            "every real session status must outrank a bare worktree"
+            "every real agent status must outrank a bare worktree"
         );
     }
 
@@ -1045,13 +1042,13 @@ mod tests {
             worktree_entry("/repo-wt/asking", clean_note(false)),
             worktree_entry("/repo-wt/running", clean_note(false)),
         ];
-        let sessions = vec![
+        let agents = vec![
             row(1, Status::Run, "run", "/repo-wt/running"),
             row(2, Status::Ask, "ask", "/repo-wt/asking"),
         ];
         // Deliberately built in a non-urgency order, so a passing test proves the function
         // itself sorts rather than merely preserving input order.
-        let rows = build_worktree_rows(&worktrees, &sessions);
+        let rows = build_worktree_rows(&worktrees, &agents);
 
         let groups = group_worktrees_by_repo(vec![repo_worktrees(0, "jerry-core", rows)]);
         assert_eq!(groups.len(), 1);
@@ -1063,7 +1060,7 @@ mod tests {
         assert_eq!(
             labels,
             vec!["asking", "running", "bare"],
-            "asking (rank 0) before running (rank 3) before a session-less bare row (rank 5)"
+            "asking (rank 0) before running (rank 3) before an agent-less bare row (rank 5)"
         );
     }
 
@@ -1073,8 +1070,8 @@ mod tests {
         let quiet_rows = build_worktree_rows(&quiet_worktrees, &[]);
 
         let urgent_worktrees = vec![worktree_entry("/urgent-repo/wt", clean_note(false))];
-        let urgent_sessions = vec![row(1, Status::Ask, "ask", "/urgent-repo/wt")];
-        let urgent_rows = build_worktree_rows(&urgent_worktrees, &urgent_sessions);
+        let urgent_agents = vec![row(1, Status::Ask, "ask", "/urgent-repo/wt")];
+        let urgent_rows = build_worktree_rows(&urgent_worktrees, &urgent_agents);
 
         // Built with the quiet (less urgent) repo listed first, so a passing test proves this
         // is a real sort, not insertion order surviving by coincidence.
@@ -1113,12 +1110,12 @@ mod tests {
             worktree_entry("/repo-wt/running", clean_note(false)),
             worktree_entry("/repo-wt/bare", clean_note(false)),
         ];
-        let sessions = vec![
+        let agents = vec![
             row(1, Status::Ask, "ask", "/repo-wt/asking"),
             row(2, Status::Fail, "fail", "/repo-wt/failed"),
             row(3, Status::Run, "run", "/repo-wt/running"),
         ];
-        let rows = build_worktree_rows(&worktrees, &sessions);
+        let rows = build_worktree_rows(&worktrees, &agents);
         let groups = group_worktrees_by_repo(vec![repo_worktrees(0, "jerry-core", rows)]);
         assert_eq!(
             groups[0].waiting_count(),
@@ -1151,38 +1148,38 @@ mod tests {
     }
 
     #[test]
-    fn filter_worktree_rows_matches_session_title_worktree_label_or_worktree_path() {
-        let with_session = {
+    fn filter_worktree_rows_matches_agent_title_worktree_label_or_worktree_path() {
+        let with_agent = {
             let worktrees = vec![worktree_entry("/a", clean_note(false))];
-            let sessions = vec![row(1, Status::Run, "Fix rate limiter", "/a")];
-            build_worktree_rows(&worktrees, &sessions).remove(0)
+            let agents = vec![row(1, Status::Run, "Fix rate limiter", "/a")];
+            build_worktree_rows(&worktrees, &agents).remove(0)
         };
         // "leftover-branch" is the label (leaf name only); "repo-worktrees" can only match
         // via the path fallback, not the label.
-        let session_less = {
+        let agent_less = {
             let worktrees = vec![worktree_entry(
                 "/repo-worktrees/leftover-branch",
                 clean_note(false),
             )];
             build_worktree_rows(&worktrees, &[]).remove(0)
         };
-        let rows = vec![with_session, session_less];
+        let rows = vec![with_agent, agent_less];
 
         assert_eq!(filter_worktree_rows(&rows, "").len(), 2);
         assert_eq!(
             filter_worktree_rows(&rows, "rate").len(),
             1,
-            "matches only the row with the session, via its title"
+            "matches only the row with the agent, via its title"
         );
         assert_eq!(
             filter_worktree_rows(&rows, "leftover").len(),
             1,
-            "matches only the session-less row, via its real (leaf-name) label"
+            "matches only the agent-less row, via its real (leaf-name) label"
         );
         assert_eq!(
             filter_worktree_rows(&rows, "repo-worktrees").len(),
             1,
-            "matches only the session-less row, via its real path - the label alone never \
+            "matches only the agent-less row, via its real path - the label alone never \
              contains a directory component like this"
         );
     }
@@ -1208,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn prunable_worktree_paths_excludes_a_path_with_a_live_session_even_if_otherwise_prunable() {
+    fn prunable_worktree_paths_excludes_a_path_with_a_live_agent_even_if_otherwise_prunable() {
         let merged_clean_path = PathBuf::from("/repo-wt/merged-clean-but-in-use");
         let mut notes = HashMap::new();
         notes.insert(
@@ -1230,20 +1227,20 @@ mod tests {
         );
 
         let worktree_paths = vec![merged_clean_path.clone()];
-        let mut live_session_cwds = HashSet::new();
-        live_session_cwds.insert(merged_clean_path.clone());
+        let mut live_agent_cwds = HashSet::new();
+        live_agent_cwds.insert(merged_clean_path.clone());
 
-        let candidates = prunable_worktree_paths(&worktree_paths, &notes, &live_session_cwds);
+        let candidates = prunable_worktree_paths(&worktree_paths, &notes, &live_agent_cwds);
         assert!(
             candidates.is_empty(),
-            "a worktree with a live session tracked against its path must never appear in \
+            "a worktree with a live agent tracked against its path must never appear in \
              the prune candidate list, even though it is otherwise prunable"
         );
 
-        // Same worktree, no live session anywhere near it - now it's really a candidate.
-        let candidates_without_session =
+        // Same worktree, no live agent anywhere near it - now it's really a candidate.
+        let candidates_without_agent =
             prunable_worktree_paths(&worktree_paths, &notes, &HashSet::new());
-        assert_eq!(candidates_without_session, vec![merged_clean_path]);
+        assert_eq!(candidates_without_agent, vec![merged_clean_path]);
     }
 
     #[test]
@@ -1268,14 +1265,14 @@ mod tests {
         }
 
         let worktree_paths = vec![a.clone(), b.clone()];
-        let mut live_session_cwds = HashSet::new();
-        live_session_cwds.insert(a.clone());
+        let mut live_agent_cwds = HashSet::new();
+        live_agent_cwds.insert(a.clone());
 
-        let candidates = prunable_worktree_paths(&worktree_paths, &notes, &live_session_cwds);
+        let candidates = prunable_worktree_paths(&worktree_paths, &notes, &live_agent_cwds);
         assert_eq!(
             candidates,
             vec![b],
-            "only the worktree with a live session should be excluded; unrelated prunable \
+            "only the worktree with a live agent should be excluded; unrelated prunable \
              worktrees are unaffected"
         );
     }

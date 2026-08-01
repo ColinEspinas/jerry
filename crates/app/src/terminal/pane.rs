@@ -4,8 +4,8 @@
 //! terminal grid, not a scrolling plain-text log (see `crate::terminal::grid`'s module docs
 //! for why that distinction matters for agent CLIs). What gets spawned is described by
 //! [`TerminalSpec`] - `TerminalPane` itself has no notion of "shell" vs. "agent CLI". The
-//! session/tab bookkeeping that decides which spec to use, and that owns more than one
-//! `TerminalPane` as tabs, lives in `crate::work_surface::sessions`/`crate::root`, one layer up.
+//! agent/tab bookkeeping that decides which spec to use, and that owns more than one
+//! `TerminalPane` as tabs, lives in `crate::work_surface::agents`/`crate::root`, one layer up.
 //!
 //! ## Offloading blocking work off the GPUI foreground thread
 //!
@@ -15,7 +15,7 @@
 //! `PtySession::output()` is a bounded `std::sync::mpsc::Receiver<Vec<u8>>`; rather than a
 //! second dedicated OS thread to bridge it, this drains it with non-blocking `try_recv()`
 //! from inside a GPUI foreground async task that wakes every [`POLL_INTERVAL`] (or, for a
-//! pane whose session isn't the globally active tab, every [`BACKGROUND_POLL_INTERVAL`] -
+//! pane whose agent isn't the globally active tab, every [`BACKGROUND_POLL_INTERVAL`] -
 //! see [`tick_cadence`]) via `cx.background_executor().timer(..)`. `try_recv()` never
 //! blocks, but see [`MAX_BYTES_PER_TICK`] for why the drain loop itself is still bounded -
 //! "never blocks" isn't the same as "bounded work per call".
@@ -76,7 +76,7 @@ use crate::terminal::grid::{GridCell, TerminalGrid, DEFAULT_BACKGROUND, DEFAULT_
 use crate::terminal::links::{self as terminal_links, LinkMatch};
 use crate::theme;
 
-/// How often the poll task of the *globally active* session's pane (see
+/// How often the poll task of the *globally active* agent's pane (see
 /// [`TerminalPane::set_foreground`]; every other pane uses [`BACKGROUND_POLL_INTERVAL`]) wakes
 /// up to drain any pty output that has arrived and, if there was any, re-render.
 ///
@@ -101,7 +101,7 @@ use crate::theme;
 /// uses a 4ms window for the same job (it coalesces pty events for 4ms before re-rendering).
 const POLL_INTERVAL: Duration = Duration::from_millis(8);
 
-/// [`POLL_INTERVAL`]'s counterpart for a pane whose session is *not* the globally active tab
+/// [`POLL_INTERVAL`]'s counterpart for a pane whose agent is *not* the globally active tab
 /// (see [`TerminalPane::set_foreground`]) - nobody can see a background pane's output live, so
 /// polling it twice per frame buys nothing. 33ms (the pre-tightening interval, ~30 drains/s)
 /// keeps a background agent's status/activity signal fresh to within a frame or two while
@@ -109,12 +109,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(8);
 ///
 /// This split exists because the 8ms/[`MAX_BYTES_PER_TICK`] tightening, correct for the *one*
 /// visible pane, was measured to be a real multi-pane regression: it raised every pane's
-/// drainable throughput ~5x, and this app's whole point is running many sessions at once. With
+/// drainable throughput ~5x, and this app's whole point is running many agents at once. With
 /// 25 concurrently-firehosing panes (release build, real X11), all-panes-at-8ms measured
 /// 10-12fps with 60-70ms invalidation-to-paint latency and the foreground thread at ~80%
 /// saturation, vs 17-19fps / ~27ms before the tightening - the aggregate decode work, not the
 /// wake frequency, is what scales with pane count. Keying cadence on real tab visibility keeps
-/// the measured single-session throughput fix without paying it once per open session.
+/// the measured single-agent throughput fix without paying it once per open agent.
 const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(33);
 
 /// Defensive cap on how many output *bytes* a single poll tick will drain and decode on the
@@ -147,7 +147,7 @@ const MAX_BYTES_PER_TICK: usize = 256 * 1024;
 /// [`BACKGROUND_POLL_INTERVAL`]'s docs for the measured multi-pane regression this split
 /// fixes). 32KiB per 33ms tick caps a background pane's *delivered* throughput at ~1MB/s -
 /// deliberately about what the pre-tightening cadence delivered (the old 64-chunk cap measured
-/// ~0.8MB/s against a real firehose), so a wall of background sessions can never generate more
+/// ~0.8MB/s against a real firehose), so a wall of background agents can never generate more
 /// aggregate foreground decode work than the app handled before the tightening. The child
 /// isn't harmed: `pty-core`'s bounded channel backpressures it, exactly as it did for every
 /// pane pre-tightening, and the pane returns to the full [`MAX_BYTES_PER_TICK`] budget the
@@ -155,7 +155,7 @@ const MAX_BYTES_PER_TICK: usize = 256 * 1024;
 const BACKGROUND_MAX_BYTES_PER_TICK: usize = 32 * 1024;
 
 /// The poll cadence - (sleep interval, per-tick drain byte budget) - for one tick of
-/// [`TerminalPane::spawn_process`]'s loop, given whether this pane's session is the globally
+/// [`TerminalPane::spawn_process`]'s loop, given whether this pane's agent is the globally
 /// active tab and whether pty EOF is already pending.
 ///
 /// `eof_pending` forces the foreground cadence regardless of visibility: [`MAX_EOF_POLL_TICKS`]
@@ -307,7 +307,7 @@ impl TerminalSpec {
 /// `Event::Open(MaybeNavigationTarget)` uses for the same "a click resolved to a navigation
 /// target" case (`vendor/zed/crates/terminal/src/terminal.rs:1823`). `TerminalPane` itself has
 /// no notion of tabs/file-opening (see the module docs), so it can only announce "a link was
-/// clicked"; `crate::work_surface::sessions::Sessions::spawn` subscribes and turns this into a
+/// clicked"; `crate::work_surface::agents::Agents::spawn` subscribes and turns this into a
 /// `crate::root::AdeApp::open_terminal_link` call, since that layer owns tab state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalPaneEvent {
@@ -368,28 +368,28 @@ pub struct TerminalPane {
     /// this cancels whatever the previous task was doing, stopping an old session's poll loop
     /// from racing a new one over the same struct fields.
     _task: Option<Task<()>>,
-    /// Whether this pane's session is the *globally active* tab
-    /// (`crate::work_surface::sessions::Sessions::active`). Drives [`tick_cadence`]: only the active
-    /// session's pane gets the frame-accurate [`POLL_INTERVAL`]/[`MAX_BYTES_PER_TICK`]
+    /// Whether this pane's agent is the *globally active* tab
+    /// (`crate::work_surface::agents::Agents::active`). Drives [`tick_cadence`]: only the active
+    /// agent's pane gets the frame-accurate [`POLL_INTERVAL`]/[`MAX_BYTES_PER_TICK`]
     /// cadence; every other pane polls at the coarser background cadence.
     ///
     /// Deliberately "globally active", not "actually visible on screen right now": a file tab
     /// (`AdeApp::open_change`) or Settings can occupy the centre pane while the active
-    /// session's pane keeps its foreground cadence. That costs at most *one* full-cadence
+    /// agent's pane keeps its foreground cadence. That costs at most *one* full-cadence
     /// pane - the multi-pane aggregate this flag exists to bound is unaffected - and keeps
-    /// the flag derivable from `Sessions::active` alone, rather than also tracking
+    /// the flag derivable from `Agents::active` alone, rather than also tracking
     /// `open_change`/`settings_open` transitions here (more writers, more ways to go stale -
     /// this codebase's recurring bug class).
     ///
-    /// Maintained solely by `crate::work_surface::sessions::Sessions::sync_pane_cadence` (the single
-    /// writer, resynced on every active-session change); `true` at construction because
-    /// `Sessions::spawn` makes a new session active in the same step.
+    /// Maintained solely by `crate::work_surface::agents::Agents::sync_pane_cadence` (the single
+    /// writer, resynced on every active-agent change); `true` at construction because
+    /// `Agents::spawn` makes a new agent active in the same step.
     is_foreground: bool,
 }
 
 impl TerminalPane {
     /// `font_size_px` is the caller-supplied starting font size - every production caller
-    /// (`crate::work_surface::sessions::Sessions::spawn`) passes the live
+    /// (`crate::work_surface::agents::Agents::spawn`) passes the live
     /// `crate::settings::store::AppearanceSettings::terminal_font_size`, never a hardcoded
     /// literal.
     /// Clamped via [`sanitized_font_size_px`] the same way [`Self::set_font_size`] clamps a
@@ -419,7 +419,7 @@ impl TerminalPane {
 
     /// Applies a Settings › Appearance "Terminal font size" edit
     /// (`crate::root::AdeApp`'s `adjust_terminal_font_size`, via
-    /// `crate::work_surface::sessions::Sessions::set_terminal_font_size`) to this already-live pane - a
+    /// `crate::work_surface::agents::Agents::set_terminal_font_size`) to this already-live pane - a
     /// no-op if the sanitized value is unchanged (e.g. a stepper click already at a clamp
     /// boundary).
     ///
@@ -493,9 +493,9 @@ impl TerminalPane {
         self.exit_status.as_ref()
     }
 
-    /// Tells this pane whether its session is the globally active tab - see
+    /// Tells this pane whether its agent is the globally active tab - see
     /// [`Self::is_foreground`]'s field docs. Called (only) by
-    /// `crate::work_surface::sessions::Sessions::sync_pane_cadence` on every active-session change; the poll
+    /// `crate::work_surface::agents::Agents::sync_pane_cadence` on every active-agent change; the poll
     /// loop reads the flag afresh each tick, so a change takes effect within one tick of
     /// whichever cadence the pane was on. Deliberately no `cx.notify()`: the flag changes
     /// polling cadence, never anything rendered.
@@ -676,7 +676,7 @@ impl TerminalPane {
                     this.session = Some(session);
                     // A freshly started process hasn't produced output yet, but it just
                     // demonstrably did something (started) - counting that as activity keeps
-                    // a still-spawning session from being immediately misread as long-idle by
+                    // a still-spawning agent from being immediately misread as long-idle by
                     // `crate::rail::status::derive_status`.
                     this.activity_at = Some(std::time::Instant::now());
                     // The pane may already have rendered (and computed a target grid size)
@@ -1086,7 +1086,7 @@ fn keystroke_to_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
     // Never forward a platform (⌘ on macOS, Super/Meta on Linux)-modified keystroke as
     // literal pty input: it would type garbage into the child process, and - since
     // `handle_key_down` calls `cx.stop_propagation()` after a successful write - it would
-    // swallow an app-level shortcut (e.g. the rail's secondary-N "new session") before it
+    // swallow an app-level shortcut (e.g. the rail's secondary-N "new agent") before it
     // reaches its `KeyBinding`, just because a terminal tab happened to have focus. Must run
     // before the fallthrough `key_char` branch below, which returns a character for any
     // keystroke that has one, including platform-modified ones.
@@ -1575,7 +1575,7 @@ mod cadence_tests {
         assert_eq!(
             tick_cadence(true, false),
             (POLL_INTERVAL, MAX_BYTES_PER_TICK),
-            "the visible pane must keep the measured single-session throughput fix"
+            "the visible pane must keep the measured single-agent throughput fix"
         );
     }
 

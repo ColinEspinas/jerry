@@ -130,7 +130,7 @@ pub fn find_links(text: &str) -> Vec<LinkMatch> {
 /// Lexically collapses `..`/`.` path components - no filesystem access (no
 /// `Path::canonicalize()`, which resolves symlinks via a blocking `stat` and requires the path
 /// to exist). [`resolve`] runs once per detected link on every rendered terminal row, on every
-/// frame a streaming session re-renders on, so a filesystem-touching normalization here would
+/// frame a streaming agent re-renders on, so a filesystem-touching normalization here would
 /// be a real per-frame cost for a purely textual concern. (It is per *frame*, not per
 /// `crate::terminal::pane::POLL_INTERVAL` poll tick as this used to claim: a tick that drains
 /// bytes calls `cx.notify()`, but GPUI coalesces however many invalidations land between two
@@ -154,7 +154,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 
 /// Resolves a detected link's path against `cwd` - an absolute `path` is returned as-is
 /// (`PathBuf::join`'s own documented behavior), a relative one is joined onto `cwd`. Callers
-/// pass the session's own `TerminalSpec::cwd`, never `std::env::current_dir()`.
+/// pass the agent's own `TerminalSpec::cwd`, never `std::env::current_dir()`.
 ///
 /// ## Deliberate: `..` is normalized away, and a path landing outside `cwd` is still allowed
 ///
@@ -163,7 +163,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 /// directory: ../../../etc/shadow.conf`). This does **not** then reject a normalized path that
 /// lands outside `cwd`/the worktree: this is a read-only file *viewer*, not a write path, and
 /// `crate::code_surface::tabs::AdeApp::open_terminal_link`'s own `path.is_file()` existence
-/// check is what actually gates a bogus link from opening a tab. A real terminal session
+/// check is what actually gates a bogus link from opening a tab. A real terminal agent
 /// legitimately prints paths outside its own worktree constantly (a `$CARGO_HOME` registry
 /// file, another checked-out worktree, a global config file); refusing to resolve those would
 /// make this viewer less useful than a real terminal's own "click to open" for no safety gain.

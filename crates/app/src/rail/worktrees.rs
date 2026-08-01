@@ -47,7 +47,7 @@ pub struct WorktreeItem {
     /// worktree move`, ...). Issue #12's "prunable / missing worktrees ... are marked as broken
     /// rather than silently listed as healthy" criterion. When `true`, [`Self::error`] is also
     /// `Some`, so every existing "is this worktree usable" check elsewhere in this crate
-    /// (selecting it, spawning a session in it, computing its disk usage, ...) already treats
+    /// (selecting it, spawning an agent in it, computing its disk usage, ...) already treats
     /// it as unusable with no separate call site needing to learn about this field.
     pub is_broken: bool,
     /// The reason `git` gives for [`Self::is_broken`], if any and non-empty.
@@ -259,7 +259,7 @@ mod tests {
 
     /// The central "don't silently list a broken worktree as healthy" guarantee (issue #12):
     /// a prunable entry must be both flagged via `is_broken`/`broken_reason` *and* rejected by
-    /// the plain `error.is_none()` gate every existing selection/session-spawn/diff call site
+    /// the plain `error.is_none()` gate every existing selection/agent-spawn/diff call site
     /// already uses, with no changes needed at those call sites.
     #[test]
     fn a_prunable_entry_is_marked_broken_and_unusable() {

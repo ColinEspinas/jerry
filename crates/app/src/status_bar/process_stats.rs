@@ -192,7 +192,7 @@ pub fn sample_processes(
 }
 
 /// Aggregates real per-pid [`ProcessSample`]s across `pids` into a total CPU% and total RSS
-/// bytes - the status bar's `X% cpu · Y GB` summary across every currently open agent session's
+/// bytes - the status bar's `X% cpu · Y GB` summary across every currently open agent's
 /// real pid.
 ///
 /// An empty `pids` list is a real, honest `(Some(0.0), Some(0))` (the sum over zero processes is
@@ -205,7 +205,7 @@ pub fn sample_processes(
 /// contribution. A single un-sampleable agent must never blank the whole cluster for every other
 /// agent that *can* be read - that was routine, not rare: a pty child kept alive during its EOF
 /// poll (see `crate::terminal::pane`'s `MAX_EOF_POLL_TICKS`) is a real zombie for up to ~10s, and
-/// a freshly-opened session's first CPU tick has no delta to compute a rate from for a full poll
+/// a freshly-opened agent's first CPU tick has no delta to compute a rate from for a full poll
 /// interval.
 ///
 /// A field is only `None` when *nothing at all* is known about it yet - not one pid in `pids`

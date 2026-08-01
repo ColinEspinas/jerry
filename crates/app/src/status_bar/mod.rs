@@ -21,12 +21,12 @@ use crate::lsp::diagnostics as diagnostics_view;
 use crate::rail::state as rail;
 use crate::root::*;
 use crate::theme;
-// `Session` itself is only named inside `render::render_status_agents_cluster`'s real
-// `#[cfg(target_os = "linux")]` variant (`Vec<&Session>`) - the non-Linux twin only needs
-// `SessionKind`, so a Windows/macOS build genuinely never references `Session` here.
+// `Agent` itself is only named inside `render::render_status_agents_cluster`'s real
+// `#[cfg(target_os = "linux")]` variant (`Vec<&Agent>`) - the non-Linux twin only needs
+// `AgentKind`, so a Windows/macOS build genuinely never references `Agent` here.
 #[cfg(target_os = "linux")]
-use crate::work_surface::sessions::Session;
-use crate::work_surface::sessions::SessionKind;
+use crate::work_surface::agents::Agent;
+use crate::work_surface::agents::AgentKind;
 use gpui::{div, font, prelude::*, px, ClickEvent, Context};
 #[cfg(test)]
 use std::path::PathBuf;

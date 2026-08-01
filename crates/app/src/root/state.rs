@@ -48,7 +48,7 @@ impl AdeApp {
         // here - not just the one `repo_path` names below - so "which repos are added" genuinely
         // survives a restart; nothing yet *renders* more than the focused one (see
         // `Self::worktrees`'s own docs), so a returning user with several repos added in a
-        // previous session sees exactly the same single-repo view they always have, just with the
+        // previous agent sees exactly the same single-repo view they always have, just with the
         // rest of their repos already known to `Self::repos` for the rail-rendering phase that
         // will actually show them.
         let repo_state_path = settings_path.as_deref().map(repo::repo_state_path_for);
@@ -125,7 +125,7 @@ impl AdeApp {
             worktree_selection_notice: None,
             rail_scroll_handle: gpui::ScrollHandle::new(),
             selected: None,
-            sessions: Sessions::new(),
+            agents: Agents::new(),
             file_tree: Vec::new(),
             file_tree_error: None,
             right_sidebar_view: RightSidebarView::Files,
@@ -169,7 +169,7 @@ impl AdeApp {
             code_focus_handle,
             code_focus: OverlayFocus::default(),
             // `true`/`Task::ready(())`: no blink loop is running yet (nothing is focused at
-            // construction - a fresh window focuses the initial session's terminal pane, not
+            // construction - a fresh window focuses the initial agent's terminal pane, not
             // the code editor, a few lines below), and `Self::start_caret_blink` will replace
             // this the moment a real caret-bearing handle is - see
             // `crate::root::caret_blink`'s module docs.
@@ -366,17 +366,17 @@ impl AdeApp {
         }
         this.apply_theme_selection(cx);
         // A fresh window starts with one shell in the repo root, as a tab like any other.
-        // `focus_active` below moves real keyboard focus onto it - see `Sessions::focus_active`'s
+        // `focus_active` below moves real keyboard focus onto it - see `Agents::focus_active`'s
         // docs and this crate's `OverlayFocus`/`restore_focus` docs for why a fresh window must
         // never start with `Window::focus == None`.
-        this.sessions.spawn(
-            SessionKind::Shell,
+        this.agents.spawn(
+            AgentKind::Shell,
             repo_path.clone(),
             this.settings.appearance.terminal_font_size,
             window,
             cx,
         );
-        this.sessions.focus_active(window, cx);
+        this.agents.focus_active(window, cx);
         this.load_worktrees(cx);
         this.load_file_tree(repo_path.clone(), cx);
         this.load_diff(repo_path, cx);
@@ -575,11 +575,11 @@ impl AdeApp {
         self._load_file_tree_task = Some(task);
     }
 
-    /// The worktree a *new* session should be spawned into: the selected worktree's real
+    /// The worktree a *new* agent should be spawned into: the selected worktree's real
     /// path if one is selected and readable, otherwise the repo root - see the module docs'
-    /// "Sessions/tabs" section for why this is resolved at spawn time rather than tracked as
+    /// "Agents/tabs" section for why this is resolved at spawn time rather than tracked as
     /// a per-tab "current worktree".
-    pub(crate) fn active_session_cwd(&self) -> PathBuf {
+    pub(crate) fn active_agent_cwd(&self) -> PathBuf {
         match self.selected.and_then(|index| self.worktrees.get(index)) {
             Some(item) if item.error.is_none() => item.path.clone(),
             _ => self.focused_repo_path(),
@@ -604,13 +604,13 @@ impl AdeApp {
         // A real, explicit user selection supersedes any stale "fell back to main" notice a
         // previous refresh may have left up - see `Self::worktree_selection_notice`'s own docs.
         self.worktree_selection_notice = None;
-        // Makes this worktree's own last-active tab (or its first session, or none) the
-        // globally active one - see `Sessions::activate_for_worktree`'s own docs for why this
-        // invariant ("the active session always belongs to the selected worktree") is the real
-        // fix this revision makes: before it, selecting a worktree never touched `self.sessions`
+        // Makes this worktree's own last-active tab (or its first agent, or none) the
+        // globally active one - see `Agents::activate_for_worktree`'s own docs for why this
+        // invariant ("the active agent always belongs to the selected worktree") is the real
+        // fix this revision makes: before it, selecting a worktree never touched `self.agents`
         // at all, so the centre pane could keep showing a completely different worktree's
         // terminal after a rail click.
-        self.sessions.activate_for_worktree(&path, cx);
+        self.agents.activate_for_worktree(&path, cx);
         // Browsing to a different worktree disarms a pending prune confirmation - see
         // `Self::request_prune`'s docs.
         self.prune_confirm_armed = false;
@@ -618,7 +618,7 @@ impl AdeApp {
         // Reset per-worktree UI state (see `reset_per_worktree_ui_state`'s docs) so switching
         // worktrees never leaks a "reviewed" checkbox, open diff, or collapsed-dir entry from
         // the worktree just left. Deliberately runs *before* the focus-fallback block below: both
-        // `focus_newly_spawned_session` and the `filter_focus_handle` fallback branch on
+        // `focus_newly_spawned_agent` and the `filter_focus_handle` fallback branch on
         // `self.open_change`, and until this call runs, `open_change` can still reflect the
         // worktree just *left* (a file tab open there) rather than the real post-switch state -
         // evaluating either guard first (a real, live-reproduced bug found in this revision's own
@@ -664,9 +664,9 @@ impl AdeApp {
         self.file_tree_limit_override = None;
         self.file_tree_truncated = false;
         self.file_tree_complete = false;
-        // `focus_newly_spawned_session` (despite its name - its body has no "newly spawned" logic
+        // `focus_newly_spawned_agent` (despite its name - its body has no "newly spawned" logic
         // in it, just the shared "move focus unless a file tab/Settings is showing" guard) closes
-        // the dangling-focus risk this switch creates: the previously-active session's pane may
+        // the dangling-focus risk this switch creates: the previously-active agent's pane may
         // no longer be part of the rendered tree at all once the tab strip's own per-worktree
         // filter (`Self::render_tab_strip`) applies, so keyboard focus left pointing at it would
         // silently break every keybinding until the next click - the same "focus left pointing at
@@ -674,15 +674,15 @@ impl AdeApp {
         // `restore_focus` mechanism exists to prevent, applied here to a plain worktree switch
         // rather than an overlay open/close. `open_change` above is already this switch's real
         // post-reset value by the time this runs, so the guard it checks is genuine.
-        self.focus_newly_spawned_session(window, cx);
-        // `focus_newly_spawned_session` is a real no-op when the newly selected worktree has no
-        // open session at all (`Sessions::focus_active` has nothing to focus) - so if a
-        // previously-focused session's pane belonged to the worktree just left, it's now exactly
-        // as dangling as the case the comment above already covers, just with no session to
+        self.focus_newly_spawned_agent(window, cx);
+        // `focus_newly_spawned_agent` is a real no-op when the newly selected worktree has no
+        // open agent at all (`Agents::focus_active` has nothing to focus) - so if a
+        // previously-focused agent's pane belonged to the worktree just left, it's now exactly
+        // as dangling as the case the comment above already covers, just with no agent to
         // redirect *onto*. Fall back to the rail's own root container
         // (`Self::rail_focus_handle`), which is part of the rendered tree whenever the
         // workspace body is showing (never while Settings has replaced it - `!self.settings_open`
-        // guards that the same way `focus_newly_spawned_session` itself does). Deliberately the
+        // guards that the same way `focus_newly_spawned_agent` itself does). Deliberately the
         // rail's root, not its filter field, which this used to target - see
         // `Self::rail_focus_handle`'s own docs for the real, audit-found keystroke-swallowing bug
         // that became once the filter field started carrying a `"text-input"` key context. It
@@ -691,8 +691,7 @@ impl AdeApp {
         // dispatch fall back to a disconnected root with no real `on_action` handlers at all, not
         // just this worktree's own missing ones - silently breaking every global keybinding (⌘P
         // included) until the next click.
-        if self.sessions.active_id().is_none() && self.open_change.is_none() && !self.settings_open
-        {
+        if self.agents.active_id().is_none() && self.open_change.is_none() && !self.settings_open {
             window.focus(&self.rail_focus_handle, cx);
         }
         // The File view's own per-worktree state (a cached parse and diff lookup that are about

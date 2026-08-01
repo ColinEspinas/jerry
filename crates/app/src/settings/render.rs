@@ -46,7 +46,7 @@ impl AdeApp {
     /// with no feedback at all.
     ///
     /// The dangling-focus mechanism itself long predates GitHub issue #17 (it is the same class
-    /// `OverlayFocus`/`restore_focus` exists for, and which `close_session`/`select_worktree`/
+    /// `OverlayFocus`/`restore_focus` exists for, and which `close_agent`/`select_worktree`/
     /// `cancel_new_file` already handle). What that issue changed is that this specific site
     /// became *silent*: before the filter field carried a `"text-input"` context there was nothing
     /// here for a stale focus to be pointing at in the first place. Found by an independent
@@ -587,8 +587,8 @@ impl AdeApp {
     }
 
     /// The Installed card's footer - `design_handoff_jerry_ade/README.md`: "Card footer ...
-    /// '+ Add an agent — any binary that speaks a resumable session on stdin'." Rendered dimmed
-    /// and inert (no `on_click`) - `crate::work_surface::sessions::SessionKind` is a fixed Rust enum, so there
+    /// '+ Add an agent — any binary that speaks a resumable agent on stdin'." Rendered dimmed
+    /// and inert (no `on_click`) - `crate::work_surface::agents::AgentKind` is a fixed Rust enum, so there
     /// is no runtime "register a new agent binary" flow to wire this to yet.
     pub(in crate::settings) fn render_settings_agents_footer(&self) -> impl IntoElement {
         div()
@@ -618,7 +618,7 @@ impl AdeApp {
                     .font(font(theme::font::SANS))
                     .text_size(px(10.5))
                     .text_color(theme::text::GHOST)
-                    .child("\u{2014} any binary that speaks a resumable session on stdin"),
+                    .child("\u{2014} any binary that speaks a resumable agent on stdin"),
             )
     }
 
@@ -727,7 +727,7 @@ impl AdeApp {
     /// command palette's `Prune Worktrees` command call: there is no "prune only this one
     /// worktree" code path, since the one safety-checked removal primitive
     /// (`Self::prunable_worktree_paths` + `Self::execute_prune`) always operates on every
-    /// currently-prunable worktree at once, live-session-excluded. A row's `Prune` button only
+    /// currently-prunable worktree at once, live-agent-excluded. A row's `Prune` button only
     /// shows when that row's own worktree is one of those candidates
     /// (`settings::worktree_row_action`), so clicking it always includes this worktree - it just
     /// isn't scoped to *only* this worktree if others are also prunable at the same moment.
@@ -885,10 +885,10 @@ impl AdeApp {
     /// detection - Revision R6's job, per the doc comment this replaced) - the same chip the
     /// status bar and terminal footer render, not a fourth copy.
     ///
-    /// `Restore sessions on launch` and `Confirm before discarding a worktree` - two more rows
+    /// `Restore agents on launch` and `Confirm before discarding a worktree` - two more rows
     /// `Jerry.dc.html`'s own `settingsRows.general` fixture shows - stay left out for the same
     /// reason as the Agents/Worktrees toggle sections (see `crate::settings::state`'s module docs):
-    /// session-restore-on-launch and a discard-confirmation flow are app behaviour this build
+    /// agent-restore-on-launch and a discard-confirmation flow are app behaviour this build
     /// doesn't have, not settings plumbing around behaviour that already exists.
     pub(in crate::settings) fn render_settings_general_page(
         &self,
@@ -923,7 +923,7 @@ impl AdeApp {
         );
         let environment_row = self.render_settings_row(
             "Default environment",
-            "Where new sessions run - real WSL detection on Windows, real CPU architecture \
+            "Where new agents run - real WSL detection on Windows, real CPU architecture \
              elsewhere. The same chip shown in the status bar and terminal footer.",
             render_env_chip(),
         );
@@ -2386,9 +2386,9 @@ impl AdeApp {
     /// same edit path the Appearance page's stepper click invokes, rather than a second,
     /// test-only setter.
     ///
-    /// The new value isn't only persisted - it's also pushed into every currently open session's
+    /// The new value isn't only persisted - it's also pushed into every currently open agent's
     /// [`crate::terminal::pane::TerminalPane`] via
-    /// [`crate::work_surface::sessions::Sessions::set_terminal_font_size`], so already-open panes pick it up
+    /// [`crate::work_surface::agents::Agents::set_terminal_font_size`], so already-open panes pick it up
     /// too, not just newly spawned ones.
     pub(in crate::settings) fn adjust_terminal_font_size(
         &mut self,
@@ -2398,7 +2398,7 @@ impl AdeApp {
         self.settings.appearance.terminal_font_size = (self.settings.appearance.terminal_font_size
             + delta)
             .clamp(settings_store::FONT_SIZE_MIN, settings_store::FONT_SIZE_MAX);
-        self.sessions
+        self.agents
             .set_terminal_font_size(self.settings.appearance.terminal_font_size, cx);
         self.persist_settings(cx);
         cx.notify();
@@ -3138,17 +3138,17 @@ mod terminal_font_size_tests {
         cx.run_until_parked();
 
         let pane = app
-            .read_with(cx, |app, _| app.sessions.active().map(|s| s.pane.clone()))
-            .expect("a fresh test window has one real, active shell session");
+            .read_with(cx, |app, _| app.agents.active().map(|s| s.pane.clone()))
+            .expect("a fresh test window has one real, active shell agent");
 
         // `grid_dimensions` reports `(cols, rows)` but `resize_sync_state_for_test` reports
         // `(rows, cols)` - hence the swap below.
         let before_dims = pane.read_with(cx, |pane, _| pane.grid_dimensions());
         let before_dims_rows_cols = (before_dims.1, before_dims.0);
-        let (_, before_session_sync) =
+        let (_, before_agent_sync) =
             pane.read_with(cx, |pane, _| pane.resize_sync_state_for_test());
         assert_eq!(
-            before_session_sync,
+            before_agent_sync,
             Some(before_dims_rows_cols),
             "the initial spawn's own resize must have already reached the real live pty"
         );
@@ -3172,7 +3172,7 @@ mod terminal_font_size_tests {
             "a real font-size change must actually recompute the grid's real (cols, rows)"
         );
 
-        let (after_grid_sync, after_session_sync) =
+        let (after_grid_sync, after_agent_sync) =
             pane.read_with(cx, |pane, _| pane.resize_sync_state_for_test());
         assert_eq!(
             after_grid_sync,
@@ -3180,7 +3180,7 @@ mod terminal_font_size_tests {
             "the grid itself must be resized to the new dimensions"
         );
         assert_eq!(
-            after_session_sync,
+            after_agent_sync,
             Some(after_dims_rows_cols),
             "the real, live child pty must also have been informed of the new size - not just \
              the local grid repainting at a size the process underneath it doesn't know about"
@@ -3188,23 +3188,23 @@ mod terminal_font_size_tests {
     }
 
     #[gpui::test]
-    fn a_terminal_font_size_edit_reaches_every_open_session_not_just_new_ones(
+    fn a_terminal_font_size_edit_reaches_every_open_agent_not_just_new_ones(
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
-        // A second real session, spawned at whatever the default font size already was.
+        // A second real agent, spawned at whatever the default font size already was.
         app.update_in(cx, |app, window, cx| {
-            app.new_session(SessionKind::Shell, window, cx);
+            app.new_agent(AgentKind::Shell, window, cx);
         });
         cx.run_until_parked();
 
         let panes: Vec<_> = app.read_with(cx, |app, _| {
-            app.sessions.iter().map(|s| s.pane.clone()).collect()
+            app.agents.iter().map(|s| s.pane.clone()).collect()
         });
-        assert_eq!(panes.len(), 2, "expected two real open sessions");
+        assert_eq!(panes.len(), 2, "expected two real open agents");
 
         app.update(cx, |app, cx| {
             app.adjust_terminal_font_size(20.0 - app.settings.appearance.terminal_font_size, cx);
@@ -3215,7 +3215,7 @@ mod terminal_font_size_tests {
             assert_eq!(
                 pane.read_with(cx, |pane, _| pane.font_size_px_for_test()),
                 20.0,
-                "every already-open session's pane must pick up the new font size, not just \
+                "every already-open agent's pane must pick up the new font size, not just \
                  whichever one happens to be active"
             );
         }

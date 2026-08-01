@@ -139,7 +139,7 @@ impl AdeApp {
         // collapsed, highlighting a row that isn't showing would be no highlight at all.
         //
         // Guarded, because `absolute` is not always inside the tree currently on screen: a
-        // terminal link resolves against its session's own cwd, and `Self::open_change_diff`
+        // terminal link resolves against its agent's own cwd, and `Self::open_change_diff`
         // resolves against [`Self::diff_root`], which really can differ from
         // [`Self::file_tree_root`] (`crate::merge::flow` and `crate::worktree_history::flow` both
         // load the *main repo's* diff while a worktree is selected). Revealing and highlighting a
@@ -219,7 +219,7 @@ impl AdeApp {
     ///
     /// Re-clicking the already-"active" tab is not always a no-op: the tab can be active without
     /// being shown (e.g. its diff disappeared after a revert, so [`Self::render_center_pane`]
-    /// falls back to the active session while the tab strip still marks it active). That case
+    /// falls back to the active agent while the tab strip still marks it active). That case
     /// falls back to `code_view = File`, which always has content to show.
     pub(crate) fn activate_file_tab(
         &mut self,
@@ -259,7 +259,7 @@ impl AdeApp {
 
     /// Closes file tab `path`, removing it from [`Self::open_files`] (the tab's `×` hit box). If
     /// `path` was the active tab, activates the neighbor to its right, else the one to its left,
-    /// else falls back to the active session's terminal (restoring focus like
+    /// else falls back to the active agent's terminal (restoring focus like
     /// [`Self::close_settings`] does). No-op if `path` isn't an open tab.
     ///
     /// Cancels any real, in-flight debounced LSP sync/completion-request task for `path` (via
@@ -351,7 +351,7 @@ impl AdeApp {
                     self.refresh_open_diff_file_cache();
                     self.hover = None;
                     self.dismiss_completions();
-                    restore_focus(&self.sessions, &mut self.code_focus, window, cx);
+                    restore_focus(&self.agents, &mut self.code_focus, window, cx);
                 }
             }
         }
@@ -617,7 +617,7 @@ impl AdeApp {
     }
 
     /// Handles `TerminalPaneEvent::OpenPath` - a mod-held click on a detected path/`path:line`
-    /// link in a session's terminal output. `path` is already resolved against the session's cwd
+    /// link in an agent's terminal output. `path` is already resolved against the agent's cwd
     /// (see `crate::terminal::links::resolve`). Reuses [`Self::navigate_to_definition`] when the
     /// link carried a line number, else [`Self::open_file_view`].
     ///
@@ -1289,7 +1289,7 @@ mod multi_file_tab_tests {
 
     /// Closing the active tab activates a sensible neighbor: the tab that was to its right first
     /// - `Self::close_file_tab`'s own documented "prefer right, then left, then fall back to the
-    /// active session" order.
+    /// active agent" order.
     #[gpui::test]
     fn closing_the_active_tab_activates_the_tab_that_was_to_its_right(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1341,7 +1341,7 @@ mod multi_file_tab_tests {
         );
 
         // Closing the last remaining tab falls all the way back to no active file at all (the
-        // active session shows through instead).
+        // active agent shows through instead).
         app.update_in(cx, |app, window, cx| {
             let active = app.open_change.clone().expect("a should be active");
             app.close_file_tab(active, window, cx);
@@ -1387,21 +1387,19 @@ mod multi_file_tab_tests {
         assert_eq!(app.read_with(cx, |app, _| app.open_files.len()), 1);
     }
 
-    /// Clicking a session tab while a file tab is active deactivates the file (it stops being
+    /// Clicking an agent tab while a file tab is active deactivates the file (it stops being
     /// shown) without closing it - it stays in `open_files`, exactly like switching away from a
     /// browser tab doesn't close it.
     #[gpui::test]
-    fn selecting_a_session_deactivates_the_open_file_tab_without_closing_it(
-        cx: &mut TestAppContext,
-    ) {
+    fn selecting_a_agent_deactivates_the_open_file_tab_without_closing_it(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let ((a, _b, _c), (a_rel, _, _)) = write_three_files(repo.path());
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
-        let session_id = app.read_with(cx, |app, _| {
-            app.sessions
+        let agent_id = app.read_with(cx, |app, _| {
+            app.agents
                 .active_id()
-                .expect("a fresh window has one real session")
+                .expect("a fresh window has one real agent")
         });
 
         app.update_in(cx, |app, window, cx| {
@@ -1414,13 +1412,13 @@ mod multi_file_tab_tests {
         );
 
         app.update_in(cx, |app, window, cx| {
-            app.select_session(session_id, window, cx);
+            app.select_agent(agent_id, window, cx);
         });
 
         assert_eq!(
             app.read_with(cx, |app, _| app.open_change.clone()),
             None,
-            "selecting a session tab should deactivate the file tab"
+            "selecting an agent tab should deactivate the file tab"
         );
         assert_eq!(
             app.read_with(cx, |app, _| app.open_files.clone()),
@@ -1428,7 +1426,7 @@ mod multi_file_tab_tests {
             "the file tab must still be in open_files, just not active"
         );
 
-        // The centre pane must actually render the session again, not silently panic/show
+        // The centre pane must actually render the agent again, not silently panic/show
         // nothing - a real smoke check on top of the state assertions above.
         app.update(cx, |app, cx| {
             app.render_center_pane(cx);
@@ -1607,7 +1605,7 @@ mod multi_file_tab_tests {
     /// Regression test for the "active but not actually showing" gap: a file tab can stay
     /// `open_change`-active even after its diff disappears (e.g. the underlying change was
     /// reverted), so `render_center_pane`'s `has_diff_or_file_view` check falls back to the
-    /// active session while the tab strip still paints the file tab as active. Before the fix,
+    /// active agent while the tab strip still paints the file tab as active. Before the fix,
     /// `activate_file_tab` early-returned as a dead no-op whenever `path` already equalled
     /// `open_change`, so re-clicking such a tab did nothing.
     #[gpui::test]
@@ -1812,7 +1810,7 @@ mod stale_completions_popup_tests {
 
 /// End-to-end proof of the "terminal is interactive" link-click-opens-a-file path:
 /// `simulate_click` against the pane's own painted bounds drives `TerminalPane`'s `on_click`/
-/// `cx.emit`, `Sessions::spawn`'s `cx.subscribe_in`, and `AdeApp::open_terminal_link` - the same
+/// `cx.emit`, `Agents::spawn`'s `cx.subscribe_in`, and `AdeApp::open_terminal_link` - the same
 /// chain a real mouse click goes through.
 #[cfg(test)]
 mod terminal_link_click_tests {
@@ -1823,7 +1821,7 @@ mod terminal_link_click_tests {
     };
 
     /// Injects a row of terminal text containing a `path:line` link on the third visible row
-    /// (`"see src/main.rs:1 for it"`, 0-indexed row 2) into the active session's pane, and
+    /// (`"see src/main.rs:1 for it"`, 0-indexed row 2) into the active agent's pane, and
     /// returns the painted geometry (`content_bounds`, cell size) needed to compute a click
     /// position.
     fn inject_link_row_and_measure(
@@ -1831,8 +1829,8 @@ mod terminal_link_click_tests {
         cx: &mut VisualTestContext,
     ) -> (Bounds<Pixels>, Size<Pixels>) {
         let pane = app
-            .read_with(cx, |app, _| app.sessions.active().map(|s| s.pane.clone()))
-            .expect("a fresh test window has one real, active shell session");
+            .read_with(cx, |app, _| app.agents.active().map(|s| s.pane.clone()))
+            .expect("a fresh test window has one real, active shell agent");
 
         pane.update(cx, |pane, cx| {
             pane.inject_bytes_for_test(
@@ -1841,7 +1839,7 @@ mod terminal_link_click_tests {
             );
         });
         // Lets the injected `cx.notify()` drive a real paint (populating `content_bounds`). The
-        // session's `$SHELL` spawn may also make background progress here, but only ever appends
+        // agent's `$SHELL` spawn may also make background progress here, but only ever appends
         // after the injected bytes, so it can't touch the link characters this test's
         // click-position math depends on.
         cx.run_until_parked();

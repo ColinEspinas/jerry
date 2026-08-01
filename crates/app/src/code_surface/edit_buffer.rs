@@ -1319,7 +1319,7 @@ impl EditBuffer {
     /// buffer's history away and starting over.
     ///
     /// That distinction is the whole point per GitHub issue #17: an external rewrite landing
-    /// mid-session must never be a silent history wipe. It is recorded as a sealed, programmatic
+    /// mid-agent must never be a silent history wipe. It is recorded as a sealed, programmatic
     /// group, so the step before it and the step after it are both still reachable, and Ctrl+Z
     /// immediately after the reload really does put the pre-reload content back.
     ///
@@ -1398,7 +1398,7 @@ impl EditBuffer {
     /// [`Self::marked_range`] over [`Self::selected_range`] whenever both exist, so passing `None`
     /// while a real IME composition happens to be active deleted the *entire* composing text
     /// instead of one real grapheme - wrong every time Backspace was pressed mid-composition, a
-    /// real, live-reachable case for any real CJK/composed input session.
+    /// real, live-reachable case for any real CJK/composed input agent.
     pub fn backspace(&mut self) {
         if !self.secondary_cursors.is_empty() {
             self.apply_at_every_cursor(EditKind::Delete, |buffer, cursor_range| {
