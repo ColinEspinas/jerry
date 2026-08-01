@@ -391,11 +391,23 @@ pub fn filter_worktree_rows<'a>(rows: &'a [WorktreeRow], query: &str) -> Vec<&'a
 /// One repo, with its already-built [`WorktreeRow`]s - `crate::root`'s reduction of one
 /// [`crate::rail::repo::Repo`] plus (for the currently focused repo only) live worktree rows,
 /// as input to [`group_worktrees_by_repo`]. See that function's own docs for why every other
-/// repo currently supplies an empty `rows`.
+/// repo currently supplies an empty `all_rows`/`rows`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepoWorktrees {
     pub repo_id: RepoId,
     pub repo_name: String,
+    /// This repo's real, complete worktree list - unaffected by the rail's filter box. The
+    /// source of the group header's `N wt` and `N worktrees waiting` counts
+    /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.0: "a repo you have
+    /// scrolled past still reports that something in it wants a human" - a header that shrank
+    /// or grew as the *filter box* was typed into would break that same promise for the repo
+    /// you're currently looking at). See [`Self::rows`] for the separate, filtered list.
+    pub all_rows: Vec<WorktreeRow>,
+    /// The rows actually rendered/expanded under this repo's header - may be narrower than
+    /// [`Self::all_rows`] when the rail's filter box has a query in it. Deliberately **not**
+    /// read by [`RepoGroup::waiting_count`] or the header's `N wt` count: which rows are
+    /// currently visible on screen is a real, separate UI concern from what the header reports
+    /// about the repo's real state.
     pub rows: Vec<WorktreeRow>,
 }
 
@@ -406,6 +418,11 @@ pub struct RepoWorktrees {
 pub struct RepoGroup {
     pub repo_id: RepoId,
     pub repo_name: String,
+    /// This repo's real, complete worktree list, ranked by [`WorktreeRow::urgency_rank`] -
+    /// see [`RepoWorktrees::all_rows`]. Header counts ([`Self::waiting_count`], the `N wt`
+    /// text at the render site) always read this field, never [`Self::rows`].
+    pub all_rows: Vec<WorktreeRow>,
+    /// The rows to actually render/expand below the header - see [`RepoWorktrees::rows`].
     /// Ranked by [`WorktreeRow::urgency_rank`], most urgent first - see
     /// [`group_worktrees_by_repo`].
     pub rows: Vec<WorktreeRow>,
@@ -416,8 +433,13 @@ impl RepoGroup {
     /// in that repo holding an asking or failed agent, hidden at zero"). Deliberately worktree-
     /// level, not agent-level: a worktree with two asking agents still counts once, since the
     /// header is answering "how many rows in this group want me", not "how many agents".
+    ///
+    /// Reads [`Self::all_rows`], **not** [`Self::rows`]: this count must survive a filter query
+    /// that hides the very row it's counting, and must survive the group's rows being collapsed
+    /// away for a non-focused repo, per this same section's "a repo you have scrolled past
+    /// still reports that something in it wants a human".
     pub fn waiting_count(&self) -> usize {
-        self.rows
+        self.all_rows
             .iter()
             .filter(|row| {
                 !row.agents.is_empty()
@@ -428,15 +450,33 @@ impl RepoGroup {
 
     /// This group's own rank for ordering groups - its most urgent worktree's
     /// [`WorktreeRow::urgency_rank`] (§2.0: "repos are ordered by their own most urgent
-    /// worktree, using the same rank function as the rows"). A worktree-less repo (no data
-    /// loaded for it yet - see [`group_worktrees_by_repo`]'s docs) sorts last, behind every repo
-    /// that has at least one real row.
+    /// worktree, using the same rank function as the rows"). Reads [`Self::all_rows`] for the
+    /// same reason [`Self::waiting_count`] does: group order must not reshuffle just because the
+    /// filter box narrowed [`Self::rows`]. A worktree-less repo (no data loaded for it yet -
+    /// see [`group_worktrees_by_repo`]'s docs) sorts last, behind every repo that has at least
+    /// one real row.
     fn rank(&self) -> u8 {
-        self.rows
+        self.all_rows
             .iter()
             .map(WorktreeRow::urgency_rank)
             .min()
             .unwrap_or(u8::MAX)
+    }
+}
+
+/// The group header's amber waiting-count text (§2.1's `N worktrees waiting`) - `None` at zero
+/// (hidden entirely, never an empty chip, mirroring
+/// `crate::title_bar::render::title_bar_agent_state_chip_text`'s own "hidden at zero" rule),
+/// singular for exactly one (`"1 worktree waiting"`), plural otherwise (`"N worktrees
+/// waiting"`) - the design doc's own example (`3 worktrees waiting`) never shows the singular
+/// case, but the rest of this codebase already conjugates every other counter correctly (see
+/// that same title-bar function's `"1 agent needs input"` vs `"2 agents need input"`), so this
+/// one must too.
+pub fn waiting_count_label(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some("1 worktree waiting".to_string()),
+        n => Some(format!("{n} worktrees waiting")),
     }
 }
 
@@ -458,11 +498,14 @@ pub fn group_worktrees_by_repo(repos: Vec<RepoWorktrees>) -> Vec<RepoGroup> {
     let mut groups: Vec<RepoGroup> = repos
         .into_iter()
         .map(|repo| {
+            let mut all_rows = repo.all_rows;
+            all_rows.sort_by_key(WorktreeRow::urgency_rank);
             let mut rows = repo.rows;
             rows.sort_by_key(WorktreeRow::urgency_rank);
             RepoGroup {
                 repo_id: repo.repo_id,
                 repo_name: repo.repo_name,
+                all_rows,
                 rows,
             }
         })
@@ -1027,10 +1070,29 @@ mod tests {
         );
     }
 
+    /// A [`RepoWorktrees`] whose `all_rows` and `rows` are the same list - the common case in
+    /// these tests, where nothing distinguishes "this repo's real worktree set" from "what's
+    /// currently rendered under it". [`repo_worktrees_split`] below is for the tests that need
+    /// the two to diverge.
     fn repo_worktrees(id: u64, name: &str, rows: Vec<WorktreeRow>) -> RepoWorktrees {
+        repo_worktrees_split(id, name, rows.clone(), rows)
+    }
+
+    /// A [`RepoWorktrees`] with independently-set `all_rows` (the repo's real, complete
+    /// worktree list - what the header counters must read) and `rows` (what's actually
+    /// rendered/expanded below the header - what a filter query or a non-focused repo can
+    /// legitimately narrow). See [`RepoWorktrees::all_rows`]'s own docs for why the two must
+    /// stay independent.
+    fn repo_worktrees_split(
+        id: u64,
+        name: &str,
+        all_rows: Vec<WorktreeRow>,
+        rows: Vec<WorktreeRow>,
+    ) -> RepoWorktrees {
         RepoWorktrees {
             repo_id: RepoId(id),
             repo_name: name.to_string(),
+            all_rows,
             rows,
         }
     }
@@ -1132,6 +1194,120 @@ mod tests {
             quiet_groups[0].waiting_count(),
             0,
             "hidden at zero - no asking or failed worktrees"
+        );
+    }
+
+    /// The bug the coordinator's audit found: `RepoGroup::waiting_count` and the header's
+    /// `N wt` count (`group.all_rows.len()` at the render site) must come from the repo's real,
+    /// complete worktree list, never from whatever narrower set happens to be rendered below the
+    /// header. Builds a repo whose `rows` (the "currently displayed" set - what a filter query
+    /// or a non-focused repo's rendering would legitimately narrow) is a completely different,
+    /// unrelated list from `all_rows` (the repo's real state, including an asking worktree) -
+    /// so a passing assertion proves the header counters read `all_rows`, not `rows`, and would
+    /// keep reporting real state even for "a repo you have scrolled past" (§2.0) or one whose
+    /// rows a filter query has hidden.
+    #[test]
+    fn repo_group_header_counts_read_the_real_worktree_list_not_the_displayed_rows() {
+        let real_worktrees = vec![
+            worktree_entry("/repo-wt/asking", clean_note(false)),
+            worktree_entry("/repo-wt/running", clean_note(false)),
+            worktree_entry("/repo-wt/bare", clean_note(false)),
+        ];
+        let real_agents = vec![
+            row(1, Status::Ask, "ask", "/repo-wt/asking"),
+            row(2, Status::Run, "run", "/repo-wt/running"),
+        ];
+        let all_rows = build_worktree_rows(&real_worktrees, &real_agents);
+
+        // A completely different, unrelated (and shorter) "displayed" set - standing in for
+        // either a filter query that hid most of the repo's rows, or a non-focused repo whose
+        // body isn't currently rendered at all.
+        let displayed_rows = vec![WorktreeRow {
+            path: PathBuf::from("/repo-wt/bare"),
+            label: "bare".to_string(),
+            branch: None,
+            note: clean_note(false),
+            error: None,
+            agents: Vec::new(),
+        }];
+
+        let groups = group_worktrees_by_repo(vec![repo_worktrees_split(
+            0,
+            "jerry-core",
+            all_rows,
+            displayed_rows,
+        )]);
+
+        assert_eq!(
+            groups[0].all_rows.len(),
+            3,
+            "the header's `N wt` count must reflect the repo's real, complete worktree list"
+        );
+        assert_eq!(
+            groups[0].rows.len(),
+            1,
+            "sanity check: the displayed rows really are a narrower, different set"
+        );
+        assert_eq!(
+            groups[0].waiting_count(),
+            1,
+            "the amber waiting count must be derived from the real worktree list too - the \
+             asking worktree exists in `all_rows` even though it isn't in the displayed `rows`"
+        );
+    }
+
+    /// Group *order* must be just as stable as the per-group counters
+    /// (`repo_group_header_counts_read_the_real_worktree_list_not_the_displayed_rows`): a repo
+    /// whose real state (`all_rows`) holds an asking worktree must still sort first even when
+    /// its currently-displayed `rows` (e.g. filtered down) look quiet.
+    #[test]
+    fn group_worktrees_by_repo_orders_groups_by_all_rows_not_displayed_rows() {
+        let urgent_worktrees = vec![worktree_entry("/urgent-repo/wt", clean_note(false))];
+        let urgent_agents = vec![row(1, Status::Ask, "ask", "/urgent-repo/wt")];
+        let urgent_all_rows = build_worktree_rows(&urgent_worktrees, &urgent_agents);
+        // The urgent repo's displayed rows are empty - e.g. a filter query matched nothing in
+        // it, or it isn't the focused repo - but its real state is still urgent.
+        let urgent_displayed_rows = Vec::new();
+
+        let quiet_worktrees = vec![worktree_entry("/quiet-repo/main", clean_note(true))];
+        let quiet_rows = build_worktree_rows(&quiet_worktrees, &[]);
+
+        let groups = group_worktrees_by_repo(vec![
+            repo_worktrees(1, "quiet-repo", quiet_rows),
+            repo_worktrees_split(2, "urgent-repo", urgent_all_rows, urgent_displayed_rows),
+        ]);
+
+        let names: Vec<&str> = groups.iter().map(|g| g.repo_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["urgent-repo", "quiet-repo"],
+            "the repo holding the real (not merely displayed) asking worktree must still sort \
+             first"
+        );
+    }
+
+    #[test]
+    fn waiting_count_label_is_hidden_at_zero() {
+        assert_eq!(waiting_count_label(0), None);
+    }
+
+    #[test]
+    fn waiting_count_label_is_singular_for_exactly_one() {
+        assert_eq!(
+            waiting_count_label(1).as_deref(),
+            Some("1 worktree waiting")
+        );
+    }
+
+    #[test]
+    fn waiting_count_label_is_plural_for_two_or_more() {
+        assert_eq!(
+            waiting_count_label(2).as_deref(),
+            Some("2 worktrees waiting")
+        );
+        assert_eq!(
+            waiting_count_label(7).as_deref(),
+            Some("7 worktrees waiting")
         );
     }
 

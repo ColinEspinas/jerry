@@ -5175,3 +5175,80 @@ _a_different_file_recomputes_the_highlight_cache` this time, a different test in
 either previously-documented flake) - `diff_view.rs` untouched by this change, re-ran it in
 isolation 5/5 clean, and the subsequent full-suite re-run above was clean. Two files touched:
 `crates/app/src/title_bar/render.rs`, `crates/app/src/title_bar/mod.rs` (new imports only).
+
+## Fixing the rail repo header's two real counter bugs (Revision R12 §2.0/§2.1)
+
+A coordinator's direct code read of `crates/app/src/rail/render.rs`'s `render_rail_list` found
+two real bugs in the group header's `N wt` / amber `N worktrees waiting` counters, both a
+straight contradiction of §2.0's own stated point: "a repo you have scrolled past still reports
+that something in it wants a human."
+
+**Root cause of bug 1, and why rows and counts had gotten conflated.** `RepoWorktrees`/`RepoGroup`
+had exactly one `rows` field, doing two jobs at once: it fed `group.rows.len()` for the header's
+`N wt` text *and* `group.waiting_count()`'s scan for asking/failed worktrees, *and* it was the
+list actually rendered/expanded below the header. Whoever built `repo_inputs` in
+`render_rail_list` had to hand that single field the *filtered, focused-repo-only* row list -
+correct for "what should the group render", but that same list also fed the header counters,
+which is how a repo you'd scrolled to a different one (any non-focused repo) always read `0 wt`
+regardless of its real state, and how typing into the rail's own filter box visibly shrank the
+`N wt` count and the amber waiting text for the very repo you were looking at - the literal
+opposite of the "even scrolled past" promise. One field, two audiences, and the render call site
+was quietly serving the wrong one to the header.
+
+**The fix**: split the one field into two. `RepoWorktrees`/`RepoGroup` now carry `all_rows` (this
+repo's real, complete worktree list, always unfiltered) alongside `rows` (what's actually
+rendered/expanded below the header, which the filter box - and, for now, repo focus - may still
+legitimately narrow). `RepoGroup::waiting_count()` and `RepoGroup::rank()` (group ordering) both
+switched to read `all_rows`; the header's `N wt` text at the render site switched from
+`group.rows.len()` to `group.all_rows.len()`. `render_rail_list` itself got split: the group-
+building half moved into a new pure(ish) `build_repo_groups`, testable without going through
+`AnyElement`, with `render_rail_list` left as a thin wrapper that only decides the empty-state
+message and builds the element tree. The one thing this fix does *not* claim to have solved:
+`self.worktrees` is still a single flat, repo-agnostic field (`crate::rail::repo::Repo::worktrees`
+remains unwired to real per-repo data, already tracked separately - no add-repo/worktree UI yet),
+so `all_rows` for a *non-focused* repo is still honestly empty rather than fabricated; what's
+fixed is that the repo whose data *is* loaded reports its real, complete state regardless of the
+filter box, and the mechanism (`all_rows` vs `rows`) is now real and tested so a later phase that
+wires up true multi-repo data has a correct place to plug into.
+
+**Bug 2, pluralization**: `format!("{waiting} worktrees waiting")` had no singular form - flagged
+by name in this very log's title-bar entry above as an already-known, unfixed "1 worktrees
+waiting" bug. Extracted a `rail::waiting_count_label(count) -> Option<String>` (mirroring
+`title_bar_agent_state_chip_text`'s own "`None` hidden at zero" shape): `None` at zero, `"1
+worktree waiting"` at exactly one, `"N worktrees waiting"` at two or more. The render site swapped
+its `.when(waiting > 0, ...)` gate for `.when_some(waiting_label, ...)`, so the label function
+alone now owns both the wording and the hidden-at-zero rule.
+
+**Testing.** GPUI's `Div`/`AnyElement` expose no way to introspect rendered text in tests (checked
+`vendor/zed/crates/gpui/src/elements/div.rs` and `element.rs` - no getters, no debug-dump), so
+this codebase's established pattern (`title_bar_agent_state_chip_text`'s own test tier) is to test
+the pure function feeding `.child(...)` directly rather than the rendered tree - followed here for
+`waiting_count_label` (hidden at zero, singular at one, plural at two and seven). The header-count
+independence itself is proven two ways: a pure `crate::rail::state` test
+(`repo_group_header_counts_read_the_real_worktree_list_not_the_displayed_rows`) builds a
+`RepoWorktrees` whose `all_rows` (three worktrees, one asking) and `rows` (one unrelated bare row)
+deliberately diverge, and asserts `all_rows.len()` and `waiting_count()` read the real list, not
+the displayed one - plus a matching group-*order* test
+(`group_worktrees_by_repo_orders_groups_by_all_rows_not_displayed_rows`) proving `rank()` doesn't
+follow `rows` either. A `#[gpui::test]` against the real, live `AdeApp`
+(`build_repo_groups_header_wt_count_is_unaffected_by_the_filter_query`) drives the same guarantee
+end to end: two real worktrees, a filter query typed in that matches only one, asserting
+`all_rows.len()` stays at 2 (header count untouched) while `rows.len()` drops to 1 (display
+narrowed) - the literal bug-1 scenario from the coordinator's audit. Getting a real, deterministic
+`Status::Ask` out of a live spawned agent for a fully live waiting-count test hit the same
+already-documented wall as the title-bar entry above (15s+ real wall-clock idle threshold, no
+virtual-clock hook) - not repeated here since the pure test already exercises the identical
+`RepoGroup::waiting_count` code path the live render call reads from, over real `WorktreeRow`
+data shapes.
+
+**Gates**, from this project's usual Linux sandbox (`export
+LIBRARY_PATH=/tmp/x11-deps/prefix/usr/lib/x86_64-linux-gnu`): `cargo fmt --all -- --check`,
+`cargo build --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` all clean.
+`cargo test --workspace --lib -- --test-threads=1`: **1117 + 44 + 14 + 107 = 1282 passed, 0
+failed** across all four crates on a full clean run (8 new tests, all in `crates/app`). Hit the
+same already-documented `code_surface::diff_view::diff_render_tests` flake once
+(`repeated_refreshes_of_the_same_open_diff_reuse_the_cached_highlighting`, unrelated module,
+untouched by this change) on an earlier run; re-ran that single test in isolation 5 times and saw
+it fail once more (4/5 clean) - consistent with the ~1-in-5 rate already on file for that family,
+not a regression from this change. Two files touched: `crates/app/src/rail/state.rs`,
+`crates/app/src/rail/render.rs`.
