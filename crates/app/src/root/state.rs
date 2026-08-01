@@ -41,6 +41,17 @@ impl AdeApp {
         // time, which for a worktree this file has never seen (including a freshly created one)
         // is nothing at all.
 
+        // The tab-order file mirrors the fold-state file's own resolution immediately above -
+        // see `work_surface::tab_order_state`'s own module docs for the identical pattern this
+        // copies. Issue #16's own "persists per session/worktree and restores on relaunch".
+        let tab_order_path = settings_path
+            .as_deref()
+            .map(crate::work_surface::tab_order_state::tab_order_path_for);
+        let tab_order_state = tab_order_path
+            .as_deref()
+            .map(crate::work_surface::tab_order_state::TabOrderState::load_at)
+            .unwrap_or_default();
+
         // The repo-list file mirrors the fold-state file's own resolution one line up (see
         // `rail::repo`'s module docs for why it's the identical pattern): a sibling of whatever
         // settings path this instance was given, `None` (and so no persistence at all) for a test
@@ -332,6 +343,10 @@ impl AdeApp {
             new_file_focus_handle: cx.focus_handle(),
             new_file_error: None,
             tab_order: HashMap::new(),
+            tab_order_state,
+            tab_order_path,
+            tab_order_owned: std::collections::BTreeSet::new(),
+            _tab_order_save_task: None,
             tab_drag_insertion: None,
             custom_themes,
             custom_theme_load_errors,

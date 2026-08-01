@@ -32,5 +32,6 @@ use std::path::{Path, PathBuf};
 
 pub mod agents;
 pub mod state;
+pub mod tab_order_state;
 
 pub(crate) mod render;

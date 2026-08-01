@@ -360,7 +360,28 @@ impl AdeApp {
     /// recurse.
     pub(crate) fn combined_tab_order(&self) -> Vec<work_surface::TabRef> {
         let cwd = self.active_agent_cwd();
-        let stored = self.tab_order.get(&cwd).map(Vec::as_slice).unwrap_or(&[]);
+        // A worktree `Self::tab_order` hasn't been touched for yet *this session* falls back to
+        // its real, on-disk order (GitHub issue #16's own "persists... and restores on relaunch")
+        // instead of the empty slice a brand new session would otherwise reconcile against - see
+        // `Self::tab_order`'s own docs. Recomputed fresh each call rather than cached back into
+        // `Self::tab_order`: `crate::work_surface::tab_order_state::TabOrderState` is already fully
+        // loaded in memory (no I/O here), and leaving `Self::tab_order` itself untouched until a
+        // real drag happens is what keeps [`Self::tab_order_owned`] scoped to worktrees this
+        // instance has actually *changed*, not merely visited.
+        let persisted_fallback;
+        let stored: &[work_surface::TabRef] = match self.tab_order.get(&cwd) {
+            Some(order) => order.as_slice(),
+            None => {
+                persisted_fallback = self
+                    .tab_order_state
+                    .file_order(&cwd)
+                    .into_iter()
+                    .filter_map(|absolute| absolute.strip_prefix(&cwd).ok().map(Path::to_path_buf))
+                    .map(work_surface::TabRef::File)
+                    .collect::<Vec<_>>();
+                &persisted_fallback
+            }
+        };
         let agents_for_cwd: Vec<&Agent> = self.agents.iter_for_cwd(cwd.clone()).collect();
         let agent_ids: Vec<AgentId> = agents_for_cwd.iter().map(|agent| agent.id).collect();
         let is_bare = !agents_for_cwd
@@ -389,8 +410,51 @@ impl AdeApp {
         let cwd = self.active_agent_cwd();
         let mut order = self.combined_tab_order();
         work_surface::move_tab_order(&mut order, &dragged, &target, insert_after);
-        self.tab_order.insert(cwd, order);
+        self.tab_order.insert(cwd.clone(), order.clone());
+
+        // The file half of the same order, persisted to disk (GitHub issue #16) - see
+        // `work_surface::tab_order_state`'s own module docs for why agent-tab entries are never
+        // recorded here at all.
+        let files: Vec<PathBuf> = order
+            .iter()
+            .filter_map(|tab_ref| match tab_ref {
+                work_surface::TabRef::File(path) => Some(cwd.join(path)),
+                work_surface::TabRef::Agent(_) => None,
+            })
+            .collect();
+        self.tab_order_state.set_file_order(&cwd, &files);
+        if let Some(key) = crate::work_surface::tab_order_state::worktree_key(&cwd) {
+            self.tab_order_owned.insert(key);
+        }
+        self.persist_tab_order(cx);
         cx.notify();
+    }
+
+    /// Queues a background-executor save of [`Self::tab_order_state`] to
+    /// [`Self::tab_order_path`] - the write-side counterpart to [`Self::reorder_tab`]'s own
+    /// read-side fallback. A genuine no-op with a `None` path (every GPUI test that hasn't opted
+    /// into a real one). The write is a *merge*
+    /// (`crate::work_surface::tab_order_state::TabOrderState::save_merged_at` against
+    /// [`Self::tab_order_owned`]), matching [`Self::persist_fold_state`]'s own reasoning: a
+    /// second `jerry` instance browsing a different repository is writing the same file, and a
+    /// whole-file write would erase its saved order.
+    pub(in crate::work_surface) fn persist_tab_order(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.tab_order_path.clone() else {
+            return;
+        };
+        let state = self.tab_order_state.clone();
+        let owned = self.tab_order_owned.clone();
+        let task = cx.spawn(async move |_this, cx| {
+            let save_path = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { state.save_merged_at(&save_path, &owned) })
+                .await;
+            if let Err(err) = result {
+                log::warn!("failed to save {}: {err}", path.display());
+            }
+        });
+        self._tab_order_save_task = Some(task);
     }
 
     /// One tab's own `on_drag_move::<DraggedTab>` handler (both [`Self::render_agent_tab`] and
@@ -3232,6 +3296,110 @@ mod tab_scoping_tests {
                 .any(|tab_ref| matches!(tab_ref, work_surface::TabRef::File(path) if path == &PathBuf::from("README.md"))),
             "the file tab must reappear once the worktree is no longer bare - its state was \
              preserved, not destroyed, while suppressed"
+        );
+    }
+}
+
+/// GitHub issue #16's own "the resulting layout... persists per session/worktree and restores on
+/// relaunch" - real end-to-end coverage that a drag-reordered tab strip survives a genuine
+/// second `AdeApp` instance, not just a worktree switch within the same one.
+#[cfg(test)]
+mod tab_order_persistence_tests {
+    use super::*;
+    use crate::settings::store as settings_store;
+    use gpui::TestAppContext;
+
+    fn open_test_app_with_real_persistence(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        settings_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                repo_path,
+                settings_store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn a_drag_reordered_tab_strip_survives_a_real_restart(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = config_dir.path().join("settings.toml");
+        std::fs::write(repo.path().join("a.txt"), "a\n").expect("write a.txt");
+        std::fs::write(repo.path().join("b.txt"), "b\n").expect("write b.txt");
+
+        // First "session": open both files (a.txt lands before b.txt, the natural open order),
+        // then really drag b.txt in front of a.txt. A real, non-`Shell` agent is required first
+        // - `Self::combined_tab_order` deliberately suppresses every file tab while the worktree
+        // is "bare" (Revision R12 §3: "a bare worktree shows only the shell tab"), and the
+        // default startup agent is a plain shell.
+        let (app, cx) = open_test_app_with_real_persistence(
+            cx,
+            repo.path().to_path_buf(),
+            settings_path.clone(),
+        );
+        app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Claude,
+                repo.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            app.open_file_view(repo.path().join("a.txt"), window, cx);
+            app.open_file_view(repo.path().join("b.txt"), window, cx);
+        });
+        cx.run_until_parked();
+
+        let order_before = app.read_with(cx, |app, _| app.combined_tab_order());
+        let a_ref = work_surface::TabRef::File(PathBuf::from("a.txt"));
+        let b_ref = work_surface::TabRef::File(PathBuf::from("b.txt"));
+        assert!(
+            order_before.iter().position(|t| t == &a_ref)
+                < order_before.iter().position(|t| t == &b_ref),
+            "premise: a.txt (opened first) must naturally sit before b.txt"
+        );
+
+        app.update(cx, |app, cx| {
+            app.reorder_tab(b_ref.clone(), a_ref.clone(), false, cx);
+        });
+        cx.run_until_parked();
+        let order_after_drag = app.read_with(cx, |app, _| app.combined_tab_order());
+        assert!(
+            order_after_drag.iter().position(|t| t == &b_ref)
+                < order_after_drag.iter().position(|t| t == &a_ref),
+            "premise: the real drag must have really moved b.txt in front of a.txt"
+        );
+
+        // A genuine second instance, matching exactly what a real app relaunch is: a fresh
+        // `AdeApp` against the same repo and the same real settings directory, with no shared
+        // in-memory state whatsoever - `expanded_folders_are_restored_exactly_after_a_simulated_
+        // reload`'s own precedent (`crate::sidebar::render`) for testing a real restart.
+        let (app, cx) =
+            open_test_app_with_real_persistence(cx, repo.path().to_path_buf(), settings_path);
+        app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Claude,
+                repo.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            app.open_file_view(repo.path().join("a.txt"), window, cx);
+            app.open_file_view(repo.path().join("b.txt"), window, cx);
+        });
+        cx.run_until_parked();
+
+        let restored_order = app.read_with(cx, |app, _| app.combined_tab_order());
+        assert!(
+            restored_order.iter().position(|t| t == &b_ref)
+                < restored_order.iter().position(|t| t == &a_ref),
+            "the drag-reordered position must survive a real restart - got {restored_order:?}"
         );
     }
 }

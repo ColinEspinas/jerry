@@ -1345,10 +1345,32 @@ pub struct AdeApp {
     /// Each worktree's own real, drag-chosen tab order (GitHub issue #16) - agent and file
     /// tabs interleaved, keyed by that worktree's cwd. Never itself the source of truth for
     /// which tabs exist (`Agents`/[`Self::open_files`] still are - see
-    /// [`Self::combined_tab_order`]'s own docs); only [`Self::reorder_tab`] writes to it, and a
-    /// worktree with no entry here simply renders its agents then its files, exactly the old
-    /// two-block layout.
+    /// [`Self::combined_tab_order`]'s own docs); only [`Self::reorder_tab`] writes to it. A
+    /// worktree with no entry here yet falls back to [`Self::tab_order_state`]'s real, persisted
+    /// order (`crate::work_surface::tab_order_state::TabOrderState::file_order`) rather than the old
+    /// two-block "agents then files" layout - see [`Self::combined_tab_order`]'s own docs for
+    /// exactly where that fallback happens.
     pub(crate) tab_order: HashMap<PathBuf, Vec<work_surface::TabRef>>,
+    /// The tab strip's real, on-disk drag order (GitHub issue #16: "the resulting layout...
+    /// persists per session/worktree and restores on relaunch") - loaded once at startup
+    /// (`Self::new_with_settings`), updated by [`Self::reorder_tab`] alongside [`Self::tab_order`]
+    /// itself, and read by [`Self::combined_tab_order`] as the fallback for a worktree
+    /// [`Self::tab_order`] hasn't touched yet this session.
+    pub(crate) tab_order_state: crate::work_surface::tab_order_state::TabOrderState,
+    /// [`Self::tab_order_state`]'s resolved on-disk path
+    /// (`crate::work_surface::tab_order_state::tab_order_path_for`), `None` for the same tests that get
+    /// no [`Self::fold_state_path`] either - see that field's own docs.
+    pub(crate) tab_order_path: Option<PathBuf>,
+    /// The `crate::work_surface::tab_order_state::worktree_key`s this instance has recorded a real order
+    /// for - what [`Self::persist_tab_order`] hands `TabOrderState::save_merged_at` as "mine to
+    /// overwrite", mirroring [`Self::fold_state_owned`]'s own reasoning exactly.
+    pub(crate) tab_order_owned: std::collections::BTreeSet<String>,
+    /// The in-flight background save task from the most recent [`Self::persist_tab_order`] call -
+    /// held so it isn't dropped (and therefore cancelled) before it finishes. A single slot: a
+    /// tab reorder is a discrete, human-paced drag-drop gesture, not a hot loop, so unlike
+    /// [`Self::fold_state_save_pending`]'s coalescing queue, a new reorder simply starts a fresh
+    /// save rather than needing one to be pending while another runs.
+    pub(crate) _tab_order_save_task: Option<Task<()>>,
     /// The unified tab strip's real, precise drop-target indicator (GitHub issue #16's "better
     /// visual feedback" ask): `Some((target, insert_after))` while a tab is being dragged over
     /// `target`'s own tab, where `insert_after` says whether the cursor is over the right half
