@@ -291,11 +291,24 @@ impl AdeApp {
         }
     }
 
-    /// Runs a palette file result: a file that is changed in the currently loaded diff opens
-    /// its diff in the centre (reusing [`Self::open_change_diff`], same as a Changes-row click);
-    /// a file with no diff to open instead reveals it in the Files tree - switches Zone 3 to
-    /// `Files`, expands every ancestor directory, and highlights it via
-    /// [`Self::selected_tree_path`].
+    /// Runs a palette file result (GitHub issue #15): opens the file - its diff if it is changed
+    /// in the currently loaded diff, otherwise the editable File view - moves real keyboard focus
+    /// into it, and reveals and highlights it in the Files tree.
+    ///
+    /// All of that is [`Self::open_and_focus_file`]'s, reached through the same
+    /// [`Self::open_change_diff`]/[`Self::open_file_view`] pair a Changes row click and a tree row
+    /// click use. This function decides exactly one thing - which of the two views to open - and
+    /// switches Zone 3 to `Files` so the row it just revealed is actually on screen.
+    ///
+    /// ## What this used to do
+    ///
+    /// The diff-less branch revealed the file in the tree, highlighted its row, and *stopped*: no
+    /// tab was opened, nothing was shown in the centre, and focus stayed wherever it was, so the
+    /// palette closed onto an unchanged screen with a highlighted tree row. That is issue #15's
+    /// report and the separately-reported "reveal in tree selects the file but does not open it"
+    /// in one defect. The diff branch did open a tab and focus it, but never revealed or
+    /// highlighted the file in the tree - so which of the two halves you got depended on whether
+    /// the file happened to be in the diff. Both now run the one path that does all of it.
     // `pub(crate)`, not `pub(in crate::palette)`: `crate::sidebar::render`'s own
     // "reveal in tree" regression test drives this real flow rather than calling
     // `AdeApp::reveal_in_tree` directly, so that the wiring between the two is what's covered.
@@ -317,21 +330,45 @@ impl AdeApp {
             .current_diff()
             .is_some_and(|diff| diff.files.iter().any(|file| file.path == relative));
 
+        // The revealed row has to be on a tab that is actually showing, or the reveal is
+        // invisible. Set before opening, so the one `cx.notify()` at the end of
+        // `open_and_focus_file` covers this too.
+        self.right_sidebar_view = RightSidebarView::Files;
         if has_diff {
             self.open_change_diff(relative, window, cx);
         } else {
-            self.right_sidebar_view = RightSidebarView::Files;
-            // Expands every ancestor *and records those expansions on disk*, exactly like a
-            // manual click (issue #18 §5) - not a transient, this-session-only reveal.
-            self.reveal_in_tree(&path, cx);
-            self.selected_tree_path = Some(path);
-            cx.notify();
+            self.open_file_view(path, window, cx);
         }
     }
 
     /// Runs the currently highlighted palette result (`⏎`) - looks it up fresh via
     /// [`Self::build_palette_groups`], dispatches by its [`palette::EntryTarget`], then closes
     /// the palette.
+    ///
+    /// ## "An action focuses its result" (GitHub issue #15)
+    ///
+    /// An entry that opens something owns keyboard focus afterwards; an entry that opens nothing
+    /// leaves focus where it was before the palette. Both are the same closing step here, and
+    /// which one applies is *observed* rather than declared: focus is read before dispatch (it is
+    /// the palette's own handle, since the palette is open and focused) and again after, and the
+    /// entry is taken to have claimed focus exactly when it moved it. `Window::focus` writes
+    /// `Window::focus` synchronously (`vendor/zed/crates/gpui/src/window.rs`), so by the time
+    /// dispatch returns this comparison is already the real answer.
+    ///
+    /// Deliberately not a per-entry `bool` the way this app's first sketch of it was, for the
+    /// reason `crate::default_key_bindings`' own docs give about this codebase's most-shipped bug
+    /// class: a flag has to be set at every site that focuses something, and the failure mode of
+    /// forgetting one is a silently swallowed keystroke. There is nothing to forget here - a new
+    /// palette entry that focuses its result keeps focus automatically, and one that doesn't
+    /// restores automatically, with no third state to get wrong.
+    ///
+    /// What this fixes concretely: [`Self::open_palette_file_result`] moves focus into the
+    /// editor, and [`Self::close_palette`]'s unconditional `restore_focus` then moved it straight
+    /// back to whatever was focused before the palette opened - so the file really did open and
+    /// the very next keystroke still went to the terminal. `OpenSettings` had the same shape and
+    /// survived only because [`Self::close_palette`] carries a hand-written special case for
+    /// Settings specifically; that case is now subsumed by this general rule (it is kept, since
+    /// `close_palette` is also reached from Esc and the scrim, where no entry ran at all).
     pub(in crate::palette) fn run_selected_palette_entry(
         &mut self,
         window: &mut Window,
@@ -341,6 +378,7 @@ impl AdeApp {
         let target = palette::flatten(&groups)
             .get(self.palette_selected)
             .map(|entry| entry.target.clone());
+        let focus_before = window.focused(cx);
         if let Some(target) = target {
             match target {
                 palette::EntryTarget::Command(command) => {
@@ -356,7 +394,11 @@ impl AdeApp {
                 }
             }
         }
-        self.close_palette(window, cx);
+        if window.focused(cx) == focus_before {
+            self.close_palette(window, cx);
+        } else {
+            self.close_palette_keeping_result_focus(cx);
+        }
     }
 
     /// `TextUndo` for the palette query (GitHub issue #17). Resets the highlighted row alongside
