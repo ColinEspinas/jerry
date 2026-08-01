@@ -211,6 +211,7 @@ impl AdeApp {
             .find(|item| item.is_main)
             .and_then(|item| item.branch.clone());
         let macos = self.window_controls_style().is_macos();
+        let agent_state_chips = self.render_title_bar_agent_state_chips(cx);
 
         div()
             .id("title-bar")
@@ -273,9 +274,123 @@ impl AdeApp {
                         )
                     }),
             )
+            .when_some(agent_state_chips, |el, chips| el.child(chips))
             .child(div().flex_1())
             .when(!macos, |el| el.child(self.render_windows_caption_buttons()))
     }
+
+    /// §4's title-bar row: `2 agents need input · 1 agent failed · 4 agents running`, one real
+    /// chip per non-empty state, entirely absent (not an empty row) when
+    /// [`title_bar_agent_state_chips`] returns nothing. Reads [`Self::build_agent_rows`] - the
+    /// exact same real per-agent [`Status`] rows the rail and the status bar's own five-square
+    /// dot row (`crate::status_bar::render::AdeApp::render_status_urgency_counters`) already
+    /// compute - and [`rail::urgency_counts`] over them, so this can never disagree with either
+    /// of those about how many agents are in which state.
+    fn render_title_bar_agent_state_chips(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let rows = self.build_agent_rows(cx);
+        let chips = title_bar_agent_state_chips(&rows);
+        if chips.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .id("title-bar-agent-state-chips")
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .children(
+                    chips
+                        .into_iter()
+                        .map(|(status, text)| render_title_bar_agent_state_chip(status, text)),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+/// The real, non-empty title-bar chips to render, already carrying their final display text, in
+/// [`Status::ORDER`] order (`needs input` → `failed` → `running` - [`Status::Review`]/
+/// [`Status::Idle`] never produce a chip here, see [`title_bar_agent_state_chip_text`]'s docs).
+/// Pure and GPUI-window-free so it can be unit tested directly against hand-built [`AgentRow`]s,
+/// the same way `crate::rail::state`'s own `urgency_counts` tests do - not a second,
+/// independent count, just a filter/format pass over the one real
+/// [`rail::urgency_counts`] already computed from [`AgentRow::status`].
+fn title_bar_agent_state_chips(rows: &[AgentRow]) -> Vec<(Status, String)> {
+    rail::urgency_counts(rows)
+        .into_iter()
+        .filter_map(|(status, count)| {
+            title_bar_agent_state_chip_text(status, count).map(|text| (status, text))
+        })
+        .collect()
+}
+
+/// Title-bar text for one agent-status chip
+/// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §4: "Title bar |
+/// `2 agents need input · 1 agent failed · 4 agents running` | agent-level, one chip per
+/// non-empty state", confirmed verbatim by
+/// `design_handoff_jerry_ade/revision 3/CHANGELOG.md`'s own "Counts" section). `None` for a
+/// zero count - hidden entirely, never an empty chip - and for [`Status::Review`]/
+/// [`Status::Idle`]: the design's own title-bar example names exactly three states
+/// (`Status::Ask`/`Status::Fail`/`Status::Run`), and review-ready/idle counts already have a
+/// real home - the rail's own agent rows, and the status bar's five-way dot row - so repeating
+/// them a third time here would just restate the same number in a fourth place.
+///
+/// Each string names its own unit (`"N agents ..."`, never bare `"N ..."`) per §4's own rule
+/// ("No two counters in the window may share wording while counting different units"), and
+/// pluralizes correctly at exactly 1 vs 2+ - `Status::Ask` conjugates its verb too (`"1 agent
+/// needs input"` vs `"2 agents need input"`), matching the design's own two example counts.
+fn title_bar_agent_state_chip_text(status: Status, count: usize) -> Option<String> {
+    if count == 0 {
+        return None;
+    }
+    let agents = if count == 1 { "agent" } else { "agents" };
+    match status {
+        Status::Ask => {
+            let verb = if count == 1 { "needs" } else { "need" };
+            Some(format!("{count} {agents} {verb} input"))
+        }
+        Status::Fail => Some(format!("{count} {agents} failed")),
+        Status::Run => Some(format!("{count} {agents} running")),
+        Status::Review | Status::Idle => None,
+    }
+}
+
+/// One title-bar agent-state chip: the same dot-plus-label pill formula
+/// [`crate::work_surface::render::render_status_pill`] uses for the agent context bar's status
+/// pill (identical 19px height, 7px/5px padding, [`theme::radius::CHIP`], `status.pill_bg()`/
+/// `status.color()`) - a visual twin, not a shared function, since that one renders the bare
+/// [`Status::label`] and this one renders this row's own derived count text instead.
+fn render_title_bar_agent_state_chip(status: Status, text: String) -> impl IntoElement {
+    div()
+        .id(("title-bar-agent-state-chip", status as usize))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(5.0))
+        .h(px(19.0))
+        .px(px(7.0))
+        .rounded(theme::radius::CHIP)
+        .bg(status.pill_bg())
+        .child(
+            div()
+                .flex_none()
+                .w(px(5.0))
+                .h(px(5.0))
+                .rounded(px(2.5))
+                .bg(status.color()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .font(font(theme::font::SANS))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_size(px(10.0))
+                .text_color(status.color())
+                .child(text),
+        )
 }
 
 /// One flat-circle window-control button - `on_activate` is called with real `&mut Window`/
@@ -433,5 +548,323 @@ mod caption_button_tests {
              `Window::remove_window`, closing this window - the exact same real GPUI window- \
              control API the macOS dot cluster's own close dot already used"
         );
+    }
+}
+
+/// Pure coverage for [`title_bar_agent_state_chip_text`]/[`title_bar_agent_state_chips`] -
+/// no GPUI window needed, since neither function touches one. Hand-built [`AgentRow`]s, the
+/// same idiom `crate::rail::state`'s own `urgency_counts`/`filter_agents` tests use (see that
+/// module's private `row` helper) - real production types, just constructed directly instead
+/// of derived from a live process, so wording/pluralization/visibility rules are exercised
+/// exhaustively without a slow or environment-dependent real spawn. The genuinely-live half of
+/// this feature (a real spawned agent's real derived `Status` actually reaching this same code)
+/// is separately covered by `title_bar_agent_state_chips_live_tests` below.
+#[cfg(test)]
+mod agent_state_chip_text_tests {
+    use super::*;
+
+    fn row(id: u64, status: Status) -> AgentRow {
+        AgentRow {
+            id,
+            kind: AgentKind::Claude,
+            title: format!("agent-{id}"),
+            cwd: PathBuf::from(format!("/wt-{id}")),
+            status,
+            branch: Some("feature-x".to_string()),
+            add: 0,
+            del: 0,
+            question_preview: None,
+            exit_code: None,
+            activity: None,
+            elapsed: Duration::ZERO,
+            review_file_count: None,
+        }
+    }
+
+    #[test]
+    fn a_zero_count_is_hidden_for_every_status() {
+        for status in Status::ORDER {
+            assert_eq!(
+                title_bar_agent_state_chip_text(status, 0),
+                None,
+                "a zero count must never render a chip, for {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_and_idle_never_get_a_title_bar_chip_even_with_a_real_nonzero_count() {
+        // The design's own title-bar example names exactly three states (§4) - review-ready
+        // and idle counts already have a real home in the rail's own agent rows and the status
+        // bar's five-way dot row, so they must stay silent here even when genuinely non-zero.
+        assert_eq!(title_bar_agent_state_chip_text(Status::Review, 3), None);
+        assert_eq!(title_bar_agent_state_chip_text(Status::Idle, 5), None);
+    }
+
+    #[test]
+    fn ask_conjugates_its_verb_at_exactly_one_vs_two_or_more() {
+        assert_eq!(
+            title_bar_agent_state_chip_text(Status::Ask, 1).as_deref(),
+            Some("1 agent needs input")
+        );
+        assert_eq!(
+            title_bar_agent_state_chip_text(Status::Ask, 2).as_deref(),
+            Some("2 agents need input")
+        );
+        assert_eq!(
+            title_bar_agent_state_chip_text(Status::Ask, 7).as_deref(),
+            Some("7 agents need input")
+        );
+    }
+
+    #[test]
+    fn fail_pluralizes_the_noun_only_the_verb_does_not_conjugate() {
+        assert_eq!(
+            title_bar_agent_state_chip_text(Status::Fail, 1).as_deref(),
+            Some("1 agent failed")
+        );
+        assert_eq!(
+            title_bar_agent_state_chip_text(Status::Fail, 2).as_deref(),
+            Some("2 agents failed")
+        );
+    }
+
+    #[test]
+    fn run_matches_the_design_doc_s_own_worked_example_exactly() {
+        assert_eq!(
+            title_bar_agent_state_chip_text(Status::Run, 1).as_deref(),
+            Some("1 agent running")
+        );
+        // `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §4's own literal
+        // example text - "4 agents running" - reproduced verbatim.
+        assert_eq!(
+            title_bar_agent_state_chip_text(Status::Run, 4).as_deref(),
+            Some("4 agents running")
+        );
+    }
+
+    #[test]
+    fn zero_agents_anywhere_produces_an_entirely_empty_chip_list() {
+        assert_eq!(title_bar_agent_state_chips(&[]), Vec::new());
+    }
+
+    #[test]
+    fn only_non_empty_states_produce_a_chip_and_review_idle_are_excluded() {
+        let rows = vec![
+            row(1, Status::Ask),
+            row(2, Status::Review),
+            row(3, Status::Idle),
+        ];
+        assert_eq!(
+            title_bar_agent_state_chips(&rows),
+            vec![(Status::Ask, "1 agent needs input".to_string())],
+            "only the one non-empty Ask/Fail/Run state should produce a chip - Review and Idle \
+             must stay silent even though they are the majority of the rows"
+        );
+    }
+
+    #[test]
+    fn every_shown_state_at_once_renders_in_needs_input_failed_running_order() {
+        let rows = vec![
+            row(1, Status::Ask),
+            row(2, Status::Ask),
+            row(3, Status::Fail),
+            row(4, Status::Run),
+            row(5, Status::Run),
+            row(6, Status::Run),
+            row(7, Status::Run),
+        ];
+        assert_eq!(
+            title_bar_agent_state_chips(&rows),
+            vec![
+                (Status::Ask, "2 agents need input".to_string()),
+                (Status::Fail, "1 agent failed".to_string()),
+                (Status::Run, "4 agents running".to_string()),
+            ],
+            "must match the design doc's own worked example (§4) both in wording and order"
+        );
+    }
+
+    #[test]
+    fn a_real_status_change_between_two_row_sets_is_reflected_in_the_chip_list() {
+        // Simulates the same "spawn agents, change their derived status" shape the live tests
+        // below exercise with a real process - here at the pure-data level, over the exact
+        // `AgentRow`/`Status` types `crate::rail::render::AdeApp::build_agent_rows` produces.
+        let before = vec![row(1, Status::Run)];
+        assert_eq!(
+            title_bar_agent_state_chips(&before),
+            vec![(Status::Run, "1 agent running".to_string())]
+        );
+
+        let mut after = before;
+        after[0].status = Status::Fail;
+        assert_eq!(
+            title_bar_agent_state_chips(&after),
+            vec![(Status::Fail, "1 agent failed".to_string())],
+            "the chip list must track a changed row's status, not the row set's identity"
+        );
+    }
+}
+
+/// Genuinely-live coverage: real spawned [`AgentKind::Shell`] agents in a real
+/// [`gpui::TestAppContext`] window, read back through the real
+/// [`crate::rail::render::AdeApp::build_agent_rows`]/[`Self::render_title_bar_agent_state_chips`]/
+/// [`Self::render_title_bar`] path - proves the wiring itself, not just the pure formatting
+/// logic `agent_state_chip_text_tests` above already covers exhaustively.
+///
+/// Only `Status::Run` is driven live here (a freshly spawned agent is real, immediately
+/// observable, and needs no artificial delay or environment-dependent trick to reach): getting
+/// a real, deterministic `Status::Fail`/`Status::Ask` out of a live process without either a
+/// slow real wait (15s+ for `Status::Ask`'s idle threshold) or mutating process-global
+/// environment state (`$SHELL`/`$PATH`, which this workspace's own established discipline
+/// forbids in a test - see `pty_core::resolve_in_path_var`'s and `lsp_core::client::
+/// resolve_server_binary_with`'s docs for the exact same call) isn't practical through
+/// [`crate::work_surface::agents::Agents::spawn`]'s real `AgentKind`-only spec. Those two states'
+/// text/visibility rules are instead covered - just as really, over the identical `Status`/
+/// `AgentRow` types - by the pure tests above.
+#[cfg(test)]
+mod agent_state_chip_live_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    fn worktree_item(path: PathBuf, label: &str) -> WorktreeItem {
+        WorktreeItem {
+            path,
+            label: label.to_string(),
+            branch: Some(label.to_string()),
+            is_main: false,
+            is_bare: false,
+            is_detached: false,
+            short_sha: None,
+            is_locked: false,
+            lock_reason: None,
+            is_broken: false,
+            broken_reason: None,
+            error: None,
+        }
+    }
+
+    /// `AdeApp::new_with_settings` (`crate::root::state`, see its own "a fresh window starts
+    /// with one shell in the repo root" comment) always auto-spawns exactly one real
+    /// `AgentKind::Shell` agent at startup, so `open_test_app` never actually starts at zero
+    /// agents - there is no real "empty app" state to observe live. This closes that one real
+    /// startup agent via the real `Self::close_agent` path (the same one the tab strip's `×`
+    /// and `Self::archive_agent` use) to reach a genuine, live zero-agents state, and proves
+    /// the title bar's chip row really disappears in response - not just that it starts out
+    /// `None` before anything has run. `Self::render_title_bar` itself is also exercised at
+    /// both ends, unmodified, to prove the real production method doesn't panic either way.
+    #[gpui::test]
+    fn closing_the_only_real_agent_makes_the_chip_row_disappear(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let startup_agent_id = app
+            .read_with(cx, |app, _| app.agents.active_id())
+            .expect("the real startup shell must be the active agent");
+
+        let chips_at_startup = app.update(cx, |app, cx| app.render_title_bar_agent_state_chips(cx));
+        assert!(
+            chips_at_startup.is_some(),
+            "the real, freshly spawned startup shell is a genuine Status::Run agent and must \
+             produce a real, visible chip"
+        );
+        app.update(cx, |app, cx| {
+            let _ = app.render_title_bar(cx);
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.close_agent(startup_agent_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, cx| app.build_agent_rows(cx))
+                .is_empty(),
+            "closing the one real open agent must leave zero rows - not a fabricated zero, a \
+             genuinely empty real agent list"
+        );
+        let chips_after_close =
+            app.update(cx, |app, cx| app.render_title_bar_agent_state_chips(cx));
+        assert!(
+            chips_after_close.is_none(),
+            "zero real agents left open must hide the chip row entirely, not render an empty \
+             one - this is the live version of \
+             `agent_state_chip_text_tests::zero_agents_anywhere_produces_an_entirely_empty_chip_list`"
+        );
+        app.update(cx, |app, cx| {
+            let _ = app.render_title_bar(cx);
+        });
+    }
+
+    /// Spawning a real second agent on top of the real startup shell is a genuine state change
+    /// over live process data - not a hand-built row - and the chip text must track it,
+    /// including the exact singular → plural flip at 1 → 2.
+    #[gpui::test]
+    fn a_second_real_spawned_agent_flips_the_live_chip_from_singular_to_plural(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_b = tempfile::tempdir().expect("tempdir wt-b");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let rows_at_startup = app.update(cx, |app, cx| app.build_agent_rows(cx));
+        assert_eq!(
+            rows_at_startup
+                .iter()
+                .filter(|row| row.status == Status::Run)
+                .count(),
+            1,
+            "the real startup shell must be observably Status::Run (recently active, still \
+             alive) - real derived status from a real process, not an assumption"
+        );
+        assert_eq!(
+            title_bar_agent_state_chips(&rows_at_startup),
+            vec![(Status::Run, "1 agent running".to_string())],
+            "one real running agent must read as the singular form"
+        );
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt_b.path().to_path_buf(), "wt-b")];
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            app.agents.spawn(
+                AgentKind::Shell,
+                wt_b.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+        });
+        // The pty spawn is async (`TerminalPane::spawn_process`) - let it actually start
+        // before reading a live `Status` off it, the same real seam
+        // `rail_row_tests::worktree_is_expanded_defaults_to_the_real_idle_rooted_rule` uses.
+        cx.run_until_parked();
+
+        let rows_after_second_spawn = app.update(cx, |app, cx| app.build_agent_rows(cx));
+        let running_count = rows_after_second_spawn
+            .iter()
+            .filter(|row| row.status == Status::Run)
+            .count();
+        assert_eq!(
+            running_count, 2,
+            "the real startup shell plus this real second spawn must both be observed running \
+             - this is the real state change the chip text must track"
+        );
+        assert_eq!(
+            title_bar_agent_state_chips(&rows_after_second_spawn),
+            vec![(Status::Run, "2 agents running".to_string())],
+            "the chip text must flip from singular to plural on this real second spawn, not \
+             stay frozen at \"1 agent running\""
+        );
+
+        // The real, unmodified render method must still run without panicking with two live
+        // agents open.
+        app.update(cx, |app, cx| {
+            let _ = app.render_title_bar(cx);
+        });
     }
 }

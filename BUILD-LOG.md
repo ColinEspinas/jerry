@@ -5095,3 +5095,83 @@ had (see above) since it wasn't part of either the real or the described third b
 `cargo clippy --workspace --all-targets -- -D warnings` - all clean.
 `cargo test --workspace --lib -- --test-threads=1`: **1100 + 44 + 14 + 107 = 1265 passed, 0
 failed** across all four crates (1263 baseline + 2 new tests). No flakes observed in this run.
+
+## Adding the title bar's missing agent-state chip row (Revision R12)
+
+`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §4's counter table has a title-bar
+row that never had code behind it: `2 agents need input · 1 agent failed · 4 agents running`,
+"agent-level, one chip per non-empty state." `crate::title_bar::render::AdeApp::render_title_bar`
+rendered window controls · project name · branch · spacer · caption buttons and nothing else -
+zero agent-state chips, not a stale or hardcoded set, just genuinely absent. This was flagged as a
+missing feature, not a bug, and the design doc's own "Counts" section (§6 of `CHANGELOG.md`,
+quoted verbatim) turned out to spell out the exact same three states and the exact same worked
+example (`2 agents need input` / `1 agent failed` / `4 agents running`) twice, independently -
+strong enough evidence to treat the title bar's chip set as exactly `Status::Ask`/`Status::Fail`/
+`Status::Run`, not all five `Status` variants read literally off "one chip per non-empty state."
+`Status::Review`/`Status::Idle` counts already have a real home elsewhere (the rail's own agent
+rows; the status bar's five-square dot row, `crate::status_bar::render::AdeApp::
+render_status_urgency_counters`) - showing them a third time here would violate §4's own "no two
+counters may share wording while counting different units" rule by restating the same number.
+
+**Reused, not re-derived.** `crate::rail::state::urgency_counts` already computes real per-status
+agent counts from `AdeApp::build_agent_rows` - it's the exact function the status bar's dot row
+already calls, and its own doc comment says so explicitly. The title bar calls it too
+(`title_bar_agent_state_chips` filters its five-entry result down to the three shown states and
+formats each), so the title bar, the status bar, and the rail can never disagree about how many
+agents are in which state - there is exactly one counting function, not three that could drift.
+
+**Pluralization**, since this codebase already has one unfixed `1 worktrees waiting` bug in the
+sibling rail counter and this change was told explicitly not to repeat it:
+`title_bar_agent_state_chip_text` conjugates both the noun (`agent`/`agents`) and, for `Ask`
+alone, the verb (`1 agent needs input` vs `2 agents need input` - `failed`/`running` don't
+conjugate). Each string names its own unit per §4's rule, never a bare `"N ..."`.
+
+**Visual convention**: a small dot-plus-label pill (`render_title_bar_agent_state_chip`) - the
+same 19px/7px/5px/`theme::radius::CHIP` formula `crate::work_surface::render::render_status_pill`
+already uses for the agent context bar's status pill, with `status.pill_bg()`/`status.color()`
+(the same `theme::status::*` tokens every other status surface in this app reads), just carrying
+this row's own derived count text instead of the bare status label. A visual twin, not a shared
+function, since the two render different text. Placed between the project/branch cluster and the
+title bar's flex spacer, hidden entirely (not an empty row) via `.when_some` when
+`render_title_bar_agent_state_chips` returns `None`.
+
+**Testing**: two tiers, deliberately. `agent_state_chip_text_tests` is pure (`#[test]`, no GPUI
+window) and covers every wording/visibility rule exhaustively against hand-built `AgentRow`s - the
+same idiom `crate::rail::state`'s own `urgency_counts` tests already use: zero count hidden for
+every status, `Review`/`Idle` never shown even with a real non-zero count, `Ask`'s verb
+conjugation, the exact worked example from the design doc reproduced verbatim, ordering, and a row
+whose `status` field changes between two assertions (the pure-data shape of "a real state
+change"). `agent_state_chip_live_tests` is a `#[gpui::test]` against a real window with real
+spawned `AgentKind::Shell` agents, reading back through the real `build_agent_rows`/
+`render_title_bar_agent_state_chips`/`render_title_bar` path end to end. It found that
+`AdeApp::new_with_settings` always auto-spawns one real shell at startup (`crate::root::state`'s
+own "a fresh window starts with one shell in the repo root" comment) - so `open_test_app` never
+actually starts at zero agents, and the "row is entirely absent with zero" case needed a genuinely
+live zero-agents state instead, reached by closing that one real startup agent via the real
+`Self::close_agent` path and asserting the chip row disappears in response. A second live test
+spawns one further real shell on top of the startup one and asserts the chip text flips from
+`"1 agent running"` to `"2 agents running"` - a real singular→plural transition driven by two
+genuine process spawns, not a hand-built row swap.
+
+**What stayed pure-only.** Getting a real, deterministic `Status::Fail`/`Status::Ask` out of a
+live process without either a slow real wait (`Status::Ask`'s idle threshold is 15s of real wall
+time - `TerminalPane::idle_duration` reads `Instant::elapsed()` directly, no virtual-clock hook
+exists) or mutating process-global environment state (overriding `$SHELL`/`$PATH` to force a fake
+binary to fail on spawn) isn't practical through `Agents::spawn`'s real `AgentKind`-only spec -
+and this workspace has an explicit, already-documented rule against exactly that env mutation in a
+test (`pty_core::resolve_in_path_var`'s and `lsp_core::client::resolve_server_binary_with`'s own
+docs: `std::env::set_var` needs `unsafe` in this edition and races `cargo test`'s concurrent
+execution). Those two states' wording/visibility rules are covered only by the pure tests above,
+over the identical `Status`/`AgentRow` types `build_agent_rows` actually produces - not a live
+spawn, and that trade-off is deliberate rather than silent.
+
+**Gates**, from this project's usual Linux sandbox (`export
+LIBRARY_PATH=/tmp/x11-deps/prefix/usr/lib/x86_64-linux-gnu`): `cargo fmt --all -- --check`,
+`cargo build --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` all clean.
+`cargo test --workspace --lib -- --test-threads=1`: **1109 + 44 + 14 + 107 = 1274 passed, 0
+failed** across all four crates (12 new tests, all in `crates/app`). One earlier full run hit the
+already-documented `code_surface::diff_view::diff_render_tests` flake (`switching_the_open_diff_to
+_a_different_file_recomputes_the_highlight_cache` this time, a different test in that module from
+either previously-documented flake) - `diff_view.rs` untouched by this change, re-ran it in
+isolation 5/5 clean, and the subsequent full-suite re-run above was clean. Two files touched:
+`crates/app/src/title_bar/render.rs`, `crates/app/src/title_bar/mod.rs` (new imports only).
