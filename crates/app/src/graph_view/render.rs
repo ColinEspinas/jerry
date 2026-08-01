@@ -466,7 +466,7 @@ pub(crate) fn render_graph_tab(app: &AdeApp, cx: &mut Context<AdeApp>) -> impl I
         .border_color(theme::border::INNER)
         .bg(colors.bg)
         // Middle-click closes the graph tab too (GitHub issue #26) - the same real
-        // `close_git_graph_tab` teardown the `×` button already uses, matching file/session tabs.
+        // `close_git_graph_tab` teardown the `×` button already uses, matching file/agent tabs.
         .on_mouse_down(
             gpui::MouseButton::Middle,
             cx.listener(move |this, _event: &gpui::MouseDownEvent, window, cx| {
@@ -634,7 +634,7 @@ impl AdeApp {
         result.into_any_element()
     }
 
-    /// Toolbar (design spec §4): `HEAD` branch/chip/counts, the `All | Sessions | Current` scope
+    /// Toolbar (design spec §4): `HEAD` branch/chip/counts, the `All | Worktrees | Current` scope
     /// segment, and the Fetch/Pull/Push button group. None of Fetch/Pull/Push perform a real git
     /// operation yet (see `super`'s module docs) - clicking any of them calls
     /// [`AdeApp::graph_action_not_yet_wired`], a real, honest, visible response.
@@ -721,12 +721,12 @@ impl AdeApp {
     fn render_graph_scope_segment(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let options = [
             widgets::ChoiceOption::new("All"),
-            widgets::ChoiceOption::new("Sessions"),
+            widgets::ChoiceOption::new("Worktrees"),
             widgets::ChoiceOption::new("Current"),
         ];
         let selected = match self.graph_state.scope {
             GraphScope::All => "All",
-            GraphScope::Sessions => "Sessions",
+            GraphScope::Worktrees => "Worktrees",
             GraphScope::Current => "Current",
         };
         self.render_choice_control(
@@ -737,7 +737,7 @@ impl AdeApp {
             |this, index, _window, cx| {
                 let scope = match index {
                     0 => GraphScope::All,
-                    1 => GraphScope::Sessions,
+                    1 => GraphScope::Worktrees,
                     _ => GraphScope::Current,
                 };
                 this.set_graph_scope(scope, cx);
@@ -1170,7 +1170,7 @@ impl AdeApp {
                     ))
                     .child(render_dropdown_menu_row(
                         "\u{25b8}", theme::button::BLUE_FG.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Start session from this commit", "not implemented yet".to_string(), Vec::new(), false,
+                        "Start agent from this commit", "not implemented yet".to_string(), Vec::new(), false,
                     ))
                     .child(render_graph_row_menu_header("Apply"))
                     .child(render_dropdown_menu_row(
@@ -2515,7 +2515,7 @@ mod graph_row_menu_tests {
         // `open_git_graph` already focuses `graph_focus_handle` by default, so proving a
         // right-click *moves* focus there needs it to genuinely start somewhere else first - the
         // Branches filter box, the same real, independently-focusable surface
-        // `leaving_the_graph_tab_from_the_branches_filter_lands_on_the_real_session_pane` (in
+        // `leaving_the_graph_tab_from_the_branches_filter_lands_on_the_real_agent_pane` (in
         // `graph_focus_tests` below) uses for the identical reason.
         app.update_in(cx, |app, _window, cx| {
             app.set_graph_right_panel(GraphRightPanel::Branches, cx);
@@ -2871,12 +2871,12 @@ mod graph_row_menu_tests {
             );
         });
 
-        // Calls `leave_graph_tab` directly, not through `select_session` - `select_session` can
-        // also route through `Self::select_worktree` (when the target session belongs to a
+        // Calls `leave_graph_tab` directly, not through `select_agent` - `select_agent` can
+        // also route through `Self::select_worktree` (when the target agent belongs to a
         // worktree not already selected), which calls `Self::load_graph` unconditionally on its
         // own and would clear `row_menu_open` for an unrelated reason, confounding what this test
         // means to isolate: `leave_graph_tab`'s *own* clear, for the plain "leave the tab, same
-        // worktree, same session, tab was already loaded" path.
+        // worktree, same agent, tab was already loaded" path.
         app.update_in(cx, |app, window, cx| {
             app.leave_graph_tab(window, cx);
         });
@@ -4478,7 +4478,7 @@ mod graph_focus_tests {
     #[gpui::test]
     fn middle_clicking_the_graph_tab_closes_it_like_every_other_tab_kind(cx: &mut TestAppContext) {
         // A real user report: the graph tab was the one tab kind that didn't support middle-click
-        // close (GitHub issue #26 already wired this for file and session tabs via
+        // close (GitHub issue #26 already wired this for file and agent tabs via
         // `on_mouse_down(MouseButton::Middle, ...)` - the graph tab's own `render_graph_tab` had
         // simply never been given the same treatment).
         let (_repo, app, cx) = open_seeded(cx);
@@ -4502,7 +4502,7 @@ mod graph_focus_tests {
 
         assert!(
             !app.read_with(cx, |app, _| app.graph_tab_open),
-            "middle-clicking the graph tab must close it, same as a file or session tab"
+            "middle-clicking the graph tab must close it, same as a file or agent tab"
         );
     }
 }

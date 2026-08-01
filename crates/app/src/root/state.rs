@@ -705,8 +705,8 @@ impl AdeApp {
         self.evict_stale_lsp_clients(&path, cx);
         self.load_diff(path, cx);
         // The graph tab is repo-scoped, not worktree-scoped (design spec §1: "the graph is
-        // repo-scoped"), but the toolbar's `HEAD` chip/upstream counts and the Sessions scope
-        // (`wt_core::graph::GraphScope::Sessions`, driven by real worktree HEADs) are real facts
+        // repo-scoped"), but the toolbar's `HEAD` chip/upstream counts and the Worktrees scope
+        // (`wt_core::graph::GraphScope::Worktrees`, driven by real worktree HEADs) are real facts
         // about *this* worktree - without this, switching worktrees while the graph tab is open
         // silently left it showing the previous worktree's data (a real, adversarial-audit-found
         // gap), and the Commit panel's cached "Files changed" could even fail against the wrong

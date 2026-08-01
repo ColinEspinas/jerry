@@ -12,10 +12,10 @@
 //! - [`GraphScope::Current`] walks only `HEAD`'s first-parent ancestry (`first_parent_only`),
 //!   mirroring `git log --first-parent`.
 //! - [`GraphScope::All`] walks every local branch, remote-tracking branch and tag.
-//! - [`GraphScope::Sessions`] walks only the branches actually checked out in one of this
+//! - [`GraphScope::Worktrees`] walks only the branches actually checked out in one of this
 //!   repository's worktrees (via [`crate::list_worktrees`]) - a real, already-available signal
-//!   (which branches have a worktree at all), *not* a fabricated stand-in for the session-to-
-//!   commit correlation feature (which branch a specific agent session authored), which is a
+//!   (which branches have a worktree at all), *not* a fabricated stand-in for the agent-to-
+//!   commit correlation feature (which branch a specific agent authored), which is a
 //!   separate, later feature.
 //!
 //! ## Lane layout
@@ -45,13 +45,13 @@ use crate::{check_success, is_dirty, list_worktrees, open_repo, run_git};
 /// commits than this is truncated, not silently hung on.
 pub const DEFAULT_MAX_COMMITS: usize = 500;
 
-/// Which ref tips seed the graph walk - the toolbar's `All | Sessions | Current` scope segment.
+/// Which ref tips seed the graph walk - the toolbar's `All | Worktrees | Current` scope segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GraphScope {
     #[default]
     All,
     /// Only branches checked out in one of this repository's worktrees.
-    Sessions,
+    Worktrees,
     /// Only `HEAD`'s first-parent ancestry.
     Current,
 }
@@ -203,7 +203,7 @@ pub fn build_graph(
     let tips: Vec<ObjectId> = match scope {
         GraphScope::Current => head_id.into_iter().collect(),
         GraphScope::All => all_tips,
-        GraphScope::Sessions => collect_session_tips(repo_path, &repo)?,
+        GraphScope::Worktrees => collect_worktree_tips(repo_path, &repo)?,
     };
 
     if tips.is_empty() {
@@ -545,10 +545,10 @@ fn collect_refs(repo: &gix::Repository, head_branch: Option<&str>) -> Result<Ref
     Ok((by_commit, tips))
 }
 
-/// Tips for [`GraphScope::Sessions`]: the `HEAD` commit of every worktree of this repository that
-/// has one checked out (main worktree included) - real data already surfaced by
-/// [`crate::list_worktrees`], not a guess at which branches have "sessions".
-fn collect_session_tips(repo_path: &Path, repo: &gix::Repository) -> Result<Vec<ObjectId>, Error> {
+/// Tips for [`GraphScope::Worktrees`]: the `HEAD` commit of every worktree of this repository
+/// that has one checked out (main worktree included) - real data already surfaced by
+/// [`crate::list_worktrees`], not a guess at which branches have a worktree.
+fn collect_worktree_tips(repo_path: &Path, repo: &gix::Repository) -> Result<Vec<ObjectId>, Error> {
     let worktrees = list_worktrees(repo_path)?;
     let mut tips = Vec::new();
     for worktree in worktrees.into_iter().flatten() {
@@ -1273,20 +1273,20 @@ mod tests {
     }
 
     #[test]
-    fn build_graph_sessions_scope_is_limited_to_checked_out_branches() {
+    fn build_graph_worktrees_scope_is_limited_to_checked_out_branches() {
         let repo = init_repo();
         commit(repo.path(), "a.txt", "1", "base");
         git(repo.path(), &["checkout", "-b", "no-worktree-branch"]);
         commit(repo.path(), "b.txt", "1", "only on no-worktree-branch");
         git(repo.path(), &["checkout", "main"]);
 
-        let graph = build_graph(repo.path(), GraphScope::Sessions, 0).expect("build_graph");
+        let graph = build_graph(repo.path(), GraphScope::Worktrees, 0).expect("build_graph");
         assert!(
             !graph
                 .rows
                 .iter()
                 .any(|row| row.commit.subject == "only on no-worktree-branch"),
-            "a branch with no worktree must not appear under the Sessions scope"
+            "a branch with no worktree must not appear under the Worktrees scope"
         );
         assert!(graph.rows.iter().any(|row| row.commit.subject == "base"));
     }

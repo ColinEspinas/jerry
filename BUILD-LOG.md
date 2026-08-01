@@ -5601,3 +5601,44 @@ require hand-deriving a number GPUI itself is responsible for.
 passed (1133 in `app`, 44 in `lsp_core`, 14 in `pty_core`, 127 in `wt_core`), 0 failed, 0
 skipped/reran - the previously-flaky `code_surface::diff_view` timing test that failed under a
 contended box in the prior entry passed cleanly this run with no rerun needed.
+
+## Rebasing the git graph tab onto the full Revision R12 stack, and a real `GraphScope::Sessions` naming bug it surfaced
+
+This branch predated the whole R12 rail/worktree-model redesign (repo-model, rail rewrite,
+Session→Agent rename, worktree-state-safety, title-bar-chips, rail-header-fix, and the Changes-
+panel commit composer with real git staging). Rebased onto the top of that stack
+(`revision-r12-tabs-changes`). Every conflict was a stale `Session`/`self.sessions` reference in
+`work_surface`/`root` code this branch's own graph-tab wiring touches (`close_git_graph_tab`,
+focus-restoration on leaving the tab, etc.) - resolved by adopting the rename's real
+`Agent`/`self.agents` names and re-applying this branch's own graph-specific logic on top. A few
+doc-comment-only hunks auto-merged with no conflict markers but still said "session" verbatim
+afterward - caught by a full post-rebase grep sweep of the touched files, not just the marked
+conflict regions, matching the same gap the tabstrip branch's own rebase found and fixed.
+
+That same sweep, run once more directly against `crates/app/src/graph_view/` and
+`crates/wt-core/src/graph.rs` (neither of which the original `Session`→`Agent` rename PR could
+have touched, since this branch didn't exist in that lineage yet), found a real, live one the
+rebase itself didn't introduce but did finally surface: `wt_core::graph::GraphScope::Sessions` -
+the toolbar's `All | Sessions | Current` scope segment. Reading its own doc comment first, this
+variant does *not* mean "agent sessions" - it means "branches actually checked out in one of this
+repository's worktrees," explicitly and deliberately distinct from a future agent-authorship
+correlation feature (the module's own docs already say so). Renaming it to `Agents` would have
+been wrong twice over: not just leftover old vocabulary, but the *wrong* new vocabulary too.
+Renamed to `GraphScope::Worktrees` instead - the name that actually describes what it does -
+along with its `collect_session_tips` implementation function (→ `collect_worktree_tips`), the
+toolbar's `"Sessions"` label (→ `"Worktrees"`), and a test name. No `Serialize`/`Deserialize` on
+`GraphScope` and nothing in `settings/` persists it, so this was a safe, non-breaking rename.
+
+Separately, a real, live, currently-rendered (if disabled) menu row - `"Start session from this
+commit"` in the row `⋯` menu's Branch group - genuinely does mean starting an agent, so that one
+*was* a straightforward rename to `"Start agent from this commit"`, along with the module's own
+top-of-file doc comment describing the same not-yet-implemented action and the "session-to-commit
+correlation" phrase describing the *other*, still-separate planned feature (→ "agent-to-commit
+correlation"). Two doc comments describing the *already-removed* per-commit session column (git
+history has what it used to render) were deliberately left saying "session" - they're accurately
+describing a historical, deleted concept, not live code.
+
+**Verification**: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings` - all clean.
+`cargo test --workspace --lib --test-threads=1`: **1198 + 44 + 14 + 139 = 1395 passed, 0 failed**
+across all four crates.

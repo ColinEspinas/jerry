@@ -2221,9 +2221,7 @@ mod palette_result_focus_tests {
             let groups = app.build_palette_groups(cx);
             let index = palette::flatten(&groups).iter().position(|entry| {
                 entry.target
-                    == palette::EntryTarget::Command(
-                        palette::PaletteCommand::WindowControlsSystem,
-                    )
+                    == palette::EntryTarget::Command(palette::PaletteCommand::WindowControlsSystem)
             });
             match index {
                 Some(index) => {
