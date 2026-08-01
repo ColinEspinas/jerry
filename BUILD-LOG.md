@@ -4370,3 +4370,25 @@ it passed, and the subsequent full run was clean with no re-run needed. All seve
 `commit_composer_tests` and both new `wt-core::undo::tests::commit_paths_*` tests were each
 independently confirmed to fail against the pre-fix code and pass against the fix, not just pass
 by construction.
+
+## Rebasing the commit-composer work onto the rail rewrite (Revision R12 stacking)
+
+This branch had drifted onto an old master tip and, separately, carried its own copy of the
+Revision R12 repo-data-model commit (`feat(app): repo data model - Revision R12 Phase 0`) - the
+same content already proposed independently as PR #56 (`revision-r12-repo-model`). It also
+touches `rail/render.rs`, `rail/state.rs`, `rail/mod.rs`, `root/mod.rs`, `root/state.rs`,
+`sidebar/changes.rs`, and `theme.rs` - all substantially rewritten by PR #57
+(`revision-r12-rail-rewrite`, itself stacked on the repo-model PR).
+
+Rather than target `master` directly (which would re-propose the repo-model diff a second time
+and conflict hard with the rail rewrite), rebased onto `origin/revision-r12-rail-rewrite`. The
+duplicate repo-model commit became empty once rebased on top of a branch that already contains
+its content and was dropped automatically; the real conflicts in the overlapping rail/root/sidebar
+files were resolved by keeping the rail-rewrite side's structural changes and re-applying this
+branch's own commit-composer and Changes-panel additions on top of them.
+
+**Verification** (independently re-run, not just agent-reported): `cargo fmt --all -- --check`,
+`cargo build --workspace`, `cargo clippy --workspace --all-targets -- -D warnings` - all clean.
+`cargo test --workspace --lib --test-threads=1`: **1114 + 44 + 14 + 111 = 1283 passed, 0 failed**
+across all four crates. No conflict markers or unresolved merge artifacts remained in source after
+the rebase (grep for `<<<<<<<`/`=======`/`>>>>>>>` outside test fixture strings came back empty).
