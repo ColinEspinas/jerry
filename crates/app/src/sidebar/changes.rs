@@ -6,7 +6,7 @@
 //! shows lives here; `gpui::Div` construction happens in `crate::root`, which owns the
 //! `Context<AdeApp>` the click handlers (review-toggle, open-in-centre) need.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use gpui::Rgba;
@@ -222,22 +222,23 @@ pub fn stat_bar_segments(add: u32, del: u32) -> [StatSegment; STAT_BAR_LEN] {
     segments
 }
 
-/// Review progress for the Changes header's `3 reviewed` label and progress bar - `reviewed`/
-/// `total` are counted by the caller from real state (how many files are in the reviewed set),
-/// never tracked as an independent counter that could drift.
+/// Staged progress for the Changes header's `N of M staged` label and progress bar (Revision R12
+/// §5: the checkbox **is** staging, not "reviewed") - `staged`/`total` are counted by the caller
+/// from real state (how many files are in [`crate::root::AdeApp::staged_files`]), never tracked
+/// as an independent counter that could drift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ReviewProgress {
-    pub reviewed: usize,
+pub struct StagedProgress {
+    pub staged: usize,
     pub total: usize,
 }
 
-impl ReviewProgress {
-    /// `0.0` (not `NaN`) when there is nothing to review.
+impl StagedProgress {
+    /// `0.0` (not `NaN`) when there is nothing to stage.
     pub fn fraction(&self) -> f32 {
         if self.total == 0 {
             0.0
         } else {
-            self.reviewed as f32 / self.total as f32
+            self.staged as f32 / self.total as f32
         }
     }
 }
@@ -289,6 +290,53 @@ pub fn empty_hunks_message(status: FileChangeStatus) -> &'static str {
         "no line changes (rename only)"
     } else {
         "no line changes"
+    }
+}
+
+/// The staged subset of `files`, in the same relative order - the one place the commit
+/// composer's file list, diffstat, and action-button count are all derived from (Revision R12
+/// §5: "derive the staged set once, early, since the header count/diffstat/composer/action-
+/// button all read from it").
+pub fn staged_subset<'a>(files: &'a [DiffFile], staged: &HashSet<PathBuf>) -> Vec<&'a DiffFile> {
+    files
+        .iter()
+        .filter(|file| staged.contains(&file.path))
+        .collect()
+}
+
+/// The staged subset's combined `+add`/`\u{2212}del`, summed the same way [`diff_file_stats`]
+/// counts a single file - the commit composer header's right-aligned diffstat (`#5f9c78`).
+pub fn staged_diff_stats(staged: &[&DiffFile]) -> (u32, u32) {
+    staged.iter().fold((0, 0), |(add, del), file| {
+        let (file_add, file_del) = diff_file_stats(file);
+        (add + file_add, del + file_del)
+    })
+}
+
+/// The commit composer's primary-button label: a ghost `Commit` with nothing staged, or `Commit
+/// N files` (singular for exactly one) once something is.
+pub fn commit_button_label(staged_count: usize) -> String {
+    if staged_count == 0 {
+        "Commit".to_string()
+    } else {
+        format!(
+            "Commit {staged_count} file{}",
+            if staged_count == 1 { "" } else { "s" }
+        )
+    }
+}
+
+/// A placeholder commit message, standing in for real agent-drafted commit-message generation -
+/// **out of scope for this task**: no such system exists anywhere in this codebase yet (this
+/// phase only wires the Changes panel's real staging/composer UI against real data, per this
+/// module's own `Authorship` precedent for "real API, honestly incomplete data"). Deterministic
+/// and derived straight from the staged file list rather than fabricated prose, and empty when
+/// nothing is staged - the composer only ever shows this with something real to say.
+pub fn draft_commit_message(staged: &[&DiffFile]) -> String {
+    match staged {
+        [] => String::new(),
+        [only] => format!("Update {}", only.path.display()),
+        many => format!("Update {} files", many.len()),
     }
 }
 
@@ -491,18 +539,18 @@ mod tests {
     }
 
     #[test]
-    fn review_progress_fraction_handles_zero_total_without_dividing_by_zero() {
-        let progress = ReviewProgress {
-            reviewed: 0,
+    fn staged_progress_fraction_handles_zero_total_without_dividing_by_zero() {
+        let progress = StagedProgress {
+            staged: 0,
             total: 0,
         };
         assert_eq!(progress.fraction(), 0.0);
     }
 
     #[test]
-    fn review_progress_fraction_is_reviewed_over_total() {
-        let progress = ReviewProgress {
-            reviewed: 3,
+    fn staged_progress_fraction_is_staged_over_total() {
+        let progress = StagedProgress {
+            staged: 3,
             total: 12,
         };
         assert!((progress.fraction() - 0.25).abs() < f32::EPSILON);
@@ -762,5 +810,90 @@ mod tests {
             0,
             "an agent with no recorded authorship anywhere gets a real 0, not a stray match"
         );
+    }
+
+    fn changed_file(path: &str, add_lines: u32, del_lines: u32) -> DiffFile {
+        let mut lines = Vec::new();
+        for _ in 0..add_lines {
+            lines.push(line(DiffLineKind::Added, "a"));
+        }
+        for _ in 0..del_lines {
+            lines.push(line(DiffLineKind::Removed, "d"));
+        }
+        DiffFile {
+            path: PathBuf::from(path),
+            old_path: None,
+            status: FileChangeStatus::Modified,
+            is_binary: false,
+            hunks: vec![DiffHunk {
+                header: "@@ -1,1 +1,1 @@".to_string(),
+                lines,
+            }],
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn staged_subset_only_keeps_files_in_the_staged_set() {
+        let files = vec![
+            changed_file("src/a.rs", 1, 0),
+            changed_file("src/b.rs", 2, 0),
+            changed_file("src/c.rs", 0, 3),
+        ];
+        let mut staged = HashSet::new();
+        staged.insert(PathBuf::from("src/b.rs"));
+
+        let subset = staged_subset(&files, &staged);
+        assert_eq!(subset.len(), 1);
+        assert_eq!(subset[0].path, PathBuf::from("src/b.rs"));
+    }
+
+    #[test]
+    fn staged_subset_is_empty_when_nothing_is_staged() {
+        let files = vec![changed_file("src/a.rs", 1, 0)];
+        let subset = staged_subset(&files, &HashSet::new());
+        assert!(subset.is_empty());
+    }
+
+    #[test]
+    fn staged_diff_stats_sums_only_the_staged_files() {
+        let a = changed_file("src/a.rs", 3, 1);
+        let b = changed_file("src/b.rs", 2, 5);
+        assert_eq!(staged_diff_stats(&[&a, &b]), (5, 6));
+        assert_eq!(staged_diff_stats(&[&a]), (3, 1));
+        assert_eq!(staged_diff_stats(&[]), (0, 0));
+    }
+
+    #[test]
+    fn commit_button_label_is_a_bare_ghost_commit_with_nothing_staged() {
+        assert_eq!(commit_button_label(0), "Commit");
+    }
+
+    #[test]
+    fn commit_button_label_is_singular_for_exactly_one_staged_file() {
+        assert_eq!(commit_button_label(1), "Commit 1 file");
+    }
+
+    #[test]
+    fn commit_button_label_is_plural_for_more_than_one_staged_file() {
+        assert_eq!(commit_button_label(3), "Commit 3 files");
+    }
+
+    #[test]
+    fn draft_commit_message_is_empty_with_nothing_staged() {
+        assert_eq!(draft_commit_message(&[]), "");
+    }
+
+    #[test]
+    fn draft_commit_message_names_the_one_file_when_exactly_one_is_staged() {
+        let a = changed_file("src/a.rs", 1, 0);
+        assert_eq!(draft_commit_message(&[&a]), "Update src/a.rs");
+    }
+
+    #[test]
+    fn draft_commit_message_names_a_count_when_several_files_are_staged() {
+        let a = changed_file("src/a.rs", 1, 0);
+        let b = changed_file("src/b.rs", 1, 0);
+        assert_eq!(draft_commit_message(&[&a, &b]), "Update 2 files");
     }
 }

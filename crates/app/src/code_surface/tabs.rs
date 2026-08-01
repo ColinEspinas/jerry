@@ -11,6 +11,21 @@ impl AdeApp {
     /// Loads (or reloads) the diff of `root` against its detected base branch. Runs on
     /// `cx.background_executor()` since `diff_against_base` does blocking I/O (gix reads plus a
     /// spawned `git diff` process) and must not run on the GPUI foreground thread.
+    ///
+    /// Also genuinely re-derives [`Self::staged_files`] from `root`'s real git index
+    /// (`wt_core::stage::staged_paths` - a real `git diff --cached --name-only`), in the same
+    /// background task, rather than caching a per-worktree copy the way
+    /// [`Self::open_files_by_worktree`]/[`Self::edit_buffers`] do: `staged_files` isn't purely
+    /// this app's own state the way an open-tab list is - real git staging can change out from
+    /// under it at any moment (an agent CLI process running its own `git add`/`git reset` in this
+    /// same worktree, exactly the interleaving hazard `wt_core::undo::commit_paths`'s own docs
+    /// already call out), so a cache would need its own invalidation story on top of the one
+    /// `load_diff` already has. Re-querying fresh every time this - the one real chokepoint every
+    /// worktree switch, tree operation, and post-commit reload already runs through - reloads the
+    /// diff is a live mirror of real git state instead, at the cost of one extra fast local `git`
+    /// call per reload. This is also what makes a worktree with something already staged in real
+    /// git *before* Jerry ever opened it read as staged the moment it's loaded, rather than
+    /// starting at an empty, UI-only set the way it used to.
     pub(crate) fn load_diff(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.diff_root = root.clone();
         self.diff_state = DiffLoadState::Loading;
@@ -22,14 +37,14 @@ impl AdeApp {
         self.file_authorship = changes::Authorship::default();
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
-            let result = cx
+            let (diff_result, staged_result) = cx
                 .background_executor()
                 .spawn({
                     let root = root.clone();
                     async move {
                         // Fold the +n/-n totals here, off the UI thread, rather than
                         // recomputing them on every render.
-                        wt_core::diff::diff_against_base(&root).map(|base| {
+                        let diff_result = wt_core::diff::diff_against_base(&root).map(|base| {
                             let totals = match &base {
                                 DiffBase::Diff(diff) => Some(diff.files.iter().fold(
                                     (0u32, 0u32),
@@ -41,12 +56,14 @@ impl AdeApp {
                                 DiffBase::NoBaseFound | DiffBase::OnDefaultBranch { .. } => None,
                             };
                             (base, totals)
-                        })
+                        });
+                        let staged_result = wt_core::stage::staged_paths(&root);
+                        (diff_result, staged_result)
                     }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                match result {
+                match diff_result {
                     Ok((base, totals)) => {
                         this.diff_state = DiffLoadState::Loaded(base);
                         this.diff_totals = totals;
@@ -55,6 +72,14 @@ impl AdeApp {
                         this.diff_state = DiffLoadState::Error(err.to_string());
                         this.diff_totals = None;
                     }
+                }
+                // A failed `staged_paths` query (an unreadable/non-git `root`, the same real
+                // failure modes `diff_against_base` itself can hit) leaves `staged_files` as it
+                // was rather than silently emptying a real staged set this call simply couldn't
+                // confirm - `diff_state`'s own `Error` arm above already surfaces the underlying
+                // problem honestly.
+                if let Ok(staged) = staged_result {
+                    this.staged_files = staged;
                 }
                 // The reloaded diff may have changed whether `open_change`'s path has a
                 // `DiffFile`, so refresh the cache immediately rather than leaving it stale.

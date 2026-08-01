@@ -5252,3 +5252,199 @@ untouched by this change) on an earlier run; re-ran that single test in isolatio
 it fail once more (4/5 clean) - consistent with the ~1-in-5 rate already on file for that family,
 not a regression from this change. Two files touched: `crates/app/src/rail/state.rs`,
 `crates/app/src/rail/render.rs`.
+
+## Real test coverage for the Changes-panel commit composer, plus two real click-through bugs and a real "commits more than N files" bug it caught along the way
+
+A prior session on this branch had already built a substantial, real, already-integrated commit
+composer for the Changes panel (`AdeApp::render_commit_composer`/`render_commit_menu`,
+Revision R12 §5): a header (`COMMIT` · `N of M staged` · staged diffstat), a pre-drafted message
+box, a primary `Commit N files` button wired to a real `AdeApp::commit_staged_files` →
+`wt_core::undo::commit_paths` (`git add` + `git commit`), and a `▾` split-button popover with four
+menu rows, three of which are deliberately dimmed/inert since no real push/amend/stash plumbing
+exists yet. It had zero test coverage. This entry adds real, paint-based interaction tests for it
+- and, in the process of proving the claims in its own doc comments, found and fixed three real
+bugs the doc comments either enabled or papered over.
+
+**Test infra note.** Neither the primary button, the menu toggle, the scrim, the popover, nor its
+rows had a `.debug_selector()` - only `.id(...)`, which drives GPUI's click plumbing but not
+`VisualTestContext::debug_bounds` (confirmed by reading `gpui`'s own `div.rs`: `debug_selector` is
+a distinct field the paint code checks separately, the same split `code_surface::lsp_ui`'s
+`hover-card` selector's own comment already documents - "`debug_bounds` reads this, not `.id(..)`"
+- so nothing in this file could previously be clicked or measured by a test at all. Added
+selectors matching this crate's existing convention throughout, including baking the real
+staged-count/diffstat/branch/message text directly into a few selector strings
+(`commit-composer-progress-{staged}-of-{total}`, `commit-composer-stat-{+add −del}`, etc.) so a
+test can prove the composer reflects real computed state without GPUI needing a general
+"read back painted text" API - the same trick `merge::render`'s `merge-{side}-code-row-{n}` and
+this file's own `file-tree-row-{name}` selectors already use.
+
+**Six new `commit_composer_tests`** (a real feature-branch repo, `simulate_click` +
+`debug_bounds`, matching `virtualization_tests`'/`status_bar_zoom_click_tests`' own discipline):
+the composer's header/diffstat/branch/message genuinely track real `staged_subset`/diff state
+across a real stage-toggle, not a hardcoded string (including the exact real `+1 −0` line count
+for a one-line real edit, not just "some non-empty diffstat"); the primary button is a genuine
+no-op with nothing staged (no commit, no in-flight flag, no in-flight *status string* either -
+see below on why that second check matters); a real click on the wired button reaches
+`commit_paths` for real (git commit count increments, `staged_files` clears, the diff reloads);
+the menu toggle genuinely opens and closes `commit_menu_open`; every non-primary menu row is
+genuinely inert (menu stays open, no commit, `staged_files` untouched); and two tests that
+specifically target the scrim/popover's click-blocking - see below.
+
+**Bug 1, found while writing the toggle-open/close test: the menu's scrim had no `.occlude()`.**
+GPUI's `Window::hit_test` (`vendor/zed/crates/gpui/src/window.rs`) walks *underneath* a
+non-occluding hitbox and keeps every hitbox it finds "hovered" unless something in front sets
+`HitboxBehavior::BlockMouse` - so a click on the still-visible primary button or menu-toggle,
+while positioned underneath the transparent (but not occluding) scrim, was genuinely reaching
+*both* the scrim's own close handler *and* the real button underneath in the same click. Proved
+real, not theoretical, by temporarily removing `.occlude()` and watching two tests fail for real:
+a second click on the toggle re-opened the menu instead of closing it (the scrim's `set false`
+firing, then the toggle's own `!self.commit_menu_open` firing right after and flipping it back to
+`true`), and a click on the primary button's own position, while the menu was open, created a
+real extra git commit. Fixed with the same `.occlude()` `root::resize::render_resize_handle`
+already uses for the identical "receives the mouse, not whatever's underneath" reason. A second,
+related gap the checker agent (below) found: the four-row popover paints *taller* than the short
+composer it hangs off, so its own top edge genuinely paints above the composer - outside the
+scrim's bounds entirely - over the real Changes-row list behind it; only the popover's own
+`.on_click(stop_propagation)` protected that region, which only worked by registration-order
+luck, not a structural guarantee. Gave the popover its own `.occlude()` too, and added a seventh
+test (`the_popover_blocks_a_click_even_where_it_paints_above_the_composers_own_bounds`) clicking
+right at the popover's real painted top edge and asserting no Changes-row diff opens.
+
+**Bug 2, found by the checker agent: `commit_paths` could commit more than the N files the button
+promised.** `wt_core::undo::commit_paths` did `git add -- <paths>` followed by a bare
+`git commit -m <message>` - and a bare `git commit` commits the *entire index*, not just what that
+call just staged. Reproduced directly with real git commands (and then as a real, failing wt-core
+test before the fix): stage `b.txt` via a separate `git add` first (standing in for an agent CLI
+running its own `git add` in this same worktree - the exact interleaving hazard
+`commit_all_changes`'s own doc already calls out for a sibling function), then call
+`commit_paths(&["a.txt"], ...)` - the resulting commit contained both files, silently including
+`b.txt` even though the UI's `Commit 1 file` button never claimed to touch it. Fixed by
+pathspec-limiting the commit itself (`git commit -m <message> -- <paths>`, not just the preceding
+`add`), verified independently with real git commands showing the pathspec-limited form leaves
+`b.txt` staged-but-uncommitted as it should. Added a real wt-core regression test,
+`commit_paths_never_commits_a_path_that_was_staged_by_something_else`, confirmed to fail against
+the pre-fix code and pass against the fix.
+
+**Bug 3, also found by the checker agent: a real, dead `⌘⏎`/`Ctrl+Enter` keycap on the primary
+button.** The composer painted a real keycap row for `mod+enter`, but no such global binding
+exists anywhere in `default_key_bindings` and the button has no focus handle for GPUI's own
+Enter/Space-activates-a-focused-element path to reach either - a keystroke that visibly promises
+an action and does nothing. This is the exact thing `work_surface::state::footer_actions`'s own
+`Keep all` row docs already name and deliberately avoid ("an audit caught this row still
+advertising the keycap after being promoted from `implemented: false` - a real keycap must never
+render for a keystroke that does nothing"), for the same underlying reason (`Ctrl+Enter` is a
+plausible "submit" gesture an agent CLI running in one of this app's own terminals could
+reasonably want for itself, so it isn't a safe global binding to add casually). Removed the
+keycap entirely from the composer rather than invent a new global binding, matching that
+precedent's own resolution.
+
+Two doc comments were also corrected to match what the code actually does, found while writing
+tests against their literal claims rather than trusting them: `commit_staged_files`'s doc claimed
+committed files "drop out of the Changes list" - false in the normal case, since `wt_core::diff`
+diffs the working tree against the merge-base with the default branch (not the previous commit),
+so a file committed on a feature branch that still differs from `main` correctly stays in the
+list (confirmed with real git commands before rewriting the comment, and reflected in the
+`clicking_the_primary_button_reaches_the_real_commit_staged_files_action` test's own assertion,
+which was originally written to expect the false behavior and had to be corrected too); and the
+same doc's parenthetical about staged paths surviving an in-flight commit was tightened to say
+precisely what the code does - it clears every committed path unconditionally once the commit
+finishes, even one a user un-staged and re-staged mid-flight (the staging checkbox isn't gated on
+`worktree_history_op_in_flight`), since `staged_files` is plain UI bookkeeping with no per-path
+history that could tell a genuine re-stage apart from an untouched one.
+
+**Adversarial check.** A fresh checker agent (read-only, given the whole diff but not this
+narrative) found bugs 2 and 3 above, the popover-occlusion gap, two real-but-weak spots in the
+first draft of the tests (the "disabled click never even starts the operation" assertion couldn't
+actually distinguish "never started" from "started and already finished" once `run_until_parked`
+had let it complete - strengthened to also check the synchronous `worktree_history_status` string;
+and the diffstat test only checked the empty-state selector's presence/absence, never a real
+number - strengthened to assert the exact `+1 −0` for the real one-line edit in the fixture), and
+confirmed clean on several other axes checked explicitly: no stale-read path from render to the
+real git-mutating call (`commit_staged_files` re-reads `staged_files`/`current_diff()`/
+`diff_root` synchronously in the click handler itself, snapshotting only *after* every guard
+passes), no unwrap/panic/blocking-IO-on-the-foreground-thread in the new code, and the other
+composer elements (message box, `redraft`, chip, branch label) have no click handlers to leak
+through in the first place. It also flagged one pre-existing, out-of-scope instance of the same
+scrim-occlusion bug class in `work_surface::render::render_plus_menu` (which this composer's own
+doc cites as the shape it matches) and a durable-state gap in `commit_paths` (a `git add` that
+succeeds followed by a `git commit` that fails, e.g. a rejecting pre-commit hook, leaves the real
+git index staged with nothing in the app surfacing it) - both noted here rather than fixed, since
+neither is reachable through this composer's own diff and each needs its own separate change.
+
+**Verification**: `export LIBRARY_PATH=/tmp/x11-deps/prefix/usr/lib/x86_64-linux-gnu`, then
+`cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy --workspace --all-targets
+-- -D warnings`, all clean. `cargo test --workspace --lib --test-threads=1`: **1095 + 44 + 14 +
+111 = 1264 passed, 0 failed** across all four crates (`app` 1095, `lsp-core` 44, `pty-core` 14,
+`wt-core` 111 - the last including both new `commit_paths` tests). One earlier full run hit the
+already-documented pre-existing `code_surface::diff_view::diff_render_tests` flake; re-run alone
+it passed, and the subsequent full run was clean with no re-run needed. All seven
+`commit_composer_tests` and both new `wt-core::undo::tests::commit_paths_*` tests were each
+independently confirmed to fail against the pre-fix code and pass against the fix, not just pass
+by construction.
+
+## Rebasing the commit-composer work onto the rail rewrite (Revision R12 stacking)
+
+This branch had drifted onto an old master tip and, separately, carried its own copy of the
+Revision R12 repo-data-model commit (`feat(app): repo data model - Revision R12 Phase 0`) - the
+same content already proposed independently as PR #56 (`revision-r12-repo-model`). It also
+touches `rail/render.rs`, `rail/state.rs`, `rail/mod.rs`, `root/mod.rs`, `root/state.rs`,
+`sidebar/changes.rs`, and `theme.rs` - all substantially rewritten by PR #57
+(`revision-r12-rail-rewrite`, itself stacked on the repo-model PR).
+
+Rather than target `master` directly (which would re-propose the repo-model diff a second time
+and conflict hard with the rail rewrite), rebased onto `origin/revision-r12-rail-rewrite`. The
+duplicate repo-model commit became empty once rebased on top of a branch that already contains
+its content and was dropped automatically; the real conflicts in the overlapping rail/root/sidebar
+files were resolved by keeping the rail-rewrite side's structural changes and re-applying this
+branch's own commit-composer and Changes-panel additions on top of them.
+
+**Verification** (independently re-run, not just agent-reported): `cargo fmt --all -- --check`,
+`cargo build --workspace`, `cargo clippy --workspace --all-targets -- -D warnings` - all clean.
+`cargo test --workspace --lib --test-threads=1`: **1114 + 44 + 14 + 111 = 1283 passed, 0 failed**
+across all four crates. No conflict markers or unresolved merge artifacts remained in source after
+the rebase (grep for `<<<<<<<`/`=======`/`>>>>>>>` outside test fixture strings came back empty).
+
+## Rebasing onto the Agent rename + worktree-state-safety + title-bar-chips stack, and making the Changes-panel checkbox real git staging
+
+Three more branches landed on top of the same rail-rewrite base since the last rebase above:
+`revision-r12-agent-rename` (`Session`→`Agent` throughout `crates/app`), `revision-r12-worktree-
+state-safety` (`open_files`/`edit_buffers` re-keyed to be genuinely per-worktree instead of
+cleared on every switch), and `revision-r12-title-bar-chips` (an isolated `title_bar/*` addition).
+Rebased onto the last of the three; conflicts were every site still saying `Session`/`self.sessions`
+(mechanically updated to `Agent`/`self.agents`), every direct `self.open_files`/`self.edit_buffers`
+touch (routed through the new `open_files()`/`open_files_mut()` and `edit_buffer()`/
+`edit_buffer_mut()`/`insert_edit_buffer()` accessors), and a `BUILD-LOG.md` append conflict
+(resolved by keeping both sides' entries in commit order).
+
+Separately, a coordinator-found real bug: the Changes-panel staging checkbox
+(`AdeApp::toggle_staged`) only ever flipped an in-memory `HashSet<PathBuf>` - real git never saw
+anything until the commit composer's own `git add` ran at commit time
+(`wt_core::undo::commit_paths`). That contradicts the design's own §5 framing, "the checkbox **is**
+staging," taken literally rather than as a UI-only intent. New `wt_core::stage` module:
+`stage_path`/`unstage_path` (real, immediate `git add -- <path>` / `git reset -- <path>`) and
+`staged_paths` (`git diff --cached --name-only`, worktree-relative), each with real tests verifying
+the actual `git status --porcelain` index state, not just an in-memory flag.
+
+`toggle_staged` now flips `AdeApp::staged_files` optimistically and synchronously (so the checkbox
+responds with no perceptible delay), then runs the real git mutation on the background executor;
+a real failure reverts the optimistic flip and surfaces the error next to the composer
+(`AdeApp::staging_error`, `render_staging_error`) rather than silently reverting behind the user's
+back. `AdeApp::load_diff` now also re-derives `staged_files` from a fresh `staged_paths` query on
+every diff load - a live re-query, not a per-worktree cache like `open_files`/`edit_buffers`,
+because real git staging can change out from under this app at any moment (an agent CLI's own
+`git add`/`git reset` in the same worktree) and a cache would need its own invalidation story on
+top of the one `load_diff` already runs through on every switch/tree-op/post-commit reload. This
+is also what makes a worktree with something already staged in real git *before* Jerry ever opened
+it read as staged from the first frame, instead of starting at an honest-looking but wrong "0
+staged." `wt_core::undo::commit_paths`'s own leading `git add` is kept as a deliberate, documented
+idempotent safety net (a per-path staging failure that got silently reverted, or a worktree-switch
+race, can each leave the app's own idea of "staged" briefly behind the real index) rather than
+removed as now-redundant.
+
+Also checked against §5's other requirements while in this code: the commit composer's `▾`
+split-button menu already correctly renders its three unimplemented rows (push / amend / stash) as
+honestly disabled, not fake-clickable - unchanged, no fix needed there.
+
+**Verification**: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings` - all clean. `cargo test --workspace --lib
+--test-threads=1`: **1130 + 44 + 14 + 119 = 1307 passed, 0 failed** across all four crates.

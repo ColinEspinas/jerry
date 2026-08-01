@@ -5,6 +5,8 @@ use crate::root::widgets::{
     render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
 };
 use crate::settings::widgets::ChoiceOption;
+use crate::worktree_history::flow as worktree_history;
+use gpui::BoxShadow;
 
 impl AdeApp {
     /// Switches which data source the right sidebar shows. Switching *to* the Changes view
@@ -254,14 +256,186 @@ impl AdeApp {
         self.load_file_tree(self.file_tree_root.clone(), cx);
     }
 
-    /// Toggles a file's reviewed state - the Changes row checkbox's click handler.
-    /// `Self::render_change_row` stops propagation at the call site so checking a box never
-    /// also opens that file's diff.
-    pub(in crate::sidebar) fn toggle_reviewed(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if !self.reviewed_files.remove(&path) {
-            self.reviewed_files.insert(path);
+    /// Toggles a file's staged state (Revision R12 §5: the checkbox **is** staging) - the
+    /// Changes row checkbox's click handler. `Self::render_change_row` stops propagation at the
+    /// call site so checking a box never also opens that file's diff.
+    ///
+    /// Real, immediate git staging, not a UI-only intent recorded for later: checking the box
+    /// runs a real `git add -- <path>` (`wt_core::stage::stage_path`); unchecking it runs a real
+    /// `git reset -- <path>` (`wt_core::stage::unstage_path`) - the design's own "the checkbox
+    /// **is** staging" framing, taken literally. [`Self::staged_files`] flips optimistically,
+    /// synchronously, in the same click (so the checkbox visibly responds with no perceptible
+    /// delay) and the real git mutation runs on the background executor right after, matching
+    /// every other real git-mutating action in this app
+    /// (`crate::worktree_history::flow`'s own "never block the foreground thread" discipline).
+    ///
+    /// If the real git call fails, the optimistic flip is reverted (back to whatever
+    /// [`Self::staged_files`] would have read before this click) and the real error is recorded
+    /// in [`Self::staging_error`] - never left as a silent success that only *looked* like it
+    /// worked. A late-resolving revert can theoretically race a newer click on the *same* path
+    /// that started after this one failed (e.g. stage, fail, immediately re-stage by hand before
+    /// the failure's `this.update` runs) and clobber that newer click's own optimistic state;
+    /// this is accepted as a rare, honest tradeoff rather than added generation-counter machinery
+    /// for a failure mode (a `git add`/`git reset` on a path this app itself just resolved from a
+    /// real, loaded diff) that real-repo testing never actually produces.
+    pub(in crate::sidebar) fn toggle_staged(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let should_stage = !self.staged_files.remove(&path);
+        if should_stage {
+            self.staged_files.insert(path.clone());
         }
+        self.staging_error = None;
         cx.notify();
+
+        let worktree_path = self.diff_root.clone();
+        let git_path = path.clone();
+        let revert_path = path.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if should_stage {
+                        wt_core::stage::stage_path(&worktree_path, &git_path)
+                    } else {
+                        wt_core::stage::unstage_path(&worktree_path, &git_path)
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Err(err) = result {
+                    // Revert the optimistic flip - the real index never actually changed, so
+                    // the checkbox must not keep claiming it did.
+                    if should_stage {
+                        this.staged_files.remove(&revert_path);
+                    } else {
+                        this.staged_files.insert(revert_path.clone());
+                    }
+                    let verb = if should_stage { "stage" } else { "unstage" };
+                    this.staging_error = Some((revert_path, format!("failed to {verb}: {err}")));
+                    cx.notify();
+                }
+            });
+        });
+        // Two different rows' checkboxes clicked in quick succession are independent real git
+        // operations - see `Self::_stage_tasks`'s own docs for why this can't be a single
+        // `Option<Task<()>>` slot.
+        self._stage_tasks.push(task);
+    }
+
+    /// The real, honest surface for a failed real staging/unstaging call
+    /// ([`Self::staging_error`]) - the Changes-panel sibling of [`Self::tree_op_error`]'s own
+    /// render site, next to the composer the failed checkbox lives above rather than buried in
+    /// the log.
+    pub(in crate::sidebar) fn render_staging_error(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let (_, message) = self.staging_error.clone()?;
+        Some(
+            div()
+                .id("staging-error")
+                .debug_selector(|| "staging-error".to_string())
+                .flex_none()
+                .w_full()
+                .px(px(10.0))
+                .py(px(5.0))
+                .font(font(theme::font::MONO))
+                .text_size(self.ui_text_size(10.0))
+                .text_color(theme::status::FAIL)
+                .cursor_pointer()
+                .tooltip(text_tooltip("Click to dismiss"))
+                .child(message)
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.staging_error = None;
+                    cx.notify();
+                })),
+        )
+    }
+
+    /// The commit composer's primary action (Revision R12 §5) - a real `git add -- <staged
+    /// paths>` + `git commit` (`wt_core::undo::commit_paths`) on [`Self::diff_root`] (the
+    /// worktree the currently-shown diff/staged set belongs to), using
+    /// `changes::draft_commit_message`'s placeholder message (see that function's own docs for
+    /// why real agent-drafted messages are out of scope here). A genuine no-op - never a
+    /// clickable-looking op that silently does nothing - with nothing staged, or while another
+    /// worktree-history operation is already in flight (shares
+    /// [`Self::worktree_history_op_in_flight`] with `Keep all changes`/`Discard worktree`/`Undo`/
+    /// `Redo` - see `worktree_history::flow`'s own module docs for why one flag is enough
+    /// discipline here). On success, clears exactly the committed `paths` (captured once, up
+    /// front, before the async git work starts) from [`Self::staged_files`] - any *other* path
+    /// staged or unstaged during the in-flight window is untouched, since the removal loop only
+    /// ever iterates that fixed snapshot. This is unconditional for the paths that *were*
+    /// committed, though: [`Self::staged_files`] is plain UI bookkeeping with no per-path
+    /// staged/committed history, so if a user un-stages and re-stages one of the very paths this
+    /// call just committed while it was still in flight (the staging checkbox itself isn't
+    /// gated on [`Self::worktree_history_op_in_flight`]), that path is still cleared once the
+    /// commit finishes - there is no way to tell that re-staging apart from it never having been
+    /// touched. Reloads the diff so it reflects the real post-commit state. That reload does
+    /// **not**
+    /// generally drop the just-committed files out of the Changes list: `wt_core::diff`'s own
+    /// docs are explicit that `diff_against_base` diffs the working tree against the
+    /// **merge-base with the default branch**, not against the previous commit, so a file
+    /// committed on a feature branch that still differs from that branch's content keeps
+    /// showing up - correctly, since it is still an uncommitted-relative-to-`main` change worth
+    /// reviewing, only now with its content latched into a real commit instead of sitting
+    /// uncommitted.
+    ///
+    /// No `Undo`/`Redo` integration yet, unlike the other four `worktree_history_op_in_flight`
+    /// operations - a real, stated gap (see `wt_core::undo::commit_paths`'s own docs), not a
+    /// fake "undo" that would only look like it worked.
+    pub(in crate::sidebar) fn commit_staged_files(&mut self, cx: &mut Context<Self>) {
+        if self.worktree_history_op_in_flight.is_some() {
+            return;
+        }
+        let Some(diff) = self.current_diff() else {
+            return;
+        };
+        let staged = changes::staged_subset(&diff.files, &self.staged_files);
+        if staged.is_empty() {
+            return;
+        }
+        let message = changes::draft_commit_message(&staged);
+        let paths: Vec<PathBuf> = staged.iter().map(|file| file.path.clone()).collect();
+        let worktree_path = self.diff_root.clone();
+        let branch_display = self.branch_display_for(&worktree_path);
+        let file_count = paths.len();
+
+        self.worktree_history_op_in_flight = Some(worktree_history::WorktreeHistoryOpKind::Commit);
+        self.worktree_history_status = Some(format!(
+            "committing {file_count} file{} in {branch_display}\u{2026}",
+            if file_count == 1 { "" } else { "s" }
+        ));
+        cx.notify();
+
+        let commit_paths = paths.clone();
+        let commit_worktree_path = worktree_path.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    wt_core::undo::commit_paths(&commit_worktree_path, &commit_paths, &message)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.worktree_history_op_in_flight = None;
+                match result {
+                    Ok(_outcome) => {
+                        this.worktree_history_status = Some(format!(
+                            "committed {file_count} file{} in {branch_display}",
+                            if file_count == 1 { "" } else { "s" }
+                        ));
+                        for path in &paths {
+                            this.staged_files.remove(path);
+                        }
+                        this.load_diff(worktree_path.clone(), cx);
+                    }
+                    Err(err) => {
+                        this.worktree_history_status = Some(format!("commit failed: {err}"));
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self._worktree_history_task = Some(task);
     }
 
     /// The `A`/`M` change marks for every changed file in the currently loaded diff, keyed by
@@ -1165,6 +1339,8 @@ impl AdeApp {
                                 .min_h_0()
                                 .child(self.render_changes_rows(cx)),
                         )
+                        .children(self.render_staging_error(cx))
+                        .child(self.render_commit_composer(diff, cx))
                         .child(render_changes_footer(self.ui_text_size(10.0)))
                 }
                 // This arm keeps its `.overflow_y_scroll()`: it renders a single message, never
@@ -1182,20 +1358,25 @@ impl AdeApp {
         }
     }
 
-    /// The Changes header: file count, a review-progress bar, and `N reviewed` count, both
-    /// computed directly from [`Self::reviewed_files`]'s membership against `diff`'s file
-    /// list rather than an independently tracked counter that could drift.
+    /// The Changes header: file count, a staged-progress bar, and `N staged` count, both
+    /// computed directly from [`Self::staged_files`]'s membership against `diff`'s file
+    /// list rather than an independently tracked counter that could drift. Distinct wording from
+    /// the commit composer's own `N of M staged` count just below it (Revision R12 §5/§4's "no
+    /// two counters in the window may share wording while counting different units") - this one
+    /// answers "how many of the worktree's changed files are staged", the composer's answers
+    /// "how many of those staged files is the next commit about to include" (today the same set,
+    /// but a distinct question).
     pub(in crate::sidebar) fn render_changes_header(
         &self,
         diff: &WorktreeDiff,
     ) -> impl IntoElement {
         let total = diff.files.len();
-        let reviewed = diff
+        let staged = diff
             .files
             .iter()
-            .filter(|file| self.reviewed_files.contains(&file.path))
+            .filter(|file| self.staged_files.contains(&file.path))
             .count();
-        let progress = changes::ReviewProgress { reviewed, total };
+        let progress = changes::StagedProgress { staged, total };
         let fraction = progress.fraction();
         const BAR_WIDTH: f32 = 56.0;
 
@@ -1240,7 +1421,7 @@ impl AdeApp {
                     .font(font(theme::font::MONO))
                     .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::DIM)
-                    .child(format!("{reviewed} reviewed")),
+                    .child(format!("{staged} staged")),
             )
     }
 
@@ -1354,11 +1535,13 @@ impl AdeApp {
         column.into_any_element()
     }
 
-    /// One Changes row: a review checkbox, `dir`/`name`, an optional tag pill, `+n`/`−n`, and
-    /// the five-segment stat bar. Clicking anywhere on the row other than the checkbox itself
-    /// (see [`Self::render_review_checkbox`]'s `stop_propagation`) opens the file's diff via
-    /// [`Self::open_change_diff`] - which, since GitHub issue #15, also reveals and highlights
-    /// that file in the Files tree, the same as every other way of opening a file in this app.
+    /// One Changes row: a staging checkbox, `dir`/`name`, a `flex:none` per-author chip group
+    /// (Revision R12 §5, multi-agent worktrees only - see [`Self::render_change_author_chips`]),
+    /// an optional tag pill, `+n`/`−n`, and the five-segment stat bar. Clicking anywhere on the
+    /// row other than the checkbox itself (see [`Self::render_staging_checkbox`]'s
+    /// `stop_propagation`) opens the file's diff via [`Self::open_change_diff`] - the checkbox
+    /// **is** staging, not "reviewed": it has its own click target, entirely separate from the
+    /// row body's.
     pub(in crate::sidebar) fn render_change_row(
         &self,
         file: &DiffFile,
@@ -1366,12 +1549,13 @@ impl AdeApp {
     ) -> impl IntoElement {
         let path = file.path.clone();
         let open_path = path.clone();
-        let reviewed = self.reviewed_files.contains(&file.path);
+        let staged = self.staged_files.contains(&file.path);
         let selected = self.open_change.as_deref() == Some(file.path.as_path());
         let (add, del) = changes::diff_file_stats(file);
         let (dir, name) = changes::split_dir_name(&file.path);
         let tag = changes::change_tag(file.status);
         let segments = changes::stat_bar_segments(add, del);
+        let author_chips = self.render_change_author_chips(&file.path);
 
         // See `Self::render_file_tree_row`'s own `debug_selector` for why this exists, and why
         // the closure borrows `file` instead of capturing an owned `String`.
@@ -1399,7 +1583,7 @@ impl AdeApp {
             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                 this.open_change_diff(open_path.clone(), window, cx);
             }))
-            .child(self.render_review_checkbox(path, reviewed, cx))
+            .child(self.render_staging_checkbox(path, staged, cx))
             .when(!dir.is_empty(), |el| {
                 el.child(
                     div()
@@ -1418,13 +1602,17 @@ impl AdeApp {
                     .font(font(theme::font::MONO))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_size(self.ui_text_size(11.5))
-                    .text_color(if reviewed {
-                        theme::text::DIMMER
-                    } else {
+                    // Staged rows read at full strength; unstaged drop to `theme::text::DIM` -
+                    // the exact inverse of the old "reviewed" dimming this replaces (Revision R12
+                    // §5), never both conventions at once.
+                    .text_color(if staged {
                         theme::text::STRONG
+                    } else {
+                        theme::text::DIM
                     })
                     .child(name),
             )
+            .when_some(author_chips, |el, chips| el.child(chips))
             .when_some(tag, |el, tag| el.child(render_tag_pill(tag)))
             // A rename-only file gets no `tag` from `changes::change_tag` (a plain rename
             // isn't `new`/`del`), so without this it looked identical to an unchanged file.
@@ -1451,17 +1639,80 @@ impl AdeApp {
             .child(render_stat_bar(segments))
     }
 
-    /// The Changes row's 12×12 review checkbox - toggled via [`Self::toggle_reviewed`]. Stops
-    /// propagation on click so checking a box never also opens the row's diff, mirroring
-    /// `Self::render_agent_tab`'s nested-clickable-child pattern (its tab-close `×`).
-    pub(in crate::sidebar) fn render_review_checkbox(
+    /// The Changes row's `flex:none` per-file author chip group (Revision R12 §5): one
+    /// [`render_change_author_chip`] per agent [`AdeApp::file_authorship`] records as having
+    /// written this file, with a 1px amber ring (`theme::status::ASK_CARD_EDGE`) once it has more
+    /// than one. `None` (never an empty-but-present group) unless the currently selected
+    /// worktree has more than one agent - [`Self::current_worktree_agent_count`] is this
+    /// gate, per the design's own reasoning: with a single agent every chip would be identical
+    /// and carry no information.
+    ///
+    /// `file_authorship` is real, wired data (`crate::sidebar::changes::Authorship::authors_for`)
+    /// that today is always empty - the heuristic that records edits into it lives on a separate,
+    /// not-yet-merged branch (see [`crate::root::AdeApp::file_authorship`]'s own docs) - so a
+    /// multi-agent worktree renders a real, ringless, chip-less group until that heuristic lands,
+    /// rather than fabricating a chip for an agent nobody recorded.
+    pub(in crate::sidebar) fn render_change_author_chips(
+        &self,
+        path: &Path,
+    ) -> Option<impl IntoElement> {
+        if self.current_worktree_agent_count() <= 1 {
+            return None;
+        }
+        let ring: gpui::Rgba = if self.file_authorship.has_multiple_authors(path) {
+            theme::status::ASK_CARD_EDGE.into()
+        } else {
+            work_surface::TRANSPARENT
+        };
+        let mut group = div()
+            .flex_none()
+            .flex()
+            .gap(px(2.0))
+            .p(px(1.0))
+            .rounded(theme::radius::BUTTON)
+            .border_1()
+            .border_color(ring);
+        for &id in self.file_authorship.authors_for(path) {
+            if let Some(kind) = self.agent_kind_for(id) {
+                group = group.child(render_change_author_chip(kind));
+            }
+        }
+        Some(group)
+    }
+
+    /// Resolves a recorded author's [`AgentKind`] for chip tinting - `None` if that agent has
+    /// since closed (its process exited, its tab closed), in which case
+    /// [`Self::render_change_author_chips`] simply omits the chip rather than guessing a kind for
+    /// an agent that no longer exists.
+    fn agent_kind_for(&self, id: AgentId) -> Option<AgentKind> {
+        self.agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .map(|agent| agent.kind)
+    }
+
+    /// How many distinct agent (non-`Shell`) processes are running in the currently selected
+    /// worktree - Revision R12 §5's gate for the Changes row author chip group. Reuses
+    /// [`Self::current_worktree_agents`] (`crate::work_surface::render`) so this and the tab
+    /// strip can never disagree about which agents belong to the selected worktree.
+    pub(in crate::sidebar) fn current_worktree_agent_count(&self) -> usize {
+        self.current_worktree_agents()
+            .filter(|agent| agent.kind != AgentKind::Shell)
+            .count()
+    }
+
+    /// The Changes row's 12×12 staging checkbox (Revision R12 §5: the checkbox **is** staging,
+    /// not "reviewed") - toggled via [`Self::toggle_staged`]. Stops propagation on click so
+    /// checking a box never also opens the row's diff, mirroring `Self::render_agent_tab`'s
+    /// nested-clickable-child pattern (its tab-close `×`).
+    pub(in crate::sidebar) fn render_staging_checkbox(
         &self,
         path: PathBuf,
         checked: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
-            .id(format!("review-checkbox-{}", path.display()))
+            .id(format!("stage-checkbox-{}", path.display()))
             .flex_none()
             .w(px(12.0))
             .h(px(12.0))
@@ -1476,15 +1727,512 @@ impl AdeApp {
                     .border_color(theme::toggle::TRACK_ON)
             })
             .when(!checked, |el| el.border_color(theme::border::BUTTON))
+            .hover(|el| el.border_color(theme::toggle::CHECKBOX_HOVER))
             .font(font(theme::font::MONO))
             .text_size(self.ui_text_size(9.0))
             .text_color(theme::button::GREEN_FG)
             .when(checked, |el| el.child("\u{2713}"))
             .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                 cx.stop_propagation();
-                this.toggle_reviewed(path.clone(), cx);
+                this.toggle_staged(path.clone(), cx);
             }))
     }
+
+    /// The commit composer at the foot of the Changes panel (Revision R12 §5): header row
+    /// (`COMMIT` · `N of M staged` · staged diffstat), a pre-drafted message box, and the primary
+    /// commit action with its `▾` split-button menu. The staged set is derived once, early
+    /// (`changes::staged_subset`), so the header count/diffstat/message/action-button all read
+    /// from the exact same list, per the design's own "derive the staged set once" rule.
+    ///
+    /// Always rendered, even with nothing staged - the primary action just drops to a disabled-
+    /// looking ghost `Commit` in that case (never hidden outright).
+    pub(in crate::sidebar) fn render_commit_composer(
+        &self,
+        diff: &WorktreeDiff,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let staged = changes::staged_subset(&diff.files, &self.staged_files);
+        let staged_count = staged.len();
+        let total = diff.files.len();
+        let (add, del) = changes::staged_diff_stats(&staged);
+        let stat_text = if staged_count > 0 {
+            format!("+{add} \u{2212}{del}")
+        } else {
+            String::new()
+        };
+
+        let branch = self
+            .worktrees
+            .iter()
+            .find(|item| item.path == self.diff_root)
+            .and_then(|item| item.branch.clone())
+            .unwrap_or_else(|| "(detached)".to_string());
+
+        // The agent whose tint/initial the message box's chip shows - the current worktree's
+        // first real agent, if any. There is no per-message "which agent drafted this"
+        // fact to read (`changes::draft_commit_message`'s own docs cover why the message itself
+        // is a deterministic placeholder, not real agent output) - `AgentKind::Shell`'s
+        // existing neutral chip (`work_surface::agent_tint`'s own docs: "isn't an agent, so it
+        // gets a neutral chip instead of an invented tint") is the honest fallback with none.
+        let drafting_kind = self
+            .current_worktree_agents()
+            .find(|agent| agent.kind != AgentKind::Shell)
+            .map(|agent| agent.kind);
+        let drafted_by = match drafting_kind {
+            Some(kind) => format!("drafted by {}", kind.label()),
+            None => "drafted by no agent".to_string(),
+        };
+        let chip_kind = drafting_kind.unwrap_or(AgentKind::Shell);
+        let (chip_fg, chip_bg) = work_surface::agent_tint(chip_kind);
+        let chip_initial = work_surface::agent_initial(chip_kind);
+
+        let message = if staged.is_empty() {
+            String::new()
+        } else {
+            changes::draft_commit_message(&staged)
+        };
+
+        let busy = self.worktree_history_op_in_flight.is_some();
+        let committing = self.worktree_history_op_in_flight
+            == Some(worktree_history::WorktreeHistoryOpKind::Commit);
+        let can_commit = staged_count > 0 && !busy;
+        let label = if committing {
+            "committing\u{2026}".to_string()
+        } else {
+            changes::commit_button_label(staged_count)
+        };
+        // Visual state (green vs. ghost) tracks whether anything is staged, independent of
+        // `can_commit`'s click-gating - the same "keep the enabled look while a busy label
+        // shows" precedent `Self::render_footer_action_button` already follows for its own
+        // `discarding…`/`keeping…` busy labels.
+        let has_staged = staged_count > 0;
+        let (primary_bg, primary_border, primary_fg): (gpui::Rgba, gpui::Rgba, gpui::Rgba) =
+            if has_staged {
+                (
+                    theme::button::GREEN_BG.into(),
+                    theme::button::GREEN_BG.into(),
+                    theme::button::GREEN_FG.into(),
+                )
+            } else {
+                (
+                    work_surface::TRANSPARENT,
+                    // No exact token for the mockup's disabled-state `#262b30` - reused
+                    // `theme::border::BUTTON` (`#2a2f34`, the closest ported outline-button
+                    // border), the same reuse-nearest-token convention
+                    // `work_surface::state::tab_colors`'s own docs establish for
+                    // `theme::text::DIMMER` standing in for the design's `#767d84`.
+                    theme::border::BUTTON.into(),
+                    theme::text::FAINTER.into(),
+                )
+            };
+        // No `⌘⏎`/`Ctrl+Enter` keycap on the primary button: the mockup shows one, but this app
+        // has no real global keybinding for it - the same "app-level shortcut steals terminal
+        // input" risk `work_surface::state::footer_actions`'s own `Keep all` row docs this exact
+        // omission for (this app's whole domain is running agent CLIs in terminals, and
+        // Ctrl+Enter/Cmd+Enter is a plausible "submit" gesture one of them could reasonably use
+        // itself). That row's own docs are explicit that an audit once caught a keycap still
+        // rendering after a promotion to "real" with no binding behind it - "a real keycap must
+        // never render for a keystroke that does nothing" - so this composer never grows one in
+        // the first place.
+        let menu_open = self.commit_menu_open;
+
+        // Test-only (no-op outside `cfg(test)`/`test-support`, matching every other
+        // `debug_selector` in this file - see e.g. `Self::render_status_zoom_value`'s own
+        // comment): the real staged/total counts baked directly into the selector string, so a
+        // real interaction test can prove this header reflects real `staged_subset`/diff state
+        // rather than a hardcoded string, without GPUI needing a general "read back the painted
+        // text" API.
+        let header_selector = format!("commit-composer-progress-{staged_count}-of-{total}");
+        let stat_selector = format!("commit-composer-stat-{stat_text}");
+        let branch_selector = format!("commit-composer-branch-{branch}");
+        let message_selector = if message.is_empty() {
+            "commit-composer-message-empty".to_string()
+        } else {
+            format!("commit-composer-message-{message}")
+        };
+
+        let mut composer = div()
+            .id("commit-composer")
+            .relative()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .px(px(12.0))
+            .pt(px(9.0))
+            .pb(px(10.0))
+            .border_t_1()
+            .border_color(theme::border::INNER)
+            .bg(theme::surface::FOOTER)
+            .child(
+                // Header row: `COMMIT` · `N of M staged` · staged diffstat, right-aligned.
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .pb(px(7.0))
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_size(px(9.5))
+                            .text_color(theme::palette::GROUP_HEADER)
+                            .child("COMMIT"),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || header_selector)
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.0))
+                            .text_color(theme::text::DIM)
+                            .child(format!("{staged_count} of {total} staged")),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .debug_selector(move || stat_selector)
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.0))
+                            .text_color(theme::diff::STAT_ADD)
+                            .child(stat_text),
+                    ),
+            )
+            .child(
+                // The pre-drafted message box.
+                div()
+                    .flex_none()
+                    .border_1()
+                    .border_color(theme::border::CARD)
+                    .rounded(theme::radius::CARD_SM)
+                    .bg(theme::surface::CARD_SUNK)
+                    .px(px(9.0))
+                    .pt(px(7.0))
+                    .pb(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .pb(px(5.0))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(13.0))
+                                    .h(px(13.0))
+                                    .rounded(theme::radius::CHIP)
+                                    .bg(chip_bg)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .font(font(theme::font::MONO))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_size(px(7.5))
+                                    .text_color(chip_fg)
+                                    .child(chip_initial),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .truncate()
+                                    .font(font(theme::font::SANS))
+                                    .text_size(px(9.5))
+                                    .text_color(theme::text::FAINTER)
+                                    .child(drafted_by),
+                            )
+                            .child(
+                                // Non-interactive by design: there is no real agent-drafted
+                                // message generation to redraft *from* yet - see
+                                // `changes::draft_commit_message`'s own docs. Shown, never
+                                // clickable-looking (no cursor/hover), matching this codebase's
+                                // `ActionKind::Unimplemented` convention for a real, visible,
+                                // honestly-inert affordance.
+                                div()
+                                    .flex_none()
+                                    .font(font(theme::font::SANS))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_size(px(9.5))
+                                    .text_color(theme::text::DIMMER)
+                                    .child("redraft"),
+                            ),
+                    )
+                    .child(
+                        div().flex().items_start().child(
+                            div()
+                                .debug_selector(move || message_selector)
+                                .flex_1()
+                                .min_w_0()
+                                .font(font(theme::font::SANS))
+                                .text_size(px(11.5))
+                                .line_height(px(17.0))
+                                .text_color(if message.is_empty() {
+                                    theme::text::FAINT
+                                } else {
+                                    theme::text::STRONG
+                                })
+                                .child(if message.is_empty() {
+                                    "no files staged yet".to_string()
+                                } else {
+                                    message
+                                }),
+                        ),
+                    ),
+            )
+            .child(
+                // Primary action + split-button menu + right-aligned target branch.
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .pt(px(8.0))
+                    .child({
+                        let mut button = div()
+                            .id("commit-composer-primary")
+                            .debug_selector(|| "commit-composer-primary".to_string())
+                            .flex_none()
+                            .h(px(24.0))
+                            .px(px(10.0))
+                            .rounded(theme::radius::BUTTON)
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .bg(primary_bg)
+                            .border_1()
+                            .border_color(primary_border)
+                            .child(
+                                div()
+                                    .font(font(theme::font::SANS))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_size(px(11.0))
+                                    .text_color(primary_fg)
+                                    .child(label),
+                            );
+                        button = if can_commit {
+                            button
+                                .cursor_pointer()
+                                .hover(|el| el.bg(theme::button::GREEN_BG_HOVER))
+                                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                    this.commit_staged_files(cx);
+                                }))
+                        } else {
+                            button.cursor_default()
+                        };
+                        button
+                    })
+                    .child(
+                        div()
+                            .id("commit-composer-menu-toggle")
+                            .debug_selector(|| "commit-composer-menu-toggle".to_string())
+                            .flex_none()
+                            .w(px(24.0))
+                            .h(px(24.0))
+                            .rounded(theme::radius::BUTTON)
+                            .border_1()
+                            .border_color(theme::border::BUTTON)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                            .font(font(theme::font::MONO))
+                            .text_size(px(8.5))
+                            .text_color(theme::text::DIMMER)
+                            .child("\u{25be}")
+                            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                this.commit_menu_open = !this.commit_menu_open;
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().flex_1().min_w_0())
+                    .child(
+                        div()
+                            .debug_selector(move || branch_selector)
+                            .flex_none()
+                            .max_w(px(120.0))
+                            .overflow_hidden()
+                            .truncate()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.0))
+                            .text_color(theme::text::PATH)
+                            .child(branch),
+                    ),
+            );
+
+        if menu_open {
+            composer = composer.child(self.render_commit_menu(cx));
+        }
+
+        composer
+    }
+
+    /// The commit composer's `▾` split-button popover (Revision R12 §5): *Commit and push* /
+    /// *Commit all N files* / *Amend last commit* / *Stash staged files*. Opens **upward** -
+    /// `bottom`-anchored, not `top` - since the button it hangs off sits near the bottom of the
+    /// Changes panel. A transparent, `.occlude()`d scrim confined to the composer's own bounds
+    /// (matching [`crate::work_surface::render::AdeApp::render_plus_menu`]'s click-away-
+    /// dismisses shape, scoped smaller here since the composer itself is the only positioned
+    /// ancestor available) closes the menu on a click anywhere else *within the composer* -
+    /// this is not a window-wide click-away like `render_plus_menu`'s own scrim, only the
+    /// composer's own footprint; the popover panel itself also `.occlude()`s and stops that
+    /// click from bubbling further.
+    ///
+    /// Every row is real, visible, and **honestly non-interactive**: only the primary `Commit N
+    /// files` button (`Self::commit_staged_files`, backed by a real `wt_core::undo::commit_paths`)
+    /// has real backing today. Push credentials, amend, and stash all need real git plumbing this
+    /// phase doesn't add - each row is dimmed and un-clickable, the same
+    /// `work_surface::state::ActionKind::Unimplemented` convention this codebase already uses for
+    /// "visible, real, but not wired up yet" (never a clickable-looking no-op).
+    fn render_commit_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (shadow_x, shadow_y, shadow_blur) = theme::shadow::COMMIT_MENU;
+        let branch = self
+            .worktrees
+            .iter()
+            .find(|item| item.path == self.diff_root)
+            .and_then(|item| item.branch.clone())
+            .unwrap_or_else(|| "(detached)".to_string());
+        let total = self
+            .current_diff()
+            .map(|diff| diff.files.len())
+            .unwrap_or(0);
+
+        div()
+            .id("commit-menu-scrim")
+            .debug_selector(|| "commit-menu-scrim".to_string())
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            // Without this, `Window::hit_test` (`vendor/zed/crates/gpui/src/window.rs`) keeps
+            // walking *underneath* this transparent overlay and includes whatever real button
+            // sits at the same screen position as still "hovered" - so a click that lands on,
+            // say, the still-visible `Self::render_commit_composer` menu-toggle button beneath
+            // this scrim would fire *both* the scrim's own close handler *and* that button's
+            // real handler in the same click. `.occlude()` is the same fix
+            // `root::resize::render_resize_handle`'s own handle already uses for exactly this
+            // "receives the mouse, not whatever's underneath" reason. Proved genuinely necessary
+            // (not cargo-culted) by `commit_composer_tests::
+            // opening_the_commit_menu_blocks_a_real_click_on_the_primary_button_underneath` and
+            // `commit_composer_tests::clicking_the_menu_toggle_genuinely_opens_and_closes_the_
+            // commit_menu`, both of which fail without it.
+            .occlude()
+            .bg(work_surface::TRANSPARENT)
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                this.commit_menu_open = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("commit-menu-popover")
+                    .debug_selector(|| "commit-menu-popover".to_string())
+                    .absolute()
+                    .left(px(12.0))
+                    .right(px(12.0))
+                    .bottom(px(44.0))
+                    // The composer itself is short (~135px of header/message-box/button-row),
+                    // shorter than this four-row popover (`bottom(px(44.0))` plus its own real
+                    // painted height) - so the popover's *top* genuinely paints above the
+                    // composer's own top edge, over the Changes rows behind it, which is outside
+                    // the scrim's own bounds (`top(0)/bottom(0)` relative to the composer, not
+                    // the whole sidebar - see this fn's own docs on the scrim being "confined to
+                    // the composer's own bounds"). Without its own `.occlude()` here, a click in
+                    // that overflow region only avoids reaching a real Changes row underneath by
+                    // relying on `Window::dispatch_mouse_event`'s bubble-phase registration
+                    // order happening to run this popover's own `stop_propagation` listener
+                    // first - a coincidence of paint order, not a structural guarantee. This
+                    // makes the block real regardless of ordering, the same reasoning as the
+                    // scrim's own `.occlude()` above.
+                    .occlude()
+                    .py(px(4.0))
+                    .bg(theme::surface::PALETTE)
+                    .border_1()
+                    .border_color(theme::border::POPOVER)
+                    .rounded(theme::radius::CARD)
+                    .shadow(vec![BoxShadow::new(
+                        shadow_x,
+                        shadow_y,
+                        gpui::black().opacity(0.5),
+                    )
+                    .blur_radius(shadow_blur)])
+                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                    }))
+                    .child(render_commit_menu_row(
+                        "Commit and push",
+                        format!("origin/{branch}"),
+                    ))
+                    .child(render_commit_menu_row(
+                        "Commit all files",
+                        format!("stages the rest first \u{2022} {total} total"),
+                    ))
+                    .child(render_commit_menu_row(
+                        "Amend last commit",
+                        "rewrites the tip".to_string(),
+                    ))
+                    .child(render_commit_menu_row(
+                        "Stash staged files",
+                        "keeps the worktree clean".to_string(),
+                    )),
+            )
+    }
+}
+
+/// One row of [`AdeApp::render_commit_menu`]'s split-button popover - label + sub-label, no
+/// leading chip (unlike `crate::work_surface::render::render_dropdown_menu_row`, which this
+/// deliberately doesn't reuse: the design has no per-row glyph here). Always dimmed and
+/// non-interactive - see [`AdeApp::render_commit_menu`]'s own docs for why.
+fn render_commit_menu_row(label: &'static str, sub: String) -> impl IntoElement {
+    div()
+        .id(format!("commit-menu-row-{label}"))
+        .debug_selector(move || format!("commit-menu-row-{label}"))
+        .flex()
+        .flex_col()
+        .gap(px(1.0))
+        .px(px(10.0))
+        .py(px(5.0))
+        .cursor_default()
+        .child(
+            div()
+                .font(font(theme::font::SANS))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_size(px(11.0))
+                .text_color(theme::text::GHOSTER)
+                .child(label),
+        )
+        .child(
+            div()
+                .font(font(theme::font::MONO))
+                .text_size(px(9.5))
+                .text_color(theme::text::FAINTER)
+                .child(sub),
+        )
+}
+
+/// One author chip in a Changes row's chip group (Revision R12 §5) - the same 13×13 visual
+/// template `Self::render_lang_chip` uses for the file tree's language chip
+/// (`crate::sidebar::file_tree::LangChip`), tinted per-agent via
+/// `work_surface::agent_tint`/`work_surface::agent_initial` (`work_surface::state`'s existing
+/// per-agent colour convention, already the tab strip's own source of truth) rather than a
+/// second, independently-tinted chip style.
+pub(in crate::sidebar) fn render_change_author_chip(kind: AgentKind) -> impl IntoElement {
+    let (fg, bg) = work_surface::agent_tint(kind);
+    let initial = work_surface::agent_initial(kind);
+    div()
+        .flex_none()
+        .w(px(13.0))
+        .h(px(13.0))
+        .rounded(theme::radius::CHIP)
+        .bg(bg)
+        .flex()
+        .items_center()
+        .justify_center()
+        .font(font(theme::font::MONO))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_size(px(7.5))
+        .text_color(fg)
+        .child(initial)
 }
 
 /// Which data source the right sidebar currently shows for the selected worktree - Zone 3's
@@ -3390,6 +4138,585 @@ mod indent_guide_tests {
         assert!(
             cx.debug_bounds("file-tree-guide-idle-b-0").is_some(),
             "the still-visible `b` row keeps its own level-0 guide"
+        );
+    }
+}
+
+/// Real interaction coverage for the commit composer (Revision R12 §5,
+/// `Self::render_commit_composer`/`Self::render_commit_menu`): a real repo, a real diff, and real
+/// `simulate_click`s - matching `virtualization_tests`' and `status_bar_zoom_click_tests`' own
+/// `debug_bounds` + `simulate_click` discipline - rather than trusting the composer's own doc
+/// comments about what is and isn't wired.
+#[cfg(test)]
+mod commit_composer_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    /// `.output()`, not `.status()` - see `virtualization_tests::git`'s own comment for why.
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_output(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn commit_count(dir: &std::path::Path) -> usize {
+        git_output(dir, &["rev-list", "--count", "HEAD"])
+            .parse()
+            .expect("git rev-list --count must print a real integer")
+    }
+
+    /// A real feature-branch repo with two files genuinely changed relative to `main`'s
+    /// merge-base - the same shape
+    /// `virtualization_tests::a_changes_row_far_below_the_viewport_is_never_painted` already
+    /// establishes for `AdeApp::current_diff` to be real and `Some` (there is no base to diff
+    /// against on the default branch itself - `wt_core::diff::DiffBase::OnDefaultBranch`).
+    fn changes_test_repo() -> TempDir {
+        let repo = TempDir::new().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("a.txt"), "one\ntwo\nthree\n").expect("write a.txt");
+        std::fs::write(repo.path().join("b.txt"), "uno\ndos\ntres\n").expect("write b.txt");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo.path().join("a.txt"), "one\ntwo\nthree\nfour\n").expect("write a.txt");
+        std::fs::write(repo.path().join("b.txt"), "uno\ndos\ntres\ncuatro\n").expect("write b.txt");
+        repo
+    }
+
+    fn open_changes_view<'a>(
+        cx: &'a mut TestAppContext,
+        repo: &TempDir,
+    ) -> (gpui::Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.set_right_sidebar_view(RightSidebarView::Changes, window, cx);
+        });
+        cx.run_until_parked();
+        (app, cx)
+    }
+
+    #[gpui::test]
+    fn the_composer_reflects_real_staged_count_diffstat_branch_and_message(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.current_diff().map(|d| d.files.len())),
+            Some(2),
+            "sanity check: both changed files must really be in the loaded diff, otherwise the \
+             assertions below would pass for the wrong reason"
+        );
+
+        assert!(
+            cx.debug_bounds("commit-composer-progress-0-of-2").is_some(),
+            "nothing is staged yet, so the header must show 0 of the real 2 changed files - not \
+             a hardcoded or stale count"
+        );
+        assert!(
+            cx.debug_bounds("commit-composer-branch-feature").is_some(),
+            "the branch label must show the worktree's real current branch (checked out as \
+             `feature`), not a placeholder"
+        );
+        assert!(
+            cx.debug_bounds("commit-composer-message-empty").is_some(),
+            "with nothing staged the message box must show the honest empty state, not a \
+             fabricated draft"
+        );
+        assert!(
+            cx.debug_bounds("commit-composer-stat-").is_some(),
+            "with nothing staged the diffstat must be genuinely empty, not a stale or invented \
+             +/- count"
+        );
+
+        let a_path = PathBuf::from("a.txt");
+        app.update(cx, |app, cx| {
+            app.toggle_staged(a_path.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("commit-composer-progress-1-of-2").is_some(),
+            "staging exactly one of the two real changed files must move the header to a real \
+             1 of 2 - a hardcoded header would never move"
+        );
+        assert!(
+            cx.debug_bounds("commit-composer-progress-0-of-2").is_none(),
+            "the stale 0-of-2 header must not still be painted alongside the new one"
+        );
+        assert!(
+            cx.debug_bounds("commit-composer-message-Update a.txt")
+                .is_some(),
+            "with only a.txt staged, the message box must show \
+             `changes::draft_commit_message`'s real single-file draft for that exact path - the \
+             same fixture shape `changes::tests::draft_commit_message_names_the_one_file_when_\
+             exactly_one_is_staged` already establishes"
+        );
+        assert!(
+            cx.debug_bounds("commit-composer-stat-").is_none(),
+            "once something real is staged the diffstat selector must change away from the \
+             empty-state string"
+        );
+        // The real number, not just "it changed": `a.txt` went from `"one\ntwo\nthree\n"` to
+        // `"one\ntwo\nthree\nfour\n"` - a single appended line, so a real `git diff` against the
+        // merge-base (confirmed independently with a real `git diff` in this same fixture shape
+        // while writing this test) reports exactly one added line and zero removed - `+1 −0`
+        // (`\u{2212}`, the real minus sign `changes::staged_diff_stats`'s caller formats with,
+        // not a plain hyphen).
+        assert!(
+            cx.debug_bounds("commit-composer-stat-+1 \u{2212}0")
+                .is_some(),
+            "the diffstat must show the real +1/-0 line count for a.txt's actual change, not a \
+             placeholder or a count that merely happens to be non-empty"
+        );
+    }
+
+    #[gpui::test]
+    fn the_primary_button_is_a_genuine_no_op_with_nothing_staged(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let commits_before = commit_count(repo.path());
+
+        let bounds = cx
+            .debug_bounds("commit-composer-primary")
+            .expect("the primary button must really paint even with nothing staged");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            commit_count(repo.path()),
+            commits_before,
+            "a real click on the primary button with nothing staged must never create a real \
+             commit"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_history_op_in_flight.is_none()),
+            "a disabled click must never even start the real commit_staged_files operation"
+        );
+        // `worktree_history_op_in_flight.is_none()` alone can't tell "never started" apart from
+        // "started and already finished" (`Self::commit_staged_files`'s own async task clears it
+        // back to `None` on completion too) - `worktree_history_status` is the stronger signal:
+        // `commit_staged_files` sets a real "committing…" string *synchronously*, before it ever
+        // spawns the background git work, so if the click had reached it at all, this would be
+        // `Some` even immediately after `run_until_parked`.
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
+            "a disabled click must never even set the real \"committing…\" status - proof the \
+             operation truly never started, not just that it already finished"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_the_primary_button_reaches_the_real_commit_staged_files_action(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let a_path = PathBuf::from("a.txt");
+        app.update(cx, |app, cx| {
+            app.toggle_staged(a_path.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        let commits_before = commit_count(repo.path());
+
+        let bounds = cx
+            .debug_bounds("commit-composer-primary")
+            .expect("the primary button must really paint once something is staged");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            commit_count(repo.path()),
+            commits_before + 1,
+            "a real click on the wired primary button must create exactly one real git commit \
+             via wt_core::undo::commit_paths"
+        );
+        assert!(
+            !app.read_with(cx, |app, _| app.staged_files.contains(&a_path)),
+            "the just-committed path must be cleared from the real staged set"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.current_diff().map(|d| d.files.len())),
+            Some(2),
+            "the diff must be reloaded for real after the commit - both files still genuinely \
+             differ from the merge-base with main (wt_core::diff diffs the working tree against \
+             the merge-base, not the previous commit, per that module's own docs), so the \
+             just-committed a.txt correctly stays in the Changes list rather than vanishing"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_history_op_in_flight.is_none()),
+            "the in-flight flag must clear once the real async commit task finishes"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_the_menu_toggle_genuinely_opens_and_closes_the_commit_menu(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        assert!(
+            !app.read_with(cx, |app, _| app.commit_menu_open),
+            "the menu must start closed"
+        );
+        assert!(
+            cx.debug_bounds("commit-menu-scrim").is_none(),
+            "an unopened menu's scrim must not be painted at all"
+        );
+
+        let toggle_bounds = cx
+            .debug_bounds("commit-composer-menu-toggle")
+            .expect("the ▾ toggle must really paint");
+        cx.simulate_click(toggle_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.commit_menu_open),
+            "a real click on the toggle must open the real commit_menu_open state"
+        );
+        assert!(
+            cx.debug_bounds("commit-menu-scrim").is_some(),
+            "opening the menu must really paint its scrim"
+        );
+        assert!(
+            cx.debug_bounds("commit-menu-popover").is_some(),
+            "opening the menu must really paint its popover"
+        );
+
+        cx.simulate_click(toggle_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app.commit_menu_open),
+            "a second click on the toggle must close the menu again"
+        );
+        assert!(
+            cx.debug_bounds("commit-menu-scrim").is_none(),
+            "closing the menu must really unpaint its scrim"
+        );
+    }
+
+    #[gpui::test]
+    fn every_commit_menu_row_except_the_primary_button_is_genuinely_inert(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let a_path = PathBuf::from("a.txt");
+        app.update(cx, |app, cx| {
+            app.toggle_staged(a_path, cx);
+        });
+        cx.run_until_parked();
+
+        let toggle_bounds = cx
+            .debug_bounds("commit-composer-menu-toggle")
+            .expect("the ▾ toggle must really paint");
+        cx.simulate_click(toggle_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.commit_menu_open),
+            "sanity check: the menu must really be open before this test's own click on the \
+             toggle can be told apart from the rows' clicks below"
+        );
+
+        let commits_before = commit_count(repo.path());
+        let staged_before = app.read_with(cx, |app, _| app.staged_files.clone());
+
+        // Literal selectors, not `format!` - `debug_bounds` takes a `&'static str` (the same
+        // constraint `guide_alignment_tests`' own comment documents).
+        for selector in [
+            "commit-menu-row-Commit and push",
+            "commit-menu-row-Commit all files",
+            "commit-menu-row-Amend last commit",
+            "commit-menu-row-Stash staged files",
+        ] {
+            let row_bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must really paint while the menu is open"));
+            cx.simulate_click(row_bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+
+            assert!(
+                app.read_with(cx, |app, _| app.commit_menu_open),
+                "a real click on {selector} must not silently do the scrim's job and close the \
+                 menu - it has no real action of its own, so it must also have no side effect \
+                 that only coincidentally resembles one"
+            );
+            assert_eq!(
+                commit_count(repo.path()),
+                commits_before,
+                "a real click on {selector} must never create a real git commit - it is dimmed \
+                 and unwired on purpose"
+            );
+            assert_eq!(
+                app.read_with(cx, |app, _| app.staged_files.clone()),
+                staged_before,
+                "a real click on {selector} must never change the real staged set"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn opening_the_commit_menu_blocks_a_real_click_on_the_primary_button_underneath(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let a_path = PathBuf::from("a.txt");
+        app.update(cx, |app, cx| {
+            app.toggle_staged(a_path, cx);
+        });
+        cx.run_until_parked();
+
+        let primary_bounds = cx
+            .debug_bounds("commit-composer-primary")
+            .expect("the primary button must really paint once something is staged");
+        let toggle_bounds = cx
+            .debug_bounds("commit-composer-menu-toggle")
+            .expect("the ▾ toggle must really paint");
+        cx.simulate_click(toggle_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.commit_menu_open),
+            "sanity check: the menu must really be open for this to be a real test of the \
+             scrim's own click-blocking, not a no-op"
+        );
+
+        let commits_before = commit_count(repo.path());
+
+        // The scrim spans the composer's full bounds (`top(0)/left(0)/right(0)/bottom(0)` on a
+        // `.relative()` parent) - including the still-visible primary-button row underneath the
+        // popover panel, which itself only covers the composer's upper portion
+        // (`bottom(px(44.0))`, leaving the button row exposed below it). A real click at the
+        // primary button's own screen position, while the menu is open, must be caught by the
+        // scrim - not fall through to the real commit action painted underneath it (the
+        // `.occlude()`-less-scrim click-through bug class this codebase has hit for real
+        // before, e.g. `root::resize::render_resize_handle`'s own `.occlude()`).
+        cx.simulate_click(primary_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            commit_count(repo.path()),
+            commits_before,
+            "a click on the primary button's own screen position, while the scrim covers it, \
+             must not reach the real commit action painted underneath"
+        );
+    }
+
+    #[gpui::test]
+    fn the_popover_blocks_a_click_even_where_it_paints_above_the_composers_own_bounds(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let a_path = PathBuf::from("a.txt");
+        app.update(cx, |app, cx| {
+            app.toggle_staged(a_path, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.open_change.is_none()),
+            "sanity check: no diff file is open yet"
+        );
+
+        let toggle_bounds = cx
+            .debug_bounds("commit-composer-menu-toggle")
+            .expect("the ▾ toggle must really paint");
+        cx.simulate_click(toggle_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.commit_menu_open),
+            "sanity check: the menu must really be open"
+        );
+
+        let popover_bounds = cx
+            .debug_bounds("commit-menu-popover")
+            .expect("the popover must really paint");
+        // The four-row popover paints taller than the short composer it hangs off, so its own
+        // top edge genuinely sits above the composer's - outside the scrim's bounds (see
+        // `Self::render_commit_menu`'s own docs). A real click right at that top edge is the
+        // case most likely to fall through to a real Changes row underneath if the popover
+        // relied only on registration-order luck instead of its own `.occlude()`.
+        let click_position =
+            gpui::point(popover_bounds.center().x, popover_bounds.origin.y + px(2.0));
+        cx.simulate_click(click_position, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.commit_menu_open),
+            "a click on the popover's own bounds must not close the menu - that is the scrim's \
+             job for a click outside the popover, not the popover's own click"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.open_change.is_none()),
+            "a click on the popover, even where it paints above the composer over the real \
+             Changes rows, must never open one of those rows' diffs"
+        );
+    }
+
+    /// Real, immediate git staging (Revision R12 §5: "the checkbox **is** staging") -
+    /// `Self::toggle_staged` is the Changes row checkbox's real click handler
+    /// (`Self::render_staging_checkbox`'s `.on_click`), so calling it directly here exercises
+    /// exactly the same code path a real click reaches, matching this module's own established
+    /// `the_composer_reflects_real_staged_count_diffstat_branch_and_message` precedent for
+    /// driving the checkbox. Verified with real `git status --porcelain` reads, the same
+    /// real-index-verification discipline `wt_core::undo::tests::
+    /// commit_paths_never_commits_a_path_that_was_staged_by_something_else` already established
+    /// for this codebase's staging-adjacent tests.
+    #[gpui::test]
+    fn toggle_staged_really_stages_and_unstages_the_real_git_index(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+        let a_path = PathBuf::from("a.txt");
+
+        // Sanity check the real starting state: a.txt is really modified but not staged.
+        assert_eq!(
+            git_output(repo.path(), &["status", "--porcelain", "a.txt"]),
+            "M a.txt",
+            "sanity check: a.txt must start out modified but genuinely unstaged"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_staged(a_path.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            git_output(repo.path(), &["status", "--porcelain", "a.txt"]),
+            "M  a.txt",
+            "checking the box must really stage a.txt in the real git index (two-space \
+             porcelain form), not just flip an in-memory flag"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.staged_files.contains(&a_path)),
+            "the in-memory staged set must agree with the real index it just changed"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_staged(a_path.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            git_output(repo.path(), &["status", "--porcelain", "a.txt"]),
+            "M a.txt",
+            "unchecking the box must really unstage a.txt in the real git index - back to the \
+             one-space, working-tree-only porcelain form - not merely forget about it in memory \
+             while leaving it staged for real"
+        );
+        assert!(
+            app.read_with(cx, |app, _| !app.staged_files.contains(&a_path)),
+            "the in-memory staged set must agree with the real index after the real unstage too"
+        );
+    }
+
+    /// Revision R12 §5's staging model has no "Jerry-only" staged state: the checkbox mirrors
+    /// the real git index, so a file already staged by something else - a user's own shell, an
+    /// agent CLI - before this worktree is ever loaded must read as staged from the very first
+    /// frame, not start at an honest-looking but wrong "0 staged".
+    #[gpui::test]
+    fn a_file_already_staged_in_real_git_before_the_worktree_is_ever_loaded_reads_as_staged(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = changes_test_repo();
+        // Stages a.txt with a real, direct `git add` *before* the app ever opens this worktree -
+        // standing in for a user's own shell or an agent CLI having staged it first.
+        git(repo.path(), &["add", "a.txt"]);
+
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.staged_files.clone()),
+            [PathBuf::from("a.txt")].into_iter().collect(),
+            "a.txt must read as staged the moment this worktree is loaded - re-derived from the \
+             real index `load_diff` just queried, not started at an empty, UI-only set"
+        );
+        assert!(
+            cx.debug_bounds("commit-composer-progress-1-of-2").is_some(),
+            "the composer header must reflect the real pre-staged count too, not just the \
+             internal `staged_files` set - a stale `0 of 2` here would mean the UI itself never \
+             actually saw the real staged state"
+        );
+    }
+
+    /// Switching to a worktree that already has something staged in real git must show it as
+    /// staged too, not just the worktree the window happened to start on - the same real
+    /// re-derivation, exercised through `AdeApp::select_worktree` instead of the initial load.
+    #[gpui::test]
+    fn switching_to_a_worktree_with_something_already_staged_in_real_git_shows_it_as_staged(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = changes_test_repo();
+        let second_wt = repo.path().join("second-wt");
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "second",
+                second_wt.to_str().expect("utf8 path"),
+            ],
+        );
+        std::fs::write(second_wt.join("c.txt"), "real change\n").expect("write c.txt");
+        // Staged in the *second* worktree's own real index, before Jerry ever selects it.
+        git(&second_wt, &["add", "c.txt"]);
+
+        let (app, cx) = open_changes_view(cx, &repo);
+        assert!(
+            app.read_with(cx, |app, _| app.staged_files.is_empty()),
+            "sanity check: the worktree the window started on has nothing staged"
+        );
+
+        let index = app.read_with(cx, |app, _| {
+            app.worktrees
+                .iter()
+                .position(|item| item.path == second_wt)
+                .expect("the newly created second worktree must be in the real worktree list")
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(index, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.staged_files.clone()),
+            [PathBuf::from("c.txt")].into_iter().collect(),
+            "switching into the second worktree must re-derive staged_files from *its* real \
+             index (c.txt, staged before this switch ever happened), not carry over the first \
+             worktree's empty set or silently stay empty"
         );
     }
 }

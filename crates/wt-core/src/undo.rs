@@ -224,6 +224,76 @@ pub fn commit_all_changes(
     })
 }
 
+/// Stage exactly `paths` (`git add -- <paths>`, never `commit_all_changes`'s `-A`) and commit
+/// them with `message` - the Changes panel commit composer's real backing (Revision R12 §5:
+/// "Commit N files" commits only the staged subset, not the whole worktree diff).
+///
+/// Refuses with [`Error::NothingToCommit`] if `paths` is empty, the same "check first, structured
+/// error" convention [`commit_all_changes`] follows for a clean worktree - the composer's own
+/// primary button already disables itself with nothing staged (see
+/// `crate::sidebar::changes::commit_button_label`), so this is a defensive backstop, not the
+/// primary guard.
+///
+/// **The leading `git add -- <paths>` is a deliberate, harmless idempotent safety net, not dead
+/// weight.** The Changes panel's staging checkbox (`crate::sidebar::render::AdeApp::
+/// toggle_staged`, backed by [`crate::stage::stage_path`]/[`crate::stage::unstage_path`]) now
+/// really stages/unstages `paths` in the real index the moment each box is clicked, so by the
+/// time the composer's primary button calls this function every path it passes is normally
+/// already staged - but "normally" isn't "always": a real per-path staging failure that got
+/// silently reverted client-side (see `toggle_staged`'s own docs on that failure mode), or a
+/// worktree-switch race where `AdeApp::staged_files` hasn't yet been re-derived from a fresh
+/// `git diff --cached` when the commit fires, can both leave the app's own idea of "staged"
+/// briefly out of sync with the real index. This function's contract is "stage exactly `paths`
+/// and commit them" regardless of what state the index happens to already be in when it's
+/// called, and re-running `git add` on a path that's already staged is a real no-op - so keeping
+/// it here is what makes that contract hold unconditionally rather than only when the click-time
+/// staging already succeeded.
+///
+/// Returns the same [`CommitAllChangesOutcome`] shape [`commit_all_changes`] does, but this
+/// function has no `undo_commit_paths`/`redo_commit_paths` counterpart yet - a partial commit
+/// isn't wired into [`crate::undo::UndoableAction`] (a real, honest gap, not a fake "undo" that
+/// would only look like it worked).
+///
+/// Performs blocking I/O.
+pub fn commit_paths(
+    worktree_path: &Path,
+    paths: &[std::path::PathBuf],
+    message: &str,
+) -> Result<CommitAllChangesOutcome, Error> {
+    if paths.is_empty() {
+        return Err(Error::NothingToCommit {
+            path: worktree_path.to_path_buf(),
+        });
+    }
+
+    let mut add_args: Vec<OsString> = vec!["add".into(), "--".into()];
+    add_args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+    let add_output = run_git(worktree_path, &add_args)?;
+    check_success(&add_args, &add_output)?;
+
+    // Pathspec-limited (`-- <paths>`), never a bare `git commit`: a bare `git commit` commits
+    // the *entire* index, not just what this call just `add`ed - anything else already staged
+    // (an agent CLI running its own `git add` in this same worktree, the same interleaving
+    // hazard `commit_all_changes`'s own doc above calls out) would silently ride along into a
+    // commit this function's own doc promises is limited to `paths`. Real regression:
+    // `commit_paths_never_commits_a_path_that_was_staged_by_something_else`.
+    let mut commit_args: Vec<OsString> =
+        vec!["commit".into(), "-m".into(), message.into(), "--".into()];
+    commit_args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+    let commit_output = run_git(worktree_path, &commit_args)?;
+    check_success(&commit_args, &commit_output)?;
+
+    let commit = rev_parse_head(worktree_path)?;
+    let parent = rev_parse_parent_of(worktree_path, &commit)?;
+    let branch = current_branch(worktree_path)?;
+
+    Ok(CommitAllChangesOutcome {
+        branch,
+        commit,
+        parent,
+    })
+}
+
 /// Undo a [`commit_all_changes`] call: real `git reset --soft <parent>`, returning the worktree
 /// to exactly the uncommitted state it was in right before that commit - see this module's own
 /// docs for why `reset --soft`, not `revert`.
@@ -672,6 +742,7 @@ fn apply_stash(worktree_path: &Path, stash: &str) -> Result<UndoDiscardOutcome, 
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -772,6 +843,108 @@ mod tests {
         let repo = init_repo();
         let err = commit_all_changes(repo.path(), "nothing to do").unwrap_err();
         assert!(matches!(err, Error::NothingToCommit { .. }));
+    }
+
+    // --- commit_paths ----------------------------------------------------------------------
+
+    #[test]
+    fn commit_paths_commits_only_the_given_paths_leaving_other_changes_uncommitted() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
+        fs::write(repo.path().join("untouched.txt"), "not staged\n").expect("new file");
+
+        let before_head = git_output(repo.path(), &["rev-parse", "HEAD"]);
+        let outcome = commit_paths(
+            repo.path(),
+            &[PathBuf::from("file.txt")],
+            "ade: commit staged files",
+        )
+        .expect("commit_paths");
+
+        assert_eq!(outcome.parent.as_deref(), Some(before_head.as_str()));
+        assert_eq!(
+            outcome.commit,
+            git_output(repo.path(), &["rev-parse", "HEAD"])
+        );
+        // The committed file is clean...
+        let status = git_output(repo.path(), &["status", "--porcelain", "file.txt"]);
+        assert_eq!(status, "", "file.txt must be committed, not left staged");
+        // ...but the other real change is genuinely untouched - still there, still uncommitted.
+        let untouched_status = git_output(repo.path(), &["status", "--porcelain", "untouched.txt"]);
+        assert!(
+            untouched_status.contains("untouched.txt"),
+            "a path not passed to commit_paths must be left exactly as it was: {untouched_status:?}"
+        );
+        assert!(is_dirty(repo.path()).expect("is_dirty"));
+    }
+
+    /// A real regression test for a real bug: a bare `git commit` (no pathspec) commits the
+    /// *entire* index, not just whatever this call's own `git add -- <paths>` just staged. The
+    /// previous `commit_paths_commits_only_the_given_paths_leaving_other_changes_uncommitted`
+    /// test above never actually exercised that failure mode - it only ever `write`s
+    /// `untouched.txt` to disk without `git add`ing it, so it was never in the index for a bare
+    /// `git commit` to sweep up in the first place. This test pre-stages the other file for
+    /// real (mirroring an agent CLI running its own `git add` in this same worktree, the exact
+    /// interleaving hazard `commit_all_changes`'s own doc calls out above), so it genuinely
+    /// fails against a bare `git commit` and genuinely passes only once the commit itself is
+    /// pathspec-limited (`-- <paths>`).
+    #[test]
+    fn commit_paths_never_commits_a_path_that_was_staged_by_something_else() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
+        fs::write(repo.path().join("also-staged.txt"), "staged elsewhere\n")
+            .expect("write also-staged.txt");
+        // Simulates something else in this worktree (an agent CLI, a manual `git add`) already
+        // having staged a different file before the composer's own commit runs.
+        git(repo.path(), &["add", "also-staged.txt"]);
+
+        commit_paths(
+            repo.path(),
+            &[PathBuf::from("file.txt")],
+            "ade: commit only file.txt",
+        )
+        .expect("commit_paths");
+
+        let committed_files =
+            git_output(repo.path(), &["show", "--name-only", "--format=", "HEAD"]);
+        assert_eq!(
+            committed_files, "file.txt",
+            "only the requested path must land in the real commit, even though \
+             also-staged.txt was genuinely staged in the index at commit time"
+        );
+        let status = git_output(repo.path(), &["status", "--porcelain", "also-staged.txt"]);
+        assert_eq!(
+            status, "A  also-staged.txt",
+            "also-staged.txt must remain exactly as staged (still added, still uncommitted) - \
+             commit_paths must never silently commit it just because it happened to share an \
+             index with the real, requested commit"
+        );
+    }
+
+    #[test]
+    fn commit_paths_refuses_an_empty_path_list() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
+        let err = commit_paths(repo.path(), &[], "nothing selected").unwrap_err();
+        assert!(matches!(err, Error::NothingToCommit { .. }));
+        assert!(
+            is_dirty(repo.path()).expect("is_dirty"),
+            "refusing must not touch the working tree at all"
+        );
+    }
+
+    #[test]
+    fn commit_paths_real_message_becomes_the_real_commit_message() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
+        commit_paths(
+            repo.path(),
+            &[PathBuf::from("file.txt")],
+            "a distinctive real commit message",
+        )
+        .expect("commit_paths");
+        let subject = git_output(repo.path(), &["log", "-1", "--format=%s"]);
+        assert_eq!(subject, "a distinctive real commit message");
     }
 
     #[test]
