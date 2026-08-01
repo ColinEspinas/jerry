@@ -4392,3 +4392,48 @@ branch's own commit-composer and Changes-panel additions on top of them.
 `cargo test --workspace --lib --test-threads=1`: **1114 + 44 + 14 + 111 = 1283 passed, 0 failed**
 across all four crates. No conflict markers or unresolved merge artifacts remained in source after
 the rebase (grep for `<<<<<<<`/`=======`/`>>>>>>>` outside test fixture strings came back empty).
+
+## Rebasing onto the Agent rename + worktree-state-safety + title-bar-chips stack, and making the Changes-panel checkbox real git staging
+
+Three more branches landed on top of the same rail-rewrite base since the last rebase above:
+`revision-r12-agent-rename` (`Session`→`Agent` throughout `crates/app`), `revision-r12-worktree-
+state-safety` (`open_files`/`edit_buffers` re-keyed to be genuinely per-worktree instead of
+cleared on every switch), and `revision-r12-title-bar-chips` (an isolated `title_bar/*` addition).
+Rebased onto the last of the three; conflicts were every site still saying `Session`/`self.sessions`
+(mechanically updated to `Agent`/`self.agents`), every direct `self.open_files`/`self.edit_buffers`
+touch (routed through the new `open_files()`/`open_files_mut()` and `edit_buffer()`/
+`edit_buffer_mut()`/`insert_edit_buffer()` accessors), and a `BUILD-LOG.md` append conflict
+(resolved by keeping both sides' entries in commit order).
+
+Separately, a coordinator-found real bug: the Changes-panel staging checkbox
+(`AdeApp::toggle_staged`) only ever flipped an in-memory `HashSet<PathBuf>` - real git never saw
+anything until the commit composer's own `git add` ran at commit time
+(`wt_core::undo::commit_paths`). That contradicts the design's own §5 framing, "the checkbox **is**
+staging," taken literally rather than as a UI-only intent. New `wt_core::stage` module:
+`stage_path`/`unstage_path` (real, immediate `git add -- <path>` / `git reset -- <path>`) and
+`staged_paths` (`git diff --cached --name-only`, worktree-relative), each with real tests verifying
+the actual `git status --porcelain` index state, not just an in-memory flag.
+
+`toggle_staged` now flips `AdeApp::staged_files` optimistically and synchronously (so the checkbox
+responds with no perceptible delay), then runs the real git mutation on the background executor;
+a real failure reverts the optimistic flip and surfaces the error next to the composer
+(`AdeApp::staging_error`, `render_staging_error`) rather than silently reverting behind the user's
+back. `AdeApp::load_diff` now also re-derives `staged_files` from a fresh `staged_paths` query on
+every diff load - a live re-query, not a per-worktree cache like `open_files`/`edit_buffers`,
+because real git staging can change out from under this app at any moment (an agent CLI's own
+`git add`/`git reset` in the same worktree) and a cache would need its own invalidation story on
+top of the one `load_diff` already runs through on every switch/tree-op/post-commit reload. This
+is also what makes a worktree with something already staged in real git *before* Jerry ever opened
+it read as staged from the first frame, instead of starting at an honest-looking but wrong "0
+staged." `wt_core::undo::commit_paths`'s own leading `git add` is kept as a deliberate, documented
+idempotent safety net (a per-path staging failure that got silently reverted, or a worktree-switch
+race, can each leave the app's own idea of "staged" briefly behind the real index) rather than
+removed as now-redundant.
+
+Also checked against §5's other requirements while in this code: the commit composer's `▾`
+split-button menu already correctly renders its three unimplemented rows (push / amend / stash) as
+honestly disabled, not fake-clickable - unchanged, no fix needed there.
+
+**Verification**: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings` - all clean. `cargo test --workspace --lib
+--test-threads=1`: **1130 + 44 + 14 + 119 = 1307 passed, 0 failed** across all four crates.

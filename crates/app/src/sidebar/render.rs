@@ -247,11 +247,96 @@ impl AdeApp {
     /// Toggles a file's staged state (Revision R12 §5: the checkbox **is** staging) - the
     /// Changes row checkbox's click handler. `Self::render_change_row` stops propagation at the
     /// call site so checking a box never also opens that file's diff.
+    ///
+    /// Real, immediate git staging, not a UI-only intent recorded for later: checking the box
+    /// runs a real `git add -- <path>` (`wt_core::stage::stage_path`); unchecking it runs a real
+    /// `git reset -- <path>` (`wt_core::stage::unstage_path`) - the design's own "the checkbox
+    /// **is** staging" framing, taken literally. [`Self::staged_files`] flips optimistically,
+    /// synchronously, in the same click (so the checkbox visibly responds with no perceptible
+    /// delay) and the real git mutation runs on the background executor right after, matching
+    /// every other real git-mutating action in this app
+    /// (`crate::worktree_history::flow`'s own "never block the foreground thread" discipline).
+    ///
+    /// If the real git call fails, the optimistic flip is reverted (back to whatever
+    /// [`Self::staged_files`] would have read before this click) and the real error is recorded
+    /// in [`Self::staging_error`] - never left as a silent success that only *looked* like it
+    /// worked. A late-resolving revert can theoretically race a newer click on the *same* path
+    /// that started after this one failed (e.g. stage, fail, immediately re-stage by hand before
+    /// the failure's `this.update` runs) and clobber that newer click's own optimistic state;
+    /// this is accepted as a rare, honest tradeoff rather than added generation-counter machinery
+    /// for a failure mode (a `git add`/`git reset` on a path this app itself just resolved from a
+    /// real, loaded diff) that real-repo testing never actually produces.
     pub(in crate::sidebar) fn toggle_staged(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if !self.staged_files.remove(&path) {
-            self.staged_files.insert(path);
+        let should_stage = !self.staged_files.remove(&path);
+        if should_stage {
+            self.staged_files.insert(path.clone());
         }
+        self.staging_error = None;
         cx.notify();
+
+        let worktree_path = self.diff_root.clone();
+        let git_path = path.clone();
+        let revert_path = path.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if should_stage {
+                        wt_core::stage::stage_path(&worktree_path, &git_path)
+                    } else {
+                        wt_core::stage::unstage_path(&worktree_path, &git_path)
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Err(err) = result {
+                    // Revert the optimistic flip - the real index never actually changed, so
+                    // the checkbox must not keep claiming it did.
+                    if should_stage {
+                        this.staged_files.remove(&revert_path);
+                    } else {
+                        this.staged_files.insert(revert_path.clone());
+                    }
+                    let verb = if should_stage { "stage" } else { "unstage" };
+                    this.staging_error = Some((revert_path, format!("failed to {verb}: {err}")));
+                    cx.notify();
+                }
+            });
+        });
+        // Two different rows' checkboxes clicked in quick succession are independent real git
+        // operations - see `Self::_stage_tasks`'s own docs for why this can't be a single
+        // `Option<Task<()>>` slot.
+        self._stage_tasks.push(task);
+    }
+
+    /// The real, honest surface for a failed real staging/unstaging call
+    /// ([`Self::staging_error`]) - the Changes-panel sibling of [`Self::tree_op_error`]'s own
+    /// render site, next to the composer the failed checkbox lives above rather than buried in
+    /// the log.
+    pub(in crate::sidebar) fn render_staging_error(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let (_, message) = self.staging_error.clone()?;
+        Some(
+            div()
+                .id("staging-error")
+                .debug_selector(|| "staging-error".to_string())
+                .flex_none()
+                .w_full()
+                .px(px(10.0))
+                .py(px(5.0))
+                .font(font(theme::font::MONO))
+                .text_size(self.ui_text_size(10.0))
+                .text_color(theme::status::FAIL)
+                .cursor_pointer()
+                .tooltip(text_tooltip("Click to dismiss"))
+                .child(message)
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.staging_error = None;
+                    cx.notify();
+                })),
+        )
     }
 
     /// The commit composer's primary action (Revision R12 §5) - a real `git add -- <staged
@@ -1240,6 +1325,7 @@ impl AdeApp {
                                 .min_h_0()
                                 .child(self.render_changes_rows(cx)),
                         )
+                        .children(self.render_staging_error(cx))
                         .child(self.render_commit_composer(diff, cx))
                         .child(render_changes_footer(self.ui_text_size(10.0)))
                 }
@@ -4319,6 +4405,140 @@ mod commit_composer_tests {
             app.read_with(cx, |app, _| app.open_change.is_none()),
             "a click on the popover, even where it paints above the composer over the real \
              Changes rows, must never open one of those rows' diffs"
+        );
+    }
+
+    /// Real, immediate git staging (Revision R12 §5: "the checkbox **is** staging") -
+    /// `Self::toggle_staged` is the Changes row checkbox's real click handler
+    /// (`Self::render_staging_checkbox`'s `.on_click`), so calling it directly here exercises
+    /// exactly the same code path a real click reaches, matching this module's own established
+    /// `the_composer_reflects_real_staged_count_diffstat_branch_and_message` precedent for
+    /// driving the checkbox. Verified with real `git status --porcelain` reads, the same
+    /// real-index-verification discipline `wt_core::undo::tests::
+    /// commit_paths_never_commits_a_path_that_was_staged_by_something_else` already established
+    /// for this codebase's staging-adjacent tests.
+    #[gpui::test]
+    fn toggle_staged_really_stages_and_unstages_the_real_git_index(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+        let a_path = PathBuf::from("a.txt");
+
+        // Sanity check the real starting state: a.txt is really modified but not staged.
+        assert_eq!(
+            git_output(repo.path(), &["status", "--porcelain", "a.txt"]),
+            "M a.txt",
+            "sanity check: a.txt must start out modified but genuinely unstaged"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_staged(a_path.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            git_output(repo.path(), &["status", "--porcelain", "a.txt"]),
+            "M  a.txt",
+            "checking the box must really stage a.txt in the real git index (two-space \
+             porcelain form), not just flip an in-memory flag"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.staged_files.contains(&a_path)),
+            "the in-memory staged set must agree with the real index it just changed"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_staged(a_path.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            git_output(repo.path(), &["status", "--porcelain", "a.txt"]),
+            "M a.txt",
+            "unchecking the box must really unstage a.txt in the real git index - back to the \
+             one-space, working-tree-only porcelain form - not merely forget about it in memory \
+             while leaving it staged for real"
+        );
+        assert!(
+            app.read_with(cx, |app, _| !app.staged_files.contains(&a_path)),
+            "the in-memory staged set must agree with the real index after the real unstage too"
+        );
+    }
+
+    /// Revision R12 §5's staging model has no "Jerry-only" staged state: the checkbox mirrors
+    /// the real git index, so a file already staged by something else - a user's own shell, an
+    /// agent CLI - before this worktree is ever loaded must read as staged from the very first
+    /// frame, not start at an honest-looking but wrong "0 staged".
+    #[gpui::test]
+    fn a_file_already_staged_in_real_git_before_the_worktree_is_ever_loaded_reads_as_staged(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = changes_test_repo();
+        // Stages a.txt with a real, direct `git add` *before* the app ever opens this worktree -
+        // standing in for a user's own shell or an agent CLI having staged it first.
+        git(repo.path(), &["add", "a.txt"]);
+
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.staged_files.clone()),
+            [PathBuf::from("a.txt")].into_iter().collect(),
+            "a.txt must read as staged the moment this worktree is loaded - re-derived from the \
+             real index `load_diff` just queried, not started at an empty, UI-only set"
+        );
+        assert!(
+            cx.debug_bounds("commit-composer-progress-1-of-2").is_some(),
+            "the composer header must reflect the real pre-staged count too, not just the \
+             internal `staged_files` set - a stale `0 of 2` here would mean the UI itself never \
+             actually saw the real staged state"
+        );
+    }
+
+    /// Switching to a worktree that already has something staged in real git must show it as
+    /// staged too, not just the worktree the window happened to start on - the same real
+    /// re-derivation, exercised through `AdeApp::select_worktree` instead of the initial load.
+    #[gpui::test]
+    fn switching_to_a_worktree_with_something_already_staged_in_real_git_shows_it_as_staged(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = changes_test_repo();
+        let second_wt = repo.path().join("second-wt");
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "second",
+                second_wt.to_str().expect("utf8 path"),
+            ],
+        );
+        std::fs::write(second_wt.join("c.txt"), "real change\n").expect("write c.txt");
+        // Staged in the *second* worktree's own real index, before Jerry ever selects it.
+        git(&second_wt, &["add", "c.txt"]);
+
+        let (app, cx) = open_changes_view(cx, &repo);
+        assert!(
+            app.read_with(cx, |app, _| app.staged_files.is_empty()),
+            "sanity check: the worktree the window started on has nothing staged"
+        );
+
+        let index = app.read_with(cx, |app, _| {
+            app.worktrees
+                .iter()
+                .position(|item| item.path == second_wt)
+                .expect("the newly created second worktree must be in the real worktree list")
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(index, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.staged_files.clone()),
+            [PathBuf::from("c.txt")].into_iter().collect(),
+            "switching into the second worktree must re-derive staged_files from *its* real \
+             index (c.txt, staged before this switch ever happened), not carry over the first \
+             worktree's empty set or silently stay empty"
         );
     }
 }

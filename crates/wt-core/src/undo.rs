@@ -234,6 +234,21 @@ pub fn commit_all_changes(
 /// `crate::sidebar::changes::commit_button_label`), so this is a defensive backstop, not the
 /// primary guard.
 ///
+/// **The leading `git add -- <paths>` is a deliberate, harmless idempotent safety net, not dead
+/// weight.** The Changes panel's staging checkbox (`crate::sidebar::render::AdeApp::
+/// toggle_staged`, backed by [`crate::stage::stage_path`]/[`crate::stage::unstage_path`]) now
+/// really stages/unstages `paths` in the real index the moment each box is clicked, so by the
+/// time the composer's primary button calls this function every path it passes is normally
+/// already staged - but "normally" isn't "always": a real per-path staging failure that got
+/// silently reverted client-side (see `toggle_staged`'s own docs on that failure mode), or a
+/// worktree-switch race where `AdeApp::staged_files` hasn't yet been re-derived from a fresh
+/// `git diff --cached` when the commit fires, can both leave the app's own idea of "staged"
+/// briefly out of sync with the real index. This function's contract is "stage exactly `paths`
+/// and commit them" regardless of what state the index happens to already be in when it's
+/// called, and re-running `git add` on a path that's already staged is a real no-op - so keeping
+/// it here is what makes that contract hold unconditionally rather than only when the click-time
+/// staging already succeeded.
+///
 /// Returns the same [`CommitAllChangesOutcome`] shape [`commit_all_changes`] does, but this
 /// function has no `undo_commit_paths`/`redo_commit_paths` counterpart yet - a partial commit
 /// isn't wired into [`crate::undo::UndoableAction`] (a real, honest gap, not a fake "undo" that
