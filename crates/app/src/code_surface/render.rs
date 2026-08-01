@@ -167,8 +167,8 @@ impl AdeApp {
         // The Diff view still genuinely never receives these bindings: `is_file_editor` is false
         // whenever `effective_view` isn't `File`, so the context string never gains
         // `"file-editor"` in that case.
-        let is_file_editor = effective_view == code_view::CodeView::File
-            && self.edit_buffers.contains_key(relative_path);
+        let is_file_editor =
+            effective_view == code_view::CodeView::File && self.edit_buffer_contains(relative_path);
         // Real Completions popup context (Revision R8.5b) - added the same way `"file-editor"`
         // itself is, only while a popup is genuinely, *actionably* open *for this exact file*
         // (matching `Self::completions_open_for_active_path`'s own guard, though that reads the

@@ -849,8 +849,7 @@ mod title_menu_tests {
         let relative = PathBuf::from("notes.txt");
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .expect("buffer")
                 .content
                 .clone()),
@@ -864,8 +863,7 @@ mod title_menu_tests {
 
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .expect("buffer")
                 .content
                 .clone()),
@@ -1246,13 +1244,16 @@ mod title_menu_tests {
     /// earlier version of `select_relative_agent` cycled the flat `self.agents` list
     /// directly rather than [`AdeApp::current_worktree_agents`], so "Next Agent" could jump
     /// to a *different* worktree's agent entirely - which `AdeApp::select_agent` then
-    /// silently promotes into a full `AdeApp::select_worktree` switch, discarding any unsaved
-    /// `edit_buffers` content for the worktree just left. Spawning every test agent into the
-    /// *same* worktree (as an earlier version of this test did) can't distinguish that bug from
-    /// correct behaviour at all - this seeds a **second** worktree with its own agent
-    /// alongside the three under test, and asserts cycling never leaves the first worktree
-    /// (`AdeApp::selected` stays put) and never clears a real unsaved edit sitting in
-    /// `AdeApp::edit_buffers`.
+    /// silently promotes into a full `AdeApp::select_worktree` switch, landing the user on the
+    /// wrong worktree's `edit_buffers` entries (keyed by `(worktree, path)` - see that field's
+    /// own docs) rather than the one they were actually cycling through. Spawning every test
+    /// agent into the *same* worktree (as an earlier version of this test did) can't distinguish
+    /// that bug from correct behaviour at all - this seeds a **second** worktree with its own
+    /// agent alongside the three under test, and asserts cycling never leaves the first worktree
+    /// (`AdeApp::selected` stays put) and a real unsaved edit seeded in the first worktree's
+    /// `AdeApp::edit_buffers` entry is still resolvable there after cycling - which an accidental
+    /// jump to the second (buffer-less) worktree would break, since [`AdeApp::edit_buffer_contains`]
+    /// resolves through whichever worktree is genuinely current.
     #[gpui::test]
     fn select_relative_agent_cycles_through_real_agents_and_wraps_around(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1333,11 +1334,13 @@ mod title_menu_tests {
         cx.run_until_parked();
 
         // A real, unsaved edit in the first worktree, seeded only after every real
-        // `select_worktree` switch above (each one genuinely clears `edit_buffers` via
-        // `reset_per_worktree_ui_state`, by design - that's not what's under test here) - a
-        // same-worktree cycle below must never discard this.
+        // `select_worktree` switch above so it's unambiguously keyed to *this* worktree
+        // (`AdeApp::edit_buffers`' `(worktree, path)` composite key - see that field's own docs) -
+        // a same-worktree cycle below must never lose sight of it, and an accidental jump to the
+        // second worktree (the bug this test guards against) would, since `edit_buffer_contains`
+        // resolves against whichever worktree is genuinely current.
         app.update(cx, |app, _cx| {
-            app.edit_buffers.insert(
+            app.insert_edit_buffer(
                 PathBuf::from("a.txt"),
                 edit_buffer::EditBuffer::new(
                     repo.path().join("a.txt"),
@@ -1392,9 +1395,10 @@ mod title_menu_tests {
         );
         app.read_with(cx, |app, _| {
             assert!(
-                app.edit_buffers.contains_key(std::path::Path::new("a.txt")),
-                "a same-worktree cycle must never discard unsaved edits via \
-                 reset_per_worktree_ui_state - only a real select_worktree switch should do that"
+                app.edit_buffer_contains(std::path::Path::new("a.txt")),
+                "cycling within one worktree must never silently jump to a different one - if it \
+                 did, this lookup would resolve against the second (buffer-less) worktree and \
+                 find nothing"
             );
         });
     }

@@ -1342,8 +1342,7 @@ mod text_undo_scoping_tests {
         cx.simulate_input("TYPED");
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .content
                 .clone()),
@@ -1359,7 +1358,7 @@ mod text_undo_scoping_tests {
         cx.run_until_parked();
         assert_eq!(app.read_with(cx, |app, _| app.open_change.clone()), None);
         assert!(
-            app.read_with(cx, |app, _| app.edit_buffers.contains_key(&relative)),
+            app.read_with(cx, |app, _| app.edit_buffer_contains(&relative)),
             "sanity check: the buffer (and its history) must still be alive, or this test would \
              pass for the wrong reason"
         );
@@ -1370,8 +1369,7 @@ mod text_undo_scoping_tests {
 
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .content
                 .clone()),
@@ -1397,7 +1395,7 @@ mod text_undo_scoping_tests {
 
         cx.simulate_input("EDITED");
         let content_before = app.read_with(cx, |app, _| {
-            app.edit_buffers.get(&relative).unwrap().content.clone()
+            app.edit_buffer(&relative).unwrap().content.clone()
         });
         assert_eq!(content_before, "EDITEDhello\n");
 
@@ -1420,8 +1418,7 @@ mod text_undo_scoping_tests {
         );
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .content
                 .clone()),
@@ -1694,9 +1691,9 @@ mod palette_result_focus_tests {
                 Some(relative.as_path()),
                 "the palette must have opened the file's tab"
             );
-            assert_eq!(app.open_files, vec![relative.clone()]);
+            assert_eq!(app.open_files(), vec![relative.clone()]);
             assert!(
-                app.edit_buffers.contains_key(&relative),
+                app.edit_buffer_contains(&relative),
                 "and a real edit buffer must be backing it"
             );
         });
@@ -1729,8 +1726,7 @@ mod palette_result_focus_tests {
 
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .expect("buffer")
                 .content
                 .clone()),
@@ -1751,8 +1747,7 @@ mod palette_result_focus_tests {
 
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .expect("buffer")
                 .cursor_offset()),
             0,
@@ -1764,8 +1759,7 @@ mod palette_result_focus_tests {
 
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .expect("buffer")
                 .cursor_offset()),
             1,
@@ -1798,7 +1792,7 @@ mod palette_result_focus_tests {
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
             assert_eq!(
-                app.edit_buffers.get(&relative).expect("buffer").content,
+                app.edit_buffer(&relative).expect("buffer").content,
                 "Afn main() {}\n",
                 "premise: with the tree focused, a keystroke must not reach the buffer"
             );
@@ -1810,12 +1804,12 @@ mod palette_result_focus_tests {
 
         app.read_with(cx, |app, _| {
             assert_eq!(
-                app.open_files,
+                app.open_files(),
                 vec![relative.clone()],
                 "reopening the same file must reuse its tab, never append a second one"
             );
             assert_eq!(
-                app.edit_buffers.get(&relative).expect("buffer").content,
+                app.edit_buffer(&relative).expect("buffer").content,
                 "ABfn main() {}\n",
                 "both keystrokes must have landed in the same real buffer - and `B` lands \
                  *after* `A` because the buffer kept its own caret (offset 1) across the \
@@ -1849,8 +1843,7 @@ mod palette_result_focus_tests {
         cx.run_until_parked();
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .expect("buffer")
                 .content
                 .clone()),
@@ -1898,8 +1891,7 @@ mod palette_result_focus_tests {
         cx.run_until_parked();
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .expect("buffer")
                 .content
                 .clone()),
@@ -2042,8 +2034,7 @@ mod palette_result_focus_tests {
         cx.run_until_parked();
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .expect("buffer")
                 .content
                 .clone()),

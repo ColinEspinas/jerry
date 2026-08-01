@@ -439,7 +439,9 @@ mod code_zoom_tests {
             app.close_file_tab(PathBuf::from("a.rs"), window, cx);
         });
         assert!(
-            !app.read_with(cx, |app, _| app.open_files.contains(&PathBuf::from("a.rs"))),
+            !app.read_with(cx, |app, _| app
+                .open_files()
+                .contains(&PathBuf::from("a.rs"))),
             "closing the tab must really remove it from open_files"
         );
 
