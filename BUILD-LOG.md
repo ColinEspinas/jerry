@@ -6890,3 +6890,44 @@ never contend with each other.
 --test-threads=1`: **1220 + 44 + 14 + 139 = 1417 passed, 0 failed** across all four crates - no
 `code_surface::diff_view` flake this run either.
 
+## The Changes panel could fail outright on a real, unremarkable git state: an unreadable index
+
+A user-reported error, shown raw in the Changes panel: `failed to compute diff: git add
+--intent-to-add -A -- . exited with status 128: ... fatal: unable to write new index file`, with
+`warning: adding embedded git repository: vendor/zed` printed just before it. The warning turned
+out to be a red herring - confirmed directly: a real repo with 18 real embedded/nested-`.git`
+directories (this project's own checkout, full of `.wt-*` worktree directories) still lets `git
+add -A -- .` succeed with exit 0, warnings and all. Embedded-repo warnings alone are advisory, not
+fatal.
+
+The real bug is in `wt_core::diff::prepare_shadow_index`, and it doesn't need an embedded repo to
+trigger: it builds a throwaway, `--intent-to-add`-augmented copy of the worktree's real index
+(so `git diff` picks up untracked files as additions) by copying the real index's bytes into a
+`tempfile::NamedTempFile`. Its own doc comment claimed that if the real index can't be read (a
+fresh worktree with no index written yet, or - the far more likely real-world trigger in this
+app specifically - an agent CLI's own concurrent `git add`/`git commit` rewriting the index at the
+exact moment this reads it), falling back to leaving the temp file empty "mirrors git's own
+missing index == empty index behavior." Verified directly with real git commands that this claim
+is false: `GIT_INDEX_FILE` pointed at a path that genuinely does not exist is treated as a fresh,
+empty index (`git add` succeeds); pointed at an *existing* empty (0-byte) file, it fails hard -
+`fatal: ... index file smaller than expected`, exit 128 - a completely different code path,
+because `NamedTempFile::new()` had already created a real, empty file on disk at that path before
+the fallback ever ran.
+
+Fixed by deleting the placeholder file (`std::fs::remove_file`) instead of leaving it empty
+whenever the real index can't be read, so the path `GIT_INDEX_FILE` names is genuinely missing,
+not merely empty - `git add` then creates a real index there from scratch, exactly as it would
+for a brand-new repository's very first `git add`.
+
+New regression test `a_missing_or_unreadable_real_index_does_not_fail_the_whole_diff`: deletes the
+real index (via the same `git rev-parse --git-path index` resolution `prepare_shadow_index` itself
+uses) after a real commit, then asserts `diff_against_base` still succeeds and still sees a real
+untracked file. Confirmed non-vacuous by temporarily reverting just the fix (restoring the old
+"leave it empty" fallback) and re-running this one test alone: it fails with the exact
+`GitCommand { ... exit: Code(128), stderr: "fatal: ... index file smaller than expected" }` shape
+the user's own report showed, then re-verified clean once the fix was restored.
+
+**Verification**: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings` - all clean.
+`cargo test --workspace --lib --test-threads=1`: **1220 + 44 + 14 + 140 = 1424 passed, 0 failed**
+across all four crates (1 new test).
