@@ -2262,7 +2262,7 @@ mod editing_tests {
         let relative = PathBuf::from("sample.rs");
 
         let initial_kinds = app.read_with(cx, |app, _| {
-            app.edit_buffers.get(&relative).unwrap().lines[0]
+            app.edit_buffer(&relative).unwrap().lines[0]
                 .runs
                 .iter()
                 .map(|(_, kind)| *kind)
@@ -4242,7 +4242,13 @@ mod editing_tests {
                     label: "wt-a".to_string(),
                     branch: Some("wt-a".to_string()),
                     is_main: true,
+                    is_bare: false,
+                    is_detached: false,
+                    short_sha: None,
                     is_locked: false,
+                    lock_reason: None,
+                    is_broken: false,
+                    broken_reason: None,
                     error: None,
                 },
                 crate::rail::worktrees::WorktreeItem {
@@ -4250,7 +4256,13 @@ mod editing_tests {
                     label: "wt-b".to_string(),
                     branch: Some("wt-b".to_string()),
                     is_main: false,
+                    is_bare: false,
+                    is_detached: false,
+                    short_sha: None,
                     is_locked: false,
+                    lock_reason: None,
+                    is_broken: false,
+                    broken_reason: None,
                     error: None,
                 },
             ];

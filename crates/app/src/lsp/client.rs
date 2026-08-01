@@ -3138,7 +3138,7 @@ process.stdin.on('data', (d) => {
         // A real, armed sync task through the real production entry point - and a real check that
         // it is genuinely armed, so this can't quietly become a test of nothing.
         app.update(cx, |app, cx| {
-            app.schedule_lsp_sync(relative.clone(), cx);
+            app.schedule_lsp_sync(root.clone(), relative.clone(), cx);
         });
         app.read_with(cx, |app, _| {
             assert!(

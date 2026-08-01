@@ -592,7 +592,7 @@ impl AdeApp {
                         // opened for the very first time has a fresh buffer at offset 0, so this
                         // reduces to exactly "line 1, scrolled to top" with no special case.
                         let buffer_cursor_line =
-                            this.edit_buffers.get(&relative_path).map(|buffer| {
+                            this.edit_buffer_at(&cwd, &relative_path).map(|buffer| {
                                 let (line, _) = buffer.line_col_for_offset(buffer.cursor_offset());
                                 line + 1
                             });
@@ -1161,7 +1161,7 @@ mod reopened_file_caret_tests {
         });
         cx.run_until_parked();
         let moved = app.read_with(cx, |app, _| {
-            let buffer = app.edit_buffers.get(&relative).expect("buffer");
+            let buffer = app.edit_buffer(&relative).expect("buffer");
             buffer.line_col_for_offset(buffer.cursor_offset()).0
         });
         assert_eq!(
@@ -1185,7 +1185,7 @@ mod reopened_file_caret_tests {
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| {
-            let buffer = app.edit_buffers.get(&relative).expect("buffer");
+            let buffer = app.edit_buffer(&relative).expect("buffer");
             assert_eq!(
                 buffer.line_col_for_offset(buffer.cursor_offset()).0,
                 200,
@@ -1232,8 +1232,7 @@ mod reopened_file_caret_tests {
         app.read_with(cx, |app, _| {
             assert_eq!(app.code_cursor, Some(1));
             assert_eq!(
-                app.edit_buffers
-                    .get(Path::new("fresh.txt"))
+                app.edit_buffer(Path::new("fresh.txt"))
                     .expect("buffer")
                     .cursor_offset(),
                 0
@@ -1699,7 +1698,13 @@ mod multi_file_tab_tests {
                     label: "wt-a".to_string(),
                     branch: Some("wt-a".to_string()),
                     is_main: true,
+                    is_bare: false,
+                    is_detached: false,
+                    short_sha: None,
                     is_locked: false,
+                    lock_reason: None,
+                    is_broken: false,
+                    broken_reason: None,
                     error: None,
                 },
                 crate::rail::worktrees::WorktreeItem {
@@ -1707,7 +1712,13 @@ mod multi_file_tab_tests {
                     label: "wt-b".to_string(),
                     branch: Some("wt-b".to_string()),
                     is_main: false,
+                    is_bare: false,
+                    is_detached: false,
+                    short_sha: None,
                     is_locked: false,
+                    lock_reason: None,
+                    is_broken: false,
+                    broken_reason: None,
                     error: None,
                 },
             ];
