@@ -1157,8 +1157,7 @@ impl AdeApp {
     ) -> impl IntoElement {
         let is_selected = self.agents.active_id() == Some(agent.id);
         let status = agent.status;
-        let (chip_fg, chip_bg) = work_surface::agent_tint(agent.kind);
-        let chip_glyph = work_surface::agent_initial(agent.kind);
+        let chip_icon = self.render_agent_chip_icon(agent.kind, px(15.0), self.ui_text_size(9.0));
         let state_color: gpui::Rgba = match status {
             Status::Ask | Status::Fail => status.color(),
             _ => theme::text::FAINT.into(),
@@ -1199,22 +1198,7 @@ impl AdeApp {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(15.0))
-                            .h(px(15.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(theme::radius::CHIP)
-                            .bg(chip_bg)
-                            .font(font(theme::font::MONO))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(self.ui_text_size(9.0))
-                            .text_color(chip_fg)
-                            .child(chip_glyph),
-                    )
+                    .child(chip_icon)
                     .child(
                         div()
                             .flex_1()
@@ -1959,6 +1943,105 @@ mod rail_filter_caret_tests {
             "focusing the rail filter must have started the real, live shared blink task - if \
              `filter_focus_handle` were never wired into `AdeApp::wire_caret_blink`, no timer \
              would be running at all and this flag would still be stuck solid"
+        );
+    }
+}
+
+/// GitHub issue #5's "custom icon packs" - real coverage that the rail agent row's chip
+/// (`AdeApp::render_agent_chip_icon`, the one real call site this feature is wired to today)
+/// actually switches between the app's default letter chip and a real pack SVG, rather than
+/// just trusting the render code's own claim to do so.
+#[cfg(test)]
+mod agent_chip_icon_pack_tests {
+    use crate::rail::worktrees::WorktreeItem;
+    use crate::root::focus::palette_focus_tests;
+    use crate::work_surface::agents::AgentKind;
+    use gpui::TestAppContext;
+
+    fn worktree_item(path: std::path::PathBuf, label: &str) -> WorktreeItem {
+        WorktreeItem {
+            path,
+            label: label.to_string(),
+            branch: Some(label.to_string()),
+            is_main: false,
+            is_bare: false,
+            is_detached: false,
+            short_sha: None,
+            is_locked: false,
+            lock_reason: None,
+            is_broken: false,
+            broken_reason: None,
+            error: None,
+        }
+    }
+
+    /// A real, running shell agent in a real seeded worktree - a just-spawned shell is `Status::
+    /// Run`, which defaults its worktree row to expanded (`AdeApp::worktree_is_expanded`'s own
+    /// "idle-rooted" rule), so the agent row (and this chip) actually renders without needing a
+    /// separate collapse-override hack.
+    fn open_with_a_running_shell_agent(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        gpui::Entity<crate::root::AdeApp>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt = tempfile::tempdir().expect("tempdir wt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt.path().to_path_buf(), "wt")];
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            app.agents
+                .spawn(AgentKind::Shell, wt.path().to_path_buf(), 12.0, window, cx);
+        });
+        cx.run_until_parked();
+        (repo, wt, app, cx)
+    }
+
+    #[gpui::test]
+    fn the_rail_agent_row_shows_the_default_chip_with_no_pack_configured(cx: &mut TestAppContext) {
+        let (_repo, _wt, _app, cx) = open_with_a_running_shell_agent(cx);
+
+        assert!(
+            cx.debug_bounds("agent-chip-icon-default").is_some(),
+            "with no icon pack configured, the rail's own default agent chip must paint"
+        );
+        assert!(
+            cx.debug_bounds("agent-chip-icon-pack-svg").is_none(),
+            "with no icon pack configured, no pack SVG element must paint at all"
+        );
+    }
+
+    #[gpui::test]
+    fn the_rail_agent_row_switches_to_a_real_pack_icon_once_one_is_configured(
+        cx: &mut TestAppContext,
+    ) {
+        let pack_dir = tempfile::tempdir().expect("tempdir");
+        // The seeded agent is a real `AgentKind::Shell` (`work_surface::agent_icon_name`'s own
+        // mapping), so `shell.svg` is the real file this specific row's chip looks for.
+        std::fs::write(pack_dir.path().join("shell.svg"), "<svg></svg>").expect("write");
+
+        let (_repo, _wt, app, cx) = open_with_a_running_shell_agent(cx);
+        app.update(cx, |app, cx| {
+            app.settings.icon_pack.directory = Some(pack_dir.path().to_path_buf());
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("agent-chip-icon-pack-svg").is_some(),
+            "once a real pack directory with a matching shell.svg is configured, the rail row \
+             must really switch to painting the pack's own SVG element"
+        );
+        assert!(
+            cx.debug_bounds("agent-chip-icon-default").is_none(),
+            "the default letter chip must not also paint once the pack icon takes over - \
+             exactly one of the two must be showing, never both at once"
         );
     }
 }

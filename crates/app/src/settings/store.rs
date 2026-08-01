@@ -99,6 +99,17 @@ pub struct Settings {
     pub file_tree: FileTreeSettings,
     pub blame: BlameSettings,
     pub editor: EditorSettings,
+    pub icon_pack: IconPackSettings,
+}
+
+/// `crate::icon_pack`'s persisted backing (GitHub issue #5's "custom icon packs") - `None` means
+/// the app's own default, built-in icons (styled shapes/glyphs, no image assets), never a
+/// fabricated "empty pack" state. See that module's own docs for how `directory` is resolved
+/// into a real icon at render time.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IconPackSettings {
+    pub directory: Option<PathBuf>,
 }
 
 /// `crate::root::AdeApp::window_controls_style`'s persisted backing - see
