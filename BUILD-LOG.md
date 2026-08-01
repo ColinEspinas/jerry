@@ -4437,3 +4437,41 @@ honestly disabled, not fake-clickable - unchanged, no fix needed there.
 **Verification**: `cargo fmt --all -- --check`, `cargo build --workspace`,
 `cargo clippy --workspace --all-targets -- -D warnings` - all clean. `cargo test --workspace --lib
 --test-threads=1`: **1130 + 44 + 14 + 119 = 1307 passed, 0 failed** across all four crates.
+
+## Rebasing the ordinal tab-label branch onto the git-staging stack (Revision R12 §3)
+
+This branch (`revision-r12-tabstrip`) carried a single commit - ordinal `#N` disambiguation for
+two same-model agents' tab labels in one worktree, plus the bare-worktree "Start an agent" prompt -
+still sitting on the old pre-rename `088f0b0` tip, five commits behind
+`origin/revision-r12-tabs-changes` (the Agent rename, the `open_files`/`edit_buffers` per-worktree
+accessors, the title-bar chip row, the rail header-counter fix, and the real commit-composer/git-
+staging work logged just above). Rebased onto that tip.
+
+The one commit's whole diff lives in `work_surface/render.rs` (plus a small pure-logic addition in
+`work_surface/state.rs` that applied without conflict). `render.rs` conflicted at every site the
+commit touched, because it predates the `Session`→`Agent` rename by a few hours: `SessionId`/
+`SessionKind`/`self.sessions`/`render_session_tab`/`render_session_context_bar`/
+`current_worktree_sessions`/`active_session_cwd` against this revision's now-current `AgentId`/
+`AgentKind`/`self.agents`/`render_agent_tab`/`render_agent_context_bar`/`current_worktree_agents`/
+`active_agent_cwd`. Resolved by keeping the rename side's types and method names throughout and
+re-applying this commit's real logic on top of them - the new
+`current_worktree_agent_tab_labels`/`current_worktree_is_bare`/`current_worktree_branch` helpers,
+`render_agent_tab` taking a precomputed `label: String` instead of deriving its own, and
+`render_agent_context_bar`'s bare-worktree `Merge`/`Archive` → `Start an agent` swap - all renamed
+to match. A few hunks (the new helper methods, the three new `#[gpui::test]`s) auto-merged as pure
+text additions without conflict markers at all, which meant they still said `SessionKind`/
+`self.sessions`/`session` verbatim after the merge; grepped the whole file for `Session` post-
+rebase (not just the marked conflict regions) and renamed those by hand too, since a clean 3-way
+merge has no idea a sibling commit renamed a type. `pty_core::PtySession` doc references were left
+alone - a genuinely distinct, lower-level type this rename never touched. No `BUILD-LOG.md`
+conflict this time (the commit doesn't touch it).
+
+**Verification**: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings` - all clean. `cargo test --workspace --lib
+--test-threads=1`: **1138 + 44 + 14 + 119 = 1315 passed, 0 failed** across all four crates. One
+full run hit the already-documented `code_surface::diff_view::diff_render_tests` flake (a
+different sub-test each time); re-ran that family alone five times in isolation and saw it fail
+twice more (different sub-tests both times) - consistent with the family's known ~1-in-5 flake
+rate, unrelated to this rebase's `work_surface`-only changes. The subsequent full run was clean
+with no re-run needed. Grepped the resolved files for stray `<<<<<<<`/`=======`/`>>>>>>>` markers
+after resolution - none remained.
