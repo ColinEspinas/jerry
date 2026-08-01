@@ -20,6 +20,8 @@ use crate::keymap;
 #[cfg(test)]
 use crate::keymap::WindowControlsStyle;
 use crate::palette::state as palette;
+use crate::rail::state::{self as rail, AgentRow};
+use crate::rail::status::Status;
 #[cfg(test)]
 use crate::rail::worktrees::WorktreeItem;
 use crate::root::*;
@@ -38,6 +40,8 @@ use gpui::{
 };
 #[cfg(test)]
 use std::path::PathBuf;
+#[cfg(test)]
+use std::time::Duration;
 
 pub(crate) mod menu;
 pub(crate) mod render;
