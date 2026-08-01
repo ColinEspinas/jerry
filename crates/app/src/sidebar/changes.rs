@@ -6,12 +6,72 @@
 //! shows lives here; `gpui::Div` construction happens in `crate::root`, which owns the
 //! `Context<AdeApp>` the click handlers (review-toggle, open-in-centre) need.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use gpui::Rgba;
 
 use crate::theme;
+use crate::work_surface::sessions::SessionId;
 use wt_core::diff::{DiffFile, DiffHunk, DiffLineKind, FileChangeStatus};
+
+/// Which agent session(s) wrote each changed file in one worktree's diff -
+/// `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §4 ("Where numbers live")'s
+/// `by: 's1'`, or `by: ['s1', 's9']` when more than one agent touched the same file. Keyed by a
+/// [`DiffFile::path`] (or `old_path`, before a rename - callers decide which path they're asking
+/// about; this type doesn't special-case renames itself).
+///
+/// **Not wired to any real tracking yet.** A separate, parallel piece of work watches an agent's
+/// edit tool calls and is meant to call [`Self::record`] as it observes them; this phase only
+/// defines the shape so that work has somewhere real to write into, and so every current consumer
+/// (`crate::code_surface::tabs::AdeApp::load_diff`, which resets this to
+/// [`Authorship::default`] on every worktree/diff reload - see that method's own docs) has a real,
+/// empty value to thread through rather than a stub. An empty `Authorship` means exactly what an
+/// empty [`Self::authors_for`] result says: "nobody's authorship has been recorded for this file
+/// yet", never fabricated as "no agent touched it".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Authorship {
+    by_path: HashMap<PathBuf, Vec<SessionId>>,
+}
+
+impl Authorship {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every session id recorded as having written `path`, in the order [`Self::record`] saw
+    /// them - empty (never fabricated) when nothing has recorded authorship for it yet, which
+    /// today is every path (see this type's own docs).
+    pub fn authors_for(&self, path: &Path) -> &[SessionId] {
+        self.by_path.get(path).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Records `session` as (one of) `path`'s authors. Idempotent: recording the same session
+    /// against the same path twice does not duplicate the entry, so [`Self::authors_for`]'s
+    /// length is always the real distinct-author count, not an edit-tool-call count.
+    pub fn record(&mut self, path: PathBuf, session: SessionId) {
+        let authors = self.by_path.entry(path).or_default();
+        if !authors.contains(&session) {
+            authors.push(session);
+        }
+    }
+
+    /// `true` when more than one distinct session has written `path` - the design's amber
+    /// shared-file warning: the rail's worktree-row `⚠ N` and the Changes panel's amber
+    /// author-chip ring both key off this per-file check.
+    pub fn has_multiple_authors(&self, path: &Path) -> bool {
+        self.authors_for(path).len() > 1
+    }
+
+    /// How many of `paths` have more than one recorded author - the worktree row's `⚠ N` count
+    /// itself (§4: "files two agents both wrote").
+    pub fn shared_file_count<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) -> usize {
+        paths
+            .into_iter()
+            .filter(|path| self.has_multiple_authors(path))
+            .count()
+    }
+}
 
 /// Added/removed line counts for one file, counted directly from its hunks.
 /// `wt_core::diff::DiffFile` has no separate stored counter for this, so it's recomputed here
@@ -594,5 +654,65 @@ mod tests {
             empty_hunks_message(FileChangeStatus::Deleted),
             "no line changes"
         );
+    }
+
+    #[test]
+    fn a_fresh_authorship_has_no_authors_for_any_path() {
+        let authorship = Authorship::new();
+        assert_eq!(
+            authorship.authors_for(Path::new("src/main.rs")),
+            &[] as &[SessionId]
+        );
+        assert!(!authorship.has_multiple_authors(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn recording_one_session_makes_it_the_sole_author() {
+        let mut authorship = Authorship::new();
+        authorship.record(PathBuf::from("src/main.rs"), 1);
+        assert_eq!(authorship.authors_for(Path::new("src/main.rs")), &[1]);
+        assert!(!authorship.has_multiple_authors(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn recording_the_same_session_twice_does_not_duplicate_it() {
+        let mut authorship = Authorship::new();
+        authorship.record(PathBuf::from("src/main.rs"), 1);
+        authorship.record(PathBuf::from("src/main.rs"), 1);
+        assert_eq!(authorship.authors_for(Path::new("src/main.rs")), &[1]);
+    }
+
+    #[test]
+    fn two_distinct_sessions_writing_the_same_file_is_a_shared_file() {
+        let mut authorship = Authorship::new();
+        authorship.record(PathBuf::from("src/main.rs"), 1);
+        authorship.record(PathBuf::from("src/main.rs"), 9);
+        assert_eq!(authorship.authors_for(Path::new("src/main.rs")), &[1, 9]);
+        assert!(authorship.has_multiple_authors(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn shared_file_count_only_counts_paths_with_more_than_one_author() {
+        let mut authorship = Authorship::new();
+        authorship.record(PathBuf::from("src/main.rs"), 1);
+        authorship.record(PathBuf::from("src/main.rs"), 9);
+        authorship.record(PathBuf::from("src/lib.rs"), 1);
+
+        let paths = [
+            PathBuf::from("src/main.rs"),
+            PathBuf::from("src/lib.rs"),
+            PathBuf::from("src/untouched.rs"),
+        ];
+        assert_eq!(
+            authorship.shared_file_count(paths.iter().map(PathBuf::as_path)),
+            1
+        );
+    }
+
+    #[test]
+    fn different_paths_never_share_recorded_authors() {
+        let mut authorship = Authorship::new();
+        authorship.record(PathBuf::from("src/main.rs"), 1);
+        assert!(authorship.authors_for(Path::new("src/other.rs")).is_empty());
     }
 }

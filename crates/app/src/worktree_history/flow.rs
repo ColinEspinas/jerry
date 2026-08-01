@@ -37,7 +37,7 @@ impl AdeApp {
     /// on disk) - the same `load_worktrees` + `load_diff` pair `Self::complete_merge_flow`'s own
     /// success arm already uses for the identical reason.
     fn refresh_after_worktree_history_op(&mut self, cx: &mut Context<Self>) {
-        let repo_path = self.repo_path.clone();
+        let repo_path = self.focused_repo_path();
         self.load_worktrees(cx);
         self.load_diff(repo_path, cx);
     }
@@ -129,7 +129,7 @@ impl AdeApp {
             return;
         };
         let worktree_path = session.cwd.clone();
-        let repo_path = self.repo_path.clone();
+        let repo_path = self.focused_repo_path();
         let branch_display = self.branch_display_for(&worktree_path);
         self.worktree_history_op_in_flight = Some(WorktreeHistoryOpKind::Discard);
         self.worktree_history_status = Some(format!("discarding {branch_display}\u{2026}"));

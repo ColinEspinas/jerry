@@ -3,6 +3,9 @@
 //! Split the way every feature folder in this crate is split - pure, GPUI-window-free
 //! logic separate from the `gpui::Div`-building code that draws it:
 //!
+//! - [`repo`] - one added git repository (`Repo`/`RepoId`), the rail's group level
+//!   (Revision R12 Phase 0), plus its own crash-safe `~/.config/jerry/repos.toml`
+//!   persistence, mirroring [`crate::sidebar::fold_state`]'s pattern.
 //! - [`state`] - the pure row model: one row per worktree, aggregating every session open
 //!   in it, plus the filter/grouping rules. No `gpui::Window`.
 //! - [`worktrees`] - maps `wt-core`'s raw worktree list into that row model's input shape, plus
@@ -40,6 +43,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
+pub mod repo;
 pub mod state;
 pub mod status;
 pub mod worktree_watch;

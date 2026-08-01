@@ -202,10 +202,9 @@ impl AdeApp {
     /// any of those controls can never also arm this drag.
     pub(crate) fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let project_name = self
-            .repo_path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.repo_path.display().to_string());
+            .focused_repo()
+            .map(|repo| repo.name.clone())
+            .unwrap_or_else(|| self.focused_repo_path().display().to_string());
         let branch = self
             .worktrees
             .iter()
