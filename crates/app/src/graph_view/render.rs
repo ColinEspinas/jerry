@@ -402,6 +402,10 @@ impl AdeApp {
         if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
             return;
         }
+        // GitHub issue #27's "solid mid-keystroke" - see `crate::rail::render::AdeApp::
+        // handle_filter_key_down`'s identical reasoning. Missing here (GitHub issue #45) is
+        // exactly why this field never blinked in the first place.
+        self.reset_caret_blink(cx);
         let changed = match keystroke.key.as_str() {
             "backspace" => self.graph_state.branches_filter.pop(Instant::now()),
             "escape" => self.graph_state.branches_filter.clear(Instant::now()),
@@ -1466,17 +1470,37 @@ impl AdeApp {
             .child(
                 div()
                     .flex_1()
-                    .font(font(theme::font::MONO))
-                    .text_size(px(10.5))
-                    .text_color(if has_query {
-                        theme::text::DIM
-                    } else {
-                        theme::text::GHOST
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    // GitHub issue #45 / live report: this filter row had *no* caret element at
+                    // all - `branches_filter_focus_handle` was never threaded into
+                    // `AdeApp::wire_caret_blink` (see `Self::new_with_settings`'s own comment on
+                    // why it's wired separately, after `graph_state` exists), so there was
+                    // nothing to paint here regardless. Now matches
+                    // `crate::rail::render::AdeApp::render_rail_filter_row`'s own fixed
+                    // before-placeholder / after-text placement.
+                    .when(!has_query, |el| {
+                        el.child(self.render_simple_input_caret("graph-branches-filter-caret"))
                     })
-                    .child(if has_query {
-                        self.graph_state.branches_filter.as_str().to_string()
-                    } else {
-                        "filter branches".to_string()
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.5))
+                            .text_color(if has_query {
+                                theme::text::DIM
+                            } else {
+                                theme::text::GHOST
+                            })
+                            .child(if has_query {
+                                self.graph_state.branches_filter.as_str().to_string()
+                            } else {
+                                "filter branches".to_string()
+                            })
+                            .debug_selector(|| "graph-branches-filter-text".to_string()),
+                    )
+                    .when(has_query, |el| {
+                        el.child(self.render_simple_input_caret("graph-branches-filter-caret"))
                     }),
             )
             .child(
@@ -4735,6 +4759,141 @@ mod graph_focus_tests {
         assert!(
             !app.read_with(cx, |app, _| app.graph_tab_open),
             "middle-clicking the graph tab must close it, same as a file or agent tab"
+        );
+    }
+
+    /// GitHub issue #45 ("Input blink only on focused input or file") plus a live follow-up
+    /// report: this filter row had *no* caret element at all - confirmed by reading
+    /// `render_graph_branches_filter_row` before this fix, and `branches_filter_focus_handle`
+    /// was never threaded through `AdeApp::wire_caret_blink` either (it didn't exist yet when
+    /// that call in `Self::new_with_settings` was first wired - the Branches panel is a later
+    /// Revision R12 addition). Real interaction coverage, mirroring
+    /// `crate::rail::render::rail_filter_caret_tests`' own measured-bounds technique.
+    #[gpui::test]
+    fn caret_sits_before_the_placeholder_when_empty_and_after_the_text_once_typed(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded(cx);
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+            app.set_graph_right_panel(GraphRightPanel::Branches, cx);
+            window.focus(&app.graph_state.branches_filter_focus_handle, cx);
+        });
+        cx.run_until_parked();
+
+        let empty_caret = cx.debug_bounds("graph-branches-filter-caret").expect(
+            "the caret should have really painted with an empty filter - before this fix, \
+                 no caret element existed here at all, so this selector would never resolve",
+        );
+        let placeholder = cx
+            .debug_bounds("graph-branches-filter-text")
+            .expect("the placeholder text should have really painted");
+        assert!(
+            empty_caret.origin.x <= placeholder.origin.x,
+            "with an empty filter, the real caret must sit before (at or left of) the \
+             placeholder's own start x, not after it - got caret {:?} vs placeholder {:?}",
+            empty_caret,
+            placeholder,
+        );
+
+        cx.simulate_input("main");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .graph_state
+                .branches_filter
+                .as_str()
+                .to_string()),
+            "main",
+            "sanity check: real typed filter"
+        );
+
+        let typed_caret = cx
+            .debug_bounds("graph-branches-filter-caret")
+            .expect("the caret should have really painted with a typed filter");
+        let typed_text = cx
+            .debug_bounds("graph-branches-filter-text")
+            .expect("the real typed text should have really painted");
+        assert!(
+            typed_caret.origin.x >= typed_text.origin.x + typed_text.size.width,
+            "with a typed filter, the real caret must sit at or after the typed text's own \
+             right edge, not before it - got caret {:?} vs text {:?}",
+            typed_caret,
+            typed_text,
+        );
+        assert!(
+            typed_caret.origin.x > empty_caret.origin.x,
+            "the caret's real measured horizontal position must differ between the \
+             empty-filter state (before the placeholder) and a typed-filter state (after the \
+             real text) - got {:?} vs {:?}",
+            empty_caret.origin.x,
+            typed_caret.origin.x,
+        );
+    }
+
+    /// GitHub issue #45's own title, taken literally: before this fix,
+    /// `branches_filter_focus_handle` was never wired into `AdeApp::wire_caret_blink` at all, so
+    /// *blurring* it never called the real [`AdeApp::stop_caret_blink`] that pins the shared
+    /// flag straight to "dimmed" the instant focus leaves - the same real, immediate effect
+    /// every already-wired handle has always had.
+    ///
+    /// This deliberately checks *blur*, not *focus*: typing into the field also calls
+    /// `Self::reset_caret_blink` directly (`Self::handle_branches_filter_key_down`'s own real
+    /// "solid mid-keystroke" behaviour, GitHub issue #27) regardless of whether
+    /// `branches_filter_focus_handle` is wired into the shared loop at all - so a test that only
+    /// focuses-then-types would pass even with the wiring gap this fix closes, and prove
+    /// nothing about it. Blurring is the one real effect that only a genuine `AdeApp::
+    /// wire_caret_blink` subscription produces: an *immediate*, synchronous flip to
+    /// `caret_blink_visible == false`, not something that could be explained by the still-live
+    /// timer from the earlier keystroke (which hasn't been given time to fire - the background
+    /// clock is never advanced in this test).
+    #[gpui::test]
+    fn blurring_the_branches_filter_stops_the_real_shared_blink_loop(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded(cx);
+        app.update_in(cx, |_app, window, _cx| window.activate_window());
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+            app.set_graph_right_panel(GraphRightPanel::Branches, cx);
+            window.focus(&app.graph_state.branches_filter_focus_handle, cx);
+        });
+        // `open_git_graph` kicks off a real, async `load_graph` (a background `gix` commit
+        // walk) - the Branches panel only actually renders its filter row (rather than the
+        // "open the graph to see branches" placeholder `render_graph_branches_panel` shows
+        // while `current_graph()` is still `None`) once that finishes. Parked here first, the
+        // same way the sibling position test above does, so `cx.simulate_input` below dispatches
+        // against a frame that genuinely has the filter row - and therefore its focus - in it.
+        cx.run_until_parked();
+
+        cx.simulate_input("m");
+        assert!(
+            app.read_with(cx, |app, _| app.caret_blink_visible),
+            "sanity check: typing must leave the caret solid/visible, whether that came from \
+             this fix's own on-focus wiring or `handle_branches_filter_key_down`'s pre-existing \
+             `reset_caret_blink` call"
+        );
+
+        // Move real keyboard focus to a genuinely different, real, *unwired* handle
+        // (`AdeApp::rail_focus_handle`, the rail's own always-present container fallback, never
+        // itself a caret-bearing input) - and force the same real redraw a live blur event
+        // needs to be observed (`rail::render::rail_filter_caret_tests`' own identical
+        // `cx.simulate_input`-forces-a-redraw finding), via a harmless, unbound plain keystroke
+        // rather than typing into a real field.
+        app.update_in(cx, |app, window, cx| {
+            window.focus(&app.rail_focus_handle, cx);
+        });
+        cx.simulate_keystrokes("x");
+
+        assert!(
+            !app.read_with(cx, |app, _| app.caret_blink_visible),
+            "blurring the branches filter must have immediately pinned the shared caret to \
+             dimmed/non-blinking (`AdeApp::stop_caret_blink`) - before this fix, \
+             `branches_filter_focus_handle` was never threaded through \
+             `AdeApp::wire_caret_blink`, so nothing would have reacted to it losing focus at \
+             all, and the caret would have stayed solid/visible until whatever timer the \
+             earlier keystroke started eventually fired on its own"
         );
     }
 }

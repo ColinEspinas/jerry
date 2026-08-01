@@ -107,6 +107,10 @@ impl AdeApp {
             "backspace" => {
                 if let Some(input) = self.new_file_input.as_mut() {
                     input.name.pop(Instant::now());
+                    // GitHub issue #27's "solid mid-keystroke" - see `crate::rail::render::
+                    // AdeApp::handle_filter_key_down`'s identical reasoning. Missing here
+                    // (GitHub issue #45) is exactly why this field never blinked.
+                    self.reset_caret_blink(cx);
                     cx.notify();
                     cx.stop_propagation();
                 }
@@ -119,6 +123,7 @@ impl AdeApp {
                 {
                     if let Some(input) = self.new_file_input.as_mut() {
                         input.name.push_str(text, Instant::now());
+                        self.reset_caret_blink(cx);
                         cx.notify();
                         cx.stop_propagation();
                     }
@@ -247,21 +252,42 @@ impl AdeApp {
                             .text_color(theme::text::FAINTER)
                             .child(parent_label),
                     )
-                    .child(
+                    .child({
+                        let has_name = !name.is_empty();
                         div()
                             .px(px(8.0))
                             .py(px(5.0))
                             .rounded(theme::radius::CHIP)
                             .bg(theme::surface::SEGMENT_TRACK)
+                            .flex()
+                            .items_center()
+                            .gap(px(2.0))
                             .font(font(theme::font::MONO))
                             .text_size(px(11.5))
                             .text_color(theme::text::BODY)
-                            .child(if name.is_empty() {
-                                "file-name.ext".to_string()
-                            } else {
-                                name
-                            }),
-                    )
+                            // GitHub issue #45 / live report: this prompt had no caret element
+                            // at all before this - just the typed name or its placeholder, no
+                            // insertion-point indicator, and `new_file_focus_handle` was never
+                            // wired into `crate::root::caret_blink` either (see
+                            // `Self::new_with_settings`'s own comment on the fix). Same
+                            // before-placeholder / after-text placement as
+                            // `crate::rail::render::AdeApp::render_rail_filter_row`.
+                            .when(!has_name, |el| {
+                                el.child(self.render_simple_input_caret("new-file-caret"))
+                            })
+                            .child(
+                                div()
+                                    .debug_selector(|| "new-file-name-text".to_string())
+                                    .child(if has_name {
+                                        name
+                                    } else {
+                                        "file-name.ext".to_string()
+                                    }),
+                            )
+                            .when(has_name, |el| {
+                                el.child(self.render_simple_input_caret("new-file-caret"))
+                            })
+                    })
                     .when_some(self.new_file_error.clone(), |el, error| {
                         el.child(
                             div()
@@ -578,5 +604,134 @@ mod tests {
         app.read_with(cx, |app, _| {
             assert!(app.new_file_input.is_none());
         });
+    }
+}
+
+/// GitHub issue #45 ("Input blink only on focused input or file") plus a live follow-up report:
+/// this prompt had no caret element at all - confirmed by reading `render_new_file_prompt`
+/// before this fix, just the typed name or its `"file-name.ext"` placeholder - and
+/// `new_file_focus_handle` was never threaded through `AdeApp::wire_caret_blink` either. Real
+/// interaction coverage, mirroring `crate::rail::render::rail_filter_caret_tests`' own
+/// measured-bounds technique.
+#[cfg(test)]
+mod new_file_caret_tests {
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn caret_sits_before_the_placeholder_when_empty_and_after_the_text_once_typed(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_new_file(repo.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let empty_caret = cx.debug_bounds("new-file-caret").expect(
+            "the caret should have really painted with an empty name - before this fix, no \
+             caret element existed here at all, so this selector would never resolve",
+        );
+        let placeholder = cx
+            .debug_bounds("new-file-name-text")
+            .expect("the placeholder text should have really painted");
+        assert!(
+            empty_caret.origin.x <= placeholder.origin.x,
+            "with an empty name, the real caret must sit before (at or left of) the \
+             placeholder's own start x, not after it - got caret {:?} vs placeholder {:?}",
+            empty_caret,
+            placeholder,
+        );
+
+        cx.simulate_input("main.rs");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .new_file_input
+                .as_ref()
+                .expect("still open")
+                .name
+                .as_str()
+                .to_string()),
+            "main.rs",
+            "sanity check: real typed name"
+        );
+
+        let typed_caret = cx
+            .debug_bounds("new-file-caret")
+            .expect("the caret should have really painted with a typed name");
+        let typed_text = cx
+            .debug_bounds("new-file-name-text")
+            .expect("the real typed name should have really painted");
+        assert!(
+            typed_caret.origin.x >= typed_text.origin.x + typed_text.size.width,
+            "with a typed name, the real caret must sit at or after the typed text's own right \
+             edge, not before it - got caret {:?} vs text {:?}",
+            typed_caret,
+            typed_text,
+        );
+        assert!(
+            typed_caret.origin.x > empty_caret.origin.x,
+            "the caret's real measured horizontal position must differ between the empty-name \
+             state (before the placeholder) and a typed-name state (after the real text) - got \
+             {:?} vs {:?}",
+            empty_caret.origin.x,
+            typed_caret.origin.x,
+        );
+    }
+
+    /// GitHub issue #45's own title, taken literally: before this fix, `new_file_focus_handle`
+    /// was never wired into `AdeApp::wire_caret_blink` at all, so *blurring* it never called the
+    /// real [`crate::root::AdeApp::stop_caret_blink`] that pins the shared flag straight to
+    /// "dimmed" the instant focus leaves.
+    ///
+    /// Checks *blur*, not *focus* - see
+    /// `crate::graph_view::render::graph_focus_tests::blurring_the_branches_filter_stops_the_real_shared_blink_loop`'s
+    /// own docs for why a focus-then-type test can't actually distinguish "wired into
+    /// `wire_caret_blink`" from "`Self::handle_new_file_key_down`'s own real `reset_caret_blink`
+    /// call on every keystroke, regardless of that wiring" - only blur has an effect that's
+    /// unique to the real subscription this fix adds.
+    #[gpui::test]
+    fn blurring_the_new_file_prompt_stops_the_real_shared_blink_loop(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        // `on_focus`/`on_blur` listeners (`AdeApp::wire_caret_blink`'s own mechanism) only
+        // fire while GPUI considers the window itself "active" - a real, freshly opened test
+        // window starts out not active at all, so this is a real, necessary precondition, not
+        // test scaffolding for its own sake.
+        app.update_in(cx, |_app, window, _cx| window.activate_window());
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_new_file(repo.path().to_path_buf(), window, cx);
+        });
+        cx.simulate_input("m");
+        assert!(
+            app.read_with(cx, |app, _| app.caret_blink_visible),
+            "sanity check: typing must leave the caret solid/visible, whether that came from \
+             this fix's own on-focus wiring or `handle_new_file_key_down`'s pre-existing \
+             `reset_caret_blink` call"
+        );
+
+        // Move real keyboard focus to a genuinely different, real, *unwired* handle
+        // (`AdeApp::rail_focus_handle`, the rail's own always-present container fallback, never
+        // itself a caret-bearing input), then force the same real redraw a live blur event
+        // needs to be observed in this test harness, via a harmless, unbound plain keystroke.
+        app.update_in(cx, |app, window, cx| {
+            window.focus(&app.rail_focus_handle, cx);
+        });
+        cx.simulate_keystrokes("x");
+
+        assert!(
+            !app.read_with(cx, |app, _| app.caret_blink_visible),
+            "blurring the \"New file\" prompt must have immediately pinned the shared caret to \
+             dimmed/non-blinking (`AdeApp::stop_caret_blink`) - before this fix, \
+             `new_file_focus_handle` was never threaded through `AdeApp::wire_caret_blink`, so \
+             nothing would have reacted to it losing focus at all, and the caret would have \
+             stayed solid/visible until whatever timer the earlier keystroke started eventually \
+             fired on its own"
+        );
     }
 }

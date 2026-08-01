@@ -6983,3 +6983,110 @@ tiling test beside it still passes - the precise blind spot, now covered.
 `lsp::client::lsp_diagnostics_wiring_tests::rust_analyzer_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions`
 blow its wall-clock deadline under load; it passes 3/3 in isolation in ~3s and the clean rerun
 above passes it too - a real-rust-analyzer timing flake, not a regression.
+
+
+## GitHub issue #45 and a live report: carets glued to the end of placeholder text, and two real inputs never wired to the shared blink loop at all
+
+Two reports, investigated together since the live one's symptoms ("displays at the end of the
+placeholder", "a lot of inputs are missing carets") pointed straight at issue #45's own title
+("Input blink only on focused input or file"): whichever mechanism drives the caret was, in some
+sense, only really correct for a couple of surfaces.
+
+### Inventory: exactly six real, hand-rolled text inputs, not a sprawling pile
+
+`grep -rn "TextField::new()" crates/app/src/` found the app's *entire* real inventory of
+hand-rolled single-line inputs (the code editor and the merge-conflict editor use a completely
+different, already-correct, real-cursor-position-aware `EditBuffer` - out of scope, per the
+task, and untouched here):
+
+- `AdeApp::palette_query` (command palette search) - `crate::palette::render::render_palette_caret`
+- `AdeApp::filter_query` (rail agent/worktree filter) - `crate::rail::render`
+- `AdeApp::settings_keymap_filter` (Settings › Keybindings filter) - `crate::settings::render`
+- the file tree's inline rename/new-file/new-folder editor - `crate::sidebar::tree_ops`
+- `GraphTabState::branches_filter` (git graph tab's Branches panel filter) - `crate::graph_view::render`
+- `NewFileInputState::name` (the "New file" prompt) - `crate::root::new_file`
+
+Two of these (the palette, the tree's inline editor) were already correct. The other four had
+two independent, real bugs:
+
+**Bug 1 - caret glued to the end of the placeholder.** `crate::root::widgets::AdeApp::
+render_simple_input_caret` is the one shared helper `render_rail_filter_row` and
+`render_settings_keymap_filter_row` both used, and it was always rendered as the row's *last*
+child, regardless of whether the row's other child was the real typed text or the placeholder
+string. With an empty filter, that put a blinking bar visually appended after `"filter worktrees
+and agents"`/`"filter N bindings"` - exactly the live report's "displays at the end of the
+placeholder but should not". `crate::palette::render::render_palette_caret` had already solved
+this correctly (caret before the placeholder at the real cursor position, 0; after the real text
+once there's any) - `render_simple_input_caret` just never got the same treatment.
+
+**Bug 2 - two inputs' carets weren't wired into the shared blink loop, or rendered at all.**
+`AdeApp::wire_caret_blink` (called once, from `Self::new_with_settings`) is the one place that
+threads a caret-bearing `FocusHandle` into the shared `on_focus`/`on_blur` subscriptions that
+start/stop the blink loop. It listed six handles. `GraphTabState::branches_filter_focus_handle`
+(added later, when the git graph tab's Branches panel shipped) and `AdeApp::new_file_focus_handle`
+were never among them - and, compounding it, `render_graph_branches_filter_row` and
+`render_new_file_prompt` never called `render_simple_input_caret` (or anything else) at all, so
+these two fields had no caret element in the tree whatsoever. That's the live report's "a lot of
+inputs are missing carets" - not hyperbole, a literal, confirmed-by-reading-the-render-code gap
+in two real, reachable surfaces.
+
+### The fix
+
+- `render_simple_input_caret` now takes a `debug_selector` and each call site places it the same
+  way the palette already does: before the placeholder while the field is empty, after the real
+  text once there's any (`crates/app/src/root/widgets.rs`,
+  `crates/app/src/rail/render.rs:render_rail_filter_row`,
+  `crates/app/src/settings/render.rs:render_settings_keymap_filter_row`).
+- `render_graph_branches_filter_row` and `render_new_file_prompt` gained the same caret, in the
+  same shared helper, rather than a third hand-rolled implementation.
+- `Self::new_with_settings` (`crates/app/src/root/state.rs`) threads
+  `branches_filter_focus_handle` and `new_file_focus_handle` into `AdeApp::wire_caret_blink` too -
+  in a second call right after the constructor's own `Self { .. }` literal, since both handles
+  live *inside* `this` (one nested in `graph_state`) and don't exist yet at the point the first
+  six are wired.
+- `handle_branches_filter_key_down`/`handle_new_file_key_down` gained the same
+  `self.reset_caret_blink(cx)` call on every real keystroke every other hand-rolled field's own
+  key handler already had (issue #27's "solid mid-keystroke") - missing here is exactly why
+  neither field ever blinked at all before this, wiring or not.
+
+Left alone, deliberately: the Changes panel's commit-message box, which the live report's own
+phrasing plausibly meant - reading `render_commit_composer`, it's genuinely non-interactive
+today (no `track_focus`, no `on_key_down` - "no real agent-drafted message generation to redraft
+*from* yet" per its own doc comment), so there's no caret bug there because there's no real text
+input there yet. Six inputs, not "every hand-rolled field reimplements this slightly
+differently, several of them wrong" at some much larger scale - a small, closed set, matching the
+task's own "if this turns out to be a couple of real callers, fix it" case rather than its
+"stop and report" one.
+
+### Tests
+
+Four new position tests (one per fixed field) measure the caret's real painted x position via
+`VisualTestContext::debug_bounds`, mirroring `palette_caret_tests`' own established technique:
+before the placeholder when empty, at or after the real text once typed, and genuinely different
+between the two states. Reverting each fix (restoring the caret to its old fixed trailing
+position, or removing it outright for the two previously-caretless fields) fails the matching
+test with the real symptom - confirmed non-vacuous by hand for all four before restoring.
+
+The two wiring-specific tests (`blurring_the_branches_filter_stops_the_real_shared_blink_loop`,
+`blurring_the_new_file_prompt_stops_the_real_shared_blink_loop`) needed a real, subtle harness
+fact: GPUI's `on_focus`/`on_blur` listeners only fire while the window itself is considered
+"active" (`Window::window_active`, gated in `crates/gpui/src/window.rs`'s own focus-event code),
+and a fresh `gpui::test` window starts out *not* active - `window.activate_window()` (which a
+real, focused desktop window always effectively has already) is required before either listener
+ever fires at all. Without it, every attempt at a focus/blur-driven test passed or failed for the
+wrong reason (a same-field `reset_caret_blink` call on typing masks a missing `wire_caret_blink`
+subscription entirely) - the tests instead check that *blurring* a freshly-focused, freshly-typed
+field immediately pins the shared caret to dimmed (`AdeApp::stop_caret_blink`'s own synchronous
+effect), the one observable behaviour that only a genuine `on_blur` subscription produces and a
+keystroke's own `reset_caret_blink` cannot explain. Reverting the `wire_caret_blink` addition in
+`Self::new_with_settings` alone (leaving the render fix and the keystroke-time `reset_caret_blink`
+calls in place) fails both, confirming they test the wiring specifically, not the render fix.
+
+### Gates
+
+`cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy --workspace --all-targets --
+-D warnings` all clean. `cargo test --workspace --lib -- --test-threads=1`: **1229 + 44 + 14 + 141
+= 1428 passed, 0 failed** (8 new tests). One run hit the documented
+`code_surface::diff_view::diff_render_tests::switching_the_open_diff_to_a_different_file_recomputes_the_highlight_cache`
+flake; passed 5/5 re-run in isolation and the full suite passed clean on a second full run -
+unrelated syntax-highlighting code, not a regression from this change.

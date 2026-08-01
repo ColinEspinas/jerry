@@ -342,6 +342,26 @@ impl AdeApp {
             _custom_theme_create_task: None,
             custom_theme_remove_armed: None,
         };
+        // GitHub issue #45 ("Input blink only on focused input or file") / a live follow-up
+        // report of missing carets: `graph_state.branches_filter_focus_handle` (added later, in
+        // Revision R12's git graph tab) and `new_file_focus_handle` are two more genuine
+        // caret-bearing `FocusHandle`s - real, hand-rolled `text_history::TextField` inputs, the
+        // same shape as the six wired above - that never got threaded through
+        // `Self::wire_caret_blink`. They can't join that earlier call: it runs before `this`
+        // exists, and both handles live *inside* `this` (one nested in `graph_state`, built by
+        // this same literal). Wired here instead, appending onto the very same
+        // `_caret_blink_subscriptions` vec so there's still exactly one place holding every real
+        // caret subscription this app has, not two.
+        let extra_caret_blink_subscriptions = AdeApp::wire_caret_blink(
+            &[
+                &this.graph_state.branches_filter_focus_handle,
+                &this.new_file_focus_handle,
+            ],
+            window,
+            cx,
+        );
+        this._caret_blink_subscriptions
+            .extend(extra_caret_blink_subscriptions);
         // Real "add this one repo on startup" (Revision R12 Phase 0): the CLI argument (or a
         // test's own `repo_path`) becomes the first, focused entry of `Self::repos` rather than a
         // separate field - `Self::add_repo` is idempotent against whatever `loaded_repo_state`

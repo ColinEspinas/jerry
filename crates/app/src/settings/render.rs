@@ -1740,6 +1740,13 @@ impl AdeApp {
                     .flex()
                     .items_center()
                     .gap(px(2.0))
+                    // GitHub issue #45 / live report: same fix as
+                    // `crate::rail::render::AdeApp::render_rail_filter_row` - the caret sits
+                    // before the placeholder (real cursor position 0) while the filter is empty,
+                    // never appended after it.
+                    .when(!has_query, |el| {
+                        el.child(self.render_simple_input_caret("settings-keymap-filter-caret"))
+                    })
                     .child(
                         div()
                             .font(font(theme::font::SANS))
@@ -1753,9 +1760,12 @@ impl AdeApp {
                                 self.settings_keymap_filter.as_str().to_string()
                             } else {
                                 format!("filter {total} bindings")
-                            }),
+                            })
+                            .debug_selector(|| "settings-keymap-filter-text".to_string()),
                     )
-                    .child(self.render_simple_input_caret()),
+                    .when(has_query, |el| {
+                        el.child(self.render_simple_input_caret("settings-keymap-filter-caret"))
+                    }),
             )
             .child(
                 div()
@@ -3349,6 +3359,116 @@ mod caret_settings_tests {
         assert!(
             app.read_with(cx, |app, _| app.settings.appearance.caret_blink),
             "the real Settings field must have flipped back on"
+        );
+    }
+}
+
+/// GitHub issue #45 ("Input blink only on focused input or file") plus a live follow-up report:
+/// [`AdeApp::render_settings_keymap_filter_row`]'s caret used to be a fixed trailing child,
+/// painted *after* the placeholder text whenever `settings_keymap_filter` was empty, instead of
+/// at the real cursor position (0). Real interaction coverage, mirroring
+/// `crate::palette::render::palette_caret_tests`'/`crate::rail::render::rail_filter_caret_tests`'
+/// own measured-bounds technique rather than only reading the render code.
+#[cfg(test)]
+mod settings_keymap_filter_caret_tests {
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+    use std::time::Duration;
+
+    #[gpui::test]
+    fn caret_sits_before_the_placeholder_when_empty_and_after_the_text_once_typed(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_settings(window, cx);
+            app.settings_page = crate::settings::SettingsPage::Keymap;
+            window.focus(&app.settings_keymap_filter_focus_handle, cx);
+        });
+        cx.run_until_parked();
+
+        let empty_caret = cx
+            .debug_bounds("settings-keymap-filter-caret")
+            .expect("the caret should have really painted with an empty filter");
+        let placeholder = cx
+            .debug_bounds("settings-keymap-filter-text")
+            .expect("the placeholder text should have really painted");
+        assert!(
+            empty_caret.origin.x <= placeholder.origin.x,
+            "with an empty filter, the real caret must sit before (at or left of) the \
+             placeholder's own start x, not after it - got caret {:?} vs placeholder {:?}",
+            empty_caret,
+            placeholder,
+        );
+
+        cx.simulate_input("palette");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings_keymap_filter.as_str().to_string()),
+            "palette",
+            "sanity check: real typed filter"
+        );
+
+        let typed_caret = cx
+            .debug_bounds("settings-keymap-filter-caret")
+            .expect("the caret should have really painted with a typed filter");
+        let typed_text = cx
+            .debug_bounds("settings-keymap-filter-text")
+            .expect("the real typed text should have really painted");
+        assert!(
+            typed_caret.origin.x >= typed_text.origin.x + typed_text.size.width,
+            "with a typed filter, the real caret must sit at or after the typed text's own \
+             right edge, not before it - got caret {:?} vs text {:?}",
+            typed_caret,
+            typed_text,
+        );
+        assert!(
+            typed_caret.origin.x > empty_caret.origin.x,
+            "the caret's real measured horizontal position must differ between the \
+             empty-filter state (before the placeholder) and a typed-filter state (after the \
+             real text) - got {:?} vs {:?}",
+            empty_caret.origin.x,
+            typed_caret.origin.x,
+        );
+    }
+
+    /// GitHub issue #45's own title, taken literally - see
+    /// `crate::rail::render::rail_filter_caret_tests`' identical test for why
+    /// `cx.simulate_input` (not a bare `window.focus`) is what actually forces the real redraw
+    /// `on_focus` fires from in this test harness.
+    #[gpui::test]
+    fn focusing_the_settings_keymap_filter_starts_the_real_shared_blink_loop(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        // `on_focus`/`on_blur` (`AdeApp::wire_caret_blink`'s own mechanism) only fire while GPUI
+        // considers the window itself "active" - a real, freshly opened test window starts out
+        // not active at all.
+        app.update_in(cx, |_app, window, _cx| window.activate_window());
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_settings(window, cx);
+            app.settings_page = crate::settings::SettingsPage::Keymap;
+            window.focus(&app.settings_keymap_filter_focus_handle, cx);
+        });
+        cx.simulate_input("p");
+        assert!(
+            app.read_with(cx, |app, _| app.caret_blink_visible),
+            "a fresh focus must start solid/visible"
+        );
+
+        cx.background_executor.advance_clock(
+            crate::root::caret_blink::CARET_BLINK_INTERVAL + Duration::from_millis(50),
+        );
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.caret_blink_visible),
+            "focusing the settings keymap filter must have started the real, live shared blink \
+             task"
         );
     }
 }

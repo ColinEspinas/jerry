@@ -262,12 +262,26 @@ impl AdeApp {
     /// (see its own docs) that these simpler, always-after-the-text fields don't need.
     /// Blinks via the same shared [`crate::root::caret_blink`] loop the code editor/palette/tree
     /// rename field use - see that module's own docs for the whole mechanism.
-    pub(crate) fn render_simple_input_caret(&self) -> impl IntoElement {
+    ///
+    /// GitHub issue #45 ("Input blink only on focused input or file") plus a live follow-up
+    /// report: every real call site used to place this caret unconditionally *after* whichever
+    /// child rendered next in document order, which for an empty field is the *placeholder*
+    /// text - a caret visually glued to the end of "filter worktrees and agents" instead of at
+    /// the real cursor position (0, i.e. before any text at all). `selector` lets each call site
+    /// give this element its own real, measurable `debug_selector` (mirroring
+    /// [`crate::palette::render::AdeApp::render_palette_caret`]'s own `"palette-caret"`) so a
+    /// real interaction test can assert *where* it painted, not just that a doc comment claims
+    /// the right position - see `rail::render::rail_filter_caret_tests`,
+    /// `settings::render::settings_keymap_filter_caret_tests`,
+    /// `graph_view::render::graph_focus_tests`, and `root::new_file::new_file_caret_tests` for
+    /// that coverage.
+    pub(crate) fn render_simple_input_caret(&self, selector: &'static str) -> impl IntoElement {
         div()
             .flex_none()
             .w(px(1.5))
             .h(px(14.0))
             .when(self.caret_blink_visible, |el| el.bg(theme::term::CURSOR))
+            .debug_selector(move || selector.to_string())
     }
 }
 
