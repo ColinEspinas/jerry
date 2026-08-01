@@ -133,6 +133,19 @@ pub fn agent_initial(kind: AgentKind) -> &'static str {
     }
 }
 
+/// `kind`'s icon-pack file name (GitHub issue #5) - `crate::icon_pack::resolve_icon`'s own
+/// `<name>.svg` lookup key. Deliberately its own, separate mapping from [`agent_initial`]'s
+/// single-letter glyph rather than reusing that string directly: a pack author names files by
+/// what the icon *depicts* (`"claude.svg"`), not by this app's own internal one-letter fallback
+/// convention.
+pub fn agent_icon_name(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Claude => "claude",
+        AgentKind::Codex => "codex",
+        AgentKind::Shell => "shell",
+    }
+}
+
 /// Which of the tab strip's two chip shapes an agent's tab draws: agent CLI gets a `❯` glyph,
 /// terminal gets the pane glyph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

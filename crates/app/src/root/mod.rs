@@ -1401,6 +1401,16 @@ pub struct AdeApp {
     /// "most other gestures clear it" discipline `Self::discard_confirm_armed`'s own docs
     /// describe, scoped to this control's own page since nothing else in the app can arm it.
     pub(crate) custom_theme_remove_armed: Option<String>,
+    /// The Themes page's most recent icon-pack action result (GitHub issue #5's "custom icon
+    /// packs") - `Ok` message or a real, honest `Err` one, shown as an inline status line until
+    /// the next action replaces it. Mirrors [`Self::custom_theme_status`]'s own shape, kept as a
+    /// separate field since choosing/clearing an icon pack and importing/exporting a theme are
+    /// two independent real actions that must never overwrite each other's own status line.
+    pub(crate) icon_pack_status: Option<Result<String, String>>,
+    /// The in-flight "Choose folder..." real native directory-picker task
+    /// (`Self::start_choose_icon_pack_folder`) - a single slot, matching
+    /// [`Self::_custom_theme_import_task`]'s own one-dialog-at-a-time reasoning.
+    pub(crate) _icon_pack_choose_task: Option<Task<()>>,
 }
 
 impl AdeApp {

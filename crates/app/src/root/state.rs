@@ -341,6 +341,8 @@ impl AdeApp {
             _custom_theme_remove_task: None,
             _custom_theme_create_task: None,
             custom_theme_remove_armed: None,
+            icon_pack_status: None,
+            _icon_pack_choose_task: None,
         };
         // GitHub issue #45 ("Input blink only on focused input or file") / a live follow-up
         // report of missing carets: `graph_state.branches_filter_focus_handle` (added later, in

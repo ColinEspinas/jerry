@@ -1262,6 +1262,7 @@ impl AdeApp {
             )
             .child(builtin_cards)
             .child(self.render_custom_themes_section(cx))
+            .child(self.render_icon_pack_section(cx))
             .child(
                 div()
                     .pt(px(20.0))
@@ -1398,6 +1399,90 @@ impl AdeApp {
             .children(empty_state)
             .child(cards)
             .children(load_errors)
+            .children(status)
+    }
+
+    /// GitHub issue #5's "custom icon packs": a real, user-chosen directory of `<name>.svg`
+    /// files (`crate::icon_pack::resolve_icon`'s own lookup) that overrides this app's own
+    /// default icons wherever a call site has been wired to check one - today, only the rail's
+    /// agent-kind chip (`AdeApp::render_agent_chip_icon`'s own docs list the real, current
+    /// scope). No active pack, or a pack missing a given name, always falls back to this app's
+    /// existing default look - never a broken icon or a blank chip.
+    fn render_icon_pack_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self
+            .settings
+            .icon_pack
+            .directory
+            .as_ref()
+            .map(|path| path.display().to_string());
+
+        let header_row = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .pt(px(20.0))
+            .pb(px(6.0))
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Icon pack"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(6.0))
+                    .child(self.render_theme_action_button(
+                        "settings-icon-pack-choose",
+                        "Choose folder\u{2026}",
+                        cx,
+                        |this, cx| this.start_choose_icon_pack_folder(cx),
+                    ))
+                    .when(current.is_some(), |el| {
+                        el.child(self.render_theme_action_button(
+                            "settings-icon-pack-clear",
+                            "Use default icons",
+                            cx,
+                            |this, cx| this.clear_icon_pack(cx),
+                        ))
+                    }),
+            );
+
+        let current_row = div()
+            .py(px(6.0))
+            .font(font(theme::font::MONO))
+            .text_size(px(10.5))
+            .text_color(theme::text::DISABLED)
+            .child(match &current {
+                Some(path) => format!(
+                    "Using {path} - files named e.g. claude.svg/codex.svg/shell.svg override \
+                     the matching default icon."
+                ),
+                None => "Using the app's default icons. Choose a folder containing files like \
+                          claude.svg/codex.svg/shell.svg to override them."
+                    .to_string(),
+            });
+
+        let status = self.icon_pack_status.as_ref().map(|result| {
+            let (text, color) = match result {
+                Ok(message) => (message.clone(), theme::status::REVIEW),
+                Err(message) => (message.clone(), theme::status::FAIL),
+            };
+            div()
+                .pt(px(6.0))
+                .font(font(theme::font::MONO))
+                .text_size(px(10.0))
+                .text_color(color)
+                .child(text)
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .child(header_row)
+            .child(current_row)
             .children(status)
     }
 
@@ -2646,6 +2731,48 @@ impl AdeApp {
             });
         });
         self._custom_theme_import_task = Some(task);
+    }
+
+    /// GitHub issue #5's "custom icon packs": a real native directory picker
+    /// (`gpui::App::prompt_for_paths`, `directories: true`) - unlike
+    /// [`Self::start_import_custom_theme`], nothing is copied anywhere: the chosen directory
+    /// itself becomes [`settings_store::IconPackSettings::directory`] directly, and
+    /// `crate::icon_pack::resolve_icon` reads straight out of it at render time, so the user's
+    /// own files stay exactly where they left them (editable/replaceable in place, no stale
+    /// copy for a later edit to silently miss).
+    pub(in crate::settings) fn start_choose_icon_pack_folder(&mut self, cx: &mut Context<Self>) {
+        let paths_receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose".into()),
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(mut paths))) = paths_receiver.await else {
+                return;
+            };
+            let Some(directory) = paths.pop() else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.settings.icon_pack.directory = Some(directory.clone());
+                this.icon_pack_status = Some(Ok(format!("Using {}.", directory.display())));
+                this.persist_settings(cx);
+                cx.notify();
+            });
+        });
+        self._icon_pack_choose_task = Some(task);
+    }
+
+    /// Real, immediate "back to the app's own default icons" - no confirmation needed, unlike
+    /// [`Self::request_remove_custom_theme`]: clearing this setting deletes nothing on disk, it
+    /// only stops one persisted path from being read, so there is no real data-loss risk to
+    /// guard against the way an actual file deletion has.
+    pub(in crate::settings) fn clear_icon_pack(&mut self, cx: &mut Context<Self>) {
+        self.settings.icon_pack.directory = None;
+        self.icon_pack_status = Some(Ok("Using the app's default icons.".to_string()));
+        self.persist_settings(cx);
+        cx.notify();
     }
 
     /// Applies [`Self::start_import_custom_theme`]'s real background-executor result - shared

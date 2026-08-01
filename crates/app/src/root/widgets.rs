@@ -1,4 +1,6 @@
 use super::*;
+use crate::icon_pack;
+use crate::work_surface::agents::AgentKind;
 
 /// The two keycap sizes: `Standard` (primary shortcuts - the rail's `+`/⌘N, the status bar's
 /// `⌘P`) and `Hint` (smaller, for hint-row contexts like footers and empty-state hint lists).
@@ -338,6 +340,54 @@ fn simple_input_caret_opacity(is_focused: bool, blink_visible: bool) -> Option<f
         Some(1.0)
     } else {
         Some(theme::syntax::CARET_UNFOCUSED_OPACITY)
+    }
+}
+
+impl AdeApp {
+    /// One agent-kind chip (GitHub issue #5's "custom icon packs"): a real, user-supplied SVG
+    /// from the active icon pack (`crate::icon_pack::resolve_icon`) if one exists for `kind`, at
+    /// its own real colors (no theme tint - see `crate::icon_pack`'s own module docs on why),
+    /// else this app's existing default look (a `size`-square rounded chip, tinted per
+    /// `work_surface::agent_tint`, showing `work_surface::agent_initial`'s single letter) -
+    /// unchanged from before this feature existed. `size` is also the SVG's real width/height,
+    /// so a pack icon fills exactly the same box the default chip already occupies at every one
+    /// of this helper's real call sites, rather than needing per-call-site size plumbing.
+    pub(crate) fn render_agent_chip_icon(
+        &self,
+        kind: AgentKind,
+        size: Pixels,
+        font_size: Pixels,
+    ) -> gpui::AnyElement {
+        if let Some(icon_path) = icon_pack::resolve_icon(
+            &self.settings.icon_pack,
+            work_surface::agent_icon_name(kind),
+        ) {
+            return gpui::svg()
+                .external_path(icon_path.to_string_lossy().into_owned())
+                .flex_none()
+                .w(size)
+                .h(size)
+                .debug_selector(|| "agent-chip-icon-pack-svg".to_string())
+                .into_any_element();
+        }
+        let (chip_fg, chip_bg) = work_surface::agent_tint(kind);
+        let chip_glyph = work_surface::agent_initial(kind);
+        div()
+            .flex_none()
+            .w(size)
+            .h(size)
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(theme::radius::CHIP)
+            .bg(chip_bg)
+            .font(font(theme::font::MONO))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(font_size)
+            .text_color(chip_fg)
+            .debug_selector(|| "agent-chip-icon-default".to_string())
+            .child(chip_glyph)
+            .into_any_element()
     }
 }
 
