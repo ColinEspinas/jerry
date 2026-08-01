@@ -4291,6 +4291,7 @@ dependencies = [
 name = "lsp-core"
 version = "0.1.0"
 dependencies = [
+ "dunce",
  "log",
  "lsp-types",
  "nix",
