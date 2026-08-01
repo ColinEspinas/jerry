@@ -1,0 +1,172 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # Same "run tests before shipping" gate on all three platforms, so a release never
+  # ships from a platform where the workspace's own test suite is red. Kept as its own
+  # job (rather than a step reused by each build job) so its pass/fail shows up as an
+  # independent status per platform in the Actions UI, matching ci.yml's existing
+  # per-platform job layout.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: macos-latest
+            name: macos
+          - os: windows-latest
+            name: windows
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install Linux system dependencies
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            pkg-config \
+            libfontconfig-dev \
+            libvulkan1 \
+            mesa-vulkan-drivers \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libx11-xcb-dev
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+            bin: app
+            archive_ext: tar.gz
+          - os: macos-latest
+            name: macos
+            bin: app
+            archive_ext: tar.gz
+          - os: windows-latest
+            name: windows
+            bin: app.exe
+            archive_ext: zip
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install Linux system dependencies
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            pkg-config \
+            libfontconfig-dev \
+            libvulkan1 \
+            mesa-vulkan-drivers \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libx11-xcb-dev
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release -p app
+        run: cargo build --release -p app
+
+      # Renamed from "app"/"app.exe" (the workspace's `[[bin]] name`) to "jerry"/
+      # "jerry.exe" at package time - the crate's own internal bin name is a workspace
+      # detail, but the product this repo ships is "jerry" (see README.md's own
+      # `# ade ("Jerry")` heading), so that's the name a downloaded executable should
+      # carry.
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.name }}" = "windows" ]; then
+            cp "target/release/${{ matrix.bin }}" dist/jerry.exe
+          else
+            cp "target/release/${{ matrix.bin }}" dist/jerry
+          fi
+
+      - name: Package (tar.gz)
+        if: matrix.archive_ext == 'tar.gz'
+        working-directory: dist
+        run: tar -czf jerry-${{ matrix.name }}.tar.gz jerry
+
+      - name: Package (zip)
+        if: matrix.archive_ext == 'zip'
+        working-directory: dist
+        shell: bash
+        run: zip jerry-${{ matrix.name }}.zip jerry.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jerry-${{ matrix.name }}
+          path: dist/jerry-${{ matrix.name }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # `workflow_dispatch` runs (no tag) publish a draft instead of a real release, so
+      # manually testing this workflow never creates a public release out from under a
+      # tag that doesn't exist.
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
+          files: dist/*
+          fail_on_unmatched_files: true
