@@ -211,6 +211,78 @@ fn word_class(ch: char) -> WordClass {
     }
 }
 
+/// Longest common byte prefix of `a`/`b`, clamped to a real UTF-8 char boundary in both -
+/// `EditBuffer::stale_spans_for_region`'s own real "which text didn't change" test (GitHub issue
+/// #48).
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    let mut len = a
+        .as_bytes()
+        .iter()
+        .zip(b.as_bytes())
+        .take_while(|(x, y)| x == y)
+        .count();
+    while len > 0 && !(a.is_char_boundary(len) && b.is_char_boundary(len)) {
+        len -= 1;
+    }
+    len
+}
+
+/// The mirror of [`common_prefix_len`] for the trailing end, capped at `max_len` so a same-line
+/// edit's own prefix/suffix search windows never overlap - see that call site's own docs.
+fn common_suffix_len(a: &str, b: &str, max_len: usize) -> usize {
+    let mut len = a
+        .as_bytes()
+        .iter()
+        .rev()
+        .zip(b.as_bytes().iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count()
+        .min(max_len);
+    while len > 0 && !(a.is_char_boundary(a.len() - len) && b.is_char_boundary(b.len() - len)) {
+        len -= 1;
+    }
+    len
+}
+
+/// Re-derives real, absolute [`code_view::HighlightSpan`]s from `line`'s own already-highlighted
+/// `runs` for whatever part of them falls inside `old_window` (a byte range into `line.text`),
+/// shifted by `delta` into the new region's own coordinates. Skips
+/// [`code_view::HighlightKind::Text`] runs - [`code_view::build_lines`] already fills any gap
+/// with plain text, so emitting a span for a run that already is one would be real, pointless
+/// work.
+fn spans_for_byte_window(
+    line: &code_view::RenderedLine,
+    old_window: Range<usize>,
+    delta: isize,
+) -> Vec<code_view::HighlightSpan> {
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
+    for (text, kind) in &line.runs {
+        let run_start = cursor;
+        let run_end = cursor + text.len();
+        cursor = run_end;
+        if *kind == code_view::HighlightKind::Text {
+            continue;
+        }
+        let clipped_start = run_start.max(old_window.start);
+        let clipped_end = run_end.min(old_window.end);
+        if clipped_start >= clipped_end {
+            continue;
+        }
+        let start = clipped_start as isize + delta;
+        let end = clipped_end as isize + delta;
+        if start < 0 || end < start {
+            continue;
+        }
+        spans.push(code_view::HighlightSpan {
+            start: start as usize,
+            end: end as usize,
+            kind: *kind,
+        });
+    }
+    spans
+}
+
 /// One open file's real, live-edited text plus real cursor/selection/IME-composition state - see
 /// this module's own docs. `selected_range`/`marked_range` are byte offsets into [`Self::content`]
 /// (never UTF-16 code units - that conversion happens only at `crate::code_surface::editing`'s
@@ -550,7 +622,6 @@ impl EditBuffer {
                 .into_iter()
                 .map(|local| local + utf16_base)
                 .collect();
-        let mut fresh_lines = code_view::build_lines(region_source, &[]);
         let mut fresh_ranges = local_ranges;
 
         let reaches_buffer_end = region_end == new_len;
@@ -561,7 +632,6 @@ impl EditBuffer {
             // this substring's own trailing empty entry is spurious - it must not become a real,
             // phantom blank line spliced into the middle of the buffer.
             fresh_ranges.pop();
-            fresh_lines.pop();
             fresh_utf16_starts.pop();
         }
         if fresh_ranges.is_empty() {
@@ -571,6 +641,18 @@ impl EditBuffer {
             self.rebuild_plain_full();
             return;
         }
+
+        // Real fix for GitHub issue #48 ("lines blink when editing code"): carry over whatever
+        // real highlighting the touched line(s) already had for the prefix/suffix text this edit
+        // didn't actually change, instead of unconditionally flashing the whole region to plain -
+        // see `Self::stale_spans_for_region`'s own docs.
+        let stale_spans =
+            self.stale_spans_for_region(first_line, last_line, region_source, &fresh_ranges);
+        let mut fresh_lines = code_view::build_lines(region_source, &stale_spans);
+        if !reaches_buffer_end {
+            fresh_lines.pop();
+        }
+
         for local_range in &mut fresh_ranges {
             local_range.start += region_start;
             local_range.end += region_start;
@@ -599,6 +681,93 @@ impl EditBuffer {
         }
 
         self.highlight_dirty = true;
+    }
+
+    /// Best-effort real highlight spans, in `region_source`-local byte coordinates, carried over
+    /// from [`Self::lines`]' own *previous* runs for the edited region's untouched prefix/suffix
+    /// text - the real fix for GitHub issue #48 ("lines blink when editing code"). Before this,
+    /// [`Self::splice_lines`] always rebuilt the touched line(s) against an empty span list, so
+    /// even a single keystroke flashed the *whole* line back to plain
+    /// [`code_view::HighlightKind::Text`] for the ~150ms until `crate::root::AdeApp`'s debounced
+    /// re-highlight landed - a real, visible flicker on every character typed, not a deliberate
+    /// blink effect. Only the byte range actually new/changed (the inserted/deleted text itself)
+    /// honestly has no real classification yet; whatever unchanged text surrounds it keeps the
+    /// real highlighting it already had. `fresh_ranges` are the touched region's own final new
+    /// local line ranges, not yet shifted by `region_start` - see [`Self::splice_lines`]'s own
+    /// docs.
+    fn stale_spans_for_region(
+        &self,
+        first_line: usize,
+        last_line: usize,
+        region_source: &str,
+        fresh_ranges: &[Range<usize>],
+    ) -> Vec<code_view::HighlightSpan> {
+        let Some(new_first_range) = fresh_ranges.first() else {
+            return Vec::new();
+        };
+        let new_first_text = &region_source[new_first_range.clone()];
+
+        let mut spans = Vec::new();
+
+        let prefix_len = match self.lines.get(first_line) {
+            Some(old_first) => {
+                let len = common_prefix_len(&old_first.text, new_first_text);
+                if len > 0 {
+                    spans.extend(spans_for_byte_window(old_first, 0..len, 0));
+                }
+                len
+            }
+            None => 0,
+        };
+
+        // Both `self.lines`' and `fresh_ranges`' own trailing entry can be an empty "phantom"
+        // line - real, [`code_view::line_ranges`]' own documented convention for content ending
+        // in `\n` (`Self::splice_lines` deliberately keeps it when the edited region reaches the
+        // buffer's own real end, to avoid leaving a stale duplicate behind) - but it was never a
+        // real line the previous highlight could have colored, so the suffix search instead
+        // targets the last real, non-empty line at or after `first_line`/`fresh_ranges[0]`.
+        let old_last_line = (first_line..=last_line)
+            .rev()
+            .find(|&index| {
+                self.lines
+                    .get(index)
+                    .is_some_and(|line| !line.text.is_empty())
+            })
+            .unwrap_or(last_line);
+        let same_line = old_last_line == first_line;
+
+        let new_last_index = (0..fresh_ranges.len())
+            .rev()
+            .find(|&index| !fresh_ranges[index].is_empty())
+            .unwrap_or(fresh_ranges.len() - 1);
+        let new_last_range = &fresh_ranges[new_last_index];
+        let new_last_text = &region_source[new_last_range.clone()];
+        let new_last_start = new_last_range.start;
+
+        if let Some(old_last) = self.lines.get(old_last_line) {
+            // On the same line, the prefix above already claimed its own share of both the old
+            // and new text - bounding the suffix's own search window by what it left behind keeps
+            // the two from ever describing overlapping byte ranges.
+            let reserved = if same_line { prefix_len } else { 0 };
+            let max_suffix = old_last
+                .text
+                .len()
+                .saturating_sub(reserved)
+                .min(new_last_text.len().saturating_sub(reserved));
+            let suffix_len = common_suffix_len(&old_last.text, new_last_text, max_suffix);
+            if suffix_len > 0 {
+                let old_start = old_last.text.len() - suffix_len;
+                let delta = new_last_start as isize
+                    + (new_last_text.len() as isize - old_last.text.len() as isize);
+                spans.extend(spans_for_byte_window(
+                    old_last,
+                    old_start..old_last.text.len(),
+                    delta,
+                ));
+            }
+        }
+
+        spans
     }
 
     /// Installs a real, freshly-computed highlight result - but only if `content_snapshot`
@@ -2610,6 +2779,80 @@ mod tests {
         let kinds: Vec<code_view::HighlightKind> =
             buf.lines[0].runs.iter().map(|(_, kind)| *kind).collect();
         assert!(kinds.contains(&code_view::HighlightKind::Keyword));
+    }
+
+    /// GitHub issue #48 ("Bug: Code editor lines blinks when editing code") - a real regression
+    /// test, not a vacuous one: checks the run kind for `"fn"`/`"foo"` on a line that was
+    /// *already* real-highlighted (`buffer(..)` runs a real immediate `tree-sitter` pass at
+    /// construction, per `EditBuffer::new`'s own docs).
+    #[test]
+    fn editing_inside_an_already_highlighted_line_keeps_its_untouched_runs_colored_while_a_rehighlight_is_pending(
+    ) {
+        let mut buf = buffer("fn foo() {}\n");
+        let find_kind = |buf: &EditBuffer, text: &str| -> Option<code_view::HighlightKind> {
+            buf.lines[0]
+                .runs
+                .iter()
+                .find(|(run_text, _)| run_text.as_ref() == text)
+                .map(|(_, kind)| *kind)
+        };
+        assert_eq!(
+            find_kind(&buf, "fn"),
+            Some(code_view::HighlightKind::Keyword)
+        );
+        assert_eq!(
+            find_kind(&buf, "foo"),
+            Some(code_view::HighlightKind::Function)
+        );
+
+        // A real single-character keystroke inside the line, away from both "fn" and "foo" -
+        // exactly the kind of edit issue #48 reports as blinking.
+        let insert_at = buf.content.find(") {").expect("closing paren present");
+        buf.move_to(insert_at + 1);
+        buf.replace_range(None, ";");
+        assert_eq!(buf.content, "fn foo(); {}\n");
+        assert!(
+            buf.highlight_dirty,
+            "a real re-highlight must still be owed after this edit"
+        );
+
+        assert!(
+            !buf.lines[0]
+                .runs
+                .iter()
+                .all(|(_, kind)| *kind == code_view::HighlightKind::Text),
+            "the whole line must not flash back to plain text while the re-highlight is pending \
+             - this is the real bug issue #48 reports; runs: {:?}",
+            buf.lines[0].runs
+        );
+        assert_eq!(
+            find_kind(&buf, "fn"),
+            Some(code_view::HighlightKind::Keyword),
+            "the untouched \"fn\" keyword must keep its own real, already-known highlighting \
+             instead of going plain just because a later, unrelated part of the same line \
+             changed"
+        );
+        assert_eq!(
+            find_kind(&buf, "foo"),
+            Some(code_view::HighlightKind::Function),
+            "the untouched \"foo\" function name must likewise keep its own real highlighting"
+        );
+
+        // Once the real debounced re-highlight actually lands (`AdeApp::schedule_rehighlight`'s
+        // own real path), it still fully replaces every run, exactly as before this fix.
+        let spans = code_view::highlight_rust(&buf.content);
+        let lines = code_view::build_lines(&buf.content, &spans);
+        let content_snapshot = buf.content.clone();
+        assert!(buf.apply_highlight(&content_snapshot, lines));
+        assert!(!buf.highlight_dirty);
+        assert_eq!(
+            find_kind(&buf, "fn"),
+            Some(code_view::HighlightKind::Keyword)
+        );
+        assert_eq!(
+            find_kind(&buf, "foo"),
+            Some(code_view::HighlightKind::Function)
+        );
     }
 
     #[test]

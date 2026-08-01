@@ -2231,6 +2231,14 @@ mod editing_tests {
     /// `tree-sitter` highlight (deliberately debounced - see this module's own "Re-highlighting
     /// cost" docs) lands once the debounce elapses, changing a token's real classification from
     /// plain `Text` to `Keyword`/`Function`.
+    ///
+    /// Also GitHub issue #48's own real regression coverage at the `AdeApp`/`replace_text_in_range`
+    /// level (`crate::code_surface::edit_buffer`'s own test module covers the same fix directly
+    /// against `EditBuffer::splice_lines`): this file already carried real, live `tree-sitter`
+    /// highlighting for "foo"/the punctuation before the edit (`open_file_for_editing`'s
+    /// background load ran a real highlight), so before the fix this same edit reset the *whole*
+    /// line back to plain `Text` for the ~150ms until the debounce fired - the real flicker the
+    /// issue reports. It must not do that anymore.
     #[gpui::test]
     fn typing_changes_real_content_and_updates_syntax_highlighting_after_the_debounce(
         cx: &mut TestAppContext,
@@ -2240,6 +2248,19 @@ mod editing_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("sample.rs");
+
+        let initial_kinds = app.read_with(cx, |app, _| {
+            app.edit_buffers.get(&relative).unwrap().lines[0]
+                .runs
+                .iter()
+                .map(|(_, kind)| *kind)
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            initial_kinds.contains(&code_view::HighlightKind::Function),
+            "the file must already carry a real highlight before the edit, or this test cannot \
+             tell a real fix from a vacuous one: {initial_kinds:?}"
+        );
 
         app.update_in(cx, |app, window, cx| {
             app.replace_text_in_range(None, "fn ", window, cx);
@@ -2267,13 +2288,25 @@ mod editing_tests {
         });
         assert!(
             dirty_immediately,
-            "the real tree-sitter highlight hasn't run yet - only the cheap plain rebuild has"
+            "the real tree-sitter highlight hasn't run yet - only the cheap incremental splice has"
         );
         assert!(
-            kinds_immediately
+            !kinds_immediately
                 .iter()
                 .all(|kind| *kind == code_view::HighlightKind::Text),
-            "every run should be plain Text immediately after the edit, before the debounce"
+            "GitHub issue #48: the whole line must not flash back to plain text while the real \
+             re-highlight is still pending - only the actually-new/changed bytes may; runs: \
+             {kinds_immediately:?}"
+        );
+        assert!(
+            kinds_immediately.contains(&code_view::HighlightKind::Function),
+            "\"foo\"'s own already-known real highlighting must survive this edit untouched, not \
+             just get lucky in the eventual re-highlight: {kinds_immediately:?}"
+        );
+        assert!(
+            kinds_immediately.contains(&code_view::HighlightKind::PunctuationBracket),
+            "the untouched brackets' own already-known real highlighting must survive too: \
+             {kinds_immediately:?}"
         );
 
         cx.background_executor
