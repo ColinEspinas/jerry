@@ -698,14 +698,26 @@ impl AdeApp {
             )
     }
 
-    /// The rail's one real structure (`design_handoff_jerry_ade/revision 3/
-    /// REVISION-2026-07-31.md` §2.1: "Two levels, always: **repo group → worktree → agents**.
-    /// There is **no rail mode toggle**"). Builds [`rail::WorktreeRow`]s fresh from live state
-    /// every render (cheap: no I/O, just field reads plus the cached
-    /// [`Self::diff_cache`]/[`Self::worktree_notes`] snapshots) - see [`Self::build_worktree_rows`]'s
-    /// docs - filters them, then groups the result by repo (see [`rail::group_worktrees_by_repo`]'s
-    /// own docs for why every repo but [`Self::focused_repo`] renders with zero rows today).
-    pub(in crate::rail) fn render_rail_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// Builds this rail's repo groups fresh from live state every render (cheap: no I/O, just
+    /// field reads plus the cached [`Self::diff_cache`]/[`Self::worktree_notes`] snapshots) -
+    /// see [`Self::build_worktree_rows`]'s docs. The shared foundation for
+    /// [`Self::render_rail_list`] and, since it returns plain data rather than GPUI elements,
+    /// this module's own tests.
+    ///
+    /// Each [`RepoGroup`]'s `all_rows` (what the header's `N wt`/`N worktrees waiting` counters
+    /// read - [`rail::RepoGroup::waiting_count`]) is always this repo's real, complete worktree
+    /// list; only `rows` (what actually renders/expands below the header) is narrowed by
+    /// [`Self::filter_query`] - fixing the bug where typing into the filter box moved both
+    /// numbers, not just which rows were visible (`design_handoff_jerry_ade/revision 3/
+    /// REVISION-2026-07-31.md` §2.0: "a repo you have scrolled past still reports that
+    /// something in it wants a human" - typing into the filter box is the same promise, just
+    /// scrolled-past-in-time rather than in-space).
+    ///
+    /// See [`rail::group_worktrees_by_repo`]'s own docs for why every repo but
+    /// [`Self::focused_repo`] still has no live data (`all_rows` empty too) today - that half is
+    /// a real, separate, already-tracked data-model limitation (no per-repo worktree loading
+    /// yet), not something this function papers over.
+    pub(in crate::rail) fn build_repo_groups(&self, cx: &mut Context<Self>) -> Vec<RepoGroup> {
         let rows = self.build_worktree_rows(cx);
         let filtered: Vec<WorktreeRow> =
             rail::filter_worktree_rows(&rows, self.filter_query.as_str())
@@ -713,28 +725,41 @@ impl AdeApp {
                 .cloned()
                 .collect();
 
-        if filtered.is_empty() {
-            return self.render_rail_empty_message(if rows.is_empty() {
-                "no worktrees found"
-            } else {
-                "no worktrees match this filter"
-            });
-        }
-
         let repo_inputs: Vec<RepoWorktrees> = self
             .repos
             .iter()
-            .map(|repo| RepoWorktrees {
-                repo_id: repo.id,
-                repo_name: repo.name.clone(),
-                rows: if Some(repo.id) == self.focused_repo {
-                    filtered.clone()
-                } else {
-                    Vec::new()
-                },
+            .map(|repo| {
+                let is_focused = Some(repo.id) == self.focused_repo;
+                RepoWorktrees {
+                    repo_id: repo.id,
+                    repo_name: repo.name.clone(),
+                    all_rows: if is_focused { rows.clone() } else { Vec::new() },
+                    rows: if is_focused {
+                        filtered.clone()
+                    } else {
+                        Vec::new()
+                    },
+                }
             })
             .collect();
-        let groups = rail::group_worktrees_by_repo(repo_inputs);
+        rail::group_worktrees_by_repo(repo_inputs)
+    }
+
+    /// The rail's one real structure (`design_handoff_jerry_ade/revision 3/
+    /// REVISION-2026-07-31.md` §2.1: "Two levels, always: **repo group → worktree → agents**.
+    /// There is **no rail mode toggle**"). See [`Self::build_repo_groups`] for how the groups
+    /// themselves are built.
+    pub(in crate::rail) fn render_rail_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let groups = self.build_repo_groups(cx);
+
+        if groups.iter().all(|group| group.rows.is_empty()) {
+            let any_real_worktrees = groups.iter().any(|group| !group.all_rows.is_empty());
+            return self.render_rail_empty_message(if any_real_worktrees {
+                "no worktrees match this filter"
+            } else {
+                "no worktrees found"
+            });
+        }
 
         let mut list = div().id("rail-repo-groups").flex().flex_col();
         for group in &groups {
@@ -764,12 +789,19 @@ impl AdeApp {
     /// One repo group (§2.0-2.1): the header (name, `N wt` count, and the amber `N worktrees
     /// waiting` when non-zero), then every worktree row already ranked most-urgent-first by
     /// [`rail::group_worktrees_by_repo`].
+    ///
+    /// The header's `N wt` and (via [`rail::RepoGroup::waiting_count`]) `N worktrees waiting`
+    /// are read from `group.all_rows`, **not** `group.rows` - see [`Self::build_repo_groups`]'s
+    /// docs for why: this repo's real, complete worktree list, unaffected by the rail's filter
+    /// query or by which repo is currently focused. Only the rows actually rendered below the
+    /// header (`group.rows`, in the `.children(...)` call at the bottom of this function) may be
+    /// narrower.
     pub(in crate::rail) fn render_repo_group(
         &self,
         group: &RepoGroup,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let waiting = group.waiting_count();
+        let waiting_label = rail::waiting_count_label(group.waiting_count());
 
         div()
             .id(("repo-group", group.repo_id.0))
@@ -797,17 +829,17 @@ impl AdeApp {
                             .font(font(theme::font::MONO))
                             .text_size(self.ui_text_size(9.5))
                             .text_color(theme::text::PATH)
-                            .child(format!("{} wt", group.rows.len())),
+                            .child(format!("{} wt", group.all_rows.len())),
                     )
                     .child(div().flex_1())
-                    .when(waiting > 0, |el| {
+                    .when_some(waiting_label, |el, text| {
                         el.child(
                             div()
                                 .font(font(theme::font::SANS))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_size(self.ui_text_size(9.5))
                                 .text_color(theme::status::ASK_CARD_FG)
-                                .child(format!("{waiting} worktrees waiting")),
+                                .child(text),
                         )
                     }),
             )
@@ -1753,5 +1785,62 @@ mod rail_row_tests {
         app.update(cx, |app, cx| {
             let _ = app.render_rail_list(cx);
         });
+    }
+
+    /// The real bug the coordinator's audit found: typing into the rail's filter box must
+    /// change only which rows a repo group *renders*, never the header's `N wt` count
+    /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.1) - that number must
+    /// keep reporting the repo's real, complete worktree list, exactly like `RepoGroup::
+    /// waiting_count` (proven independently, against hand-built rows, by `crate::rail::state`'s
+    /// own `repo_group_header_counts_read_the_real_worktree_list_not_the_displayed_rows`) does.
+    /// This test drives the same guarantee through the real, live `AdeApp`: two real worktrees,
+    /// a filter query that matches only one of them.
+    #[gpui::test]
+    fn build_repo_groups_header_wt_count_is_unaffected_by_the_filter_query(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_alpha = tempfile::tempdir().expect("tempdir alpha");
+        let wt_beta = tempfile::tempdir().expect("tempdir beta");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![
+                worktree_item(wt_alpha.path().to_path_buf(), "alpha"),
+                worktree_item(wt_beta.path().to_path_buf(), "beta"),
+            ];
+        });
+
+        let groups_before_filter = app.update(cx, |app, cx| app.build_repo_groups(cx));
+        assert_eq!(
+            groups_before_filter[0].all_rows.len(),
+            2,
+            "sanity check: both real worktrees are counted before any filter is typed"
+        );
+        assert_eq!(
+            groups_before_filter[0].rows.len(),
+            2,
+            "sanity check: both rows are displayed with an empty filter query"
+        );
+
+        // Type a filter query that matches only "alpha", not "beta".
+        app.update(cx, |app, _cx| {
+            app.filter_query
+                .push_str("alpha", std::time::Instant::now());
+        });
+
+        let groups_after_filter = app.update(cx, |app, cx| app.build_repo_groups(cx));
+        assert_eq!(
+            groups_after_filter[0].all_rows.len(),
+            2,
+            "the header's `N wt` count must stay at the repo's real worktree count - typing \
+             into the filter box must not shrink it"
+        );
+        assert_eq!(
+            groups_after_filter[0].rows.len(),
+            1,
+            "sanity check: the *displayed* rows really did narrow to the one matching worktree \
+             - proving the filter query took effect at all, just not on the header count"
+        );
     }
 }
