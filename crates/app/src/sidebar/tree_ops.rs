@@ -106,7 +106,7 @@ impl InlineEditKind {
 /// #19 §4's "a watcher refresh must not clobber an in-progress editor" requirement.** The file
 /// tree is a `Vec<FileTreeEntry>` that `AdeApp::load_file_tree`'s background walk *replaces
 /// wholesale* every time it completes - which is exactly what happens when an agent CLI creates
-/// or deletes a file mid-session and something triggers a re-walk. Any editor state stored in
+/// or deletes a file mid-agent and something triggers a re-walk. Any editor state stored in
 /// that vector, or keyed by an index into it, would be silently destroyed by that replacement,
 /// mid-keystroke. Keeping it here means the walk can replace every row without the typed text
 /// ever being at risk, and the renderer re-locates the editor's anchor row by *path* on each
@@ -880,7 +880,7 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         // The one hard boundary on the app's single irreversible operation: whatever route got
-        // here, the path must be a plain, normal-component path genuinely inside the session's
+        // here, the path must be a plain, normal-component path genuinely inside the agent's
         // worktree. Every real caller already satisfies this (the targets come from the tree's
         // own walk), which is exactly why it is worth stating as a checked precondition rather
         // than an assumption - a future caller that passes something else gets a refusal, not a
@@ -976,7 +976,7 @@ impl AdeApp {
     /// `lsp_opened_files`/`lsp_document_versions` entries behind. That last one is not cosmetic:
     /// `crate::lsp::client`'s `didOpen` dispatch early-returns for a path already in
     /// `lsp_opened_files`, so recreating a file at the deleted path would silently get no
-    /// diagnostics and no completions for the rest of the session.
+    /// diagnostics and no completions for the rest of the agent.
     ///
     /// Deliberately **not** a `close_file_tab` call: that method restores focus and picks a
     /// neighbouring tab, both of which need a `Window` this async completion handler doesn't
@@ -1368,7 +1368,7 @@ fn remap_path_set(set: &mut HashSet<PathBuf>, old: &Path, new: &Path) {
 
 /// Whether `path` is a plain, normal-component-only path inside `root` - the guard every
 /// tree-originated operation runs before touching the filesystem, so a `..` that somehow reached
-/// one of these methods can't act outside the session's worktree.
+/// one of these methods can't act outside the agent's worktree.
 pub(crate) fn is_inside_worktree(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
@@ -1718,7 +1718,7 @@ mod tree_ops_regression_tests {
             "premise: the editor must be a real painted row before the reload"
         );
 
-        // An agent CLI creating a file mid-session, followed by the real re-walk.
+        // An agent CLI creating a file mid-agent, followed by the real re-walk.
         fs::write(repo.path().join("src/agent-made.rs"), "// new\n").expect("write");
         app.update(cx, |app, cx| {
             let root = app.file_tree_root.clone();
@@ -2169,7 +2169,7 @@ mod tree_ops_regression_tests {
             // A real selection, so the tree binding would genuinely have something to copy if it
             // fired - otherwise this test could pass for the wrong reason.
             app.selected_tree_path = Some(repo.path().join("README.md"));
-            app.sessions.focus_active(window, cx);
+            app.agents.focus_active(window, cx);
         });
         cx.run_until_parked();
 
@@ -2516,7 +2516,7 @@ mod tree_ops_regression_tests {
         /// `crate::lsp::client`'s `didOpen` dispatch early-returns for a path already in
         /// `lsp_opened_files`, and that set is documented as never being cleared on close. So a
         /// rename (or a delete) that left the old absolute path in it meant recreating a file at
-        /// that path silently got no diagnostics and no completions for the rest of the session.
+        /// that path silently got no diagnostics and no completions for the rest of the agent.
         #[gpui::test]
         fn renaming_and_deleting_both_clear_the_lsp_per_document_bookkeeping(
             cx: &mut TestAppContext,

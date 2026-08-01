@@ -758,7 +758,7 @@ impl AdeApp {
     /// intentionally treats that as "already open," not "reopen." Sending `didClose` on every
     /// tab switch would mean re-sending `didOpen` (and re-waiting through indexing) every time
     /// the user switches back to a file - real latency for no benefit, since this app keeps at
-    /// most a handful of files' worth of server-side state alive per session. The `LspClient`
+    /// most a handful of files' worth of server-side state alive per agent. The `LspClient`
     /// (and every document it opened) is torn down when its owning root's client is dropped -
     /// this app's actual document lifetime boundary.
     ///

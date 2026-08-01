@@ -3,9 +3,9 @@ use crate::code_surface::zoom::zoom_scoped;
 
 impl AdeApp {
     /// Surface D - the merge-conflict resolution surface, replacing the pty/diff body below the
-    /// tab strip and session context bar (which keep rendering normally) exactly like Surface
+    /// tab strip and agent context bar (which keep rendering normally) exactly like Surface
     /// B/C already do. Renders whichever [`merge::MergeFlowState`] `self.merge_flow` is
-    /// currently in for `session`; every value shown (branch names, file paths, conflict line
+    /// currently in for `agent`; every value shown (branch names, file paths, conflict line
     /// content) comes from the `wt_core::merge` call [`Self::start_merge`] made.
     ///
     /// Real per-token syntax coloring ([`code_view::highlight_block`], cached in
@@ -29,10 +29,10 @@ impl AdeApp {
     ///
     /// The left ("ours"/base) column is labelled with the base branch name rather than an agent
     /// identity, since `attempt_merge` always runs `git merge` from the base worktree - real git
-    /// state, not a running session, so there's no agent to attribute a tint to.
+    /// state, not a running agent, so there's no agent to attribute a tint to.
     pub(crate) fn render_merge_flow_surface(
         &self,
-        session: &Session,
+        agent: &Agent,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let Some(flow) = self.merge_flow.as_ref() else {
@@ -226,7 +226,7 @@ impl AdeApp {
                             body = body
                                 .child(self.render_conflict_columns(
                                     base_branch,
-                                    session,
+                                    agent,
                                     &file.relative_path,
                                     hunk,
                                     cx,
@@ -387,7 +387,7 @@ impl AdeApp {
     pub(in crate::merge) fn render_conflict_columns(
         &self,
         base_branch: &str,
-        session: &Session,
+        agent: &Agent,
         relative_path: &Path,
         hunk: &ConflictHunk,
         cx: &mut Context<Self>,
@@ -403,11 +403,11 @@ impl AdeApp {
         // keeps `theme::syntax::COMMENT` a single real, unconditional token wherever it's used
         // (the File/Diff views included) instead of a merge-view-specific override, and gets
         // both columns to the same real legibility - neither has text sitting on a color wash.
-        let (agent_fg, _) = work_surface::agent_tint(session.kind);
-        let session_branch = self
+        let (agent_fg, _) = work_surface::agent_tint(agent.kind);
+        let agent_branch = self
             .worktrees
             .iter()
-            .find(|item| item.path == session.cwd)
+            .find(|item| item.path == agent.cwd)
             .and_then(|item| item.branch.clone())
             .unwrap_or_else(|| hunk.theirs_label.clone());
 
@@ -600,8 +600,8 @@ impl AdeApp {
                     )
                     .child(column(
                         "theirs",
-                        session.kind.label().to_string(),
-                        session_branch,
+                        agent.kind.label().to_string(),
+                        agent_branch,
                         &hunk.theirs,
                         theirs_rendered,
                         hunk.theirs_start_line,

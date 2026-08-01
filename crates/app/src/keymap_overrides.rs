@@ -540,22 +540,19 @@ mod tests {
                     && context_label(b.predicate().as_deref()) == "file-editor"
             })
             .expect("a file-editor-scoped EditorLeft binding should exist");
-        let new_session = bindings
+        let new_agent = bindings
             .iter()
-            .find(|b| b.action().name() == "app::NewSession")
-            .expect("NewSession should be a real global default binding");
-        assert_eq!(context_label(new_session.predicate().as_deref()), "global");
+            .find(|b| b.action().name() == "app::NewAgent")
+            .expect("NewAgent should be a real global default binding");
+        assert_eq!(context_label(new_agent.predicate().as_deref()), "global");
 
         let collision = find_colliding_binding(
             &bindings,
             &bindings,
             editor_left,
-            &new_session.keystrokes()[0].inner().unparse(),
+            &new_agent.keystrokes()[0].inner().unparse(),
         );
-        assert_eq!(
-            collision.map(|b| b.action().name()),
-            Some("app::NewSession")
-        );
+        assert_eq!(collision.map(|b| b.action().name()), Some("app::NewAgent"));
     }
 
     #[test]

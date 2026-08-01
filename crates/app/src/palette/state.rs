@@ -1,5 +1,5 @@
 //! Pure, GPUI-free data model for the command palette (⌘P): scope/matching/ranking/grouping
-//! over already-real app state (open sessions, the loaded file tree, a fixed command list),
+//! over already-real app state (open agents, the loaded file tree, a fixed command list),
 //! kept unit-testable without a live GPUI window. `crate::palette::render` turns the
 //! result into `gpui::Div` trees and real click/key handlers, since it owns the `Context<AdeApp>`
 //! those need. Every [`PaletteCommand`] variant maps one-to-one onto an existing `AdeApp` method
@@ -8,7 +8,7 @@
 //! Matching is a plain, deterministic, case-insensitive (ASCII-fold) leftmost substring search
 //! ([`substring_match`]), not fuzzy/skip-char matching, so a match highlights one contiguous
 //! span per row rather than scattered characters. Results rank by how early the match starts;
-//! an entry that only matched via a secondary field (a session's branch, a file's directory, a
+//! an entry that only matched via a secondary field (an agent's branch, a file's directory, a
 //! command's keywords) still qualifies but ranks after every primary-label match - see
 //! [`match_against`].
 //!
@@ -19,8 +19,8 @@
 //! for either at the time: the only real commit path
 //! (`crate::root::AdeApp::complete_merge_flow`) only finalizes an already-running merge attempt,
 //! and the only real worktree-removal path (`crate::root::AdeApp::execute_prune`) always removes
-//! every prunable worktree at once and explicitly excludes any worktree with a live session -
-//! neither matches "act on this one arbitrary session, cold, in one click". That revision left
+//! every prunable worktree at once and explicitly excludes any worktree with a live agent -
+//! neither matches "act on this one arbitrary agent, cold, in one click". That revision left
 //! the History group out entirely rather than half-build it against those mismatched
 //! primitives, deferring it to this one.
 //!
@@ -35,7 +35,7 @@
 use std::path::PathBuf;
 
 use crate::rail::status::Status;
-use crate::work_surface::sessions::{SessionId, SessionKind};
+use crate::work_surface::agents::{AgentId, AgentKind};
 
 /// Cap on how many rows a single group ([`PaletteGroup`]) contributes, independent of how many
 /// candidates matched - a palette meant to answer "which of these am I looking for" at a glance
@@ -105,12 +105,12 @@ pub fn typed_scope_prefix(ch: char) -> Option<PaletteScope> {
     }
 }
 
-/// An already-open session, reduced to what a palette row needs - built from the same live
-/// `crate::work_surface::sessions::Sessions` list the rail (`crate::rail::state::SessionRow`) renders.
+/// An already-open agent, reduced to what a palette row needs - built from the same live
+/// `crate::work_surface::agents::Agents` list the rail (`crate::rail::state::AgentRow`) renders.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SessionCandidate {
-    pub id: SessionId,
-    pub kind: SessionKind,
+pub struct AgentCandidate {
+    pub id: AgentId,
+    pub kind: AgentKind,
     pub title: String,
     pub branch: Option<String>,
     pub status: Status,
@@ -121,12 +121,12 @@ pub struct SessionCandidate {
 /// never a stub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteCommand {
-    /// `crate::root::AdeApp::new_session(SessionKind::Shell, ..)`, same as the rail's `+`/⌘N.
+    /// `crate::root::AdeApp::new_agent(AgentKind::Shell, ..)`, same as the rail's `+`/⌘N.
     NewShell,
-    /// `crate::root::AdeApp::new_session(SessionKind::Claude, ..)`.
-    NewClaudeSession,
-    /// `crate::root::AdeApp::new_session(SessionKind::Codex, ..)`.
-    NewCodexSession,
+    /// `crate::root::AdeApp::new_agent(AgentKind::Claude, ..)`.
+    NewClaudeAgent,
+    /// `crate::root::AdeApp::new_agent(AgentKind::Codex, ..)`.
+    NewCodexAgent,
     /// `crate::root::AdeApp::set_right_sidebar_view`, same as the `Files | Changes` control.
     ToggleFilesChanges,
     /// `crate::root::AdeApp::request_prune` - goes through the same two-click confirmation gate
@@ -149,8 +149,8 @@ pub enum PaletteCommand {
 impl PaletteCommand {
     pub const ALL: [PaletteCommand; 9] = [
         PaletteCommand::NewShell,
-        PaletteCommand::NewClaudeSession,
-        PaletteCommand::NewCodexSession,
+        PaletteCommand::NewClaudeAgent,
+        PaletteCommand::NewCodexAgent,
         PaletteCommand::ToggleFilesChanges,
         PaletteCommand::PruneWorktrees,
         PaletteCommand::OpenSettings,
@@ -162,8 +162,8 @@ impl PaletteCommand {
     pub fn label(self) -> &'static str {
         match self {
             PaletteCommand::NewShell => "New Shell",
-            PaletteCommand::NewClaudeSession => "New Claude Session",
-            PaletteCommand::NewCodexSession => "New Codex Session",
+            PaletteCommand::NewClaudeAgent => "New Claude Agent",
+            PaletteCommand::NewCodexAgent => "New Codex Agent",
             PaletteCommand::ToggleFilesChanges => "Toggle Files / Changes",
             PaletteCommand::PruneWorktrees => "Prune Worktrees",
             PaletteCommand::OpenSettings => "Open Settings",
@@ -177,9 +177,9 @@ impl PaletteCommand {
     /// [`match_against`]), so e.g. typing "terminal" still finds "New Shell".
     fn keywords(self) -> &'static str {
         match self {
-            PaletteCommand::NewShell => "shell terminal spawn session",
-            PaletteCommand::NewClaudeSession => "claude agent spawn session cli",
-            PaletteCommand::NewCodexSession => "codex agent spawn session cli",
+            PaletteCommand::NewShell => "shell terminal spawn agent",
+            PaletteCommand::NewClaudeAgent => "claude agent spawn agent cli",
+            PaletteCommand::NewCodexAgent => "codex agent spawn agent cli",
             PaletteCommand::ToggleFilesChanges => "files changes panel sidebar switch",
             PaletteCommand::PruneWorktrees => "prune worktree remove delete cleanup merged",
             PaletteCommand::OpenSettings => "settings preferences agents worktrees config",
@@ -247,7 +247,7 @@ pub struct FileCandidate {
 #[derive(Debug, Clone, PartialEq)]
 pub enum EntryTarget {
     Command(PaletteCommand),
-    Session(SessionId),
+    Agent(AgentId),
     /// The real, absolute file-tree path (`crate::sidebar::file_tree::FileTreeEntry::path`) - not yet
     /// resolved to repo-relative; see `crate::root::AdeApp::open_palette_file_result`'s docs
     /// for how it decides between opening a real diff and revealing the file in the real tree.
@@ -332,13 +332,13 @@ pub struct PaletteEntry {
     pub label: MatchedText,
     pub secondary: String,
     pub shortcut: Option<&'static str>,
-    /// Only set for an [`EntryTarget::Session`] row - the rail's status colour, reused verbatim
+    /// Only set for an [`EntryTarget::Agent`] row - the rail's status colour, reused verbatim
     /// so the palette inherits the rail's colour coding.
     pub status: Option<Status>,
     /// Only set for an [`EntryTarget::File`] row that is an add/delete in the loaded diff.
     pub file_change: Option<FileChangeKind>,
-    /// Only set for an [`EntryTarget::Session`] row - which agent badge/tint to draw.
-    pub session_kind: Option<SessionKind>,
+    /// Only set for an [`EntryTarget::Agent`] row - which agent badge/tint to draw.
+    pub agent_kind: Option<AgentKind>,
     pub target: EntryTarget,
 }
 
@@ -395,7 +395,7 @@ pub fn substring_match(haystack: &str, needle: &str) -> Option<(usize, usize)> {
 /// `Some((highlight_span, rank))` if it matches at all. An empty `query` matches everything with
 /// rank `0` and no highlight (the "browse everything" state). A match in `primary` is
 /// highlighted and ranked by how early it starts (`0` is best). A match found only in `aux` (a
-/// session's branch, a file's directory, a command's keywords) still qualifies but has nothing
+/// agent's branch, a file's directory, a command's keywords) still qualifies but has nothing
 /// for the label to highlight, so it ranks last, at `usize::MAX`.
 fn match_against(
     primary: &str,
@@ -423,9 +423,9 @@ fn finish_group(mut scored: Vec<(usize, PaletteEntry)>) -> Vec<PaletteEntry> {
     scored.into_iter().map(|(_, entry)| entry).collect()
 }
 
-fn filter_sessions(sessions: &[SessionCandidate], query: &str) -> Vec<PaletteEntry> {
+fn filter_agents(agents: &[AgentCandidate], query: &str) -> Vec<PaletteEntry> {
     let mut scored = Vec::new();
-    for candidate in sessions {
+    for candidate in agents {
         let branch = candidate.branch.as_deref().unwrap_or("");
         let aux = [branch, candidate.kind.label()];
         let Some((span, rank)) = match_against(&candidate.title, &aux, query) else {
@@ -442,8 +442,8 @@ fn filter_sessions(sessions: &[SessionCandidate], query: &str) -> Vec<PaletteEnt
                 shortcut: None,
                 status: Some(candidate.status),
                 file_change: None,
-                session_kind: Some(candidate.kind),
-                target: EntryTarget::Session(candidate.id),
+                agent_kind: Some(candidate.kind),
+                target: EntryTarget::Agent(candidate.id),
             },
         ));
     }
@@ -466,7 +466,7 @@ fn filter_commands(commands: &[CommandCandidate], query: &str) -> Vec<PaletteEnt
                 shortcut: candidate.command.shortcut(),
                 status: None,
                 file_change: None,
-                session_kind: None,
+                agent_kind: None,
                 target: EntryTarget::Command(candidate.command),
             },
         ));
@@ -500,7 +500,7 @@ fn filter_history(history: &[HistoryCandidate], query: &str) -> Vec<PaletteEntry
                 }),
                 status: None,
                 file_change: None,
-                session_kind: None,
+                agent_kind: None,
                 target: EntryTarget::History(candidate.direction),
             },
         ));
@@ -541,7 +541,7 @@ fn filter_files(files: &[FileCandidate], query: &str) -> Vec<PaletteEntry> {
                 shortcut: None,
                 status: None,
                 file_change: candidate.changed,
-                session_kind: None,
+                agent_kind: None,
                 target: EntryTarget::File(candidate.path.clone()),
             },
         ));
@@ -550,10 +550,10 @@ fn filter_files(files: &[FileCandidate], query: &str) -> Vec<PaletteEntry> {
 }
 
 /// Builds the palette's result groups for the current `scope`/`query`. Group order is always
-/// Sessions, Commands, History, Files; a group with zero matches is omitted entirely rather than
+/// Agents, Commands, History, Files; a group with zero matches is omitted entirely rather than
 /// shown as an empty header.
 ///
-/// Sessions only appear in [`PaletteScope::All`] - there is no dedicated Sessions segment in the
+/// Agents only appear in [`PaletteScope::All`] - there is no dedicated Agents segment in the
 /// scope control. For an empty query in a scope that shows files, the file candidates are first
 /// narrowed to changed files (`FileCandidate::changed.is_some()`) under a `"Recent Files"`
 /// label: this app has no file-access/mtime history to rank true recency by, so "recent" is
@@ -567,7 +567,7 @@ fn filter_files(files: &[FileCandidate], query: &str) -> Vec<PaletteEntry> {
 pub fn build_groups(
     scope: PaletteScope,
     query: &str,
-    sessions: &[SessionCandidate],
+    agents: &[AgentCandidate],
     commands: &[CommandCandidate],
     history: &[HistoryCandidate],
     files: &[FileCandidate],
@@ -575,10 +575,10 @@ pub fn build_groups(
     let mut groups = Vec::new();
 
     if scope == PaletteScope::All {
-        let entries = filter_sessions(sessions, query);
+        let entries = filter_agents(agents, query);
         if !entries.is_empty() {
             groups.push(PaletteGroup {
-                label: "Sessions",
+                label: "Agents",
                 entries,
             });
         }
@@ -718,8 +718,8 @@ mod tests {
         unique.dedup();
         assert_eq!(unique.len(), labels.len(), "no duplicate commands");
         assert!(labels.contains(&"New Shell"));
-        assert!(labels.contains(&"New Claude Session"));
-        assert!(labels.contains(&"New Codex Session"));
+        assert!(labels.contains(&"New Claude Agent"));
+        assert!(labels.contains(&"New Codex Agent"));
         assert!(labels.contains(&"Prune Worktrees"));
         assert!(labels.contains(&"Open Settings"));
     }
@@ -743,15 +743,10 @@ mod tests {
         }
     }
 
-    fn session(
-        id: SessionId,
-        title: &str,
-        branch: Option<&str>,
-        status: Status,
-    ) -> SessionCandidate {
-        SessionCandidate {
+    fn agent(id: AgentId, title: &str, branch: Option<&str>, status: Status) -> AgentCandidate {
+        AgentCandidate {
             id,
-            kind: SessionKind::Claude,
+            kind: AgentKind::Claude,
             title: title.to_string(),
             branch: branch.map(str::to_string),
             status,
@@ -787,8 +782,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_query_all_scope_shows_sessions_commands_and_recent_files_together() {
-        let sessions = vec![session(1, "Fix rate limiter", Some("fix/rl"), Status::Run)];
+    fn empty_query_all_scope_shows_agents_commands_and_recent_files_together() {
+        let agents = vec![agent(1, "Fix rate limiter", Some("fix/rl"), Status::Run)];
         let commands: Vec<CommandCandidate> = PaletteCommand::ALL
             .into_iter()
             .map(command_candidate)
@@ -798,13 +793,13 @@ mod tests {
             file("src/unchanged.rs", None),
         ];
 
-        let groups = build_groups(PaletteScope::All, "", &sessions, &commands, &[], &files);
+        let groups = build_groups(PaletteScope::All, "", &agents, &commands, &[], &files);
 
         let labels: Vec<&str> = groups.iter().map(|g| g.label).collect();
         assert_eq!(
             labels,
-            vec!["Sessions", "Commands", "Recent Files"],
-            "real order: Sessions, Commands, Files - matching Jerry.dc.html's own fixture"
+            vec!["Agents", "Commands", "Recent Files"],
+            "real order: Agents, Commands, Files - matching Jerry.dc.html's own fixture"
         );
         let files_group = groups.iter().find(|g| g.label == "Recent Files").unwrap();
         assert_eq!(
@@ -855,17 +850,17 @@ mod tests {
     }
 
     #[test]
-    fn sessions_never_appear_outside_all_scope() {
-        let sessions = vec![session(1, "Fix rate limiter", None, Status::Run)];
-        let groups = build_groups(PaletteScope::Commands, "", &sessions, &[], &[], &[]);
-        assert!(groups.iter().all(|g| g.label != "Sessions"));
-        let groups = build_groups(PaletteScope::Files, "", &sessions, &[], &[], &[]);
-        assert!(groups.iter().all(|g| g.label != "Sessions"));
+    fn agents_never_appear_outside_all_scope() {
+        let agents = vec![agent(1, "Fix rate limiter", None, Status::Run)];
+        let groups = build_groups(PaletteScope::Commands, "", &agents, &[], &[], &[]);
+        assert!(groups.iter().all(|g| g.label != "Agents"));
+        let groups = build_groups(PaletteScope::Files, "", &agents, &[], &[], &[]);
+        assert!(groups.iter().all(|g| g.label != "Agents"));
     }
 
     #[test]
     fn a_query_matching_nothing_yields_no_groups_at_all() {
-        let sessions = vec![session(1, "Fix rate limiter", None, Status::Run)];
+        let agents = vec![agent(1, "Fix rate limiter", None, Status::Run)];
         let commands: Vec<CommandCandidate> = PaletteCommand::ALL
             .into_iter()
             .map(command_candidate)
@@ -875,7 +870,7 @@ mod tests {
         let groups = build_groups(
             PaletteScope::All,
             "zzz_no_such_thing",
-            &sessions,
+            &agents,
             &commands,
             &[],
             &files,
@@ -924,15 +919,15 @@ mod tests {
     fn flatten_preserves_group_then_row_order() {
         let groups = vec![
             PaletteGroup {
-                label: "Sessions",
+                label: "Agents",
                 entries: vec![PaletteEntry {
                     label: MatchedText::plain("s1"),
                     secondary: String::new(),
                     shortcut: None,
                     status: None,
                     file_change: None,
-                    session_kind: None,
-                    target: EntryTarget::Session(1),
+                    agent_kind: None,
+                    target: EntryTarget::Agent(1),
                 }],
             },
             PaletteGroup {
@@ -943,14 +938,14 @@ mod tests {
                     shortcut: None,
                     status: None,
                     file_change: None,
-                    session_kind: None,
+                    agent_kind: None,
                     target: EntryTarget::Command(PaletteCommand::NewShell),
                 }],
             },
         ];
         let flat = flatten(&groups);
         assert_eq!(flat.len(), 2);
-        assert_eq!(flat[0].target, EntryTarget::Session(1));
+        assert_eq!(flat[0].target, EntryTarget::Agent(1));
         assert_eq!(
             flat[1].target,
             EntryTarget::Command(PaletteCommand::NewShell)
@@ -958,18 +953,18 @@ mod tests {
     }
 
     #[test]
-    fn session_matches_via_branch_still_qualifies_without_highlighting_the_title() {
-        let sessions = vec![session(
+    fn agent_matches_via_branch_still_qualifies_without_highlighting_the_title() {
+        let agents = vec![agent(
             1,
             "Fix rate limiter",
             Some("fix/auth-token-race"),
             Status::Run,
         )];
-        let groups = build_groups(PaletteScope::All, "token", &sessions, &[], &[], &[]);
-        let sessions_group = groups.iter().find(|g| g.label == "Sessions").unwrap();
-        assert_eq!(sessions_group.entries.len(), 1);
-        assert_eq!(sessions_group.entries[0].label.mid, "");
-        assert_eq!(sessions_group.entries[0].label.pre, "Fix rate limiter");
+        let groups = build_groups(PaletteScope::All, "token", &agents, &[], &[], &[]);
+        let agents_group = groups.iter().find(|g| g.label == "Agents").unwrap();
+        assert_eq!(agents_group.entries.len(), 1);
+        assert_eq!(agents_group.entries[0].label.mid, "");
+        assert_eq!(agents_group.entries[0].label.pre, "Fix rate limiter");
     }
 
     #[test]

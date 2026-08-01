@@ -1,7 +1,7 @@
 //! Real, themed, overlay scrollbars (GitHub issue #30) for every scrollable region audited in
 //! that issue: the file tree and Changes list (`crate::sidebar`), the code editor and merge
 //! hand-edit buffer (`crate::code_surface`, `crate::merge`), Settings' nav/content columns
-//! (`crate::settings`), the session rail's worktree list (`crate::rail`), the command palette's
+//! (`crate::settings`), the agent rail's worktree list (`crate::rail`), the command palette's
 //! result list (`crate::palette`), and the read-only diff view (`crate::code_surface::diff_view`).
 //!
 //! ## Why one shared component, not nine hand-copied ones

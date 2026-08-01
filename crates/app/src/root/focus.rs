@@ -16,7 +16,7 @@ impl AdeApp {
     /// focused by then). Always moves focus onto [`Self::code_focus_handle`] regardless.
     pub(crate) fn focus_code_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.open_change.is_none() {
-            self.code_focus.capture(window, &self.sessions, cx);
+            self.code_focus.capture(window, &self.agents, cx);
         }
         window.focus(&self.code_focus_handle, cx);
     }
@@ -28,13 +28,13 @@ impl AdeApp {
     /// something else".
     pub(crate) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = true;
-        // The tab strip's `+` menu, the title bar's File/Edit/View/Session/Help dropdown, and
+        // The tab strip's `+` menu, the title bar's File/Edit/View/Agent/Help dropdown, and
         // the "New file" prompt are all unconditional siblings of the palette - see
         // `Self::plus_menu_open`'s/`Self::title_menu_open`'s/`Self::new_file_input`'s own docs.
         self.plus_menu_open = false;
         self.title_menu_open = None;
         self.new_file_input = None;
-        self.palette_focus.capture(window, &self.sessions, cx);
+        self.palette_focus.capture(window, &self.agents, cx);
         self.palette_scope = palette::PaletteScope::default();
         // A reopened palette is a genuinely new widget instance, so its predecessor's undo
         // history must not be reachable from it - `reset`, not `clear` (which is itself a real,
@@ -56,13 +56,13 @@ impl AdeApp {
             // palette was opened while Settings was already open and is now dismissing back
             // down to it) - focus belongs on `settings_focus_handle`, the same handle
             // `open_settings` itself uses, not on `palette_focus`'s restore target or the
-            // active session's pane (neither is actually rendered right now).
+            // active agent's pane (neither is actually rendered right now).
             window.focus(&self.settings_focus_handle, cx);
             self.palette_focus.clear();
             cx.notify();
             return;
         }
-        restore_focus(&self.sessions, &mut self.palette_focus, window, cx);
+        restore_focus(&self.agents, &mut self.palette_focus, window, cx);
         cx.notify();
     }
 
@@ -88,7 +88,7 @@ impl AdeApp {
         self.tree_context_menu = None;
         self.tree_inline_edit = None;
         self.settings_open = true;
-        self.settings_focus.capture(window, &self.sessions, cx);
+        self.settings_focus.capture(window, &self.agents, cx);
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
         window.focus(&self.settings_focus_handle, cx);
@@ -105,7 +105,7 @@ impl AdeApp {
         // `App::intercept_keystrokes` subscription - it must never survive leaving the Settings
         // surface, or every keystroke in the whole app would keep being silently swallowed.
         self.cancel_keybinding_recording(cx);
-        restore_focus(&self.sessions, &mut self.settings_focus, window, cx);
+        restore_focus(&self.agents, &mut self.settings_focus, window, cx);
         cx.notify();
     }
 }
@@ -170,7 +170,7 @@ pub(crate) mod palette_focus_tests {
     }
 
     /// A fresh window starts with `Window::focus == None` - without `AdeApp::new` giving the
-    /// initial session's pane focus up front, the very first ⌘P would silently do nothing.
+    /// initial agent's pane focus up front, the very first ⌘P would silently do nothing.
     #[gpui::test]
     fn toggle_palette_works_on_a_fresh_window_with_nothing_clicked_yet(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -185,15 +185,15 @@ pub(crate) mod palette_focus_tests {
         );
     }
 
-    /// Spawning a session from the palette swaps the active session; verifies `close_palette`
-    /// focuses the *new* session's pane instead of the stale captured handle (see
-    /// [`OverlayFocus`]'s `opened_session` field).
+    /// Spawning an agent from the palette swaps the active agent; verifies `close_palette`
+    /// focuses the *new* agent's pane instead of the stale captured handle (see
+    /// [`OverlayFocus`]'s `opened_agent` field).
     #[gpui::test]
     fn toggle_palette_still_works_after_a_palette_spawned_new_shell(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
-        let initial_session_id = app.read_with(cx, |app, _| app.sessions.active_id());
+        let initial_agent_id = app.read_with(cx, |app, _| app.agents.active_id());
 
         cx.dispatch_action(TogglePalette);
         app.update_in(cx, |app, window, cx| {
@@ -206,17 +206,17 @@ pub(crate) mod palette_focus_tests {
             app.close_palette(window, cx);
         });
 
-        let new_session_id = app.read_with(cx, |app, _| app.sessions.active_id());
+        let new_agent_id = app.read_with(cx, |app, _| app.agents.active_id());
         assert_ne!(
-            initial_session_id, new_session_id,
-            "sanity check: New Shell should have made a different session active"
+            initial_agent_id, new_agent_id,
+            "sanity check: New Shell should have made a different agent active"
         );
 
         cx.dispatch_action(TogglePalette);
         assert!(
             app.read_with(cx, |app, _| app.palette_open),
             "secondary-p after a palette-spawned New Shell should still open the palette - the \
-             center pane now renders a different session's terminal pane than the one focus \
+             center pane now renders a different agent's terminal pane than the one focus \
              was captured from, so close_palette must not restore that now-stale handle"
         );
     }
@@ -349,46 +349,46 @@ mod tab_strip_keybinding_tests {
     /// `crate::default_key_bindings`), so it's simulated literally rather than branching on
     /// `cfg!(target_os = "macos")`.
     #[gpui::test]
-    fn ctrl_shift_t_spawns_a_real_shell_session_through_the_real_key_bindings(
+    fn ctrl_shift_t_spawns_a_real_shell_agent_through_the_real_key_bindings(
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
-        let sessions_before = app.read_with(cx, |app, _| app.sessions.iter().count());
+        let agents_before = app.read_with(cx, |app, _| app.agents.iter().count());
 
         cx.simulate_keystrokes("ctrl-shift-t");
 
-        let (sessions_after, active_kind) = app.read_with(cx, |app, _| {
+        let (agents_after, active_kind) = app.read_with(cx, |app, _| {
             (
-                app.sessions.iter().count(),
-                app.sessions.active().map(|session| session.kind),
+                app.agents.iter().count(),
+                app.agents.active().map(|agent| agent.kind),
             )
         });
         assert_eq!(
-            sessions_after,
-            sessions_before + 1,
+            agents_after,
+            agents_before + 1,
             "a real, simulated ctrl-shift-t keystroke should have spawned exactly one new \
-             session through crate::default_key_bindings' real ctrl-shift-t -> NewTerminal \
+             agent through crate::default_key_bindings' real ctrl-shift-t -> NewTerminal \
              binding"
         );
         assert_eq!(
             active_kind,
-            Some(SessionKind::Shell),
-            "New terminal always spawns a real Shell session"
+            Some(AgentKind::Shell),
+            "New terminal always spawns a real Shell agent"
         );
     }
 
     #[gpui::test]
-    fn secondary_shift_n_spawns_a_real_agent_session_through_the_real_key_bindings(
+    fn secondary_shift_n_spawns_a_real_agent_through_the_real_key_bindings(
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
-        let sessions_before = app.read_with(cx, |app, _| app.sessions.iter().count());
+        let agents_before = app.read_with(cx, |app, _| app.agents.iter().count());
 
         let secondary_shift_n = if cfg!(target_os = "macos") {
             "cmd-shift-n"
@@ -401,12 +401,12 @@ mod tab_strip_keybinding_tests {
         // other background-dispatching test in this crate calls `run_until_parked`.
         cx.run_until_parked();
 
-        let sessions_after = app.read_with(cx, |app, _| app.sessions.iter().count());
+        let agents_after = app.read_with(cx, |app, _| app.agents.iter().count());
         assert_eq!(
-            sessions_after,
-            sessions_before + 1,
+            agents_after,
+            agents_before + 1,
             "a real, simulated {secondary_shift_n} keystroke should have spawned exactly one \
-             new agent session through crate::default_key_bindings' real \
+             new agent through crate::default_key_bindings' real \
              secondary-shift-n -> NewAgentPane binding"
         );
     }
@@ -425,15 +425,15 @@ mod tab_strip_keybinding_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
-        // Explicitly focus the initial shell session - the real, concrete "a terminal pane
+        // Explicitly focus the initial shell agent - the real, concrete "a terminal pane
         // genuinely has keyboard focus" state this test's own name promises, rather than relying
         // on whatever `AdeApp::new_with_settings` happens to leave focus on by default.
         app.update_in(cx, |app, window, cx| {
-            app.sessions.focus_active(window, cx);
+            app.agents.focus_active(window, cx);
         });
         assert!(
-            app.read_with(cx, |app, _| app.sessions.active_id().is_some()),
-            "sanity check: a real terminal session must be focused for this test to mean anything"
+            app.read_with(cx, |app, _| app.agents.active_id().is_some()),
+            "sanity check: a real terminal agent must be focused for this test to mean anything"
         );
         assert!(
             !app.read_with(cx, |app, _| app.palette_open),
@@ -463,9 +463,9 @@ mod tab_strip_keybinding_tests {
         }
     }
 
-    /// With a file tab active (so `render_center_pane` shows the file, not any session's pane),
-    /// spawning a new session via `ctrl-shift-t` must not leave `Window::focus` on a pane that
-    /// isn't rendered anywhere that frame - `Sessions::spawn` used to move focus there
+    /// With a file tab active (so `render_center_pane` shows the file, not any agent's pane),
+    /// spawning a new agent via `ctrl-shift-t` must not leave `Window::focus` on a pane that
+    /// isn't rendered anywhere that frame - `Agents::spawn` used to move focus there
     /// unconditionally, silently killing every bound shortcut until the next click.
     #[gpui::test]
     fn ctrl_p_still_works_after_ctrl_shift_t_with_a_file_tab_active(cx: &mut TestAppContext) {
@@ -485,8 +485,8 @@ mod tab_strip_keybinding_tests {
 
         cx.simulate_keystrokes("ctrl-shift-t");
         assert!(
-            app.read_with(cx, |app, _| app.sessions.iter().count()) >= 2,
-            "sanity check: ctrl-shift-t should have spawned a real new session"
+            app.read_with(cx, |app, _| app.agents.iter().count()) >= 2,
+            "sanity check: ctrl-shift-t should have spawned a real new agent"
         );
 
         let key = secondary_p();
@@ -495,27 +495,27 @@ mod tab_strip_keybinding_tests {
         assert!(
             app.read_with(cx, |app, _| app.palette_open),
             "a real {key} keystroke after ctrl-shift-t, with a file tab active, must still open \
-             the palette - before the fix, Sessions::spawn's unconditional focus pointed \
-             Window::focus at the new session's pane even though render_center_pane was still \
+             the palette - before the fix, Agents::spawn's unconditional focus pointed \
+             Window::focus at the new agent's pane even though render_center_pane was still \
              showing the file tab, leaving no real dispatch path to any on_action handler"
         );
     }
 
-    /// The identical gap in `Sessions::close`: closing the active session's tab picks a new
-    /// active session but must also move focus onto it, or every bound shortcut dies until the
+    /// The identical gap in `Agents::close`: closing the active agent's tab picks a new
+    /// active agent but must also move focus onto it, or every bound shortcut dies until the
     /// next click.
     #[gpui::test]
-    fn ctrl_p_still_works_after_closing_the_active_session_tab(cx: &mut TestAppContext) {
+    fn ctrl_p_still_works_after_closing_the_active_agent_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
         let first_id = app.read_with(cx, |app, _| {
-            app.sessions.active_id().expect("the initial shell session")
+            app.agents.active_id().expect("the initial shell agent")
         });
         app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+            app.agents.spawn(
+                AgentKind::Shell,
                 repo.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
                 window,
@@ -523,16 +523,16 @@ mod tab_strip_keybinding_tests {
             )
         });
         app.update_in(cx, |app, window, cx| {
-            app.select_session(first_id, window, cx);
+            app.select_agent(first_id, window, cx);
         });
         assert_eq!(
-            app.read_with(cx, |app, _| app.sessions.active_id()),
+            app.read_with(cx, |app, _| app.agents.active_id()),
             Some(first_id),
-            "sanity check: the first session should be active again before closing it"
+            "sanity check: the first agent should be active again before closing it"
         );
 
         app.update_in(cx, |app, window, cx| {
-            app.close_session(first_id, window, cx);
+            app.close_agent(first_id, window, cx);
         });
 
         let key = secondary_p();
@@ -540,26 +540,26 @@ mod tab_strip_keybinding_tests {
 
         assert!(
             app.read_with(cx, |app, _| app.palette_open),
-            "a real {key} keystroke after closing the active session's own tab must still open \
-             the palette - Sessions::close must move real keyboard focus onto whichever session \
+            "a real {key} keystroke after closing the active agent's own tab must still open \
+             the palette - Agents::close must move real keyboard focus onto whichever agent \
              became active as a result, not leave Window::focus dangling"
         );
     }
 
-    /// The other path to the same `Sessions::close` gap: archiving the active session from the
-    /// rail (`AdeApp::archive_session`, which delegates to `Self::close_session`).
+    /// The other path to the same `Agents::close` gap: archiving the active agent from the
+    /// rail (`AdeApp::archive_agent`, which delegates to `Self::close_agent`).
     #[gpui::test]
-    fn ctrl_p_still_works_after_archiving_the_active_session(cx: &mut TestAppContext) {
+    fn ctrl_p_still_works_after_archiving_the_active_agent(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
         let first_id = app.read_with(cx, |app, _| {
-            app.sessions.active_id().expect("the initial shell session")
+            app.agents.active_id().expect("the initial shell agent")
         });
         app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+            app.agents.spawn(
+                AgentKind::Shell,
                 repo.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
                 window,
@@ -567,16 +567,16 @@ mod tab_strip_keybinding_tests {
             )
         });
         app.update_in(cx, |app, window, cx| {
-            app.select_session(first_id, window, cx);
+            app.select_agent(first_id, window, cx);
         });
         assert_eq!(
-            app.read_with(cx, |app, _| app.sessions.active_id()),
+            app.read_with(cx, |app, _| app.agents.active_id()),
             Some(first_id),
-            "sanity check: the first session should be active again before archiving it"
+            "sanity check: the first agent should be active again before archiving it"
         );
 
         app.update_in(cx, |app, window, cx| {
-            app.archive_session(first_id, window, cx);
+            app.archive_agent(first_id, window, cx);
         });
 
         let key = secondary_p();
@@ -584,8 +584,8 @@ mod tab_strip_keybinding_tests {
 
         assert!(
             app.read_with(cx, |app, _| app.palette_open),
-            "a real {key} keystroke after archiving the active session must still open the \
-             palette - archiving goes through the same Sessions::close real focus-restore path \
+            "a real {key} keystroke after archiving the active agent must still open the \
+             palette - archiving goes through the same Agents::close real focus-restore path \
              closing a tab does"
         );
     }
@@ -708,10 +708,10 @@ mod tab_strip_keybinding_tests {
     /// (`crate::terminal::pane::keystroke_tests::ctrl_z_maps_to_the_real_sigtstp_control_byte`
     /// covers
     /// that half). `AdeApp::new_with_settings` always starts a window with one real shell
-    /// session already focused (see that function's own docs) - no extra spawn/focus needed
+    /// agent already focused (see that function's own docs) - no extra spawn/focus needed
     /// here, unlike the merge/palette tests elsewhere in this file.
     #[gpui::test]
-    fn secondary_z_does_not_undo_while_the_default_terminal_session_is_focused(
+    fn secondary_z_does_not_undo_while_the_default_terminal_agent_is_focused(
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -720,9 +720,9 @@ mod tab_strip_keybinding_tests {
         bind_real_keys(cx);
 
         assert_eq!(
-            app.read_with(cx, |app, _| app.sessions.iter().count()),
+            app.read_with(cx, |app, _| app.agents.iter().count()),
             1,
-            "sanity check: a fresh window always starts with one real, focused shell session"
+            "sanity check: a fresh window always starts with one real, focused shell agent"
         );
         assert!(app.read_with(cx, |app, _| app.worktree_history_status.is_none()));
 
@@ -736,7 +736,7 @@ mod tab_strip_keybinding_tests {
         assert!(
             app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
             "a real, simulated secondary-z keystroke must NOT reach Undo while the default, \
-             real terminal session has focus - crate::default_key_bindings scopes Undo/Redo to \
+             real terminal agent has focus - crate::default_key_bindings scopes Undo/Redo to \
              Some(\"!terminal\") specifically so this stays free to reach the pty as literal \
              input instead"
         );
@@ -780,11 +780,11 @@ mod tab_strip_keybinding_tests {
         );
     }
 
-    /// Spawns four extra real shell sessions (five total, including the one `AdeApp::new` starts)
-    /// and confirms `secondary-3` really jumps to the third one in real session order - not just
-    /// that `AdeApp::jump_to_session_at(3, ..)` does when called directly.
+    /// Spawns four extra real shell agents (five total, including the one `AdeApp::new` starts)
+    /// and confirms `secondary-3` really jumps to the third one in real agent order - not just
+    /// that `AdeApp::jump_to_agent_at(3, ..)` does when called directly.
     #[gpui::test]
-    fn secondary_3_jumps_to_the_third_real_session_through_the_real_key_bindings(
+    fn secondary_3_jumps_to_the_third_real_agent_through_the_real_key_bindings(
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -793,20 +793,20 @@ mod tab_strip_keybinding_tests {
 
         for _ in 0..4 {
             app.update_in(cx, |app, window, cx| {
-                app.new_session(SessionKind::Shell, window, cx);
+                app.new_agent(AgentKind::Shell, window, cx);
             });
         }
         let third_id = app.read_with(cx, |app, _| {
-            app.sessions
+            app.agents
                 .iter()
                 .nth(2)
-                .map(|session| session.id)
-                .expect("five real sessions should exist by now")
+                .map(|agent| agent.id)
+                .expect("five real agents should exist by now")
         });
         assert_ne!(
-            app.read_with(cx, |app, _| app.sessions.active_id()),
+            app.read_with(cx, |app, _| app.agents.active_id()),
             Some(third_id),
-            "sanity check: the most recently spawned session (the fifth), not the third, should \
+            "sanity check: the most recently spawned agent (the fifth), not the third, should \
              be active before the jump"
         );
 
@@ -818,28 +818,28 @@ mod tab_strip_keybinding_tests {
         cx.simulate_keystrokes(secondary_3);
 
         assert_eq!(
-            app.read_with(cx, |app, _| app.sessions.active_id()),
+            app.read_with(cx, |app, _| app.agents.active_id()),
             Some(third_id),
-            "a real, simulated {secondary_3} keystroke must activate the session at position 3 \
-             through crate::default_key_bindings' real secondary-3 -> JumpToSession3 binding"
+            "a real, simulated {secondary_3} keystroke must activate the agent at position 3 \
+             through crate::default_key_bindings' real secondary-3 -> JumpToAgent3 binding"
         );
     }
 
-    /// [`AdeApp::jump_to_session_at`]'s own direct-call coverage (as opposed to the keystroke
-    /// simulation above) for every position 1..=8, plus the real "fewer sessions than the
+    /// [`AdeApp::jump_to_agent_at`]'s own direct-call coverage (as opposed to the keystroke
+    /// simulation above) for every position 1..=8, plus the real "fewer agents than the
     /// position" no-op.
     #[gpui::test]
-    fn jump_to_session_at_activates_the_right_session_by_position(cx: &mut TestAppContext) {
+    fn jump_to_agent_at_activates_the_right_agent_by_position(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
         let mut ids = vec![app.read_with(cx, |app, _| {
-            app.sessions.active_id().expect("the initial shell session")
+            app.agents.active_id().expect("the initial shell agent")
         })];
         for _ in 0..3 {
             let id = app.update_in(cx, |app, window, cx| {
-                app.sessions.spawn(
-                    SessionKind::Shell,
+                app.agents.spawn(
+                    AgentKind::Shell,
                     repo.path().to_path_buf(),
                     app.settings.appearance.terminal_font_size,
                     window,
@@ -848,29 +848,29 @@ mod tab_strip_keybinding_tests {
             });
             ids.push(id);
         }
-        // Four real sessions now exist, in spawn order `ids[0..4]`.
+        // Four real agents now exist, in spawn order `ids[0..4]`.
 
         for (position, expected_id) in ids.iter().enumerate() {
             let position = position + 1;
             app.update_in(cx, |app, window, cx| {
-                app.jump_to_session_at(position, window, cx);
+                app.jump_to_agent_at(position, window, cx);
             });
             assert_eq!(
-                app.read_with(cx, |app, _| app.sessions.active_id()),
+                app.read_with(cx, |app, _| app.agents.active_id()),
                 Some(*expected_id),
-                "position {position} should activate session {expected_id}"
+                "position {position} should activate agent {expected_id}"
             );
         }
 
-        // A real no-op: there is no fifth session.
-        let active_before = app.read_with(cx, |app, _| app.sessions.active_id());
+        // A real no-op: there is no fifth agent.
+        let active_before = app.read_with(cx, |app, _| app.agents.active_id());
         app.update_in(cx, |app, window, cx| {
-            app.jump_to_session_at(5, window, cx);
+            app.jump_to_agent_at(5, window, cx);
         });
         assert_eq!(
-            app.read_with(cx, |app, _| app.sessions.active_id()),
+            app.read_with(cx, |app, _| app.agents.active_id()),
             active_before,
-            "jumping to a position with no real session there must be a no-op"
+            "jumping to a position with no real agent there must be a no-op"
         );
     }
 }
@@ -966,18 +966,18 @@ mod settings_focus_tests {
         );
     }
 
-    /// A session tab opened before Settings was shown is still there, and still active, after an
+    /// A agent tab opened before Settings was shown is still there, and still active, after an
     /// open/close round-trip - Settings swaps which body `Render::render` draws
-    /// ([`AdeApp::render_workspace_body`]) without touching `AdeApp::sessions` itself.
+    /// ([`AdeApp::render_workspace_body`]) without touching `AdeApp::agents` itself.
     #[gpui::test]
-    fn closing_settings_leaves_open_session_tabs_intact(cx: &mut TestAppContext) {
+    fn closing_settings_leaves_open_agent_tabs_intact(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
-        let sessions_before = app.read_with(cx, |app, _| app.sessions.iter().count());
-        let active_before = app.read_with(cx, |app, _| app.sessions.active_id());
+        let agents_before = app.read_with(cx, |app, _| app.agents.iter().count());
+        let active_before = app.read_with(cx, |app, _| app.agents.active_id());
         assert_eq!(
-            sessions_before, 1,
+            agents_before, 1,
             "AdeApp::new starts with exactly one real shell tab"
         );
 
@@ -987,11 +987,11 @@ mod settings_focus_tests {
         cx.simulate_keystrokes("escape");
         assert!(!app.read_with(cx, |app, _| app.settings_open));
 
-        let sessions_after = app.read_with(cx, |app, _| app.sessions.iter().count());
-        let active_after = app.read_with(cx, |app, _| app.sessions.active_id());
+        let agents_after = app.read_with(cx, |app, _| app.agents.iter().count());
+        let active_after = app.read_with(cx, |app, _| app.agents.active_id());
         assert_eq!(
-            sessions_after, sessions_before,
-            "the real session tab opened before Settings was shown must still exist after \
+            agents_after, agents_before,
+            "the real agent tab opened before Settings was shown must still exist after \
              closing Settings"
         );
         assert_eq!(
@@ -1279,7 +1279,7 @@ mod code_focus_tests {
     }
 
     /// Closing the File view ([`AdeApp::close_change_diff`]) must restore focus onto the active
-    /// session's pane, not leave it dangling on [`AdeApp::code_focus_handle`].
+    /// agent's pane, not leave it dangling on [`AdeApp::code_focus_handle`].
     #[gpui::test]
     fn closing_the_file_view_restores_real_focus_and_actions_keep_working(cx: &mut TestAppContext) {
         let (app, cx, file_path) = open_test_app_with_a_plain_text_file(cx);
@@ -1298,7 +1298,7 @@ mod code_focus_tests {
         assert!(
             app.read_with(cx, |app, _| app.settings_open),
             "secondary-, must still reach handle_toggle_settings_action after closing the File view - \
-             AdeApp::close_change_diff must have restored real focus onto the active session's \
+             AdeApp::close_change_diff must have restored real focus onto the active agent's \
              terminal pane, not left it dangling on code_focus_handle"
         );
     }
@@ -1380,7 +1380,7 @@ mod text_undo_scoping_tests {
         );
 
         // Close the file tab: `close_file_tab` deliberately keeps the `edit_buffers` entry (and
-        // so its whole undo history) alive while restoring real focus to the active session's
+        // so its whole undo history) alive while restoring real focus to the active agent's
         // terminal pane - exactly the overlapping state this test needs.
         app.update_in(cx, |app, window, cx| {
             app.close_change_diff(window, cx);
@@ -1546,7 +1546,7 @@ mod text_undo_scoping_tests {
         );
     }
 
-    /// The rail's session filter - the fourth and last of this app's hand-rolled single-line
+    /// The rail's agent filter - the fourth and last of this app's hand-rolled single-line
     /// inputs. Also covers that `Esc`-clearing a filter is a real, undoable step rather than a
     /// silent loss.
     #[gpui::test]
@@ -1670,15 +1670,15 @@ mod text_undo_scoping_tests {
         cx.run_until_parked();
         bind_real_keys(cx);
 
-        let session_id = app
-            .read_with(cx, |app, _| app.sessions.active_id())
-            .expect("a fresh window always starts with one real, focused shell session");
+        let agent_id = app
+            .read_with(cx, |app, _| app.agents.active_id())
+            .expect("a fresh window always starts with one real, focused shell agent");
         app.update_in(cx, |app, window, cx| {
-            app.close_session(session_id, window, cx);
+            app.close_agent(agent_id, window, cx);
         });
         cx.run_until_parked();
         assert!(
-            app.read_with(cx, |app, _| app.sessions.active_id().is_none()
+            app.read_with(cx, |app, _| app.agents.active_id().is_none()
                 && app.open_change.is_none()
                 && !app.settings_open),
             "sanity check: this must really be the \"nothing left to focus\" fallback state, or \

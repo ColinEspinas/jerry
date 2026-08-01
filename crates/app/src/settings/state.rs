@@ -29,7 +29,7 @@
 use std::path::PathBuf;
 
 use crate::rail::state::WorktreeNote;
-use crate::work_surface::sessions::SessionKind;
+use crate::work_surface::agents::AgentKind;
 
 /// Every page `Jerry.dc.html`'s `settingsNavDefs` fixture lists, in the order the design's four
 /// nav groups present them (see [`nav_groups`]).
@@ -127,7 +127,7 @@ impl SettingsPage {
                 "Which agent binaries Jerry can actually find on PATH right now - detected live, not configured."
             }
             SettingsPage::Worktrees => {
-                "Every session gets its own worktree. This is where they live, their real disk usage, and what's safe to prune."
+                "Every agent gets its own worktree. This is where they live, their real disk usage, and what's safe to prune."
             }
             SettingsPage::Appearance => {
                 "These sizes and scale are saved for real, but nothing in the interface renders at them yet."
@@ -192,15 +192,15 @@ pub fn nav_groups() -> Vec<NavGroup> {
     ]
 }
 
-/// Agent kinds this app can spawn as an "agent" - `SessionKind::Shell` is deliberately excluded,
+/// Agent kinds this app can spawn as an "agent" - `AgentKind::Shell` is deliberately excluded,
 /// since the Settings › Agents card lists agent CLIs, not shells.
-pub const AGENT_KINDS: [SessionKind; 2] = [SessionKind::Claude, SessionKind::Codex];
+pub const AGENT_KINDS: [AgentKind; 2] = [AgentKind::Claude, AgentKind::Codex];
 
 /// One row for the Agents page's Installed card - see [`detect_agent_rows`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRow {
-    pub kind: SessionKind,
-    /// The exact command name `SessionKind::agent_binary_name` hands to `TerminalSpec::command`
+    pub kind: AgentKind,
+    /// The exact command name `AgentKind::agent_binary_name` hands to `TerminalSpec::command`
     /// at spawn time - the same name [`Self::resolved_path`] was searched for.
     pub binary_name: &'static str,
     /// `Some(path)` if a real `$PATH` search found the binary, `None` if it genuinely isn't
@@ -256,7 +256,7 @@ pub enum WorktreeDotStatus {
     /// Uncommitted changes - matches [`WorktreeNote::clean`] being `Some(false)`.
     Dirty,
     /// A prune candidate on its own merits (see [`WorktreeNote::is_prunable`]) - not the final
-    /// "safe to remove right now" answer, since a live session could still exclude it (see
+    /// "safe to remove right now" answer, since a live agent could still exclude it (see
     /// `crate::rail::state::prunable_worktree_paths`); just this row's own local state.
     Prunable,
     /// `wt_core::is_dirty` failed for this path - genuinely unknown, not a guess.
@@ -364,7 +364,7 @@ pub struct LspLanguage {
     pub binary: &'static str,
     /// Generic descriptive copy, not a live count - `Jerry.dc.html`'s own `lspDefs` notes mix
     /// this with fabricated live data ("1,284 crates indexed") this app has no per-language
-    /// session summary to back (`crate::lsp::client`'s server clients are keyed by worktree, not
+    /// agent summary to back (`crate::lsp::client`'s server clients are keyed by worktree, not
     /// surfaced here). Every note here is deliberately the descriptive kind only.
     pub note: &'static str,
     /// This server's real official install/docs page - see
@@ -508,21 +508,21 @@ pub struct KeybindingRow {
 /// a raw `gpui::Action::name()` compiler identifier in a user-facing error.
 pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
     match action.name() {
-        "app::NewSession" => Some("New session"),
+        "app::NewAgent" => Some("New agent"),
         "app::TogglePalette" => Some("Command palette"),
         "app::ToggleSettings" => Some("Open settings"),
         "app::GotoDefinition" => Some("Go to definition"),
         "app::NewTerminal" => Some("New terminal"),
         "app::NewAgentPane" => Some("New agent pane"),
         "app::NextChangedFile" => Some("Next changed file"),
-        "app::JumpToSession1" => Some("Jump to session 1"),
-        "app::JumpToSession2" => Some("Jump to session 2"),
-        "app::JumpToSession3" => Some("Jump to session 3"),
-        "app::JumpToSession4" => Some("Jump to session 4"),
-        "app::JumpToSession5" => Some("Jump to session 5"),
-        "app::JumpToSession6" => Some("Jump to session 6"),
-        "app::JumpToSession7" => Some("Jump to session 7"),
-        "app::JumpToSession8" => Some("Jump to session 8"),
+        "app::JumpToAgent1" => Some("Jump to agent 1"),
+        "app::JumpToAgent2" => Some("Jump to agent 2"),
+        "app::JumpToAgent3" => Some("Jump to agent 3"),
+        "app::JumpToAgent4" => Some("Jump to agent 4"),
+        "app::JumpToAgent5" => Some("Jump to agent 5"),
+        "app::JumpToAgent6" => Some("Jump to agent 6"),
+        "app::JumpToAgent7" => Some("Jump to agent 7"),
+        "app::JumpToAgent8" => Some("Jump to agent 8"),
         "app::EditorBackspace" => Some("Editor: delete backward"),
         "app::EditorDelete" => Some("Editor: delete forward"),
         "app::EditorEnter" => Some("Editor: insert newline"),
@@ -630,7 +630,7 @@ pub fn keybinding_rows(
 
 /// The Keybindings page's filter row logic (`CHANGELOG.md`'s change 3: "filter row (`/ filter N
 /// bindings`, right-aligned count)") - a case-insensitive substring match against a row's
-/// command name or context, matching `crate::rail::state::filter_sessions`'s shape. An empty (or
+/// command name or context, matching `crate::rail::state::filter_agents`'s shape. An empty (or
 /// all-whitespace) query matches every row.
 pub fn filter_keybinding_rows<'a>(
     rows: &'a [KeybindingRow],
@@ -776,7 +776,7 @@ mod tests {
         assert!(rows.iter().all(|row| row.status_label() == "ready"));
         let claude = rows
             .iter()
-            .find(|row| row.kind == SessionKind::Claude)
+            .find(|row| row.kind == AgentKind::Claude)
             .expect("a Claude row should exist");
         assert_eq!(claude.binary_name, "claude");
         assert_eq!(claude.resolved_path, Some(PathBuf::from("/usr/bin/claude")));
@@ -801,11 +801,11 @@ mod tests {
         });
         let claude = rows
             .iter()
-            .find(|row| row.kind == SessionKind::Claude)
+            .find(|row| row.kind == AgentKind::Claude)
             .expect("claude row");
         let codex = rows
             .iter()
-            .find(|row| row.kind == SessionKind::Codex)
+            .find(|row| row.kind == AgentKind::Codex)
             .expect("codex row");
         assert!(claude.is_ready());
         assert!(!codex.is_ready());
@@ -1092,7 +1092,7 @@ mod tests {
         assert_eq!(
             commands,
             vec![
-                "New session",
+                "New agent",
                 "Command palette",
                 "Open settings",
                 "Worktree history: undo",
@@ -1104,14 +1104,14 @@ mod tests {
                 "New terminal",
                 "New agent pane",
                 "Next changed file",
-                "Jump to session 1",
-                "Jump to session 2",
-                "Jump to session 3",
-                "Jump to session 4",
-                "Jump to session 5",
-                "Jump to session 6",
-                "Jump to session 7",
-                "Jump to session 8",
+                "Jump to agent 1",
+                "Jump to agent 2",
+                "Jump to agent 3",
+                "Jump to agent 4",
+                "Jump to agent 5",
+                "Jump to agent 6",
+                "Jump to agent 7",
+                "Jump to agent 8",
                 "Editor: delete backward",
                 "Editor: delete forward",
                 "Editor: insert newline",
@@ -1218,7 +1218,7 @@ mod tests {
         // Revision R8.5a added a second real scoped context (`"file-editor"`, the real File
         // view text-editing actions) alongside the pre-existing `"diff"` one (`]` ->
         // `NextChangedFile`) - both are deliberately non-global for the same real reason
-        // (swallowing ordinary keystrokes in a focused terminal session), so the scoped count
+        // (swallowing ordinary keystrokes in a focused terminal agent), so the scoped count
         // grew from 1 to 1 + 19 real `Editor*` bindings (a fix round added `EditorSaveAnyway`,
         // the real escape hatch for a permanently-stuck `AdeApp::file_external_conflict`). A
         // later fix round changed `]`'s own registered predicate from `Some("diff")` to

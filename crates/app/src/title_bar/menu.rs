@@ -1,4 +1,4 @@
-//! The Windows/Linux title bar's five real `File Edit View Session Help` dropdowns -
+//! The Windows/Linux title bar's five real `File Edit View Agent Help` dropdowns -
 //! which rows each one offers, and which already-existing real `AdeApp` method every row
 //! calls. Split out of [`super::render`] (the band's own chrome) because the two answer
 //! genuinely different questions: "what does the title bar look like" versus "what can I
@@ -9,7 +9,7 @@ use super::*;
 use crate::root::focus::palette_focus_tests;
 use crate::work_surface::render::render_dropdown_menu_row;
 
-/// The Windows/Linux title bar's five real menu dropdowns (`File Edit View Session Help`) - see
+/// The Windows/Linux title bar's five real menu dropdowns (`File Edit View Agent Help`) - see
 /// [`Self::label`] for each one's real display text and [`render_title_menu`] for what each now
 /// genuinely opens. [`Self::index`] keeps this in lockstep with [`AdeApp::title_menu_button_bounds`],
 /// which is captured in [`Self::ALL`]'s own order.
@@ -21,7 +21,7 @@ use crate::work_surface::render::render_dropdown_menu_row;
 /// hover-only labels with no `cursor_pointer()`/`on_click()` - a deliberate choice over a
 /// dropdown that looked openable but showed nothing. Every row in every one of these five real
 /// dropdowns now calls a real, already-existing `AdeApp` method (the same ones the tab strip's
-/// `+` menu, the command palette, and the session footer already call) - never a placeholder row
+/// `+` menu, the command palette, and the agent footer already call) - never a placeholder row
 /// that only closes the menu.
 ///
 /// ## One source of truth, not two parallel arrays
@@ -35,7 +35,7 @@ pub(crate) enum TitleMenu {
     File,
     Edit,
     View,
-    Session,
+    Agent,
     Help,
 }
 
@@ -44,7 +44,7 @@ impl TitleMenu {
         TitleMenu::File,
         TitleMenu::Edit,
         TitleMenu::View,
-        TitleMenu::Session,
+        TitleMenu::Agent,
         TitleMenu::Help,
     ];
 
@@ -53,7 +53,7 @@ impl TitleMenu {
             TitleMenu::File => 0,
             TitleMenu::Edit => 1,
             TitleMenu::View => 2,
-            TitleMenu::Session => 3,
+            TitleMenu::Agent => 3,
             TitleMenu::Help => 4,
         }
     }
@@ -64,7 +64,7 @@ impl TitleMenu {
             TitleMenu::File => "File",
             TitleMenu::Edit => "Edit",
             TitleMenu::View => "View",
-            TitleMenu::Session => "Session",
+            TitleMenu::Agent => "Agent",
             TitleMenu::Help => "Help",
         }
     }
@@ -92,7 +92,7 @@ impl AdeApp {
     /// This menu is mouse-only - clicking a [`TitleMenu::label`] is the only way to open it, and
     /// there is no `gpui::KeyBinding` for it in `crate::default_key_bindings`. That's a
     /// deliberate scope decision: this project has repeatedly hit real, live-reproduced bugs
-    /// where a *global* keybinding stole a keystroke a focused terminal/agent session needed
+    /// where a *global* keybinding stole a keystroke a focused terminal/agent needed
     /// (`crate::default_key_bindings`'s own docs cover several it scoped away from this exact
     /// way - unscoped `"]"`, unscoped `secondary-z` - and one, `secondary-p`, it ultimately
     /// accepted stealing anyway as a deliberate, discussed tradeoff). A title-bar menu has no
@@ -112,7 +112,7 @@ impl AdeApp {
             TitleMenu::File => self.file_menu_rows(macos, cx),
             TitleMenu::Edit => self.edit_menu_rows(macos, cx),
             TitleMenu::View => self.view_menu_rows(cx),
-            TitleMenu::Session => self.session_menu_rows(macos, cx),
+            TitleMenu::Agent => self.agent_menu_rows(macos, cx),
             TitleMenu::Help => self.help_menu_rows(cx),
         };
 
@@ -470,30 +470,30 @@ impl AdeApp {
         rows
     }
 
-    /// The Session menu: spawn a terminal or agent pane (the same two real actions the `+`
-    /// menu's own top two rows call), cycle the active session tab
-    /// ([`crate::work_surface::render::AdeApp::select_relative_session`]), and the real,
-    /// per-active-session worktree-history actions - archive, "Keep all changes", and "Discard
+    /// The Agent menu: spawn a terminal or agent pane (the same two real actions the `+`
+    /// menu's own top two rows call), cycle the active agent tab
+    /// ([`crate::work_surface::render::AdeApp::select_relative_agent`]), and the real,
+    /// per-active-agent worktree-history actions - archive, "Keep all changes", and "Discard
     /// worktree". The last two reuse the exact same real methods
     /// ([`crate::worktree_history::flow::AdeApp::keep_all_changes`]/`request_discard_worktree`)
     /// and the same busy/two-click-confirm state
-    /// ([`AdeApp::worktree_history_op_in_flight`]/[`AdeApp::discard_confirm_armed`]) the session
+    /// ([`AdeApp::worktree_history_op_in_flight`]/[`AdeApp::discard_confirm_armed`]) the agent
     /// footer's own buttons already use - a first click on "Discard worktree" only arms
     /// confirmation and deliberately does **not** close the menu (so the row's own label can
     /// swap to "confirm discard?" for a real second click); every other row closes the menu on
     /// click, matching the `+` menu's own convention.
-    fn session_menu_rows(&self, macos: bool, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+    fn agent_menu_rows(&self, macos: bool, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let resolved_kind = self.resolved_new_agent_kind();
         let (agent_fg, agent_bg) = work_surface::agent_tint(resolved_kind);
         let agent_initial = work_surface::agent_initial(resolved_kind);
         let agent_label = resolved_kind.label();
-        // Scoped to the *currently selected worktree*'s own sessions, matching
-        // `AdeApp::select_relative_session`'s own real cycling scope (see that method's docs) -
+        // Scoped to the *currently selected worktree*'s own agents, matching
+        // `AdeApp::select_relative_agent`'s own real cycling scope (see that method's docs) -
         // otherwise this row could show "enabled" while the real cycle it drives is a genuine
         // no-op (or worse, silently jumps to a different worktree) whenever other worktrees have
-        // sessions open but this one doesn't have a second one of its own.
-        let can_cycle = self.current_worktree_sessions().count() > 1;
-        let active_id = self.sessions.active_id();
+        // agents open but this one doesn't have a second one of its own.
+        let can_cycle = self.current_worktree_agents().count() > 1;
+        let active_id = self.agents.active_id();
 
         let mut rows = vec![
             render_dropdown_menu_row(
@@ -541,21 +541,21 @@ impl AdeApp {
                 if can_cycle {
                     row = row.on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                         this.title_menu_open = None;
-                        this.select_relative_session($delta, window, cx);
+                        this.select_relative_agent($delta, window, cx);
                     }));
                 }
                 rows.push(row.into_any_element());
             }};
         }
-        cyclic_row!("\u{203a}", "Next Session", 1isize);
-        cyclic_row!("\u{2039}", "Previous Session", -1isize);
+        cyclic_row!("\u{203a}", "Next Agent", 1isize);
+        cyclic_row!("\u{2039}", "Previous Agent", -1isize);
         rows.push(Self::render_title_menu_divider());
 
         let mut archive_row = render_dropdown_menu_row(
             "A",
             theme::text::DIM.into(),
             theme::surface::CHIP_NEUTRAL.into(),
-            "Archive Session",
+            "Archive Agent",
             "close the active tab".to_string(),
             Vec::new(),
             active_id.is_some(),
@@ -564,7 +564,7 @@ impl AdeApp {
             archive_row =
                 archive_row.on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                     this.title_menu_open = None;
-                    this.archive_session(id, window, cx);
+                    this.archive_agent(id, window, cx);
                 }));
         }
         rows.push(archive_row.into_any_element());
@@ -624,7 +624,7 @@ impl AdeApp {
                         // The first click only arms confirmation
                         // (`AdeApp::discard_confirm_armed`) - keep the menu open so this row's
                         // own label can swap to "confirm discard?" for a real second click,
-                        // mirroring the session footer's identical two-step button
+                        // mirroring the agent footer's identical two-step button
                         // (`crate::work_surface::render::AdeApp::render_footer_action_button`).
                         // Only the second click - which actually executes and clears the arm
                         // flag - closes the menu.
@@ -700,7 +700,7 @@ impl AdeApp {
     }
 }
 
-/// Real, interactive coverage for the five File/Edit/View/Session/Help dropdowns
+/// Real, interactive coverage for the five File/Edit/View/Agent/Help dropdowns
 /// ([`render_title_menu`]) - opening each via a genuine simulated click on its own painted label
 /// (not just flipping [`AdeApp::title_menu_open`] directly), and clicking a representative real
 /// row from each menu, asserting the real effect that row's own doc comment promises actually
@@ -999,10 +999,10 @@ mod title_menu_tests {
     }
 
     #[gpui::test]
-    fn clicking_the_session_label_opens_the_real_session_menu(cx: &mut TestAppContext) {
+    fn clicking_the_agent_label_opens_the_real_agent_menu(cx: &mut TestAppContext) {
         let (app, cx) = open_windows_variant(cx);
         let bounds = app.read_with(cx, |app, _| {
-            app.title_menu_button_bounds[TitleMenu::Session.index()]
+            app.title_menu_button_bounds[TitleMenu::Agent.index()]
         });
 
         cx.simulate_click(center_of(bounds), gpui::Modifiers::none());
@@ -1010,24 +1010,24 @@ mod title_menu_tests {
 
         assert_eq!(
             app.read_with(cx, |app, _| app.title_menu_open),
-            Some(TitleMenu::Session)
+            Some(TitleMenu::Agent)
         );
     }
 
-    /// The Session menu's first row ("New Terminal") really spawns a new real session tab (the
-    /// same real `Sessions::spawn` call the tab strip's own `+` menu row and `secondary-n` use),
-    /// not just a decoration - the session count genuinely increases.
+    /// The Agent menu's first row ("New Terminal") really spawns a new real agent tab (the
+    /// same real `Agents::spawn` call the tab strip's own `+` menu row and `secondary-n` use),
+    /// not just a decoration - the agent count genuinely increases.
     #[gpui::test]
-    fn session_menu_new_terminal_row_spawns_a_real_session(cx: &mut TestAppContext) {
+    fn agent_menu_new_terminal_row_spawns_a_real_agent(cx: &mut TestAppContext) {
         let (app, cx) = open_windows_variant(cx);
-        let sessions_before = app.read_with(cx, |app, _| app.sessions.iter().count());
+        let agents_before = app.read_with(cx, |app, _| app.agents.iter().count());
         app.update(cx, |app, cx| {
-            app.title_menu_open = Some(TitleMenu::Session);
+            app.title_menu_open = Some(TitleMenu::Agent);
             cx.notify();
         });
         cx.run_until_parked();
         let bounds = app.read_with(cx, |app, _| {
-            app.title_menu_button_bounds[TitleMenu::Session.index()]
+            app.title_menu_button_bounds[TitleMenu::Agent.index()]
         });
 
         cx.simulate_click(first_row_click_point(bounds), gpui::Modifiers::none());
@@ -1035,9 +1035,9 @@ mod title_menu_tests {
 
         app.read_with(cx, |app, _| {
             assert_eq!(
-                app.sessions.iter().count(),
-                sessions_before + 1,
-                "the real New Terminal row should have spawned one real new session"
+                app.agents.iter().count(),
+                agents_before + 1,
+                "the real New Terminal row should have spawned one real new agent"
             );
             assert_eq!(app.title_menu_open, None);
         });
@@ -1104,7 +1104,7 @@ mod title_menu_tests {
         );
     }
 
-    /// The Session menu's "Discard worktree" row's real two-step confirm - mirrors the session
+    /// The Agent menu's "Discard worktree" row's real two-step confirm - mirrors the agent
     /// footer's own identical two-click button
     /// (`crate::work_surface::render::AdeApp::render_footer_action_button`), reusing the
     /// exact same real [`AdeApp::request_discard_worktree`]/[`AdeApp::discard_confirm_armed`]
@@ -1113,7 +1113,7 @@ mod title_menu_tests {
     /// unconditionally refuses on the main worktree), so this sets one up the same way
     /// `crate::worktree_history::flow::worktree_history_regression_tests::add_worktree` does.
     #[gpui::test]
-    fn session_menu_discard_row_arms_then_executes_a_real_discard(cx: &mut TestAppContext) {
+    fn agent_menu_discard_row_arms_then_executes_a_real_discard(cx: &mut TestAppContext) {
         use std::process::Command;
 
         fn git(dir: &std::path::Path, args: &[&str]) {
@@ -1153,8 +1153,8 @@ mod title_menu_tests {
             app.set_window_controls_style(WindowControlsStyle::WindowsLinuxStyle, cx);
         });
         let id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+            app.agents.spawn(
+                AgentKind::Shell,
                 worktree_path.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
@@ -1162,11 +1162,11 @@ mod title_menu_tests {
             )
         });
         app.update_in(cx, |app, window, cx| {
-            app.select_session(id, window, cx);
+            app.select_agent(id, window, cx);
         });
         cx.run_until_parked();
 
-        // Session>Discard worktree is the last row - two dividers and three earlier rows above
+        // Agent>Discard worktree is the last row - two dividers and three earlier rows above
         // it, so this drives the real handler directly (`request_discard_worktree`) rather than
         // computing that row's exact pixel offset. What's under real test here is the *result*
         // of two real calls through the exact same real method the row's `on_click` calls - the
@@ -1215,7 +1215,7 @@ mod title_menu_tests {
     /// never actually catch a bug in the real rendered row's own click wiring (e.g. a wrong
     /// bounds computation, or the row silently missing its `on_click` entirely).
     #[gpui::test]
-    fn session_menu_discard_row_stays_open_while_armed_and_closes_once_confirmed(
+    fn agent_menu_discard_row_stays_open_while_armed_and_closes_once_confirmed(
         cx: &mut TestAppContext,
     ) {
         use std::process::Command;
@@ -1257,8 +1257,8 @@ mod title_menu_tests {
             app.set_window_controls_style(WindowControlsStyle::WindowsLinuxStyle, cx);
         });
         let id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+            app.agents.spawn(
+                AgentKind::Shell,
                 worktree_path.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
@@ -1266,21 +1266,21 @@ mod title_menu_tests {
             )
         });
         app.update_in(cx, |app, window, cx| {
-            app.select_session(id, window, cx);
+            app.select_agent(id, window, cx);
         });
         cx.run_until_parked();
         app.update(cx, |app, cx| {
-            app.title_menu_open = Some(TitleMenu::Session);
+            app.title_menu_open = Some(TitleMenu::Agent);
             cx.notify();
         });
         cx.run_until_parked();
 
-        // The Discard row is the 7th real row (index 6, 0-based) in the Session menu: New
-        // Terminal, New Agent Pane, [divider], Next Session, Previous Session, [divider],
-        // Archive Session, Keep All Changes, Discard Worktree - six real rows and two dividers
-        // sit above it (see `AdeApp::session_menu_rows`'s own row order).
+        // The Discard row is the 7th real row (index 6, 0-based) in the Agent menu: New
+        // Terminal, New Agent Pane, [divider], Next Agent, Previous Agent, [divider],
+        // Archive Agent, Keep All Changes, Discard Worktree - six real rows and two dividers
+        // sit above it (see `AdeApp::agent_menu_rows`'s own row order).
         let bounds = app.read_with(cx, |app, _| {
-            app.title_menu_button_bounds[TitleMenu::Session.index()]
+            app.title_menu_button_bounds[TitleMenu::Agent.index()]
         });
         let discard_row_point = nth_row_click_point(bounds, 6, 2);
 
@@ -1294,7 +1294,7 @@ mod title_menu_tests {
         );
         assert_eq!(
             app.read_with(cx, |app, _| app.title_menu_open),
-            Some(TitleMenu::Session),
+            Some(TitleMenu::Agent),
             "an arming first click must leave the menu open"
         );
         assert!(
@@ -1323,27 +1323,25 @@ mod title_menu_tests {
         );
     }
 
-    /// [`crate::work_surface::render::AdeApp::select_relative_session`] (the Session menu's
-    /// "Next Session"/"Previous Session" rows) - real coverage of the cyclic-index logic itself:
-    /// cycling forward through three real sessions wraps back to the first, and cycling backward
-    /// from the first wraps to the last, via the same real [`AdeApp::select_session`] every
+    /// [`crate::work_surface::render::AdeApp::select_relative_agent`] (the Agent menu's
+    /// "Next Agent"/"Previous Agent" rows) - real coverage of the cyclic-index logic itself:
+    /// cycling forward through three real agents wraps back to the first, and cycling backward
+    /// from the first wraps to the last, via the same real [`AdeApp::select_agent`] every
     /// tab-strip click already goes through.
     ///
     /// Also real, live-reproduced coverage for this revision's own self-audit finding: an
-    /// earlier version of `select_relative_session` cycled the flat `self.sessions` list
-    /// directly rather than [`AdeApp::current_worktree_sessions`], so "Next Session" could jump
-    /// to a *different* worktree's session entirely - which `AdeApp::select_session` then
+    /// earlier version of `select_relative_agent` cycled the flat `self.agents` list
+    /// directly rather than [`AdeApp::current_worktree_agents`], so "Next Agent" could jump
+    /// to a *different* worktree's agent entirely - which `AdeApp::select_agent` then
     /// silently promotes into a full `AdeApp::select_worktree` switch, discarding any unsaved
-    /// `edit_buffers` content for the worktree just left. Spawning every test session into the
+    /// `edit_buffers` content for the worktree just left. Spawning every test agent into the
     /// *same* worktree (as an earlier version of this test did) can't distinguish that bug from
-    /// correct behaviour at all - this seeds a **second** worktree with its own session
+    /// correct behaviour at all - this seeds a **second** worktree with its own agent
     /// alongside the three under test, and asserts cycling never leaves the first worktree
     /// (`AdeApp::selected` stays put) and never clears a real unsaved edit sitting in
     /// `AdeApp::edit_buffers`.
     #[gpui::test]
-    fn select_relative_session_cycles_through_real_sessions_and_wraps_around(
-        cx: &mut TestAppContext,
-    ) {
+    fn select_relative_agent_cycles_through_real_agents_and_wraps_around(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let other_wt = tempfile::tempdir().expect("tempdir b");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
@@ -1372,38 +1370,38 @@ mod title_menu_tests {
             app.select_worktree(0, window, cx);
         });
 
-        // `open_test_app` already spawns one real shell session in the first worktree; add two
-        // more real sessions there so there are three to cycle through.
+        // `open_test_app` already spawns one real shell agent in the first worktree; add two
+        // more real agents there so there are three to cycle through.
         app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+            app.agents.spawn(
+                AgentKind::Shell,
                 repo.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
                 window,
                 cx,
             );
-            app.sessions.spawn(
-                SessionKind::Shell,
+            app.agents.spawn(
+                AgentKind::Shell,
                 repo.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
                 window,
                 cx,
             );
         });
-        // The second worktree's own session - real coverage that cycling stays scoped to the
+        // The second worktree's own agent - real coverage that cycling stays scoped to the
         // selected worktree rather than this flat list.
         app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+            app.agents.spawn(
+                AgentKind::Shell,
                 other_wt.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
                 window,
                 cx,
             );
         });
-        // Spawning into the second worktree above made its own session globally active - re-
+        // Spawning into the second worktree above made its own agent globally active - re-
         // select the first worktree to restore it as the one under test (its own last-active tab
-        // via `Sessions::activate_for_worktree`).
+        // via `Agents::activate_for_worktree`).
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
         });
@@ -1426,27 +1424,27 @@ mod title_menu_tests {
             );
         });
 
-        let ids: Vec<SessionId> = app.read_with(cx, |app, _| {
-            app.current_worktree_sessions().map(|s| s.id).collect()
+        let ids: Vec<AgentId> = app.read_with(cx, |app, _| {
+            app.current_worktree_agents().map(|s| s.id).collect()
         });
         assert_eq!(
             ids.len(),
             3,
-            "should have three real sessions in the first worktree to cycle through"
+            "should have three real agents in the first worktree to cycle through"
         );
         assert_eq!(
-            app.read_with(cx, |app, _| app.sessions.active_id()),
+            app.read_with(cx, |app, _| app.agents.active_id()),
             Some(ids[2]),
             "re-selecting the first worktree should restore its own last-active tab"
         );
 
         app.update_in(cx, |app, window, cx| {
-            app.select_relative_session(1, window, cx);
+            app.select_relative_agent(1, window, cx);
         });
         assert_eq!(
-            app.read_with(cx, |app, _| app.sessions.active_id()),
+            app.read_with(cx, |app, _| app.agents.active_id()),
             Some(ids[0]),
-            "cycling forward from the last real session should wrap around to the first"
+            "cycling forward from the last real agent should wrap around to the first"
         );
         assert_eq!(
             app.read_with(cx, |app, _| app.selected),
@@ -1455,12 +1453,12 @@ mod title_menu_tests {
         );
 
         app.update_in(cx, |app, window, cx| {
-            app.select_relative_session(-1, window, cx);
+            app.select_relative_agent(-1, window, cx);
         });
         assert_eq!(
-            app.read_with(cx, |app, _| app.sessions.active_id()),
+            app.read_with(cx, |app, _| app.agents.active_id()),
             Some(ids[2]),
-            "cycling backward from the first real session should wrap around to the last"
+            "cycling backward from the first real agent should wrap around to the last"
         );
         assert_eq!(
             app.read_with(cx, |app, _| app.selected),

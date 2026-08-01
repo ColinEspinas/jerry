@@ -3,7 +3,7 @@ use super::*;
 use crate::root::focus::palette_focus_tests;
 
 impl AdeApp {
-    /// Cleanup for [`Self::close_session`] closing the session whose `Merge` click started
+    /// Cleanup for [`Self::close_agent`] closing the agent whose `Merge` click started
     /// [`Self::merge_flow`]. If a merge is still in progress in the base worktree at that
     /// moment (`Clean`/`Conflicted`, or an `Error` with `abortable_worktree`), this aborts it
     /// (`wt_core::merge::abort_merge`) rather than leaving the repository mid-merge with no UI
@@ -11,7 +11,7 @@ impl AdeApp {
     ///
     /// A `Running` attempt (the `git merge` child process itself) can't be cancelled from here -
     /// there is no cancellation token threaded through it. Clearing `merge_flow` regardless is
-    /// still correct: [`Self::start_merge`]'s completion handler guards on `session_id` still
+    /// still correct: [`Self::start_merge`]'s completion handler guards on `agent_id` still
     /// matching, so a `Running` attempt that finishes after this point is a no-op there. If it
     /// left a `MERGE_HEAD` behind, the next `Merge` click hits a git failure and
     /// [`run_merge_attempt`]'s `find_in_progress_merge` fallback surfaces `Abort merge` for it
@@ -23,7 +23,7 @@ impl AdeApp {
     /// their shared [`Self::_merge_task`] slot here would drop (cancel) their in-flight
     /// operation. See [`Self::_merge_cleanup_task`]'s docs for why this method's own
     /// best-effort abort uses a separate field instead.
-    pub(crate) fn clear_merge_flow_for_closed_session(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn clear_merge_flow_for_closed_agent(&mut self, cx: &mut Context<Self>) {
         let Some(flow) = self.merge_flow.take() else {
             return;
         };
@@ -31,7 +31,7 @@ impl AdeApp {
         // unconditionally taken above, regardless of `merge_op_in_flight` below - only the
         // best-effort abort *spawn* further down is skipped while an in-flight
         // complete/abort owns the outcome instead) - see `Self::clear_merge_edit_state`'s own
-        // docs. The session tab (and thus any UI that could show this hand-edit) is genuinely
+        // docs. The agent tab (and thus any UI that could show this hand-edit) is genuinely
         // gone either way, so this always runs.
         self.clear_merge_edit_state();
         if self.merge_op_in_flight {
@@ -53,7 +53,7 @@ impl AdeApp {
             return;
         };
         let task = cx.spawn(async move |_this, cx| {
-            // Fire-and-forget: the session tab is already gone, so there's no UI left to
+            // Fire-and-forget: the agent tab is already gone, so there's no UI left to
             // report a failure to. Best-effort is the honest ceiling here - on failure the
             // repository is left in whatever state `git merge --abort` left it in,
             // inspectable/recoverable via a terminal.
@@ -71,26 +71,26 @@ impl AdeApp {
     /// spawned `git merge` child process - see that function's own docs).
     ///
     /// Only one merge flow is tracked at a time; a click while one is already in progress for
-    /// any session is a no-op, since two concurrent `git merge` invocations would race over the
+    /// any agent is a no-op, since two concurrent `git merge` invocations would race over the
     /// same base worktree.
-    pub(crate) fn start_merge(&mut self, id: SessionId, cx: &mut Context<Self>) {
+    pub(crate) fn start_merge(&mut self, id: AgentId, cx: &mut Context<Self>) {
         if self.merge_flow.is_some() {
             return;
         }
-        let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
+        let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
             return;
         };
         let repo_path = self.focused_repo_path();
-        let worktree_path = session.cwd.clone();
+        let worktree_path = agent.cwd.clone();
         // A fresh attempt, even one reusing `id` (e.g. Abort then immediately Merge again on the
-        // same session tab) - see `merge::MergeFlow::generation`'s own docs. Any hand-edit from a
+        // same agent tab) - see `merge::MergeFlow::generation`'s own docs. Any hand-edit from a
         // *previous* attempt is unconditionally gone the moment a new one starts, since its
         // `files[]`/hunk indices belong to an attempt that no longer exists.
         self.merge_generation = self.merge_generation.wrapping_add(1);
         let generation = self.merge_generation;
         self.clear_merge_edit_state();
         self.merge_flow = Some(merge::MergeFlow {
-            session_id: id,
+            agent_id: id,
             generation,
             state: merge::MergeFlowState::Running,
         });
@@ -104,9 +104,9 @@ impl AdeApp {
                 .spawn(async move { run_merge_attempt(&repo_path, &worktree_path) })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.merge_flow.as_ref().map(|flow| flow.session_id) == Some(id) {
+                if this.merge_flow.as_ref().map(|flow| flow.agent_id) == Some(id) {
                     this.merge_flow = Some(merge::MergeFlow {
-                        session_id: id,
+                        agent_id: id,
                         generation,
                         state,
                     });
@@ -169,10 +169,10 @@ impl AdeApp {
             *active_file = next_file;
             *active_hunk = next_hunk;
         }
-        // `session_id`/`generation` (plain `Copy` values) read out now, while `flow` (borrowed
+        // `agent_id`/`generation` (plain `Copy` values) read out now, while `flow` (borrowed
         // from `self.merge_flow`) is still alive - `flow`/`files`/`active_file`/`active_hunk` are
         // not used again past this point, so this is the last real use of that borrow.
-        let session_id = flow.session_id;
+        let agent_id = flow.agent_id;
         let generation = flow.generation;
         cx.notify();
         // The real state-transition point the newly-active hunk (if the advance above landed on
@@ -200,12 +200,12 @@ impl AdeApp {
             let _ = this.update(cx, |this, cx| {
                 if let Err(err) = result {
                     // Real defense in depth (see `merge::MergeFlow::generation`'s own docs): a
-                    // bare `session_id` match alone can't tell "this write's own attempt is still
-                    // the live one" apart from "the same session started a *fresh* attempt while
-                    // this write was still in flight" - both share `session_id`, only the newer
+                    // bare `agent_id` match alone can't tell "this write's own attempt is still
+                    // the live one" apart from "the same agent started a *fresh* attempt while
+                    // this write was still in flight" - both share `agent_id`, only the newer
                     // one shares `generation` too.
                     let still_current = this.merge_flow.as_ref().is_some_and(|flow| {
-                        flow.session_id == session_id && flow.generation == generation
+                        flow.agent_id == agent_id && flow.generation == generation
                     });
                     if still_current {
                         // Re-check MERGE_HEAD so `Abort merge` stays offered rather than
@@ -240,12 +240,12 @@ impl AdeApp {
     /// second click while the first is still in flight (e.g. a fast Abort-right-after-Complete)
     /// would otherwise spawn a second git operation, overwriting [`Self::_merge_task`] and
     /// dropping the first one's completion handler mid-commit.
-    /// [`Self::clear_merge_flow_for_closed_session`] respects the same flag so closing the
-    /// session mid-commit can't cancel this operation either.
+    /// [`Self::clear_merge_flow_for_closed_agent`] respects the same flag so closing the
+    /// agent mid-commit can't cancel this operation either.
     ///
     /// The success arm only clears [`Self::merge_flow`] when it still belongs to this
-    /// `session_id`, matching the error arm below it: a session close no longer blocks this
-    /// commit from running to completion, so a merge for a *different* session could
+    /// `agent_id`, matching the error arm below it: an agent close no longer blocks this
+    /// commit from running to completion, so a merge for a *different* agent could
     /// legitimately be in `merge_flow` by the time this closure runs.
     pub(in crate::merge) fn complete_merge_flow(&mut self, cx: &mut Context<Self>) {
         self.prune_confirm_armed = false;
@@ -269,7 +269,7 @@ impl AdeApp {
         };
         self.merge_op_in_flight = true;
         cx.notify();
-        let session_id = flow.session_id;
+        let agent_id = flow.agent_id;
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -279,8 +279,7 @@ impl AdeApp {
                 this.merge_op_in_flight = false;
                 match result {
                     Ok(()) => {
-                        if this.merge_flow.as_ref().map(|flow| flow.session_id) == Some(session_id)
-                        {
+                        if this.merge_flow.as_ref().map(|flow| flow.agent_id) == Some(agent_id) {
                             this.merge_flow = None;
                             this.clear_merge_edit_state();
                         }
@@ -289,8 +288,7 @@ impl AdeApp {
                         this.load_diff(repo_path, cx);
                     }
                     Err(err) => {
-                        if this.merge_flow.as_ref().map(|flow| flow.session_id) == Some(session_id)
-                        {
+                        if this.merge_flow.as_ref().map(|flow| flow.agent_id) == Some(agent_id) {
                             // MERGE_HEAD is still present when `complete_merge`'s defense in
                             // depth is what failed, so `Abort merge` stays offered.
                             let abortable_worktree =
@@ -352,7 +350,7 @@ impl AdeApp {
         };
         self.merge_op_in_flight = true;
         cx.notify();
-        let session_id = flow.session_id;
+        let agent_id = flow.agent_id;
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -360,7 +358,7 @@ impl AdeApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.merge_op_in_flight = false;
-                if this.merge_flow.as_ref().map(|flow| flow.session_id) == Some(session_id) {
+                if this.merge_flow.as_ref().map(|flow| flow.agent_id) == Some(agent_id) {
                     match result {
                         Ok(()) => {
                             this.merge_flow = None;
@@ -404,11 +402,11 @@ impl AdeApp {
     /// Real teardown for [`Self::merge_edit`] - clears the hand-edit slot itself. Does not, and
     /// need not, cancel [`Self::_merge_edit_save_task`] if a save happens to be in flight at the
     /// moment this runs: that background task's own completion handler
-    /// ([`Self::apply_merge_edit_save_result`]) independently re-checks `(session_id,
+    /// ([`Self::apply_merge_edit_save_result`]) independently re-checks `(agent_id,
     /// generation, relative_path)` before applying anything, so a stale completion after this
     /// call is already a safe no-op - the same "identify, don't cancel" discipline
     /// [`Self::_merge_write_tasks`] already establishes for the quick-pick resolution path (see
-    /// [`Self::clear_merge_flow_for_closed_session`]'s own docs for why that path doesn't reach
+    /// [`Self::clear_merge_flow_for_closed_agent`]'s own docs for why that path doesn't reach
     /// into its own task pool either).
     pub(in crate::merge) fn clear_merge_edit_state(&mut self) {
         self.merge_edit = None;
@@ -428,7 +426,7 @@ impl AdeApp {
             return;
         };
         let still_active = self.merge_flow.as_ref().is_some_and(|flow| {
-            flow.session_id == edit.session_id
+            flow.agent_id == edit.agent_id
                 && flow.generation == edit.generation
                 && matches!(
                     &flow.state,
@@ -501,7 +499,7 @@ impl AdeApp {
         // `merge::MergeEditState::buffer_id`'s own docs for the real race this closes.
         self.merge_edit_buffer_id = self.merge_edit_buffer_id.wrapping_add(1);
         self.merge_edit = Some(merge::MergeEditState {
-            session_id: flow.session_id,
+            agent_id: flow.agent_id,
             generation: flow.generation,
             buffer_id: self.merge_edit_buffer_id,
             base_worktree_path,
@@ -573,7 +571,7 @@ impl AdeApp {
                     this.merge_edit_save_pending = false;
                     match this.merge_edit.as_ref() {
                         Some(edit) => Some((
-                            edit.session_id,
+                            edit.agent_id,
                             edit.generation,
                             edit.buffer_id,
                             edit.base_worktree_path.clone(),
@@ -592,7 +590,7 @@ impl AdeApp {
                     }
                 });
                 let Ok(Some((
-                    session_id,
+                    agent_id,
                     generation,
                     buffer_id,
                     base_worktree_path,
@@ -697,11 +695,11 @@ impl AdeApp {
                             // superseded, while this write was in flight must not resurrect
                             // `Self::merge_edit` or silently apply to the wrong attempt's/
                             // buffer's state. `buffer_id` is load-bearing on top of
-                            // `session_id`/`generation`/`relative_path`: a discard followed by an
+                            // `agent_id`/`generation`/`relative_path`: a discard followed by an
                             // immediate re-open of hand-edit mode for the *same* file keeps all
                             // three of those identical but seeds a genuinely new `EditBuffer`.
                             let still_current = this.merge_edit.as_ref().is_some_and(|edit| {
-                                edit.session_id == session_id
+                                edit.agent_id == agent_id
                                     && edit.generation == generation
                                     && edit.buffer_id == buffer_id
                                     && edit.relative_path == relative_path
@@ -722,7 +720,7 @@ impl AdeApp {
                                             )
                                         });
                                         this.apply_merge_edit_save_result(
-                                            session_id,
+                                            agent_id,
                                             generation,
                                             relative_path,
                                             fresh,
@@ -742,7 +740,7 @@ impl AdeApp {
                         }
                         Err(err) => {
                             if this.merge_edit.as_ref().is_some_and(|edit| {
-                                edit.session_id == session_id
+                                edit.agent_id == agent_id
                                     && edit.generation == generation
                                     && edit.buffer_id == buffer_id
                             }) {
@@ -762,14 +760,14 @@ impl AdeApp {
     /// matched by path), recomputes `active_file`/`active_hunk`
     /// ([`crate::merge::state::first_unresolved`]), and refreshes the highlight cache - the real
     /// state-transition point mirroring [`Self::resolve_active_hunk`]'s own identical sequence
-    /// for the quick-pick path. Only applies anything if `session_id`/`generation` still match
+    /// for the quick-pick path. Only applies anything if `agent_id`/`generation` still match
     /// the live flow - see [`Self::spawn_merge_edit_save_loop`]'s own docs for why the caller
     /// already re-checked this once (for [`Self::merge_edit`] itself) before calling here; this
     /// method independently re-checks against [`Self::merge_flow`] too, since those are two
     /// different pieces of state that could in principle have diverged.
     fn apply_merge_edit_save_result(
         &mut self,
-        session_id: SessionId,
+        agent_id: AgentId,
         generation: u64,
         relative_path: PathBuf,
         fresh: wt_core::merge::ConflictedFile,
@@ -777,7 +775,7 @@ impl AdeApp {
         let Some(flow) = self.merge_flow.as_mut() else {
             return;
         };
-        if flow.session_id != session_id || flow.generation != generation {
+        if flow.agent_id != agent_id || flow.generation != generation {
             return;
         }
         let merge::MergeFlowState::Conflicted {
@@ -995,13 +993,11 @@ mod merge_regression_tests {
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
     }
 
-    /// Regression test: closing/archiving the session mid-`Complete merge` must not cancel the
+    /// Regression test: closing/archiving the agent mid-`Complete merge` must not cancel the
     /// in-flight `git commit` or strand `merge_op_in_flight` at `true` - see
-    /// `AdeApp::clear_merge_flow_for_closed_session`'s docs for the mechanism this guards.
+    /// `AdeApp::clear_merge_flow_for_closed_agent`'s docs for the mechanism this guards.
     #[gpui::test]
-    fn close_session_during_in_flight_complete_merge_lets_the_commit_finish(
-        cx: &mut TestAppContext,
-    ) {
+    fn close_agent_during_in_flight_complete_merge_lets_the_commit_finish(cx: &mut TestAppContext) {
         let repo = init_repo();
         let feature = add_worktree(repo.path(), "feature", "feature-wt");
         fs::write(feature.join("new.txt"), "from feature\n").expect("write");
@@ -1009,9 +1005,9 @@ mod merge_regression_tests {
         git(&feature, &["commit", "-m", "feature commit"]);
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let feature_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
@@ -1019,7 +1015,7 @@ mod merge_regression_tests {
             )
         });
 
-        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| {
@@ -1027,7 +1023,7 @@ mod merge_regression_tests {
                 .merge_flow
                 .as_ref()
                 .expect("merge_flow after start_merge");
-            assert_eq!(flow.session_id, feature_session_id);
+            assert_eq!(flow.agent_id, feature_agent_id);
             assert!(
                 matches!(flow.state, merge::MergeFlowState::Clean { .. }),
                 "seed setup should produce a clean (no-conflict) merge, ready for Complete"
@@ -1042,10 +1038,10 @@ mod merge_regression_tests {
             "merge_op_in_flight should be set synchronously by complete_merge_flow"
         );
 
-        // Close (archive) the session before that commit has run - the "click Complete, then
+        // Close (archive) the agent before that commit has run - the "click Complete, then
         // immediately click Archive" race.
         app.update_in(cx, |app, window, cx| {
-            app.close_session(feature_session_id, window, cx)
+            app.close_agent(feature_agent_id, window, cx)
         });
 
         // Let the pending commit and its completion handler run.
@@ -1054,7 +1050,7 @@ mod merge_regression_tests {
         assert!(
             !app.read_with(cx, |app, _| app.merge_op_in_flight),
             "merge_op_in_flight must not be permanently stranded at true - the real commit's \
-             own completion handler must still run to reset it, since closing the session must \
+             own completion handler must still run to reset it, since closing the agent must \
              not cancel that in-flight task"
         );
 
@@ -1077,7 +1073,7 @@ mod merge_regression_tests {
     /// Same setup, asserting the repository is left clean and usable: a brand-new merge started
     /// right after the close-during-complete race must succeed, not hit a wedged repo.
     #[gpui::test]
-    fn close_session_during_in_flight_complete_merge_leaves_repo_usable_for_a_new_merge(
+    fn close_agent_during_in_flight_complete_merge_leaves_repo_usable_for_a_new_merge(
         cx: &mut TestAppContext,
     ) {
         let repo = init_repo();
@@ -1087,9 +1083,9 @@ mod merge_regression_tests {
         git(&feature, &["commit", "-m", "feature commit"]);
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let feature_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
@@ -1097,11 +1093,11 @@ mod merge_regression_tests {
             )
         });
 
-        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
         cx.run_until_parked();
         app.update(cx, |app, cx| app.complete_merge_flow(cx));
         app.update_in(cx, |app, window, cx| {
-            app.close_session(feature_session_id, window, cx)
+            app.close_agent(feature_agent_id, window, cx)
         });
         cx.run_until_parked();
 
@@ -1111,23 +1107,23 @@ mod merge_regression_tests {
         git(&second_feature, &["add", "more.txt"]);
         git(&second_feature, &["commit", "-m", "second feature commit"]);
 
-        let second_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let second_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 second_feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
                 cx,
             )
         });
-        app.update(cx, |app, cx| app.start_merge(second_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(second_agent_id, cx));
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
             let flow = app
                 .merge_flow
                 .as_ref()
                 .expect("merge_flow after second start_merge");
-            assert_eq!(flow.session_id, second_session_id);
+            assert_eq!(flow.agent_id, second_agent_id);
             assert!(
                 matches!(flow.state, merge::MergeFlowState::Clean { .. }),
                 "a real, independent merge must succeed cleanly on the now-clean repo, not hit \
@@ -1170,9 +1166,9 @@ mod merge_regression_tests {
         );
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let feature_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
@@ -1180,7 +1176,7 @@ mod merge_regression_tests {
             )
         });
 
-        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| {
@@ -1281,9 +1277,9 @@ mod merge_regression_tests {
         git(&feature, &["commit", "-am", "feature changes value.rs"]);
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let feature_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
@@ -1291,7 +1287,7 @@ mod merge_regression_tests {
             )
         });
 
-        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
         cx.run_until_parked();
 
         // Hand-verified real line numbers for the conflict git produces from this fixture:
@@ -1384,16 +1380,16 @@ mod merge_regression_tests {
         git(&feature, &["commit", "-am", "feature changes value.rs"]);
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let feature_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
                 cx,
             )
         });
-        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
         cx.run_until_parked();
 
         let first_ptr = app.read_with(cx, |app, _| {
@@ -1451,16 +1447,16 @@ mod merge_regression_tests {
         );
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let feature_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
                 cx,
             )
         });
-        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
         cx.run_until_parked();
 
         let first_path = app.read_with(cx, |app, _| {
@@ -1536,9 +1532,9 @@ mod merge_regression_tests {
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
-        let feature_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
@@ -1546,7 +1542,7 @@ mod merge_regression_tests {
             )
         });
 
-        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
             let flow = app
@@ -1654,16 +1650,16 @@ mod merge_regression_tests {
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
-        let feature_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
                 cx,
             )
         });
-        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
         cx.run_until_parked();
 
         let hunk_count = app.read_with(cx, |app, _| {
@@ -1786,16 +1782,16 @@ mod merge_regression_tests {
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
-        let feature_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
                 cx,
             )
         });
-        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
             let flow = app.merge_flow.as_ref().expect("merge_flow");
@@ -1893,16 +1889,16 @@ mod merge_regression_tests {
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
-        let feature_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
                 cx,
             )
         });
-        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
         cx.run_until_parked();
         app.update_in(cx, |app, window, cx| {
             app.start_merge_hand_edit(window, cx);
@@ -1965,7 +1961,7 @@ mod merge_regression_tests {
     /// R2, R4a, R4b, R8.5a, R8.5b) - proves the new `"merge-editor"` key context does not swallow
     /// a keystroke while a *different* surface (here, the File view) is what's actually focused,
     /// even while a merge hand-edit is genuinely still alive in the background for a different
-    /// session.
+    /// agent.
     #[gpui::test]
     fn merge_editor_context_does_not_swallow_keystrokes_meant_for_a_different_focused_surface(
         cx: &mut TestAppContext,
@@ -1997,16 +1993,16 @@ mod merge_regression_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
         let notes_path = repo.path().join("notes.txt");
-        let feature_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
                 cx,
             )
         });
-        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
         cx.run_until_parked();
         app.update_in(cx, |app, window, cx| {
             app.start_merge_hand_edit(window, cx);
@@ -2137,7 +2133,7 @@ mod merge_regression_tests {
     /// flow (here, abort), must genuinely tear down [`AdeApp::merge_edit`] (not merely hide it),
     /// and a fresh, unrelated merge started afterward must neither resurrect it nor be corruptible
     /// by a stale result for the old attempt - even one carrying the old attempt's own real
-    /// `session_id`/`generation` identity, directly proving `Self::apply_merge_edit_save_result`'s
+    /// `agent_id`/`generation` identity, directly proving `Self::apply_merge_edit_save_result`'s
     /// own guard rather than relying on timing to reproduce the race.
     #[gpui::test]
     fn ending_a_merge_flow_tears_down_hand_edit_state_and_a_fresh_merge_cannot_be_polluted_by_it(
@@ -2163,25 +2159,25 @@ mod merge_regression_tests {
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
-        let feature_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
                 cx,
             )
         });
-        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
         cx.run_until_parked();
         app.update_in(cx, |app, window, cx| {
             app.start_merge_hand_edit(window, cx);
         });
         cx.run_until_parked();
-        let (stale_session_id, stale_generation, stale_relative_path) =
+        let (stale_agent_id, stale_generation, stale_relative_path) =
             app.read_with(cx, |app, _| {
                 let edit = app.merge_edit.as_ref().expect("merge_edit");
-                (edit.session_id, edit.generation, edit.relative_path.clone())
+                (edit.agent_id, edit.generation, edit.relative_path.clone())
             });
 
         // Abort the merge - a real exit point.
@@ -2216,23 +2212,23 @@ mod merge_regression_tests {
             &second_feature,
             &["commit", "-am", "second feature changes second.txt"],
         );
-        let second_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let second_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 second_feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
                 cx,
             )
         });
-        app.update(cx, |app, cx| app.start_merge(second_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(second_agent_id, cx));
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
             let flow = app
                 .merge_flow
                 .as_ref()
                 .expect("merge_flow after second start_merge");
-            assert_eq!(flow.session_id, second_session_id);
+            assert_eq!(flow.agent_id, second_agent_id);
             assert!(
                 matches!(flow.state, merge::MergeFlowState::Conflicted { .. }),
                 "the fresh, independent merge must succeed (conflicted, as this fixture \
@@ -2249,13 +2245,13 @@ mod merge_regression_tests {
         );
 
         // Direct identity-guard proof: a stale hand-edit save result carrying the *old*
-        // attempt's own real `session_id`/`generation` must be a real, verified no-op against
+        // attempt's own real `agent_id`/`generation` must be a real, verified no-op against
         // the live, fresh flow - never silently applied to it.
         let injected = wt_core::merge::load_conflicted_file(repo.path(), Path::new("shared.txt"))
             .expect("load_conflicted_file");
         app.update(cx, |app, _cx| {
             app.apply_merge_edit_save_result(
-                stale_session_id,
+                stale_agent_id,
                 stale_generation,
                 stale_relative_path,
                 injected,
@@ -2264,7 +2260,7 @@ mod merge_regression_tests {
         app.read_with(cx, |app, _| {
             let flow = app.merge_flow.as_ref().expect("merge_flow still present");
             assert_eq!(
-                flow.session_id, second_session_id,
+                flow.agent_id, second_agent_id,
                 "the stale call must not have touched the live, fresh flow's own identity"
             );
             let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
@@ -2292,7 +2288,7 @@ mod merge_regression_tests {
     /// `open_diff_file_cache` goes back to `None` with `open_change` untouched - exactly the state
     /// `crate::code_surface::tabs::AdeApp::activate_file_tab`'s own doc comment describes ("the
     /// tab can be active without being shown"). `render_center_pane` then genuinely falls through
-    /// to the session/merge surface with `open_change` still `Some` the whole time. Set directly
+    /// to the agent/merge surface with `open_change` still `Some` the whole time. Set directly
     /// here (the same established precedent `status_bar::render`'s own tests already use for this
     /// exact field pair) rather than chasing the full multi-step live path, for a deterministic
     /// reproduction of the *state* the routing bug actually depends on - what matters for this
@@ -2324,16 +2320,16 @@ mod merge_regression_tests {
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
-        let feature_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
                 cx,
             )
         });
-        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
         cx.run_until_parked();
         app.update_in(cx, |app, window, cx| {
             app.start_merge_hand_edit(window, cx);
@@ -2420,16 +2416,16 @@ mod merge_regression_tests {
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
-        let feature_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
                 cx,
             )
         });
-        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
         cx.run_until_parked();
         app.update_in(cx, |app, window, cx| {
             app.start_merge_hand_edit(window, cx);
@@ -2504,7 +2500,7 @@ mod merge_regression_tests {
     /// test-only-delay seam `AdeApp::persist_settings`'s own tests already use for the analogous
     /// settings-save race - `AdeApp::set_merge_edit_save_test_delay`): a save dispatched against
     /// one hand-edit buffer, discarded and immediately replaced by a genuinely fresh buffer for
-    /// the *same* file (same session/generation/relative_path) *before* the first save's real
+    /// the *same* file (same agent/generation/relative_path) *before* the first save's real
     /// background write lands, must not let that stale completion apply itself to the new
     /// buffer/state at all - not `EditBuffer::mark_saved` (which would wrongly stamp the new,
     /// untouched buffer as having saved the old buffer's content, corrupting its own dirty-state
@@ -2535,16 +2531,16 @@ mod merge_regression_tests {
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
-        let feature_session_id = app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 window,
                 cx,
             )
         });
-        app.update(cx, |app, cx| app.start_merge(feature_session_id, cx));
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
         cx.run_until_parked();
 
         // Buffer A: hand-edit, resolve it fully, and dispatch a save with a long artificial

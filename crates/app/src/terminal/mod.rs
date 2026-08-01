@@ -1,4 +1,4 @@
-//! Real terminal sessions: everything about one feature, in one folder.
+//! Real terminal agents: everything about one feature, in one folder.
 //!
 //! Split by what each half is responsible for, keeping the window-free parts window-free:
 //!

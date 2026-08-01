@@ -8,7 +8,7 @@ use crate::sidebar::render::RightSidebarView;
 /// `Self::build_palette_groups`'s other live-state secondaries.
 ///
 /// [`WindowControlsStyle`] is a rendering-only preview of another platform's title bar and
-/// keycap glyphs, never a rebinding of this session's globally-bound shortcuts (fixed at compile
+/// keycap glyphs, never a rebinding of this agent's globally-bound shortcuts (fixed at compile
 /// time by the real OS - see `crate::keymap`'s "cosmetic preview, not a rebinding" docs).
 /// Picking "macOS" on Linux/Windows makes every keycap render `⌘`-style while the key that
 /// actually works is still Ctrl - a deliberate tradeoff, not an oversight.
@@ -44,28 +44,28 @@ impl AdeApp {
     /// by keyboard handling ([`Self::move_palette_selection`]/[`Self::run_selected_palette_entry`]),
     /// built fresh every call so what's drawn and what `⏎`/`↑`/`↓` act on can never disagree.
     ///
-    /// `sessions`/`commands` are cheap (bounded by open-tab count plus 10 fixed commands) and
+    /// `agents`/`commands` are cheap (bounded by open-tab count plus 10 fixed commands) and
     /// built fresh here. `files` is the expensive part (as many entries as the whole loaded
     /// tree has, bounded by `Settings.file_tree.max_entries`) and is *not* rebuilt here - this reads [`Self::palette_file_candidates`], which
     /// [`Self::rebuild_palette_file_candidates`] keeps current at its own two mutation points.
     pub(crate) fn build_palette_groups(&self, cx: &App) -> Vec<palette::PaletteGroup> {
-        let sessions: Vec<palette::SessionCandidate> = self
-            .sessions
+        let agents: Vec<palette::AgentCandidate> = self
+            .agents
             .iter()
-            .map(|session| {
-                let status = self.session_status(session, cx);
+            .map(|agent| {
+                let status = self.agent_status(agent, cx);
                 let branch = self
                     .worktrees
                     .iter()
-                    .find(|item| item.path == session.cwd)
+                    .find(|item| item.path == agent.cwd)
                     .and_then(|item| item.branch.clone());
-                let title = match session.cwd.file_name() {
+                let title = match agent.cwd.file_name() {
                     Some(name) => name.to_string_lossy().into_owned(),
-                    None => session.cwd.display().to_string(),
+                    None => agent.cwd.display().to_string(),
                 };
-                palette::SessionCandidate {
-                    id: session.id,
-                    kind: session.kind,
+                palette::AgentCandidate {
+                    id: agent.id,
+                    kind: agent.kind,
                     title,
                     branch,
                     status,
@@ -73,7 +73,7 @@ impl AdeApp {
             })
             .collect();
 
-        let active_cwd = self.active_session_cwd();
+        let active_cwd = self.active_agent_cwd();
         let next_sidebar_view = match self.right_sidebar_view {
             RightSidebarView::Files => "Changes",
             RightSidebarView::Changes => "Files",
@@ -84,11 +84,11 @@ impl AdeApp {
                 secondary: format!("spawn a shell in {}", active_cwd.display()),
             },
             palette::CommandCandidate {
-                command: palette::PaletteCommand::NewClaudeSession,
+                command: palette::PaletteCommand::NewClaudeAgent,
                 secondary: format!("spawn claude in {}", active_cwd.display()),
             },
             palette::CommandCandidate {
-                command: palette::PaletteCommand::NewCodexSession,
+                command: palette::PaletteCommand::NewCodexAgent,
                 secondary: format!("spawn codex in {}", active_cwd.display()),
             },
             palette::CommandCandidate {
@@ -159,7 +159,7 @@ impl AdeApp {
         palette::build_groups(
             self.palette_scope,
             self.palette_query.as_str(),
-            &sessions,
+            &agents,
             &commands,
             &history,
             &self.palette_file_candidates,
@@ -250,13 +250,11 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         match command {
-            palette::PaletteCommand::NewShell => self.new_session(SessionKind::Shell, window, cx),
-            palette::PaletteCommand::NewClaudeSession => {
-                self.new_session(SessionKind::Claude, window, cx)
+            palette::PaletteCommand::NewShell => self.new_agent(AgentKind::Shell, window, cx),
+            palette::PaletteCommand::NewClaudeAgent => {
+                self.new_agent(AgentKind::Claude, window, cx)
             }
-            palette::PaletteCommand::NewCodexSession => {
-                self.new_session(SessionKind::Codex, window, cx)
-            }
+            palette::PaletteCommand::NewCodexAgent => self.new_agent(AgentKind::Codex, window, cx),
             palette::PaletteCommand::ToggleFilesChanges => {
                 // Any palette gesture must disarm a pending prune confirmation (see
                 // `Self::open_palette`'s docs); the other branches already do this via the
@@ -316,7 +314,7 @@ impl AdeApp {
         } else {
             self.right_sidebar_view = RightSidebarView::Files;
             // Expands every ancestor *and records those expansions on disk*, exactly like a
-            // manual click (issue #18 §5) - not a transient, this-session-only reveal.
+            // manual click (issue #18 §5) - not a transient, this-agent-only reveal.
             self.reveal_in_tree(&path, cx);
             self.selected_tree_path = Some(path);
             cx.notify();
@@ -340,7 +338,7 @@ impl AdeApp {
                 palette::EntryTarget::Command(command) => {
                     self.execute_palette_command(command, window, cx)
                 }
-                palette::EntryTarget::Session(id) => self.select_session(id, window, cx),
+                palette::EntryTarget::Agent(id) => self.select_agent(id, window, cx),
                 palette::EntryTarget::File(path) => self.open_palette_file_result(path, window, cx),
                 palette::EntryTarget::History(palette::HistoryDirection::Undo) => {
                     self.perform_undo(cx)
@@ -611,7 +609,7 @@ impl AdeApp {
                             .child(if has_query {
                                 self.palette_query.as_str().to_string()
                             } else {
-                                "Type a command, file or session\u{2026}".to_string()
+                                "Type a command, file or agent\u{2026}".to_string()
                             })
                             .debug_selector(|| "palette-query-text".to_string()),
                     )
@@ -780,9 +778,9 @@ impl AdeApp {
 
         let chip = match &entry.target {
             palette::EntryTarget::Command(_) => render_palette_command_chip().into_any_element(),
-            palette::EntryTarget::Session(_) => {
-                let kind = entry.session_kind.unwrap_or(SessionKind::Shell);
-                render_palette_session_chip(kind).into_any_element()
+            palette::EntryTarget::Agent(_) => {
+                let kind = entry.agent_kind.unwrap_or(AgentKind::Shell);
+                render_palette_agent_chip(kind).into_any_element()
             }
             palette::EntryTarget::File(path) => {
                 let name = path
@@ -792,7 +790,7 @@ impl AdeApp {
                 render_palette_file_chip(file_tree::lang_chip_for_name(&name)).into_any_element()
             }
             // History rows (Revision R10) are commands in every sense that matters to this
-            // chip (a fixed, non-file, non-session action) - reusing the same chip rather than
+            // chip (a fixed, non-file, non-agent action) - reusing the same chip rather than
             // inventing a dedicated one for two rows.
             palette::EntryTarget::History(_) => render_palette_command_chip().into_any_element(),
         };
@@ -912,7 +910,7 @@ impl AdeApp {
 }
 
 /// The palette row's 15×15 command chip - every command result gets the same generic `›` chip,
-/// since (unlike sessions/files) a command has no per-instance colour to inherit.
+/// since (unlike agents/files) a command has no per-instance colour to inherit.
 pub(in crate::palette) fn render_palette_command_chip() -> impl IntoElement {
     let (fg, bg) = theme::palette::COMMAND_CHIP;
     div()
@@ -931,10 +929,10 @@ pub(in crate::palette) fn render_palette_command_chip() -> impl IntoElement {
         .child("\u{203A}")
 }
 
-/// The palette row's 15×15 session chip - the same agent badge/tint
-/// (`crate::work_surface::state::agent_tint`/`agent_initial`) the rail's session rows use, reused
+/// The palette row's 15×15 agent chip - the same agent badge/tint
+/// (`crate::work_surface::state::agent_tint`/`agent_initial`) the rail's agent rows use, reused
 /// verbatim rather than a second, independently-drifting colour mapping.
-pub(in crate::palette) fn render_palette_session_chip(kind: SessionKind) -> impl IntoElement {
+pub(in crate::palette) fn render_palette_agent_chip(kind: AgentKind) -> impl IntoElement {
     let (fg, bg) = work_surface::agent_tint(kind);
     div()
         .flex_none()
@@ -975,7 +973,7 @@ pub(in crate::palette) fn render_palette_file_chip(chip: LangChip) -> impl IntoE
 /// A result row's matched-substring label: three adjacent spans (`pre`/`mid`/`post`), the
 /// middle one tinted with `theme::term::PROMPT` (reused rather than a separate token, since the
 /// hex value is identical - same precedent as `theme::button::GREEN_KEYCAP_FG`'s docs). `mono`
-/// selects mono for a file result, sans for a command/session result.
+/// selects mono for a file result, sans for a command/agent result.
 pub(in crate::palette) fn render_palette_label(
     matched: &palette::MatchedText,
     mono: bool,

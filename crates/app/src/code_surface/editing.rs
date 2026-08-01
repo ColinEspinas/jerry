@@ -7,7 +7,7 @@
 //!    `Window::handle_input`). Every method resolves its target buffer through
 //!    [`AdeApp::active_editable_path`]/`AdeApp::edit_buffers` and returns an honest empty/`None`
 //!    result when there's no active File-view tab or buffer for it - an input-handler call
-//!    arriving while, say, a terminal session or the read-only Diff view has focus is a safe
+//!    arriving while, say, a terminal agent or the read-only Diff view has focus is a safe
 //!    no-op, never a panic or a wrong-buffer edit (the Diff view's own dispatch path never even
 //!    gets the `"file-editor"` key context these actions are scoped to - see
 //!    `crate::code_surface::render::AdeApp::render_code_surface`'s own docs for exactly where that
@@ -89,7 +89,7 @@ const REHIGHLIGHT_DEBOUNCE: Duration = Duration::from_millis(150);
 /// `crate::code_surface::tabs::AdeApp::activate_file_tab`'s own doc comment): `open_change` can
 /// be `Some` while Surface C is *not* shown at all - a tab can be "active" (its path still in
 /// `open_change`) without a diff to show it (`open_diff_file_cache` is `None`) and `code_view`
-/// left on `Diff`, in which case `render_center_pane` falls through to the session/merge surface
+/// left on `Diff`, in which case `render_center_pane` falls through to the agent/merge surface
 /// with `open_change` still `Some` the whole time. [`AdeApp::active_edit_target`] mirrors this
 /// exact predicate (not the weaker "`open_change.is_some()`" a first version of this method used,
 /// which incorrectly treated that real, reachable state as "Surface C is showing" and silently
@@ -119,8 +119,8 @@ impl AdeApp {
 
     /// The generalized real edit target (Revision R8.5c) - see [`EditTarget`]'s own docs for the
     /// mutual-exclusivity guarantee this relies on. `Merge` only while the merge hand-edit slot
-    /// exists *and* actually belongs to the currently active session tab (a merge for a
-    /// background session tab the user has since switched away from is real, live state, but
+    /// exists *and* actually belongs to the currently active agent tab (a merge for a
+    /// background agent tab the user has since switched away from is real, live state, but
     /// genuinely not on screen right now, so it must not receive keystrokes meant for whatever
     /// *is* focused).
     fn active_edit_target(&self) -> Option<EditTarget> {
@@ -137,8 +137,8 @@ impl AdeApp {
             return None;
         }
         let edit = self.merge_edit.as_ref()?;
-        let active_session_id = self.sessions.active().map(|session| session.id)?;
-        if edit.session_id != active_session_id {
+        let active_agent_id = self.agents.active().map(|agent| agent.id)?;
+        if edit.agent_id != active_agent_id {
             return None;
         }
         Some(EditTarget::Merge)
@@ -682,7 +682,7 @@ impl AdeApp {
 
     /// Moves keyboard focus off the editor entirely, onto [`AdeApp::filter_focus_handle`] (the
     /// rail's own filter field) - the same real fallback target [`crate::work_surface::render::
-    /// AdeApp::close_session`] already uses for "nothing session/file-related is left to focus".
+    /// AdeApp::close_agent`] already uses for "nothing agent/file-related is left to focus".
     /// Since `Tab`/`Shift+Tab` are now real indent/dedent actions while the editor has focus
     /// (rather than falling through to GPUI's ordinary focus-cycling), a keyboard-only user needs
     /// some other way to leave the editor and keep tabbing through the rest of the UI - this is
@@ -965,7 +965,7 @@ impl AdeApp {
     /// and [`Self::save_active_file`]'s own freshness gate can never pass again after any real
     /// external touch to the file (even reverting it back to byte-identical content still
     /// changes its real mtime) - so without a real, deliberate way to override it, the file
-    /// would stay unsavable for the rest of the session. This skips the *freshness* gate
+    /// would stay unsavable for the rest of the agent. This skips the *freshness* gate
     /// entirely and unconditionally overwrites the file with the buffer's current content - a
     /// real, user-initiated action, never automatic (matches this phase's own "no auto-merge"
     /// scope: this is a real, explicit "keep mine" choice, not a silent one) - reusing the exact
@@ -1612,7 +1612,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
             // the primary's own above - `theme.rs` has no separate "secondary cursor" color, and
             // inventing one with no `design_handoff_jerry_ade` spec to back it would be an
             // unjustified guess (`CONTRIBUTING.md`'s own "exact values" discipline) - so a real
-            // multi-cursor session simply shows several real, identically-styled carets/
+            // multi-cursor agent simply shows several real, identically-styled carets/
             // selections rather than a fabricated visual distinction between them. Empty in
             // ordinary single-cursor use, so this is real, additional work only when it's real,
             // additional cursors.
@@ -3344,7 +3344,7 @@ mod editing_tests {
     /// cleared it, and `AdeApp::save_active_file`'s own freshness gate could never pass again
     /// after any real external touch (even reverting the file back to byte-identical content
     /// still changes its real mtime) - so the file became permanently unsavable for the rest of
-    /// the session, with no real way out. `EditorSaveAnyway`/`AdeApp::force_save_active_file` is
+    /// the agent, with no real way out. `EditorSaveAnyway`/`AdeApp::force_save_active_file` is
     /// the real, explicit, opt-in escape hatch this fixes it with.
     #[gpui::test]
     fn editor_save_anyway_resolves_a_real_permanently_stuck_conflict(cx: &mut TestAppContext) {

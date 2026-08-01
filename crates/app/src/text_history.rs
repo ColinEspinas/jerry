@@ -106,7 +106,7 @@ pub const MAX_EDITS_PER_GROUP: usize = 10_000;
 /// `code_view::MAX_FILE_BYTES` (2 MiB). 200 external rewrites of a 2 MiB file - an agent CLI
 /// rewriting a file in a loop, which is this app's whole domain - would retain roughly 800 MB in a
 /// single buffer, times one per open file. Bounding bytes as well as groups is what actually closes
-/// that. Generous enough that no ordinary editing session ever reaches it (a full undo stack of
+/// that. Generous enough that no ordinary editing agent ever reaches it (a full undo stack of
 /// real keystrokes is kilobytes), so this only ever bites the pathological case it exists for.
 pub const MAX_HISTORY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -605,7 +605,7 @@ impl TextHistory {
 }
 
 /// One of the app's five hand-rolled single-line text inputs (the command-palette query, the rail
-/// session filter, the Settings › Keybindings filter, the New file name prompt, and the file
+/// agent filter, the Settings › Keybindings filter, the New file name prompt, and the file
 /// tree's inline New File / New Folder / Rename editor - `crate::sidebar::tree_ops::TreeInlineEdit`,
 /// which became one of these when GitHub issue #19's tree met issue #17's undo work at a merge)
 /// with a real undo history attached. All five are append/backspace-only with no caret of their own - see

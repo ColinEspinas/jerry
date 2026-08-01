@@ -17,15 +17,15 @@
 //! `wt_core::undo::*` call has actually resolved, matching every other real git-backed action in
 //! this app.
 //!
-//! ## Undo/redo never depends on the originating session tab still existing
+//! ## Undo/redo never depends on the originating agent tab still existing
 //!
 //! [`undo::UndoableAction`] carries the worktree path/branch/repo path/outcome its
-//! `wt_core::undo` call needs directly - `session_id` is display context only. This matters
-//! concretely for discard: [`AdeApp::execute_discard_worktree`] closes the originating session
+//! `wt_core::undo` call needs directly - `agent_id` is display context only. This matters
+//! concretely for discard: [`AdeApp::execute_discard_worktree`] closes the originating agent
 //! tab on success (its cwd no longer exists), and undo/redo must still work correctly with that
 //! tab gone. The trade-off this implies is real and worth stating plainly: undoing a discard
-//! restores the worktree and its content, but **not** the closed session tab - out of this
-//! revision's scope (a worktree-level undo, not a session-level one).
+//! restores the worktree and its content, but **not** the closed agent tab - out of this
+//! revision's scope (a worktree-level undo, not an agent-level one).
 //!
 //! ## Redoing a discard is a fresh discard, not a replay
 //!
@@ -87,17 +87,17 @@ impl AdeApp {
     }
 
     /// The Review footer's `Keep all` action - a real, undoable `wt_core::undo::commit_all_changes`
-    /// on session `id`'s worktree. Not gated by any confirmation (unlike
+    /// on agent `id`'s worktree. Not gated by any confirmation (unlike
     /// [`Self::request_discard_worktree`]): it's non-destructive and immediately undoable via
     /// `Undo`.
-    pub(crate) fn keep_all_changes(&mut self, id: SessionId, cx: &mut Context<Self>) {
+    pub(crate) fn keep_all_changes(&mut self, id: AgentId, cx: &mut Context<Self>) {
         if self.worktree_history_op_in_flight.is_some() {
             return;
         }
-        let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
+        let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
             return;
         };
-        let worktree_path = session.cwd.clone();
+        let worktree_path = agent.cwd.clone();
         let branch_display = self.branch_display_for(&worktree_path);
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
@@ -145,11 +145,11 @@ impl AdeApp {
     /// [`Self::request_prune`]'s own reasoning: this is a real, destructive-*feeling* action -
     /// it force-removes a worktree directory - even though [`wt_core::undo::discard_worktree`]
     /// makes it genuinely recoverable via `Undo` now). The first click only arms
-    /// [`AdeApp::discard_confirm_armed`] for `id`; a second click on the *same* session's button
+    /// [`AdeApp::discard_confirm_armed`] for `id`; a second click on the *same* agent's button
     /// while armed actually runs it.
     pub(crate) fn request_discard_worktree(
         &mut self,
-        id: SessionId,
+        id: AgentId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -169,21 +169,21 @@ impl AdeApp {
     /// Runs the real, already-confirmed discard - only ever reached through
     /// [`Self::request_discard_worktree`]'s second click. `_window` is accepted (not read
     /// directly) purely to match every other footer-button click handler's signature - the real
-    /// `Window` [`Self::close_session`] needs on success is obtained fresh, asynchronously, via
+    /// `Window` [`Self::close_agent`] needs on success is obtained fresh, asynchronously, via
     /// `update_in` in the completion handler below (see this module's own docs).
     pub(in crate::worktree_history) fn execute_discard_worktree(
         &mut self,
-        id: SessionId,
+        id: AgentId,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.worktree_history_op_in_flight.is_some() {
             return;
         }
-        let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
+        let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
             return;
         };
-        let worktree_path = session.cwd.clone();
+        let worktree_path = agent.cwd.clone();
         let repo_path = self.focused_repo_path();
         let branch_display = self.branch_display_for(&worktree_path);
         self.worktree_history_op_in_flight = Some(WorktreeHistoryOpKind::Discard);
@@ -200,7 +200,7 @@ impl AdeApp {
                     })
                     .await;
             // `update_in` (not plain `update`): a successful discard closes the now-cwd-less
-            // session tab, and `Self::close_session` needs a real `Window` to move focus off it -
+            // agent tab, and `Self::close_agent` needs a real `Window` to move focus off it -
             // see `vendor/zed/crates/gpui/src/app/async_context.rs`'s `AsyncApp::with_window`,
             // the same mechanism `Self::trigger_goto_definition`'s own completion handler already
             // relies on for the identical reason.
@@ -228,9 +228,9 @@ impl AdeApp {
                             },
                             format!("Discarded worktree ({branch_display})"),
                         );
-                        // The session's cwd no longer exists - see this module's own docs on why
+                        // The agent's cwd no longer exists - see this module's own docs on why
                         // the tab, unlike the worktree/content itself, is not restored by `Undo`.
-                        this.close_session(id, window, cx);
+                        this.close_agent(id, window, cx);
                         this.refresh_after_worktree_history_op(cx);
                     }
                     Err(err) => {
@@ -559,16 +559,16 @@ mod worktree_history_regression_tests {
         path
     }
 
-    /// Spawns a real `Shell` session (a real pty) in `cwd` and returns its id - the same
-    /// `sessions.spawn` call `AdeApp::new_session` itself makes.
-    fn spawn_session(
+    /// Spawns a real `Shell` agent (a real pty) in `cwd` and returns its id - the same
+    /// `agents.spawn` call `AdeApp::new_agent` itself makes.
+    fn spawn_agent(
         app: &Entity<AdeApp>,
         cx: &mut gpui::VisualTestContext,
         cwd: PathBuf,
-    ) -> SessionId {
+    ) -> AgentId {
         app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+            app.agents.spawn(
+                AgentKind::Shell,
                 cwd,
                 app.settings.appearance.terminal_font_size,
                 window,
@@ -586,7 +586,7 @@ mod worktree_history_regression_tests {
         fs::write(feature.join("new.txt"), "from feature\n").expect("write");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_session(&app, cx, feature.clone());
+        let id = spawn_agent(&app, cx, feature.clone());
         let head_before = git_output(&feature, &["rev-parse", "HEAD"]);
 
         app.update(cx, |app, cx| app.keep_all_changes(id, cx));
@@ -634,7 +634,7 @@ mod worktree_history_regression_tests {
         fs::write(feature.join("new.txt"), "from feature\n").expect("write");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_session(&app, cx, feature.clone());
+        let id = spawn_agent(&app, cx, feature.clone());
         let head_before = git_output(&feature, &["rev-parse", "HEAD"]);
 
         app.update(cx, |app, cx| app.keep_all_changes(id, cx));
@@ -679,7 +679,7 @@ mod worktree_history_regression_tests {
         fs::write(feature.join("new.txt"), "from feature\n").expect("write");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_session(&app, cx, feature.clone());
+        let id = spawn_agent(&app, cx, feature.clone());
 
         app.update(cx, |app, cx| app.keep_all_changes(id, cx));
         cx.run_until_parked();
@@ -726,8 +726,8 @@ mod worktree_history_regression_tests {
         fs::write(feature_b.join("b.txt"), "b\n").expect("write");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id_a = spawn_session(&app, cx, feature_a.clone());
-        let id_b = spawn_session(&app, cx, feature_b.clone());
+        let id_a = spawn_agent(&app, cx, feature_a.clone());
+        let id_b = spawn_agent(&app, cx, feature_b.clone());
 
         app.update(cx, |app, cx| app.keep_all_changes(id_a, cx));
         assert!(app.read_with(cx, |app, _| app.worktree_history_op_in_flight.is_some()));
@@ -758,15 +758,13 @@ mod worktree_history_regression_tests {
     }
 
     #[gpui::test]
-    fn discard_worktree_two_click_confirm_removes_it_and_closes_its_session(
-        cx: &mut TestAppContext,
-    ) {
+    fn discard_worktree_two_click_confirm_removes_it_and_closes_its_agent(cx: &mut TestAppContext) {
         let repo = init_repo();
         let feature = add_worktree(repo.path(), "feature", "feature-wt");
         fs::write(feature.join("scratch.txt"), "wip\n").expect("write untracked");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_session(&app, cx, feature.clone());
+        let id = spawn_agent(&app, cx, feature.clone());
 
         // Click 1: arm.
         app.update_in(cx, |app, window, cx| {
@@ -791,11 +789,11 @@ mod worktree_history_regression_tests {
         );
         assert!(
             app.read_with(cx, |app, _| app
-                .sessions
+                .agents
                 .iter()
                 .find(|s| s.id == id)
                 .is_none()),
-            "the now-cwd-less session tab must have been closed"
+            "the now-cwd-less agent tab must have been closed"
         );
         app.read_with(cx, |app, _| {
             assert!(app.undo_stack.can_undo());
@@ -823,7 +821,7 @@ mod worktree_history_regression_tests {
         .expect("write ignored file");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_session(&app, cx, feature.clone());
+        let id = spawn_agent(&app, cx, feature.clone());
         app.update_in(cx, |app, window, cx| {
             app.request_discard_worktree(id, window, cx)
         });
@@ -858,7 +856,7 @@ mod worktree_history_regression_tests {
         git(&feature, &["commit", "-m", "add gitignore"]);
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_session(&app, cx, feature.clone());
+        let id = spawn_agent(&app, cx, feature.clone());
         app.update_in(cx, |app, window, cx| {
             app.request_discard_worktree(id, window, cx)
         });
@@ -899,7 +897,7 @@ mod worktree_history_regression_tests {
     }
 
     #[gpui::test]
-    fn undo_of_discard_recreates_the_worktree_with_stash_content_restored_but_not_the_session(
+    fn undo_of_discard_recreates_the_worktree_with_stash_content_restored_but_not_the_agent(
         cx: &mut TestAppContext,
     ) {
         let repo = init_repo();
@@ -908,7 +906,7 @@ mod worktree_history_regression_tests {
         fs::write(feature.join("base.txt"), "edited\n").expect("modify tracked");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_session(&app, cx, feature.clone());
+        let id = spawn_agent(&app, cx, feature.clone());
 
         app.update_in(cx, |app, window, cx| {
             app.request_discard_worktree(id, window, cx)
@@ -933,11 +931,11 @@ mod worktree_history_regression_tests {
         );
         assert!(
             app.read_with(cx, |app, _| app
-                .sessions
+                .agents
                 .iter()
                 .find(|s| s.id == id)
                 .is_none()),
-            "the closed session tab is deliberately not restored by undo - see this module's \
+            "the closed agent tab is deliberately not restored by undo - see this module's \
              own docs"
         );
         app.read_with(cx, |app, _| {
@@ -964,7 +962,7 @@ mod worktree_history_regression_tests {
         fs::write(feature.join("scratch.txt"), "wip v1\n").expect("write untracked");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_session(&app, cx, feature.clone());
+        let id = spawn_agent(&app, cx, feature.clone());
         app.update_in(cx, |app, window, cx| {
             app.request_discard_worktree(id, window, cx)
         });
@@ -1012,7 +1010,7 @@ mod worktree_history_regression_tests {
         fs::write(feature.join("first.txt"), "first\n").expect("write");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_session(&app, cx, feature.clone());
+        let id = spawn_agent(&app, cx, feature.clone());
 
         app.update(cx, |app, cx| app.keep_all_changes(id, cx));
         cx.run_until_parked();
@@ -1047,7 +1045,7 @@ mod worktree_history_regression_tests {
         fs::write(feature.join("scratch.txt"), "wip\n").expect("write");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_session(&app, cx, feature.clone());
+        let id = spawn_agent(&app, cx, feature.clone());
         app.update_in(cx, |app, window, cx| {
             app.request_discard_worktree(id, window, cx)
         });
@@ -1111,7 +1109,7 @@ mod worktree_history_regression_tests {
 
     /// Regression coverage for a real bug an audit caught: the busy label was keyed off the
     /// bare in-flight flag alone, so undoing a "keep all changes" made every visible
-    /// `Discard worktree` button (on a *different* session) falsely read "discarding…". Only
+    /// `Discard worktree` button (on a *different* agent) falsely read "discarding…". Only
     /// asserts the real, specific [`WorktreeHistoryOpKind`] value itself, not the rendered button
     /// label text (`work_surface_render.rs`'s `label` match arms, ~1299-1318, are what actually
     /// consume this value to pick "discarding…"/"keeping…" vs. the unrelated button's default
@@ -1127,7 +1125,7 @@ mod worktree_history_regression_tests {
         fs::write(feature.join("first.txt"), "first\n").expect("write");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_session(&app, cx, feature.clone());
+        let id = spawn_agent(&app, cx, feature.clone());
         app.update(cx, |app, cx| app.keep_all_changes(id, cx));
         cx.run_until_parked();
 
@@ -1182,7 +1180,7 @@ mod worktree_history_regression_tests {
         fs::write(feature.join("first.txt"), "first\n").expect("write");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_session(&app, cx, feature.clone());
+        let id = spawn_agent(&app, cx, feature.clone());
         app.update(cx, |app, cx| app.keep_all_changes(id, cx));
         cx.run_until_parked();
         assert!(app.read_with(cx, |app, _| app.undo_stack.can_undo()));
@@ -1230,7 +1228,7 @@ mod worktree_history_regression_tests {
         fs::write(feature.join("first.txt"), "first\n").expect("write");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_session(&app, cx, feature.clone());
+        let id = spawn_agent(&app, cx, feature.clone());
         app.update(cx, |app, cx| app.keep_all_changes(id, cx));
         cx.run_until_parked();
 

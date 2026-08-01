@@ -4,7 +4,7 @@
 //! Naming UI: a small, hand-rolled append/backspace-only inline text field
 //! (`Self::handle_new_file_key_down`), the same minimal shape `Self::handle_filter_key_down`
 //! already established for the rail's filter row - there is no existing "rename"/"create" text
-//! prompt anywhere else in this app to match instead (sessions have no user-assigned names at
+//! prompt anywhere else in this app to match instead (agents have no user-assigned names at
 //! all), and a single-line name prompt doesn't warrant pulling in the full `EntityInputHandler`
 //! machinery the File view's real text editing uses (`vendor/zed/crates/gpui/examples/input.rs`).
 
@@ -50,22 +50,22 @@ impl AdeApp {
         // somewhere still real and rendered rather than leaving it dangling on the now-hidden
         // prompt field (`Self::new_file_focus_handle`) - onto the code surface's own focus
         // target if a file tab is showing (an earlier version of this method only ever checked
-        // `self.sessions.focus_active`, which is a no-op while a file tab occupies the centre
+        // `self.agents.focus_active`, which is a no-op while a file tab occupies the centre
         // pane, so cancelling "New file" while a file was open left focus dangling on the
         // now-unrendered prompt - the exact "focus left pointing at something no longer
-        // rendered" class this project keeps re-finding), or the active session's pane otherwise
-        // (the same guard `Self::focus_newly_spawned_session` uses). If neither is showing - no
-        // file tab *and* no active session, a real, reachable state under the tabs rework
-        // (`Sessions::active_id`'s own docs, and `Self::select_worktree`'s identical fallback) -
-        // `Sessions::focus_active` is a genuine no-op, so fall back to the rail's own filter
+        // rendered" class this project keeps re-finding), or the active agent's pane otherwise
+        // (the same guard `Self::focus_newly_spawned_agent` uses). If neither is showing - no
+        // file tab *and* no active agent, a real, reachable state under the tabs rework
+        // (`Agents::active_id`'s own docs, and `Self::select_worktree`'s identical fallback) -
+        // `Agents::focus_active` is a genuine no-op, so fall back to the rail's own filter
         // root container (`Self::rail_focus_handle`) the same way `Self::select_worktree` does -
         // deliberately the rail's root, not its filter field, which this used to target; see that
         // handle's own docs for the real keystroke-swallowing bug that was - rather
         // than leaving `Window::focus` dangling on the just-closed prompt field.
         if self.open_change.is_some() {
             window.focus(&self.code_focus_handle, cx);
-        } else if self.sessions.active_id().is_some() {
-            self.sessions.focus_active(window, cx);
+        } else if self.agents.active_id().is_some() {
+            self.agents.focus_active(window, cx);
         } else {
             window.focus(&self.rail_focus_handle, cx);
         }
@@ -399,14 +399,14 @@ mod tests {
     }
 
     /// Real, live-reproduced coverage for the case [`super::AdeApp::cancel_new_file`] didn't
-    /// handle before this revision's own self-audit: no file tab open *and* no active session at
-    /// all (every session in the worktree already closed) - a real, reachable state under the
-    /// tabs rework (`crate::work_surface::sessions::Sessions::active_id`'s own docs, and
+    /// handle before this revision's own self-audit: no file tab open *and* no active agent at
+    /// all (every agent in the worktree already closed) - a real, reachable state under the
+    /// tabs rework (`crate::work_surface::agents::Agents::active_id`'s own docs, and
     /// `crate::root::AdeApp::select_worktree`'s identical fallback for the same case). Before the
-    /// fix, `Sessions::focus_active` was a genuine no-op here, leaving `Window::focus` dangling
+    /// fix, `Agents::focus_active` was a genuine no-op here, leaving `Window::focus` dangling
     /// on the just-closed prompt field.
     #[gpui::test]
-    fn cancelling_new_file_with_no_file_tab_and_no_active_session_does_not_leave_focus_dangling(
+    fn cancelling_new_file_with_no_file_tab_and_no_active_agent_does_not_leave_focus_dangling(
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -414,14 +414,14 @@ mod tests {
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
 
         let initial_id = app.read_with(cx, |app, _| {
-            app.sessions.active_id().expect("initial shell session")
+            app.agents.active_id().expect("initial shell agent")
         });
         app.update_in(cx, |app, window, cx| {
-            app.close_session(initial_id, window, cx);
+            app.close_agent(initial_id, window, cx);
         });
         assert!(
-            app.read_with(cx, |app, _| app.sessions.active_id().is_none()),
-            "sanity check: closing the only session should leave none active"
+            app.read_with(cx, |app, _| app.agents.active_id().is_none()),
+            "sanity check: closing the only agent should leave none active"
         );
 
         app.update_in(cx, |app, window, cx| {
@@ -438,8 +438,8 @@ mod tests {
         assert!(
             app.read_with(cx, |app, _| app.palette_open),
             "a real {key} keystroke after cancelling \"New file\" with no file tab and no \
-             active session must still open the palette - before the fix, \
-             Sessions::focus_active was a no-op here and Window::focus was left dangling on the \
+             active agent must still open the palette - before the fix, \
+             Agents::focus_active was a no-op here and Window::focus was left dangling on the \
              now-hidden prompt field"
         );
     }

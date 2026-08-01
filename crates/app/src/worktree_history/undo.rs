@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UndoableAction {
     /// A real `wt_core::undo::commit_all_changes` call. Undo/redo itself is keyed entirely off
-    /// `worktree_path`/`outcome`, and works the same whether or not the session tab that
+    /// `worktree_path`/`outcome`, and works the same whether or not the agent tab that
     /// triggered this still exists.
     KeptAllChanges {
         worktree_path: PathBuf,

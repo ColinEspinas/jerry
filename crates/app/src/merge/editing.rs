@@ -53,8 +53,8 @@ impl AdeApp {
     /// quick-pick view whenever [`AdeApp::merge_edit`] matches the currently active conflicted
     /// file (see `crate::merge::render`'s own docs for exactly where this is called
     /// from) - `&self`, matching `crate::merge::render::AdeApp::
-    /// render_merge_flow_surface`'s own receiver (the caller already holds an immutable `session`
-    /// borrow from `self.sessions`, so `&mut self` isn't available there; every real mutation
+    /// render_merge_flow_surface`'s own receiver (the caller already holds an immutable `agent`
+    /// borrow from `self.agents`, so `&mut self` isn't available there; every real mutation
     /// here happens later, inside an event handler's own `&mut Self` lease, not during this
     /// render call).
     pub(in crate::merge) fn render_merge_edit_view(

@@ -65,7 +65,7 @@
 //! `AdeApp::code_zoom_percent` multiplier that got reset to 100% on every worktree switch
 //! (`AdeApp::select_worktree`); and an optional `AdeApp::file_zoom_percent` per-open-file
 //! override, gated by a `per_tab_zoom` toggle. None of the last two survived an app restart, and
-//! the worktree-reset meant even a single session's zoom wasn't stable while browsing worktrees.
+//! the worktree-reset meant even a single agent's zoom wasn't stable while browsing worktrees.
 //! `editor_zoom_percent` replaces both: one real, `settings.toml`-persisted multiplier, applied
 //! uniformly to every open file, in every worktree, exactly like `editor_font_size` itself
 //! already was. `per_tab_zoom`, `AdeApp::file_zoom_percent`, and the worktree-reset are gone

@@ -1,15 +1,15 @@
-//! Session/tab bookkeeping: ties a spawned terminal process (a [`TerminalPane`]) to the
-//! worktree it's running in, and tracks which sessions are open and which one is active for
+//! Agent/tab bookkeeping: ties a spawned terminal process (a [`TerminalPane`]) to the
+//! worktree it's running in, and tracks which agents are open and which one is active for
 //! the tabbed center pane. `TerminalPane` itself has no notion of tabs or of "which
 //! worktree" - see its module docs - this is that one layer up.
 //!
 //! ## Per-worktree tab scoping
 //!
-//! Every session belongs to exactly one worktree (its [`Session::cwd`]), and the centre pane's
-//! tab strip (`crate::root::AdeApp::render_tab_strip`) only ever shows the sessions belonging to
-//! whichever worktree is currently selected - so [`Self::active`] doubles as "which session is
-//! shown in the centre pane" *and* must always name a session in the currently selected
-//! worktree (or be `None`, if that worktree has no open session at all). [`Self::active_by_cwd`]
+//! Every agent belongs to exactly one worktree (its [`Agent::cwd`]), and the centre pane's
+//! tab strip (`crate::root::AdeApp::render_tab_strip`) only ever shows the agents belonging to
+//! whichever worktree is currently selected - so [`Self::active`] doubles as "which agent is
+//! shown in the centre pane" *and* must always name an agent in the currently selected
+//! worktree (or be `None`, if that worktree has no open agent at all). [`Self::active_by_cwd`]
 //! is the second half of that invariant: a per-worktree "last active tab" memory, so switching
 //! back and forth between two worktrees each restores whichever tab you were last looking at in
 //! each, rather than always landing on the first one. [`Self::activate_for_worktree`] is the one
@@ -24,26 +24,26 @@ use gpui::{App, AppContext as _, Context, Entity, Focusable as _, Subscription, 
 use crate::root::AdeApp;
 use crate::terminal::pane::{TerminalPane, TerminalPaneEvent, TerminalSpec};
 
-/// What kind of process a session runs. Purely descriptive - drives the tab label and which
-/// "New ... Session" button created it; `TerminalPane` itself has no branching for
+/// What kind of process an agent runs. Purely descriptive - drives the tab label and which
+/// "New ... Agent" button created it; `TerminalPane` itself has no branching for
 /// "shell" vs. "agent CLI".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionKind {
+pub enum AgentKind {
     Shell,
     /// The `claude` CLI (Claude Code), spawned with no arguments in the chosen worktree.
     /// Resolved via `PATH`; if not installed, spawning fails and the pane shows
     /// `TerminalPane::spawn_error`.
     Claude,
-    /// The `codex` CLI, spawned the same way as [`SessionKind::Claude`].
+    /// The `codex` CLI, spawned the same way as [`AgentKind::Claude`].
     Codex,
 }
 
-impl SessionKind {
+impl AgentKind {
     pub fn label(self) -> &'static str {
         match self {
-            SessionKind::Shell => "Shell",
-            SessionKind::Claude => "Claude",
-            SessionKind::Codex => "Codex",
+            AgentKind::Shell => "Shell",
+            AgentKind::Claude => "Claude",
+            AgentKind::Codex => "Codex",
         }
     }
 
@@ -56,7 +56,7 @@ impl SessionKind {
         }
     }
 
-    /// The literal command name this kind spawns as - `None` for [`SessionKind::Shell`],
+    /// The literal command name this kind spawns as - `None` for [`AgentKind::Shell`],
     /// which resolves `$SHELL` rather than a fixed binary name.
     ///
     /// Public so `crate::settings::state`'s Agents page can look up the same `$PATH` name this
@@ -64,53 +64,53 @@ impl SessionKind {
     /// list that could drift from what's actually spawned.
     pub fn agent_binary_name(self) -> Option<&'static str> {
         match self {
-            SessionKind::Shell => None,
-            SessionKind::Claude => Some("claude"),
-            SessionKind::Codex => Some("codex"),
+            AgentKind::Shell => None,
+            AgentKind::Claude => Some("claude"),
+            AgentKind::Codex => Some("codex"),
         }
     }
 }
 
-/// A monotonically increasing session id, stable across other sessions closing - used
+/// A monotonically increasing agent id, stable across other agents closing - used
 /// instead of a `Vec` index so a click handler capturing an id can't end up referring to the
 /// wrong tab once some other tab closes and later indices shift down.
-pub type SessionId = u64;
+pub type AgentId = u64;
 
-pub struct Session {
-    pub id: SessionId,
-    pub kind: SessionKind,
-    /// The worktree (or repo root) this session's process was started in. Kept for the tab
+pub struct Agent {
+    pub id: AgentId,
+    pub kind: AgentKind,
+    /// The worktree (or repo root) this agent's process was started in. Kept for the tab
     /// label/title; `TerminalPane` doesn't expose its own `cwd` back out.
     pub cwd: PathBuf,
     pub pane: Entity<TerminalPane>,
-    /// When this session was spawned - the rail agent row's real elapsed-time trailing text
+    /// When this agent was spawned - the rail agent row's real elapsed-time trailing text
     /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.3: "elapsed 9.5px mono
     /// right"). Set once, here, and never mutated afterwards - this app has no
     /// pause/resume-with-a-fresh-clock concept (see `crate::work_surface::state::pty_state_label`'s
     /// docs), so "elapsed" is simply wall-clock time since this real process was spawned.
     pub spawned_at: Instant,
-    /// Keeps [`Sessions::spawn`]'s link-click-opens-a-file subscription (see
-    /// [`TerminalPaneEvent`]) alive for this session's lifetime - never read, only held.
+    /// Keeps [`Agents::spawn`]'s link-click-opens-a-file subscription (see
+    /// [`TerminalPaneEvent`]) alive for this agent's lifetime - never read, only held.
     _link_subscription: Subscription,
 }
 
-/// Owns every open session/tab and which one is active.
-pub struct Sessions {
-    sessions: Vec<Session>,
-    active: Option<SessionId>,
-    /// The last-active session id for each worktree that has (or has ever had) one - see the
+/// Owns every open agent/tab and which one is active.
+pub struct Agents {
+    agents: Vec<Agent>,
+    active: Option<AgentId>,
+    /// The last-active agent id for each worktree that has (or has ever had) one - see the
     /// module docs' "Per-worktree tab scoping" section. An entry is removed once its worktree
-    /// has no open sessions left (see [`Self::close`]), rather than left pointing at a closed
+    /// has no open agents left (see [`Self::close`]), rather than left pointing at a closed
     /// id, so [`Self::activate_for_worktree`] can tell "never visited"/"visited but now empty"
     /// apart from "has a real tab to restore" by nothing more than `HashMap::get`.
-    active_by_cwd: HashMap<PathBuf, SessionId>,
-    next_id: SessionId,
+    active_by_cwd: HashMap<PathBuf, AgentId>,
+    next_id: AgentId,
 }
 
-impl Sessions {
+impl Agents {
     pub fn new() -> Self {
         Self {
-            sessions: Vec::new(),
+            agents: Vec::new(),
             active: None,
             active_by_cwd: HashMap::new(),
             next_id: 0,
@@ -118,58 +118,56 @@ impl Sessions {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sessions.is_empty()
+        self.agents.is_empty()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Session> {
-        self.sessions.iter()
+    pub fn iter(&self) -> impl Iterator<Item = &Agent> {
+        self.agents.iter()
     }
 
-    /// Every currently open session whose [`Session::cwd`] is exactly `cwd` - the tab strip's
-    /// real per-worktree filter (`crate::root::AdeApp::current_worktree_sessions`), in the same
+    /// Every currently open agent whose [`Agent::cwd`] is exactly `cwd` - the tab strip's
+    /// real per-worktree filter (`crate::root::AdeApp::current_worktree_agents`), in the same
     /// stable creation order [`Self::iter`] itself returns. Takes `cwd` by value (rather than
     /// borrowing it) so the returned iterator doesn't need to borrow a caller-local `PathBuf` for
     /// as long as `self` - it owns its own copy instead, closed over by the filter closure.
-    pub fn iter_for_cwd(&self, cwd: PathBuf) -> impl Iterator<Item = &Session> {
-        self.sessions
-            .iter()
-            .filter(move |session| session.cwd == cwd)
+    pub fn iter_for_cwd(&self, cwd: PathBuf) -> impl Iterator<Item = &Agent> {
+        self.agents.iter().filter(move |agent| agent.cwd == cwd)
     }
 
-    pub fn active_id(&self) -> Option<SessionId> {
+    pub fn active_id(&self) -> Option<AgentId> {
         self.active
     }
 
-    pub fn active(&self) -> Option<&Session> {
+    pub fn active(&self) -> Option<&Agent> {
         let id = self.active?;
-        self.sessions.iter().find(|session| session.id == id)
+        self.agents.iter().find(|agent| agent.id == id)
     }
 
-    /// Spawns a new session of `kind` into `cwd` (the caller resolves this - see
-    /// `crate::root::AdeApp::active_session_cwd`), appends it as a new tab, and makes it
+    /// Spawns a new agent of `kind` into `cwd` (the caller resolves this - see
+    /// `crate::root::AdeApp::active_agent_cwd`), appends it as a new tab, and makes it
     /// active (both globally, [`Self::active`], and as `cwd`'s own remembered tab,
-    /// [`Self::active_by_cwd`]). Returns the new session's id.
+    /// [`Self::active_by_cwd`]). Returns the new agent's id.
     ///
     /// Deliberately does not move keyboard focus itself: only the caller
     /// (`crate::root::AdeApp`) knows whether a file tab is currently occupying the centre
-    /// pane, and focusing a session's pane while a file tab is showing points
+    /// pane, and focusing an agent's pane while a file tab is showing points
     /// `Window::focus` at a node nothing in the rendered tree tracks. Every real call site
-    /// guards this via `crate::root::AdeApp::focus_newly_spawned_session`, whose own docs
+    /// guards this via `crate::root::AdeApp::focus_newly_spawned_agent`, whose own docs
     /// cover the bug this avoids.
     ///
     /// Subscribes to the new pane's [`TerminalPaneEvent`]s so a click on a detected
-    /// path/`path:line` link in this session's terminal output opens it as a file tab
+    /// path/`path:line` link in this agent's terminal output opens it as a file tab
     /// (`crate::root::AdeApp::open_terminal_link`). `terminal_font_size_px` is read fresh
     /// from live settings by every call site, so a freshly spawned pane never starts out
     /// mismatched from what Settings › Appearance shows.
     pub fn spawn(
         &mut self,
-        kind: SessionKind,
+        kind: AgentKind,
         cwd: PathBuf,
         terminal_font_size_px: f32,
         window: &mut Window,
         cx: &mut Context<AdeApp>,
-    ) -> SessionId {
+    ) -> AgentId {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -181,7 +179,7 @@ impl Sessions {
                 app.open_terminal_link(path.clone(), *line, window, cx);
             });
 
-        self.sessions.push(Session {
+        self.agents.push(Agent {
             id,
             kind,
             cwd: cwd.clone(),
@@ -196,70 +194,70 @@ impl Sessions {
     }
 
     /// Re-derives every open pane's poll cadence from [`Self::active`]: exactly the active
-    /// session's pane is foreground (`TerminalPane::set_foreground`), every other pane is
-    /// background. Called at the end of **every** mutator that can change which session is
+    /// agent's pane is foreground (`TerminalPane::set_foreground`), every other pane is
+    /// background. Called at the end of **every** mutator that can change which agent is
     /// active ([`Self::spawn`], [`Self::set_active`], [`Self::activate_for_worktree`],
     /// [`Self::close`]) - a full re-derivation over all panes rather than a delta update at
     /// each site, so no future mutator can leave a pane's cadence stale by forgetting the
     /// "demote the old one" half (this codebase's recurring stale-state bug class; a pane
     /// wrongly left background would lag visibly, one wrongly left foreground would quietly
     /// re-grow the multi-pane drain cost this flag exists to bound). Cheap enough for that:
-    /// one flag write per open session.
+    /// one flag write per open agent.
     fn sync_pane_cadence(&self, cx: &mut Context<AdeApp>) {
-        for session in &self.sessions {
-            let foreground = Some(session.id) == self.active;
-            session
+        for agent in &self.agents {
+            let foreground = Some(agent.id) == self.active;
+            agent
                 .pane
                 .update(cx, |pane, _| pane.set_foreground(foreground));
         }
     }
 
     /// Applies a Settings › Appearance "Terminal font size" edit to every currently open
-    /// session's pane, not just newly spawned ones. `TerminalPane::set_font_size` is a no-op
+    /// agent's pane, not just newly spawned ones. `TerminalPane::set_font_size` is a no-op
     /// for a pane already at that size, so calling this on every edit is cheap.
     pub fn set_terminal_font_size(&mut self, font_size_px: f32, cx: &mut Context<AdeApp>) {
-        for session in &self.sessions {
-            session
+        for agent in &self.agents {
+            agent
                 .pane
                 .update(cx, |pane, cx| pane.set_font_size(font_size_px, cx));
         }
     }
 
-    /// Makes `id` the globally active session, and remembers it as its own worktree's active
-    /// tab too - a no-op if `id` doesn't name a currently open session. Takes `cx` (unlike a
-    /// plain setter) because the active session is what drives every pane's poll cadence -
+    /// Makes `id` the globally active agent, and remembers it as its own worktree's active
+    /// tab too - a no-op if `id` doesn't name a currently open agent. Takes `cx` (unlike a
+    /// plain setter) because the active agent is what drives every pane's poll cadence -
     /// see [`Self::sync_pane_cadence`].
-    pub fn set_active(&mut self, id: SessionId, cx: &mut Context<AdeApp>) {
-        if let Some(session) = self.sessions.iter().find(|session| session.id == id) {
+    pub fn set_active(&mut self, id: AgentId, cx: &mut Context<AdeApp>) {
+        if let Some(agent) = self.agents.iter().find(|agent| agent.id == id) {
             self.active = Some(id);
-            self.active_by_cwd.insert(session.cwd.clone(), id);
+            self.active_by_cwd.insert(agent.cwd.clone(), id);
             self.sync_pane_cadence(cx);
         }
     }
 
     /// Makes `cwd`'s own last-active tab (see [`Self::active_by_cwd`]) the globally active
-    /// session - or, if `cwd` has never had one recorded (a worktree just visited for the
-    /// first time this window), its first open session in creation order. `None` if `cwd`
-    /// currently has no open sessions at all.
+    /// agent - or, if `cwd` has never had one recorded (a worktree just visited for the
+    /// first time this window), its first open agent in creation order. `None` if `cwd`
+    /// currently has no open agents at all.
     ///
     /// This is the real fix for the bug this revision exists to close: before it,
     /// [`Self::active`] was a single value entirely independent of which worktree was
     /// selected in the rail, so switching worktrees could leave the centre pane showing a
     /// completely different worktree's terminal. `crate::root::AdeApp::select_worktree` calls
     /// this on every switch - see that method's own docs for why it must also move real
-    /// keyboard focus in the same step (the previously-active session's pane may no longer be
+    /// keyboard focus in the same step (the previously-active agent's pane may no longer be
     /// rendered at all once the tab strip's own per-worktree filter applies).
     pub fn activate_for_worktree(&mut self, cwd: &Path, cx: &mut Context<AdeApp>) {
         let remembered = self
             .active_by_cwd
             .get(cwd)
             .copied()
-            .filter(|id| self.sessions.iter().any(|session| session.id == *id));
+            .filter(|id| self.agents.iter().any(|agent| agent.id == *id));
         let id = remembered.or_else(|| {
-            self.sessions
+            self.agents
                 .iter()
-                .find(|session| session.cwd == cwd)
-                .map(|session| session.id)
+                .find(|agent| agent.cwd == cwd)
+                .map(|agent| agent.id)
         });
         self.active = id;
         if let Some(id) = id {
@@ -268,12 +266,12 @@ impl Sessions {
         self.sync_pane_cadence(cx);
     }
 
-    /// Moves keyboard focus onto the currently active session's terminal pane, if there is
+    /// Moves keyboard focus onto the currently active agent's terminal pane, if there is
     /// one - a no-op when [`Self::active`] is `None`. See [`Self::spawn`]'s docs for why
     /// callers, not this method, decide whether it's safe to call.
     pub fn focus_active(&self, window: &mut Window, cx: &mut App) {
-        if let Some(session) = self.active() {
-            window.focus(&session.pane.focus_handle(cx), cx);
+        if let Some(agent) = self.active() {
+            window.focus(&agent.pane.focus_handle(cx), cx);
         }
     }
 
@@ -281,54 +279,54 @@ impl Sessions {
     /// the `Entity<TerminalPane>`, so closing a tab never just hides it while its process
     /// leaks.
     ///
-    /// The fallback for what becomes active next is scoped to the closed session's *own
+    /// The fallback for what becomes active next is scoped to the closed agent's *own
     /// worktree*, never a same-`Vec`-neighbor from a different one (pre-redesign, every
-    /// session shared one flat tab strip, so any neighbor was a reasonable fallback; now that
+    /// agent shared one flat tab strip, so any neighbor was a reasonable fallback; now that
     /// the tab strip is per-worktree, falling back across worktrees would silently switch the
     /// centre pane to an unrelated worktree's terminal): the sibling that was immediately to
     /// the closed tab's right (in creation order, within the same `cwd`), falling back to its
     /// left, falling back to `None` if this was the worktree's last open tab - in which case
-    /// its rail row simply reverts to the same "no active session" state a worktree the user
+    /// its rail row simply reverts to the same "no active agent" state a worktree the user
     /// hasn't started anything in already shows (see `crate::rail::state::WorktreeRow`'s own docs);
-    /// deliberately not auto-respawning a fresh shell, since a session-less worktree is already
+    /// deliberately not auto-respawning a fresh shell, since an agent-less worktree is already
     /// a normal, existing state this app models everywhere else.
     ///
-    /// Only moves focus (via [`Self::focus_active`]) when the closed session was the *globally*
+    /// Only moves focus (via [`Self::focus_active`]) when the closed agent was the *globally*
     /// active one - closing a background tab in a worktree that isn't currently selected must
-    /// never steal focus - unless `skip_focus_move` says the centre pane isn't showing a
-    /// session's pane right now anyway (a file tab occupies it, or the whole workspace body is
-    /// currently swapped out for Settings) - the caller, `crate::root::AdeApp::close_session`,
+    /// never steal focus - unless `skip_focus_move` says the centre pane isn't showing an
+    /// agent's pane right now anyway (a file tab occupies it, or the whole workspace body is
+    /// currently swapped out for Settings) - the caller, `crate::root::AdeApp::close_agent`,
     /// computes that from `AdeApp::open_change`/`AdeApp::settings_open` - see [`Self::spawn`]'s
     /// docs for why this can't be decided here.
     pub fn close(
         &mut self,
-        id: SessionId,
+        id: AgentId,
         skip_focus_move: bool,
         window: &mut Window,
         cx: &mut Context<AdeApp>,
     ) {
-        let Some(index) = self.sessions.iter().position(|session| session.id == id) else {
+        let Some(index) = self.agents.iter().position(|agent| agent.id == id) else {
             return;
         };
-        let cwd = self.sessions[index].cwd.clone();
+        let cwd = self.agents[index].cwd.clone();
 
-        self.sessions[index]
+        self.agents[index]
             .pane
             .update(cx, |pane, cx| pane.shutdown(cx));
-        self.sessions.remove(index);
+        self.agents.remove(index);
 
         let sibling_indices: Vec<usize> = self
-            .sessions
+            .agents
             .iter()
             .enumerate()
-            .filter(|(_, session)| session.cwd == cwd)
+            .filter(|(_, agent)| agent.cwd == cwd)
             .map(|(sibling_index, _)| sibling_index)
             .collect();
         let new_cwd_active = sibling_indices
             .iter()
             .find(|&&sibling_index| sibling_index >= index)
             .or_else(|| sibling_indices.last())
-            .map(|&sibling_index| self.sessions[sibling_index].id);
+            .map(|&sibling_index| self.agents[sibling_index].id);
 
         if self.active_by_cwd.get(&cwd) == Some(&id) {
             match new_cwd_active {
@@ -351,7 +349,7 @@ impl Sessions {
     }
 }
 
-impl Default for Sessions {
+impl Default for Agents {
     fn default() -> Self {
         Self::new()
     }
@@ -361,18 +359,18 @@ impl Default for Sessions {
 mod tests {
     use super::*;
 
-    /// `close`/`activate_for_worktree` both need a real `Session` (a real `Entity<TerminalPane>`,
-    /// only buildable via `Sessions::spawn` inside a real GPUI window) to exercise meaningfully,
+    /// `close`/`activate_for_worktree` both need a real `Agent` (a real `Entity<TerminalPane>`,
+    /// only buildable via `Agents::spawn` inside a real GPUI window) to exercise meaningfully,
     /// so that coverage lives in `work_surface::render`'s GPUI-test module (`tab_scoping_tests`)
     /// instead, alongside the rest of this revision's worktree/tab scoping coverage (and the
     /// combined tab-order drag-to-reorder coverage - see `work_surface::state`'s own
     /// `reconcile_tab_order`/`move_tab_order` for the tab strip's real ordering layer, which
-    /// tracks position on top of `Sessions` rather than inside it). This module only holds the
+    /// tracks position on top of `Agents` rather than inside it). This module only holds the
     /// plain, GPUI-free checks that don't need a real pane at all.
     #[test]
-    fn a_fresh_sessions_collection_has_no_active_session() {
-        let sessions = Sessions::new();
-        assert_eq!(sessions.active_id(), None);
-        assert!(sessions.is_empty());
+    fn a_fresh_agents_collection_has_no_active_agent() {
+        let agents = Agents::new();
+        assert_eq!(agents.active_id(), None);
+        assert!(agents.is_empty());
     }
 }
