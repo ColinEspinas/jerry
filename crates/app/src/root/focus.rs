@@ -1371,8 +1371,7 @@ mod text_undo_scoping_tests {
         cx.simulate_input("TYPED");
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .content
                 .clone()),
@@ -1388,7 +1387,7 @@ mod text_undo_scoping_tests {
         cx.run_until_parked();
         assert_eq!(app.read_with(cx, |app, _| app.open_change.clone()), None);
         assert!(
-            app.read_with(cx, |app, _| app.edit_buffers.contains_key(&relative)),
+            app.read_with(cx, |app, _| app.edit_buffer_contains(&relative)),
             "sanity check: the buffer (and its history) must still be alive, or this test would \
              pass for the wrong reason"
         );
@@ -1400,8 +1399,7 @@ mod text_undo_scoping_tests {
 
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .content
                 .clone()),
@@ -1433,7 +1431,7 @@ mod text_undo_scoping_tests {
 
         cx.simulate_input("EDITED");
         let content_before = app.read_with(cx, |app, _| {
-            app.edit_buffers.get(&relative).unwrap().content.clone()
+            app.edit_buffer(&relative).unwrap().content.clone()
         });
         assert_eq!(content_before, "EDITEDhello\n");
 
@@ -1456,8 +1454,7 @@ mod text_undo_scoping_tests {
         );
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .content
                 .clone()),

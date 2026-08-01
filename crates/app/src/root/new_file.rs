@@ -330,11 +330,11 @@ impl AdeApp {
         self.focus_code_surface(window, cx);
         self.pending_cursor_line = None;
         if !self
-            .open_files
+            .open_files()
             .iter()
             .any(|open| open.as_path() == relative.as_path())
         {
-            self.open_files.push(relative.clone());
+            self.open_files_mut().push(relative.clone());
         }
         self.open_change = Some(relative.clone());
         self.code_view = code_view::CodeView::File;
@@ -344,7 +344,7 @@ impl AdeApp {
         // showing at all. Same real reveal - and same recorded expansions - as the palette's own
         // "reveal in tree".
         self.reveal_in_tree(&absolute_path, cx);
-        self.edit_buffers.insert(
+        self.insert_edit_buffer(
             relative,
             edit_buffer::EditBuffer::new(absolute_path, String::new(), extension, None, 0),
         );

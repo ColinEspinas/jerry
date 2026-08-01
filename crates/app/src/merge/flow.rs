@@ -2042,8 +2042,7 @@ mod merge_regression_tests {
 
         let relative_notes = PathBuf::from("notes.txt");
         let file_content = app.read_with(cx, |app, _| {
-            app.edit_buffers
-                .get(&relative_notes)
+            app.edit_buffer(&relative_notes)
                 .expect("notes.txt buffer")
                 .content
                 .clone()
@@ -2116,8 +2115,7 @@ mod merge_regression_tests {
              got {merge_edit_content_final:?}"
         );
         let file_content_after_stale_tab = app.read_with(cx, |app, _| {
-            app.edit_buffers
-                .get(&relative_notes)
+            app.edit_buffer(&relative_notes)
                 .expect("notes.txt buffer")
                 .content
                 .clone()

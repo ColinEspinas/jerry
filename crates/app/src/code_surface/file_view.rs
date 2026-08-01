@@ -90,7 +90,7 @@ impl AdeApp {
         // actual data loss, but the *visible warning* disappearing on its own would have been a
         // real, deceptive regression from "surface a real warning".
         if should_check {
-            match self.edit_buffers.get(relative_path) {
+            match self.edit_buffer(relative_path) {
                 Some(buffer) if buffer.is_dirty() => {
                     let metadata = std::fs::metadata(&absolute_path).ok();
                     let disk_mtime = metadata.as_ref().and_then(|meta| meta.modified().ok());
@@ -250,7 +250,7 @@ impl AdeApp {
                     // closes. `file_view_cache`/`parsed.lines` is still the real fallback for a
                     // file with no edit buffer at all (still-loading, or truncated/non-UTF-8 and
                     // thus permanently read-only - see `EditBuffer`'s own docs).
-                    match self.edit_buffers.get(&relative_path_buf) {
+                    match self.edit_buffer(&relative_path_buf) {
                         Some(buffer) => {
                             diagnostics_view::index_diagnostics_by_line(&diagnostics, &buffer.lines)
                         }
@@ -301,8 +301,7 @@ impl AdeApp {
         // `Self::render_file_view`'s own top docs on the throttled `std::fs::metadata` check);
         // diagnostics/hover now track the *live* buffer instead, per Revision R8.5b, above.
         let line_count = self
-            .edit_buffers
-            .get(&relative_path_buf)
+            .edit_buffer(&relative_path_buf)
             .map(|buffer| buffer.lines.len())
             .unwrap_or_else(|| parsed.lines.len());
         // `true` while the real edit buffer for this file has genuine unsaved changes.
@@ -319,8 +318,7 @@ impl AdeApp {
         // - a line shifted by typing would still misalign that marker onto the wrong row, so
         // suppressing it while dirty is still the honest choice, not a leftover gap.
         let buffer_dirty = self
-            .edit_buffers
-            .get(&relative_path_buf)
+            .edit_buffer(&relative_path_buf)
             .is_some_and(|buffer| buffer.is_dirty());
         // GitHub issue #29: the current line's real, already-cached inline git blame label -
         // `None` while the buffer is dirty, while the setting is off, or while no fresh cache
@@ -353,23 +351,20 @@ impl AdeApp {
         //   about yet - `content_unsynced` alone already covers that case honestly.
         let sync_pending = has_lsp
             && buffer_dirty
-            && self
-                .edit_buffers
-                .get(&relative_path_buf)
-                .is_some_and(|buffer| {
-                    let content_unsynced = self.lsp_last_synced_content.get(&relative_path_buf)
-                        != Some(&buffer.content);
-                    let diagnostics_unconfirmed =
-                        match self.lsp_synced_version.get(&relative_path_buf) {
-                            Some(sent_version) => {
-                                self.lsp_diagnostics_confirmed_version
-                                    .get(&relative_path_buf)
-                                    != Some(sent_version)
-                            }
-                            None => false,
-                        };
-                    content_unsynced || diagnostics_unconfirmed
-                });
+            && self.edit_buffer(&relative_path_buf).is_some_and(|buffer| {
+                let content_unsynced =
+                    self.lsp_last_synced_content.get(&relative_path_buf) != Some(&buffer.content);
+                let diagnostics_unconfirmed = match self.lsp_synced_version.get(&relative_path_buf)
+                {
+                    Some(sent_version) => {
+                        self.lsp_diagnostics_confirmed_version
+                            .get(&relative_path_buf)
+                            != Some(sent_version)
+                    }
+                    None => false,
+                };
+                content_unsynced || diagnostics_unconfirmed
+            });
         let diagnostics_card = render_diagnostics_card(&self.file_view_diagnostics);
         // Hover only applies to a file whose extension has a real LSP identity; cloned once here
         // and reused per row for the same reason as `file_uri` above.
@@ -386,7 +381,7 @@ impl AdeApp {
         // Captured here, before `relative_path_buf` is moved into the row-builder closure below
         // (`cx.processor`'s own `move` closure takes it by value) - the real fallback click
         // handler further down (see its own docs) needs its own independent copy of both.
-        let has_buffer = self.edit_buffers.contains_key(&relative_path_buf);
+        let has_buffer = self.edit_buffer_contains(&relative_path_buf);
         let below_content_click_path = relative_path_buf.clone();
         let minimap_relative_path = relative_path_buf.clone();
 
@@ -395,11 +390,10 @@ impl AdeApp {
             line_count,
             cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
                 let relative_path = relative_path_buf.clone();
-                let has_buffer = this.edit_buffers.contains_key(&relative_path);
+                let has_buffer = this.edit_buffer_contains(&relative_path);
                 if has_buffer {
                     let total = this
-                        .edit_buffers
-                        .get(&relative_path)
+                        .edit_buffer(&relative_path)
                         .map(|buffer| buffer.lines.len())
                         .unwrap_or(0);
                     let start = range.start.min(total);
@@ -417,12 +411,11 @@ impl AdeApp {
                         .retain(|line_number, _| visible_line_numbers.contains(line_number));
                     let cursor_line = this.code_cursor;
                     let cursor_line_index = this
-                        .edit_buffers
-                        .get(&relative_path)
+                        .edit_buffer(&relative_path)
                         .map(|buffer| buffer.line_col_for_offset(buffer.cursor_offset()).0);
                     let mut rows = Vec::with_capacity(end.saturating_sub(start));
                     for index in start..end {
-                        let Some(buffer) = this.edit_buffers.get(&relative_path) else {
+                        let Some(buffer) = this.edit_buffer(&relative_path) else {
                             break;
                         };
                         let Some(line) = buffer.lines.get(index) else {
@@ -564,7 +557,7 @@ impl AdeApp {
                     // almost certainly no longer describes - same real dismiss-on-caret-move
                     // reasoning as the per-row click handler in `crate::code_surface::editing`.
                     this.dismiss_completions();
-                    let Some(buffer) = this.edit_buffers.get_mut(&click_path) else {
+                    let Some(buffer) = this.edit_buffer_mut(&click_path) else {
                         return;
                     };
                     let end = buffer.content.len();
@@ -643,7 +636,7 @@ impl AdeApp {
         // outcome (the setting is off, or the file is too large - see that module's own docs),
         // not a placeholder.
         let minimap_lines: Option<&[code_view::RenderedLine]> =
-            if let Some(buffer) = self.edit_buffers.get(&minimap_relative_path) {
+            if let Some(buffer) = self.edit_buffer(&minimap_relative_path) {
                 Some(buffer.lines.as_slice())
             } else {
                 self.file_view_cache
@@ -1192,8 +1185,7 @@ mod dirty_buffer_stale_decoration_tests {
         // Dirty the buffer with a real edit - no real sync has been recorded for it yet.
         let relative = PathBuf::from("sample.rs");
         app.update(cx, |app, cx| {
-            app.edit_buffers
-                .get_mut(&relative)
+            app.edit_buffer_mut(&relative)
                 .expect("real edit buffer should have been seeded for sample.rs")
                 .replace_range(None, "// ");
             cx.notify();
@@ -1216,11 +1208,7 @@ mod dirty_buffer_stale_decoration_tests {
         // (Revision R8.5b audit finding 6) has its own dedicated coverage in
         // `sync_pending_diagnostics_confirmation_tests`, below.
         let synced_content = app.read_with(cx, |app, _| {
-            app.edit_buffers
-                .get(&relative)
-                .expect("buffer")
-                .content
-                .clone()
+            app.edit_buffer(&relative).expect("buffer").content.clone()
         });
         app.update(cx, |app, cx| {
             app.lsp_last_synced_content
@@ -1238,8 +1226,7 @@ mod dirty_buffer_stale_decoration_tests {
         );
         assert!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .expect("buffer")
                 .is_dirty()),
             "sanity check: the buffer must still genuinely be dirty/unsaved at this point"
@@ -1248,8 +1235,7 @@ mod dirty_buffer_stale_decoration_tests {
         // A further real edit moves the content past what was last synced - the banner must
         // reappear.
         app.update(cx, |app, cx| {
-            app.edit_buffers
-                .get_mut(&relative)
+            app.edit_buffer_mut(&relative)
                 .expect("buffer")
                 .replace_range(None, "more ");
             cx.notify();
@@ -1294,8 +1280,7 @@ mod sync_pending_diagnostics_confirmation_tests {
 
         let relative = PathBuf::from("sample.rs");
         app.update(cx, |app, cx| {
-            app.edit_buffers
-                .get_mut(&relative)
+            app.edit_buffer_mut(&relative)
                 .expect("real edit buffer should have been seeded for sample.rs")
                 .replace_range(None, "// ");
             cx.notify();
@@ -1307,11 +1292,7 @@ mod sync_pending_diagnostics_confirmation_tests {
         // diagnostics answer for that version has landed yet - the real, honest "sent but not yet
         // answered" gap this fix exists to keep the banner truthful through.
         let synced_content = app.read_with(cx, |app, _| {
-            app.edit_buffers
-                .get(&relative)
-                .expect("buffer")
-                .content
-                .clone()
+            app.edit_buffer(&relative).expect("buffer").content.clone()
         });
         app.update(cx, |app, cx| {
             app.lsp_last_synced_content

@@ -987,10 +987,16 @@ impl AdeApp {
         let under_relative = |path: &Path| file_ops::is_self_or_descendant(&deleted_relative, path);
         let under_absolute = |path: &Path| file_ops::is_self_or_descendant(deleted, path);
 
-        self.open_files.retain(|open| !under_relative(open));
-        self.edit_buffers.retain(|key, _| !under_relative(key));
+        // Scoped to the *current* worktree - `open_files_by_worktree`/`edit_buffers` are now
+        // per-worktree-keyed (see their own docs), and `deleted`/`deleted_relative` only ever
+        // name a path inside whichever worktree this delete was run against, so a same-named
+        // file in an unrelated worktree must never be swept up by the same relative-path match.
+        let current_root = self.file_tree_root.clone();
+        self.open_files_mut().retain(|open| !under_relative(open));
+        self.edit_buffers
+            .retain(|(cwd, relative), _| !(*cwd == current_root && under_relative(relative)));
         if self.open_change.as_deref().is_some_and(under_relative) {
-            self.open_change = self.open_files.first().cloned();
+            self.open_change = self.open_files().first().cloned();
         }
         if self
             .selected_tree_path
@@ -1213,7 +1219,7 @@ impl AdeApp {
         let old_relative = self.worktree_relative(old);
         let new_relative = self.worktree_relative(new);
 
-        for open in self.open_files.iter_mut() {
+        for open in self.open_files_mut().iter_mut() {
             if let Some(moved) = remap_path(open, &old_relative, &new_relative) {
                 *open = moved;
             }
@@ -1224,18 +1230,27 @@ impl AdeApp {
             }
         }
 
-        // The buffer map is keyed by the worktree-relative path *and* each buffer carries the
-        // absolute path an explicit save writes to - both have to move, or a save after a rename
-        // would write the old file back into existence.
+        // The buffer map is keyed by `(worktree, worktree-relative path)` and each buffer also
+        // carries the absolute path an explicit save writes to - both have to move, or a save
+        // after a rename would write the old file back into existence. Only the *current*
+        // worktree's entries are ever eligible: `old`/`new`/`old_relative`/`new_relative` all name
+        // paths inside it, so an unrelated worktree's same-named entry (a different `cwd` half of
+        // the key) must pass through completely untouched rather than being remapped by a
+        // relative-path match that says nothing about which worktree it belongs to.
+        let current_root = self.file_tree_root.clone();
         let buffers = std::mem::take(&mut self.edit_buffers);
         self.edit_buffers = buffers
             .into_iter()
-            .map(|(key, mut buffer)| {
-                let key = remap_path(&key, &old_relative, &new_relative).unwrap_or(key);
+            .map(|((cwd, relative), mut buffer)| {
+                if cwd != current_root {
+                    return ((cwd, relative), buffer);
+                }
+                let relative =
+                    remap_path(&relative, &old_relative, &new_relative).unwrap_or(relative);
                 if let Some(moved) = remap_path(&buffer.path, old, new) {
                     buffer.path = moved;
                 }
-                (key, buffer)
+                ((cwd, relative), buffer)
             })
             .collect();
 
@@ -1426,7 +1441,7 @@ mod tree_ops_regression_tests {
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
             assert!(
-                app.edit_buffers.contains_key(Path::new("src/main.rs")),
+                app.edit_buffer_contains(Path::new("src/main.rs")),
                 "premise: opening the file must have created a real buffer keyed by its \
                  worktree-relative path"
             );
@@ -1445,7 +1460,7 @@ mod tree_ops_regression_tests {
 
         app.read_with(cx, |app, _| {
             assert_eq!(
-                app.open_files,
+                app.open_files().to_vec(),
                 vec![PathBuf::from("src/renamed.rs")],
                 "the open tab must follow the rename"
             );
@@ -1454,13 +1469,12 @@ mod tree_ops_regression_tests {
                 Some(Path::new("src/renamed.rs"))
             );
             assert!(
-                !app.edit_buffers.contains_key(Path::new("src/main.rs")),
+                !app.edit_buffer_contains(Path::new("src/main.rs")),
                 "an orphaned buffer still keyed by the old path is exactly what this must not \
                  leave behind"
             );
             let buffer = app
-                .edit_buffers
-                .get(Path::new("src/renamed.rs"))
+                .edit_buffer(Path::new("src/renamed.rs"))
                 .expect("the buffer must be re-keyed, not dropped");
             assert_eq!(
                 buffer.path,
@@ -1502,12 +1516,12 @@ mod tree_ops_regression_tests {
         assert!(repo.path().join("lib/main.rs").exists());
         app.read_with(cx, |app, _| {
             assert_eq!(
-                app.open_files,
+                app.open_files().to_vec(),
                 vec![PathBuf::from("lib/main.rs"), PathBuf::from("lib/util.rs")],
                 "every tab under the renamed folder must follow it"
             );
-            assert!(app.edit_buffers.contains_key(Path::new("lib/util.rs")));
-            assert!(!app.edit_buffers.contains_key(Path::new("src/util.rs")));
+            assert!(app.edit_buffer_contains(Path::new("lib/util.rs")));
+            assert!(!app.edit_buffer_contains(Path::new("src/util.rs")));
             assert!(
                 app.expanded_dirs.contains(&repo.path().join("lib"))
                     && !app.expanded_dirs.contains(&repo.path().join("src")),
@@ -1582,10 +1596,10 @@ mod tree_ops_regression_tests {
         );
         app.read_with(cx, |app, _| {
             assert!(
-                !app.open_files.contains(&PathBuf::from("src/util.rs")),
+                !app.open_files().contains(&PathBuf::from("src/util.rs")),
                 "the deleted file's tab must not survive it"
             );
-            assert!(!app.edit_buffers.contains_key(Path::new("src/util.rs")));
+            assert!(!app.edit_buffer_contains(Path::new("src/util.rs")));
             assert!(app.tree_delete_confirm.is_none());
         });
     }
@@ -1683,8 +1697,8 @@ mod tree_ops_regression_tests {
         assert!(!source.exists());
         assert!(repo.path().join("dest/util.rs").exists());
         app.read_with(cx, |app, _| {
-            assert!(app.open_files.contains(&PathBuf::from("dest/util.rs")));
-            assert!(!app.edit_buffers.contains_key(Path::new("src/util.rs")));
+            assert!(app.open_files().contains(&PathBuf::from("dest/util.rs")));
+            assert!(!app.edit_buffer_contains(Path::new("src/util.rs")));
             assert!(
                 app.tree_clipboard.is_none(),
                 "a cut is consumed by its paste - a second paste would target a path that no \

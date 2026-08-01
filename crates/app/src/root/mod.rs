@@ -435,12 +435,18 @@ pub struct AdeApp {
     /// state that `Self::render_changes_header`'s progress bar and count read directly.
     pub(crate) reviewed_files: HashSet<PathBuf>,
     /// Ordered list of currently-open file tabs, rendered after every agent's own tab by
-    /// `Self::render_tab_strip`. No duplicates: opening an already-open file just activates its
-    /// existing entry (`Self::push_open_file`). Removed only on explicit tab close
-    /// (`Self::close_file_tab`) or leaving the owning worktree (`reset_per_worktree_ui_state`) -
-    /// these are worktree-relative paths, meaningless (or collision-prone) once the worktree
-    /// changes.
-    pub(crate) open_files: Vec<PathBuf>,
+    /// `Self::render_tab_strip` - **per worktree**, keyed by [`Self::file_tree_root`]
+    /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §3: "Switching worktrees
+    /// swaps the whole strip. Each worktree remembers its own ... open files"). No duplicates
+    /// within one worktree's list: opening an already-open file just activates its existing entry
+    /// (`Self::push_open_file`). Removed only on explicit tab close (`Self::close_file_tab`) -
+    /// **not** on a worktree switch: these are worktree-*relative* paths, which is exactly why a
+    /// flat, unscoped list would be collision-prone (two worktrees sharing a relative path) if it
+    /// weren't split per worktree like this. Read through [`Self::open_files`] (a method, not this
+    /// field, outside this struct) and written through [`Self::open_files_mut`] - both resolve the
+    /// *current* worktree's entry, creating it empty on first access rather than requiring a
+    /// separate "new worktree" seeding step.
+    pub(crate) open_files_by_worktree: HashMap<PathBuf, Vec<PathBuf>>,
     /// Which file tab (if any) the centre pane is showing instead of an agent -
     /// `Some(path)` iff `path` is also in [`Self::open_files`]. Set by a Changes row
     /// (`Self::open_change_diff`), a Files-tree row (`Self::open_file_view`), or an already-open
@@ -572,25 +578,39 @@ pub struct AdeApp {
     /// [`Self::ensure_blame_commit_message`]), off-thread.
     pub(crate) blame_commit_messages: HashMap<String, CommitMessageState>,
     pub(crate) _blame_message_tasks: HashMap<String, Task<()>>,
-    /// Real, live per-tab text-editing state for the File view (Revision R8.5a) - keyed the same
-    /// way as [`Self::open_files`] (a worktree-relative path), so switching between open file
-    /// tabs never loses unsaved edits in a background tab. Created lazily the first time a file
-    /// is opened in File view (see
+    /// Real, live per-tab text-editing state for the File view (Revision R8.5a) - keyed by
+    /// **both** the owning worktree ([`Self::file_tree_root`] at the time the buffer was created)
+    /// and the worktree-relative path, exactly like [`Self::open_files_by_worktree`]'s own outer
+    /// key, so an unsaved edit survives a worktree switch away and back
+    /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §1/§3) and two worktrees that
+    /// happen to share a relative path can never merge or overwrite each other's in-memory
+    /// content. Created lazily the first time a file is opened in File view (see
     /// [`crate::code_surface::file_view::AdeApp::render_file_view`]), seeded from the exact same
     /// background read [`Self::spawn_file_load`] already performs. [`Self::file_view_cache`]
     /// stays the freshness-check/diagnostics/hover source of truth (the last-*saved* snapshot,
     /// per this phase's own scope); this map is what's actually on screen and what an explicit
     /// save writes. Deliberately **not** removed on an ordinary tab close
-    /// ([`crate::code_surface::tabs::AdeApp::close_file_tab`]) - dropping unsaved edits just
-    /// because a tab was closed (with no "save before closing?" prompt - out of scope this
-    /// phase) would be a real, silent data-loss risk; reopening the same file later restores the
-    /// exact in-memory buffer. Reset alongside `open_files` in `reset_per_worktree_ui_state` so a
-    /// worktree switch doesn't leak another worktree's buffers, matching the same
-    /// per-worktree-reset convention `open_files` already follows. (Editor zoom used to be
-    /// reset the same way too - see `settings_store`'s "Editor zoom is one global, persisted
-    /// number now" docs for why it no longer is: it moved to `Settings.appearance.
-    /// editor_zoom_percent`, a real persisted field, not per-worktree UI state.)
-    pub(crate) edit_buffers: HashMap<PathBuf, edit_buffer::EditBuffer>,
+    /// ([`crate::code_surface::tabs::AdeApp::close_file_tab`]) **or** a worktree switch -
+    /// dropping unsaved edits just because a tab was closed or a different worktree was clicked
+    /// (with no "save before closing?"/"discard this edit?" prompt - the design's own explicit
+    /// call: fluidly hopping between worktrees must never carry that friction) would be a real,
+    /// silent data-loss risk; reopening the same file (in the same worktree) later restores the
+    /// exact in-memory buffer. Read through [`Self::edit_buffer`]/written through
+    /// [`Self::edit_buffer_mut`]/[`Self::insert_edit_buffer`]/[`Self::remove_edit_buffer`] for
+    /// every *synchronous* call site (these resolve the worktree half of the key from whatever
+    /// [`Self::file_tree_root`] is right now); a real `cx.spawn` task that reads or writes a
+    /// buffer *after* an `.await` must instead go through [`Self::edit_buffer_at`]/
+    /// [`Self::edit_buffer_at_mut`] with a `cwd` captured **before** the await - by the time such
+    /// a task resumes, [`Self::file_tree_root`] may already name a different worktree entirely
+    /// (the user switched away while the task was in flight), and resolving the key from the
+    /// *current* one at that point would silently read or write the wrong worktree's buffer -
+    /// exactly the stale-async-task bug class `Self::load_file_tree`'s own `file_tree_root`
+    /// identity guard exists to prevent, applied here to a keyed map instead of a single field.
+    /// (Editor zoom used to be reset on a worktree switch too - see `settings_store`'s "Editor
+    /// zoom is one global, persisted number now" docs for why it no longer is: it moved to
+    /// `Settings.appearance.editor_zoom_percent`, a real persisted field, not per-worktree UI
+    /// state.)
+    pub(crate) edit_buffers: HashMap<(PathBuf, PathBuf), edit_buffer::EditBuffer>,
     /// Every visible File-view row's real painted bounds and shaped line, captured by
     /// `crate::code_surface::editing`'s per-row `gpui::canvas` paint callback each render - read back by
     /// a row's own click handler to hit-test a click into a real byte offset

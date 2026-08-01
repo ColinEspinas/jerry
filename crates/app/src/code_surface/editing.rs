@@ -146,14 +146,14 @@ impl AdeApp {
 
     pub(crate) fn active_edit_buffer(&self) -> Option<&EditBuffer> {
         match self.active_edit_target()? {
-            EditTarget::File(path) => self.edit_buffers.get(&path),
+            EditTarget::File(path) => self.edit_buffer(&path),
             EditTarget::Merge => self.merge_edit.as_ref().map(|edit| &edit.buffer),
         }
     }
 
     fn active_edit_buffer_mut(&mut self) -> Option<&mut EditBuffer> {
         match self.active_edit_target()? {
-            EditTarget::File(path) => self.edit_buffers.get_mut(&path),
+            EditTarget::File(path) => self.edit_buffer_mut(&path),
             EditTarget::Merge => self.merge_edit.as_mut().map(|edit| &mut edit.buffer),
         }
     }
@@ -166,7 +166,7 @@ impl AdeApp {
     pub(crate) fn sync_cursor_and_scroll(&mut self) {
         match self.active_edit_target() {
             Some(EditTarget::File(path)) => {
-                let Some(buffer) = self.edit_buffers.get(&path) else {
+                let Some(buffer) = self.edit_buffer(&path) else {
                     return;
                 };
                 let (line, _) = buffer.line_col_for_offset(buffer.cursor_offset());
@@ -192,7 +192,7 @@ impl AdeApp {
     /// (cancels) whatever earlier debounce timer for the same path was still waiting, so only the
     /// most recent keystroke's timer ever actually fires - real debounce, not a queue.
     pub(crate) fn schedule_rehighlight(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let Some(buffer) = self.edit_buffers.get(&path) else {
+        let Some(buffer) = self.edit_buffer(&path) else {
             return;
         };
         if !buffer.highlight_dirty {
@@ -203,12 +203,16 @@ impl AdeApp {
             // "no highlighter -> plain text" behavior) - the plain rebuild already done by
             // `EditBuffer::rebuild_plain` is the final, correct rendering; just clear the flag
             // rather than debouncing work that would never run.
-            if let Some(buffer) = self.edit_buffers.get_mut(&path) {
+            if let Some(buffer) = self.edit_buffer_mut(&path) {
                 buffer.highlight_dirty = false;
             }
             return;
         };
         let content_snapshot = buffer.content.clone();
+        // Captured now (synchronously, before the real debounce timer below) rather than
+        // re-read from `self.file_tree_root` once this task resumes - see `AdeApp::
+        // edit_buffers`'s own docs for the stale-worktree bug class this prevents.
+        let cwd = self.file_tree_root.clone();
         let task = cx.spawn({
             let path = path.clone();
             let content_snapshot = content_snapshot.clone();
@@ -225,7 +229,7 @@ impl AdeApp {
                     })
                     .await;
                 let _ = this.update(cx, |this, cx| {
-                    if let Some(buffer) = this.edit_buffers.get_mut(&path) {
+                    if let Some(buffer) = this.edit_buffer_at_mut(&cwd, &path) {
                         if buffer.apply_highlight(&content_snapshot, lines) {
                             cx.notify();
                         }
@@ -250,12 +254,12 @@ impl AdeApp {
         // for a different bug class.
         match self.active_edit_target() {
             Some(EditTarget::File(path)) => {
-                let Some(buffer) = self.edit_buffers.get_mut(&path) else {
+                let Some(buffer) = self.edit_buffer_mut(&path) else {
                     return;
                 };
                 buffer.backspace();
                 self.schedule_rehighlight(path.clone(), cx);
-                self.schedule_lsp_sync(path, cx);
+                self.schedule_lsp_sync(self.file_tree_root.clone(), path, cx);
             }
             Some(EditTarget::Merge) => {
                 let Some(edit) = self.merge_edit.as_mut() else {
@@ -280,12 +284,12 @@ impl AdeApp {
         // `EditBuffer::delete_forward` for the same real reason.
         match self.active_edit_target() {
             Some(EditTarget::File(path)) => {
-                let Some(buffer) = self.edit_buffers.get_mut(&path) else {
+                let Some(buffer) = self.edit_buffer_mut(&path) else {
                     return;
                 };
                 buffer.delete_forward();
                 self.schedule_rehighlight(path.clone(), cx);
-                self.schedule_lsp_sync(path, cx);
+                self.schedule_lsp_sync(self.file_tree_root.clone(), path, cx);
             }
             Some(EditTarget::Merge) => {
                 let Some(edit) = self.merge_edit.as_mut() else {
@@ -575,13 +579,13 @@ impl AdeApp {
         let unit = indent::indent_unit(settings);
         let changed = match self.active_edit_target() {
             Some(EditTarget::File(path)) => {
-                let Some(buffer) = self.edit_buffers.get_mut(&path) else {
+                let Some(buffer) = self.edit_buffer_mut(&path) else {
                     return;
                 };
                 let changed = buffer.indent_lines(&unit);
                 if changed {
                     self.schedule_rehighlight(path.clone(), cx);
-                    self.schedule_lsp_sync(path, cx);
+                    self.schedule_lsp_sync(self.file_tree_root.clone(), path, cx);
                 }
                 changed
             }
@@ -614,13 +618,13 @@ impl AdeApp {
         let settings = self.resolved_indent_settings_for_target();
         let changed = match self.active_edit_target() {
             Some(EditTarget::File(path)) => {
-                let Some(buffer) = self.edit_buffers.get_mut(&path) else {
+                let Some(buffer) = self.edit_buffer_mut(&path) else {
                     return;
                 };
                 let changed = buffer.dedent_lines(settings.tab_width);
                 if changed {
                     self.schedule_rehighlight(path.clone(), cx);
-                    self.schedule_lsp_sync(path, cx);
+                    self.schedule_lsp_sync(self.file_tree_root.clone(), path, cx);
                 }
                 changed
             }
@@ -653,7 +657,7 @@ impl AdeApp {
             tab_width: self.settings.editor.tab_width,
         };
         match self.active_edit_target() {
-            Some(EditTarget::File(path)) => match self.edit_buffers.get(&path) {
+            Some(EditTarget::File(path)) => match self.edit_buffer(&path) {
                 Some(buffer) => indent::indent_settings_for_path(
                     &buffer.path,
                     &self.file_tree_root,
@@ -835,7 +839,7 @@ impl AdeApp {
     fn step_edit_history(&mut self, cx: &mut Context<Self>, undo: bool) {
         match self.active_edit_target() {
             Some(EditTarget::File(path)) => {
-                let Some(buffer) = self.edit_buffers.get_mut(&path) else {
+                let Some(buffer) = self.edit_buffer_mut(&path) else {
                     return;
                 };
                 let changed = if undo { buffer.undo() } else { buffer.redo() };
@@ -846,7 +850,7 @@ impl AdeApp {
                 // meaningless - the same reasoning `Self::move_active_buffer` already applies.
                 self.dismiss_completions();
                 self.schedule_rehighlight(path.clone(), cx);
-                self.schedule_lsp_sync(path, cx);
+                self.schedule_lsp_sync(self.file_tree_root.clone(), path, cx);
             }
             Some(EditTarget::Merge) => {
                 let Some(edit) = self.merge_edit.as_mut() else {
@@ -911,7 +915,7 @@ impl AdeApp {
         let Some(path) = self.active_editable_path() else {
             return;
         };
-        let Some(buffer) = self.edit_buffers.get(&path) else {
+        let Some(buffer) = self.edit_buffer(&path) else {
             return;
         };
 
@@ -982,7 +986,7 @@ impl AdeApp {
         let Some(path) = self.active_editable_path() else {
             return;
         };
-        let Some(buffer) = self.edit_buffers.get(&path) else {
+        let Some(buffer) = self.edit_buffer(&path) else {
             return;
         };
         if !buffer.is_dirty() {
@@ -1006,7 +1010,13 @@ impl AdeApp {
             return;
         }
         self.file_save_running.insert(path.clone());
-        self.spawn_file_save_loop(path, cx);
+        // Captured now (synchronously - `enqueue_save` is only ever reached from a real
+        // keystroke/action handler) rather than re-read from `self.file_tree_root` inside the
+        // loop below, which spans real `.await`s and so could otherwise resolve against whatever
+        // worktree the user has since switched to. See `AdeApp::edit_buffers`'s own docs for the
+        // stale-worktree bug class this prevents.
+        let cwd = self.file_tree_root.clone();
+        self.spawn_file_save_loop(cwd, path, cx);
     }
 
     /// The real serial writer loop for one path - see [`AdeApp::save_active_file`]'s docs. Reads
@@ -1017,18 +1027,20 @@ impl AdeApp {
     /// [`AdeApp::file_save_running`] must be cleared on *every* real exit path from the loop
     /// below, not just one of them - a real, if previously only latent, bug an audit caught: an
     /// earlier version only cleared it in the "no pending save left" branch, so a pending save
-    /// whose [`AdeApp::edit_buffers`] entry vanished before this loop got to check it (currently
-    /// only reachable via `state::reset_per_worktree_ui_state`, which happens to clear
-    /// `file_save_running` too today - so this was latent, not live, but one future refactor away
-    /// from becoming real) left `file_save_running` stuck containing that path forever, since the
-    /// closure below returned `None` without clearing it and the loop broke on exactly that
-    /// `None`. [`Self::enqueue_save`] then treats any path still in `file_save_running` as "a
-    /// writer loop is already alive for it" and silently no-ops every future save for that path -
+    /// whose [`AdeApp::edit_buffers`] entry vanished before this loop got to check it (a real,
+    /// live path - `crate::sidebar::tree_ops::AdeApp::forget_deleted_paths` really does remove a
+    /// deleted file's buffer entry via `edit_buffers.retain`, and a save can genuinely still be
+    /// pending for it at that moment; also directly simulated in this module's own tests via the
+    /// test-only `AdeApp::remove_edit_buffer`) left `file_save_running` stuck containing that path
+    /// forever, since the closure below returned `None` without clearing it and the loop broke on
+    /// exactly that `None`. [`Self::enqueue_save`] then treats any path still in
+    /// `file_save_running` as "a writer loop is already alive for it" and silently no-ops every
+    /// future save for that path -
     /// a real, silent, permanent, data-loss-adjacent failure the user would have no way to notice
     /// (Ctrl+S would appear to do nothing, forever, for that one file). Restructured so there is
     /// exactly one real place this flag is set ([`Self::enqueue_save`]) and every `None`-producing
     /// branch here clears it before returning `None`, impossible to desync.
-    fn spawn_file_save_loop(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    fn spawn_file_save_loop(&mut self, cwd: PathBuf, path: PathBuf, cx: &mut Context<Self>) {
         let task = cx.spawn({
             let path = path.clone();
             async move |this, cx| {
@@ -1038,7 +1050,7 @@ impl AdeApp {
                             this.file_save_running.remove(&path);
                             return None;
                         }
-                        match this.edit_buffers.get(&path) {
+                        match this.edit_buffer_at(&cwd, &path) {
                             Some(buffer) => Some((buffer.path.clone(), buffer.content.clone())),
                             None => {
                                 // The buffer vanished while a save was still pending for it -
@@ -1074,7 +1086,7 @@ impl AdeApp {
                     let _ = this.update(cx, |this, cx| {
                         match write_result {
                             Ok((mtime, len, written_content)) => {
-                                if let Some(buffer) = this.edit_buffers.get_mut(&path) {
+                                if let Some(buffer) = this.edit_buffer_at_mut(&cwd, &path) {
                                     buffer.mark_saved(written_content, mtime, len);
                                 }
                                 this.file_save_error = None;
@@ -1160,13 +1172,13 @@ impl EntityInputHandler for AdeApp {
     ) {
         match self.active_edit_target() {
             Some(EditTarget::File(path)) => {
-                let Some(buffer) = self.edit_buffers.get_mut(&path) else {
+                let Some(buffer) = self.edit_buffer_mut(&path) else {
                     return;
                 };
                 let range = range_utf16.map(|range_utf16| buffer.range_from_utf16(&range_utf16));
                 buffer.replace_range(range, text);
                 self.schedule_rehighlight(path.clone(), cx);
-                self.schedule_lsp_sync(path, cx);
+                self.schedule_lsp_sync(self.file_tree_root.clone(), path, cx);
             }
             Some(EditTarget::Merge) => {
                 let Some(edit) = self.merge_edit.as_mut() else {
@@ -1193,13 +1205,13 @@ impl EntityInputHandler for AdeApp {
     ) {
         match self.active_edit_target() {
             Some(EditTarget::File(path)) => {
-                let Some(buffer) = self.edit_buffers.get_mut(&path) else {
+                let Some(buffer) = self.edit_buffer_mut(&path) else {
                     return;
                 };
                 let range = range_utf16.map(|range_utf16| buffer.range_from_utf16(&range_utf16));
                 buffer.replace_and_mark_range(range, new_text, new_selected_range_utf16);
                 self.schedule_rehighlight(path.clone(), cx);
-                self.schedule_lsp_sync(path, cx);
+                self.schedule_lsp_sync(self.file_tree_root.clone(), path, cx);
             }
             Some(EditTarget::Merge) => {
                 let Some(edit) = self.merge_edit.as_mut() else {
@@ -1226,7 +1238,7 @@ impl EntityInputHandler for AdeApp {
     ) -> Option<Bounds<Pixels>> {
         match self.active_edit_target()? {
             EditTarget::File(path) => {
-                let buffer = self.edit_buffers.get(&path)?;
+                let buffer = self.edit_buffer(&path)?;
                 let (last_path, last_line) = self.file_view_last_layout_for.clone()?;
                 if last_path != path {
                     return None;
@@ -1260,7 +1272,7 @@ impl EntityInputHandler for AdeApp {
     ) -> Option<usize> {
         match self.active_edit_target()? {
             EditTarget::File(path) => {
-                let buffer = self.edit_buffers.get(&path)?;
+                let buffer = self.edit_buffer(&path)?;
                 let (last_path, last_line) = self.file_view_last_layout_for.clone()?;
                 if last_path != path {
                     return None;
@@ -1750,7 +1762,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 // real double-lease, and GPUI's `EntityMap::read` panics on exactly that
                 // (confirmed live: "cannot read app::root::AdeApp while it is already being
                 // updated") - every real left-click on an editable row hit this, unconditionally.
-                let Some(buffer) = this.edit_buffers.get(&row_path) else {
+                let Some(buffer) = this.edit_buffer(&row_path) else {
                     return;
                 };
                 let Some(line_range) = buffer.line_ranges.get(click_line_index).cloned() else {
@@ -1770,7 +1782,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 // no longer describes - see `Self::move_active_buffer`'s own docs for the same
                 // real dismiss-on-caret-move reasoning.
                 this.dismiss_completions();
-                if let Some(buffer) = this.edit_buffers.get_mut(&row_path) {
+                if let Some(buffer) = this.edit_buffer_mut(&row_path) {
                     // Alt+click (Revision R13, issue #28): adds a brand-new cursor at the click
                     // point, keeping every existing real cursor - `EditBuffer::add_cursor_at`'s
                     // own docs. Checked first, before the click-count/shift chain below, so an
@@ -1853,14 +1865,14 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                     return;
                 };
                 let local_offset = shaped.closest_index_for_x(local_point.x);
-                let Some(buffer) = this.edit_buffers.get(&drag_row_path) else {
+                let Some(buffer) = this.edit_buffer(&drag_row_path) else {
                     return;
                 };
                 let Some(line_range) = buffer.line_ranges.get(click_line_index).cloned() else {
                     return;
                 };
                 let absolute_offset = line_range.start + local_offset;
-                let Some(buffer) = this.edit_buffers.get_mut(&drag_row_path) else {
+                let Some(buffer) = this.edit_buffer_mut(&drag_row_path) else {
                     return;
                 };
                 buffer.select_to(absolute_offset);
@@ -2247,8 +2259,7 @@ mod editing_tests {
         });
 
         let content = app.read_with(cx, |app, _| {
-            app.edit_buffers
-                .get(&relative)
+            app.edit_buffer(&relative)
                 .expect("buffer should exist")
                 .content
                 .clone()
@@ -2256,7 +2267,7 @@ mod editing_tests {
         assert_eq!(content, "fn foo(x: i32) {}\n");
 
         let (dirty_immediately, kinds_immediately) = app.read_with(cx, |app, _| {
-            let buffer = app.edit_buffers.get(&relative).expect("buffer");
+            let buffer = app.edit_buffer(&relative).expect("buffer");
             (
                 buffer.highlight_dirty,
                 buffer.lines[0]
@@ -2282,7 +2293,7 @@ mod editing_tests {
         cx.run_until_parked();
 
         let (dirty_after, kinds_after) = app.read_with(cx, |app, _| {
-            let buffer = app.edit_buffers.get(&relative).expect("buffer");
+            let buffer = app.edit_buffer(&relative).expect("buffer");
             (
                 buffer.highlight_dirty,
                 buffer.lines[0]
@@ -2319,8 +2330,7 @@ mod editing_tests {
 
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .selected_range
                 .clone()),
@@ -2330,11 +2340,7 @@ mod editing_tests {
         cx.simulate_keystrokes("right right right");
 
         let selected = app.read_with(cx, |app, _| {
-            app.edit_buffers
-                .get(&relative)
-                .unwrap()
-                .selected_range
-                .clone()
+            app.edit_buffer(&relative).unwrap().selected_range.clone()
         });
         assert_eq!(
             selected,
@@ -2345,11 +2351,7 @@ mod editing_tests {
 
         cx.simulate_keystrokes("left");
         let selected = app.read_with(cx, |app, _| {
-            app.edit_buffers
-                .get(&relative)
-                .unwrap()
-                .selected_range
-                .clone()
+            app.edit_buffer(&relative).unwrap().selected_range.clone()
         });
         assert_eq!(
             selected,
@@ -2372,11 +2374,7 @@ mod editing_tests {
         cx.simulate_keystrokes("shift-right shift-right shift-right");
 
         let selected = app.read_with(cx, |app, _| {
-            app.edit_buffers
-                .get(&relative)
-                .unwrap()
-                .selected_range
-                .clone()
+            app.edit_buffer(&relative).unwrap().selected_range.clone()
         });
         assert_eq!(
             selected,
@@ -2408,11 +2406,7 @@ mod editing_tests {
         cx.simulate_keystrokes(select_word_right);
 
         let selected = app.read_with(cx, |app, _| {
-            app.edit_buffers
-                .get(&relative)
-                .unwrap()
-                .selected_range
-                .clone()
+            app.edit_buffer(&relative).unwrap().selected_range.clone()
         });
         assert_eq!(
             selected,
@@ -2429,7 +2423,7 @@ mod editing_tests {
         };
         cx.simulate_keystrokes(word_left);
         let cursor = app.read_with(cx, |app, _| {
-            app.edit_buffers.get(&relative).unwrap().cursor_offset()
+            app.edit_buffer(&relative).unwrap().cursor_offset()
         });
         assert_eq!(
             cursor, 0,
@@ -2469,7 +2463,7 @@ mod editing_tests {
         });
 
         let selected_text = app.read_with(cx, |app, _| {
-            let buffer = app.edit_buffers.get(&relative).unwrap();
+            let buffer = app.edit_buffer(&relative).unwrap();
             buffer.content[buffer.selected_range.clone()].to_string()
         });
         assert_eq!(
@@ -2487,7 +2481,7 @@ mod editing_tests {
         });
 
         let selected_text = app.read_with(cx, |app, _| {
-            let buffer = app.edit_buffers.get(&relative).unwrap();
+            let buffer = app.edit_buffer(&relative).unwrap();
             buffer.content[buffer.selected_range.clone()].to_string()
         });
         assert_eq!(
@@ -2522,7 +2516,7 @@ mod editing_tests {
 
         // A real selection on line 1 (offsets 0..4, "line").
         app.update(cx, |app, cx| {
-            let buffer = app.edit_buffers.get_mut(&relative).unwrap();
+            let buffer = app.edit_buffer_mut(&relative).unwrap();
             buffer.move_to(0);
             buffer.select_to(4);
             cx.notify();
@@ -2531,8 +2525,7 @@ mod editing_tests {
 
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .selection_within_line(0)),
             Some(0..4),
@@ -2574,8 +2567,7 @@ mod editing_tests {
 
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .selection_within_line(0)),
             Some(0..4),
@@ -2602,17 +2594,13 @@ mod editing_tests {
         let relative = PathBuf::from("sample.txt");
 
         app.update(cx, |app, cx| {
-            app.edit_buffers.get_mut(&relative).unwrap().move_to(1);
+            app.edit_buffer_mut(&relative).unwrap().move_to(1);
             cx.notify();
         });
 
         cx.simulate_keystrokes("ctrl-d");
         let after_first = app.read_with(cx, |app, _| {
-            app.edit_buffers
-                .get(&relative)
-                .unwrap()
-                .selected_range
-                .clone()
+            app.edit_buffer(&relative).unwrap().selected_range.clone()
         });
         assert_eq!(
             after_first,
@@ -2622,7 +2610,7 @@ mod editing_tests {
 
         cx.simulate_keystrokes("ctrl-d");
         let cursor_count = app.read_with(cx, |app, _| {
-            app.edit_buffers.get(&relative).unwrap().cursor_count()
+            app.edit_buffer(&relative).unwrap().cursor_count()
         });
         assert_eq!(
             cursor_count, 2,
@@ -2633,7 +2621,7 @@ mod editing_tests {
             app.replace_text_in_range(None, "x", window, cx);
         });
         let content = app.read_with(cx, |app, _| {
-            app.edit_buffers.get(&relative).unwrap().content.clone()
+            app.edit_buffer(&relative).unwrap().content.clone()
         });
         assert_eq!(
             content, "x + x\n",
@@ -2654,14 +2642,14 @@ mod editing_tests {
         let relative = PathBuf::from("sample.txt");
 
         app.update(cx, |app, cx| {
-            app.edit_buffers.get_mut(&relative).unwrap().move_to(1);
+            app.edit_buffer_mut(&relative).unwrap().move_to(1);
             cx.notify();
         });
 
         cx.simulate_keystrokes("ctrl-shift-l");
 
         let cursor_count = app.read_with(cx, |app, _| {
-            app.edit_buffers.get(&relative).unwrap().cursor_count()
+            app.edit_buffer(&relative).unwrap().cursor_count()
         });
         assert_eq!(
             cursor_count, 3,
@@ -2684,7 +2672,7 @@ mod editing_tests {
         let relative = PathBuf::from("sample.txt");
 
         app.update(cx, |app, cx| {
-            app.edit_buffers.get_mut(&relative).unwrap().move_to(1);
+            app.edit_buffer_mut(&relative).unwrap().move_to(1);
             cx.notify();
         });
         cx.simulate_keystrokes("ctrl-d"); // selects the first "value"
@@ -2692,7 +2680,7 @@ mod editing_tests {
         cx.simulate_keystrokes("ctrl-k ctrl-d");
 
         let (cursor_count, selected) = app.read_with(cx, |app, _| {
-            let buffer = app.edit_buffers.get(&relative).unwrap();
+            let buffer = app.edit_buffer(&relative).unwrap();
             (buffer.cursor_count(), buffer.selected_range.clone())
         });
         assert_eq!(cursor_count, 1, "skip must not add a cursor");
@@ -2711,15 +2699,14 @@ mod editing_tests {
         let relative = PathBuf::from("sample.txt");
 
         app.update(cx, |app, cx| {
-            app.edit_buffers.get_mut(&relative).unwrap().move_to(1);
+            app.edit_buffer_mut(&relative).unwrap().move_to(1);
             cx.notify();
         });
         cx.simulate_keystrokes("ctrl-d");
         cx.simulate_keystrokes("ctrl-d");
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .cursor_count()),
             2
@@ -2729,8 +2716,7 @@ mod editing_tests {
 
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .cursor_count()),
             1,
@@ -2751,15 +2737,14 @@ mod editing_tests {
         let relative = PathBuf::from("sample.txt");
 
         app.update(cx, |app, cx| {
-            app.edit_buffers.get_mut(&relative).unwrap().move_to(2);
+            app.edit_buffer_mut(&relative).unwrap().move_to(2);
             cx.notify();
         });
 
         cx.simulate_keystrokes("backspace");
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .content
                 .clone()),
@@ -2769,8 +2754,7 @@ mod editing_tests {
         cx.simulate_keystrokes("delete");
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .content
                 .clone()),
@@ -2792,11 +2776,7 @@ mod editing_tests {
         app.update_in(cx, |app, window, cx| {
             app.replace_text_in_range(None, "well ", window, cx);
         });
-        assert!(app.read_with(cx, |app, _| app
-            .edit_buffers
-            .get(&relative)
-            .unwrap()
-            .is_dirty()));
+        assert!(app.read_with(cx, |app, _| app.edit_buffer(&relative).unwrap().is_dirty()));
 
         let secondary_s = if cfg!(target_os = "macos") {
             "cmd-s"
@@ -2812,11 +2792,7 @@ mod editing_tests {
             "the real file on disk should hold the real edit"
         );
         assert!(
-            !app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
-                .unwrap()
-                .is_dirty()),
+            !app.read_with(cx, |app, _| app.edit_buffer(&relative).unwrap().is_dirty()),
             "the dirty flag should be cleared by a successful real save"
         );
         assert!(app.read_with(cx, |app, _| app.file_save_error.is_none()));
@@ -2841,11 +2817,7 @@ mod editing_tests {
         app.update_in(cx, |app, window, cx| {
             app.replace_text_in_range(None, "edited ", window, cx);
         });
-        assert!(app.read_with(cx, |app, _| app
-            .edit_buffers
-            .get(&relative)
-            .unwrap()
-            .is_dirty()));
+        assert!(app.read_with(cx, |app, _| app.edit_buffer(&relative).unwrap().is_dirty()));
 
         // A real external change, bypassing this app entirely.
         std::fs::write(&file_path, "changed on disk, a completely different size\n")
@@ -2876,11 +2848,7 @@ mod editing_tests {
             "save must refuse rather than silently overwrite the real external change"
         );
         assert!(
-            app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
-                .unwrap()
-                .is_dirty()),
+            app.read_with(cx, |app, _| app.edit_buffer(&relative).unwrap().is_dirty()),
             "the user's own real unsaved edit must not have been silently discarded either"
         );
         assert!(app.read_with(cx, |app, _| app.file_save_error.is_some()));
@@ -2909,11 +2877,7 @@ mod editing_tests {
 
         assert!(app.read_with(cx, |app, _| app.file_save_error.is_none()));
         assert!(!app.read_with(cx, |app, _| app.file_external_conflict.contains(&relative)));
-        assert!(!app.read_with(cx, |app, _| app
-            .edit_buffers
-            .get(&relative)
-            .unwrap()
-            .is_dirty()));
+        assert!(!app.read_with(cx, |app, _| app.edit_buffer(&relative).unwrap().is_dirty()));
         let on_disk = std::fs::read_to_string(&file_path).expect("read back");
         assert_eq!(on_disk, "well hello\n");
     }
@@ -2988,7 +2952,7 @@ mod editing_tests {
         let relative = PathBuf::from("sample.txt");
 
         app.update(cx, |app, cx| {
-            app.edit_buffers.get_mut(&relative).unwrap().move_to(1);
+            app.edit_buffer_mut(&relative).unwrap().move_to(1);
             cx.notify();
         });
 
@@ -2997,7 +2961,7 @@ mod editing_tests {
         });
 
         let (content, marked) = app.read_with(cx, |app, _| {
-            let buffer = app.edit_buffers.get(&relative).unwrap();
+            let buffer = app.edit_buffer(&relative).unwrap();
             (buffer.content.clone(), buffer.marked_range.clone())
         });
         assert_eq!(content, "anb\n");
@@ -3011,7 +2975,7 @@ mod editing_tests {
             app.unmark_text(window, cx);
         });
         let (content_after, marked_after) = app.read_with(cx, |app, _| {
-            let buffer = app.edit_buffers.get(&relative).unwrap();
+            let buffer = app.edit_buffer(&relative).unwrap();
             (buffer.content.clone(), buffer.marked_range.clone())
         });
         assert_eq!(
@@ -3080,8 +3044,7 @@ mod editing_tests {
         // buggy handler that *did* fire against the wrong file would show up here as a real,
         // unexpected `EditBuffer` entry.
         assert!(app.read_with(cx, |app, _| !app
-            .edit_buffers
-            .contains_key(&PathBuf::from("sample.rs"))));
+            .edit_buffer_contains(&PathBuf::from("sample.rs"))));
         assert!(app.read_with(cx, |app, _| app.file_save_error.is_none()));
     }
 
@@ -3145,7 +3108,7 @@ mod editing_tests {
         cx.run_until_parked();
 
         let (cursor_line, selected_range) = app.read_with(cx, |app, _| {
-            let buffer = app.edit_buffers.get(&relative).expect("buffer");
+            let buffer = app.edit_buffer(&relative).expect("buffer");
             (
                 buffer.line_col_for_offset(buffer.cursor_offset()).0,
                 buffer.selected_range.clone(),
@@ -3201,7 +3164,7 @@ mod editing_tests {
         cx.run_until_parked();
 
         let (cursor_line, cursor_col) = app.read_with(cx, |app, _| {
-            let buffer = app.edit_buffers.get(&relative).expect("buffer");
+            let buffer = app.edit_buffer(&relative).expect("buffer");
             buffer.line_col_for_offset(buffer.cursor_offset())
         });
         assert_eq!(
@@ -3246,7 +3209,7 @@ mod editing_tests {
         cx.run_until_parked();
 
         let (cursor_line, cursor_col) = app.read_with(cx, |app, _| {
-            let buffer = app.edit_buffers.get(&relative).expect("buffer");
+            let buffer = app.edit_buffer(&relative).expect("buffer");
             buffer.line_col_for_offset(buffer.cursor_offset())
         });
         assert_eq!(
@@ -3289,11 +3252,11 @@ mod editing_tests {
         cx.run_until_parked();
 
         let expected_end = app.read_with(cx, |app, _| {
-            let buffer = app.edit_buffers.get(&relative).expect("buffer");
+            let buffer = app.edit_buffer(&relative).expect("buffer");
             buffer.content.len()
         });
         let (cursor_offset, selected_range) = app.read_with(cx, |app, _| {
-            let buffer = app.edit_buffers.get(&relative).expect("buffer");
+            let buffer = app.edit_buffer(&relative).expect("buffer");
             (buffer.cursor_offset(), buffer.selected_range.clone())
         });
         assert_eq!(
@@ -3333,7 +3296,7 @@ mod editing_tests {
             "the file should have really loaded (read-only) with its real invalid-UTF-8 flag set"
         );
         assert!(
-            app.read_with(cx, |app, _| !app.edit_buffers.contains_key(&relative)),
+            app.read_with(cx, |app, _| !app.edit_buffer_contains(&relative)),
             "a file whose real bytes aren't valid UTF-8 must not get a real edit buffer - saving \
              one would silently corrupt the file with U+FFFD replacement characters"
         );
@@ -3399,11 +3362,7 @@ mod editing_tests {
              user's own edits"
         );
         assert!(
-            !app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
-                .unwrap()
-                .is_dirty()),
+            !app.read_with(cx, |app, _| app.edit_buffer(&relative).unwrap().is_dirty()),
             "a successful force-save should clear the real dirty flag"
         );
         assert!(
@@ -3446,11 +3405,7 @@ mod editing_tests {
         let relative = PathBuf::from("sample.txt");
 
         assert!(
-            !app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
-                .unwrap()
-                .is_dirty()),
+            !app.read_with(cx, |app, _| app.edit_buffer(&relative).unwrap().is_dirty()),
             "a freshly-opened buffer should start clean"
         );
         let mtime_before = std::fs::metadata(&file_path)
@@ -3506,7 +3461,7 @@ mod editing_tests {
         // The buffer vanishes before the (already-spawned, not-yet-polled) writer loop task gets
         // to check it.
         app.update(cx, |app, _cx| {
-            app.edit_buffers.remove(&relative);
+            app.remove_edit_buffer(&relative);
         });
         cx.run_until_parked();
 
@@ -3560,8 +3515,7 @@ mod editing_tests {
         let relative = PathBuf::from("sample.txt");
 
         app.update(cx, |app, cx| {
-            app.edit_buffers
-                .get_mut(&relative)
+            app.edit_buffer_mut(&relative)
                 .unwrap()
                 .move_to("prefix ".len());
             cx.notify();
@@ -3580,7 +3534,7 @@ mod editing_tests {
         });
 
         let (content, selected_range) = app.read_with(cx, |app, _| {
-            let buffer = app.edit_buffers.get(&relative).unwrap();
+            let buffer = app.edit_buffer(&relative).unwrap();
             (buffer.content.clone(), buffer.selected_range.clone())
         });
         assert_eq!(content, "prefix \u{65e5}\u{672c}\u{8a9e}ok\n");
@@ -3600,7 +3554,7 @@ mod editing_tests {
             app.replace_text_in_range(None, "!", window, cx);
         });
         let content_after = app.read_with(cx, |app, _| {
-            app.edit_buffers.get(&relative).unwrap().content.clone()
+            app.edit_buffer(&relative).unwrap().content.clone()
         });
         assert_eq!(content_after, "prefix \u{65e5}\u{672c}!\u{8a9e}ok\n");
     }
@@ -3628,7 +3582,7 @@ mod editing_tests {
         let relative = PathBuf::from("sample.rs");
 
         app.update(cx, |app, cx| {
-            app.edit_buffers.get_mut(&relative).unwrap().move_to(3);
+            app.edit_buffer_mut(&relative).unwrap().move_to(3);
             cx.notify();
         });
 
@@ -3636,8 +3590,7 @@ mod editing_tests {
 
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .content
                 .clone()),
@@ -3674,14 +3627,13 @@ mod editing_tests {
         // State 1: no popup open - `up`/`down`/`enter` must behave exactly like the plain
         // editor actions always have.
         app.update(cx, |app, cx| {
-            app.edit_buffers.get_mut(&relative).unwrap().move_to(1);
+            app.edit_buffer_mut(&relative).unwrap().move_to(1);
             cx.notify();
         });
         cx.simulate_keystrokes("down");
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .cursor_offset()),
             4,
@@ -3691,8 +3643,7 @@ mod editing_tests {
         cx.simulate_keystrokes("enter");
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .content
                 .clone()),
@@ -3718,10 +3669,10 @@ mod editing_tests {
         });
 
         let cursor_before = app.read_with(cx, |app, _| {
-            app.edit_buffers.get(&relative).unwrap().cursor_offset()
+            app.edit_buffer(&relative).unwrap().cursor_offset()
         });
         let content_before = app.read_with(cx, |app, _| {
-            app.edit_buffers.get(&relative).unwrap().content.clone()
+            app.edit_buffer(&relative).unwrap().content.clone()
         });
         cx.simulate_keystrokes("down");
         assert_eq!(
@@ -3742,8 +3693,7 @@ mod editing_tests {
         );
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .cursor_offset()),
             cursor_before,
@@ -3751,8 +3701,7 @@ mod editing_tests {
         );
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .content
                 .clone()),
@@ -3762,7 +3711,7 @@ mod editing_tests {
 
         cx.simulate_keystrokes("enter");
         let content_after_enter = app.read_with(cx, |app, _| {
-            app.edit_buffers.get(&relative).unwrap().content.clone()
+            app.edit_buffer(&relative).unwrap().content.clone()
         });
         assert!(
             content_after_enter.contains("beta"),
@@ -3787,7 +3736,7 @@ mod editing_tests {
             cx.notify();
         });
         let content_before_escape = app.read_with(cx, |app, _| {
-            app.edit_buffers.get(&relative).unwrap().content.clone()
+            app.edit_buffer(&relative).unwrap().content.clone()
         });
         cx.simulate_keystrokes("escape");
         assert!(
@@ -3796,8 +3745,7 @@ mod editing_tests {
         );
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .content
                 .clone()),
@@ -3839,7 +3787,7 @@ mod editing_tests {
             ),
         ] {
             app.update(cx, |app, cx| {
-                app.edit_buffers.get_mut(&relative).unwrap().move_to(1);
+                app.edit_buffer_mut(&relative).unwrap().move_to(1);
                 app.completions = Some(crate::lsp::completion_popup::CompletionsEntry {
                     path: relative.clone(),
                     status,
@@ -3856,11 +3804,11 @@ mod editing_tests {
             );
 
             let content_before = app.read_with(cx, |app, _| {
-                app.edit_buffers.get(&relative).unwrap().content.clone()
+                app.edit_buffer(&relative).unwrap().content.clone()
             });
             cx.simulate_keystrokes("enter");
             let content_after_enter = app.read_with(cx, |app, _| {
-                app.edit_buffers.get(&relative).unwrap().content.clone()
+                app.edit_buffer(&relative).unwrap().content.clone()
             });
             assert_ne!(
                 content_after_enter, content_before,
@@ -3878,7 +3826,7 @@ mod editing_tests {
             // re-seed a fresh `Loading`/`Failed` entry (the Enter above already dismissed the
             // previous one via `Self::move_active_buffer`'s own caret-move dismissal).
             app.update(cx, |app, cx| {
-                let buffer = app.edit_buffers.get_mut(&relative).unwrap();
+                let buffer = app.edit_buffer_mut(&relative).unwrap();
                 buffer.move_to(1);
                 let status = match label {
                     "Loading" => crate::lsp::completion_popup::CompletionsStatus::Loading,
@@ -3893,11 +3841,11 @@ mod editing_tests {
                 cx.notify();
             });
             let cursor_before_down = app.read_with(cx, |app, _| {
-                app.edit_buffers.get(&relative).unwrap().cursor_offset()
+                app.edit_buffer(&relative).unwrap().cursor_offset()
             });
             cx.simulate_keystrokes("down");
             let cursor_after_down = app.read_with(cx, |app, _| {
-                app.edit_buffers.get(&relative).unwrap().cursor_offset()
+                app.edit_buffer(&relative).unwrap().cursor_offset()
             });
             assert_ne!(
                 cursor_after_down, cursor_before_down,
@@ -3933,8 +3881,7 @@ mod editing_tests {
         relative: &Path,
     ) -> String {
         app.read_with(cx, |app, _| {
-            app.edit_buffers
-                .get(relative)
+            app.edit_buffer(relative)
                 .expect("buffer should exist")
                 .content
                 .clone()
@@ -3957,7 +3904,7 @@ mod editing_tests {
         cx.simulate_input("hello");
         assert_eq!(buffer_content(&app, cx, &relative), "helloab\ncd\n");
         let caret_after_typing = app.read_with(cx, |app, _| {
-            app.edit_buffers.get(&relative).unwrap().cursor_offset()
+            app.edit_buffer(&relative).unwrap().cursor_offset()
         });
         assert_eq!(caret_after_typing, 5);
 
@@ -3969,8 +3916,7 @@ mod editing_tests {
         );
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .cursor_offset()),
             0,
@@ -3981,8 +3927,7 @@ mod editing_tests {
         assert_eq!(buffer_content(&app, cx, &relative), "helloab\ncd\n");
         assert_eq!(
             app.read_with(cx, |app, _| app
-                .edit_buffers
-                .get(&relative)
+                .edit_buffer(&relative)
                 .unwrap()
                 .cursor_offset()),
             5,
@@ -4170,11 +4115,7 @@ mod editing_tests {
         });
         cx.run_until_parked();
         assert!(
-            app.read_with(cx, |app, _| !app
-                .edit_buffers
-                .get(&relative)
-                .unwrap()
-                .is_dirty()),
+            app.read_with(cx, |app, _| !app.edit_buffer(&relative).unwrap().is_dirty()),
             "sanity check: the buffer must really be clean before the external rewrite"
         );
 
@@ -4229,11 +4170,7 @@ mod editing_tests {
         let relative = PathBuf::from("sample.txt");
 
         cx.simulate_input("MINE");
-        assert!(app.read_with(cx, |app, _| app
-            .edit_buffers
-            .get(&relative)
-            .unwrap()
-            .is_dirty()));
+        assert!(app.read_with(cx, |app, _| app.edit_buffer(&relative).unwrap().is_dirty()));
 
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&file_path, "theirs\n").expect("external rewrite");
@@ -4262,6 +4199,121 @@ mod editing_tests {
             buffer_content(&app, cx, &relative),
             "original\n",
             "and the user's own undo history must be exactly as it was"
+        );
+    }
+
+    /// Real, live-reproduced coverage for `design_handoff_jerry_ade/revision 3/
+    /// REVISION-2026-07-31.md` §1 ("the open file tabs, the active tab ... the commit composer"
+    /// is worktree-scoped) and the coordinator's own explicit call-out: a user with an unsaved
+    /// edit open who switches worktrees must never lose it - real data loss, no confirm dialog,
+    /// nothing, was the bug. Drives two *real* worktrees (temp directories) that both have a file
+    /// at the identical relative path `sample.txt`, edits both with different, real unsaved
+    /// content, and proves: (1) each survives a switch away and back to its own worktree with the
+    /// buffer's real content and dirty flag intact, and (2) the two same-relative-path buffers
+    /// never merge or overwrite each other - the "worse than the current bug" collision risk the
+    /// coordinator flagged for `AdeApp::edit_buffers`'s composite `(worktree, path)` key.
+    #[gpui::test]
+    fn switching_worktrees_and_back_preserves_unsaved_edits_without_cross_worktree_collision(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = tempfile::tempdir().expect("tempdir a");
+        let repo_b = tempfile::tempdir().expect("tempdir b");
+        // Deliberately the *same* relative path in both worktrees - the real collision risk this
+        // test exists to rule out.
+        let file_a = write_file(repo_a.path(), "sample.txt", "worktree a original\n");
+        let file_b = write_file(repo_b.path(), "sample.txt", "worktree b original\n");
+        let relative = PathBuf::from("sample.txt");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![
+                crate::rail::worktrees::WorktreeItem {
+                    path: repo_a.path().to_path_buf(),
+                    label: "wt-a".to_string(),
+                    branch: Some("wt-a".to_string()),
+                    is_main: true,
+                    is_locked: false,
+                    error: None,
+                },
+                crate::rail::worktrees::WorktreeItem {
+                    path: repo_b.path().to_path_buf(),
+                    label: "wt-b".to_string(),
+                    branch: Some("wt-b".to_string()),
+                    is_main: false,
+                    is_locked: false,
+                    error: None,
+                },
+            ];
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+        });
+        cx.run_until_parked();
+
+        // A real, unsaved edit in worktree A.
+        open_file_for_editing(&app, cx, file_a);
+        app.update_in(cx, |app, window, cx| {
+            app.replace_text_in_range(None, "A-EDIT ", window, cx);
+        });
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "A-EDIT worktree a original\n",
+            "sanity check: worktree A's own buffer should hold its own real edit"
+        );
+
+        // Switch to worktree B, which has never opened this path - a real independent buffer, not
+        // a leaked or collided view of A's.
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(1, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.edit_buffer(&relative).is_none()),
+            "worktree B must not see worktree A's buffer for the identical relative path"
+        );
+        open_file_for_editing(&app, cx, file_b);
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "worktree b original\n",
+            "worktree B's freshly opened buffer must hold its own real on-disk content, not \
+             worktree A's"
+        );
+        app.update_in(cx, |app, window, cx| {
+            app.replace_text_in_range(None, "B-EDIT ", window, cx);
+        });
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "B-EDIT worktree b original\n"
+        );
+
+        // Switch back to worktree A: its own real unsaved edit must be exactly as it was left -
+        // the real fix. Before this revision, `reset_per_worktree_ui_state` cleared
+        // `edit_buffers` on every switch, so this would have come back empty.
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "A-EDIT worktree a original\n",
+            "switching back to worktree A must restore its own real unsaved edit, not discard it"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.edit_buffer(&relative).unwrap().is_dirty()),
+            "the restored buffer must still be genuinely dirty, not silently marked clean"
+        );
+
+        // And worktree B's own edit must still be exactly as it was left too - proof the two
+        // never merged in either direction.
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(1, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "B-EDIT worktree b original\n",
+            "worktree B's own real unsaved edit must survive too, untouched by worktree A's \
+             identical-relative-path buffer"
         );
     }
 }
