@@ -5486,6 +5486,7 @@ twice more (different sub-tests both times) - consistent with the family's known
 rate, unrelated to this rebase's `work_surface`-only changes. The subsequent full run was clean
 with no re-run needed. Grepped the resolved files for stray `<<<<<<<`/`=======`/`>>>>>>>` markers
 after resolution - none remained.
+
 ## Focus-follows-open (issue #15) and seven file-tree UI reports
 
 Two things that looked like separate bug lists turned out to be one defect and one design gap.
