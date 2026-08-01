@@ -378,18 +378,98 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// The honest not-yet-wired response for Fetch/Pull/Push (and their menu entries): real,
-    /// visible feedback rather than a silent no-op or a fabricated success - see `super`'s module
-    /// docs for why none of these are actually implemented in phase (a). Still does one real
-    /// thing: reloads the graph, so a click at least confirms nothing crashed and the view is
-    /// current.
-    pub(crate) fn graph_action_not_yet_wired(&mut self, action: &str, cx: &mut Context<Self>) {
-        self.graph_state.status_message = Some(format!("{action} - not implemented yet"));
+    /// Real `git fetch` for the current worktree, off the UI thread - GitHub issue #1's own
+    /// "Fetch" toolbar button. Updates remote-tracking refs only, so the graph reload afterward
+    /// (which recomputes [`GraphTabState::upstream_counts`]) is what actually makes a fetch
+    /// *visible*: the ahead/behind counts and any newly-visible remote branch chips.
+    pub(crate) fn request_graph_fetch(&mut self, cx: &mut Context<Self>) {
+        self.run_graph_remote_op("Fetch", cx, |root| wt_core::remote::fetch(&root));
+    }
+
+    /// Real `git pull` (fetch + merge into the current branch) for the current worktree, off the
+    /// UI thread - GitHub issue #1's own "Pull" toolbar button. A real merge conflict surfaces
+    /// as [`GraphTabState::status_message`] showing git's own error text (see
+    /// `wt_core::remote`'s own module docs on why this doesn't attempt to resolve one itself) -
+    /// the worktree is left exactly where a real `git pull` on the command line would leave it,
+    /// for the user to resolve through the Changes panel or a real terminal.
+    pub(crate) fn request_graph_pull(&mut self, cx: &mut Context<Self>) {
+        self.run_graph_remote_op("Pull", cx, |root| wt_core::remote::pull(&root));
+    }
+
+    /// The Push menu's `force` row click handler - GitHub issue #1's own "push (force with
+    /// lease, force, no force)". `force == PushForce::None` (the plain "Push" row) runs
+    /// immediately, exactly like Fetch/Pull: it can only ever fast-forward the remote, never
+    /// lose anyone's work. `WithLease`/`Force` are real, remote-history-losing operations
+    /// (`wt_core::remote::PushForce::Force`'s own docs), so this applies the same two-click
+    /// confirmation `crate::rail::render::AdeApp::request_prune` uses for worktree removal: the
+    /// first click on a force row only arms [`GraphTabState::push_force_confirm_armed`] and
+    /// re-labels the row (see `Self::render_graph_push_menu`), without pushing anything; a
+    /// second click on that *same* force value is what actually runs [`wt_core::remote::push`].
+    pub(crate) fn request_graph_push(
+        &mut self,
+        force: wt_core::remote::PushForce,
+        cx: &mut Context<Self>,
+    ) {
+        use wt_core::remote::PushForce;
+
+        if force != PushForce::None && self.graph_state.push_force_confirm_armed != Some(force) {
+            self.graph_state.push_force_confirm_armed = Some(force);
+            self.graph_state.status_message = Some(match force {
+                PushForce::WithLease => "click Force with lease again to really push".to_string(),
+                PushForce::Force => "click Force again to really push".to_string(),
+                PushForce::None => unreachable!("guarded above"),
+            });
+            cx.notify();
+            return;
+        }
+        self.graph_state.push_force_confirm_armed = None;
+
+        let action = match force {
+            PushForce::None => "Push",
+            PushForce::WithLease => "Force-with-lease push",
+            PushForce::Force => "Force push",
+        };
+        self.run_graph_remote_op(action, cx, move |root| wt_core::remote::push(&root, force));
+    }
+
+    /// Shared plumbing behind [`Self::request_graph_fetch`]/[`Self::request_graph_pull`]/
+    /// [`Self::request_graph_push`]: guards against a double-click starting a second, overlapping
+    /// git subprocess (`GraphTabState::remote_op_in_flight`), runs `op` on the background
+    /// executor (every `wt_core::remote` function performs real blocking I/O), then surfaces a
+    /// real success or a real git error message and reloads the graph either way - a fetch/pull/
+    /// push always changes what the graph/ahead-behind counts should show, success or not (a
+    /// failed pull can still have fetched new remote-tracking data, for one).
+    fn run_graph_remote_op(
+        &mut self,
+        action: &'static str,
+        cx: &mut Context<Self>,
+        op: impl FnOnce(std::path::PathBuf) -> Result<(), wt_core::Error> + Send + 'static,
+    ) {
+        if self.graph_state.remote_op_in_flight {
+            return;
+        }
+        let root = self.diff_root.clone();
+        self.graph_state.remote_op_in_flight = true;
         self.graph_state.push_menu_open = false;
         self.graph_state.row_menu_open = None;
-        // The one real thing this honestly can do: reload, so a click at least confirms the view
-        // is current rather than doing visibly nothing beyond the status line.
-        self.load_graph(cx);
+        self.graph_state.status_message = Some(format!("{action}\u{2026}"));
+        cx.notify();
+
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { op(root) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.graph_state.remote_op_in_flight = false;
+                this.graph_state.status_message = Some(match result {
+                    Ok(()) => action.to_string(),
+                    Err(err) => format!("{action} failed: {err}"),
+                });
+                this.load_graph(cx);
+            });
+        });
+        self.graph_state._remote_op_task = Some(task);
     }
 
     pub(in crate::graph_view) fn handle_branches_filter_key_down(
@@ -697,7 +777,7 @@ impl AdeApp {
             .child(
                 render_graph_toolbar_button("Fetch", false, false).on_click(cx.listener(
                     |this, _event: &ClickEvent, _window, cx| {
-                        this.graph_action_not_yet_wired("Fetch", cx);
+                        this.request_graph_fetch(cx);
                     },
                 )),
             )
@@ -708,7 +788,7 @@ impl AdeApp {
                     false,
                 )
                 .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                    this.graph_action_not_yet_wired("Pull", cx);
+                    this.request_graph_pull(cx);
                 })),
             )
             .child(self.render_graph_push_button(cx))
@@ -831,33 +911,69 @@ impl AdeApp {
                     .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
                         cx.stop_propagation();
                     }))
-                    .child(render_dropdown_menu_row(
-                        "\u{2191}",
-                        theme::button::BLUE_FG.into(),
-                        theme::button::BLUE_BG.into(),
-                        "Push",
-                        "not implemented yet".to_string(),
-                        Vec::new(),
-                        false,
-                    ))
-                    .child(render_dropdown_menu_row(
-                        "\u{2191}",
-                        theme::button::DANGER_FG.into(),
-                        theme::surface::CHIP_NEUTRAL.into(),
-                        "Force with lease",
-                        "aborts if the remote moved - not implemented yet".to_string(),
-                        Vec::new(),
-                        false,
-                    ))
-                    .child(render_dropdown_menu_row(
-                        "\u{2191}",
-                        theme::button::DANGER_FG.into(),
-                        theme::surface::CHIP_NEUTRAL.into(),
-                        "Force",
-                        "not implemented yet".to_string(),
-                        Vec::new(),
-                        false,
-                    )),
+                    .child(
+                        render_dropdown_menu_row(
+                            "\u{2191}",
+                            theme::button::BLUE_FG.into(),
+                            theme::button::BLUE_BG.into(),
+                            "Push",
+                            "fast-forwards the remote branch".to_string(),
+                            Vec::new(),
+                            true,
+                        )
+                        .on_click(cx.listener(
+                            |this, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                this.request_graph_push(wt_core::remote::PushForce::None, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        render_dropdown_menu_row(
+                            "\u{2191}",
+                            theme::button::DANGER_FG.into(),
+                            theme::surface::CHIP_NEUTRAL.into(),
+                            "Force with lease",
+                            if self.graph_state.push_force_confirm_armed
+                                == Some(wt_core::remote::PushForce::WithLease)
+                            {
+                                "click again to really push".to_string()
+                            } else {
+                                "aborts if the remote moved".to_string()
+                            },
+                            Vec::new(),
+                            true,
+                        )
+                        .on_click(cx.listener(
+                            |this, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                this.request_graph_push(wt_core::remote::PushForce::WithLease, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        render_dropdown_menu_row(
+                            "\u{2191}",
+                            theme::button::DANGER_FG.into(),
+                            theme::surface::CHIP_NEUTRAL.into(),
+                            "Force",
+                            if self.graph_state.push_force_confirm_armed
+                                == Some(wt_core::remote::PushForce::Force)
+                            {
+                                "click again to really push".to_string()
+                            } else {
+                                "overwrites the remote unconditionally".to_string()
+                            },
+                            Vec::new(),
+                            true,
+                        )
+                        .on_click(cx.listener(
+                            |this, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                this.request_graph_push(wt_core::remote::PushForce::Force, cx);
+                            },
+                        )),
+                    ),
             )
     }
 
@@ -4894,6 +5010,282 @@ mod graph_focus_tests {
              `AdeApp::wire_caret_blink`, so nothing would have reacted to it losing focus at \
              all, and the caret would have stayed solid/visible until whatever timer the \
              earlier keystroke started eventually fired on its own"
+        );
+    }
+}
+
+/// Real interaction coverage for GitHub issue #1's "push (force with lease, force, no force)"/
+/// "pull" acceptance criteria - `AdeApp::request_graph_fetch`/`request_graph_pull`/
+/// `request_graph_push` really shelling out to `wt_core::remote`, not just the not-yet-wired
+/// stub these replaced.
+#[cfg(test)]
+mod graph_remote_action_tests {
+    use crate::root::focus::palette_focus_tests;
+    use crate::root::AdeApp;
+    use gpui::{Entity, TestAppContext};
+    use std::path::Path;
+    use wt_core::remote::PushForce;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_output(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn commit(dir: &Path, file: &str, contents: &str, message: &str) {
+        std::fs::write(dir.join(file), contents).expect("write file");
+        git(dir, &["add", file]);
+        git(dir, &["commit", "-m", message]);
+    }
+
+    /// A real bare remote plus a real clone of it, with a real committer identity and one
+    /// tracked file - the app is opened against the clone, matching how a real user's worktree
+    /// would already have a configured upstream.
+    fn open_seeded_with_remote(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Entity<AdeApp>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let remote = tempfile::tempdir().expect("tempdir");
+        git(remote.path(), &["init", "--bare", "-b", "main"]);
+
+        let seed = tempfile::tempdir().expect("tempdir");
+        git(
+            seed.path(),
+            &["clone", remote.path().to_str().expect("utf8"), "."],
+        );
+        git(seed.path(), &["config", "user.email", "test@example.com"]);
+        git(seed.path(), &["config", "user.name", "Test User"]);
+        commit(seed.path(), "a.txt", "1", "base");
+        git(seed.path(), &["push", "origin", "main"]);
+
+        let local = tempfile::tempdir().expect("tempdir");
+        git(
+            local.path(),
+            &["clone", remote.path().to_str().expect("utf8"), "."],
+        );
+        git(local.path(), &["config", "user.email", "test@example.com"]);
+        git(local.path(), &["config", "user.name", "Test User"]);
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, local.path().to_path_buf());
+        (remote, local, app, cx)
+    }
+
+    #[gpui::test]
+    async fn fetch_really_updates_the_remote_tracking_ref_and_the_status_line(
+        cx: &mut TestAppContext,
+    ) {
+        let (remote, local, app, cx) = open_seeded_with_remote(cx);
+
+        // Advance the remote past what the local clone knows about, so fetch has something real
+        // to do.
+        let seed_dir = tempfile::tempdir().expect("tempdir");
+        git(
+            seed_dir.path(),
+            &["clone", remote.path().to_str().expect("utf8"), "."],
+        );
+        git(
+            seed_dir.path(),
+            &["config", "user.email", "test@example.com"],
+        );
+        git(seed_dir.path(), &["config", "user.name", "Test User"]);
+        commit(seed_dir.path(), "b.txt", "1", "second");
+        git(seed_dir.path(), &["push", "origin", "main"]);
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_fetch(cx);
+        });
+        cx.run_until_parked();
+
+        let remote_tracking_subject =
+            git_output(local.path(), &["log", "-1", "--format=%s", "origin/main"]);
+        assert_eq!(
+            remote_tracking_subject, "second",
+            "the real click must have run a real git fetch that updated the remote-tracking ref"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
+            Some("Fetch".to_string()),
+            "a successful fetch must report real success, not the old 'not implemented yet' \
+             stub text"
+        );
+        assert!(
+            !app.read_with(cx, |app, _| app.graph_state.remote_op_in_flight),
+            "the in-flight guard must clear once the real fetch completes"
+        );
+    }
+
+    #[gpui::test]
+    async fn plain_push_runs_on_a_single_click_and_really_updates_the_remote(
+        cx: &mut TestAppContext,
+    ) {
+        let (remote, local, app, cx) = open_seeded_with_remote(cx);
+        commit(local.path(), "b.txt", "1", "local work");
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_push(PushForce::None, cx);
+        });
+        cx.run_until_parked();
+
+        let remote_subject = git_output(remote.path(), &["log", "-1", "--format=%s", "main"]);
+        assert_eq!(
+            remote_subject, "local work",
+            "a plain Push click must run immediately and really update the remote - it can \
+             only ever fast-forward, so it must never require the two-click confirmation"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.push_force_confirm_armed),
+            None,
+            "a plain push must never arm the force-confirmation state"
+        );
+    }
+
+    #[gpui::test]
+    async fn force_push_requires_a_real_second_click_on_the_same_variant(cx: &mut TestAppContext) {
+        let (remote, local, app, cx) = open_seeded_with_remote(cx);
+        // Diverge local history from the remote so a plain push would be a non-fast-forward -
+        // the real case Force exists for.
+        commit(local.path(), "b.txt", "1", "local work");
+        git(
+            local.path(),
+            &["commit", "--amend", "-m", "amended local work"],
+        );
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_push(PushForce::Force, cx);
+        });
+        cx.run_until_parked();
+
+        let remote_subject_after_first_click =
+            git_output(remote.path(), &["log", "-1", "--format=%s", "main"]);
+        assert_eq!(
+            remote_subject_after_first_click, "base",
+            "the first click on Force must only arm the confirmation, never touch the real \
+             remote"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.push_force_confirm_armed),
+            Some(PushForce::Force),
+            "the first click must arm exactly the Force variant that was clicked"
+        );
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_push(PushForce::Force, cx);
+        });
+        cx.run_until_parked();
+
+        let remote_subject_after_second_click =
+            git_output(remote.path(), &["log", "-1", "--format=%s", "main"]);
+        assert_eq!(
+            remote_subject_after_second_click, "amended local work",
+            "the second click on the same armed variant must really run the force push"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.push_force_confirm_armed),
+            None,
+            "the confirmation must disarm once the real push has actually run"
+        );
+    }
+
+    #[gpui::test]
+    async fn clicking_a_different_row_disarms_the_previous_confirmation(cx: &mut TestAppContext) {
+        let (remote, local, app, cx) = open_seeded_with_remote(cx);
+        commit(local.path(), "b.txt", "1", "local work");
+        git(
+            local.path(),
+            &["commit", "--amend", "-m", "amended local work"],
+        );
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_push(PushForce::WithLease, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.push_force_confirm_armed),
+            Some(PushForce::WithLease),
+            "premise: With lease is armed by its own first click"
+        );
+
+        // A click on the *other* danger row must not accidentally inherit the first row's arm -
+        // switching rows disarms rather than carrying over a confirmation the user never gave
+        // for this specific variant.
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_push(PushForce::Force, cx);
+        });
+        cx.run_until_parked();
+
+        let remote_subject = git_output(remote.path(), &["log", "-1", "--format=%s", "main"]);
+        assert_eq!(
+            remote_subject, "base",
+            "switching rows must never let one row's confirmation authorize a different row's \
+             push"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.push_force_confirm_armed),
+            Some(PushForce::Force),
+            "the click must have armed the newly-clicked Force row instead"
+        );
+    }
+
+    #[gpui::test]
+    async fn pull_surfaces_a_real_conflict_as_a_real_status_message_not_a_crash(
+        cx: &mut TestAppContext,
+    ) {
+        let (remote, local, app, cx) = open_seeded_with_remote(cx);
+
+        let seed_dir = tempfile::tempdir().expect("tempdir");
+        git(
+            seed_dir.path(),
+            &["clone", remote.path().to_str().expect("utf8"), "."],
+        );
+        git(
+            seed_dir.path(),
+            &["config", "user.email", "test@example.com"],
+        );
+        git(seed_dir.path(), &["config", "user.name", "Test User"]);
+        commit(seed_dir.path(), "a.txt", "remote change", "remote diverges");
+        git(seed_dir.path(), &["push", "origin", "main"]);
+        commit(local.path(), "a.txt", "local change", "local diverges");
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_pull(cx);
+        });
+        cx.run_until_parked();
+
+        let status = app.read_with(cx, |app, _| app.graph_state.status_message.clone());
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Pull failed:")),
+            "a real conflicting pull must surface as a real, visible failure message, not a \
+             silent success or a panic - got {status:?}"
+        );
+        assert!(
+            !app.read_with(cx, |app, _| app.graph_state.remote_op_in_flight),
+            "the in-flight guard must still clear even when the operation fails"
         );
     }
 }

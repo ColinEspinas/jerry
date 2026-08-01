@@ -11,16 +11,24 @@
 //!   row list, the row `⋯` menu, the Push `▾` menu, and the Commit/Branches right panel, plus
 //!   the `impl AdeApp` glue that opens/closes/loads the tab.
 //!
-//! ## Scope (phase (a) only)
+//! ## Scope
 //!
-//! This is read-only. The row `⋯` menu's Branch/Apply/Reset groups are real, visible menu rows
-//! (per the design spec) but every entry that would perform a destructive git operation (check
-//! out, cherry-pick, revert, rebase, reset, force-push, "start an agent from this commit") is
-//! rendered **disabled** - `crate::work_surface::render::render_dropdown_menu_row`'s existing
-//! `enabled: false` treatment, with no `.on_click` attached - because none of those operations
-//! exist in `wt_core` yet (that's a separate, later phase). Only the Copy group's entries
-//! (real clipboard writes of already-loaded data) and the toolbar's read-only scope segment are
-//! actually wired. Agent-to-commit correlation (which agent authored a commit) is a
+//! Phase (a) shipped read-only. Phase (c) (GitHub issue #1's own "push (force with lease,
+//! force, no force)"/"pull") has since wired the toolbar's Fetch/Pull and the Push `▾` menu's
+//! Push/Force-with-lease/Force rows to real `wt_core::remote` calls
+//! (`AdeApp::request_graph_fetch`/`request_graph_pull`/`request_graph_push`) - see that
+//! module's own docs for the fetch/pull/push implementations and
+//! [`state::GraphTabState::push_force_confirm_armed`] for the real two-click confirmation the
+//! two force variants require. The row `⋯` menu's Branch/Apply/Reset groups remain real,
+//! visible menu rows (per the design spec) but every entry that would perform a *different*
+//! destructive git operation (check out, cherry-pick, revert, rebase, reset, "start an agent
+//! from this commit") is still rendered **disabled** -
+//! `crate::work_surface::render::render_dropdown_menu_row`'s existing `enabled: false`
+//! treatment, with no `.on_click` attached - because none of those specific operations exist in
+//! `wt_core` yet (real, separate follow-up work, not yet started). Only the Copy group's
+//! entries (real clipboard writes of already-loaded data), the toolbar's read-only scope
+//! segment, and now Fetch/Pull/Push are actually wired. Agent-to-commit correlation (which agent
+//! authored a commit) is a
 //! separate, later feature too; a first draft carried an always-empty per-commit agent column
 //! for it, but `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §6.2 removed that
 //! column outright rather than leave it honestly empty - a commit belongs to a worktree, which

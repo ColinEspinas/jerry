@@ -3,9 +3,10 @@
 use crate::root::AdeApp;
 use crate::text_history::TextField;
 use crate::theme;
-use gpui::{Bounds, Context, FocusHandle, Pixels};
+use gpui::{Bounds, Context, FocusHandle, Pixels, Task};
 use std::collections::HashMap;
 use wt_core::graph::{Graph, GraphScope};
+use wt_core::remote::PushForce;
 
 /// Which side panel the graph tab's right sidebar shows while it's focused, replacing
 /// Files/Changes (design spec §5).
@@ -84,10 +85,34 @@ pub(crate) struct GraphTabState {
     /// `Self::load` reload - the toolbar's `Pull ↓N` / `Push ↑N` counts. `None` while loading or
     /// when there's genuinely no upstream to compare against, never a fabricated `{0, 0}`.
     pub upstream_counts: Option<wt_core::diff::AheadBehind>,
-    /// An honest, real status line for a not-yet-wired toolbar action (Fetch/Pull/Push) - "not
-    /// implemented yet", never a fake success. `None` when nothing has been clicked since the
+    /// A real, live status line for the toolbar's Fetch/Pull/Push actions - success or a real
+    /// git error message, never a fake success. `None` when nothing has been clicked since the
     /// tab last opened.
     pub status_message: Option<String>,
+    /// `true` while a real `wt_core::remote::{fetch,pull,push}` call is running on the
+    /// background executor - guards Fetch/Pull/Push against a double-click starting a second,
+    /// overlapping git subprocess against the same worktree, mirroring
+    /// `AdeApp::worktree_history_op_in_flight`'s identical single-flight discipline for
+    /// Keep/Discard/Commit (a separate flag, not the same field: a graph-tab remote operation
+    /// and a Changes-panel worktree-history operation are never mutually exclusive with each
+    /// other, only with themselves).
+    pub remote_op_in_flight: bool,
+    /// `Some(force)` for exactly one real click past the two-click confirmation on the Push
+    /// menu's "Force with lease"/"Force" rows (both real, remote-history-losing operations -
+    /// see `wt_core::remote::PushForce::Force`'s own docs) - `None` for the ordinary, single-
+    /// click "Push" row, which is never destructive to already-pushed history. Mirrors
+    /// `crate::rail::render::AdeApp::request_prune`'s own two-click discipline: the *first*
+    /// click on a force row only arms this field and re-labels the row, without pushing
+    /// anything; only a second click on the *same* `force` value actually runs
+    /// [`wt_core::remote::push`]. Clicking a different row (including the plain "Push" row)
+    /// disarms this rather than carrying the arm over onto an operation the user never
+    /// confirmed.
+    pub push_force_confirm_armed: Option<PushForce>,
+    /// The currently in-flight remote operation's own real task - held so it isn't dropped (and
+    /// therefore cancelled) the instant this function returns, matching
+    /// `AdeApp::_worktree_history_task`'s identical one-slot-per-feature pattern. `None` when
+    /// [`Self::remote_op_in_flight`] is `false`.
+    pub _remote_op_task: Option<Task<()>>,
 }
 
 impl GraphTabState {
@@ -106,6 +131,9 @@ impl GraphTabState {
             branches_filter_focus_handle: cx.focus_handle(),
             upstream_counts: None,
             status_message: None,
+            remote_op_in_flight: false,
+            push_force_confirm_armed: None,
+            _remote_op_task: None,
         }
     }
 }
