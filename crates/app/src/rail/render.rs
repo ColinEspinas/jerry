@@ -1546,7 +1546,13 @@ mod rail_row_tests {
             label: label.to_string(),
             branch: Some(label.to_string()),
             is_main: false,
+            is_bare: false,
+            is_detached: false,
+            short_sha: None,
             is_locked: false,
+            lock_reason: None,
+            is_broken: false,
+            broken_reason: None,
             error: None,
         }
     }
