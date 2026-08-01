@@ -98,11 +98,14 @@ jobs:
         working-directory: dist
         run: tar -czf jerry-${{ matrix.name }}.tar.gz jerry
 
+      # Windows runners don't ship a `zip` CLI on PATH (only Linux/macOS runners do) -
+      # `Compress-Archive` is a builtin PowerShell cmdlet present on every windows-latest
+      # image, so it needs no extra install step.
       - name: Package (zip)
         if: matrix.archive_ext == 'zip'
         working-directory: dist
-        shell: bash
-        run: zip jerry-${{ matrix.name }}.zip jerry.exe
+        shell: pwsh
+        run: Compress-Archive -Path jerry.exe -DestinationPath jerry-${{ matrix.name }}.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
