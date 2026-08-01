@@ -1289,9 +1289,11 @@ impl AdeApp {
                                 })
                                 .tooltip(text_tooltip("New file in worktree root"))
                                 .child("+")
-                                .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                                    this.start_new_file(root.clone(), window, cx);
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _event: &ClickEvent, window, cx| {
+                                        this.start_new_file(root.clone(), window, cx);
+                                    },
+                                )),
                         )
                     }),
             )
