@@ -980,6 +980,129 @@ pub mod scrollbar {
     pub const THUMB_HOVER: ColorToken = super::status::IDLE;
 }
 
+/// The git graph tab (design handoff `design_handoff_jerry_ade/revision 2/CHANGELOG.md`,
+/// 2026-07-31 entry, "git graph (issue #1)") - real hex values transcribed directly from that
+/// entry's §2/§3, not paraphrased. The column header band and the removal of the per-commit
+/// session column (`HEADER`/`HEADER_BG`/`HEADER_LABEL_FG` below) are `revision 3/
+/// REVISION-2026-07-31.md` §6.1/§6.2 instead - that revision supersedes the revision-2 entry
+/// for those two points only, everything else here is still the revision-2 values.
+pub mod graph {
+    use super::{hex, px, ColorToken, Pixels};
+
+    /// Row height (§2: "Row height 26").
+    pub const ROW: Pixels = px(26.0);
+    /// Lane canvas column width (§2: "lane canvas 100").
+    pub const LANE_CANVAS: Pixels = px(100.0);
+    /// A lane's vertical sits at `x = 9 + lane * 14` (§2).
+    pub const LANE_X_BASE: Pixels = px(9.0);
+    pub const LANE_STEP: Pixels = px(14.0);
+    /// Each S-curve piece's own box width, and its base height (`crate::graph_view::render`'s
+    /// `CurveBox::height` adds exactly one stroke to the bottom-edged curve's own height, so that
+    /// GPUI's inside-painted bottom border lands on the waist row rather than one row above it -
+    /// see that field's own docs). Must be at least `2 * ELBOW_RADIUS` - GPUI
+    /// (`Corners::clamp_radii_for_quad_size`, `vendor/zed/crates/gpui/src/style.rs`) clamps every
+    /// requested corner radius to half the box's own shorter side, so a smaller box would silently
+    /// render a smaller radius than requested (this is exactly what happened before this constant
+    /// existed: a 7px-square box with a 7px radius request rendered at an effective 3.5px, a real
+    /// user-reported vertical-alignment bug traced back to this GPUI behavior).
+    pub const ELBOW_CURVE_SIZE: Pixels = px(10.0);
+    /// Each S-curve piece's real, rendered corner radius - always exactly half of
+    /// `ELBOW_CURVE_SIZE`, so GPUI's own clamp (see that constant's docs) never kicks in and this
+    /// value renders unclamped, not silently halved again.
+    pub const ELBOW_RADIUS: Pixels = px(5.0);
+
+    /// The tab chip's own background (§1: "`#2a2030` bg").
+    pub const TAB_CHIP_BG: ColorToken = hex(0x2a2030);
+    /// The tab chip's fork-glyph colour (§1: "`#c98fbf` fork glyph").
+    pub const TAB_CHIP_FG: ColorToken = hex(0xc98fbf);
+
+    /// Six lane colours, cycled by `lane % 6` - lane 0 is the trunk (§2).
+    pub const LANES: [ColorToken; 6] = [
+        hex(0x6b9bd1),
+        hex(0xc98fbf),
+        hex(0x5cb87f),
+        hex(0xd8a94a),
+        hex(0xc0824a),
+        hex(0x8f8fd4),
+    ];
+
+    /// A local branch ref chip's dim background pair, indexed the same way as [`LANES`] (§2: "local
+    /// branch = lane colour on its dim pair").
+    pub const LOCAL_BRANCH_DIM_BG: [ColorToken; 6] = [
+        hex(0x1a2733),
+        hex(0x2a2030),
+        hex(0x16261e),
+        hex(0x2b2413),
+        hex(0x2a1e13),
+        hex(0x1f2033),
+    ];
+
+    /// `HEAD` ref chip (§2: "`HEAD` `#243c50`/`#a5cdf0`").
+    pub const HEAD_CHIP_BG: ColorToken = hex(0x243c50);
+    pub const HEAD_CHIP_FG: ColorToken = hex(0xa5cdf0);
+    /// A remote branch chip is outlined only (§2: "remote outlined `#2a2f34`").
+    pub const REMOTE_CHIP_BORDER: ColorToken = hex(0x2a2f34);
+    /// A tag chip (§2: "tag `#2b2413`/`#d8a94a`").
+    pub const TAG_CHIP_BG: ColorToken = hex(0x2b2413);
+    pub const TAG_CHIP_FG: ColorToken = hex(0xd8a94a);
+
+    /// The commit dot's diameter (§2: "commit 7px filled").
+    pub const DOT_COMMIT: Pixels = px(7.0);
+    /// The `HEAD`/merge dot's diameter (§2: "**HEAD** 9px", "**merge** 9px").
+    pub const DOT_HEAD_OR_MERGE: Pixels = px(9.0);
+    /// The `HEAD` dot's ring colour (§2: "a 2px `#5a9ad4` ring").
+    pub const HEAD_RING: ColorToken = hex(0x5a9ad4);
+    /// The working-tree dot's dashed border colour (§2: "1px dashed `#6b7178` border").
+    pub const WORKING_TREE_BORDER: ColorToken = hex(0x6b7178);
+
+    /// The toolbar band's height (§4: "Toolbar 35 high").
+    pub const TOOLBAR: Pixels = px(35.0);
+    /// The column header band's height (`revision 3/REVISION-2026-07-31.md` §6.1: "Column
+    /// header, 22 high"). Sits between [`TOOLBAR`] and the row list -
+    /// `crate::graph_view::render::AdeApp::render_graph_view` renders it as a real sibling band,
+    /// not a literal folded into the row list's own top padding, so the row `⋯` menu's anchor
+    /// (built from a row's own real captured bounds, never a `TOOLBAR`/`HEADER`/index formula -
+    /// see [`super::graph::ROW_MENU_HEIGHT`]'s neighbour `Self::toggle_graph_row_menu`) shifts
+    /// down for free the moment this band exists, with zero changes to that anchor logic itself.
+    pub const HEADER: Pixels = px(22.0);
+    /// The column header band's own background (§6.1: "`#101315`") - close to but distinct from
+    /// [`super::surface::HEADER`]'s `#121417` (context bar, panel headers), so kept as its own
+    /// token rather than reused, the same "same-ish hex, distinct token for a distinct element"
+    /// call `super::text::TREE_CARET`'s own doc comment already makes for [`super::text::PATH`].
+    pub const HEADER_BG: ColorToken = hex(0x101315);
+    /// The column header labels' colour (§6.1: "`#4a5057` - quieter than any row content").
+    /// Same hex as [`super::text::PATH`]/[`super::text::TREE_CARET`] - again a distinct token
+    /// for a distinct element, per those constants' own precedent.
+    pub const HEADER_LABEL_FG: ColorToken = hex(0x4a5057);
+    /// The `Push …` menu's width (§4: "opening a 268-wide menu").
+    pub const PUSH_MENU_WIDTH: Pixels = px(268.0);
+    /// The row `⋯` context menu's width (§4: "a 330-wide context menu").
+    pub const ROW_MENU_WIDTH: Pixels = px(330.0);
+    /// The row `⋯` context menu's painted height under the test suite's `gpui::TestAppContext` -
+    /// its content is fixed (four headers, twelve action rows, one footer line; never varies with
+    /// which row opened it), so unlike `crate::sidebar::context_menu::menu_height` (which has to
+    /// measure a variable row count) this is a plain constant rather than a formula, pinned by
+    /// `crate::graph_view::render::graph_row_menu_tests::
+    /// the_row_menu_pins_the_real_height_this_edge_clamp_relies_on` - if that test ever fails, the
+    /// menu's content changed and this must be re-measured, not guessed, the same discipline
+    /// `crate::lsp::completion_popup::POPOVER_MAX_HEIGHT`'s own docs describe for a hand-derived
+    /// popover size constant. Caveat an adversarial audit raised: the test harness's text system
+    /// uses synthetic, not real-font, glyph metrics, so this may be off by roughly a line's worth
+    /// of height from a real build's actual paint near the very edge of the clamp - the clamp
+    /// degrades safely either way (it still keeps the menu on-screen, just not pixel-perfectly
+    /// flush with the edge), so this has been left as a known imprecision rather than a blocker.
+    pub const ROW_MENU_HEIGHT: Pixels = px(483.0);
+    /// Behind-count amber threshold (§5: "behind turns `#a3873f` past 4").
+    pub const BEHIND_WARN_THRESHOLD: usize = 4;
+    pub const BEHIND_WARN: ColorToken = hex(0xa3873f);
+    /// Branches panel row height (§5: "28-high rows").
+    pub const BRANCH_ROW: Pixels = px(28.0);
+    /// Branches panel filter row height (§5: "a 31-high filter row").
+    pub const BRANCHES_FILTER_ROW: Pixels = px(31.0);
+    /// A branch with no lane in the visible graph gets a neutral dot (§5).
+    pub const BRANCH_NO_LANE_DOT: ColorToken = hex(0x3d4248);
+}
+
 pub mod radius {
     use super::{px, Pixels};
 

@@ -179,6 +179,13 @@ impl AdeApp {
             caret_blink_visible: true,
             _caret_blink_task: Task::ready(()),
             _caret_blink_subscriptions: caret_blink_subscriptions,
+            graph_tab_open: false,
+            graph_tab_active: false,
+            graph_focus_handle: cx.focus_handle(),
+            graph_focus: OverlayFocus::default(),
+            graph_state: graph_view::state::GraphTabState::new(cx),
+            _load_graph_task: None,
+            _load_commit_files_task: None,
             file_view_scroll_handle: UniformListScrollHandle::new(),
             diff_view_scroll_handle: gpui::ScrollHandle::new(),
             file_view_cache: None,
@@ -776,6 +783,17 @@ impl AdeApp {
         // `path` is the active root by the time eviction runs.
         self.evict_stale_lsp_clients(&path, cx);
         self.load_diff(path, cx);
+        // The graph tab is repo-scoped, not worktree-scoped (design spec §1: "the graph is
+        // repo-scoped"), but the toolbar's `HEAD` chip/upstream counts and the Worktrees scope
+        // (`wt_core::graph::GraphScope::Worktrees`, driven by real worktree HEADs) are real facts
+        // about *this* worktree - without this, switching worktrees while the graph tab is open
+        // silently left it showing the previous worktree's data (a real, adversarial-audit-found
+        // gap), and the Commit panel's cached "Files changed" could even fail against the wrong
+        // repo path. `load_diff` above already updated `Self::diff_root` synchronously, so
+        // `load_graph` (which reads it) picks up the new worktree correctly.
+        if self.graph_tab_open {
+            self.load_graph(cx);
+        }
         cx.notify();
     }
 

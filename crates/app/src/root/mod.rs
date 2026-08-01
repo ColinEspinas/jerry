@@ -62,6 +62,7 @@ use wt_core::merge::ConflictHunk;
 use crate::code_surface::code_view;
 use crate::code_surface::edit_buffer;
 use crate::env_info;
+use crate::graph_view;
 use crate::keymap::WindowControlsStyle;
 use crate::keymap_overrides;
 use crate::lsp::diagnostics as diagnostics_view;
@@ -135,6 +136,7 @@ actions!(
         GotoDefinition,
         NewTerminal,
         NewAgentPane,
+        NewGitGraph,
         NextChangedFile,
         JumpToAgent1,
         JumpToAgent2,
@@ -562,6 +564,36 @@ pub struct AdeApp {
     /// `crate::root::caret_blink::AdeApp::wire_caret_blink`. Held for this instance's whole
     /// lifetime; an unheld `gpui::Subscription` is dropped, and a dropped one stops firing.
     pub(crate) _caret_blink_subscriptions: Vec<Subscription>,
+    /// Whether the git graph tab (GitHub issue #1, phase (a)) exists in the tab strip. Unlike
+    /// [`Self::open_files`] there is at most one - "one per window" per the design spec - so this
+    /// is a plain `bool`, not a collection.
+    pub(crate) graph_tab_open: bool,
+    /// Whether the git graph tab is the tab strip's currently *active* entry -
+    /// `crate::work_surface::render::AdeApp::render_center_pane` shows it whenever this is
+    /// `true`, taking priority over [`Self::open_change`]/an agent pane. Switching to an agent
+    /// or file tab sets this back to `false` without closing the graph tab, exactly mirroring how
+    /// [`Self::open_change`] behaves for file tabs; closing the graph tab outright
+    /// (`crate::graph_view::render::AdeApp::close_git_graph_tab`) always sets it `false` too.
+    pub(crate) graph_tab_active: bool,
+    /// The git graph tab's own keyboard-focus target, `track_focus`'d by
+    /// `crate::graph_view::render::AdeApp::render_graph_view`'s container.
+    pub(crate) graph_focus_handle: FocusHandle,
+    /// Pre-open focus target for [`Self::graph_focus_handle`] - see [`OverlayFocus`]. Captured
+    /// only on the closed-to-open transition and moved on only when something else becomes the
+    /// active centre-pane content - see `crate::graph_view::render::AdeApp::leave_graph_tab`.
+    pub(crate) graph_focus: OverlayFocus,
+    /// The git graph tab's own state (loaded rows, scope, selection, right panel) - see
+    /// `crate::graph_view::state::GraphTabState`.
+    pub(crate) graph_state: graph_view::state::GraphTabState,
+    /// The in-flight `wt_core::graph::build_graph` background load, one slot - a fresh load
+    /// supersedes an older one still running, mirroring [`Self::_load_diff_task`].
+    pub(crate) _load_graph_task: Option<Task<()>>,
+    /// The in-flight `wt_core::graph::commit_changed_files` background load behind the Commit
+    /// panel's "Files changed" list - one slot, same shape as [`Self::_load_graph_task`].
+    /// `commit_changed_files` performs real blocking I/O (spawns `git show`), so it must never
+    /// run inline in a render method - see `crate::graph_view::render::AdeApp::
+    /// load_commit_files`'s own docs for the real bug this replaced.
+    pub(crate) _load_commit_files_task: Option<Task<()>>,
     /// The File view's `uniform_list` scroll handle (`gpui::UniformListScrollHandle`, matching
     /// `vendor/zed/crates/git_ui/src/git_panel.rs`'s `commit_history_scroll_handle` use of the
     /// same type) - driven by go-to-definition landing on a distant [`Self::code_cursor`] line,
@@ -1742,6 +1774,7 @@ impl Render for AdeApp {
             .on_action(cx.listener(Self::handle_goto_definition_action))
             .on_action(cx.listener(Self::handle_new_terminal_action))
             .on_action(cx.listener(Self::handle_new_agent_pane_action))
+            .on_action(cx.listener(Self::handle_new_git_graph_action))
             .on_action(cx.listener(Self::handle_next_changed_file_action))
             .on_action(cx.listener(Self::handle_jump_to_agent_1_action))
             .on_action(cx.listener(Self::handle_jump_to_agent_2_action))
@@ -1767,6 +1800,30 @@ impl Render for AdeApp {
             .when(self.plus_menu_open, |el| {
                 el.child(self.render_plus_menu(cx))
             })
+            // The git graph tab's Push `▾` menu and row `⋯` menu (GitHub issue #1, phase (a)) -
+            // window-positioned overlays for the same reason `render_plus_menu` is a sibling here
+            // rather than nested inside the workspace body: their `gpui::canvas`-captured bounds
+            // are window-space, so `.absolute()` positioning built from them is only correct as a
+            // direct child of this root element (a real, adversarial-audit-found bug when they
+            // were nested inside `crate::graph_view::render::AdeApp::render_graph_view`'s own
+            // container - see that method's docs).
+            //
+            // Also gated on `!self.settings_open`, the same belt-to-`Self::open_settings`'s-
+            // braces reasoning the tree context menu gate below documents: opening Settings does
+            // not clear `graph_tab_active` (the graph tab underneath is still "active"), and
+            // `open_settings` already clears both `graph_state.row_menu_open`/`push_menu_open`
+            // itself now (an adversarial-audit-found gap, fixed there) - this is defensive
+            // padding against that invariant ever drifting, not the primary fix.
+            .when(
+                self.graph_tab_active && !self.settings_open && self.graph_state.push_menu_open,
+                |el| el.child(self.render_graph_push_menu(cx)),
+            )
+            .when(
+                self.graph_tab_active
+                    && !self.settings_open
+                    && self.graph_state.row_menu_open.is_some(),
+                |el| el.child(self.render_graph_row_menu(cx)),
+            )
             .when_some(self.title_menu_open, |el, menu| {
                 el.child(self.render_title_menu(menu, cx))
             })

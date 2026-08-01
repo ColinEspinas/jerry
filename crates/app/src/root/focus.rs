@@ -35,7 +35,13 @@ impl AdeApp {
     /// Whether keyboard focus is currently on one of this app's overlay handles - the palette,
     /// Settings, or the "New file" prompt. See [`Self::focus_code_surface`] for why capturing one
     /// as a return target is always wrong.
-    fn focus_is_on_an_overlay(&self, window: &Window, cx: &App) -> bool {
+    ///
+    /// `pub(crate)`, not private: `crate::graph_view::render::AdeApp::open_git_graph` reuses this
+    /// exact check for its own pre-open focus capture (the git graph tab is real tab-strip
+    /// content, the same shape as [`Self::code_focus_handle`] - not a fourth entry in this list -
+    /// but it still must never capture the palette/Settings/new-file handles as its own return
+    /// target, for the same reason [`Self::focus_code_surface`] mustn't).
+    pub(crate) fn focus_is_on_an_overlay(&self, window: &Window, cx: &App) -> bool {
         window.focused(cx).is_some_and(|focused| {
             focused == self.palette_focus_handle
                 || focused == self.settings_focus_handle
@@ -140,6 +146,15 @@ impl AdeApp {
         // Settings is up rather than silently disarming it.
         self.tree_context_menu = None;
         self.tree_inline_edit = None;
+        // Same reason, for the git graph tab's own two window-positioned overlays (GitHub issue
+        // #1's row `⋯`/right-click menu and Push `▾` menu): unlike opening a *different* tab,
+        // opening Settings does not clear `graph_tab_active` (the graph tab, if it was showing,
+        // is still "active" underneath Settings - `crate::graph_view::render::AdeApp::
+        // leave_graph_tab` is not called here), so without this an open row or Push menu kept
+        // painting its full-window scrim over the Settings surface, swallowing the first click a
+        // user aimed at it (an adversarial audit's own finding).
+        self.graph_state.row_menu_open = None;
+        self.graph_state.push_menu_open = false;
         self.settings_open = true;
         self.settings_focus.capture(window, &self.agents, cx);
         self.prune_confirm_armed = false;

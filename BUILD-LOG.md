@@ -5486,3 +5486,1208 @@ twice more (different sub-tests both times) - consistent with the family's known
 rate, unrelated to this rebase's `work_surface`-only changes. The subsequent full run was clean
 with no re-run needed. Grepped the resolved files for stray `<<<<<<<`/`=======`/`>>>>>>>` markers
 after resolution - none remained.
+
+## Focus-follows-open (issue #15) and seven file-tree UI reports
+
+Two things that looked like separate bug lists turned out to be one defect and one design gap.
+
+**The one defect.** `open_palette_file_result`'s diff-less branch expanded a file's ancestors,
+highlighted its tree row, and stopped: no tab, nothing in the centre pane, focus untouched. That
+is both issue #15's report ("the file opens, but you still have to click into the editor") and the
+separately-reported "Reveal in tree selects the file in the tree but does not open it" - the same
+five lines. Its sibling branch was wrong in the mirror-image way: a *changed* file opened and
+focused a tab but never revealed or highlighted itself in the tree, so which half of the behaviour
+you got depended on whether the file happened to be in the loaded diff. Both now run one function,
+`code_surface::tabs::AdeApp::open_and_focus_file`, which opens-or-reuses the tab, moves real focus
+onto `code_focus_handle`, and reveals + highlights the row - and which `open_file_view` and
+`open_change_diff` are both now thin wrappers over. "Reveal and open are one action" is structural
+here, not a convention two call sites happen to follow.
+
+Focusing the editor is also what makes the caret real: `code_surface::editing`'s per-row paint only
+emits the caret quad when `code_focus_handle.is_focused(window)`, and only registers the real
+`Window::handle_input` from the caret's own row. So "the next keystroke lands in the buffer" is a
+consequence of that one call, not a separate feature to build.
+
+**"An action focuses its result", without a flag to forget.** Opening the file was only half of it:
+`close_palette` then restored focus to wherever it was before the palette, so the file really did
+open and the keystroke really did go to the terminal. The rule is that an entry which opens
+something owns focus afterwards and one that opens nothing restores it - and which applies is now
+*observed* rather than declared: `run_selected_palette_entry` reads `window.focused(cx)` either
+side of dispatch (`Window::focus` writes synchronously) and picks its closing path from the
+difference. Deliberately not a per-entry `bool`: that has to be set at every site that focuses
+something, and the failure mode of forgetting one is a silently swallowed keystroke, which is this
+project's most-shipped bug (see `crate::lib`'s own module docs). There is nothing to forget here.
+
+Two smaller pieces of #15's checklist: reopening a file restored its buffer caret already
+(`edit_buffers` outlives a tab close) but *showed* line 1 and stayed scrolled to the top, so a
+caret restored to line 200 was correct, misreported and invisible - both now follow the buffer.
+And the "different tab group/pane" bullet is trivially satisfied: this app has one centre pane and
+one global `open_change`, which is recorded rather than quietly skipped.
+
+**The design gap** was the file-tree context menu, and one of its seven reports was not a taste
+question at all: its rows *did* have a `.hover(..)`, set to `theme::surface::ROW_HOVER` - which is
+byte-identical to `theme::surface::PALETTE`, the popover's own background. The hover state existed
+and painted nothing. `theme::palette::ROW_HOVER`'s own docs record the identical trap for the
+palette's rows, which is where `theme::surface::PLUS_MENU_ROW_HOVER` came from. Alongside it: the
+row now speaks `work_surface::render::render_dropdown_menu_row`'s language (11.5px `text::HEADING`
+medium, `gap(9)`, `text::GHOSTER` + `cursor_default()` when disabled) rather than four values
+invented for this one menu; issue #19 §1's groups get the app's one real in-menu divider, extracted
+out of `title_bar::menu` into `root::widgets::render_menu_group_divider` so both menus draw the
+same element; and the delete confirmation gets the hover states its two buttons never had, the
+destructive `theme::button::DANGER_FG`/`DANGER_FG_HOVER` pair the rail's prune button already
+uses instead of the rail's *status* red, `theme::radius::BUTTON` instead of the chip radius, and a
+scrim built from `theme::surface::SCRIM` instead of a raw `gpui::black()` literal.
+
+**"Still lets you select the rows underneath it" had a cause no `stop_propagation` could fix.** The
+scrim was a real full-window element with a real dismiss handler, but nothing about it stopped the
+row beneath from also taking the click - and hover styling isn't an event at all, so a propagation
+guard could only ever have fixed half of it. `.occlude()` is the real mechanism (`HitboxBehavior::
+BlockMouse`; `Window::hit_test` stops walking hitboxes at the first one carrying it, which is what
+both mouse dispatch *and* `Hitbox::is_hovered` consult), and this app already used it for the pane
+resize handles. Applied to the context menu and to both centred modals.
+
+**`Shift+F10` was kept, and made findable.** Issue #19 §2 required the menu to be reachable from
+the keyboard, so deleting it was never the right answer; the honest problem was that nothing in the
+product said why it exists. The Keybindings row now reads "Files tree: open the selected row's
+actions menu" (that page has no description column - the label is the whole explanation a user
+gets), and the Files tree gained the keyboard-hint footer strip the design handoff already
+specifies for exactly this job, with keycaps resolved through `keymap::resolve_combo` rather than
+written out, and hidden while an inline editor or the delete confirmation is open - because the
+bindings genuinely don't fire then, and advertising a dead shortcut is its own small lie.
+
+### What the independent audit then found
+
+A real adversarial review sub-agent was dispatched over the finished branch and really reported;
+everything below is its work, not the author's own reasoning, and it reproduced each finding with
+throwaway probe tests before reporting. It found one CRITICAL that this change had introduced.
+
+**CRITICAL - a palette file result run while Settings is open.** `open_and_focus_file` focused
+`code_focus_handle` while `AdeApp::render` was still drawing Settings *instead of* the workspace
+body, so `Window::focus` pointed at a `FocusId` no longer in the rendered frame; GPUI fell back to
+the dispatch root with an empty context stack and every scoped binding died, Esc included. The
+user was left on a Settings page they could not leave, with no file in sight, until they clicked.
+`close_palette` had a hand-written Settings branch that used to catch this, and the new
+observe-focus path routed around it. Fixed at the source rather than by re-adding the special
+case: opening a file now closes Settings first, so what gets focused really is rendered. Restoring
+focus instead would have left the user staring at Settings after asking for a file.
+
+Two MAJOR findings were dangling-focus bugs one level removed from the code changed here, both of
+which this change made reachable or more reachable. `focus_code_surface` captures the pre-open
+focus target on the first file opened - and with no tab yet, the thing holding focus at that
+moment is the *palette's own handle*; capturing it just relocated the bug to `close_file_tab`,
+which restores through the same `OverlayFocus`. It now refuses to capture any overlay handle at
+all. And running the palette's own "Toggle Files / Changes" unrenders the whole file tree while the
+palette holds focus, so `set_right_sidebar_view`'s existing `tree_focus_handle.is_focused(window)`
+guard could not see that an overlay was holding the tree's handle as its *return* target; closing
+the palette then restored focus straight onto it. `OverlayFocus::forget_target` is the fix, swept
+from all three overlays rather than only the palette.
+
+Two more MAJOR findings were about this change's own edges. `.occlude()`ing a full-window scrim
+swallows the window's own close/minimise/maximise buttons and the title bar's drag region - the
+audit reproduced a close click being eaten - so all three scrims now start at
+`theme::band::TITLE_BAR`, which is what `render_palette`'s scrim had always done and which is now a
+load-bearing choice rather than an aesthetic one. That in turn moved the context menu's panel a
+whole title bar down, since its origin is clamped in *window* space; the offset is subtracted
+explicitly and `right_clicking_a_folder_row_opens_the_folder_menu_at_a_clamped_origin` now asserts
+the popover's real painted origin against the clamped one, which is what caught it. And
+`open_change_diff` was resolving its relative path against `file_tree_root` when `DiffFile::path`
+is relative to `diff_root` - normally equal, but `merge::flow` and `worktree_history::flow` both
+load the *main repo's* diff while a worktree is selected, so a Changes-row click there produced a
+path that exists nowhere, which the new shared reveal would have written into this worktree's
+persisted fold state. Both roots are now used for what they are, and the reveal is guarded on the
+path really being inside the tree on screen.
+
+The audit also caught this change citing `design_handoff_jerry_ade/revision 2/` - a newer handoff
+revision that is real, but is not committed to this repository, so five source comments pointed at
+a path that does not exist, and three geometry constants derived from it had no support in the
+handoff that *is* committed. Those constants are gone: the menu's row height and horizontal
+padding are back to what shipped, and the grouping is drawn with the app's own existing divider
+element. Everything now cited resolves in-tree. The footer strip's citation was real all along and
+just named the wrong directory - its shape is `design_handoff_jerry_ade/revision/Jerry.dc.html`'s
+own `diffHints` strip, values included.
+
+Smaller audit findings, all fixed: a test that asserted `menu_groups(..).flatten() == menu_items(..)`
+when `menu_items` is *defined* as that expression (deleted, and replaced with a real assertion that
+dividers never lead, trail, double up, or reorder anything); the scroll half of the caret-restore
+change having no coverage at all (it now asserts the real `UniformListScrollHandle`'s resolved
+offset against a 400-line file, and fails when reverted); a test named
+`..._and_the_next_keystroke_lands_in_the_buffer` that never simulated a keystroke; the footer's own
+tooltip hard-coding the very keystroke string its doc said it never hard-codes; the footer binding
+guard reconstructing only `shift`, so a binding that gained a Ctrl would still have matched; a doc
+enumerating `OverlayFocus::clear`'s "only" caller when it now has three; four cross-references left
+stale by the `open_and_focus_file` extraction; and an undocumented `text::GHOST` → `GHOSTER` change.
+
+Three findings were checked and deliberately not acted on, recorded here rather than left silent.
+The `+` menu's and title-bar menus' scrims have the same non-occluding click-through as the tree
+menu did - real, but not reported and not in this change's scope. A truncated or non-UTF-8 file has
+no `EditBuffer`, so the "otherwise scrolled to top" clause can't be honoured for it; the shared
+scroll handle keeps the previous file's offset, which is now written down on the test module that
+owns the behaviour. And the audit flagged two pre-existing bugs entirely outside this diff (the
+palette's Prune Worktrees entry can never actually prune, since `open_palette` disarms the
+confirmation it just armed; and `render_changes_footer`'s doc claims `]` isn't bound to anything
+when `default_key_bindings` binds it) - left for their own change.
+
+Verification: all four gates clean - `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace --lib -- --test-threads=1` at 946 app + 42 lsp-core + 14 pty-core + 98
+wt-core, up from 928 app at the verified baseline. Every fix here was confirmed non-vacuous by
+reverting it and watching its own regression fail: the focus-ownership branch in *both* directions
+(always-restore fails five tests, never-restore fails the sixth), the palette's open-the-file half,
+the `.occlude()`, the panel's title-bar offset, the caret indicator, the scroll, and all three
+audit fixes. The project's known diff-rendering flake appeared twice during this work, a different
+test in the module each time. Because this change touches `open_change_diff`, that was not assumed:
+the flakiest test was run 55 times on this branch and 55 times on the untouched base, interleaved,
+giving 3/55 here against 4/55 there - the same rate, and load-dependent rather than
+change-dependent.
+
+## Git graph tab, phase (a) (GitHub issue #1)
+
+A new read-only "git graph" tab - the first of a deliberate three-phase split of issue #1 (session-
+to-commit correlation is phase (b); every destructive git operation the design spec's row menu and
+Push menu reference is phase (c)). Built against `design_handoff_jerry_ade/revision 2/CHANGELOG.md`'s
+2026-07-31 entry, which exists only as an untracked directory in the main worktree (not yet committed
+to this repo) - copied into this branch's own worktree for reference but deliberately left out of
+this commit, the same way the coordinator's own instructions treated it.
+
+**The data layer** (`wt_core::graph`, new module) is the part with no shortcuts taken. `build_graph`
+walks the real object database via `gix::Repository::rev_walk` (`Sorting::ByCommitTime(NewestFirst)`,
+`first_parent_only` for the `Current` scope), and a small, independently-tested pure function -
+`layout_lanes` - assigns each commit a lane and describes per-row lane segments and elbows, knowing
+nothing about `gix` at all (tested with plain `&str` ids). Building it surfaced a real edge case
+before it ever reached review: feeding `GraphScope::All`'s multiple tips (an unmerged feature branch
+plus `main`) into a single time-sorted walk can hand back a parent before one of its own children
+when two tips' commits share (or clock-skew past) a timestamp - a real, occasionally-observed `git
+log` phenomenon, reproduced here by the test harness's own fast successive commits. `layout_lanes`
+now tracks which ids it has already emitted and skips wiring an edge to one of them rather than
+leaving a lane permanently dangling - a real, tested degradation (the affected row's elbow is simply
+omitted), not a guess. `ahead_behind_against_upstream` and `commit_changed_files` (`git show
+--name-status`, hex-validated shas only) round out the module, both real, both read-only. Nothing in
+`wt_core::graph` mutates a repository; that is the deliberate, hard scope boundary for this phase.
+
+**The UI** (`crate::graph_view`, new module) mirrors this project's existing "two independently-
+shaped parallel collections" tab-strip pattern rather than forcing a unified `Tab` enum: the graph
+tab is a third slot (`AdeApp::graph_tab_open`/`graph_tab_active`), not a new enum variant threaded
+through `open_files`/`sessions`. The row `⋯` menu's Branch/Apply/Reset groups and the toolbar's Push
+menu are real, visible, grouped rows using the existing `render_dropdown_menu_row` helper - but every
+one of them that would mutate the repo is rendered with `enabled: false` and no `.on_click` at all,
+since none of those operations exist in `wt_core` yet. Only Copy SHA/Copy subject (real
+`cx.write_to_clipboard`) and the read-only scope segment are wired. Fetch/Pull are honest no-ops
+("not implemented yet" plus a real reload) rather than fake successes. The session column is
+honestly empty (session-to-commit correlation is phase (b)); the "note" column is a reserved, empty
+spacer, not a guess at data the spec names but this phase has none of.
+
+### What the self-review pass found
+
+Before dispatching the audit, a re-read of the row `⋯` menu's own bounds-capture caught a real bug:
+its `gpui::canvas` wrote a *single* `AdeApp::graph_state.row_menu_bounds` field from *every* row's
+trigger simultaneously (up to 500 of them, unvirtualized), so by the time a frame finished painting
+the field held whichever row happened to paint last - not necessarily the open one. Fixed before the
+audit ran: `row_menu_bounds` is now a `HashMap<usize, Bounds<Pixels>>` keyed by row index, cleared on
+every reload since a reload can renumber which commit sits at which index.
+
+### What the independent adversarial audit then found
+
+A real adversarial review sub-agent was dispatched over the finished branch and really reported;
+everything below is its own work, reproduced by tracing real call chains rather than reasoning from
+this change's own comments. It found six CRITICALs, five of them dangling-focus bugs this project has
+hit before in exactly this shape - and, correctly, observed that the feature shipped with no focus
+regression test at all even though every sibling overlay in this crate (`palette_focus_tests`,
+`settings_focus_tests`, `code_focus_tests`) has one.
+
+**Five real dangling-focus paths**, all through `AdeApp::open_git_graph`/`leave_graph_tab`:
+
+- `leave_graph_tab` swept `graph_focus_handle` but not the Branches panel's own real text-input
+  surface, `graph_state.branches_filter_focus_handle` - focusing the filter box then switching to a
+  session tab left `Window::focus` on a handle that had just stopped being rendered.
+- `open_git_graph` cleared `open_change` (unrendering the code surface) but only swept
+  `tree_focus_handle`, not `code_focus_handle` - opening the graph tab with a file focused could
+  capture `graph_focus`'s own return target as a handle already unrendered by the time it was
+  captured, and a second file tab opened afterward could even capture it a second time as *its own*
+  return target, deferring the dangle to whenever that tab closed. It also skipped
+  `refresh_open_diff_file_cache()`, which every other site clearing `open_change` calls.
+- `close_session`'s `skip_focus_move` guard checked `open_change`/`settings_open` but not
+  `graph_tab_active`, so closing a session tab while the graph tab was showing pointed focus at a
+  pane `render_center_pane` wasn't drawing. The sibling guard in `focus_newly_spawned_session` had
+  been updated for this; this one hadn't.
+- `cancel_new_file` (Escape from the `+` menu's "New file" prompt) and `create_file_named` (Enter)
+  both had the same gap - real "open a file"/"leave a prompt" paths that don't go through
+  `code_surface::tabs::open_and_focus_file`, this project's own documented single chokepoint for
+  opening a file, so the graph-tab sweep added there never covered them.
+
+All five are fixed at their real sites (`leave_graph_tab` now sweeps both handles and is called from
+`create_file_named` too; `open_git_graph` sweeps `code_focus_handle` the same way it already swept
+`tree_focus_handle`; `close_session` and `cancel_new_file` both gained the `graph_tab_active` guard
+the audit named as missing), and a new `graph_focus_tests` module (four tests, in
+`graph_view::render`, the same place `code_focus_tests` lives beside the code it exercises) now
+covers the first two paths end to end with real `AdeApp` instances and positive `assert_eq!` checks
+against the real handle focus should land on - not just `assert_ne!` against the one that shouldn't,
+which the audit's own module doc note calls out as a false-negative shape that would still pass on a
+genuinely dangling `Window::focus`.
+
+**The sixth CRITICAL**: `render_graph_commit_panel` called `wt_core::graph::commit_changed_files`
+- a function whose own docs say it spawns a real `git show` child process - directly inside a render
+method, on every frame the Commit panel was visible. `load_graph` already had the correct
+`cx.background_executor()` pattern for the graph itself; this one bypassed it. Fixed with a real
+cache (`GraphTabState::commit_files_cache`, keyed by sha, loaded via `AdeApp::load_commit_files`
+exactly like `load_graph`), which also fixed a smaller issue the same finding named: a real load
+failure was being silently swallowed into an empty-looking file list via `.unwrap_or_default()`
+instead of shown as the real error it was.
+
+**Also found and fixed**: both the Push `▾` menu and the row `⋯` menu anchored themselves using
+window-space `gpui::canvas` bounds while being rendered *nested inside* the graph view's own
+container - correct for `render_plus_menu`'s identical mechanism only because that one is a direct
+child of the window's root element. Nested here, both popovers painted double-offset (roughly the
+rail's width and the title bar's height) and their scrims only covered the container, not the
+window, so clicking outside the centre pane didn't dismiss either one. Both are now rendered from
+`AdeApp::render` as siblings of `render_plus_menu`, gated on `graph_tab_active`. Switching worktrees
+while the graph tab was open left it silently showing the previous repository's data (`select_worktree`
+now reloads it, same as it already reloads the diff). The Push button showed a fabricated `↑0` when
+the real upstream count was unknown rather than loading; it now renders a bare "Push" in that state,
+matching `ahead_behind_against_upstream`'s own "no entry rather than a fabricated value" contract. A
+`.expect()` in `wt_core::graph::build_graph` that could only ever fire on a `gix` behavior change, not
+a real input, is now a silent, honest skip instead of a library panic. The Branches filter's real
+undo history is now reset (not merely cleared) when the tab closes, matching `open_palette`'s own
+documented reasoning for why a reopened widget must not see its predecessor's history.
+
+**Checked and cleared** by the audit, not just asserted by the author: every `wt_core::graph`
+function really is read-only (no checkout/cherry-pick/revert/rebase/reset/push anywhere in it, argv-
+only git invocation, sha hex-validated before reaching one); all ten Branch/Apply/Reset rows and all
+three Push-menu rows really do pass `enabled: false` with no `.on_click`, and only the two Copy rows
+are genuinely wired; the `"text-input"` tag on the Branches filter box matches the other three
+existing sites exactly; `layout_lanes`' branch/merge/recycling behavior and its out-of-order handling
+were hand-traced against the fixtures and genuinely match what the tests claim; the session and
+"note" columns really are honestly empty, not fabricated.
+
+Verification: all four gates clean - `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace --lib -- --test-threads=1` at 954 app + 42 lsp-core + 14 pty-core + 115
+wt-core, up from 946/42/14/98 at the last recorded baseline (BUILD-LOG.md's own prior entry) - +8
+app tests (four real `graph_focus_tests`, four pure `graph_view::state` unit tests) and +17 wt-core
+tests (`wt_core::graph`'s own suite, including the out-of-order-timestamp regression and the merge/
+non-merge/root-commit `commit_changed_files` cases). A single `diff_render_tests`-named failure
+appeared on one full run and was confirmed a pre-existing flake by re-running it alone (passes
+every time in isolation) before being treated as unrelated, per this project's own established
+practice for that specific test.
+
+Not done in this pass, left honest rather than papered over: the row `⋯` menu's vertical anchor uses
+its own captured button bounds rather than the design spec's literal `top = 39 + row × 26 + 20`
+formula (a real, working popover, just not pixel-identical to the spec's math); the row list is not
+virtualized (`wt_core::graph::DEFAULT_MAX_COMMITS` already caps loaded data at 500 rows, which was
+judged an acceptable simplification for this phase rather than a correctness gap, but it is a real
+per-frame cost at that size); the design spec's branch-row ahead/behind counts and `merged` mark are
+not rendered in the Branches panel, which currently shows only the branch name, lane dot, and `HEAD`
+mark.
+
+## Git graph tab: real right-click on the row `⋯` menu, and click/button-anchored positioning (GitHub issue #1, phase (a) follow-up)
+
+A follow-up refinement to the git graph tab above, not new scope: the row `⋯` context menu opened
+only via its small trigger button, and wherever it opened was computed from a fixed per-row formula
+(`left(px(140.0))`, `top(bounds.origin.y - bounds.size.height)`) rather than any real position. Two
+real user reports fixed: a real right-click anywhere on a commit row now opens the same menu
+(`AdeApp::render_graph_row`'s new `on_mouse_down(gpui::MouseButton::Right, ..)`, mirroring the file
+tree's own real right-click pattern from GitHub issue #19 - `crate::sidebar::tree_ops::
+open_tree_context_menu`), and both that path and the `⋯` button's own click now anchor the popover
+at a real, captured position (`GraphRowMenu { row_index, origin_x, origin_y }`, replacing the old
+bare `Option<usize>`) rather than a formula - resolved once at open time in the new
+`AdeApp::open_graph_row_menu_at`, clamped inside the window with the same `context_menu::
+clamp_menu_origin` the file tree menu uses (`theme::graph::ROW_MENU_HEIGHT` is a new hand-measured
+constant this needed, pinned by its own test).
+
+### Self-review and the independent adversarial check
+
+A self-review before dispatching the audit confirmed the three things the coordinator's own
+instructions asked about directly: a right-click on a scrolled row anchors correctly (the fix
+reads the real `event.position`/captured bounds, never row index, so scroll was never actually
+reachable as a bug once the formula was gone); right-clicking a different row while another row's
+menu is open replaces it at the new position, not two menus at once (`row_menu_open` is a single
+`Option`, unconditionally overwritten); and `cx.stop_propagation()` on the row's right-click handler
+does prevent its other handlers from firing (though for `on_click` specifically this turned out to
+be structurally guaranteed by `gpui` itself, which only tracks `MouseButton::Left` for `on_click` -
+documented in the test that covers it rather than assumed). The menu's own entries/content were
+confirmed untouched - this is a pure positioning/input-handling change.
+
+A genuinely independent adversarial checker sub-agent was then dispatched with no access to this
+session's own reasoning, asked to verify those same three things plus the "content unchanged" claim
+directly against the code. It passed all four, but traced two real bugs while reading the
+surrounding code that the self-review missed, both pre-existing (present before this change, not
+introduced by it, but real and adjacent enough to fix here rather than leave for later):
+
+- The row `⋯`/right-click menu and the Push `▾` menu are independent state with nothing stopping
+  both from being open at once - opening one left the other's own full-window scrim painted
+  underneath it, silently eating the next click aimed at dismissing it. Fixed: `open_graph_row_menu_at`
+  now clears `push_menu_open`, and `toggle_graph_push_menu` now clears `row_menu_open`.
+- `AdeApp::open_git_graph` only calls `load_graph` (the thing that actually clears `row_menu_open`)
+  while the graph is still `NotLoaded` - so switching away from an already-loaded graph tab with a
+  row menu open, then back, left the stale menu reappear the instant the tab became active again,
+  with no click at all, since `crate::root::AdeApp::render`'s overlay gate only checks
+  `graph_tab_active`. `leave_graph_tab` now clears both `row_menu_open`/`push_menu_open` itself,
+  the same way `close_git_graph_tab` already did for an outright close. A related instance of the
+  same class the checker also flagged - opening Settings doesn't clear `graph_tab_active` either,
+  so an open row/Push menu kept painting over the Settings surface - is fixed the same way in
+  `AdeApp::open_settings`, plus a defensive `!self.settings_open` added to the overlay gate in
+  `crate::root::AdeApp::render` itself (belt to that fix's braces, matching the tree context menu's
+  own identical guard one hunk below it).
+
+The checker also flagged one doc-comment inaccuracy (an early claim that `MouseDownEvent::
+is_focusing()` gates `gpui`'s auto-focus-on-click by mouse button - it doesn't; the real reason a
+right-click needed an explicit `window.focus` call is that the row's own `cx.stop_propagation()`
+preempts the container's auto-focus listener) and one overstated doc claim (`ROW_MENU_HEIGHT` being
+"measured from a real paint" when it's actually measured under the test harness's synthetic text
+metrics, which can differ slightly from a real build's). Both comments are corrected in place rather
+than left misleading.
+
+Every fix above was confirmed non-vacuous the same way this project's prior entries have: each was
+reverted in turn and its own regression test (a new `switching_away_from_the_graph_tab_and_back_does_
+not_resurrect_a_stale_row_menu`, `opening_settings_dismisses_an_open_row_menu`, and the two
+`opening_the_{row,push}_menu_closes_an_open_{push,row}_menu` tests) was watched fail before being
+restored. The stale-menu-on-reactivation test specifically calls `leave_graph_tab` directly rather
+than through `select_session`, since `select_session` can also route through `Self::select_worktree`
+(which reloads the graph unconditionally on its own) - an early draft of that test went through
+`select_session` and passed even with the fix reverted, for that confounding reason, before being
+corrected to isolate what it actually meant to prove.
+
+Verification: all four gates clean - `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace --lib -- --test-threads=1` at 967 app + 42 lsp-core + 14 pty-core + 115
+wt-core, up from 954/42/14/115 at the prior entry's own baseline (+13 app tests: 9 real-dispatch
+`graph_row_menu_tests` covering right-click/anchoring/replacement/occlusion/focus, plus 4 more from
+this pass's own review). One `lsp_diagnostics_wiring_tests` failure (a real-`rust-analyzer`,
+timing-dependent test, not the project's previously-documented `diff_render_tests` flake) appeared on
+one full-workspace run under test-thread contention and was confirmed a pre-existing, unrelated flake
+by re-running it alone (passes immediately in isolation) - this diff touches no LSP code at all. A
+clean full re-run afterward showed zero failures.
+
+## Git graph tab: connecting elbows for shared-ancestor convergence, and a selection-border layout
+shift (GitHub issue #1, phase (a) follow-up)
+
+Two more real bugs against the git graph tab above, diagnosed directly against this repository's own
+commit history rather than a synthetic fixture.
+
+**Converging elbows.** `layout_lanes` drew a real elbow for a merge commit's second parent (`Elbow`
+with what is now `ElbowKind::Diverging`) but had no equivalent for the opposite, equally-real case:
+two independent lanes sharing an ancestor with *no* merge commit involved (e.g. this repository's own
+row 9, `ac8e6cd`, where two unrelated branch tips both reach the same shared parent). The ending
+lane's `LaneSegment` still marked `ends_here`, but nothing drew the elbow connecting it to the
+surviving lane's dot - the line simply dead-ended. Fixed by giving `Elbow` a new `kind: ElbowKind`
+field (`Diverging` for the existing merge case, `Converging` for the new shared-ancestor case, drawn
+as the geometric mirror in the row's *top* half instead of the *bottom*), wired through a new pure
+`elbow_geometry` function in `crate::graph_view::render` that picks the bordered edge/corner and
+row-half per kind, with `debug_selector`-tagged real paint coverage (`graph_elbow_render_tests`)
+alongside pure geometry unit tests (`elbow_geometry_tests`) - the two were kept separate because
+`debug_bounds`-only assertions on a painted box's position/size can't tell a swapped edge/corner
+choice apart from a correct one (same bounds, different border), which only the pure test can pin
+down directly.
+
+### What the independent adversarial check found
+
+A genuinely independent checker sub-agent was dispatched against this fix with no access to prior
+reasoning, asked to verify two things by hand-tracing `layout_lanes` and `elbow_geometry` against
+constructed multi-branch DAGs (not just re-reading the existing tests' own names): that every ending
+lane really gets a connecting elbow, and that a `Converging` elbow can never paint in a row's bottom
+half (or a `Diverging` one in its top half). Both held - but brute-forcing 265,200 synthetic layouts
+(all topologically-sound 6-node DAGs plus adjacent-row swaps) surfaced two real, reachable defects in
+`layout_lanes` itself, both stemming from the same root cause: Step 4's "open a new lane for this
+merge's second parent" allocation could reuse a lane index this *same row* had just freed a few lines
+earlier, which the checker traced to two distinct broken outputs:
+
+- A **self-loop elbow** (`Elbow { from_lane: N, to_lane: N }`) when a merge's first parent had
+  already been seen elsewhere (an out-of-order history), which frees `own_lane` in Step 3 - Step 4
+  could then hand that same just-freed slot right back out for the second parent, producing a
+  1px-wide elbow box that connects a lane to itself instead of a real merge point.
+- A **duplicate `LaneSegment`** for one lane in one row when Step 4 reused a lane Step 2 had just
+  freed via a `Converging` collapse - the row ended up with both an `ends_here` segment and a
+  `starts_here` segment at the same lane index, which `render_graph_lane_canvas` then painted as one
+  unbroken pass-through line for what were really two entirely unrelated branches. The existing
+  `a_merge_row_that_is_also_a_shared_ancestor_gets_both_elbow_kinds` test (added for the original
+  `Converging` fix) already constructed this exact scenario but only asserted on `row.elbows`, never
+  on `row.segments`, so it passed while still rendering the bug.
+
+Fixed with a new `free_before_row` snapshot (which lane indices were actually free *before* this
+row's own Step 2/3 mutations) and a dedicated `allocate_fresh_lane` used only by Step 4's new-lane
+path, which - unlike the general-purpose `allocate_lane` Step 1 still uses for the ordinary
+recycled-lane case - refuses to hand back `own_lane` or anything freed earlier in the same row. The
+existing shared-ancestor test now also asserts every lane index in `m_row.segments` is unique and
+that the row's `Diverging` elbow's `to_lane` is never `own_lane`; a new dedicated regression,
+`a_merge_whose_first_parent_was_already_seen_never_self_loops_its_second_parent`, covers the self-loop
+case directly.
+
+**Selection-border layout shift.** User report: clicking a graph row visibly moved its content
+instead of just highlighting it. `render_graph_row` applied `.border_l_2()` only inside
+`.when(selected, ...)`, so selecting a row added 2px of border-box inset that had not been there a
+frame earlier, pushing every child (lane canvas, ref chips, subject, ...) 2px to the right on click.
+Fixed the same way this codebase already solves this exact class of problem elsewhere
+(`crate::work_surface::state::TRANSPARENT`, documented there as existing specifically "so every
+button/tab can always call `.bg()`/`.border_color()` uniformly rather than conditionally skipping the
+call, which would also shift the box model by the border's width"): `.border_l_2()` is now applied
+unconditionally, and only its *colour* toggles between `theme::border::SELECTED_EDGE` and
+`work_surface::TRANSPARENT`. A new regression test, `graph_selection_render_tests::
+selecting_a_row_never_shifts_its_own_lane_canvas`, drives a real selection change on a live `AdeApp`
+and asserts the lane canvas's real painted `debug_bounds` (position *and* size) are identical before
+and after - mirroring `code_surface::editing`'s own `assert_eq!(a.size.width, b.size.width, ...)`
+bounds-comparison pattern and `merge::flow`'s "capture bounds before and after a real state-changing
+action on the same live entity" shape, rather than a fresh `TestAppContext` per state (the bug is
+specifically about the *same* row moving when its own selection flips, not about two different rows
+differing).
+
+The exact same conditional-`border_l_2()` pattern also exists in `crate::sidebar::render`'s
+change-row rendering - a real, pre-existing bug in the same shape, not introduced by this change and
+left untouched here since it is a separate surface with its own scope; noted for a future pass rather
+than silently left unmentioned.
+
+Verification: all four gates clean - `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace --lib -- --test-threads=1` at 975 app + 42 lsp-core + 14 pty-core + 118
+wt-core, up from 967/42/14/115 at the prior entry's own baseline (+8 app tests: 5
+`elbow_geometry_tests` + 2 `graph_elbow_render_tests` for the `Converging` elbow's real paint/geometry
+coverage, + 1 `graph_selection_render_tests` for the border fix; +3 wt-core tests: the two
+`Converging`-elbow scenarios plus the new self-loop regression). A full, clean run showed zero
+failures this time - no `diff_render_tests` or other flake reappeared.
+
+## Fix: a Converging elbow's vertical stroke was anchored on the wrong side
+
+Real, direct user feedback on the git graph tab (after the fixes above landed): "curve the start and
+end of branch lines to make them join the horizontal lines instead of continuing" - a branch line
+kept running straight through the exact spot where it should have bent into a curve, with the curve
+itself appearing as a disconnected shape nearby rather than the actual path the line took.
+
+Root cause, in `elbow_geometry`'s `Converging` case (`crates/app/src/graph_view/render.rs`):
+`from_lane` is the *ending* lane (confirmed directly in `crates/wt-core/src/graph.rs` -
+`Elbow { from_lane: index, to_lane: own_lane, kind: Converging }`), which already has its own real,
+separately-painted `ends_here` stub occupying this row's top half at `from_lane`'s own x. The elbow's
+own vertical stroke has to land on that exact same side to visually continue it - but the code had
+`vertical: if own_right_of_ending { Right } else { Left }`, anchoring at `to_lane` (own_lane)'s side
+instead: the *destination* dot, which has no incoming line there to continue at all. The result: the
+ending lane's straight stub simply stopped, unconnected, while a separate L-shaped curve rendered
+near own_lane's side, never actually bending from the stub it was supposed to be continuing - exactly
+the reported symptom. Flipped both branches of the ternary to match `from_lane`'s side instead,
+mirroring the already-correct `Diverging` case's own `rightward`/`Left` pairing (which anchors at
+`from_lane` too - `Diverging`'s `from_lane` plays the same "already has a real line here" role
+`Converging`'s `from_lane` does, just for the opposite direction).
+
+This exact bug had already shipped through a real, previously-dispatched adversarial checker
+undetected, for two real, compounding reasons: the paint-based `graph_elbow_render_tests` (added in
+the prior entry) only asserted the elbow box's *bounding rectangle* (top/height/left/width), which is
+byte-for-byte identical regardless of which side gets the border - only the *painted border/corner*
+differs, and `debug_bounds` cannot see styling. The pure `elbow_geometry_tests` unit tests *did* assert
+the `vertical` field directly - but with the wrong expected value, confidently reasoning "the vertical
+stroke must be anchored at own_lane (to_lane), not from_lane" in their own comments, backwards from
+the truth in the same way as the implementation bug itself, so they never had a chance to catch it.
+Fixed both wrong assertions to match the corrected geometry, with comments explaining why this side
+is correct this time - real user-visible feedback made the actual answer unambiguous.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+975 app + 42 lsp-core + 14 pty-core + 118 wt-core, 0 failed - counts unchanged from the prior entry
+since this fix corrected two existing tests' expectations rather than adding new ones.
+
+## Two more real fixes: doubled-up lane lines, and a fixed-width lane canvas
+
+Two more pieces of direct user feedback on the git graph tab.
+
+**"The vertical lines are going too far at the end and at the start."** Real root cause: a lane
+that both starts (or ends) at a given row *and* has a real elbow there was getting **two**
+elements painted over the exact same pixels - the plain `starts_here`/`ends_here` stub
+(`render_graph_lane_canvas`'s own segment loop) *and* the elbow's own vertical stroke
+(`elbow_geometry`, now correctly anchored at that same lane's x after the fix above) - not
+visually distinguishable from one line simply running further than it should. Fixed by skipping
+the plain stub whenever a real elbow of the matching kind (`Converging` for `ends_here`,
+`Diverging` for `starts_here`) already covers that exact lane in that row - the elbow becomes the
+sole visual representation for that half, instead of two overlapping ones. Added a real,
+paint-based regression test (`a_lane_with_a_diverging_elbow_does_not_also_paint_a_plain_starts_here_stub`)
+reusing the existing real-merge fixture, confirmed non-vacuous by temporarily disabling the new
+skip condition and watching it fail first.
+
+**"The width reserved for the graph is static... with a lot of branches it overlaps the lines
+text."** `theme::graph::LANE_CANVAS`'s fixed 100px only fits up to 6 concurrent lanes
+(`lane_x(5) + 9 == 88`); a 7th lane's own dot/elbow already painted at `x >= 93`, past the
+canvas's own right edge, directly overlapping the ref chips and subject text columns next to it.
+Added `graph_lane_canvas_width(lane_count)` (`graph_view/state.rs`): grows past the fixed default
+exactly as far as the real `lane_count` needs, never shrinks below it. `render_graph_lane_canvas`
+already receives `lane_count` from the graph's own real global max (not a per-row value), so every
+row's canvas width stays consistently aligned regardless of how many lanes any *individual* row
+happens to use. Two new pure unit tests pin the boundary (still-fits counts stay at the default;
+counts past it grow to actually cover the rightmost lane's real x position).
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+978 app + 42 lsp-core + 14 pty-core + 118 wt-core, 0 failed (+3 app tests: the new segment-overlap
+regression, plus two `graph_lane_canvas_width` unit tests).
+
+## Elbow redesign: a real two-curve S-shape, replacing the single-corner fix above
+
+A third round of direct user feedback on the same feature, after the two fixes above: "the start of
+lines are the good size now but the horizontal lines corners are then wrong direction so they need to
+go toward the line. Also the end of the lines need to have corners too so they rejoin after merge."
+The previous design (both fixes above) painted exactly **one** rounded-corner box per elbow: a
+vertical stroke on one side smoothly curving into the horizontal middle, but the *other* end of that
+same box just stopped flat, with no curve at all - the line "rejoining" the next row's straight
+segment (or `own_lane`'s dot) as a sharp, uncurved corner instead of a real bend. Both ends needed
+their own curve, not one curve and one flat dead-end.
+
+Replaced the old flat `ElbowGeometry { top, left, width, height, horizontal, vertical }` with a
+nested shape: `entry: CurveBox` (continues whichever lane already has a line there - `own_lane`'s own
+dot for `Diverging`, the ending lane's own already-painted `ends_here` stub for `Converging`),
+`straight: Option<StraightSegment>` (a plain 1px-tall bridge, only present when the two lanes are far
+enough apart that the two curves don't already meet), and `exit: CurveBox` (lands exactly on the
+*other* lane - the continuing lane's own `starts_here` stub in the row below for `Diverging`, or
+`own_lane`'s own dot for `Converging`). Each `CurveBox` is one `ELBOW_RADIUS`-square quarter-circle,
+reusing the same `HorizontalEdge`/`VerticalEdge` border/corner scheme the old single-box design used,
+just applied twice per elbow instead of once.
+
+`ELBOW_RADIUS` being exactly half of `ELBOW_HEIGHT` (7px/14px) is a load-bearing coincidence: the two
+curves' combined height exactly fills the row's available half with nothing left over, so the
+existing 1px overshoot into the neighbouring row (matching `LaneSegment`'s own half-height stubs)
+falls out of the same arithmetic with no extra fudge term. Verified this by hand for both directions
+and both `ElbowKind`s before touching the render loop.
+
+Rewrote the render loop (`render_graph_lane_canvas`) to paint 2-3 pieces per elbow via a small
+`render_curve` closure (one call per `CurveBox`, shared between entry and exit), plus the optional
+straight segment as a plain background-colored div. Debug selectors gained an explicit part suffix
+(`graph-row-{row}-elbow-{index}-{kind}-entry` / `-straight` / `-exit`) since a single elbow no longer
+paints as one box.
+
+Rewrote both test modules to match: `elbow_geometry_tests` (pure, `Pixels`-only) now asserts each
+curve's own position and edge/corner choice independently, plus two new tests for the straight
+segment's presence/absence and its exact no-gap-no-overlap fit between the two curves. Dropped the
+old "converging and diverging never share a horizontal edge" assertion - it doesn't hold for this
+shape (both kinds legitimately use the same Bottom-then-Top border pattern; only their absolute row
+position tells them apart now) - and replaced it with a same-purpose "always occupy opposite row
+halves" test. `graph_elbow_render_tests` (paint-based, real GPUI test app) now checks the entry and
+exit curves' bounds separately against `from_lane`/`to_lane`'s real x, instead of one box spanning
+both.
+
+As with the two rounds above, visual verification of the actual rendered curves remains impossible in
+this sandbox (GPUI's headless test renderer is macOS-only in this pinned revision; the sandbox's own
+X11 screenshot capture is separately, independently broken). This geometry is verified by hand-derived
+arithmetic and `debug_bounds`-based paint tests, not by looking at it - the real test is the next round
+of user feedback.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+928 app + 42 lsp-core + 14 pty-core + 98 wt-core, 0 failed (+3 app tests net in
+`elbow_geometry_tests`: two new straight-segment tests, one entry/exit split adding a test). One
+unrelated, pre-existing flake (`diff_render_tests::opening_a_real_diff_renders_real_syntax_highlighted_rows`,
+a timing-sensitive async-highlight test in a file untouched by this change) was seen once in a full
+run and passed cleanly both in isolation and on a full-suite rerun - not a regression from this work.
+
+## Two more real fixes on the S-curve shape: a 1px seam, and a wrong merge-line color
+
+Real user feedback on the S-curve redesign above: "everything is good except a small gap of a pixel
+or so in between the connections of lines. Also the line going back to the branch merged should be
+the same color as the branch instead of the color it is being merged in."
+
+**The seam.** `elbow_geometry`'s entry/straight/exit pieces were positioned so the straight bridge's
+own ends land *exactly* on the tangent point each curve's own arc math predicts - correct in theory,
+but a border-radius arc (`render_curve`'s bordered, rounded div) and a straight bridge (a plain
+background-filled div) are two different GPUI rendering paths, and nothing guarantees their
+anti-aliased edges land on the same physical pixel even when the underlying coordinates agree
+exactly. That mismatch reads as a hairline gap right at each entry-to-straight and straight-to-exit
+junction - small enough to have been invisible in the hand-derived arithmetic that verified the
+shape, but visible in the real rendered app. Fixed by always drawing a straight bridge - even between
+lanes exactly `2*RADIUS` apart, where the two curves' own math says they already touch with nothing
+left over - shifted 1px earlier and widened by 2px, so each end overlaps 1px *into* its neighbouring
+curve's own box rather than merely touching it. `ElbowGeometry.straight` changed from
+`Option<StraightSegment>` to a plain `StraightSegment` (always present now); the
+`adjacent_lanes_need_no_straight_segment_at_all` test (asserting `None` in that case) no longer holds
+and was replaced with `adjacent_lanes_still_get_a_minimal_overlapping_straight_bridge`, pinning the
+new 2px-minimum, 1px-overlap-per-side shape directly.
+
+**The merge-line color.** `wt_core::graph::layout_lanes` sets a `Diverging` elbow's `from_lane` to
+*this row's own dot* (the branch being merged **into**) and `to_lane` to the *other* lane (the branch
+actually being merged **in**) - see the doc comment on `ElbowKind::Diverging` itself. The render loop
+colored every elbow with `lane_color(elbow.from_lane)`, which for `Diverging` is backwards: it painted
+the connector with the color of the branch it lands in, not the branch it's carrying. Fixed by pulling
+the color choice out into its own pure function, `elbow_color_lane` (mirroring `elbow_geometry`'s own
+"pure and independently testable" shape, since GPUI's test harness can inspect painted *bounds* via
+`debug_bounds` but has no way to inspect a painted *color*): `Diverging` now resolves to `to_lane`
+(the merged-in branch), `Converging` is unchanged at `from_lane` (the ending lane - there is no
+"merged into" branch at all here, no merge commit is involved, so the ending lane's own color
+continuing is already correct, matching the `ends_here` stub it continues). Added two focused unit
+tests pinning this choice directly by kind.
+
+As with every round on this feature, visual verification remains impossible in this sandbox (GPUI's
+headless test renderer is macOS-only in this pinned revision; this sandbox's own X11 screenshot
+capture is separately, independently broken) - both fixes are verified by hand-derived arithmetic and
+`debug_bounds`/pure-function unit tests, not by looking at the result.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+1111 app + 44 lsp-core + 14 pty-core + 127 wt-core, 0 failed (+2 app tests: the two new
+`elbow_color_lane` unit tests; the wide jump in app/wt-core counts from the prior entry's reported
+928/98 reflects those earlier numbers having been read from a stale or partially-built test binary in
+this sandbox, not any change to those crates in this round - confirmed by grepping the wt-core source
+directly for `#[test]`, which independently counts 127, matching this run exactly).
+
+## Seam still visible after the 1px overlap - widened to 2px
+
+A follow-up real screenshot showed the hairline gap at each curve-to-straight junction survived the
+1px-per-side overlap above. This coordinate-level fix cannot see (or control) whatever the real
+display's own anti-aliasing or sub-pixel rounding does with these values once GPUI actually paints
+them - a border-radius arc and a filled rect are still two different rendering paths regardless of
+how exactly their coordinates line up on paper. Rather than keep chasing an exact value analytically
+(twice already insufficient), widened the overlap to 2px per side (a `const OVERLAP: Pixels = px(2.0)`
+now drives both the shift and the added width) - a value with enough margin to absorb a reasonable
+amount of that uncertainty, still imperceptible on a 1px-wide line. Updated
+`a_wide_lane_gap_gets_a_real_straight_middle_segment_overlapping_2px_into_each_curve` and
+`adjacent_lanes_still_get_a_minimal_overlapping_straight_bridge` to pin the new 2px/4px-minimum shape.
+
+Flagged honestly in the PR comment: if this still doesn't fully close the gap, the likely next step is
+asking for a tighter description of exactly where the gap sits (at the dot, at the curve's own
+45-degree midpoint, or specifically at this straight-segment seam) rather than a fourth blind
+coordinate guess, since this sandbox still cannot render the result to check directly.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+1111 app + 44 lsp-core + 14 pty-core + 127 wt-core, 0 failed (test count unchanged - same two tests,
+updated in place to assert the new 2px/4px values).
+
+## Middle-click didn't close the graph tab
+
+A real user report: "the git graph tab can't be closed with middle mouse, this should be the case
+for every tab." GitHub issue #26 already wired middle-click close for both file tabs
+(`work_surface/render.rs`'s file-tab div) and session/terminal tabs (its session-tab div), each via
+`.on_mouse_down(MouseButton::Middle, ...)` calling the same real close path the `×` button uses. The
+graph tab's own `render_graph_tab` had simply never been given the same treatment - its outer div had
+only `.on_click` on the inner hit-target, no middle-click handler at all on the tab itself. Fixed by
+adding the identical `on_mouse_down(MouseButton::Middle, ...)` wiring to the graph tab's own div,
+calling `close_git_graph_tab` (the same real teardown the `×` button already uses - the graph tab has
+no dirty-state confirmation to bypass, unlike a file tab, so no extra gating is needed).
+
+Confirmed the Settings surface has no tab-strip entry at all (it replaces the whole workspace body,
+not a tab), so it was correctly out of scope for this audit - the graph tab was the only real gap.
+
+Added `middle_clicking_the_graph_tab_closes_it_like_every_other_tab_kind`, a real `gpui::test` driving
+a genuine `MouseDownEvent` (`MouseButton::Middle`) at the graph tab's own painted bounds via
+`cx.simulate_event` (mirroring `graph_row_menu_tests`' own `right_click` helper) and asserting
+`graph_tab_open` flips to `false`. Confirmed non-vacuous by temporarily reverting the fix and watching
+it fail first.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+1112 app + 44 lsp-core + 14 pty-core + 127 wt-core, 0 failed (+1 app test: the new middle-click
+regression).
+
+## The elbow seam, actually diagnosed: GPUI paints borders *inside* the box, so `border_b` and `border_t` at the same y are always one row apart
+
+Five rounds of "fixed" on this seam had not fixed it. The user's latest, and most precise,
+description: "branch lines elbow start 1px above the base branch elbow" where a branch diverges,
+and "horizontal lines including elbow from branch 1px below the base branch elbow when merging
+back", asking to "align the elbow line from the base with the center horizontal line and the elbows
+from the branch at the start and at the end." The round immediately before this one - extending the
+straight bridge's horizontal reach by `ELBOW_RADIUS` per side so its filled rect would cover each
+curve's whole already-straight border run - came back as, simply, "Still not aligned."
+
+**Stopping the guessing.** Every previous round reasoned about the shape analytically and then
+picked a 1px value. This round started instead by measuring the user's own screenshots pixel by
+pixel (PIL, classifying each pixel by lane color against the `#131518` background) and reading
+GPUI's actual quad rasterizer, rather than only `Corners::clamp_radii_for_quad_size`.
+
+The measurement was unambiguous. On a real diverging orange elbow in the latest screenshot, at 1:1
+device scale (lane columns 14px apart, exactly `LANE_STEP`, confirming no HiDPI scaling to reason
+around): the entry curve's vertical ran down column 75, its arc turned, and its horizontal run
+landed on **row 121** spanning x 78-84 - while the straight bridge ran along **row 122** from x 83
+to 113, and the exit curve's own horizontal run and arc were also on **row 122**, turning down into
+its lane at column 116. The same one-row step, same direction, on the second orange elbow (entry row
+173, bridge and exit row 174) and on both pink elbows (diverging: entry 69, bridge/exit 70;
+converging: entry 23, bridge/exit 24). Not anti-aliasing, not a half-pixel: a clean, reproducible,
+integral one-row step, always with the `HorizontalEdge::Bottom` curve one row above everything else.
+
+**The root cause.** GPUI paints a border *inside* the box's own bounds, exactly like CSS
+`box-sizing: border-box`. Its quad fragment shader (`fs_quad` in `crates/gpui_wgpu/src/shaders.wgsl`
+at the pinned revision `7b030b5`) computes `straight_border_inner_corner_to_point = corner_to_point
++ reduced_border` and treats a pixel as border when it lies between the bounds edge and that inset
+inner edge - measured *inward* from the bounds. `Style::paint` insets the content rect the same way.
+So for the 1px borders this module paints:
+
+* `border_b` on a box whose **bottom** edge is `y` paints the pixel row `[y - 1, y)`;
+* `border_t` on a box whose **top** edge is `y` paints the pixel row `[y, y + 1)`.
+
+`elbow_geometry` placed the entry curve's bottom edge and the exit curve's top edge at the same
+computed `waist_y`, and the 1px-tall filled bridge at `top = waist_y`. The coordinate arithmetic
+really did meet exactly - which is why hand-derivation kept confirming a zero-gap join, and why the
+previous entry in this log concluded the residue "sat within GPUI's own sub-pixel anti-aliasing
+rather than a real coordinate error." It was neither. Two boxes that *touch* at a shared `y` paint
+their two horizontal strokes on two different, adjacent rows, by construction, always.
+
+This also explains precisely why the immediately preceding fix changed nothing: the bridge was
+extended to cover each curve's straight border run, but the entry curve's border run was never on
+the same *row* as the bridge, so there was nothing there for the fill to cover. It painted over
+empty background and left the stray stroke exactly where it was.
+
+**The fix.** `CurveBox` gained a `height` field, and the `HorizontalEdge::Bottom` curve (the entry
+curve, for both `Diverging` and `Converging`) is now built exactly one stroke width taller:
+`curve_size + ELBOW_STROKE`. Its bottom *edge* moves to `waist_y + 1`, so its bottom *border* is
+painted on `waist_y` itself - the same row the bridge and the `HorizontalEdge::Top` exit curve
+already occupied. `render_curve` uses `.h(curve.height)` instead of a fixed `ELBOW_CURVE_SIZE`.
+
+Growing the height rather than moving the box is what makes this safe against the two regressions
+earlier attempts hit. GPUI anchors a rounded corner's arc at the box's own corner, so adding a
+stroke of height to a `rounded_bl`/`rounded_br` box while holding `top` fixed slides the whole arc
+down by exactly that pixel and lengthens the straight vertical lead-in above it by the same amount -
+which is the correction wanted - while leaving `top` (the end that has to meet this row's commit dot
+for `Diverging`, or the row above's own stub for `Converging`) exactly where it was. That is why the
+earlier uniform vertical nudge broke the far end and this does not. And only the `Bottom` curve is
+corrected: an earlier attempt grew *both* curves toward the waist, which just moved the step to the
+other side of the bridge. Only the box whose border is painted on the far side of its own anchoring
+edge is wrong. The box grows on one axis only, so `min(width, height) / 2` is still exactly
+`ELBOW_RADIUS` and GPUI's radius clamp still never engages.
+
+This commit also carries the `ELBOW_CURVE_SIZE` work that was in the working tree unreviewed from
+the previous round and is genuinely correct on its own terms: the curve box used to be
+`ELBOW_RADIUS`-square with a radius request of `ELBOW_RADIUS`, which
+`Corners::clamp_radii_for_quad_size` silently halved. `ELBOW_CURVE_SIZE` is now `2 * ELBOW_RADIUS`
+(10px / 5px), so the clamp's own threshold equals the requested radius and never reduces it, and
+`ELBOW_HEIGHT` follows at 20px.
+
+**Known, deliberately-unfixed sibling.** The same border-box off-by-one has a horizontal face:
+`border_l` paints the column at `left`, but `border_r` paints the column at `right - 1`, so the
+uniform `ELBOW_NUDGE_RIGHT` cannot anchor both edge choices onto their lane's 1px vertical. What it
+actually does is anchor the `VerticalEdge::Right` cases exactly, at the cost of putting the
+`VerticalEdge::Left` cases one column right of their lane x. In the common shapes (a branch
+diverging rightward, merging back leftward) every `Left`-edge end lands inside the row's own 7-9px
+commit dot where a column of offset is invisible, while every `Right`-edge end meets a bare 1px lane
+line where it would not be - which is why the nudge was confirmed correct live. The mirrored shapes
+(a leftward `Diverging`, a rightward `Converging`) do carry that 1px offset against a real lane line.
+It is a separate, so-far-unreported symptom from the waist misalignment, and is documented on
+`ELBOW_NUDGE_RIGHT` rather than folded into an already-delicate change.
+
+**Tests.** Three new pure unit tests in `elbow_geometry_tests`, built around a
+`painted_horizontal_row` helper that deliberately derives each curve's row the way GPUI lays a
+border out (inward from the bounds edge) rather than from the box's anchoring edge - the entire bug
+was the difference between those two.
+`all_three_elbow_pieces_paint_their_horizontal_stroke_on_the_very_same_pixel_row` asserts entry,
+bridge and exit share one painted row across both kinds, both directions, and the degenerate
+same-lane case; `only_the_bottom_edged_curve_carries_the_extra_stroke_of_height` pins which box is
+corrected, so the "grow both" attempt cannot come back; and
+`the_extra_stroke_of_height_still_cannot_trigger_gpuis_radius_clamp` pins the clamp invariant on the
+box's *shorter* side rather than on `ELBOW_CURVE_SIZE` alone. The existing wide-gap test now asserts
+the bridge against `painted_horizontal_row` on both ends instead of against raw box edges, and the
+tests that read a curve's bottom edge now use `curve.height` rather than assuming `CURVE_SIZE`.
+
+**Confidence, stated honestly.** The diagnosis is not a guess this time: the one-row step is
+measured directly in the user's own screenshots at four separate elbows, and the mechanism is read
+directly out of GPUI's shader source at the exact pinned revision. The arithmetic after the fix puts
+all three pieces on the same row for every shape, and the three real paint-based `gpui::test`s still
+pass. What still cannot be done in this sandbox is *looking at the result*: GPUI's headless test
+renderer is macOS-only at this pinned revision and this sandbox's own X11 screenshot capture is
+separately, confirmedly broken, so no new screenshot of this fix exists. If a 1px step somehow
+survives, the next thing to check is whether it has *reversed* direction (which would mean the
+correction is right in kind but applied to the wrong one of the two boxes) rather than staying in
+the same place, and a fresh screenshot would settle that in one measurement.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+1116 app + 44 lsp-core + 14 pty-core + 127 wt-core (+4 app tests over the last commit: the three
+above, plus `elbow_curve_size_is_exactly_double_the_radius_so_gpuis_own_clamp_never_kicks_in` which
+arrived with the uncommitted `ELBOW_CURVE_SIZE` work this commit also carries). The final run was
+fully clean at 0 failed; an earlier run in this same round flaked on
+`code_surface::diff_view::diff_render_tests::opening_a_real_diff_renders_real_syntax_highlighted_rows`,
+the known timing-sensitive async-highlight test in an unrelated file, which passed in isolation
+immediately afterwards and then passed again in the final full run. Untouched by this change.
+
+## The horizontal counterpart: per-edge anchoring, and a doubled lane line only visible on odd lanes
+
+The vertical fix above was confirmed live by the user. The next report was horizontal, with a
+specific and initially puzzling qualifier: "horizontal misalignment seems only on odds lines."
+
+**Measuring first.** The new screenshot turned out to be at a **1.25x device scale**, unlike the
+three before it (all 1.0x) - lane columns sat 17.5px apart rather than `LANE_STEP`'s 14. Fitting
+`device_x = round(lane_x * 1.25) + 70` to the five measured lane columns (81, 99, 116, 134, 151)
+reproduced all five exactly, which pinned the scale before any conclusion was drawn from the image.
+
+That scale matters, because `LANE_STEP * 1.25 = 17.5` is a *half*-integer: consecutive lanes land on
+alternating sub-pixel phases, and GPUI snaps each element's bounds to whole device pixels
+independently (`round_to_device_pixel` on each of left/top/right/bottom, `window.rs`). So a lane's
+own line and an elbow's border stroke - the same logical span, but one positioned by its own left
+edge and the other inset from a rounded box's right edge - can round to different device columns,
+and whether they do depends on the lane's parity. That is exactly the "odd lines" pattern, and it is
+not something a logical-coordinate fix can control.
+
+**What was actually wrong.** Scanning every lane column and its two neighbours for full-strength
+runs of the lane's own colour separated the real defect from the DPI artefact:
+
+* lane 1 (pink): column 98 carried solid runs at rows 52-59, 128-133 and 372-379, alongside lane 1's
+  own line at column 99 - a **2px-wide doubled line**, both columns at the exact pure lane colour
+  (`(201,143,191)`), so two fully-opaque elements, not anti-aliasing;
+* lane 3 (amber): the same, at column 133 against its line at 134;
+* lanes 0, 2 and 4 (even): nothing but their commit dots on the neighbouring columns.
+
+The doubled stretches are the elbow's **overshoot**. Both curves together stand
+`2 * ELBOW_CURVE_SIZE` = 20px tall, but only `ROW / 2` = 13px of the row exists past the dot, so the
+far curve always reaches 7px into the neighbouring row - where that lane's *own* `LaneSegment` is
+already painting the identical line. Two elements for one 1px line: harmless at 1.0x, where they
+snap identically, and a visibly doubled band at 1.25x on the lanes whose phase makes them disagree.
+Worth noting how this got here: the overshoot was ~1px under the old 14px elbow and only became 7px
+when `ELBOW_CURVE_SIZE` grew from 7 to 10 to defeat GPUI's radius clamp - the clamp fix quietly
+seven-folded a pre-existing overlap.
+
+**Fix 1: per-edge anchoring, replacing `ELBOW_NUDGE_RIGHT`.** The horizontal face of the same
+border-box rule: `border_l` paints the column at `left`, `border_r` the column at `right - stroke`.
+No single uniform shift can anchor both, so the uniform nudge was replaced by
+`CurveBox::anchored`, which positions each curve from its *painted* stroke on both axes. That needed
+one real distinction the old code did not have, now `LaneJoin`:
+
+* `ContinuesLane` - the curve's stroke *is* that lane's line for this half-row (the plain stub is
+  skipped for exactly this lane), so it must land on `lane_x` itself;
+* `LeavesDot` - the curve departs from, or arrives at, this row's dot while `own_lane`'s own line
+  runs straight through the same rows, so it belongs one stroke to the side the elbow travels,
+  beside that through-line rather than erasing a stroke's width of it.
+
+Every shape currently reachable from `layout_lanes` comes out **bit-for-bit identical** to what the
+nudge produced, so nothing the user already confirmed moves. The shape that changes is the leftward
+`Diverging` elbow, which was landing a column off the lane line it is supposed to continue, and
+whose dot end was painting on top of `own_lane` instead of beside it. Checking `layout_lanes`
+directly also corrected an over-claim in the previous entry: rightward `Converging` is **not**
+reachable (Step 2 takes `own_lane` as the lowest lane expecting the commit, so every other
+converging lane has a higher index), while leftward `Diverging` genuinely is, via either Step 4's
+`position` lookup or `allocate_fresh_lane` reusing a lower free slot.
+
+**Fix 2: never paint one stretch of lane line twice.** `render_graph_lane_canvas` already refused to
+draw a plain stub *and* an elbow over the same half-row; that rule now extends across the row
+boundary. `lane_segment_span` (pure, in the same spirit as `elbow_geometry`/`elbow_color_lane`)
+insets a through-lane's span by `ELBOW_OVERSHOOT` when a neighbouring row's elbow already covers it -
+a `Diverging` elbow above reaches down, a `Converging` elbow below reaches up. Only through-lanes can
+ever be affected, since the lane a neighbouring elbow points at necessarily starts or ends in *that*
+row. `render_graph_row`/`render_graph_lane_canvas` take a new `RowNeighbours`, deliberately carrying
+just the neighbours' `&[Elbow]` rather than whole `GraphRow`s.
+
+**Clarity pass.** The elbow section had accumulated a running commentary of reverted attempts. The
+two GPUI behaviours that actually drive the numbers (radius clamped to half the shorter side; borders
+painted inside the box) are now stated once, on `CurveBox`, with the corollary that matters - the arc
+only ever fills an `ELBOW_RADIUS` corner, so each bordered edge always carries exactly
+`ELBOW_RADIUS` of straight lead-in - and everything else refers to that instead of re-litigating.
+`elbow_geometry` lost its duplicated per-kind arms (both kinds now differ only in `waist_y` and
+`LaneJoin`, which is what actually distinguishes them) and its post-hoc nudge rewrap. The bridge is
+computed from the two boxes via a new `CurveBox::right()` rather than re-deriving lane arithmetic.
+`theme::graph::ELBOW_HEIGHT` was deleted outright: after the S-curve redesign it was always exactly
+`2 * ELBOW_CURVE_SIZE`, its own doc comment already conceded it no longer meant what the design spec
+said, and nothing but tests referenced it.
+
+**Tests.** `a_lane_continuing_curve_paints_its_stroke_on_that_lanes_own_column` and
+`a_dot_leaving_curve_paints_one_stroke_clear_of_its_lanes_own_line` assert the *painted* column (via
+a `painted_vertical_column` helper deriving it the way GPUI lays a border out) across all four
+shapes, including the previously-untested leftward `Diverging` and rightward `Converging`. The first
+was confirmed non-vacuous by reproducing the old uniform-nudge position and watching only that test
+fail. Three tests cover `lane_segment_span`: the trim itself, that it keys on the specific lane and
+direction rather than merely "a neighbour has an elbow", and that half-height stubs are never
+trimmed. `the_overshoot_constant_matches_the_geometry_it_stands_for` pins `ELBOW_OVERSHOOT` to
+`2 * CURVE_SIZE - ROW / 2` (`Pixels` has no const arithmetic) and asserts it is still positive, so
+that if the elbow ever fits its own half-row the constant and the inset get deleted rather than left
+silently doing nothing. The two paint-based `gpui::test`s now assert painted stroke columns derived
+independently from each elbow's own lanes and the documented rules, rather than from
+`elbow_geometry`'s internals.
+
+**Confidence.** The measurements are solid: scale, lane columns, the doubled runs and their absence
+on even lanes are all read directly off the user's screenshot, and the per-edge rule follows from
+GPUI's own source. What is *not* fully derived is the exact snapping arithmetic - an analytical model
+of `round_to_device_pixel` over these particular bounds did not reproduce the observed columns, so
+the parity behaviour is characterised empirically rather than predicted. Fix 2 does not depend on
+that arithmetic being understood: it removes the second element entirely, so there is nothing left
+to disagree. What remains possible, and is worth saying plainly, is a residual **1px seam** where the
+elbow's stroke hands off to the lane's own rect at fractional scale - a border inset from a rounded
+box and a filled rect are still two different elements. Removing that class of seam completely would
+mean drawing the whole lane canvas as one path primitive rather than per-element divs, which is a
+redesign, not a fix. And as every round on this feature: GPUI's headless renderer is macOS-only at
+this pinned revision and this sandbox's X11 capture is broken, so none of this was seen rendered.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+1119 app + 44 lsp-core + 14 pty-core + 127 wt-core, 0 failed (+3 app tests net: six new, three
+positional tests folded into the painted-column ones that supersede them).
+
+## Fix: Mod+Shift+G didn't open the git graph tab
+
+`default_key_bindings` already bound the keystroke to `root::NewGitGraph`, but nothing in
+`AdeApp::render` ever registered an `.on_action` handler for it - the action dispatched and went
+nowhere, silently. The command palette's own "Open git graph" row masked the gap the whole time,
+since it calls `open_git_graph` directly rather than going through the action, so this only showed
+up once someone tried the keystroke itself. Registered the missing handler alongside the palette's
+own dispatch path and added a real regression test exercising the keystroke end-to-end (not just
+the direct method call the existing tests already covered).
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace --lib -- --test-threads=1` at
+1120 app + 44 lsp-core + 14 pty-core + 127 wt-core, 0 failed (+1 app test: the keystroke
+regression). One unrelated test in `code_surface::diff_view` (async-highlighting-cache timing)
+flaked once under full-suite load and passed cleanly in isolation on rerun - a pre-existing flake,
+not touched by this change.
+
+## Two more real elbow bugs: a bridge that overshot on adjacent lanes, and hover erasing lines
+
+Two user reports against the S-curve work above, with two screenshots for the first and a verbal
+description for the second.
+
+**Reading the screenshots first.** Both images are small (152x281 and 157x240), so they were scanned
+at 6-14x nearest-neighbour before any conclusion was drawn. In the first, four elbows leave the
+trunk: lane 0 -> lane 3 (amber) and lane 0 -> lane 4 (orange) render cleanly - smooth arc, the
+horizontal meeting the descent exactly - while lane 0 -> lane 1 (pink) and lane 1 -> lane 2 (green)
+both show the same defect: the horizontal run **continues past the corner** as a stub hanging in
+mid-air, and the corner itself reads as a hard notch instead of an arc. The second screenshot shows
+the identical defect at two merge-back elbows (lane 1 -> lane 0) and one branch start (lane 1 ->
+lane 2), confirming it is not specific to one kind. It also happens to capture the second bug: one
+row band is visibly lighter (hovered), and the amber elbow immediately above it is cut off exactly
+at that band's top edge.
+
+That comparison is what actually located the first bug. The report said "merges back into a branch
+that is just one **row** below", but the clean and broken elbows in the same screenshot differ by
+**lane** distance, not row distance - the amber elbow is also exactly one row tall and renders fine.
+
+### Bug 1: the straight bridge ran past the far curve's own arc
+
+`LANE_STEP` is 14px while the two curve boxes together want `2 * ELBOW_CURVE_SIZE` = 20px, so for
+adjacent lanes the boxes do not merely touch, they **overlap by 6px**, and the honest bridge span
+comes out *shorter* than in the wide-gap case, not longer. The width was
+`(right_curve.left + overlap - straight_left).max(overlap * 2.0)`; for a rightward `Diverging` elbow
+from `lane_x(0)` to `lane_x(1)` the raw span is 4px and the floor forced it to 10px. A 1px filled
+rect then ran from x=15 to x=25 while the far curve's arc begins at x=19 and its vertical stroke
+sits at x=23..24 - so the fill painted flat across the whole arc (the flattened corner) and stuck
+out one pixel past the lane line (the dangling stub). Three lane steps apart the raw span is 32px,
+comfortably past the floor, which is exactly why every wider elbow looked right.
+
+The fix clamps **both** ends to the arc, not just the near one: the bridge runs from
+`left_curve.right() - RADIUS` (where the near arc ends) to `right_curve.left + RADIUS` (where the far
+arc begins), flooring the width at zero. When the boxes overlap, the two curves' own straight border
+lead-ins already overlap too, so there is nothing left for a bridge to cover and a shorter one is
+correct rather than a compromise. The floor's original justification - that `StraightSegment` must
+cover each curve's straight run so a border arc and a filled rect never meet mid-seam - is unharmed:
+the bridge still starts and ends exactly at the two tangent points.
+
+### Bug 2: a later row's hover background painted over an earlier row's elbow
+
+The mechanism was verified against GPUI's own source rather than assumed. `Style::overflow_mask`
+(`gpui/src/style.rs:634`) returns `None` outright for the default `Overflow::Visible`, so GPUI clips
+nothing unless asked; `Style::paint` draws a div's background and border and *then* calls the
+continuation that paints its children. Rows are siblings of one `flex_col`, painted in order. So
+anything row N paints outside its own box and into row N+1's rectangle is covered by row N+1's own
+background as soon as that background stops being transparent - which is precisely what
+`.hover(|el| el.bg(theme::surface::ROW_HOVER))` does. Only *downward* spill is affected: a
+`Converging` elbow reaches up into row N-1, which has already painted.
+
+And the elbow did spill. A far curve is `ELBOW_CURVE_SIZE` = 10px tall against only `ROW / 2` = 13px
+of row past the dot, and with the waist one full curve from the dot at y=23 the exit curve ran to
+y=33 - 7px into the next row. Hovering row N+1 therefore erased 7px of row N's branch-start line.
+
+**Fix: clip each lane canvas to its own row.** `render_graph_lane_canvas` is now `overflow_hidden()`.
+On its own that would have been a regression, though: at waist y=23 the exit arc sweeps y=23..28, so
+the clip would cut it at y=26, two pixels before it has finished turning onto the lane column, and
+the next row's segment - a straight line at that column - would not line up with where the cut left
+it. A kink at every row boundary instead of a gap.
+
+So `waist_y` is clamped to keep the whole arc inside the row: `(ROW/2 + CURVE_SIZE).min(ROW - RADIUS)`
+for `Diverging` and the mirror for `Converging`, moving the waist from 23 to 21 and from 3 to 5. The
+arc now ends exactly on the row boundary and the only thing crossing it is `CURVE_SIZE - RADIUS` =
+5px of *straight vertical stroke*, sitting on exactly the column the neighbouring row's own
+`LaneSegment` continues the line on. Clipping it away is lossless: the neighbour redraws those
+pixels. The 2px waist move is a real visual change, and a small improvement in its own right - the
+elbow's dot end is now hidden entirely under even the smallest 7px `DOT_COMMIT` disc, where roughly
+1.5px of it used to poke out beside the dot.
+
+**What that let us delete.** `lane_segment_span`'s neighbouring-row trim existed because the elbow
+really did paint into the next row and two elements for one 1px line disagree by a device pixel at
+fractional scale. With the clip there is no second element in that row at all, so the trim has
+nothing to trim: `RowNeighbours`, `ELBOW_OVERSHOOT`, the `elbows_of` lookup in `render_graph_rows`
+and the parameter threaded through `render_graph_row`/`render_graph_lane_canvas` are all gone, and a
+through-lane runs the full row height again. The doubled-line bug the trim fixed cannot recur,
+because the element that caused it no longer paints there.
+
+One consequence worth recording: GPUI's content mask is a single rectangle
+(`ContentMask { bounds }`), so `overflow_hidden()` bounds x as well as y - there is no y-only clip
+even via `overflow_y_hidden()`, whose two match arms both intersect with the full bounds. That is
+safe here only because `graph_lane_canvas_width` always reserves `LANE_X_BASE` past the rightmost
+lane while no elbow piece ever reaches more than one stroke past it, which is now pinned by a test
+rather than left as an observation.
+
+### Tests
+
+Seven new, five retargeted, four deleted with the trim they covered. All four tests for the two new
+bugs were confirmed **non-vacuous** by reverting each fix on its own and watching only the matching
+tests fail: restoring the `max(overlap * 2.0)` floor fails
+`the_straight_bridge_never_runs_past_the_far_curves_own_arc` (bridge end 25px against an arc
+beginning at 19px) and `adjacent_lanes_get_a_real_but_shorter_bridge_than_a_wide_gap` (10px against
+4px); restoring the unclamped waist fails `every_arc_sweeps_entirely_inside_its_own_rows_box` ("the
+exit curve's arc sweeps 23px..28px, outside its own row's 0..26px box") and
+`what_the_row_clip_removes_is_exactly_what_the_neighbouring_row_paints`.
+
+`ALL_SHAPES_AND_GAPS` extends the existing `ALL_SHAPES` to run every shape at both a three-lane gap
+and the minimum one-lane gap, since the narrow gap turned out to be its own regime rather than just
+a smaller number. `no_elbow_piece_ever_reaches_past_the_lane_canvas_own_width` checks every lane pair
+for lane counts 2..=12 against real `graph_lane_canvas_width` values, covering the rectangular-mask
+consequence above. `consecutive_lane_canvases_tile_exactly_so_the_row_clip_loses_no_line` is a real
+`gpui::test` asserting each canvas is exactly `ROW` tall and sits exactly `ROW` below the last -
+the layout fact the clip's losslessness depends on, which geometry alone cannot show because a row's
+`border_b_1()` makes its content box shorter than `ROW` and the canvas is centred in it.
+
+Five existing tests were measuring "which half of the row" off a curve **box edge**, which the waist
+clamp legitimately moves. They now measure the **waist** - the painted horizontal run, the one piece
+unambiguously on one side of the dot - and bound each curve's dot end by the dot's own disc instead.
+Each curve box straddles the dot centre by design, so a box edge was always the wrong thing to read
+that claim off; the old assertions passed by coincidence of the old constants.
+
+### Confidence, and one limit worth stating plainly
+
+Bug 1 is fully derived: the numbers come from `LANE_STEP`, `ELBOW_CURVE_SIZE` and `ELBOW_RADIUS`, the
+broken and clean elbows in the same screenshot separate the variable cleanly, and the geometry tests
+reproduce the exact overshoot. Bug 2's mechanism is read directly out of GPUI's own source, and the
+spill it depends on is arithmetic.
+
+What is **not** covered is the occlusion itself. GPUI's test harness exposes layout bounds
+(`debug_bounds`) and nothing else - no pixel readback, no way to inspect a content mask - so there is
+no test that asserts "hovering a row no longer erases its neighbour's elbow". The coverage is the
+invariant that makes the fix work (every arc inside its own row; only straight stroke crossing the
+boundary; consecutive canvases tiling exactly), not the symptom. That gap is a property of the
+harness, not something a better test would close, and it sits alongside the previous entry's residual
+fractional-scale seam as a known limit. As with every round on this feature, none of it was seen
+rendered: GPUI's headless renderer is macOS-only at this pinned revision and this sandbox's X11
+capture is broken.
+
+All four gates clean: `cargo fmt --all -- --check`, `cargo build -p app --bin app`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test -p app --lib` at 1122 app tests (+2 net:
+seven new, four deleted with the trim, one paint test added). Three tests flaked under full-suite
+load on a badly oversubscribed box (load average 30-53 on 16 cores, from unrelated processes) and all
+three passed in isolation - `code_surface::diff_view`'s async-highlighting-cache test needed five
+clean reruns to confirm. To rule the change in or out as the cause, the same suite was run on the
+parent commit under the same load: it failed **five** tests, a different and partly non-overlapping
+set including `status_bar::process_stats` and `lsp::client`. No `graph_view` test failed in any run,
+on either tree.
+
+## Git graph tab: a real column header, and the per-commit session column removed (GitHub issue #1, phase (a), audit follow-up)
+
+A read-only audit of this branch against `design_handoff_jerry_ade/revision 3/
+REVISION-2026-07-31.md` §6 found three real gaps between what phase (a) built and what that
+revision actually specifies. All three are fixed here; none of the audit's findings turned out to
+be non-issues.
+
+### Gap 1: no column header at all
+
+`render_graph_view` went straight from the toolbar to the row list - there was no header row,
+so `commit`/`author`/`age`/`sha` read as a bare list rather than a table. `render_graph_header`
+(a free function alongside `render_graph_lane_canvas`/`render_graph_ref_chips`, not an `impl
+AdeApp` method - it needs no `&self`) adds the real 22px band the spec calls for, with its own
+three new `theme::graph` constants: `HEADER` (the height), `HEADER_BG` (`#101315` - close to but
+deliberately not reusing `theme::surface::HEADER`'s `#121417`, the same "same-ish hex, distinct
+token for a distinct element" call `theme::text::TREE_CARET`'s own doc comment already makes for
+`theme::text::PATH`), and `HEADER_LABEL_FG` (`#4a5057`, again the same hex as `text::PATH` under
+its own name).
+
+Column widths mirror the row's own real cells rather than repeating the spec's numbers as fresh
+literals: `graph` is `LANE_CANVAS + 2px` (100 + the row's own permanently-reserved 2px selection
+edge) with an 11px left pad, so the label lands where a row's first lane dot actually sits
+(`2 + LANE_X_BASE` = `2 + 9`); `commit` is the header's only flex cell, standing in for the row's
+ref-chip (variable-width) and subject (flex) cells combined; `author`/`age`/`sha` and the
+trailing unlabelled 22px spacer (under the row's `⋯` column) match the row's own fixed-width
+cells one for one. That last point is what makes the alignment work without hand-tuning: in a
+flex row, fixed-width items trailing a single flex item always sit a constant distance from the
+container's own right edge, independent of what precedes the flex item - so as long as the
+header's trailing fixed widths (88 + 40 + 62 + 22) match the row's, `author`/`age`/`sha`/the
+spacer land on the exact same x whether or not a row's ref-chip count varies its own leading
+width. `graph_row_menu_tests::the_fixed_header_columns_land_on_the_same_x_as_the_row_columns_below`
+proves this by comparing real `debug_bounds` for each pair, not by asserting either side against
+a hardcoded pixel number - the audit's own instruction was to verify real alignment, not match
+the spec's illustrative `630/718/758/820` figures if this build's actual widths differ, and they
+do (this build's total fixed-column budget is 314px including the header's leading 102, not
+whatever produced those four numbers in the spec's own 1520-wide reference build).
+
+One deliberate, documented gap: the spec's labels want `.07em` letter-tracking, and GPUI's
+`TextStyle` (`vendor/zed/crates/gpui/src/style.rs`) has no letter-spacing field at all - confirmed
+by reading the struct directly, not assumed. This is not a new shortcut; `crate::rail::render`'s
+own urgency-group header (`.08em` in the same spec family) and `crate::settings::render`'s nav
+group header already drop their own tracking values for the identical reason, so this header just
+follows established precedent rather than being pixel-different for no reason. Labels are
+uppercased via `.to_uppercase()` in Rust, matching both of those.
+
+### Gap 2: the per-commit session column, and an undocumented stray column next to it
+
+`render_graph_row` rendered a fixed 88px cell (`render_graph_session_column`) holding a
+permanently-empty em-dash chip - real UI with no real data behind it in this phase, and per §6.2
+the design intent isn't "wait for the data", it's "this column shouldn't exist": a commit belongs
+to a worktree, which can hold several agents, so pinning one agent's live status to a past commit
+was always going to be imprecise, independent of whether phase (a) had session-correlation data
+to fill it in. Deleted the call site and the function.
+
+Immediately before it sat a second, 40px empty `div()` - a "note" column - that was in neither
+this revision's nor the previous one's own column list (`lane canvas 100 · ref chips · subject
+flex · author 88 · age 40 · sha 62 · ⋯ 22`). Grepped the whole crate for any reference to it
+before deleting: nothing else read, positioned against, or tested it. It was dead weight, not
+load-bearing for anything - removed along with the session column.
+
+The row's own doc comment and this module's top-level doc comment (`graph_view/mod.rs`, which
+used to say "the row's session column always renders honestly empty here") are updated to match;
+git history carries the old column's own former doc comment for anyone who needs the record of
+what it used to render.
+
+### Gap 3: verifying the row `⋯` menu's anchor still holds, not assuming it
+
+The anchor was already built from a row's own real captured `row_menu_bounds`
+(`AdeApp::toggle_graph_row_menu`, `anchor_x`/`anchor_y`) - never a formula involving the row's
+index or `TOOLBAR`/`HEADER` as literals - so adding a real header band above the row list should
+shift every row down for free, with zero changes to that anchor logic. That was the audit's own
+claim to verify, not to take on faith. `the_dots_button_anchor_reflects_the_real_header_band_now_
+above_the_rows` (alongside the existing `the_dots_button_anchors_off_its_own_real_captured_bounds`,
+matching its own style) confirms it end to end through a real click, not a direct method call:
+first that `graph-row-0`'s real top edge sits exactly at the header's own real bottom edge, then
+that `graph-row-1` sits immediately below `graph-row-0` with no gap, then that a real click on row
+1's own `⋯` button opens its menu at exactly that button's real captured bounds. It held on the
+first try - the anchor code needed no changes, only the header needed to exist.
+
+### Tests
+
+Two new tests (the column-alignment comparison and the header-band anchor confirmation above),
+two row cells (`author`/`age`/`sha`) gained `debug_selector`s so a test can capture their real
+bounds without adding test-only rendering paths, and one existing test's premise assertion was
+corrected mid-review: an early draft asserted `graph-row-menu-button-1`'s top sits at exactly
+`row0.origin.y + ROW`, which is wrong by 1.5px - GPUI's box model plus the button's own
+`items_center` centering inside a bordered row doesn't reduce to that simple arithmetic, and
+chasing the exact offset down would have meant re-deriving GPUI's border/box-model behavior by
+hand for a premise check that isn't actually the property under test. Replaced it with a
+real-bounds comparison instead (`graph-row-1`'s own top sits at `graph-row-0`'s top plus its own
+real height) - still real, still proves the header pushed the whole list down, but doesn't
+require hand-deriving a number GPUI itself is responsible for.
+
+### Gates
+
+`cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy --workspace --all-targets
+-- -D warnings`, and `cargo test --workspace --lib -- --test-threads=1` all clean: 1318 tests
+passed (1133 in `app`, 44 in `lsp_core`, 14 in `pty_core`, 127 in `wt_core`), 0 failed, 0
+skipped/reran - the previously-flaky `code_surface::diff_view` timing test that failed under a
+contended box in the prior entry passed cleanly this run with no rerun needed.
+
+## Rebasing the git graph tab onto the full Revision R12 stack, and a real `GraphScope::Sessions` naming bug it surfaced
+
+This branch predated the whole R12 rail/worktree-model redesign (repo-model, rail rewrite,
+Session→Agent rename, worktree-state-safety, title-bar-chips, rail-header-fix, and the Changes-
+panel commit composer with real git staging). Rebased onto the top of that stack
+(`revision-r12-tabs-changes`). Every conflict was a stale `Session`/`self.sessions` reference in
+`work_surface`/`root` code this branch's own graph-tab wiring touches (`close_git_graph_tab`,
+focus-restoration on leaving the tab, etc.) - resolved by adopting the rename's real
+`Agent`/`self.agents` names and re-applying this branch's own graph-specific logic on top. A few
+doc-comment-only hunks auto-merged with no conflict markers but still said "session" verbatim
+afterward - caught by a full post-rebase grep sweep of the touched files, not just the marked
+conflict regions, matching the same gap the tabstrip branch's own rebase found and fixed.
+
+That same sweep, run once more directly against `crates/app/src/graph_view/` and
+`crates/wt-core/src/graph.rs` (neither of which the original `Session`→`Agent` rename PR could
+have touched, since this branch didn't exist in that lineage yet), found a real, live one the
+rebase itself didn't introduce but did finally surface: `wt_core::graph::GraphScope::Sessions` -
+the toolbar's `All | Sessions | Current` scope segment. Reading its own doc comment first, this
+variant does *not* mean "agent sessions" - it means "branches actually checked out in one of this
+repository's worktrees," explicitly and deliberately distinct from a future agent-authorship
+correlation feature (the module's own docs already say so). Renaming it to `Agents` would have
+been wrong twice over: not just leftover old vocabulary, but the *wrong* new vocabulary too.
+Renamed to `GraphScope::Worktrees` instead - the name that actually describes what it does -
+along with its `collect_session_tips` implementation function (→ `collect_worktree_tips`), the
+toolbar's `"Sessions"` label (→ `"Worktrees"`), and a test name. No `Serialize`/`Deserialize` on
+`GraphScope` and nothing in `settings/` persists it, so this was a safe, non-breaking rename.
+
+Separately, a real, live, currently-rendered (if disabled) menu row - `"Start session from this
+commit"` in the row `⋯` menu's Branch group - genuinely does mean starting an agent, so that one
+*was* a straightforward rename to `"Start agent from this commit"`, along with the module's own
+top-of-file doc comment describing the same not-yet-implemented action and the "session-to-commit
+correlation" phrase describing the *other*, still-separate planned feature (→ "agent-to-commit
+correlation"). Two doc comments describing the *already-removed* per-commit session column (git
+history has what it used to render) were deliberately left saying "session" - they're accurately
+describing a historical, deleted concept, not live code.
+
+**Verification**: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings` - all clean.
+`cargo test --workspace --lib --test-threads=1`: **1198 + 44 + 14 + 139 = 1395 passed, 0 failed**
+across all four crates.

@@ -70,6 +70,44 @@ pub enum Error {
     #[error("failed to compute merge-base: {0}")]
     MergeBase(#[source] Box<gix::repository::merge_base::Error>),
 
+    /// [`crate::graph::build_graph`] failed to configure the commit walk (e.g. a bad `git`
+    /// commit-graph cache).
+    #[error("failed to start the commit graph walk: {0}")]
+    RevWalk(#[source] Box<gix::revision::walk::Error>),
+
+    /// [`crate::graph::build_graph`] failed while stepping the commit walk (a corrupt or
+    /// unreadable object encountered mid-traversal).
+    #[error("failed while walking the commit graph: {0}")]
+    RevWalkIter(#[source] Box<gix::revision::walk::iter::Error>),
+
+    /// [`crate::graph::build_graph`] could not read a commit object the walk yielded an id for.
+    #[error("failed to read a commit object: {0}")]
+    RevWalkObject(#[source] Box<gix::object::find::existing::Error>),
+
+    /// [`crate::graph::build_graph`] could not decode a commit's message or author signature.
+    #[error("failed to decode a commit: {0}")]
+    RevWalkDecode(#[source] Box<gix::objs::decode::Error>),
+
+    /// [`crate::graph::build_graph`] could not decode a commit's committer time.
+    #[error("failed to read a commit's committer time: {0}")]
+    RevWalkCommit(#[source] Box<gix::object::commit::Error>),
+
+    /// [`crate::graph::build_graph`] failed to open the repository's reference store.
+    #[error("failed to open the reference store: {0}")]
+    References(#[source] Box<gix::reference::iter::Error>),
+
+    /// [`crate::graph::build_graph`] failed to start iterating references.
+    #[error("failed to iterate references: {0}")]
+    ReferencesIter(#[source] Box<gix::reference::iter::init::Error>),
+
+    /// [`crate::graph::build_graph`] encountered a broken or unparsable reference while
+    /// enumerating them. Per [`gix::Repository::references`]'s own docs, even broken refs are
+    /// yielded (not silently skipped) so a caller can decide how to handle them; this crate
+    /// treats one broken ref as a hard error for the whole graph build rather than silently
+    /// dropping commits it might point at.
+    #[error("failed to read a reference: {0}")]
+    ReferenceEntry(Box<dyn std::error::Error + Send + Sync + 'static>),
+
     /// Failed to spawn the `git` process.
     #[error("failed to run `git {args}`: {source}")]
     GitSpawn {
