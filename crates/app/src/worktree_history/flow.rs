@@ -31,17 +31,6 @@ pub(crate) enum WorktreeHistoryOpKind {
     Commit,
 }
 
-/// Whether `a` and `b` refer to the same real path, canonicalizing both sides first - mirrors
-/// `wt_core::undo::is_main_worktree`'s own canonicalization (see its docs) so a relative,
-/// symlinked, or otherwise differently-spelled path still matches correctly rather than silently
-/// failing closed. Falls back to a raw comparison if either side can't be canonicalized (e.g. it
-/// no longer exists) - the same fallback `is_main_worktree` itself uses.
-fn canonical_paths_match(a: &Path, b: &Path) -> bool {
-    let a_canon = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
-    let b_canon = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
-    a_canon == b_canon
-}
-
 impl AdeApp {
     /// Looks up worktree `path`'s branch name for display (History/status-line text) - falls
     /// back to the path itself if the worktree list doesn't (yet, or any more) have an entry for

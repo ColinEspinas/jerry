@@ -1,8 +1,8 @@
 use super::*;
 use crate::keymap;
 use crate::root::widgets::{
-    modal_scrim_bg, render_action_keycap_row, render_keycap_row, render_menu_group_divider,
-    render_modal_button, render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
+    modal_scrim_bg, render_keycap_row, render_menu_group_divider, render_modal_button,
+    render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
 };
 use crate::settings::widgets::ChoiceOption;
 use crate::worktree_history::flow as worktree_history;
