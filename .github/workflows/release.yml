@@ -118,6 +118,13 @@ jobs:
     needs: build
     name: Create GitHub Release
     runs-on: ubuntu-latest
+    # The default GITHUB_TOKEN is read-only unless a job explicitly asks for more (the
+    # v0.0.1-test run failed here with "Resource not accessible by integration" against
+    # this repo's own default token permissions) - scoped to just this job, the only one
+    # that actually calls the Releases API, rather than widening the whole workflow's
+    # token.
+    permissions:
+      contents: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
