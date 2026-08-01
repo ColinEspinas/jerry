@@ -564,7 +564,8 @@ pub(crate) fn render_graph_tab_chip() -> impl IntoElement {
 }
 
 impl AdeApp {
-    /// The git graph tab's full centre-pane content - toolbar plus the row list. Called from
+    /// The git graph tab's full centre-pane content - toolbar, column header, then the row
+    /// list. Called from
     /// `crate::work_surface::render::AdeApp::render_center_pane` whenever `graph_tab_active` is
     /// `true`, taking priority over a file tab or agent pane.
     pub(crate) fn render_graph_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -577,7 +578,8 @@ impl AdeApp {
             .min_h_0()
             .min_w_0()
             .bg(theme::surface::CENTER)
-            .child(self.render_graph_toolbar(cx));
+            .child(self.render_graph_toolbar(cx))
+            .child(render_graph_header());
 
         let body = match &self.graph_state.load {
             GraphLoadState::NotLoaded | GraphLoadState::Loading => div()
@@ -904,8 +906,15 @@ impl AdeApp {
         list.into_any_element()
     }
 
-    /// One row: lane canvas 100 · ref chips · subject (flex) · note · session 88 · author 88 ·
-    /// relative time 40 right · sha 62 right · `⋯` 22 (design spec §2).
+    /// One row: lane canvas 100 · ref chips · subject (flex) · author 88 · relative time 40
+    /// right · sha 62 right · `⋯` 22 (`revision 3/REVISION-2026-07-31.md` §6.2 - supersedes the
+    /// revision-2 entry's own column list, which also had a `note` column and a per-commit
+    /// session column between subject and author; both are gone. A commit belongs to a
+    /// worktree, which can hold several agents, so pinning one agent's live status to a past
+    /// commit was exactly the imprecision that revision set out to remove; the `note` column
+    /// next to it was never in either revision's own column list and had no real data behind
+    /// it either - see the removed `render_graph_session_column`'s own former doc comment, git
+    /// history has it, for what it used to render).
     fn render_graph_row(
         &self,
         index: usize,
@@ -985,12 +994,9 @@ impl AdeApp {
                     .text_color(theme::text::BODY)
                     .child(row.commit.subject.clone()),
             )
-            // "note" column - reserved per the design spec's column list but nothing this phase
-            // has real data for lives here yet; an honestly empty cell, not a fabricated one.
-            .child(div().w(px(40.0)))
-            .child(render_graph_session_column())
             .child(
                 div()
+                    .debug_selector(move || format!("graph-row-{index}-author"))
                     .w(px(88.0))
                     .px(px(4.0))
                     .truncate()
@@ -1001,6 +1007,7 @@ impl AdeApp {
             )
             .child(
                 div()
+                    .debug_selector(move || format!("graph-row-{index}-age"))
                     .w(px(40.0))
                     .text_right()
                     .font(font(theme::font::MONO))
@@ -1010,6 +1017,7 @@ impl AdeApp {
             )
             .child(
                 div()
+                    .debug_selector(move || format!("graph-row-{index}-sha"))
                     .w(px(62.0))
                     .text_right()
                     .font(font(theme::font::MONO))
@@ -1598,27 +1606,6 @@ fn render_graph_branch_row(
         })
 }
 
-/// The row's session column - always honestly empty in phase (a) (session-to-commit correlation
-/// is a separate, later feature; see `super`'s module docs), rendered with the same "no session"
-/// visual `crate::rail::render`'s own worktree row already uses for a real session-less row.
-fn render_graph_session_column() -> impl IntoElement {
-    div().w(px(88.0)).flex().items_center().gap(px(5.0)).child(
-        div()
-            .w(px(16.0))
-            .h(px(16.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(theme::radius::CHIP)
-            .bg(theme::surface::CHIP_NEUTRAL)
-            .font(font(theme::font::MONO))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_size(px(9.0))
-            .text_color(theme::text::GHOST)
-            .child("\u{2014}"),
-    )
-}
-
 fn render_graph_row_menu_header(label: &'static str) -> impl IntoElement {
     div()
         .px(px(11.0))
@@ -1942,6 +1929,95 @@ fn lane_segment_span(segment: &wt_core::graph::LaneSegment, row_h: Pixels) -> (P
         (false, true) => (px(0.0), row_h / 2.0),
         (false, false) => (px(0.0), row_h),
     }
+}
+
+/// The column header band, sitting between the toolbar and the row list (`revision 3/
+/// REVISION-2026-07-31.md` §6.1). Column widths mirror `AdeApp::render_graph_row`'s own real
+/// cells exactly - `graph` matches [`theme::graph::LANE_CANVAS`] plus the row's own reserved
+/// 2px selection edge, `commit` is the single flex cell standing in for the row's ref-chip
+/// (variable-width) and subject (flex) cells combined, `author`/`age`/`sha` and the trailing
+/// spacer match the row's own fixed-width cells one for one - so in a flex row, whose trailing
+/// fixed-width items always sit a constant distance from the container's own right edge
+/// regardless of what precedes the single flex item, this header's `author`/`age`/`sha`/spacer
+/// land on exactly the same x as the row's do. Proven, not assumed, by
+/// `graph_header_tests::the_fixed_header_columns_land_on_the_same_x_as_the_row_columns_below`.
+///
+/// Labels are uppercased in Rust (`.to_uppercase()`) rather than via a CSS-style text-transform -
+/// GPUI's `Styled` trait has no such property, so every uppercase label in this codebase already
+/// does this (`crate::rail::render::AdeApp::render_urgency_worktree_group`,
+/// `crate::settings::render::AdeApp::render_settings_nav`). The spec's `.07em` letter-tracking is
+/// dropped for the same reason those two also drop their own `.08em`/tracking values: GPUI's
+/// `TextStyle` (`vendor/zed/crates/gpui/src/style.rs`) has no letter-spacing field to set it
+/// with - a pre-existing gap in this GPUI build, not something newly cut for this header.
+fn render_graph_header() -> impl IntoElement {
+    fn label(text: &'static str) -> impl IntoElement {
+        div()
+            .font(font(theme::font::SANS))
+            .font_weight(gpui::FontWeight(450.0))
+            .text_size(px(9.0))
+            .text_color(theme::graph::HEADER_LABEL_FG)
+            .child(text.to_uppercase())
+    }
+
+    div()
+        .id("graph-header")
+        .debug_selector(|| "graph-header".to_string())
+        .flex_none()
+        .flex()
+        .items_center()
+        .w_full()
+        .h(theme::graph::HEADER)
+        .bg(theme::graph::HEADER_BG)
+        .border_b_1()
+        .border_color(theme::border::INNER)
+        .child(
+            div()
+                .debug_selector(|| "graph-header-graph".to_string())
+                .flex_none()
+                .w(theme::graph::LANE_CANVAS + px(2.0))
+                .pl(px(11.0))
+                .child(label("graph")),
+        )
+        .child(
+            div()
+                .debug_selector(|| "graph-header-commit".to_string())
+                .flex_1()
+                .min_w_0()
+                .px(px(6.0))
+                .child(label("commit")),
+        )
+        .child(
+            div()
+                .debug_selector(|| "graph-header-author".to_string())
+                .flex_none()
+                .w(px(88.0))
+                .px(px(4.0))
+                .child(label("author")),
+        )
+        .child(
+            div()
+                .debug_selector(|| "graph-header-age".to_string())
+                .flex_none()
+                .w(px(40.0))
+                .text_right()
+                .child(label("age")),
+        )
+        .child(
+            div()
+                .debug_selector(|| "graph-header-sha".to_string())
+                .flex_none()
+                .w(px(62.0))
+                .text_right()
+                .child(label("sha")),
+        )
+        // The 22px spacer under the row's `⋯` menu column - no label (§6.1: "22 spacer under
+        // the `⋯` menu column").
+        .child(
+            div()
+                .debug_selector(|| "graph-header-spacer".to_string())
+                .flex_none()
+                .w(px(22.0)),
+        )
 }
 
 /// Draws one row's lane canvas: full-height verticals for every lane passing through, half-height
@@ -2524,6 +2600,73 @@ mod graph_row_menu_tests {
         });
     }
 
+    /// `revision 3/REVISION-2026-07-31.md` §6.1 added a real 22px column header band between
+    /// the toolbar and the row list. The `⋯` button's own anchor
+    /// (`AdeApp::toggle_graph_row_menu`) is built entirely from that row's own real captured
+    /// `row_menu_bounds` - never `TOOLBAR`/`HEADER`/the row's index - so adding the header should
+    /// shift it down for free, with zero code changes to the anchor formula itself. This proves
+    /// that, end to end, through a *real* click on row 1's own `⋯` button (not a synthetic bounds
+    /// value like `the_dots_button_anchors_off_its_own_real_captured_bounds` above uses): first
+    /// that the row list genuinely starts immediately under the header's own real painted bottom
+    /// edge (not an assumed offset), then that the button click opens the menu at exactly that
+    /// real, header-shifted button position.
+    #[gpui::test]
+    fn the_dots_button_anchor_reflects_the_real_header_band_now_above_the_rows(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        let header = cx
+            .debug_bounds("graph-header")
+            .expect("the column header must be painted");
+        assert_eq!(
+            header.size.height,
+            theme::graph::HEADER,
+            "the header's real painted height must match the constant the anchor math relies on"
+        );
+
+        let row0 = cx.debug_bounds("graph-row-0").expect("row 0 painted");
+        assert_eq!(
+            row0.origin.y,
+            header.origin.y + header.size.height,
+            "the row list must start immediately under the header's own real painted bottom \
+             edge, not some assumed `TOOLBAR`-only offset"
+        );
+
+        let row1 = cx.debug_bounds("graph-row-1").expect("row 1 painted");
+        assert_eq!(
+            row1.origin.y,
+            row0.origin.y + row0.size.height,
+            "premise: row 1 sits immediately below row 0 with no gap - the real, contiguous \
+             layout the header must have shifted as a whole, not just row 0"
+        );
+
+        let button = cx
+            .debug_bounds("graph-row-menu-button-1")
+            .expect("row 1's own ⋯ trigger must be painted");
+
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let menu = app
+                .graph_state
+                .row_menu_open
+                .expect("clicking row 1's own ⋯ button must open its menu");
+            assert_eq!(menu.row_index, 1);
+            assert_eq!(
+                (menu.origin_x, menu.origin_y),
+                (
+                    button.origin.x + button.size.width - theme::graph::ROW_MENU_WIDTH,
+                    button.origin.y + button.size.height + px(2.0),
+                ),
+                "anchored off row 1's own real captured bounds, which already sit lower now \
+                 that the header band is a real sibling above the row list - `open_graph_row_menu_at`/ \
+                 `toggle_graph_row_menu` needed zero changes for this to hold"
+            );
+        });
+    }
+
     /// Real dispatch, not a direct method call: an adversarial audit of an earlier draft of this
     /// change found that a *real* second click on the same button did not close the menu the way
     /// a direct `toggle_graph_row_menu` call in a test claimed - the already-open menu's own
@@ -2791,6 +2934,54 @@ mod graph_row_menu_tests {
                 "an open row menu must not keep painting its scrim over Settings"
             );
         });
+    }
+
+    /// `revision 3/REVISION-2026-07-31.md` §6.1: "Verify the fixed columns land on the same x as
+    /// a real row's." The spec gives illustrative numbers for its own 1520-wide reference build;
+    /// this compares this app's own real painted bounds against each other instead of hardcoding
+    /// those numbers, since a real column width here would make a hardcoded literal the thing
+    /// that's wrong, not the layout. Covers `author`/`age`/`sha` - the three fixed-width columns
+    /// both the header and a row genuinely share (the header's `graph`/`commit` cells stand in
+    /// for the row's `lane canvas`/`ref chips`/`subject` cells, which don't have single matching
+    /// counterparts to compare against 1:1).
+    #[gpui::test]
+    fn the_fixed_header_columns_land_on_the_same_x_as_the_row_columns_below(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, _app, cx) = open_seeded_graph(cx);
+
+        let columns: [(&'static str, &'static str, &'static str); 3] = [
+            ("author", "graph-header-author", "graph-row-0-author"),
+            ("age", "graph-header-age", "graph-row-0-age"),
+            ("sha", "graph-header-sha", "graph-row-0-sha"),
+        ];
+        for (column, header_selector, row_selector) in columns {
+            let header = cx
+                .debug_bounds(header_selector)
+                .unwrap_or_else(|| panic!("the header's {column} cell must be painted"));
+            let row = cx
+                .debug_bounds(row_selector)
+                .unwrap_or_else(|| panic!("row 0's {column} cell must be painted"));
+            assert_eq!(
+                (header.origin.x, header.size.width),
+                (row.origin.x, row.size.width),
+                "the header's {column} column must land on the exact same x and width as the \
+                 row's own {column} cell, or the label above it describes the wrong content"
+            );
+        }
+
+        let header_spacer = cx
+            .debug_bounds("graph-header-spacer")
+            .expect("the header's trailing spacer must be painted");
+        let row_menu_button = cx
+            .debug_bounds("graph-row-menu-button-0")
+            .expect("row 0's own ⋯ trigger must be painted");
+        assert_eq!(
+            (header_spacer.origin.x, header_spacer.size.width),
+            (row_menu_button.origin.x, row_menu_button.size.width),
+            "the header's unlabelled trailing spacer must sit exactly over the row's own `⋯` \
+             column"
+        );
     }
 }
 

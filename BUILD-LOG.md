@@ -6548,3 +6548,104 @@ clean reruns to confirm. To rule the change in or out as the cause, the same sui
 parent commit under the same load: it failed **five** tests, a different and partly non-overlapping
 set including `status_bar::process_stats` and `lsp::client`. No `graph_view` test failed in any run,
 on either tree.
+
+## Git graph tab: a real column header, and the per-commit session column removed (GitHub issue #1, phase (a), audit follow-up)
+
+A read-only audit of this branch against `design_handoff_jerry_ade/revision 3/
+REVISION-2026-07-31.md` §6 found three real gaps between what phase (a) built and what that
+revision actually specifies. All three are fixed here; none of the audit's findings turned out to
+be non-issues.
+
+### Gap 1: no column header at all
+
+`render_graph_view` went straight from the toolbar to the row list - there was no header row,
+so `commit`/`author`/`age`/`sha` read as a bare list rather than a table. `render_graph_header`
+(a free function alongside `render_graph_lane_canvas`/`render_graph_ref_chips`, not an `impl
+AdeApp` method - it needs no `&self`) adds the real 22px band the spec calls for, with its own
+three new `theme::graph` constants: `HEADER` (the height), `HEADER_BG` (`#101315` - close to but
+deliberately not reusing `theme::surface::HEADER`'s `#121417`, the same "same-ish hex, distinct
+token for a distinct element" call `theme::text::TREE_CARET`'s own doc comment already makes for
+`theme::text::PATH`), and `HEADER_LABEL_FG` (`#4a5057`, again the same hex as `text::PATH` under
+its own name).
+
+Column widths mirror the row's own real cells rather than repeating the spec's numbers as fresh
+literals: `graph` is `LANE_CANVAS + 2px` (100 + the row's own permanently-reserved 2px selection
+edge) with an 11px left pad, so the label lands where a row's first lane dot actually sits
+(`2 + LANE_X_BASE` = `2 + 9`); `commit` is the header's only flex cell, standing in for the row's
+ref-chip (variable-width) and subject (flex) cells combined; `author`/`age`/`sha` and the
+trailing unlabelled 22px spacer (under the row's `⋯` column) match the row's own fixed-width
+cells one for one. That last point is what makes the alignment work without hand-tuning: in a
+flex row, fixed-width items trailing a single flex item always sit a constant distance from the
+container's own right edge, independent of what precedes the flex item - so as long as the
+header's trailing fixed widths (88 + 40 + 62 + 22) match the row's, `author`/`age`/`sha`/the
+spacer land on the exact same x whether or not a row's ref-chip count varies its own leading
+width. `graph_row_menu_tests::the_fixed_header_columns_land_on_the_same_x_as_the_row_columns_below`
+proves this by comparing real `debug_bounds` for each pair, not by asserting either side against
+a hardcoded pixel number - the audit's own instruction was to verify real alignment, not match
+the spec's illustrative `630/718/758/820` figures if this build's actual widths differ, and they
+do (this build's total fixed-column budget is 314px including the header's leading 102, not
+whatever produced those four numbers in the spec's own 1520-wide reference build).
+
+One deliberate, documented gap: the spec's labels want `.07em` letter-tracking, and GPUI's
+`TextStyle` (`vendor/zed/crates/gpui/src/style.rs`) has no letter-spacing field at all - confirmed
+by reading the struct directly, not assumed. This is not a new shortcut; `crate::rail::render`'s
+own urgency-group header (`.08em` in the same spec family) and `crate::settings::render`'s nav
+group header already drop their own tracking values for the identical reason, so this header just
+follows established precedent rather than being pixel-different for no reason. Labels are
+uppercased via `.to_uppercase()` in Rust, matching both of those.
+
+### Gap 2: the per-commit session column, and an undocumented stray column next to it
+
+`render_graph_row` rendered a fixed 88px cell (`render_graph_session_column`) holding a
+permanently-empty em-dash chip - real UI with no real data behind it in this phase, and per §6.2
+the design intent isn't "wait for the data", it's "this column shouldn't exist": a commit belongs
+to a worktree, which can hold several agents, so pinning one agent's live status to a past commit
+was always going to be imprecise, independent of whether phase (a) had session-correlation data
+to fill it in. Deleted the call site and the function.
+
+Immediately before it sat a second, 40px empty `div()` - a "note" column - that was in neither
+this revision's nor the previous one's own column list (`lane canvas 100 · ref chips · subject
+flex · author 88 · age 40 · sha 62 · ⋯ 22`). Grepped the whole crate for any reference to it
+before deleting: nothing else read, positioned against, or tested it. It was dead weight, not
+load-bearing for anything - removed along with the session column.
+
+The row's own doc comment and this module's top-level doc comment (`graph_view/mod.rs`, which
+used to say "the row's session column always renders honestly empty here") are updated to match;
+git history carries the old column's own former doc comment for anyone who needs the record of
+what it used to render.
+
+### Gap 3: verifying the row `⋯` menu's anchor still holds, not assuming it
+
+The anchor was already built from a row's own real captured `row_menu_bounds`
+(`AdeApp::toggle_graph_row_menu`, `anchor_x`/`anchor_y`) - never a formula involving the row's
+index or `TOOLBAR`/`HEADER` as literals - so adding a real header band above the row list should
+shift every row down for free, with zero changes to that anchor logic. That was the audit's own
+claim to verify, not to take on faith. `the_dots_button_anchor_reflects_the_real_header_band_now_
+above_the_rows` (alongside the existing `the_dots_button_anchors_off_its_own_real_captured_bounds`,
+matching its own style) confirms it end to end through a real click, not a direct method call:
+first that `graph-row-0`'s real top edge sits exactly at the header's own real bottom edge, then
+that `graph-row-1` sits immediately below `graph-row-0` with no gap, then that a real click on row
+1's own `⋯` button opens its menu at exactly that button's real captured bounds. It held on the
+first try - the anchor code needed no changes, only the header needed to exist.
+
+### Tests
+
+Two new tests (the column-alignment comparison and the header-band anchor confirmation above),
+two row cells (`author`/`age`/`sha`) gained `debug_selector`s so a test can capture their real
+bounds without adding test-only rendering paths, and one existing test's premise assertion was
+corrected mid-review: an early draft asserted `graph-row-menu-button-1`'s top sits at exactly
+`row0.origin.y + ROW`, which is wrong by 1.5px - GPUI's box model plus the button's own
+`items_center` centering inside a bordered row doesn't reduce to that simple arithmetic, and
+chasing the exact offset down would have meant re-deriving GPUI's border/box-model behavior by
+hand for a premise check that isn't actually the property under test. Replaced it with a
+real-bounds comparison instead (`graph-row-1`'s own top sits at `graph-row-0`'s top plus its own
+real height) - still real, still proves the header pushed the whole list down, but doesn't
+require hand-deriving a number GPUI itself is responsible for.
+
+### Gates
+
+`cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy --workspace --all-targets
+-- -D warnings`, and `cargo test --workspace --lib -- --test-threads=1` all clean: 1318 tests
+passed (1133 in `app`, 44 in `lsp_core`, 14 in `pty_core`, 127 in `wt_core`), 0 failed, 0
+skipped/reran - the previously-flaky `code_surface::diff_view` timing test that failed under a
+contended box in the prior entry passed cleanly this run with no rerun needed.

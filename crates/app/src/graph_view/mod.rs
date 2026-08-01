@@ -21,7 +21,12 @@
 //! exist in `wt_core` yet (that's a separate, later phase). Only the Copy group's entries
 //! (real clipboard writes of already-loaded data) and the toolbar's read-only scope segment are
 //! actually wired. Session-to-commit correlation (which agent session authored a commit) is a
-//! separate, later feature too; the row's session column always renders honestly empty here.
+//! separate, later feature too; a first draft carried an always-empty per-commit session column
+//! for it, but `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §6.2 removed that
+//! column outright rather than leave it honestly empty - a commit belongs to a worktree, which
+//! can hold several agents, so pinning one agent's live status to a past commit was imprecise on
+//! its own terms, independent of whether the phase (a) data existed to fill it in. The row list
+//! also gained a real column header band (§6.1) in that same revision.
 //!
 //! `render` glob-imports [`state`] (`use super::*`), mirroring `crate::sidebar::render`'s own
 //! convention.

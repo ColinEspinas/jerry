@@ -982,7 +982,10 @@ pub mod scrollbar {
 
 /// The git graph tab (design handoff `design_handoff_jerry_ade/revision 2/CHANGELOG.md`,
 /// 2026-07-31 entry, "git graph (issue #1)") - real hex values transcribed directly from that
-/// entry's §2/§3, not paraphrased.
+/// entry's §2/§3, not paraphrased. The column header band and the removal of the per-commit
+/// session column (`HEADER`/`HEADER_BG`/`HEADER_LABEL_FG` below) are `revision 3/
+/// REVISION-2026-07-31.md` §6.1/§6.2 instead - that revision supersedes the revision-2 entry
+/// for those two points only, everything else here is still the revision-2 values.
 pub mod graph {
     use super::{hex, px, ColorToken, Pixels};
 
@@ -1054,6 +1057,23 @@ pub mod graph {
 
     /// The toolbar band's height (§4: "Toolbar 35 high").
     pub const TOOLBAR: Pixels = px(35.0);
+    /// The column header band's height (`revision 3/REVISION-2026-07-31.md` §6.1: "Column
+    /// header, 22 high"). Sits between [`TOOLBAR`] and the row list -
+    /// `crate::graph_view::render::AdeApp::render_graph_view` renders it as a real sibling band,
+    /// not a literal folded into the row list's own top padding, so the row `⋯` menu's anchor
+    /// (built from a row's own real captured bounds, never a `TOOLBAR`/`HEADER`/index formula -
+    /// see [`super::graph::ROW_MENU_HEIGHT`]'s neighbour `Self::toggle_graph_row_menu`) shifts
+    /// down for free the moment this band exists, with zero changes to that anchor logic itself.
+    pub const HEADER: Pixels = px(22.0);
+    /// The column header band's own background (§6.1: "`#101315`") - close to but distinct from
+    /// [`super::surface::HEADER`]'s `#121417` (context bar, panel headers), so kept as its own
+    /// token rather than reused, the same "same-ish hex, distinct token for a distinct element"
+    /// call `super::text::TREE_CARET`'s own doc comment already makes for [`super::text::PATH`].
+    pub const HEADER_BG: ColorToken = hex(0x101315);
+    /// The column header labels' colour (§6.1: "`#4a5057` - quieter than any row content").
+    /// Same hex as [`super::text::PATH`]/[`super::text::TREE_CARET`] - again a distinct token
+    /// for a distinct element, per those constants' own precedent.
+    pub const HEADER_LABEL_FG: ColorToken = hex(0x4a5057);
     /// The `Push …` menu's width (§4: "opening a 268-wide menu").
     pub const PUSH_MENU_WIDTH: Pixels = px(268.0);
     /// The row `⋯` context menu's width (§4: "a 330-wide context menu").
