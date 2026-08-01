@@ -3930,3 +3930,95 @@ diff_render_tests` flake - a different test in that module than the two previous
 this repo's own notes (`repeated_refreshes_of_the_same_open_diff_reuse_the_cached_highlighting`
 this time), same timing-sensitive family, `diff_view.rs` untouched anywhere by this change -
 confirmed it passes cleanly in isolation, and the subsequent full-suite re-run above was clean.
+
+## Fix: language servers silently dying, with no health check and no way back
+
+A real, user-reported reliability complaint - "even when they're installed they disconnect or
+don't work" - traced to two genuinely distinct bugs, one of them live-reproduced, the other
+structural. Both are the same class this project's discipline exists to catch: silently degrading
+instead of failing honestly, and failing to recover when it legitimately could.
+
+**Live-reproduced root cause: a server that is alive but has stopped reading its stdin wedged the
+client permanently.** Driven against a real child process that completed a real handshake and then
+stopped draining its stdin, a single 256 KiB `textDocument/didChange` never returned - the pipe's
+own ~64 KiB kernel buffer filled and `write_all` parked with no time bound whatsoever. Worse, it
+parked *holding* `LspClient`'s `stdin` mutex, which meant the per-request timeout this crate
+documents was not a real timeout at all: a subsequent `textDocument/hover` carrying an explicit
+**3-second** budget was measured still unfinished **8 seconds** later, because it never got as far
+as its own `recv_timeout`. And since the process was genuinely still alive, the reader thread never
+saw EOF, so `is_connection_alive()` kept answering `true` throughout. Nothing anywhere could say
+what had happened. Revision R8.5b's own crash detection was re-verified and is intact and fast (a
+real `SIGKILL` flips the flag in ~330ns; writes then fail `BrokenPipe` in ~40µs) - it simply never
+covered the hung-but-alive case, which has no EOF to observe.
+
+Fixed by giving writes a real bound: the child's stdin is set `O_NONBLOCK` once at spawn, and every
+outbound message now goes through a new `transport::write_message_bounded` that owns its waiting via
+a deadline-bounded `poll`. POSIX is explicit that a blocking `write()` past `PIPE_BUF` returns only
+once *all* bytes are written, so "poll, then write the rest" on a blocking fd would still have
+parked mid-frame - hence the non-blocking fd rather than the cheaper-looking alternative. The budget
+is a *no-progress* one, refreshed on every byte the peer accepts, so a large frame against a merely
+slow server costs nothing; only a peer that has accepted nothing at all for 30 seconds trips it. A
+write that cannot finish ends the connection honestly, and a connection already known dead now fails
+writes immediately - that early-out is its own measured fix, since without it the first write
+correctly gave up after 30s and a 3-second-timeout hover still sat there 12 seconds later, refilling
+and re-timing-out the same wedged pipe.
+
+**Structural root cause: there was no recovery path at all, and no health check on any cadence.**
+`is_connection_alive` has been an honest signal since R8.5b, but nothing ever *checked* it
+periodically - only `lsp_file_status` read it, i.e. only while the dead server's own language
+happened to be the file on screen. Meanwhile `spawn_lsp_client` deliberately no-ops for a key that
+already has an entry *in any state*, and nothing ever removed one whose process had died. So a dead
+`rust-analyzer` stayed `Ready` in `lsp_clients` for the window's life, with every sync tick, hover
+and completion still routed at a process that would never answer; the only real way back was to
+switch worktrees and back, or restart the app - neither discoverable as a fix for "diagnostics
+stopped appearing". Now a real liveness sweep runs on the existing 250ms poll loop and demotes a
+dead client to a named `Failed` state (which also stops further doomed requests, since the
+connection then stops resolving), and a real `restart_lsp_clients` frees the key so the ordinary
+render path spawns fresh - reachable both from a new `Restart Language Servers` palette command and
+by clicking the failed status chip in the File view footer, which is where a user who has noticed
+the problem is actually looking. Automatic respawning was deliberately not chosen: a server that
+died analyzing a particular file will likely die again on it, turning one honest failure into an
+invisible crash loop. Real Zed was checked in the vendored tree rather than assumed and makes the
+same call - a user-invoked `"Restart Server"` entry, no automatic post-crash respawn.
+
+The verification here is honestly bounded and worth stating: the real GUI could not be driven in
+this sandbox (screenshots come back black under WSLg's rootless X, and there is no `xdotool`/`wtype`
+or sudo to install one), so the app binary was launched for real but not clicked. Everything else
+was driven against real processes - including a real, installed `rust-analyzer` frozen with
+`SIGSTOP`, which is what a deadlocked or thrashing server genuinely looks like.
+
+An adversarial review was dispatched to a checker sub-agent and its report genuinely received (this
+is a real sub-agent finding, not self-review). It found eight real issues, several serious, and one
+of them was a **new data-corruption bug introduced by the first fix itself**: writers queue on the
+`stdin` mutex, so every concurrent hover/completion/pull has already passed the liveness check and
+is parked on the lock while one writer is mid-frame - and the wedged writer released the guard
+*before* publishing the death, letting the next writer emit a perfectly-formed frame into a peer
+whose framer was mid-body, to be swallowed as the previous message's payload. Fixed by publishing
+the death while still holding the guard and re-checking liveness after acquiring it, with a
+regression test using two real threads against a real frozen rust-analyzer - verified to genuinely
+fail without the fix, not merely to pass with it. The same review found: the reader thread's own
+reply writer had no early-out and could re-create the original symptom from a different direction;
+`restart_lsp_clients` did not cancel in-flight sync/completion tasks, which could re-pollute the
+bookkeeping it had just cleared for a real ~8 seconds and leave the old process alive alongside the
+new one - the exact "worse silent failure" that method's own doc claimed to prevent; restarting a
+`Spawning` entry could double-spawn; the reap ran `LspClient::drop` (a `/proc` walk plus real
+`kill(2)`s) on the GPUI foreground thread; a `flush` failure after a fully-written frame was
+reported as a mid-frame desync; and four doc comments overstated things, one citing a function that
+does not exist. All fixed. One review finding was deliberately answered with documentation rather
+than code: killing the connection when a write times out having accepted *zero* bytes is a policy
+call, not a correctness requirement, and is now named as one - it is defensible because the budget
+measures stalled time, and because the counterweight is a real one-click restart rather than a dead
+end.
+
+Two tests were written honestly rather than optimistically. The attempt to reproduce the
+stale-task interleaving as a *symptom* was abandoned after verifying it passed identically with and
+without the fix - GPUI's deterministic test executor collapses exactly that window - so it pins the
+mechanism instead and says so. And a test originally named as if it proved a server "comes back" was
+renamed to what it actually proves (the spawn guard is genuinely freed and a real attempt reaches
+the OS); the real end-to-end recovery is proven separately, by the chip-click test, which genuinely
+observed a fresh `rust-analyzer` spawn and reach `Ready` after a real painted-bounds click.
+
+All four gates clean. 907 tests passing, up from a real 896 baseline (+11): 748 app, 47 lsp-core, 14
+pty-core, 98 wt-core. `lsp-core` also re-checked for `x86_64-pc-windows-gnu`, where the bounded
+write is honestly documented as narrower (no `poll` for Windows anonymous pipes), matching the same
+real, tracked platform split `kill_process_tree` already carries.

@@ -136,6 +136,21 @@ fn lsp_result_is_empty<T: serde::Serialize>(value: &T) -> bool {
     }
 }
 
+/// The one real "this server is gone" message, shared by [`LspConnection::liveness_failure_reason`]
+/// (which reports it for the file being rendered) and [`AdeApp::reap_dead_lsp_clients`] (which
+/// records it into [`LspClientState::Failed`] on the poll cadence) so the two can't drift into
+/// telling the user two different things about the same dead process.
+///
+/// Says "exited or stopped responding", not just "exited", because both are now real, distinct
+/// ways `lsp_core::LspClient::is_connection_alive` genuinely goes `false`: the reader thread
+/// seeing EOF (a crash/kill), and an outbound write that the server never accepted within
+/// `lsp-core`'s own write budget (a hung-but-alive server - see that crate's
+/// `transport::write_message_bounded`). Naming only the first would be actively wrong for the
+/// second.
+fn connection_lost_message(server: &str) -> String {
+    format!("{server}'s connection was lost (the process exited or stopped responding)")
+}
+
 impl LspConnection {
     fn primary(&self) -> &std::sync::Arc<lsp_core::LspClient> {
         match self {
@@ -299,10 +314,7 @@ impl LspConnection {
             .flatten()
         {
             if !client.is_connection_alive() {
-                return Some(format!(
-                    "{}'s connection was lost (the process exited unexpectedly)",
-                    client.name()
-                ));
+                return Some(connection_lost_message(client.name()));
             }
         }
         None
@@ -537,30 +549,186 @@ impl AdeApp {
             let Some(state) = self.lsp_clients.remove(&key) else {
                 continue;
             };
-            if let LspClientState::Ready(client) = state {
-                let server_name = client.name();
-                let task = cx.background_executor().spawn(async move {
-                    match std::sync::Arc::try_unwrap(client) {
-                        Ok(mut client) => {
-                            if let Err(err) = client.shutdown() {
-                                log::warn!("failed to shut down {server_name}: {err}");
-                            }
-                        }
-                        Err(client) => {
-                            // Some other clone is still alive - see this method's own docs.
-                            // Dropping it here is still real cleanup via `Drop`, just not the
-                            // graceful path.
-                            drop(client);
-                        }
-                    }
-                });
-                self._lsp_tasks.push(task);
-            }
+            self.shutdown_lsp_client_off_thread(state, cx);
             // `Spawning`/`Failed` states hold no process to tear down. A `Spawning` one whose
             // background task is still in-flight will, once it resolves, re-insert an entry
             // under `key` even though it's no longer active - harmless: the next eviction pass
             // catches it same as any other stale entry.
         }
+    }
+
+    /// Tears one real server down without blocking the GPUI thread - the shared body behind both
+    /// [`Self::evict_stale_lsp_clients`] and [`Self::restart_lsp_clients`], so the
+    /// `try_unwrap`-then-`shutdown`-else-`drop` rule lives in exactly one place. See
+    /// [`Self::evict_stale_lsp_clients`]'s own docs for why each half of that rule is what it is.
+    fn shutdown_lsp_client_off_thread(&mut self, state: LspClientState, cx: &mut Context<Self>) {
+        let LspClientState::Ready(client) = state else {
+            // `Spawning`/`Failed` hold no process to tear down.
+            return;
+        };
+        let server_name = client.name();
+        let task = cx.background_executor().spawn(async move {
+            match std::sync::Arc::try_unwrap(client) {
+                Ok(mut client) => {
+                    if let Err(err) = client.shutdown() {
+                        log::warn!("failed to shut down {server_name}: {err}");
+                    }
+                }
+                Err(client) => drop(client),
+            }
+        });
+        self._lsp_tasks.push(task);
+    }
+
+    /// Demotes every [`LspClientState::Ready`] entry whose real process has actually died to a
+    /// [`LspClientState::Failed`] one naming it. Returns `true` if anything changed, so
+    /// [`Self::ensure_lsp_poll_task`]'s loop - the one real cadence this runs on - can `cx.notify()`
+    /// only when there's something new to draw.
+    ///
+    /// ## The real bug this closes
+    ///
+    /// `lsp_core::LspClient::is_connection_alive` has been a real, honest signal since Revision
+    /// R8.5b, but nothing in this crate ever *checked* it on a cadence: it was read only by
+    /// `lsp_file_status`, i.e. only while the dead server's own language happened to be the file
+    /// being rendered. A dead `rust-analyzer` therefore stayed `Ready` in [`Self::lsp_clients`]
+    /// indefinitely while a TypeScript file was open, with every sync tick, hover and completion
+    /// still being routed at a process that will never answer, and nothing anywhere saying so.
+    ///
+    /// Demoting to `Failed` fixes both halves of that at once, because the rest of this module
+    /// already treats `Failed` correctly: [`Self::lsp_connection_for_path`] stops resolving a
+    /// connection at all (so no further doomed requests are dispatched), and [`lsp_file_status`]
+    /// reports the real message. It deliberately does **not** respawn - see
+    /// [`Self::restart_lsp_clients`] for why that stays the user's call.
+    pub(in crate::lsp) fn reap_dead_lsp_clients(&mut self, cx: &mut Context<Self>) -> bool {
+        let dead: Vec<(LspClientKey, String)> = self
+            .lsp_clients
+            .iter()
+            .filter_map(|(key, state)| {
+                let LspClientState::Ready(client) = state else {
+                    return None;
+                };
+                (!client.is_connection_alive())
+                    .then(|| (key.clone(), connection_lost_message(client.name())))
+            })
+            .collect();
+        if dead.is_empty() {
+            return false;
+        }
+        for (key, reason) in dead {
+            log::warn!("{reason} - it will not be used again until it is restarted");
+            let replaced = self.lsp_clients.insert(key, LspClientState::Failed(reason));
+            // The replaced `Ready` state is handed to the same off-thread teardown eviction and
+            // restart use, never just dropped here. Dropping the last `Arc` inline would run
+            // `lsp_core::LspClient`'s own `Drop` on the GPUI foreground thread - a `/proc`
+            // descendant walk, real `kill(2)` calls and a blocking reap - from inside this
+            // method's 250ms poll tick, breaking this file's own "never block the UI thread on
+            // process teardown" rule. Short in practice for an already-dead process, but the rule
+            // does not have a "probably fast" exemption.
+            if let Some(replaced) = replaced {
+                self.shutdown_lsp_client_off_thread(replaced, cx);
+            }
+        }
+        true
+    }
+
+    /// Throws away every language server for the active worktree root and lets the ordinary
+    /// render path start fresh ones - the real recovery action behind
+    /// [`crate::palette::state::PaletteCommand::RestartLanguageServers`] and the File view footer's own
+    /// clickable failed-status chip.
+    ///
+    /// ## Why this is a user action and not an automatic respawn
+    ///
+    /// Before this existed there was no recovery path at all: [`Self::spawn_lsp_client`]
+    /// deliberately no-ops for a key that already has an entry *in any state* (so a failure isn't
+    /// retried on every render), and nothing ever removed an entry whose process had died. The
+    /// only thing that did was [`Self::evict_stale_lsp_clients`], on a worktree switch - so the
+    /// sole real way a user could revive a dead server was to switch worktrees and back, or
+    /// restart the app, neither of which is discoverable as a fix for "diagnostics stopped
+    /// appearing".
+    ///
+    /// Automatic respawning was considered and deliberately not chosen. A server that died *while
+    /// analyzing a particular file* will very likely die again the moment it's handed that same
+    /// file, and an automatic loop turns one honest failure into a permanent, invisible
+    /// spawn/crash cycle - the opposite of this app's "honest status over magic" rule. Real Zed
+    /// makes the same call, and it was checked in the vendored tree rather than assumed: its own
+    /// recovery is a user-invoked `"Restart Server"` menu entry
+    /// (`vendor/zed/crates/language_tools/src/lsp_button.rs:476`) calling
+    /// `LspStore::restart_language_servers_for_buffers`; no automatic post-crash respawn path was
+    /// found in `vendor/zed/crates/project/src/lsp_store.rs` to point at (an absence, so cited as
+    /// one rather than as a verified line).
+    ///
+    /// ## Why the document bookkeeping has to be cleared too
+    ///
+    /// [`Self::lsp_opened_files`] is what makes `didOpen` fire exactly once per path, and the
+    /// version/sync maps describe a conversation with a process that no longer exists. Leaving
+    /// any of them behind would give the fresh server a file it was never told to open, or a
+    /// `didChange` at a version it never saw - a *worse* silent failure than the dead connection
+    /// this is recovering from, since everything would look alive while answering about nothing.
+    /// [`Self::lsp_uri_cache`] is deliberately kept: it is a pure path-to-`file://` mapping with
+    /// no server state in it at all, and dropping it would needlessly stall the next tick's
+    /// completions (see [`Self::prepare_lsp_sync`]'s own cache-miss branch).
+    pub(crate) fn restart_lsp_clients(&mut self, cx: &mut Context<Self>) {
+        let root = self.file_tree_root.clone();
+        // Dropped *first*, before a single map is cleared. Each of these is a real in-flight
+        // background task that ends by writing back into exactly the bookkeeping cleared below:
+        // `schedule_lsp_sync`'s continuation re-inserts `lsp_last_synced_content`/
+        // `lsp_synced_version` when its `did_change_full` returns `Ok`, and its diagnostics-pull
+        // retry loop re-inserts `lsp_diagnostics_confirmed_version` on every attempt - a window
+        // of `PULL_DIAGNOSTICS_EMPTY_RETRIES` x `PULL_DIAGNOSTICS_EMPTY_RETRY_DELAY`, about 8
+        // real seconds *after* the restart. A resurrected `lsp_last_synced_content` entry is the
+        // damaging one: `prepare_lsp_sync` reads it as "the server already has this content", so
+        // the freshly spawned server would never be sent a `didChange` for a dirty buffer and
+        // would answer forever about the file's on-disk text instead - a user who clicked restart
+        // because diagnostics stopped, and now silently gets diagnostics for the wrong content.
+        // Dropping a `Task` cancels it, which is also what stops a surviving task's captured
+        // `Arc<LspConnection>` clone from defeating `Arc::try_unwrap` in the teardown below and
+        // leaving the old server process alive alongside the new one. Same discipline, and the
+        // same ordering, as `AdeApp::select_worktree`'s own worktree-switch reset.
+        self._lsp_sync_tasks = std::collections::HashMap::new();
+        self._completions_request_task = None;
+
+        let keys: Vec<LspClientKey> = self
+            .lsp_clients
+            .keys()
+            .filter(|(key_root, _)| *key_root == root)
+            // A `Spawning` entry is deliberately left in place. Its own background task is still
+            // in flight and will re-insert under this key when it resolves, so removing it here
+            // would free the key for the next render to spawn a *second* real process for the
+            // same server - two rust-analyzers indexing one workspace, at real GB apiece.
+            // (`evict_stale_lsp_clients` tolerates that same re-insert only because its keys are
+            // no longer the active root's; that reasoning does not carry over here.) Nothing is
+            // lost by waiting: a spawn in flight is already the fresh start a restart is asking
+            // for, and if it resolves into a client that is itself dead, the poll loop's own
+            // `reap_dead_lsp_clients` catches it on the next tick.
+            .filter(|key| !matches!(self.lsp_clients.get(key), Some(LspClientState::Spawning)))
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(state) = self.lsp_clients.remove(&key) {
+                log::info!("restarting {} for {}", key.1, root.display());
+                self.shutdown_lsp_client_off_thread(state, cx);
+            }
+        }
+
+        self.lsp_opened_files
+            .retain(|path| !path.starts_with(&root));
+        self.lsp_document_versions
+            .retain(|path, _| !path.starts_with(&root));
+        // Worktree-relative-keyed, and only ever holding the *active* worktree's paths (see
+        // `AdeApp::select_worktree`, which clears all three on a switch) - so
+        // clearing them outright is exactly "forget this root's conversation", not an
+        // over-broad reset.
+        self.lsp_last_synced_content.clear();
+        self.lsp_synced_version.clear();
+        self.lsp_diagnostics_confirmed_version.clear();
+        // Anything still on screen was computed from the connection just torn down - the same
+        // set `AdeApp::select_worktree` clears for the same reason.
+        self.dismiss_completions();
+        self.hover = None;
+        self.file_view_diagnostics = std::collections::HashMap::new();
+        // The next render's own `ensure_lsp_client`/`dispatch_did_open` calls do the real
+        // respawn and re-open, through exactly the same code path a cold start uses.
+        cx.notify();
     }
 
     /// Lazily spawns (or reuses) an `lsp_core::LspClient` for `repo_root` running the server for
@@ -842,6 +1010,12 @@ impl AdeApp {
                     crate::language::CompanionServer,
                     serde_json::Value,
                 )> = Vec::new();
+                // A real, cadence-driven health check, before anything else this tick reads
+                // `lsp_clients` - see `AdeApp::reap_dead_lsp_clients`'s own docs for the real
+                // silent-failure bug it closes.
+                if this.reap_dead_lsp_clients(cx) {
+                    any_update = true;
+                }
                 for (key, state) in this.lsp_clients.iter() {
                     if let LspClientState::Ready(client) = state {
                         if client.drain_updates() {
@@ -2749,6 +2923,351 @@ process.stdin.on('data', (d) => {
             "a companion mid-spawn says nothing yet - the primary's own honest 'no result for \
              this file yet' is the right answer"
         );
+    }
+
+    /// Waits for a genuinely spawned server's real process death to be observed by its client.
+    fn wait_until_dead(client: &lsp_core::LspClient) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while client.is_connection_alive() {
+            assert!(
+                Instant::now() < deadline,
+                "the real process death should have been observed within 10s"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The real bug: nothing in this crate ever checked `is_connection_alive` on a *cadence*. It
+    /// was read only by [`lsp_file_status`], i.e. only while the dead server's own language
+    /// happened to be the file on screen - so a `rust-analyzer` that died while a TypeScript file
+    /// was open stayed `Ready` in `lsp_clients` indefinitely, with every sync tick, hover and
+    /// completion still routed at a process that would never answer, and nothing anywhere saying
+    /// so.
+    ///
+    /// Driven through a genuinely spawned process killed on cue, and through the real
+    /// [`AdeApp::reap_dead_lsp_clients`] the production poll loop calls - not a simulated state
+    /// flip.
+    #[gpui::test]
+    fn a_dead_ready_client_is_reaped_into_a_real_named_failed_state(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        let key: LspClientKey = (repo.path().to_path_buf(), "rust-analyzer");
+
+        app.update(cx, |app, cx| {
+            app.lsp_clients
+                .insert(key.clone(), LspClientState::Ready(client.clone()));
+            assert!(
+                !app.reap_dead_lsp_clients(cx),
+                "a genuinely alive client must never be reaped - that would be a self-inflicted \
+                 outage, not a fix"
+            );
+        });
+
+        // A real, unprompted process death, with no `shutdown()` - standing in for a crash.
+        client
+            .notify_raw("test/die", serde_json::Value::Null)
+            .expect("the fake server should accept the notification that kills it");
+        wait_until_dead(&client);
+
+        app.update(cx, |app, cx| {
+            assert!(
+                app.reap_dead_lsp_clients(cx),
+                "a real, dead process must be noticed on the poll cadence"
+            );
+            let Some(LspClientState::Failed(message)) = app.lsp_clients.get(&key) else {
+                panic!(
+                    "a dead client must be demoted to a real Failed state, got: {:?}",
+                    app.lsp_clients.get(&key).map(std::mem::discriminant)
+                );
+            };
+            assert!(
+                message.contains("rust-analyzer"),
+                "the recorded reason must name which real server died, got: {message}"
+            );
+            assert!(
+                !app.reap_dead_lsp_clients(cx),
+                "a second pass must report no change - the poll loop calls this every 250ms and \
+                 must not notify the window forever over one death"
+            );
+        });
+
+        // The real consequence that makes the demotion worth doing: no further request is routed
+        // at the dead process, because the connection no longer resolves at all.
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.lsp_connection_for_path(&repo.path().join("main.rs"))
+                    .is_none(),
+                "a reaped client must stop resolving into a usable connection"
+            );
+        });
+    }
+
+    /// The other half of the same bug, and the one a user actually feels: before this, there was
+    /// no recovery path at all. [`AdeApp::spawn_lsp_client`] deliberately no-ops for a key that
+    /// already has an entry *in any state*, and nothing ever removed one whose process had died -
+    /// so the only real way to revive a dead server was to switch worktrees and back, or restart
+    /// the app.
+    ///
+    /// Also pins the part that would be a *worse* silent failure if it were forgotten: the
+    /// per-server document bookkeeping has to go too. `lsp_opened_files` is what makes `didOpen`
+    /// fire exactly once per path, so a restart that left it behind would give the fresh server a
+    /// file it was never told to open - everything would look alive while answering about nothing.
+    #[gpui::test]
+    fn restarting_clears_the_dead_client_and_all_of_its_document_bookkeeping(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let opened = root.join("src").join("main.rs");
+        let relative = PathBuf::from("src/main.rs");
+
+        app.update(cx, |app, _cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Failed("rust-analyzer's connection was lost".to_string()),
+            );
+            app.lsp_opened_files.insert(opened.clone());
+            app.lsp_document_versions.insert(opened.clone(), 42);
+            app.lsp_last_synced_content
+                .insert(relative.clone(), "fn main() {}".to_string());
+            app.lsp_synced_version.insert(relative.clone(), 42);
+            app.lsp_diagnostics_confirmed_version
+                .insert(relative.clone(), 42);
+        });
+
+        app.update(cx, |app, cx| app.restart_lsp_clients(cx));
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.lsp_clients
+                    .contains_key(&(root.clone(), "rust-analyzer")),
+                "the entry has to be genuinely removed, not merely marked - `spawn_lsp_client` \
+                 no-ops for any key that still exists, so leaving it behind would mean the \
+                 restart silently did nothing at all"
+            );
+            assert!(
+                !app.lsp_opened_files.contains(&opened),
+                "a fresh server has been told about no files; leaving this behind would suppress \
+                 the real didOpen the next render owes it"
+            );
+            assert!(
+                !app.lsp_document_versions.contains_key(&opened),
+                "document versions describe a conversation with a process that no longer exists"
+            );
+            assert!(app.lsp_last_synced_content.is_empty());
+            assert!(app.lsp_synced_version.is_empty());
+            assert!(
+                app.lsp_diagnostics_confirmed_version.is_empty(),
+                "a stale confirmed-version would let the sync-pending banner claim a fresh \
+                 server's diagnostics were up to date before it had answered anything"
+            );
+        });
+    }
+
+    /// The race an adversarial review of this fix caught, and the nastier half of it: clearing
+    /// the bookkeeping is not enough on its own, because the tasks that *write* that bookkeeping
+    /// are still in flight when the restart happens.
+    ///
+    /// [`AdeApp::schedule_lsp_sync`]'s continuation captures its own `Arc<LspConnection>` at plan
+    /// time and never re-checks [`AdeApp::lsp_clients`] afterwards, so once past that point it
+    /// completes against the *old* client and writes back unconditionally: `lsp_last_synced_content`
+    /// and `lsp_synced_version` when its `did_change_full` returns `Ok`, and
+    /// `lsp_diagnostics_confirmed_version` on every attempt of a retry loop that runs for a real
+    /// ~8 seconds. A resurrected `lsp_last_synced_content` entry is the damaging one:
+    /// [`AdeApp::prepare_lsp_sync`] reads it as "the server already has this content", so the
+    /// freshly spawned server would never be sent a `didChange` for a dirty buffer and would
+    /// answer forever about the file's on-disk text - a user who restarted *because* diagnostics
+    /// went wrong then silently gets diagnostics for the wrong content.
+    ///
+    /// ## What this test does and does not prove
+    ///
+    /// It pins the **mechanism**, not the symptom: that a restart genuinely drops the in-flight
+    /// sync/completion tasks, which is what makes the write-back impossible. Reproducing the
+    /// interleaving itself was attempted and abandoned honestly - GPUI's deterministic test
+    /// executor collapses exactly the window in question (driving the clock runs the awaiting
+    /// continuation straight through to completion), so a test written against the symptom passes
+    /// identically with and without the fix, which was verified rather than assumed. The
+    /// assertions below do fail without it.
+    #[gpui::test]
+    async fn a_restart_drops_the_in_flight_tasks_that_would_repopulate_cleared_bookkeeping(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        let absolute = root.join("src").join("main.rs");
+        std::fs::write(&absolute, "fn main() {}\n").expect("write main.rs");
+        let relative = PathBuf::from("src/main.rs");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        app.update_in(cx, |app, window, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(server.clone()),
+            );
+            app.open_file_view(absolute.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        // A real, armed sync task through the real production entry point - and a real check that
+        // it is genuinely armed, so this can't quietly become a test of nothing.
+        app.update(cx, |app, cx| {
+            app.schedule_lsp_sync(relative.clone(), cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(
+                app._lsp_sync_tasks.contains_key(&relative),
+                "sanity check: the real production call must genuinely arm a sync task, or the \
+                 assertion below proves nothing"
+            );
+        });
+
+        app.update(cx, |app, cx| app.restart_lsp_clients(cx));
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app._lsp_sync_tasks.is_empty(),
+                "an in-flight sync task outliving the restart re-records 'the server already has \
+                 this content' for a server that never saw it - the fresh server would then never \
+                 be sent a didChange at all"
+            );
+            assert!(
+                app._completions_request_task.is_none(),
+                "an in-flight completion request belongs to the connection just torn down"
+            );
+        });
+
+        // And the bookkeeping those tasks write is genuinely clear once everything drains.
+        cx.background_executor.advance_clock(LSP_SYNC_DEBOUNCE * 4);
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.lsp_last_synced_content.is_empty());
+            assert!(app.lsp_synced_version.is_empty());
+            assert!(app.lsp_diagnostics_confirmed_version.is_empty());
+        });
+    }
+
+    /// The recovery has to be reachable without already knowing where to look, so the palette
+    /// command is wired to the same real method the failed-status chip calls - proven by running
+    /// the real [`AdeApp::execute_palette_command`], not by asserting the enum variant exists.
+    #[gpui::test]
+    fn the_restart_palette_command_runs_the_real_restart(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+
+        app.update(cx, |app, _cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Failed("dead".to_string()),
+            );
+        });
+        assert!(
+            crate::palette::state::PaletteCommand::ALL
+                .contains(&crate::palette::state::PaletteCommand::RestartLanguageServers),
+            "a command absent from ALL never appears in the palette, so it is not a real \
+             recovery path a user can find"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.execute_palette_command(
+                crate::palette::state::PaletteCommand::RestartLanguageServers,
+                window,
+                cx,
+            );
+        });
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.lsp_clients
+                    .contains_key(&(root.clone(), "rust-analyzer")),
+                "the palette command must run the real restart, not a stub"
+            );
+        });
+    }
+
+    /// A live client dies, the real poll-cadence reap notices, the real restart clears it, and a
+    /// subsequent real spawn attempt genuinely *reaches the OS* under the same key.
+    ///
+    /// That last step is the whole point, and it is deliberately checked with a binary that
+    /// cannot exist rather than a real server: what has to be proven is that
+    /// [`AdeApp::spawn_lsp_client`]'s "already have an entry, do nothing" guard - the exact thing
+    /// that made a dead connection permanent - is genuinely cleared, and a real `Failed` outcome
+    /// proves an attempt was made where previously none would have been. This test does not
+    /// claim a working server comes back; that is `ensure_lsp_client`'s ordinary cold-start path,
+    /// already covered end to end against a real rust-analyzer by
+    /// `lsp_diagnostics_wiring_tests`.
+    #[gpui::test]
+    async fn a_restart_frees_the_key_so_a_fresh_spawn_is_really_attempted(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let key: LspClientKey = (root.clone(), "rust-analyzer");
+
+        let first = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        app.update(cx, |app, _cx| {
+            app.lsp_clients
+                .insert(key.clone(), LspClientState::Ready(first.clone()));
+        });
+        first
+            .notify_raw("test/die", serde_json::Value::Null)
+            .expect("notification accepted");
+        wait_until_dead(&first);
+        app.update(cx, |app, cx| {
+            assert!(app.reap_dead_lsp_clients(cx));
+        });
+
+        app.update(cx, |app, cx| app.restart_lsp_clients(cx));
+        // The real production spawn path, exactly as `render_file_view` drives it - with a
+        // deliberately non-existent binary swapped in via the same real `build_config` seam
+        // `ensure_lsp_client` uses, so this proves the *guard* is genuinely cleared without
+        // making the test depend on a real toolchain being installed. A `Failed` outcome here is
+        // a real spawn attempt that reached the OS; before the restart cleared the entry, no
+        // attempt would have been made at all.
+        app.update(cx, |app, cx| {
+            app.spawn_lsp_client(
+                key.clone(),
+                root.clone(),
+                || {
+                    Ok(lsp_core::ServerSpawnConfig {
+                        // Both fields carry the same deliberately-impossible marker: `name` is
+                        // what `LspError::Spawn` actually prints, and `binary` is what is really
+                        // handed to the OS - so the assertion below can only pass if a genuine
+                        // spawn was attempted and genuinely failed.
+                        name: "ade-no-such-language-server-binary",
+                        binary: "ade-no-such-language-server-binary",
+                        args: Vec::new(),
+                        initialization_options: None,
+                        workspace_configuration: lsp_core::default_workspace_configuration,
+                        custom_notification_methods: Vec::new(),
+                    })
+                },
+                cx,
+            );
+        });
+        app.read_with(cx, |app, _| {
+            assert!(
+                matches!(app.lsp_clients.get(&key), Some(LspClientState::Spawning)),
+                "the restart must leave the key genuinely free for a fresh spawn - a still-present \
+                 entry would make this call a silent no-op, which is the original bug"
+            );
+        });
+
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let Some(LspClientState::Failed(message)) = app.lsp_clients.get(&key) else {
+                panic!("the real spawn attempt should have resolved to a real outcome");
+            };
+            assert!(
+                message.contains("ade-no-such-language-server-binary"),
+                "the real spawn error must be surfaced as-is, naming the binary that was actually \
+                 attempted - anything vaguer would let this pass without a real attempt having \
+                 been made: {message}"
+            );
+        });
     }
 
     /// The real, full relay round trip through the real production dispatch, with both halves

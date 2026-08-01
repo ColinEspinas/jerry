@@ -24,15 +24,213 @@ use std::io::{self, BufRead, Read, Write};
 /// outright-malicious peer.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Writes one real, framed JSON-RPC message: `Content-Length: <n>\r\n\r\n<json bytes>`, then
-/// flushes so the bytes actually leave this process rather than sitting in a `Write` adapter's
-/// internal buffer (load-bearing for a child process reading from a pipe with no buffering of
-/// its own to force a flush on).
-pub fn write_message<W: Write>(writer: &mut W, value: &serde_json::Value) -> io::Result<()> {
+/// Why a real [`write_message_bounded`] call gave up, and - load-bearing - **how far into the
+/// frame it got before it did**.
+///
+/// `bytes_written > 0` is not a detail: it means part of a `Content-Length`-framed message is
+/// already sitting in the peer's pipe with no way to finish it, so the peer's own framer is now
+/// permanently desynced (it is mid-body, waiting on bytes that will never arrive, and will
+/// mis-frame everything after them). A caller that sees that must treat the whole connection as
+/// dead rather than retrying on it - see [`crate::client::LspClient::is_connection_alive`]'s own
+/// docs for what actually acts on this.
+#[derive(Debug)]
+pub enum BoundedWriteError {
+    /// The caller's deadline elapsed with the peer still not accepting bytes.
+    ///
+    /// Never constructed on Windows: that platform's [`write_message_bounded`] is honestly
+    /// unbounded (no `poll` for anonymous pipes - see its own docs), so it can only ever produce
+    /// [`Self::Io`]. The `allow` documents that as the real, tracked platform gap it is, rather
+    /// than letting a dead-code warning fail the build for a variant unix genuinely uses - the
+    /// same pattern `crate::client` already uses for its own unix-only items.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Timeout { bytes_written: usize },
+    /// A real I/O error (the peer closed its read end, etc.).
+    Io {
+        source: io::Error,
+        bytes_written: usize,
+    },
+}
+
+impl BoundedWriteError {
+    /// `true` when a partial frame genuinely reached the peer - see this type's own docs for why
+    /// that is unrecoverable rather than merely a failed call.
+    pub fn stream_desynced(&self) -> bool {
+        match self {
+            Self::Timeout { bytes_written } | Self::Io { bytes_written, .. } => *bytes_written > 0,
+        }
+    }
+
+    /// The real underlying `io::Error`, synthesizing a [`io::ErrorKind::TimedOut`] one for the
+    /// timeout case so a caller that only wants to report *something* honest doesn't have to
+    /// match on the variant.
+    pub fn into_io_error(self) -> io::Error {
+        match self {
+            Self::Timeout { .. } => io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the language server stopped reading its stdin",
+            ),
+            Self::Io { source, .. } => source,
+        }
+    }
+}
+
+/// Serializes `value` into one real, framed message: `Content-Length: <n>\r\n\r\n<json bytes>`.
+/// The single place this crate encodes the wire format, shared by both
+/// [`write_message_bounded`] platform paths (and exercised directly by this module's own
+/// round-trip tests) so no two writers can ever drift apart on it.
+fn frame(value: &serde_json::Value) -> io::Result<Vec<u8>> {
     let body = serde_json::to_vec(value).map_err(io::Error::from)?;
-    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
-    writer.write_all(&body)?;
-    writer.flush()
+    let mut frame = Vec::with_capacity(body.len() + 32);
+    write!(&mut frame, "Content-Length: {}\r\n\r\n", body.len())?;
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+/// Writes one real, framed JSON-RPC message to a **non-blocking** fd, giving up with a real
+/// [`BoundedWriteError::Timeout`] if `timeout` elapses before the peer accepts the whole frame.
+///
+/// ## The real bug this exists for
+///
+/// An ordinary blocking `write_all` of a framed message has no time bound at all, and that is
+/// not theoretical:
+/// live-reproduced against a real child process that completed a real LSP handshake and then
+/// stopped reading its stdin (`process.stdin.pause()`, standing in for a hung/SIGSTOPped/
+/// deadlocked server), a single 256 KiB `textDocument/didChange` never returned - the pipe's own
+/// ~64 KiB kernel buffer filled and `write_all` parked forever. Worse, it parks *holding*
+/// `LspClient`'s `stdin` mutex, so every later call on that client blocks on the mutex before it
+/// can even reach its own `recv_timeout`: a subsequent `textDocument/hover` request with an
+/// explicit **3-second** timeout was measured still unfinished 8 seconds later. And because the
+/// process is genuinely still alive, the reader thread never sees EOF, so
+/// `LspClient::is_connection_alive` keeps honestly-but-uselessly reporting `true` - the whole
+/// connection silently stops working with nothing anywhere saying why.
+///
+/// ## Why `O_NONBLOCK` rather than "poll, then write the rest"
+///
+/// POSIX is explicit that a blocking `write()` of more than `PIPE_BUF` bytes returns only once
+/// *all* `nbyte` have been written, so a "poll for `POLLOUT`, then write everything remaining"
+/// loop on a blocking fd would still park inside `write()` the moment the peer stalls mid-frame.
+/// Making the fd non-blocking once, at spawn (see [`crate::client::LspClient::spawn`]), removes
+/// that class of reasoning entirely: `write` then answers `EWOULDBLOCK` instead of parking, and
+/// this loop owns the waiting via a real, deadline-bounded `poll`.
+///
+/// `writer` must therefore genuinely be `O_NONBLOCK`; passing a blocking fd is not unsafe, it
+/// just silently gives back the unbounded behavior this function exists to remove.
+#[cfg(unix)]
+pub fn write_message_bounded<W: Write + std::os::fd::AsFd>(
+    writer: &mut W,
+    value: &serde_json::Value,
+    timeout: std::time::Duration,
+) -> Result<(), BoundedWriteError> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout};
+
+    let frame = frame(value).map_err(|source| BoundedWriteError::Io {
+        source,
+        bytes_written: 0,
+    })?;
+    // A *no-progress* deadline, refreshed on every byte the peer actually accepts - not one
+    // budget for the whole frame. The difference is real: a single absolute deadline would kill a
+    // peer that is genuinely draining, just slowly (a large frame against a busy server), and
+    // report it as a desynced connection. What this bound is actually for is a peer that has
+    // stopped reading altogether, and "no progress at all for `timeout`" says exactly that.
+    let mut deadline = std::time::Instant::now() + timeout;
+    let mut written = 0usize;
+
+    while written < frame.len() {
+        match writer.write(&frame[written..]) {
+            Ok(0) => {
+                return Err(BoundedWriteError::Io {
+                    source: io::Error::new(io::ErrorKind::WriteZero, "wrote zero bytes"),
+                    bytes_written: written,
+                });
+            }
+            Ok(count) => {
+                written += count;
+                deadline = std::time::Instant::now() + timeout;
+                continue;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Err(source) => {
+                return Err(BoundedWriteError::Io {
+                    source,
+                    bytes_written: written,
+                });
+            }
+        }
+
+        // The pipe is full right now. Wait - bounded by whatever is left of the caller's own
+        // deadline - for the peer to drain enough of it to accept more.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(BoundedWriteError::Timeout {
+                bytes_written: written,
+            });
+        }
+        // `PollTimeout::try_from` only fails for a duration whose millisecond count overflows
+        // `i32`; `remaining` is bounded by the caller's own timeout, and clamping to
+        // `PollTimeout::MAX` for an absurdly large one keeps the deadline check above the single
+        // real authority on when to give up rather than introducing a second failure mode.
+        let poll_timeout = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX);
+        let mut fds = [PollFd::new(writer.as_fd(), PollFlags::POLLOUT)];
+        match nix::poll::poll(&mut fds, poll_timeout) {
+            // A real poll timeout: the peer has not freed a single byte of pipe space within the
+            // caller's whole budget.
+            Ok(0) => {
+                return Err(BoundedWriteError::Timeout {
+                    bytes_written: written,
+                });
+            }
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(errno) => {
+                return Err(BoundedWriteError::Io {
+                    source: io::Error::from(errno),
+                    bytes_written: written,
+                });
+            }
+        }
+    }
+
+    // A pipe fd has no userspace buffer of its own to flush, but `flush` is still called for the
+    // same reason any framed writer would: `W` is only promised to be a `Write`.
+    //
+    // Reported with `bytes_written: 0` even though the whole frame demonstrably went out, because
+    // that field means one specific thing to callers - "a *partial* frame reached the peer, so its
+    // framer is desynced" (see [`BoundedWriteError`]). Nothing was cut off here; passing `written`
+    // through would make [`BoundedWriteError::stream_desynced`] claim a corruption that did not
+    // happen, and the caller would log "was cut off part-way through" about a frame that wasn't.
+    writer.flush().map_err(|source| BoundedWriteError::Io {
+        source,
+        bytes_written: 0,
+    })
+}
+
+/// Windows twin of [`write_message_bounded`], honestly narrower: it performs the same real,
+/// framed write but has **no** time bound, because `poll` does not exist for Windows anonymous
+/// pipes and the non-blocking-write machinery above has no direct equivalent. Documented as a
+/// real, tracked gap rather than papered over with a fake timeout - the same shape as
+/// `LspClient::kill_process_tree`'s own `#[cfg(windows)]` twin, which is likewise real but
+/// narrower than its unix counterpart (direct child only, no descendant-process-tree walk).
+#[cfg(not(unix))]
+pub fn write_message_bounded<W: Write>(
+    writer: &mut W,
+    value: &serde_json::Value,
+    _timeout: std::time::Duration,
+) -> Result<(), BoundedWriteError> {
+    let frame = frame(value).map_err(|source| BoundedWriteError::Io {
+        source,
+        bytes_written: 0,
+    })?;
+    writer
+        .write_all(&frame)
+        .and_then(|()| writer.flush())
+        .map_err(|source| BoundedWriteError::Io {
+            source,
+            // A failed `write_all` genuinely may have written part of the frame, and there is no
+            // way to find out how much - reported as a desync, the conservative answer, since
+            // treating a possibly-half-written frame as recoverable is the unsafe direction.
+            bytes_written: 1,
+        })
 }
 
 /// Reads one real, framed JSON-RPC message from `reader`. Returns `Ok(None)` on a clean EOF
@@ -122,6 +320,15 @@ mod tests {
     use super::*;
     use std::io::BufReader;
     use std::io::Cursor;
+
+    /// Appends one real, production-framed message to `buffer`. Deliberately goes through
+    /// [`frame`] - the exact encoder both real [`write_message_bounded`] paths use - so these
+    /// round-trip tests pin the framing production actually emits, not a second copy of it
+    /// written for the tests' convenience.
+    fn write_message(buffer: &mut Vec<u8>, value: &serde_json::Value) -> io::Result<()> {
+        buffer.extend_from_slice(&frame(value)?);
+        Ok(())
+    }
 
     #[test]
     fn round_trips_a_real_message_through_encode_then_decode() {
@@ -285,5 +492,95 @@ mod tests {
             .expect("read_message should succeed")
             .expect("message present");
         assert_eq!(decoded, value);
+    }
+
+    /// Real, fast, process-backed coverage for [`write_message_bounded`]'s own deadline, against
+    /// a genuine OS pipe nobody is draining - no language server involved, so this pins the write
+    /// bound itself in under a second rather than paying `client.rs`'s real 30-second production
+    /// budget.
+    ///
+    /// `sleep` is spawned purely for its stdin: it holds the read end of a real pipe open and
+    /// never reads a byte of it, which is exactly the frozen-server condition the bound exists
+    /// for (see [`write_message_bounded`]'s own docs for the live reproduction).
+    #[cfg(unix)]
+    mod bounded_write_tests {
+        use super::*;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        struct UndrainedPipe {
+            child: std::process::Child,
+            stdin: std::process::ChildStdin,
+        }
+
+        impl UndrainedPipe {
+            fn new() -> Self {
+                let mut child = Command::new("sleep")
+                    .arg("60")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("spawning a real `sleep` for its stdin pipe");
+                let stdin = child.stdin.take().expect("piped stdin");
+                // The same real `O_NONBLOCK` production sets at spawn - `write_message_bounded`
+                // owns its own waiting and requires it (see that function's own docs).
+                use std::os::fd::AsRawFd;
+                let fd = stdin.as_raw_fd();
+                let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL).expect("F_GETFL");
+                let flags =
+                    nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK;
+                nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(flags)).expect("F_SETFL");
+                Self { child, stdin }
+            }
+        }
+
+        impl Drop for UndrainedPipe {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+
+        /// A message that fits in the kernel pipe buffer still goes through untouched - the
+        /// common case must not have been turned into a timeout by the bound.
+        #[test]
+        fn a_small_message_still_writes_straight_through() {
+            let mut pipe = UndrainedPipe::new();
+            let value = serde_json::json!({"jsonrpc": "2.0", "method": "initialized"});
+            write_message_bounded(&mut pipe.stdin, &value, Duration::from_secs(5))
+                .expect("a message that fits in the pipe buffer must not time out");
+        }
+
+        /// The real regression: a frame far larger than the pipe buffer, to a peer that never
+        /// reads, gives up on the caller's own deadline instead of blocking forever - and reports
+        /// the partial write, which is what tells the caller the peer's framer is now desynced.
+        #[test]
+        fn an_oversized_message_to_a_peer_that_never_reads_times_out_and_reports_the_desync() {
+            let mut pipe = UndrainedPipe::new();
+            let value = serde_json::json!({ "payload": "x".repeat(1024 * 1024) });
+
+            let started = Instant::now();
+            let error = write_message_bounded(&mut pipe.stdin, &value, Duration::from_millis(250))
+                .expect_err("a 1 MiB frame cannot fit in a pipe nobody is draining");
+            let elapsed = started.elapsed();
+
+            assert!(
+                matches!(error, BoundedWriteError::Timeout { .. }),
+                "the peer is alive and the fd is fine - this is a real timeout, not an I/O \
+                 error: {error:?}"
+            );
+            assert!(
+                error.stream_desynced(),
+                "part of the frame genuinely reached the pipe, so the peer's framer is mid-body \
+                 and can never recover - the caller has to be told that, not just that one write \
+                 failed"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "the write must give up on the 250ms deadline it was given, not block - took \
+                 {elapsed:?}"
+            );
+        }
     }
 }

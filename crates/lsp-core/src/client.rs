@@ -30,9 +30,17 @@
 //! callers can be the GPUI foreground thread (a key-handler), where blocking on a full pty
 //! write buffer would freeze the UI. Every write this crate performs ([`LspClient::request`],
 //! [`LspClient::notify`]) is only ever called from inside `cx.background_executor().spawn(..)`
-//! by this workspace's convention, so blocking the *calling* background thread for the
-//! duration of a `write_all` to a child's stdin pipe (a small, fast syscall in the common
-//! case) is an acceptable, simpler alternative to a second thread and channel here.
+//! by this workspace's convention, so occupying the *calling* background thread for the
+//! duration of one write is an acceptable, simpler alternative to a second thread and channel
+//! here.
+//!
+//! What made that acceptable is no longer "the write is a small, fast syscall in the common
+//! case" - that was true in the common case and catastrophic outside it. The child's stdin is
+//! non-blocking (set in [`LspClient::spawn`]) and every write goes through
+//! [`transport::write_message_bounded`], which owns its own bounded waiting: a server that stops
+//! reading its stdin now costs one background thread a bounded [`WRITE_TIMEOUT`] and ends the
+//! connection honestly, instead of parking that thread forever while holding the writer mutex
+//! every other caller queues on.
 //!
 //! ## Why no self-pipe for reader-thread shutdown, unlike `pty-core`
 //!
@@ -154,6 +162,23 @@ const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(800);
 /// re-checks real current state via [`LspClient::diagnostics_for`], so a dropped/coalesced wake
 /// never loses a real diagnostic, only a redundant "something changed" nudge).
 const WAKE_CHANNEL_CAPACITY: usize = 64;
+
+/// How long any one outbound message may spend waiting for a language server to accept it into
+/// its own stdin pipe before that write is treated as a real failure - see
+/// [`transport::write_message_bounded`]'s own docs for the live-reproduced unbounded hang this
+/// bound closes, and for why unix and Windows differ here.
+///
+/// Deliberately generous, and it bounds *stalled* time rather than total time: it is a
+/// no-progress budget (see [`transport::write_message_bounded`], which refreshes it on every byte
+/// the peer accepts), so a large frame against a server that is draining slowly costs nothing
+/// here no matter how long the whole write takes. It is only ever consumed while the kernel pipe
+/// buffer is completely full and the server has not read a single further byte of its stdin. A
+/// healthy server drains even a whole-file `didOpen` in milliseconds; one that has not touched
+/// its stdin for a full 30 seconds is not slow, it is not running. Matched to
+/// [`INITIALIZE_TIMEOUT`], the crate's other "something is deeply wrong" bound, rather than to
+/// the app's much tighter per-query timeouts, so an ordinary busy-server stall can never be
+/// misreported as a dead connection.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Hard bound on how many un-drained entries [`LspClient::drain_custom_notifications`]' own queue
 /// holds - see [`LspClient::custom_notifications`]'s docs. A server that sends an unrecognized
 /// notification faster than its caller drains one (or a caller that never drains at all, which is
@@ -478,6 +503,32 @@ impl LspClient {
             .take()
             .ok_or(LspError::MissingStdio { server: name })?;
 
+        // Every outbound byte this client ever writes goes through
+        // `transport::write_message_bounded`, which owns its own waiting via a real,
+        // deadline-bounded `poll` and therefore requires a genuinely non-blocking fd - see that
+        // function's own docs for the live-reproduced unbounded hang this is half of the fix for,
+        // and for why POSIX makes "poll, then write the rest" insufficient on a blocking fd. A
+        // failure here is fatal to the whole point (the client would silently fall back to
+        // unbounded blocking writes), so it is a real spawn error, not a warning.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = stdin.as_raw_fd();
+            let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL).map_err(|errno| {
+                LspError::Io {
+                    server: name,
+                    source: std::io::Error::from(errno),
+                }
+            })?;
+            let flags =
+                nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK;
+            nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(flags)).map_err(|errno| {
+                LspError::Io {
+                    server: name,
+                    source: std::io::Error::from(errno),
+                }
+            })?;
+        }
         let stdin = Arc::new(Mutex::new(stdin));
         let pending: Arc<Mutex<HashMap<i64, SyncSender<PendingResponse>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -511,8 +562,8 @@ impl LspClient {
                         wake_tx,
                         stdin: stdin_for_replies,
                         workspace_configuration,
+                        connection_alive,
                     },
-                    connection_alive,
                 )
             }
         });
@@ -995,15 +1046,9 @@ impl LspClient {
             "method": method,
             "params": params,
         });
-        {
-            let mut stdin = lock(&self.stdin);
-            if let Err(source) = transport::write_message(&mut *stdin, &message) {
-                lock(&self.pending).remove(&id);
-                return Err(LspError::Io {
-                    server: self.name,
-                    source,
-                });
-            }
+        if let Err(err) = self.write_framed(&message, method) {
+            lock(&self.pending).remove(&id);
+            return Err(err);
         }
 
         match rx.recv_timeout(timeout) {
@@ -1037,10 +1082,99 @@ impl LspClient {
             "method": method,
             "params": params,
         });
+        self.write_framed(&message, method)
+    }
+
+    /// The single real outbound path for every message this client sends - requests and
+    /// notifications alike - so the time bound and the "did that failure corrupt the stream"
+    /// rule below exist in exactly one place rather than per call site.
+    ///
+    /// A write that cannot complete within [`WRITE_TIMEOUT`] flips
+    /// [`Self::connection_alive`] to `false`, for both of the real reasons it can happen, which
+    /// are worth telling apart in the log but not in the outcome:
+    ///
+    /// * **A partial frame reached the server** ([`transport::BoundedWriteError::stream_desynced`]).
+    ///   Its framer is now mid-body waiting on bytes that will never arrive and will mis-frame
+    ///   everything after them. Unrecoverable by construction.
+    /// * **Not one byte was accepted in the whole budget.** Here the stream is provably still
+    ///   intact ([`transport::BoundedWriteError::stream_desynced`] is `false`), so killing the
+    ///   connection is a deliberate policy call rather than a correctness requirement, and worth
+    ///   naming as one: `connection_alive` is never set back to `true`, so this permanently ends
+    ///   a connection that a slower judgement might have let recover. It is the right call
+    ///   anyway. [`WRITE_TIMEOUT`] is a *no-progress* budget, so reaching it means a full pipe
+    ///   and zero bytes accepted for 30 consecutive seconds - not a busy server, a stopped one.
+    ///   And reporting that as merely "this one call failed" is exactly what produced the real,
+    ///   live-reproduced symptom this fixes: the client kept answering
+    ///   `is_connection_alive() == true` while every request piled up behind the stuck write's
+    ///   mutex, so the app had nothing honest to show and no reason to offer a restart. The
+    ///   counterweight to being wrong is real and cheap: the `app` crate surfaces this as a named
+    ///   `Failed` status with a one-click restart, rather than leaving it as a dead end.
+    ///
+    /// An ordinary I/O error that wrote nothing (the common `EPIPE` after a real crash) is left
+    /// alone: the reader thread's own EOF is already the real, direct signal there, and it
+    /// arrives first.
+    fn write_framed(
+        &self,
+        message: &serde_json::Value,
+        method: &'static str,
+    ) -> Result<(), LspError> {
+        // Once this connection is known dead, every further write fails immediately rather than
+        // spending its own full [`WRITE_TIMEOUT`] rediscovering the same fact. Live-measured, and
+        // the reason this early-out exists rather than being left to the loop below: against a
+        // real hung server, the *first* write correctly gave up after 30s - and then a
+        // `textDocument/hover` request carrying an explicit 3-second timeout still sat there
+        // 12 seconds later, because it had to fill and time out the same wedged pipe all over
+        // again. Fanned across hover, completions and each diagnostics-pull retry, that is the
+        // difference between an app that reports a dead server promptly and one that appears to
+        // hang for minutes.
+        if !self.is_connection_alive() {
+            return Err(LspError::ConnectionClosed { server: self.name });
+        }
         let mut stdin = lock(&self.stdin);
-        transport::write_message(&mut *stdin, &message).map_err(|source| LspError::Io {
-            server: self.name,
-            source,
+        // Re-checked **after** acquiring the lock, and this is load-bearing rather than
+        // defensive. Every concurrent caller (hover, completions, and each diagnostics-pull
+        // retry all run at once - see the `app` crate's `schedule_lsp_sync`) has already passed
+        // the check above and is queued right here while one writer is mid-frame. If that writer
+        // gives up part-way through, the peer's framer is left mid-body, and a queued writer that
+        // proceeded would have its own perfectly-formed frame swallowed as the *previous*
+        // message's body - silent, confident wire corruption, the exact class this whole fix
+        // exists to remove. The wedged writer publishes the death before releasing the guard
+        // (below), so by the time anyone else holds it, this check is guaranteed to see it.
+        if !self.is_connection_alive() {
+            return Err(LspError::ConnectionClosed { server: self.name });
+        }
+        let Err(err) = transport::write_message_bounded(&mut *stdin, message, WRITE_TIMEOUT) else {
+            return Ok(());
+        };
+
+        let desynced = err.stream_desynced();
+        let timed_out = matches!(err, transport::BoundedWriteError::Timeout { .. });
+        if timed_out || desynced {
+            // Published while the `stdin` guard is still held, deliberately: dropping the guard
+            // first would let a writer already queued on it wake up and write into the stream
+            // this call just desynced, before it had been told the connection was over.
+            self.connection_alive.store(false, Ordering::SeqCst);
+            log::warn!(
+                "marking {}'s connection dead: a `{method}` write {} within {WRITE_TIMEOUT:?}",
+                self.name,
+                if desynced {
+                    "was cut off part-way through, desyncing the server's own framer"
+                } else {
+                    "was not accepted at all - the server has stopped reading its stdin"
+                }
+            );
+        }
+        drop(stdin);
+        Err(if timed_out {
+            LspError::Timeout {
+                server: self.name,
+                method,
+            }
+        } else {
+            LspError::Io {
+                server: self.name,
+                source: err.into_io_error(),
+            }
         })
     }
 
@@ -1290,13 +1424,13 @@ struct IncomingSinks {
     wake_tx: SyncSender<()>,
     stdin: Arc<Mutex<ChildStdin>>,
     workspace_configuration: WorkspaceConfigFn,
+    /// The same flag [`run_reader_loop`] clears on EOF - shared in here too so the detached
+    /// server-request-reply writer in [`handle_incoming`] can report a write it could not finish,
+    /// which is just as fatal to the connection as EOF is (see that write's own comment).
+    connection_alive: Arc<AtomicBool>,
 }
 
-fn run_reader_loop(
-    stdout: std::process::ChildStdout,
-    sinks: IncomingSinks,
-    connection_alive: Arc<AtomicBool>,
-) {
+fn run_reader_loop(stdout: std::process::ChildStdout, sinks: IncomingSinks) {
     let mut reader = BufReader::new(stdout);
     loop {
         match transport::read_message(&mut reader) {
@@ -1317,7 +1451,7 @@ fn run_reader_loop(
     // `recv_timeout` gets a real, immediate `Disconnected` rather than waiting out its own
     // timeout for a response that will now never arrive.
     lock(&sinks.pending).clear();
-    connection_alive.store(false, Ordering::SeqCst);
+    sinks.connection_alive.store(false, Ordering::SeqCst);
 }
 
 fn handle_incoming(value: serde_json::Value, sinks: &IncomingSinks) {
@@ -1342,20 +1476,50 @@ fn handle_incoming(value: serde_json::Value, sinks: &IncomingSinks) {
             );
 
             // Written from a short-lived, detached thread rather than inline from this reader
-            // thread: `transport::write_message` is a blocking `write_all` to the child's
-            // stdin pipe, and if that pipe's OS write buffer is full at this moment (e.g.
-            // another thread is mid-write of a large un-chunked `textDocument/didOpen`),
-            // writing here would block this reader thread from draining the child's stdout -
-            // if the child is itself blocked writing to its own undrained stdout waiting for
-            // more stdin, neither side can make progress. Server-initiated requests needing a
-            // reply are rare (a handful per session, not a hot path), so the per-call
-            // thread-spawn cost is negligible; the spawned thread reuses the same
-            // lock-then-`write_message` path every other outbound message goes through
-            // (`LspClient::send_request_raw`/`send_notification_raw`).
+            // thread: the write is to the child's own stdin pipe, and if that pipe's OS write
+            // buffer is full at this moment (e.g. another thread is mid-write of a large
+            // `textDocument/didOpen`), writing here would stop this reader thread from draining
+            // the child's stdout - if the child is itself blocked writing to its own undrained
+            // stdout waiting for more stdin, neither side can make progress. Server-initiated
+            // requests needing a reply are rare (a handful per session, not a hot path), so the
+            // per-call thread-spawn cost is negligible.
             let stdin = Arc::clone(&sinks.stdin);
+            // This thread must follow **both** halves of `LspClient::write_framed`'s rule, not
+            // just the bounded-write half, and for a sharper reason than consistency: it takes
+            // the very mutex the whole client serializes on, and `write_framed`'s own early-out
+            // sits *before* that mutex. So a reply thread that sat here for a full
+            // `WRITE_TIMEOUT` against a wedged server would park every caller on the mutex behind
+            // it - reproducing, from a different direction, the exact "a request with a 3-second
+            // timeout takes 30" symptom this fix exists to remove. Hence: skip entirely if the
+            // connection is already known dead, re-check once the guard is held (same
+            // wire-corruption reason as `write_framed`'s own post-lock re-check), and publish a
+            // death before releasing the guard.
+            let connection_alive = Arc::clone(&sinks.connection_alive);
+            let method = method.to_string();
             std::thread::spawn(move || {
+                if !connection_alive.load(Ordering::SeqCst) {
+                    return;
+                }
                 let mut guard = lock(&stdin);
-                let _ = transport::write_message(&mut *guard, &reply);
+                if !connection_alive.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Err(err) = transport::write_message_bounded(&mut *guard, &reply, WRITE_TIMEOUT)
+                else {
+                    return;
+                };
+                let desynced = err.stream_desynced();
+                // Matches `write_framed`'s own condition exactly rather than killing the
+                // connection for any error at all: a plain `EPIPE` that wrote nothing means the
+                // process is already gone, and the reader thread's own EOF is the real, direct
+                // signal for that - it arrives first and says it better.
+                if desynced || matches!(err, transport::BoundedWriteError::Timeout { .. }) {
+                    connection_alive.store(false, Ordering::SeqCst);
+                    log::warn!(
+                        "marking a connection dead: replying to a server-initiated `{method}` \
+                         failed ({err:?}); desynced={desynced}"
+                    );
+                }
             });
             return;
         }
@@ -1761,6 +1925,7 @@ mod tests {
                     wake_tx,
                     stdin: Arc::new(Mutex::new(stdin)),
                     workspace_configuration: default_workspace_configuration,
+                    connection_alive: Arc::new(AtomicBool::new(true)),
                 },
                 wake_rx,
             }
@@ -2431,6 +2596,205 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// The other real way a language server stops working - and, unlike a crash, the one nothing
+    /// used to detect at all: the process stays **alive** but stops reading its own stdin.
+    ///
+    /// Live-reproduced before this fix, against a real child that had completed a real handshake:
+    /// a single 256 KiB `textDocument/didChange` never returned (the pipe's ~64 KiB kernel buffer
+    /// filled and `write_all` parked with no time bound), it parked *holding* the `stdin` mutex so
+    /// a subsequent `textDocument/hover` carrying an explicit 3-second timeout was still unfinished
+    /// 8 seconds later, and [`LspClient::is_connection_alive`] reported `true` throughout - the
+    /// reader thread never sees EOF for a process that hasn't exited. The whole connection silently
+    /// stopped working with nothing anywhere able to say why.
+    ///
+    /// `SIGSTOP` against a **real, installed rust-analyzer** is used rather than a scripted stand-in
+    /// precisely because this is the failure mode a stand-in would be easiest to fake: a stopped
+    /// process is genuinely still alive, genuinely still holds its end of the pipe open, and
+    /// genuinely never drains it - exactly what a deadlocked or thrashing real server does.
+    #[test]
+    fn a_real_but_frozen_server_fails_the_write_within_the_budget_instead_of_hanging_forever() {
+        let project = write_scratch_project("fn main() {\n    let x: i32 = 1;\n}\n");
+        let main_rs = project.path().join("src").join("main.rs");
+        let client = LspClient::spawn(project.path(), rust_analyzer_config())
+            .expect("a real rust-analyzer should spawn and handshake");
+        let pid = client.pid;
+        assert!(
+            client.is_connection_alive(),
+            "sanity check: a freshly handshaked client is alive"
+        );
+
+        // Freeze the real process. It keeps its end of the pipe open and never reads another byte.
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGSTOP,
+        )
+        .expect("a real SIGSTOP against the real rust-analyzer pid");
+
+        // Comfortably more than a pipe's ~64 KiB kernel buffer, so the write genuinely cannot
+        // complete into it - the same shape as a real whole-file sync for a large source file.
+        let oversized = "x".repeat(256 * 1024);
+        let started = Instant::now();
+        let result = client.did_change_full(&main_rs, oversized.clone(), 2);
+        let elapsed = started.elapsed();
+
+        // Cleaned up before any assertion can unwind past it: a still-`SIGSTOP`ped process would
+        // otherwise ignore the `SIGTERM` half of teardown and linger until the `SIGKILL`.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGCONT,
+        );
+
+        assert!(
+            matches!(result, Err(LspError::Timeout { .. })),
+            "a write a frozen server never accepts must surface as a real timeout, got: {result:?}"
+        );
+        assert!(
+            elapsed < WRITE_TIMEOUT * 2,
+            "the write must give up on its own budget rather than blocking indefinitely - took \
+             {elapsed:?} against a {WRITE_TIMEOUT:?} budget"
+        );
+        assert!(
+            !client.is_connection_alive(),
+            "a write that could not be completed leaves the server's own framer mid-message; the \
+             connection must be reported dead rather than left looking healthy - this reporting \
+             `true` is exactly what made the original bug invisible"
+        );
+    }
+
+    /// The follow-up half of the same fix, and its own real, measured bug: once a connection is
+    /// known dead, further writes must fail *immediately* rather than each re-paying the full
+    /// [`WRITE_TIMEOUT`] rediscovering it.
+    ///
+    /// Measured live while building this: with the bounded write in place but no early-out, the
+    /// first write correctly gave up after its 30s budget, and a `textDocument/hover` carrying an
+    /// explicit 3-second timeout was *still* unfinished 12 seconds later - it had to fill and time
+    /// out the same wedged pipe all over again. Fanned across hover, completions and every
+    /// diagnostics-pull retry, that is the difference between reporting a dead server promptly and
+    /// appearing to hang for minutes.
+    #[test]
+    fn a_connection_already_known_dead_fails_further_writes_immediately() {
+        let project = write_scratch_project("fn main() {}\n");
+        let main_rs = project.path().join("src").join("main.rs");
+        let client = LspClient::spawn(project.path(), rust_analyzer_config())
+            .expect("a real rust-analyzer should spawn and handshake");
+        let pid = client.pid;
+
+        // A real, unprompted death - the reader thread observes EOF and flips the flag.
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .expect("a real SIGKILL against the real rust-analyzer pid");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while client.is_connection_alive() {
+            assert!(
+                Instant::now() < deadline,
+                "the real process death should have been observed within 10s"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let started = Instant::now();
+        let result = client.request::<lsp_types::request::HoverRequest>(
+            lsp_types::HoverParams {
+                text_document_position_params: lsp_types::TextDocumentPositionParams {
+                    text_document: lsp_types::TextDocumentIdentifier {
+                        uri: path_to_uri(&main_rs).expect("a real uri"),
+                    },
+                    position: lsp_types::Position {
+                        line: 0,
+                        character: 3,
+                    },
+                },
+                work_done_progress_params: Default::default(),
+            },
+            Duration::from_secs(30),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(result, Err(LspError::ConnectionClosed { .. })),
+            "a request on a known-dead connection must say so directly, got: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "it must not re-pay any real timeout budget to rediscover a death already recorded - \
+             took {elapsed:?}"
+        );
+    }
+
+    /// A real, concurrent-writer regression, and one an adversarial review of this very fix
+    /// caught *in* the fix: the bounded write closed the unbounded hang but left a window in
+    /// which the corruption it exists to prevent could still happen.
+    ///
+    /// The shape: writers queue on the `stdin` mutex, so every concurrent hover/completion/pull
+    /// (all genuinely in flight at once - see the `app` crate's `schedule_lsp_sync`) has already
+    /// passed the "is this connection alive" check and is parked on the lock while one writer is
+    /// mid-frame. If that writer gives up part-way through and releases the guard *before*
+    /// publishing the death, the next writer emits a perfectly-formed frame into a peer whose
+    /// framer is mid-body - and those bytes get eaten as the previous message's payload. Silent,
+    /// confident wire corruption.
+    ///
+    /// Driven against a real, `SIGSTOP`ped rust-analyzer, with a real second thread genuinely
+    /// contending for the real mutex.
+    #[test]
+    fn a_writer_queued_behind_one_that_gives_up_is_refused_rather_than_corrupting_the_stream() {
+        let project = write_scratch_project("fn main() {}\n");
+        let main_rs = project.path().join("src").join("main.rs");
+        let client = Arc::new(
+            LspClient::spawn(project.path(), rust_analyzer_config())
+                .expect("a real rust-analyzer should spawn and handshake"),
+        );
+        let pid = client.pid;
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGSTOP,
+        )
+        .expect("a real SIGSTOP against the real rust-analyzer pid");
+
+        // Writer A: wedges on the frozen server for the full budget, holding the real mutex.
+        let wedged = {
+            let client = Arc::clone(&client);
+            let main_rs = main_rs.clone();
+            std::thread::spawn(move || client.did_change_full(&main_rs, "x".repeat(256 * 1024), 2))
+        };
+
+        // Writer B: a real second caller, started while A is definitely still inside its write,
+        // so it genuinely queues on the mutex rather than racing the liveness check.
+        std::thread::sleep(Duration::from_secs(2));
+        let queued = {
+            let client = Arc::clone(&client);
+            let main_rs = main_rs.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let result = client.did_change_full(&main_rs, "fn main() {}".to_string(), 3);
+                (result, started.elapsed())
+            })
+        };
+
+        let wedged_result = wedged.join().expect("writer A should not panic");
+        let (queued_result, queued_elapsed) = queued.join().expect("writer B should not panic");
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGCONT,
+        );
+
+        assert!(
+            matches!(wedged_result, Err(LspError::Timeout { .. })),
+            "sanity check: writer A should have given up on its own budget, got {wedged_result:?}"
+        );
+        assert!(
+            matches!(queued_result, Err(LspError::ConnectionClosed { .. })),
+            "the queued writer must be refused outright once the writer ahead of it desynced the \
+             stream - anything else means it wrote a frame the peer will swallow as the previous \
+             message's body: {queued_result:?}"
+        );
+        assert!(
+            queued_elapsed < WRITE_TIMEOUT * 2,
+            "the queued writer must be refused as soon as the lock is released, not left to time \
+             out on its own account - took {queued_elapsed:?}"
+        );
     }
 
     /// The real `ServerSpawnConfig` for typescript-language-server this test module spawns
