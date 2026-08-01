@@ -138,7 +138,7 @@ pub enum PaletteCommand {
 }
 
 impl PaletteCommand {
-    pub const ALL: [PaletteCommand; 10] = [
+    pub const ALL: [PaletteCommand; 11] = [
         PaletteCommand::NewShell,
         PaletteCommand::NewClaudeAgent,
         PaletteCommand::NewCodexAgent,
