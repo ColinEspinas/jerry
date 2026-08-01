@@ -2000,7 +2000,7 @@ mod palette_result_focus_tests {
 
     /// The other direction of the same rule, and the reason it is *observed* rather than
     /// declared: an entry that opens nothing must leave focus exactly where it was.
-    /// `ToggleRailGrouping` is the smallest real such entry - it flips one rail field and
+    /// `WindowControlsSystem` is the smallest real such entry - it flips one setting and
     /// touches no focus handle at all.
     #[gpui::test]
     fn a_palette_entry_that_opens_nothing_still_restores_the_previous_focus(
@@ -2017,7 +2017,7 @@ mod palette_result_focus_tests {
             let groups = app.build_palette_groups(cx);
             let index = palette::flatten(&groups).iter().position(|entry| {
                 entry.target
-                    == palette::EntryTarget::Command(palette::PaletteCommand::ToggleRailGrouping)
+                    == palette::EntryTarget::Command(palette::PaletteCommand::WindowControlsSystem)
             });
             match index {
                 Some(index) => {
@@ -2029,7 +2029,7 @@ mod palette_result_focus_tests {
         });
         assert!(
             ran,
-            "the palette must offer the real rail-grouping command to run"
+            "the palette must offer the real window-controls-style command to run"
         );
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();

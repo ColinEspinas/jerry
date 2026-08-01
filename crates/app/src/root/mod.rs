@@ -68,7 +68,7 @@ use crate::lsp::diagnostics as diagnostics_view;
 use crate::merge::state as merge;
 use crate::palette::state as palette;
 use crate::rail::repo::{self as repo, Repo, RepoId};
-use crate::rail::state::{self as rail, RailMode};
+use crate::rail::state as rail;
 use crate::rail::worktrees::{self, WorktreeItem};
 use crate::settings::custom_theme;
 use crate::settings::state as settings;
@@ -741,14 +741,19 @@ pub struct AdeApp {
     /// platform_title_bar.rs`'s same pattern) is needed instead of starting the move on
     /// mouse-down directly.
     pub(crate) title_bar_move_armed: bool,
-    /// The session rail's grouping mode (`by urgency` / `by project`). See
-    /// [`crate::rail::state::RailMode`].
-    pub(crate) rail_mode: RailMode,
-    /// The rail's filter query - filters the rendered session/worktree rows in both grouping
-    /// modes (see `crate::rail::state::filter_sessions`/`filter_worktree_rows`). Carries a real
-    /// per-widget undo history (GitHub issue #17 - see [`text_history::TextField`]); unlike the
-    /// palette's, this widget lives for the whole session, so its history does too.
+    /// The rail's filter query - filters the rendered worktree/agent rows (see
+    /// `crate::rail::state::filter_worktree_rows`). Carries a real per-widget undo history
+    /// (GitHub issue #17 - see [`text_history::TextField`]); unlike the palette's, this widget
+    /// lives for the whole session, so its history does too.
     pub(crate) filter_query: text_history::TextField,
+    /// Explicit per-worktree expand/collapse overrides for the rail's worktree rows
+    /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.2: "caret state is
+    /// remembered per worktree"), keyed by worktree path. Absence means "use the default" -
+    /// [`crate::rail::render::AdeApp::worktree_is_expanded`] is the one place that default is
+    /// decided (collapsed for a worktree whose most urgent agent is idle, expanded otherwise) -
+    /// so a worktree the user has never touched the caret on tracks that live default rather
+    /// than freezing whatever it happened to be the first time it rendered.
+    pub(crate) rail_collapse_overrides: HashMap<PathBuf, bool>,
     pub(crate) filter_focus_handle: FocusHandle,
     /// The rail's *root container*'s focus handle - the app's real "nowhere else to put focus"
     /// fallback target (`Self::select_worktree`, `Self::close_session`, `Self::cancel_new_file`),

@@ -71,6 +71,23 @@ impl Authorship {
             .filter(|path| self.has_multiple_authors(path))
             .count()
     }
+
+    /// How many of `paths` `session` is a recorded author of - the rail agent row's
+    /// `review ready` trailing text (`design_handoff_jerry_ade/revision 3/
+    /// REVISION-2026-07-31.md` §2.3: "`12 files` ... here the count **is** the ask - the size of
+    /// the review handed to you"). Deliberately per-agent, unlike [`Self::shared_file_count`]
+    /// (which is worktree-wide) - the whole point of this number is "how much of *this* review
+    /// is mine".
+    pub fn file_count_for<'a>(
+        &self,
+        session: SessionId,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> usize {
+        paths
+            .into_iter()
+            .filter(|path| self.authors_for(path).contains(&session))
+            .count()
+    }
 }
 
 /// Added/removed line counts for one file, counted directly from its hunks.
@@ -714,5 +731,36 @@ mod tests {
         let mut authorship = Authorship::new();
         authorship.record(PathBuf::from("src/main.rs"), 1);
         assert!(authorship.authors_for(Path::new("src/other.rs")).is_empty());
+    }
+
+    #[test]
+    fn file_count_for_only_counts_paths_this_session_authored() {
+        let mut authorship = Authorship::new();
+        authorship.record(PathBuf::from("src/main.rs"), 1);
+        authorship.record(PathBuf::from("src/main.rs"), 9);
+        authorship.record(PathBuf::from("src/lib.rs"), 1);
+        authorship.record(PathBuf::from("src/other.rs"), 9);
+
+        let paths = [
+            PathBuf::from("src/main.rs"),
+            PathBuf::from("src/lib.rs"),
+            PathBuf::from("src/other.rs"),
+            PathBuf::from("src/untouched.rs"),
+        ];
+        assert_eq!(
+            authorship.file_count_for(1, paths.iter().map(PathBuf::as_path)),
+            2,
+            "session 1 wrote main.rs and lib.rs, not other.rs or untouched.rs"
+        );
+        assert_eq!(
+            authorship.file_count_for(9, paths.iter().map(PathBuf::as_path)),
+            2,
+            "session 9 wrote main.rs and other.rs, not lib.rs or untouched.rs"
+        );
+        assert_eq!(
+            authorship.file_count_for(42, paths.iter().map(PathBuf::as_path)),
+            0,
+            "a session with no recorded authorship anywhere gets a real 0, not a stray match"
+        );
     }
 }
