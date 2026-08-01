@@ -1481,7 +1481,10 @@ impl AdeApp {
                     // `crate::rail::render::AdeApp::render_rail_filter_row`'s own fixed
                     // before-placeholder / after-text placement.
                     .when(!has_query, |el| {
-                        el.child(self.render_simple_input_caret("graph-branches-filter-caret"))
+                        el.child(self.render_simple_input_caret(
+                            "graph-branches-filter-caret",
+                            &self.graph_state.branches_filter_focus_handle,
+                        ))
                     })
                     .child(
                         div()
@@ -1500,7 +1503,10 @@ impl AdeApp {
                             .debug_selector(|| "graph-branches-filter-text".to_string()),
                     )
                     .when(has_query, |el| {
-                        el.child(self.render_simple_input_caret("graph-branches-filter-caret"))
+                        el.child(self.render_simple_input_caret(
+                            "graph-branches-filter-caret",
+                            &self.graph_state.branches_filter_focus_handle,
+                        ))
                     }),
             )
             .child(

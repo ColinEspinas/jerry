@@ -676,7 +676,10 @@ impl AdeApp {
                     // placement) and after the real typed text once there is any, never
                     // appended past whatever placeholder string happens to render.
                     .when(!has_query, |el| {
-                        el.child(self.render_simple_input_caret("rail-filter-caret"))
+                        el.child(self.render_simple_input_caret(
+                            "rail-filter-caret",
+                            &self.filter_focus_handle,
+                        ))
                     })
                     .child(
                         div()
@@ -695,7 +698,10 @@ impl AdeApp {
                             .debug_selector(|| "rail-filter-text".to_string()),
                     )
                     .when(has_query, |el| {
-                        el.child(self.render_simple_input_caret("rail-filter-caret"))
+                        el.child(self.render_simple_input_caret(
+                            "rail-filter-caret",
+                            &self.filter_focus_handle,
+                        ))
                     }),
             )
     }
