@@ -256,7 +256,15 @@ pub fn commit_paths(
     let add_output = run_git(worktree_path, &add_args)?;
     check_success(&add_args, &add_output)?;
 
-    let commit_args: Vec<OsString> = vec!["commit".into(), "-m".into(), message.into()];
+    // Pathspec-limited (`-- <paths>`), never a bare `git commit`: a bare `git commit` commits
+    // the *entire* index, not just what this call just `add`ed - anything else already staged
+    // (an agent CLI running its own `git add` in this same worktree, the same interleaving
+    // hazard `commit_all_changes`'s own doc above calls out) would silently ride along into a
+    // commit this function's own doc promises is limited to `paths`. Real regression:
+    // `commit_paths_never_commits_a_path_that_was_staged_by_something_else`.
+    let mut commit_args: Vec<OsString> =
+        vec!["commit".into(), "-m".into(), message.into(), "--".into()];
+    commit_args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
     let commit_output = run_git(worktree_path, &commit_args)?;
     check_success(&commit_args, &commit_output)?;
 
@@ -847,13 +855,55 @@ mod tests {
         let status = git_output(repo.path(), &["status", "--porcelain", "file.txt"]);
         assert_eq!(status, "", "file.txt must be committed, not left staged");
         // ...but the other real change is genuinely untouched - still there, still uncommitted.
-        let untouched_status =
-            git_output(repo.path(), &["status", "--porcelain", "untouched.txt"]);
+        let untouched_status = git_output(repo.path(), &["status", "--porcelain", "untouched.txt"]);
         assert!(
             untouched_status.contains("untouched.txt"),
             "a path not passed to commit_paths must be left exactly as it was: {untouched_status:?}"
         );
         assert!(is_dirty(repo.path()).expect("is_dirty"));
+    }
+
+    /// A real regression test for a real bug: a bare `git commit` (no pathspec) commits the
+    /// *entire* index, not just whatever this call's own `git add -- <paths>` just staged. The
+    /// previous `commit_paths_commits_only_the_given_paths_leaving_other_changes_uncommitted`
+    /// test above never actually exercised that failure mode - it only ever `write`s
+    /// `untouched.txt` to disk without `git add`ing it, so it was never in the index for a bare
+    /// `git commit` to sweep up in the first place. This test pre-stages the other file for
+    /// real (mirroring an agent CLI running its own `git add` in this same worktree, the exact
+    /// interleaving hazard `commit_all_changes`'s own doc calls out above), so it genuinely
+    /// fails against a bare `git commit` and genuinely passes only once the commit itself is
+    /// pathspec-limited (`-- <paths>`).
+    #[test]
+    fn commit_paths_never_commits_a_path_that_was_staged_by_something_else() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
+        fs::write(repo.path().join("also-staged.txt"), "staged elsewhere\n")
+            .expect("write also-staged.txt");
+        // Simulates something else in this worktree (an agent CLI, a manual `git add`) already
+        // having staged a different file before the composer's own commit runs.
+        git(repo.path(), &["add", "also-staged.txt"]);
+
+        commit_paths(
+            repo.path(),
+            &[PathBuf::from("file.txt")],
+            "ade: commit only file.txt",
+        )
+        .expect("commit_paths");
+
+        let committed_files =
+            git_output(repo.path(), &["show", "--name-only", "--format=", "HEAD"]);
+        assert_eq!(
+            committed_files, "file.txt",
+            "only the requested path must land in the real commit, even though \
+             also-staged.txt was genuinely staged in the index at commit time"
+        );
+        let status = git_output(repo.path(), &["status", "--porcelain", "also-staged.txt"]);
+        assert_eq!(
+            status, "A  also-staged.txt",
+            "also-staged.txt must remain exactly as staged (still added, still uncommitted) - \
+             commit_paths must never silently commit it just because it happened to share an \
+             index with the real, requested commit"
+        );
     }
 
     #[test]

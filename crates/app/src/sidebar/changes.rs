@@ -540,7 +540,10 @@ mod tests {
 
     #[test]
     fn staged_progress_fraction_handles_zero_total_without_dividing_by_zero() {
-        let progress = StagedProgress { staged: 0, total: 0 };
+        let progress = StagedProgress {
+            staged: 0,
+            total: 0,
+        };
         assert_eq!(progress.fraction(), 0.0);
     }
 
