@@ -62,14 +62,19 @@ pub struct SessionRow {
     /// row's line-1 elapsed time (§2.3: "elapsed 9.5px mono right"). See [`format_elapsed`] for
     /// how this becomes the rendered `4m`/`1h` text.
     pub elapsed: Duration,
-    /// How many files this session is a recorded author of, for a [`Status::Review`] row only -
-    /// §2.3's "review ready" trailing text (`12 files`), sourced from
-    /// `crate::sidebar::changes::Authorship::file_count_for`. `None` for every other status (§2.3:
-    /// "Do not put a per-agent file count here" - review-ready is the one documented exception),
-    /// and also `None` for a review-ready row whose worktree diff isn't the one currently loaded
-    /// in Zone 3 - `crate::root::AdeApp::file_authorship` is scoped to that single loaded diff
-    /// (see its own docs), not tracked per-worktree yet, so a row outside it genuinely has no
-    /// authorship data to report rather than a fabricated count.
+    /// How many files are in the loaded diff, for a [`Status::Review`] row only - §2.3's "review
+    /// ready" trailing text (`12 files`). `None` for every other status (§2.3: "Do not put a
+    /// per-agent file count here" - review-ready is the one documented exception).
+    ///
+    /// Also `None` when either the count would be a guess rather than a fact: a review-ready row
+    /// whose worktree diff isn't the one currently loaded in Zone 3 (`crate::root::AdeApp::
+    /// diff_root` only tracks one diff at a time, so a row outside it has no diff data at all),
+    /// or a worktree with more than one agent sharing it - attributing which of the diff's files
+    /// are "this session's" needs real per-agent authorship tracking, which doesn't exist yet
+    /// (see `crate::sidebar::changes::Authorship`'s own docs), so every agent sharing that
+    /// worktree would otherwise report the same full count, or - if sourced from `Authorship`
+    /// instead - a uniformly fabricated zero. With exactly one agent in the worktree there's no
+    /// such ambiguity: every file in the diff is unambiguously that session's.
     pub review_file_count: Option<usize>,
 }
 

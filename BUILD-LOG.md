@@ -4865,3 +4865,39 @@ diff_render_tests` flake
 (`repeated_refreshes_of_the_same_open_diff_reuse_the_cached_highlighting`), unrelated to this
 change (`diff_view.rs` untouched anywhere in this diff) - confirmed it passes cleanly in
 isolation, and the subsequent full-suite re-run above was clean.
+## Fixing a real "0 files" bug in the rail's review-ready row, found while deciding to shelve per-agent authorship tracking
+
+A separate branch (`revision-r12-authorship-heuristic`, PR #59) built a heuristic engine to
+populate `crate::sidebar::changes::Authorship` - the record this rewrite's own
+`SessionRow::review_file_count` was already sourcing its `§2.3` "review ready" trailing text
+(`12 files`) from, via `Authorship::file_count_for`. That PR was closed unmerged: an mtime-based
+correlation heuristic risks confidently attributing a file to the wrong agent in exactly the
+scenario this app exists to supervise (multiple agents active in the same worktree near the same
+moment), which is worse than showing nothing.
+
+With `Authorship` now permanently empty, `file_count_for` always returns `0` - so every
+review-ready agent row in the currently-loaded-diff worktree would have rendered a real, visible
+`0 files`, not an absent count. This is a materially different failure than
+`worktree_shared_file_count`'s own use of the same always-empty `Authorship` (the `⚠ N` badge),
+which already degrades honestly: its render site only shows the badge when the count is `\u{2265}
+1`, so an always-zero count there just means the badge never appears - correct, if the app
+genuinely has no way to detect a shared-file conflict yet.
+
+Fixed by recognizing the count is only ever ambiguous when more than one agent shares the
+worktree - with exactly one agent there, every file in the loaded diff is unambiguously that
+session's, no authorship tracking required at all. `build_session_rows` now counts agents sharing
+`session.cwd` directly: a lone agent gets the diff's real `files.len()`; two or more get `None`
+(the same "graceful absence over fabrication" this codebase already applies everywhere else -
+`Authorship`'s own docs, `SessionRow::activity`, `question_preview`), so `agent_trailing_text`'s
+`.unwrap_or_default()` renders nothing rather than a lie. No test added directly against
+`build_session_rows`'s `Status::Review` path - reaching it needs a genuinely-exited real pty
+process, which no existing test in this crate does yet (`derive_status` requires
+`ProcessSignal::Exited { success: true }`, itself sourced from a live `TerminalPane`); the fix
+itself is a plain filter-and-count over `self.sessions`/`diff.files`, both already exercised
+elsewhere, so this was judged lower-value than the cost of standing up new pty-exit test
+infrastructure for one narrow change. Flagged here rather than silently skipped.
+
+**Verification**: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings` - all clean.
+`cargo test --workspace --lib --test-threads=1`: **1098 + 44 + 14 + 107 = 1263 passed, 0 failed**
+across all four crates.

@@ -136,21 +136,29 @@ impl AdeApp {
                     None => session.cwd.display().to_string(),
                 };
 
-                // See `SessionRow::review_file_count`'s own docs: `Self::file_authorship` is
-                // scoped to whichever single diff is currently loaded in Zone 3
-                // (`Self::diff_root`), not tracked per-worktree yet - so a review-ready session
-                // outside that one worktree has no real data to report and stays `None` rather
-                // than a fabricated count.
-                let review_file_count = if status_value == Status::Review
-                    && session.cwd == self.diff_root
-                {
-                    self.current_diff().map(|diff| {
-                        self.file_authorship
-                            .file_count_for(session.id, diff.files.iter().map(|f| f.path.as_path()))
-                    })
-                } else {
-                    None
-                };
+                // See `SessionRow::review_file_count`'s own docs: a review-ready session outside
+                // the one worktree currently loaded in Zone 3 (`Self::diff_root`) has no diff data
+                // to report and stays `None` rather than a fabricated count. Within that worktree,
+                // the count is only unambiguous when this session is the sole agent there - with
+                // more than one agent sharing the worktree, attributing which files are "this
+                // session's" needs real per-agent authorship tracking, which doesn't exist yet (see
+                // `crate::sidebar::changes::Authorship`'s own docs), so that case also stays `None`
+                // rather than reporting every agent's row as authoring zero files.
+                let review_file_count =
+                    if status_value == Status::Review && session.cwd == self.diff_root {
+                        let agents_in_worktree = self
+                            .sessions
+                            .iter()
+                            .filter(|s| s.cwd == session.cwd)
+                            .count();
+                        if agents_in_worktree <= 1 {
+                            self.current_diff().map(|diff| diff.files.len())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
 
                 SessionRow {
                     id: session.id,
