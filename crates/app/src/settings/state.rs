@@ -568,13 +568,6 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::EditorIndent" => Some("Editor: indent"),
         "app::EditorDedent" => Some("Editor: dedent"),
         "app::EditorEscape" => Some("Editor: move focus out"),
-        // Deliberately *not* bare "Undo"/"Redo": GitHub issue #17 adds a second, genuinely
-        // distinct undo system on the same physical keys (text undo, below), and two rows both
-        // labelled "Undo" on this page would be exactly the confusion this project's own
-        // "distinguishable rows" rule exists to prevent. The context column already differs, but
-        // a context predicate is not what a user reads first.
-        "app::Undo" => Some("Worktree history: undo"),
-        "app::Redo" => Some("Worktree history: redo"),
         "app::TextUndo" => Some("Text: undo"),
         "app::TextRedo" => Some("Text: redo"),
         "app::CloseFocusedTab" => Some("Close focused tab"),
@@ -1177,8 +1170,6 @@ mod tests {
                 "New session",
                 "Command palette",
                 "Open settings",
-                "Worktree history: undo",
-                "Worktree history: redo",
                 "Text: undo",
                 "Text: redo",
                 "Text: redo",
@@ -1318,18 +1309,12 @@ mod tests {
         // `"file-editor"` set minus `EditorSaveAnyway` (see
         // `keybinding_rows_are_derived_in_real_registration_order`'s own updated expectations
         // for exactly which).
-        // Revision R10 added 2 more real scoped bindings, `Undo`/`Redo`, each `Some("!terminal")`
-        // - a real, live-reproduced-conflict fix in the same class as `]`'s own
-        // `"diff && !file-editor"` narrowing above: `secondary-z` resolves to plain `Ctrl+Z` on
-        // Linux/Windows, which a focused terminal needs unclaimed to send the real `SIGTSTP`
-        // suspend control byte (`crate::terminal::pane::keystroke_to_bytes`) - see
-        // `crate::default_key_bindings`'s own docs for the full reasoning.
         // GitHub issue #17 added 3 more real scoped bindings, `TextUndo` (`secondary-z`) and
-        // `TextRedo` (bound twice - `secondary-shift-z` and `ctrl-y`), each `Some("text-input")`,
-        // and correspondingly narrowed `Undo`/`Redo` from `Some("!terminal")` to
-        // `Some("!terminal && !text-input")` - still scoped either way, so only the count of
-        // scoped rows moves. See `crate::default_key_bindings`'s own docs for why the two undo
-        // systems are kept disjoint structurally rather than by dispatch order.
+        // `TextRedo` (bound twice - `secondary-shift-z` and `ctrl-y`), each `Some("text-input")`:
+        // `secondary-z` resolves to plain `Ctrl+Z` on Linux/Windows, which a focused terminal
+        // needs unclaimed to send the real `SIGTSTP` suspend control byte
+        // (`crate::terminal::pane::keystroke_to_bytes`) - see `crate::default_key_bindings`'s own
+        // docs for the full reasoning.
         // GitHub issue #27 added 8 more real scoped bindings: `EditorWordLeft`/`EditorWordRight`/
         // `EditorSelectWordLeft`/`EditorSelectWordRight`, each bound once under `"file-editor"`
         // and once under `"merge-editor"` - the same word-wise-caret-navigation set both real
@@ -1352,7 +1337,7 @@ mod tests {
         // `"merge-editor"` never gets multi-cursor actions and so never faces the same collision
         // `EditorCollapseCursors` resolves in the File view), `CompletionsInvoke` under plain
         // `"file-editor"` (1), and `CloseFocusedTab` under `Some("!terminal")` (1, the same real
-        // terminal-control-byte conflict class as `Undo`/`Redo` above).
+        // terminal-control-byte conflict class `"ctrl-shift-t"` above already established).
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings, &[]);
         assert!(!rows.is_empty());
@@ -1360,10 +1345,10 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            72,
+            70,
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
              every real Completions* binding (5) plus every real merge-editor binding (18) plus \
-             Undo/Redo (2) plus TextUndo/TextRedo (3, GitHub issue #17) plus every real \
+             TextUndo/TextRedo (3, GitHub issue #17) plus every real \
              file-tree binding (5, GitHub issue #19) plus every real word-wise Editor* binding \
              (8, GitHub issue #27) plus every real multi-cursor Editor* binding (4, GitHub issue \
              #28) plus every real GitHub issue #26 binding (7, not counting \

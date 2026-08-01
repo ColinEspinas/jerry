@@ -573,7 +573,7 @@ impl AdeApp {
     /// `Ctrl+C`/`Ctrl+X`/`Ctrl+V`/`F2`/`Shift+F10` from firing while the user is typing a name -
     /// see `crate::sidebar::tree_ops`'s module docs and `crate::default_key_bindings`' own
     /// entries for why an extra context word is used rather than conditionally omitting the
-    /// bindings. The second is what keeps the *worktree* `Undo` off `Ctrl+Z` mid-filename.
+    /// bindings. The second is what routes `Ctrl+Z` mid-filename to `TextUndo`.
     ///
     /// The literals themselves come from `crate::keymap_overrides::file_tree_key_context`, which
     /// `real_context_stacks()` also calls, so the renderer and the enumeration every scoping
@@ -585,13 +585,9 @@ impl AdeApp {
         // word each (an open inline name editor, and the modal delete confirmation, which would
         // otherwise let `F2`/`Shift+F10` fire behind its own scrim), and an open editor adds
         // `"text-input"` on top - GitHub issue #17's one shared tag for every real text-typing
-        // surface. That last one is not decoration and is not merely about offering undo:
-        // `Undo`/`Redo` (the *worktree* history - committing and discarding real git state) are
-        // bound `Some("!terminal && !text-input")`, and while this editor is open the tree is the
-        // deepest focused node, so without it `Ctrl+Z` in a rename box ran the worktree undo.
-        // The two features were built on separate branches and met at a merge, so nothing
-        // textual flagged it - see `crate::sidebar::tree_ops::AdeApp::handle_tree_text_undo`,
-        // the listener the tag routes to.
+        // surface, routing `Ctrl+Z` in a rename box to `TextUndo` - see
+        // `crate::sidebar::tree_ops::AdeApp::handle_tree_text_undo`, the listener the tag routes
+        // to.
         let key_context = crate::keymap_overrides::file_tree_key_context(
             self.tree_inline_edit.is_some(),
             self.tree_delete_confirm.is_some(),

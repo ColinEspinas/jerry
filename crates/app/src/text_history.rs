@@ -10,25 +10,21 @@
 //! is precisely
 //! the silent-drift bug class this project's own history (Revision R5.5) already flagged once.
 //!
-//! ## Two undo systems, never one
+//! ## This app's one undo system
 //!
-//! This is **text** undo, strictly per widget. It is a genuinely separate system from
-//! `crate::worktree_history` (Revision R10), which undoes real *git* actions - committing a
-//! worktree's changes, discarding a worktree - at the worktree level. The two share the same
-//! physical keys (`secondary-z`/`secondary-shift-z`), so they are kept apart structurally, by
-//! `crate::default_key_bindings`' own `"text-input"` / `"!terminal && !text-input"` context
-//! predicates, not by handler-side guesswork - see that function's own docs for the full scoping
-//! rationale. Nothing in this module ever touches `crate::worktree_history`'s state, and vice
-//! versa.
+//! This is **text** undo, strictly per widget - the only undo system this app has. It used to
+//! share `secondary-z`/`secondary-shift-z` with a second, worktree-level system that undid real
+//! *git* actions (committing a worktree's changes, discarding a worktree); that system was
+//! removed (GitHub issue #47) since it was out of the app's original scope. `crate::
+//! default_key_bindings`' own `"text-input"` context predicate is what this history is scoped by
+//! - see that function's own docs for the full scoping rationale.
 //!
 //! ## Cursor, not two `Vec`s
 //!
 //! [`TextHistory`] is one `Vec<EditGroup>` plus a `cursor`: groups `[0..cursor)` are currently
-//! *applied*, `[cursor..)` are currently *undone* (available to redo). This is deliberately the
-//! same shape `crate::worktree_history::undo::UndoStack` already uses (see that module's own
-//! docs), so "a new edit after an undo drops the redo branch" - the standard linear-history rule
-//! this issue asks for - falls out of one `truncate(cursor)` in [`TextHistory::record`] rather
-//! than ad-hoc bookkeeping.
+//! *applied*, `[cursor..)` are currently *undone* (available to redo), so "a new edit after an
+//! undo drops the redo branch" - the standard linear-history rule this issue asks for - falls out
+//! of one `truncate(cursor)` in [`TextHistory::record`] rather than ad-hoc bookkeeping.
 //!
 //! ## The coalescing policy, and why it is exactly this
 //!
@@ -550,12 +546,11 @@ impl TextHistory {
     /// [`apply_inverse`] to each of its edits **in reverse order**, restores `before`, and only
     /// then calls [`Self::commit_undo`].
     ///
-    /// Peek-then-commit rather than one `undo()` that does both, mirroring
-    /// `crate::worktree_history::undo::UndoStack`'s own established discipline (see that module's
-    /// docs): every real caller here has to validate that the group genuinely describes the text
-    /// it is about to be applied to, and a combined call would leave the cursor moved after a
-    /// refusal - a silent desynchronization between the cursor and the content, which is exactly
-    /// the failure the validation exists to prevent.
+    /// Peek-then-commit rather than one `undo()` that does both: every real caller here has to
+    /// validate that the group genuinely describes the text it is about to be applied to, and a
+    /// combined call would leave the cursor moved after a refusal - a silent desynchronization
+    /// between the cursor and the content, which is exactly the failure the validation exists to
+    /// prevent.
     ///
     /// Returned by value (a clone) rather than by reference: every real caller mutates the same
     /// object that owns this history while applying it, which a live borrow would forbid. Groups

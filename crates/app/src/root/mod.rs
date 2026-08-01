@@ -85,7 +85,6 @@ use crate::title_bar::menu as title_bar;
 use crate::work_surface::sessions::{SessionId, SessionKind, Sessions};
 use crate::work_surface::state as work_surface;
 use crate::worktree_history::flow as worktree_history;
-use crate::worktree_history::undo;
 
 use crate::code_surface::state::{
     BlameCacheEntry, BlameLoadState, CommitMessageState, DiffLoadState, FileLoadState, HoverEntry,
@@ -179,8 +178,6 @@ actions!(
         EditorIndent,
         EditorDedent,
         EditorEscape,
-        Undo,
-        Redo,
         TextUndo,
         TextRedo,
         CloseFocusedTab,
@@ -678,11 +675,9 @@ pub struct AdeApp {
     /// audit found had become a real, reachable bug once GitHub issue #17 tagged that field
     /// `"text-input"`: closing the last session focused a text input the user never asked to type
     /// in, and `Ctrl+Z` there resolved to `TextUndo` against an empty field - a silently swallowed
-    /// keystroke with no feedback, instead of the worktree-level `Undo` that had always handled it
-    /// (`crate::default_key_bindings` scopes that one `!terminal && !text-input`). The rail's root
-    /// div carries no key context of its own, so focusing *it* keeps the focused `FocusId`
-    /// genuinely findable in the next rendered frame - the actual invariant the fallback exists to
-    /// protect - without claiming to be a text widget.
+    /// keystroke with no feedback. The rail's root div carries no key context of its own, so
+    /// focusing *it* keeps the focused `FocusId` genuinely findable in the next rendered frame -
+    /// the actual invariant the fallback exists to protect - without claiming to be a text widget.
     pub(crate) rail_focus_handle: FocusHandle,
     /// Real `+N -M`/has-changes totals per worktree or session cwd, refreshed by the
     /// periodic background task started in `Self::new` - see `crate::rail::state::
@@ -725,30 +720,21 @@ pub struct AdeApp {
     /// [`Self::_prune_task`] and drop (cancel) the first mid-flight. Set synchronously before
     /// spawning, reset in that same task's completion handler.
     pub(crate) prune_in_flight: bool,
-    /// The real command-pattern undo/redo stack (Revision R10,
-    /// `crate::worktree_history::flow`) - see [`undo::UndoStack`]'s own docs for the cursor
-    /// model. Only ever mutated from inside a background task's completion handler, after the
-    /// real `wt_core::undo::*` call it corresponds to has actually succeeded - never
-    /// speculatively at click time.
-    pub(crate) undo_stack: undo::UndoStack,
-    /// `Some(kind)` for the duration of any in-flight "keep all changes"/"discard worktree"/
-    /// `Undo`/`Redo` operation, naming *which* one - not just a bare `bool` - so
-    /// `Self::render_pty_footer`'s busy label ("keeping…"/"discarding…") can honestly reflect
-    /// what's actually running instead of guessing from which button happens to be visible (a
-    /// real, live-reproduced bug an audit caught: undoing a "keep all changes" made every
-    /// visible `Discard worktree` button across every session read "discarding…"). A single
-    /// field shared across all four, not four independent guards or a generation counter: these
-    /// are the only operations that ever mutate real git history or a worktree's own existence
-    /// for this feature, so fully serializing them (a second click of *any* of the four while
+    /// `Some(kind)` for the duration of any in-flight "keep all changes"/"discard worktree"
+    /// operation, naming *which* one - not just a bare `bool` - so `Self::render_pty_footer`'s
+    /// busy label ("keeping…"/"discarding…") can honestly reflect what's actually running instead
+    /// of guessing from which button happens to be visible (a real, live-reproduced bug an audit
+    /// caught: a running "keep all changes" made every visible `Discard worktree` button across
+    /// every session read "discarding…"). A single field shared across both, not two independent
+    /// guards: these are the only operations that ever mutate real git history or a worktree's
+    /// own existence for this feature, so fully serializing them (a second click of either while
     /// one is in flight is a no-op, mirroring [`Self::prune_in_flight`]'s own
-    /// single-flag-per-feature precedent) is sufficient, on its own, to make "a slow undo/redo
-    /// op racing a newer one" structurally impossible - there can never be a second one in
-    /// flight to race with. See `crate::worktree_history::flow`'s own module docs for why this
-    /// is a deliberate simplification of - not a skip of - this project's usual
-    /// task-slot/generation-guard discipline.
+    /// single-flag-per-feature precedent) is sufficient, on its own, to make "a slow op racing a
+    /// newer one" structurally impossible - there can never be a second one in flight to race
+    /// with.
     pub(crate) worktree_history_op_in_flight: Option<worktree_history::WorktreeHistoryOpKind>,
-    /// Feedback from the most recent "keep all changes"/"discard worktree"/`Undo`/`Redo`
-    /// operation, shown in the status bar
+    /// Feedback from the most recent "keep all changes"/"discard worktree" operation, shown in
+    /// the status bar
     /// (`status_bar::render::AdeApp::render_status_worktree_history_notice`) until the next one -
     /// deliberately its own render slot, independent of [`Self::prune_status`] (see that
     /// method's own docs for why sharing one slot with `prune_status` was a real bug: an
@@ -885,9 +871,9 @@ pub struct AdeApp {
     pub(crate) _status_poll_task: Option<Task<()>>,
     pub(crate) _disk_usage_task: Option<Task<()>>,
     pub(crate) _prune_task: Option<Task<()>>,
-    /// The single in-flight "keep all changes"/"discard worktree"/`Undo`/`Redo` background task,
-    /// guarded by [`Self::worktree_history_op_in_flight`] - see that field's own docs for why one
-    /// slot shared across all four is sufficient discipline here.
+    /// The single in-flight "keep all changes"/"discard worktree" background task, guarded by
+    /// [`Self::worktree_history_op_in_flight`] - see that field's own docs for why one slot
+    /// shared across both is sufficient discipline here.
     pub(crate) _worktree_history_task: Option<Task<()>>,
     pub(crate) _agent_rows_task: Option<Task<()>>,
     pub(crate) _merge_task: Option<Task<()>>,
@@ -1454,16 +1440,14 @@ impl Render for AdeApp {
             // (`vendor/zed/crates/gpui/src/keymap/context.rs:277-280`) returns `false`
             // *immediately*, before even inspecting which predicate variant it is, whenever the
             // context stack for the current dispatch path is completely empty
-            // (`contexts.last()` is `None`) - live-reproduced while wiring up `Undo`/`Redo`'s
+            // (`contexts.last()` is `None`) - live-reproduced while wiring up `CloseFocusedTab`'s
             // `Some("!terminal")` scoping: with Settings open (a real focus target with no
             // `.key_context(..)` anywhere on its own ancestor chain), the stack was genuinely
             // empty, so `!terminal` never got a chance to evaluate "is 'terminal' absent" - it
             // just always returned `false` (never matching) regardless of whether a terminal
             // was anywhere in sight. `"app"` here guarantees the stack always has at least one
             // frame, so `!terminal` (and any future negated-context predicate) evaluates its
-            // real, intended logic everywhere - confirmed by
-            // `root::focus::tab_strip_keybinding_tests::
-            // secondary_z_reaches_undo_once_real_focus_moves_off_the_terminal`.
+            // real, intended logic everywhere.
             .key_context("app")
             .on_action(cx.listener(Self::handle_new_session_action))
             .on_action(cx.listener(Self::handle_toggle_palette_action))
@@ -1480,8 +1464,6 @@ impl Render for AdeApp {
             .on_action(cx.listener(Self::handle_jump_to_session_6_action))
             .on_action(cx.listener(Self::handle_jump_to_session_7_action))
             .on_action(cx.listener(Self::handle_jump_to_session_8_action))
-            .on_action(cx.listener(Self::handle_undo_action))
-            .on_action(cx.listener(Self::handle_redo_action))
             .on_action(cx.listener(Self::handle_close_focused_tab_action))
             .child(self.render_title_bar(cx))
             // The Settings surface (`design_handoff_jerry_ade/README.md`: "a separate surface,

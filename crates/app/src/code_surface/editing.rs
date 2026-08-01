@@ -794,8 +794,7 @@ impl AdeApp {
     /// `TextUndo` for the code surface and the merge hand-edit surface (GitHub issue #17). Bound
     /// to `secondary-z` scoped `Some("text-input")`, registered on the exact focused node that
     /// carries that tag - see `crate::default_key_bindings`' own docs for why the routing is
-    /// structural (per-node `on_action`) rather than a state lookup, and why this can never
-    /// collide with `crate::worktree_history`'s worktree-level `Undo`.
+    /// structural (per-node `on_action`) rather than a state lookup.
     pub(crate) fn handle_text_undo_action(
         &mut self,
         _: &TextUndo,
@@ -816,8 +815,7 @@ impl AdeApp {
 
     /// The keystroke-independent entry points, so the title bar's Edit menu drives the exact same
     /// real code path the `secondary-z` binding does rather than a second implementation - the
-    /// same split `crate::worktree_history::flow`'s own `perform_undo`/`handle_undo_action` pair
-    /// already established for the worktree-level stack.
+    /// `perform_*`/`handle_*_action` split lets both call sites share one implementation.
     pub(crate) fn perform_text_undo(&mut self, cx: &mut Context<Self>) {
         self.step_edit_history(cx, true);
     }
@@ -4011,23 +4009,15 @@ mod editing_tests {
 
     /// The central scoping guarantee of GitHub issue #17 §3, proven by dispatch rather than by
     /// reading the predicate: with a real file editor focused, `secondary-z` must reach **text**
-    /// undo and must *not* reach `crate::worktree_history`'s worktree-level `Undo` - whose own
-    /// honest "nothing to undo" status is a real, observable signal that it ran.
+    /// undo.
     #[gpui::test]
-    fn secondary_z_in_the_code_editor_never_reaches_the_worktree_level_history_undo(
-        cx: &mut TestAppContext,
-    ) {
+    fn secondary_z_in_the_code_editor_reaches_text_undo(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let file_path = write_file(repo.path(), "sample.txt", "ab\n");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
-
-        assert!(
-            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
-            "sanity check: nothing has touched the worktree-level history yet"
-        );
 
         cx.simulate_input("z");
         cx.simulate_keystrokes(SECONDARY_Z);
@@ -4037,21 +4027,11 @@ mod editing_tests {
             "ab\n",
             "the text undo must genuinely have run"
         );
-        assert!(
-            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
-            "and the worktree-level Undo must NOT have - it would have set its own honest \
-             \"nothing to undo\" status if the keystroke had reached it. This is the exact \
-             \"a keystroke goes to the wrong handler\" bug class crate::default_key_bindings' \
-             own docs catalogue seven-plus instances of."
-        );
 
         // Same again for redo, in both of its real spellings.
         cx.simulate_keystrokes(SECONDARY_SHIFT_Z);
         cx.simulate_keystrokes("ctrl-y");
-        assert!(
-            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
-            "neither redo spelling may reach the worktree-level Redo either"
-        );
+        assert_eq!(buffer_content(&app, cx, &relative), "zab\n");
     }
 
     /// The same routing guarantee with the real Completions popup **also** open - a real
@@ -4099,10 +4079,6 @@ mod editing_tests {
             buffer_content(&app, cx, &relative),
             "ab\n",
             "an open completions popup must not divert secondary-z away from text undo"
-        );
-        assert!(
-            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
-            "and it must still never reach the worktree-level Undo"
         );
     }
 

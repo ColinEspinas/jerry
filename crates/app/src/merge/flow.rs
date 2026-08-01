@@ -1863,12 +1863,9 @@ mod merge_regression_tests {
 
     /// GitHub issue #17 for Surface D's merge hand-edit buffer - the sixth and last real
     /// text-typing surface. Driven through the real, bound `secondary-z` keystroke, so this also
-    /// proves the `"merge-editor text-input"` context really does route text undo here and never
-    /// to `crate::worktree_history`'s worktree-level `Undo`.
+    /// proves the `"merge-editor text-input"` context really does route text undo here.
     #[gpui::test]
-    fn secondary_z_in_the_merge_hand_edit_buffer_undoes_its_text_not_the_worktree_history(
-        cx: &mut TestAppContext,
-    ) {
+    fn secondary_z_in_the_merge_hand_edit_buffer_undoes_its_text(cx: &mut TestAppContext) {
         let repo = init_repo();
         fs::write(repo.path().join("shared.txt"), "line1\nline2\nline3\n").expect("write");
         git(repo.path(), &["add", "shared.txt"]);
@@ -1918,7 +1915,6 @@ mod merge_regression_tests {
                 .content
                 .clone()
         });
-        assert!(app.read_with(cx, |app, _| app.worktree_history_status.is_none()));
 
         cx.simulate_input("HAND");
         let typed = app.read_with(cx, |app, _| {
@@ -1950,10 +1946,6 @@ mod merge_regression_tests {
                 .clone()),
             before,
             "the typing burst must undo as one step in the merge hand-edit buffer too"
-        );
-        assert!(
-            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
-            "and secondary-z must never reach the worktree-level Undo from this surface"
         );
     }
 

@@ -121,30 +121,16 @@ use gpui::{
 ///   sets can never both match the same keystroke - the same real `&&`/`!`
 ///   `KeyBindingContextPredicate` mechanism the `"]"` entry already established for this exact
 ///   bug class.
-/// - `Undo`/`Redo` (Revision R10, `crate::worktree_history::flow`) back the real command-pattern
-///   undo/redo stack for "keep all changes"/"discard worktree". `"secondary-z"`/
-///   `"secondary-shift-z"` follow this list's own `"secondary-"` convention, but - unlike every
-///   other entry above except `"]"` - are **not** globally scoped (`None`): `"secondary-z"`
-///   resolves to plain `Ctrl+Z` on Linux/Windows, which `crate::terminal::pane::keystroke_to_bytes`
-///   already maps to the real `SIGTSTP` control byte (`0x1a`) - the terminal-suspend keystroke
-///   essentially every interactive terminal program relies on. A global binding here would
-///   swallow it before it ever reached a focused terminal's own key handling, the same
-///   "app-level shortcut steals terminal input" bug class this list's own `secondary-p`/`"]"`
-///   docs already cover, just for a far more disruptive keystroke to silently lose than either of
-///   those. Unlike `secondary-p` (no narrower context existed for it - the palette must be
-///   reachable from a focused terminal), a real, narrower scope *is* available here: `Undo`/
-///   `Redo` have no legitimate reason to need to fire while a terminal has keyboard focus, so
-///   they're scoped to `Some("!terminal")` - `crate::terminal::pane::TerminalPane`'s own
-///   `"terminal"` context tag (added in the same revision specifically to make this predicate
-///   possible), matching this list's own `"]"`/`"diff && !file-editor"` precedent for the same
-///   `!`-negated-context mechanism. **Narrowed again** by GitHub issue #17 to
-///   `Some("!terminal && !text-input")` - see the `TextUndo`/`TextRedo` entry directly below.
-/// - `TextUndo`/`TextRedo` (GitHub issue #17, `crate::text_history`) are the *second*, genuinely
-///   distinct undo system in this app: per-widget **text** undo, as opposed to `Undo`/`Redo`'s
-///   worktree-level git history above. They share the same physical keys, which is exactly the
-///   situation this list's own docs exist to keep honest, so they are kept apart **structurally**,
-///   by mutually-exclusive context predicates, not by handler-side guesswork or by relying on
-///   registration order:
+/// - `TextUndo`/`TextRedo` (GitHub issue #17, `crate::text_history`) back this app's one real
+///   undo system: per-widget **text** undo. `"secondary-z"`/`"secondary-shift-z"` follow this
+///   list's own `"secondary-"` convention, but - unlike every other entry above except `"]"` -
+///   are **not** globally scoped (`None`): `"secondary-z"` resolves to plain `Ctrl+Z` on
+///   Linux/Windows, which `crate::terminal::pane::keystroke_to_bytes` already maps to the real
+///   `SIGTSTP` control byte (`0x1a`) - the terminal-suspend keystroke essentially every
+///   interactive terminal program relies on. A global binding here would swallow it before it
+///   ever reached a focused terminal's own key handling, the same "app-level shortcut steals
+///   terminal input" bug class this list's own `secondary-p`/`"]"` docs already cover, just for a
+///   far more disruptive keystroke to silently lose than either of those.
 ///   - `TextUndo`/`TextRedo` are scoped `Some("text-input")` - one shared context tag carried by
 ///     every real text-typing surface in the app and by nothing else: `crate::palette`'s query
 ///     panel, `crate::rail`'s filter row, `crate::settings`' Keybindings filter row,
@@ -155,23 +141,12 @@ use gpui::{
 ///     name editor is open, alongside `"file-tree tree-editing"` - see
 ///     `crate::keymap_overrides::file_tree_key_context`). That last one arrived by *merge* rather
 ///     than by an edit to this file: GitHub issue #19 built those editors on a branch where this
-///     tag did not exist, and until they gained it `Ctrl+Z` mid-filename ran the worktree history.
-///     Keeping this enumeration complete is exactly what that incident argues for.
-///   - `Undo`/`Redo` gain the matching `&& !text-input`, so the two predicate sets are provably
-///     disjoint: no live context stack can satisfy both. That is deliberately *not* left to
-///     GPUI's tie-break rules. `vendor/zed/crates/gpui/src/keymap.rs`'s own `bindings_for_input`
-///     orders equally-deep matches by registration index, and `KeyBindingContextPredicate::
-///     depth_of` (`.../keymap/context.rs:260`) reports the *same* depth for `"text-input"` and
-///     `"!terminal"` when a text surface is the deepest focused node - so with only the old
-///     predicate, which of the two undo systems ran would have come down to the order of two
-///     lines in this function. This project has shipped the "a keystroke gets swallowed or goes
-///     to the wrong handler" bug class seven-plus times (documented throughout this very list);
-///     an ordering-dependent answer to "does Ctrl+Z undo my typing or my commit" is not a risk
-///     worth taking.
-///   - The terminal is unaffected in both directions: no terminal surface ever carries
-///     `"text-input"` (a real terminal wants `Ctrl+Z` as the literal `SIGTSTP` byte - see the
-///     `Undo`/`Redo` entry above), so neither system fires there and the keystroke stays free to
-///     reach the pty, exactly as before.
+///     tag did not exist, and until they gained it `Ctrl+Z` mid-filename ran the worktree-level
+///     undo/redo this app used to also have (removed - GitHub issue #47). Keeping this
+///     enumeration complete is exactly what that incident argues for.
+///   - No terminal surface ever carries `"text-input"` (a real terminal wants `Ctrl+Z` as the
+///     literal `SIGTSTP` byte), so `TextUndo`/`TextRedo` never fire there and the keystroke stays
+///     free to reach the pty, exactly as before.
 ///   - `"ctrl-y"` is bound to `TextRedo` as well, per GitHub issue #17's own checklist, and is
 ///     deliberately a literal `Ctrl` on every OS (like `"ctrl-shift-t"` above, unlike this list's
 ///     usual `"secondary-"`): `Ctrl+Y` is the Windows-convention redo key, and `Cmd+Y` means
@@ -196,8 +171,8 @@ use gpui::{
 ///   see `crate::code_surface::editing::AdeApp::handle_editor_collapse_cursors_action`'s own docs
 ///   for exactly how the File view composes both real behaviors from one binding), and `"ctrl-w"`
 ///   (`CloseFocusedTab`, close the focused tab) - the last of these follows the exact same
-///   literal-`ctrl`/`!terminal`-scoping precedent `"ctrl-shift-t"`/`Undo`/`Redo` already
-///   established above, for the same real reasons. `EditorIndent`/`EditorDedent` are scoped
+///   literal-`ctrl`/`!terminal`-scoping precedent `"ctrl-shift-t"` above already established, for
+///   the same real reasons. `EditorIndent`/`EditorDedent` are scoped
 ///   `"file-editor && !completions"`/`"merge-editor"` like every other plain `Editor*` action,
 ///   never `"text-input"` - that tag is GitHub issue #17's own **text-history** context, a
 ///   different real concept from "is real text editing allowed here" (see the `TextUndo`/
@@ -221,12 +196,6 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         // navigation is unaffected either way).
         gpui::KeyBinding::new("secondary-p", root::TogglePalette, None),
         gpui::KeyBinding::new("secondary-,", root::ToggleSettings, None),
-        gpui::KeyBinding::new("secondary-z", root::Undo, Some("!terminal && !text-input")),
-        gpui::KeyBinding::new(
-            "secondary-shift-z",
-            root::Redo,
-            Some("!terminal && !text-input"),
-        ),
         gpui::KeyBinding::new("secondary-z", root::TextUndo, Some("text-input")),
         gpui::KeyBinding::new("secondary-shift-z", root::TextRedo, Some("text-input")),
         gpui::KeyBinding::new("ctrl-y", root::TextRedo, Some("text-input")),
@@ -517,8 +486,8 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         // exactly what "focused" resolves to and why this can never close the window (this app
         // registers no window-close keybinding anywhere in this list, on any platform, so there
         // is no native default here to intercept in the first place). Scoped `Some("!terminal")`,
-        // the same real precedent `Undo`/`Redo` above already established for this exact conflict
-        // class: plain `Ctrl+W` is `crate::terminal::pane::keystroke_to_bytes`'s own real
+        // the same real precedent `"ctrl-shift-t"` above already established for this exact
+        // conflict class: plain `Ctrl+W` is `crate::terminal::pane::keystroke_to_bytes`'s own real
         // `unix-word-rerase` control byte (`0x17`), a standard readline word-backspace a focused
         // shell needs unclaimed - a global binding here would swallow it in every focused
         // terminal/agent session on Linux/Windows, the same bug class this list's own
@@ -596,13 +565,13 @@ pub fn run(repo_path: PathBuf) {
 /// and complements them rather than duplicating them. GPUI dispatches only the highest-precedence
 /// matching binding (`vendor/zed/crates/gpui/src/keymap.rs`'s `bindings_for_input`, then
 /// `window.rs`'s `replay_pending_input`, which stops at the first handler that doesn't propagate),
-/// so a live keystroke test can only ever observe the *winner* - it would happily pass even if
-/// both undo systems matched and the right one merely happened to be registered second. This
-/// asserts the thing that actually matters: for every real context stack, **at most one** of the
-/// two systems is enabled at all, so nothing about this depends on the order of two lines in
-/// [`default_key_bindings`]. See that function's own docs for the full rationale, and this
-/// project's documented seven-plus instances of the "keystroke reaches the wrong handler" bug
-/// class for why it is checked this precisely.
+/// so a live keystroke test can only ever observe the *winner*, which would happily pass even if
+/// `TextUndo`/`TextRedo` were live somewhere this list's own docs don't claim. This asserts the
+/// thing that actually matters: for every real context stack, `TextUndo`/`TextRedo` are enabled
+/// in exactly the contexts `Some("text-input")` is documented to mean, and nowhere else. See
+/// [`default_key_bindings`]'s own docs for the full rationale, and this project's documented
+/// seven-plus instances of the "keystroke reaches the wrong handler" bug class for why it is
+/// checked this precisely.
 #[cfg(test)]
 mod undo_scoping_matrix_tests {
     use gpui::{KeyBinding, KeyContext};
@@ -618,10 +587,9 @@ mod undo_scoping_matrix_tests {
     /// was exactly wrong in the place it mattered, since the empty stack is what GPUI falls back to
     /// when the focused `FocusId` is not in the last rendered frame, and an independent adversarial
     /// audit found a real, reachable dangling-focus site (Settings page navigation) living there.
-    /// The matrix's "at most one system is live" invariant held vacuously on that stack while the
-    /// keystroke was in fact silently swallowed. It is now asserted explicitly, with its own honest
-    /// meaning: neither system live, which is a real bug class this app fixes at the focus sites
-    /// rather than in the keymap.
+    /// `TextUndo`/`TextRedo` are disabled on that stack, which is asserted explicitly, with its
+    /// own honest meaning: the keystroke is silently swallowed, a real bug class this app fixes at
+    /// the focus sites rather than in the keymap.
     fn real_context_stacks() -> Vec<Vec<&'static str>> {
         crate::keymap_overrides::real_context_stacks()
     }
@@ -671,108 +639,59 @@ mod undo_scoping_matrix_tests {
             .collect()
     }
 
-    /// A real `secondary-z` keystroke can never be claimed by both undo systems at once, in any
-    /// real context - and is claimed by the *expected* one in each.
+    /// `TextUndo` is enabled in exactly the real contexts `Some("text-input")` is documented to
+    /// mean, and nowhere else.
     #[test]
-    fn secondary_z_is_claimed_by_at_most_one_undo_system_in_every_real_context() {
+    fn secondary_z_reaches_text_undo_in_exactly_the_real_text_input_contexts() {
         let keystroke = if cfg!(target_os = "macos") {
             "cmd-z"
         } else {
             "ctrl-z"
         };
-        let worktree = bindings_for("app::Undo", keystroke);
         let text = bindings_for("app::TextUndo", keystroke);
-        assert_eq!(worktree.len(), 1, "one real worktree-level Undo binding");
         assert_eq!(text.len(), 1, "one real text-undo binding");
 
         // Index-aligned with `real_context_stacks()`/`stack_descriptions()`.
-        let expectations: Vec<(bool, bool)> = vec![
+        let expectations: Vec<bool> = vec![
             // A dangling focus handle: GPUI evaluates every predicate against an empty stack and
-            // `eval_inner` short-circuits to false, so *neither* system is live and the keystroke
-            // is silently swallowed. Asserted, not tolerated: this is a real, reachable bug class
-            // (four sites fixed on this branch), and the fix belongs at the focus sites - a
-            // keymap that "handled" an empty stack would be handling a frame that isn't on screen.
-            (false, false),
-            (true, false),  // anything with no key context of its own
-            (false, false), // a focused terminal - the pty gets the real SIGTSTP byte
-            (true, false),  // the read-only Diff view - nothing to text-undo there
-            (false, true),  // the editable File view
-            (false, true),  // ...with completions open
-            (false, true),  // the merge hand-edit surface
-            (false, true),  // a focused single-line text input
-            // The file tree with no editor open is not a text surface: Ctrl+Z there means the
-            // worktree history, exactly as it does on the Diff view.
-            (true, false),
+            // `eval_inner` short-circuits to false, so the keystroke is silently swallowed.
+            // Asserted, not tolerated: this is a real, reachable bug class (four sites fixed on
+            // this branch), and the fix belongs at the focus sites - a keymap that "handled" an
+            // empty stack would be handling a frame that isn't on screen.
+            false, false, // anything with no key context of its own
+            false, // a focused terminal - the pty gets the real SIGTSTP byte
+            false, // the read-only Diff view - nothing to text-undo there
+            true,  // the editable File view
+            true,  // ...with completions open
+            true,  // the merge hand-edit surface
+            true,  // a focused single-line text input
+            // The file tree with no editor open is not a text surface.
+            false,
             // ...but its inline name editor *is* one. This row is the whole reason issue #19's
             // tree had to gain issue #17's `"text-input"` tag when the two branches merged:
-            // without it this read `(true, false)`, and Ctrl+Z while typing a filename ran the
-            // worktree undo - discarding or re-committing real git state from inside a rename
-            // box, with the tree's own key handler never even seeing the keystroke (it returns
-            // early on a `control`/`platform` modifier).
-            (false, true),
-            (true, false), // the modal delete confirmation - no text being typed
-            (false, true), // the name editor, delete confirmation over it
+            // without it Ctrl+Z while typing a filename used to reach the worktree-level undo
+            // this app used to also have (removed - GitHub issue #47), with the tree's own key
+            // handler never even seeing the keystroke (it returns early on a
+            // `control`/`platform` modifier).
+            true, false, // the modal delete confirmation - no text being typed
+            true,  // the name editor, delete confirmation over it
         ];
-        // Both pairings, not just one: the loop below is a `zip` chain, and `zip` truncates to
-        // the shortest input - so a stack added without a matching description would silently
-        // drop rows from this matrix rather than fail it.
+        // A stack added without a matching expectation would otherwise silently drop a row from
+        // this matrix rather than fail it (`zip` truncates to the shortest input).
         assert_eq!(expectations.len(), real_context_stacks().len());
         assert_eq!(stack_descriptions().len(), real_context_stacks().len());
 
-        for ((description, parts), (wants_worktree, wants_text)) in stack_descriptions()
+        for ((description, parts), wants_text) in stack_descriptions()
             .into_iter()
             .zip(real_context_stacks())
             .zip(expectations)
         {
             let contexts = stack(&parts);
-            let worktree_enabled = enabled(&worktree[0], &contexts);
             let text_enabled = enabled(&text[0], &contexts);
-            assert!(
-                !(worktree_enabled && text_enabled),
-                "both undo systems are live for {description} - which one actually runs would \
-                 then come down to registration order, the exact fragility \
-                 crate::default_key_bindings' `!text-input` narrowing exists to remove"
-            );
-            assert_eq!(
-                worktree_enabled, wants_worktree,
-                "worktree-level Undo enablement for {description}"
-            );
             assert_eq!(
                 text_enabled, wants_text,
                 "text undo enablement for {description}"
             );
-        }
-    }
-
-    /// The same matrix for both real redo spellings.
-    #[test]
-    fn every_redo_spelling_is_claimed_by_at_most_one_undo_system_in_every_real_context() {
-        let shift_z = if cfg!(target_os = "macos") {
-            "cmd-shift-z"
-        } else {
-            "ctrl-shift-z"
-        };
-        let worktree = bindings_for("app::Redo", shift_z);
-        assert_eq!(worktree.len(), 1);
-        let text: Vec<KeyBinding> = crate::default_key_bindings()
-            .into_iter()
-            .filter(|binding| binding.action().name() == "app::TextRedo")
-            .collect();
-        assert_eq!(
-            text.len(),
-            2,
-            "TextRedo is bound twice by design: secondary-shift-z and ctrl-y"
-        );
-
-        for (description, parts) in stack_descriptions().into_iter().zip(real_context_stacks()) {
-            let contexts = stack(&parts);
-            let worktree_enabled = enabled(&worktree[0], &contexts);
-            for binding in &text {
-                assert!(
-                    !(worktree_enabled && enabled(binding, &contexts)),
-                    "both redo systems are live for {description}"
-                );
-            }
         }
     }
 

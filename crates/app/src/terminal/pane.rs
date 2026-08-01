@@ -1413,20 +1413,18 @@ impl Render for TerminalPane {
             .id("terminal-pane")
             .track_focus(&self.focus_handle)
             // Tagged `"terminal"` (Revision R10) so `crate::default_key_bindings`'s global
-            // `Undo`/`Redo` bindings can scope themselves away from a focused terminal via
-            // `Some("!terminal")` - see that function's own docs for the real conflict this
-            // closes: `"secondary-z"` resolves to plain `Ctrl+Z` on Linux/Windows
-            // (`crate::default_key_bindings`'s own `"secondary-"` docs), which
-            // `Self::keystroke_to_bytes` below already maps to the real `SIGTSTP` control byte
-            // (`0x1a`) every interactive terminal program relies on to suspend - a global,
-            // unscoped `Undo` binding would swallow that keystroke before it ever reached this
-            // pane's own `on_key_down`, the same "app-level shortcut steals terminal input" bug
-            // class `crate::default_key_bindings`'s own docs discuss for `secondary-p`/Ctrl+P -
-            // unlike that case, which the project ultimately accepted as a deliberate, discussed
+            // bindings that have no business firing over a focused terminal (e.g.
+            // `CloseFocusedTab`) can scope themselves away from it via `Some("!terminal")` - see
+            // that function's own docs for the real conflict this closes: `"ctrl-w"` is
+            // `crate::terminal::pane::keystroke_to_bytes`'s own real `unix-word-rerase` control
+            // byte, a standard readline word-backspace a focused shell needs unclaimed - a
+            // global, unscoped binding would swallow it before it ever reached this pane's own
+            // `on_key_down`, the same "app-level shortcut steals terminal input" bug class
+            // `crate::default_key_bindings`'s own docs discuss for `secondary-p`/Ctrl+P - unlike
+            // that case, which the project ultimately accepted as a deliberate, discussed
             // tradeoff (`TogglePalette` now deliberately claims Ctrl+P unscoped, shadowing
-            // readline's own `previous-history`), `Undo` instead avoids the collision entirely
-            // via this real `!terminal` scoping, since a lost `SIGTSTP` is a far more disruptive
-            // keystroke to lose silently than a lost `previous-history`.
+            // readline's own `previous-history`), these bindings instead avoid the collision
+            // entirely via this real `!terminal` scoping.
             .key_context("terminal")
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
@@ -1962,16 +1960,15 @@ mod keystroke_tests {
         );
     }
 
-    /// Direct proof of the control-byte mapping Revision R10's `Undo`/`Redo` scoping decision
-    /// depends on: `crate::default_key_bindings` scopes `Undo`/`Redo` to `Some("!terminal")`
-    /// rather than binding them globally, specifically because `secondary-z` resolves to plain
-    /// `Ctrl+Z` on Linux/Windows, and this mapping sends the real `SIGTSTP` terminal-suspend
-    /// control byte (`0x1a`) a focused interactive program relies on. Mirrors
-    /// `ctrl_p_maps_to_the_real_readline_previous_history_control_byte` and
-    /// `crate::root::focus::tab_strip_keybinding_tests`'s own
-    /// `secondary_z_does_not_undo_while_the_default_terminal_session_is_focused`: that test
-    /// proves the scoped dispatch doesn't intercept it; this one proves what reaches the pty
-    /// once it doesn't.
+    /// Direct proof of the control-byte mapping `TextUndo`/`TextRedo`'s `Some("text-input")`
+    /// scoping depends on: no terminal surface ever carries `"text-input"`, specifically because
+    /// `secondary-z` resolves to plain `Ctrl+Z` on Linux/Windows, and this mapping sends the real
+    /// `SIGTSTP` terminal-suspend control byte (`0x1a`) a focused interactive program relies on.
+    /// Mirrors `ctrl_p_maps_to_the_real_readline_previous_history_control_byte` and
+    /// `crate::root::focus::text_undo_scoping_tests`'s own
+    /// `secondary_z_with_a_terminal_focused_does_not_reach_text_undo`: that test proves the
+    /// scoped dispatch doesn't intercept it; this one proves what reaches the pty once it
+    /// doesn't.
     #[test]
     fn ctrl_z_maps_to_the_real_sigtstp_control_byte() {
         let modifiers = Modifiers {

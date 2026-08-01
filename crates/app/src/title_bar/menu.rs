@@ -246,21 +246,10 @@ impl AdeApp {
     }
 
     /// The Edit menu: real **text** `Undo`/`Redo` for whichever edit buffer is currently active
-    /// (GitHub issue #17, `crate::text_history`), then the worktree-level "keep all changes"/
-    /// "discard worktree" undo stack (Revision R10) as its own separately-labelled pair, then
-    /// Cut/Copy/Paste/Select All against the real active edit buffer (File view or merge
-    /// hand-edit - [`crate::code_surface::editing::AdeApp::active_edit_buffer`]), dimmed when there's no
-    /// real edit target right now.
-    ///
-    /// The two undo pairs are deliberately separate rows with separate labels, and only the text
-    /// pair carries a keycap. Before GitHub issue #17 there was one pair, labelled `Undo` with a
-    /// `"worktree history"` sub-line and a `mod+z` keycap, and that was accurate. It stopped being
-    /// accurate the moment `mod+z` started resolving to `TextUndo` inside every real text widget
-    /// (see `crate::default_key_bindings`' own scoping docs): a keycap that is only true when no
-    /// text input has focus, on a row that fires a real `git reset --soft`, is exactly the kind of
-    /// confidently-wrong affordance this project's discipline forbids. The worktree rows are still
-    /// fully clickable - only their (now context-dependent) keycap is gone, with the sub-line
-    /// saying where the shortcut does apply.
+    /// (GitHub issue #17, `crate::text_history`), then Cut/Copy/Paste/Select All against the real
+    /// active edit buffer (File view or merge hand-edit -
+    /// [`crate::code_surface::editing::AdeApp::active_edit_buffer`]), dimmed when there's no real
+    /// edit target right now.
     ///
     /// The text rows are dimmed, per [`crate::work_surface::render::render_dropdown_menu_row`]'s
     /// own enabled/disabled convention, whenever there is genuinely nothing to undo or redo -
@@ -323,35 +312,6 @@ impl AdeApp {
                 }
                 row.into_any_element()
             },
-            Self::render_title_menu_divider(),
-            render_dropdown_menu_row(
-                "U",
-                theme::text::DIM.into(),
-                theme::surface::CHIP_NEUTRAL.into(),
-                "Undo worktree action",
-                "history \u{b7} shortcut applies outside text inputs".to_string(),
-                Vec::new(),
-                true,
-            )
-            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                this.title_menu_open = None;
-                this.perform_undo(cx);
-            }))
-            .into_any_element(),
-            render_dropdown_menu_row(
-                "R",
-                theme::text::DIM.into(),
-                theme::surface::CHIP_NEUTRAL.into(),
-                "Redo worktree action",
-                "history \u{b7} shortcut applies outside text inputs".to_string(),
-                Vec::new(),
-                true,
-            )
-            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                this.title_menu_open = None;
-                this.perform_redo(cx);
-            }))
-            .into_any_element(),
             Self::render_title_menu_divider(),
         ];
 
@@ -839,42 +799,6 @@ mod title_menu_tests {
         );
     }
 
-    /// The Edit menu's `Undo worktree action` row really calls the real
-    /// `crate::worktree_history::flow::AdeApp::perform_undo` - with nothing in
-    /// [`AdeApp::undo_stack`] yet (a fresh test app), that's a real, honest "nothing to undo"
-    /// status (Revision R10's own fix for the "looks actionable, silently does nothing" bug
-    /// class - see that revision's build-log entry), not a silent no-op, and is exactly the
-    /// observable effect this test asserts actually happened.
-    ///
-    /// It is the *third* row now, behind the text `Undo`/`Redo` pair and a divider (GitHub issue
-    /// #17) - clicked by its real structural position through the shared
-    /// [`nth_row_click_point`] geometry, so the two undo pairs can't silently swap places without
-    /// this failing.
-    #[gpui::test]
-    fn edit_menu_worktree_undo_row_runs_the_real_undo_stack(cx: &mut TestAppContext) {
-        let (app, cx) = open_windows_variant(cx);
-        app.update(cx, |app, cx| {
-            app.title_menu_open = Some(TitleMenu::Edit);
-            cx.notify();
-        });
-        cx.run_until_parked();
-        let bounds = app.read_with(cx, |app, _| {
-            app.title_menu_button_bounds[TitleMenu::Edit.index()]
-        });
-
-        cx.simulate_click(nth_row_click_point(bounds, 2, 1), gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        app.read_with(cx, |app, _| {
-            assert_eq!(
-                app.worktree_history_status.as_deref(),
-                Some("nothing to undo"),
-                "the real `perform_undo` should have run and reported its real, honest status"
-            );
-            assert_eq!(app.title_menu_open, None);
-        });
-    }
-
     /// The Edit menu's *first* row is now real **text** undo (GitHub issue #17), and it is a real
     /// affordance in both directions: inert with nothing to undo (no `on_click` attached at all,
     /// per `render_dropdown_menu_row`'s own enabled/disabled contract), and genuinely undoing the
@@ -909,10 +833,6 @@ mod title_menu_tests {
         let bounds = open_edit_menu(&app, cx);
         cx.simulate_click(first_row_click_point(bounds), gpui::Modifiers::none());
         cx.run_until_parked();
-        assert!(
-            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
-            "a disabled text-undo row must never fall through to the worktree-level undo - that              would be the exact confidently-wrong affordance this row was split out to remove"
-        );
 
         // Now open a real file, type into it, and click the same row again.
         app.update_in(cx, |app, window, cx| {
@@ -950,11 +870,8 @@ mod title_menu_tests {
                 .content
                 .clone()),
             "hello\n",
-            "the Edit menu's own text-undo row must drive the exact same real history the              secondary-z binding does"
-        );
-        assert!(
-            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
-            "and it must never touch the worktree-level stack"
+            "the Edit menu's own text-undo row must drive the exact same real history the \
+             secondary-z binding does"
         );
         assert_eq!(app.read_with(cx, |app, _| app.title_menu_open), None);
     }
@@ -1198,10 +1115,6 @@ mod title_menu_tests {
         );
         app.read_with(cx, |app, _| {
             assert_eq!(app.discard_confirm_armed, None);
-            assert!(
-                app.undo_stack.can_undo(),
-                "a real, undoable entry should have been pushed"
-            );
         });
     }
 

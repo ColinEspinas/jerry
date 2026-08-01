@@ -189,7 +189,6 @@ impl AdeApp {
             prune_status: None,
             prune_confirm_armed: false,
             prune_in_flight: false,
-            undo_stack: undo::UndoStack::new(),
             worktree_history_op_in_flight: None,
             worktree_history_status: None,
             discard_confirm_armed: None,
