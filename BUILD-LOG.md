@@ -6931,3 +6931,55 @@ the user's own report showed, then re-verified clean once the fix was restored.
 `cargo clippy --workspace --all-targets -- -D warnings` - all clean.
 `cargo test --workspace --lib --test-threads=1`: **1220 + 44 + 14 + 140 = 1424 passed, 0 failed**
 across all four crates (1 new test).
+
+### Follow-up: the elbows were painted half a pixel off the row grid
+
+The fix above was real but it was not the whole report. Pressed again with "the lines and elbows
+do not align correctly vertically", the answer turned out to be a subpixel layout bug that every
+existing test was structurally blind to.
+
+`render_graph_row` is `.h(ROW).border_b_1()` on a `.flex().items_center()` row, and GPUI's taffy
+layout is **border-box**: `Style::to_taffy` (`vendor/zed/crates/gpui/src/taffy.rs`) maps `size` and
+`border` across and fills the rest with `..Default::default()`, never setting `box_sizing`, so
+taffy's own `BoxSizing::BorderBox` default applies. The row is therefore 26px on the outside but
+its *content* box is only 25px, while `render_graph_lane_canvas` is a full `ROW` = 26px. Under
+`.items_center()` that centres to `(25 - 26) / 2` = **-0.5px**. Measured on real painted bounds,
+every row:
+
+```
+row 0: row.y=129px | canvas.y=128.5px | delta=-0.5px
+row 1: row.y=155px | canvas.y=154.5px | delta=-0.5px
+```
+
+Every horizontal 1px stroke in the canvas - the elbow bridge's `h(px(1.0))` and both curve boxes'
+`border_t_1()`/`border_b_1()` - then sat on a half-pixel boundary and rendered smeared across two
+physical pixel rows at half intensity, while the vertical lane lines (x is untouched) stayed
+crisp. Crisp verticals against smeared horizontals is exactly what "elbows don't line up
+vertically" looks like, and it is very probably why four earlier rounds of 1px elbow-seam fixes
+each only half-worked: the geometry was computed on an integer grid, every test measured that same
+integer grid, and then the whole canvas was painted half a pixel off it.
+
+Fixed with `.self_start()` on the lane canvas. The row has no *top* border, so its content-box top
+is its border-box top; pinning there puts the canvas back on whole pixels and keeps consecutive
+canvases exactly `ROW` apart. The 1px it now overflows past the content box is the row's own
+separator border, which lane lines have to run through anyway for a line to read as continuous
+across rows.
+
+Why nothing caught it: `consecutive_lane_canvases_tile_exactly_so_the_row_clip_loses_no_line` only
+ever compares one lane canvas against *another* lane canvas. A constant offset shared by every row
+keeps both its invariants (each canvas is `ROW` tall, each sits `ROW` below the last) perfectly
+intact. It passes against the bug - verified by reverting the fix and re-running it.
+
+New test `every_lane_canvas_sits_on_whole_pixels_at_its_own_rows_top_edge` closes that gap by
+measuring the canvas against **its own row**: `canvas.origin.y == row.origin.y`, and
+`y == y.round()`. Reverting `.self_start()` fails it with `left: 128.5px / right: 129px` while the
+tiling test beside it still passes - the precise blind spot, now covered.
+
+### Gates (both changes)
+
+`cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy --workspace --all-targets --
+-D warnings` all clean. `cargo test --workspace --lib -- --test-threads=1`: **1221 + 44 + 14 + 140
+= 1419 passed, 0 failed**. One run of the full serialized suite had
+`lsp::client::lsp_diagnostics_wiring_tests::rust_analyzer_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions`
+blow its wall-clock deadline under load; it passes 3/3 in isolation in ~3s and the clean rerun
+above passes it too - a real-rust-analyzer timing flake, not a regression.
