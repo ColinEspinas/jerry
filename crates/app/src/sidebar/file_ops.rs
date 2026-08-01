@@ -288,7 +288,7 @@ pub enum DeleteMechanism {
 ///
 /// - **Linux / FreeBSD (and any other Unix)**: real `gio trash -- <path>`. `gio` is GLib's own
 ///   CLI, and `gio trash` is a direct wrapper around `g_file_trash`, which implements the
-///   freedesktop.org trash specification for local files entirely in-process (no session bus, no
+///   freedesktop.org trash specification for local files entirely in-process (no agent bus, no
 ///   gvfs daemon needed for a local path). Verified for real in this project's own environment,
 ///   not assumed: trashing both a file and a non-empty directory succeeded and both appeared in
 ///   `~/.local/share/Trash/files`. The `--` is a real, supported `gio` argument terminator and is

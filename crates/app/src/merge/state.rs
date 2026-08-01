@@ -9,19 +9,19 @@ use std::path::{Path, PathBuf};
 use wt_core::merge::{ConflictSegment, ConflictedFile, ConflictedPath, UnmergeableReason};
 
 use crate::code_surface::edit_buffer::EditBuffer;
-use crate::work_surface::sessions::SessionId;
+use crate::work_surface::agents::AgentId;
 
-/// The live state of one merge attempt/resolution, scoped to the session whose `Merge` button
+/// The live state of one merge attempt/resolution, scoped to the agent whose `Merge` button
 /// started it.
 pub struct MergeFlow {
-    pub session_id: SessionId,
+    pub agent_id: AgentId,
     /// Bumped by [`crate::root::AdeApp::start_merge`] every time a fresh attempt is started -
-    /// including a fresh attempt for the *same* `session_id` (aborting a merge and immediately
-    /// re-clicking `Merge` on the same session tab reuses the same `session_id`). Real callers
-    /// that stamp a background operation with `(session_id, generation)` at dispatch time (see
+    /// including a fresh attempt for the *same* `agent_id` (aborting a merge and immediately
+    /// re-clicking `Merge` on the same agent tab reuses the same `agent_id`). Real callers
+    /// that stamp a background operation with `(agent_id, generation)` at dispatch time (see
     /// [`MergeEditState::generation`]'s own docs) use this to tell "a result for the attempt
     /// still in progress" apart from "a stale result for an attempt that has since been
-    /// superseded" - a bare `session_id` match alone cannot distinguish those two cases from each
+    /// superseded" - a bare `agent_id` match alone cannot distinguish those two cases from each
     /// other.
     pub generation: u64,
     pub state: MergeFlowState,
@@ -33,14 +33,14 @@ pub struct MergeFlow {
 /// sidebar-worktree-selection-scoped map with its own wholesale-reset discipline this state must
 /// never share - a hand-edit here must survive a sidebar worktree switch untouched, since
 /// browsing a different worktree in the sidebar is a completely independent axis from which
-/// session/merge flow is on screen).
+/// agent/merge flow is on screen).
 pub struct MergeEditState {
-    /// Which [`MergeFlow`] (by session) this hand-edit belongs to.
-    pub session_id: SessionId,
+    /// Which [`MergeFlow`] (by agent) this hand-edit belongs to.
+    pub agent_id: AgentId,
     /// [`MergeFlow::generation`] at the moment this hand-edit was started - see that field's own
     /// docs for the real, narrow race this closes: a stale in-flight background save from an
     /// aborted merge attempt landing *after* a fresh `start_merge` reused the very same
-    /// `session_id` must never be silently applied to the new attempt's unrelated conflict
+    /// `agent_id` must never be silently applied to the new attempt's unrelated conflict
     /// state.
     pub generation: u64,
     /// A real, monotonic per-buffer identity stamp - bumped by
@@ -48,16 +48,16 @@ pub struct MergeEditState {
     /// `EditBuffer` is actually seeded (not on a re-click that reuses an already-open one - see
     /// that method's own docs). Closes a real, narrow race an audit found by reading (not
     /// live-reproduced under the test executor, since it requires a real yield point mid-save
-    /// that this app's synchronous UI-event dispatch doesn't offer without one): `session_id`/
+    /// that this app's synchronous UI-event dispatch doesn't offer without one): `agent_id`/
     /// `generation`/`relative_path` alone are *not* enough to identify a specific *buffer*, only
     /// a specific merge attempt's specific file - if a hand-edit save is dispatched, the user
     /// then discards it and immediately re-opens hand-edit mode for the *same* file (same
-    /// session/generation/relative_path, but a brand-new `EditBuffer`) before that earlier save's
+    /// agent/generation/relative_path, but a brand-new `EditBuffer`) before that earlier save's
     /// background write actually lands, the earlier save's completion would otherwise call
     /// `EditBuffer::mark_saved` on the *new* buffer, stamping the old buffer's own written
     /// content as the new buffer's `saved_content` - silently corrupting the new buffer's dirty-
     /// state bookkeeping against content it never actually held. Every place a background save
-    /// result gets applied checks this alongside `session_id`/`generation`/`relative_path`.
+    /// result gets applied checks this alongside `agent_id`/`generation`/`relative_path`.
     pub buffer_id: u64,
     pub base_worktree_path: PathBuf,
     /// The conflicted file this hand-edit is for - matched by path (never a captured index) at
@@ -76,7 +76,7 @@ pub struct MergeEditState {
 pub enum MergeFlowState {
     /// The `git merge` child process is still running on a background thread.
     Running,
-    /// The session branch already contributes nothing new to the base branch - `git merge`
+    /// The agent branch already contributes nothing new to the base branch - `git merge`
     /// exited successfully but there was nothing to merge.
     AlreadyUpToDate { base_branch: String },
     /// The merge completed with no conflicts and is staged, uncommitted - waiting for an

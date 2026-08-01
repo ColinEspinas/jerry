@@ -2,17 +2,17 @@ use super::*;
 use crate::root::widgets::{render_env_chip, render_keycap_row, text_tooltip, KeycapSize};
 
 /// The 28px status bar (`CHANGELOG.md`'s change 7 - height 26 -> 28, gap 12 -> 9, every value
-/// 10px mono), rebuilt from the old single `8 sessions · 2 waiting · …` summary string into a
+/// 10px mono), rebuilt from the old single `8 agents · 2 waiting · …` summary string into a
 /// left/right cluster layout. Every field here reads a real, already-live data source - see each
 /// render helper's own docs for exactly which one, and [`AdeApp::status_bar_active_parsed_file`]
 /// for the one shared gate that keeps the file-scoped fields (`ln N`, indent, line-ending,
 /// `UTF-8`, the diagnostics error count) from ever showing stale data left over from a
 /// previously-viewed file.
 ///
-/// The mockup's second `⌘⇧K sessions` palette hint is still omitted for the same reason the old
+/// The mockup's second `⌘⇧K agents` palette hint is still omitted for the same reason the old
 /// bar omitted it: that binding is never wired up anywhere in this codebase, so a keycap for it
 /// would advertise a shortcut that silently does nothing. The real `secondary-1`..`secondary-8`
-/// session-jump keycaps (reused from `Self::render_tab_strip`'s own right-aligned cluster) are
+/// agent-jump keycaps (reused from `Self::render_tab_strip`'s own right-aligned cluster) are
 /// shown instead, since those genuinely are bound.
 impl AdeApp {
     pub(crate) fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -61,7 +61,7 @@ impl AdeApp {
     /// (`Self::render_rail_footer`) - an audit found two real problems with that shared slot:
     /// [`AdeApp::prune_status`] took priority there and is never cleared once set (see that
     /// field's own docs), so a single prune click permanently hid every future worktree-history
-    /// status for the rest of the session; and the rail footer disappears entirely while Settings
+    /// status for the rest of the agent; and the rail footer disappears entirely while Settings
     /// is open (`AdeApp::render_workspace_body` isn't called - `root/mod.rs`'s `Render` impl
     /// swaps it out for `Self::render_settings`), leaving *no* real status surface at all for
     /// this feedback while Settings is open. The status bar is rendered as an unconditional
@@ -86,7 +86,7 @@ impl AdeApp {
     }
 
     /// Environment chip + real LSP server/error counts, the real file/editor cluster, then the
-    /// palette/session keycap hints - divided the same way as the left side.
+    /// palette/agent keycap hints - divided the same way as the left side.
     fn render_status_bar_right(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let env_and_servers = div()
             .flex()
@@ -100,7 +100,7 @@ impl AdeApp {
             .items_center()
             .gap(px(16.0))
             .child(self.render_status_palette_hint(cx))
-            .child(self.render_status_session_hint());
+            .child(self.render_status_agent_hint());
 
         render_status_segment_row(vec![
             env_and_servers.into_any_element(),
@@ -111,20 +111,20 @@ impl AdeApp {
         .into_any_element()
     }
 
-    /// The active session's real branch name (`self.worktrees`, the same lookup
-    /// `Self::render_session_context_bar` already does - not a second copy) plus its real
+    /// The active agent's real branch name (`self.worktrees`, the same lookup
+    /// `Self::render_agent_context_bar` already does - not a second copy) plus its real
     /// `↑ahead ↓behind` from [`Self::ahead_behind_cache`] (populated by the same periodic
     /// `wt_core::diff::ahead_behind_against_base` refresh as [`Self::diff_cache`]). `None` (the
-    /// whole cluster hidden) only when there is no active session at all - a detached `HEAD`
-    /// still shows real text (`"(detached)"`), matching the session context bar's own
+    /// whole cluster hidden) only when there is no active agent at all - a detached `HEAD`
+    /// still shows real text (`"(detached)"`), matching the agent context bar's own
     /// convention, and a not-yet-computed ahead/behind is honestly omitted rather than shown as
     /// a fabricated `↑0 ↓0`.
     fn render_status_branch_cluster(&self) -> Option<gpui::AnyElement> {
-        let session = self.sessions.active()?;
+        let agent = self.agents.active()?;
         let branch = self
             .worktrees
             .iter()
-            .find(|item| item.path == session.cwd)
+            .find(|item| item.path == agent.cwd)
             .and_then(|item| item.branch.clone())
             .unwrap_or_else(|| "(detached)".to_string());
 
@@ -134,7 +134,7 @@ impl AdeApp {
             .gap(px(6.0))
             .child(self.render_status_text(branch));
 
-        if let Some(ahead_behind) = self.ahead_behind_cache.get(&session.cwd) {
+        if let Some(ahead_behind) = self.ahead_behind_cache.get(&agent.cwd) {
             row = row.child(self.render_status_text(format!(
                 "\u{2191}{} \u{2193}{}",
                 ahead_behind.ahead, ahead_behind.behind
@@ -146,21 +146,21 @@ impl AdeApp {
 
     /// Five real 5×5 radius-1 urgency-counter squares, one per [`Status`] in
     /// [`Status::ORDER`] (amber/red/green/blue/grey), each with a real count aggregated across
-    /// every currently open session - [`rail::urgency_counts`] over [`Self::build_session_rows`],
-    /// the exact same per-session status classification the rail's own urgency grouping uses
-    /// (`Self::session_status` under the hood), not a second, independent classification.
+    /// every currently open agent - [`rail::urgency_counts`] over [`Self::build_agent_rows`],
+    /// the exact same per-agent status classification the rail's own urgency grouping uses
+    /// (`Self::agent_status` under the hood), not a second, independent classification.
     ///
     /// Known, low-priority redundancy: [`Self::render_rail_list`] already calls
-    /// `build_session_rows` once earlier in the very same frame, so this is a second, real (if
+    /// `build_agent_rows` once earlier in the very same frame, so this is a second, real (if
     /// cheap - no I/O, per that method's own docs) computation of the identical rows, including,
-    /// for any [`Status::Ask`] session, a fresh `Vec<String>` allocation of that session's whole
+    /// for any [`Status::Ask`] agent, a fresh `Vec<String>` allocation of that agent's whole
     /// visible terminal grid. Not fixed here: both `Self::render_rail`/`Self::render_rail_list`
     /// and this status bar are `&self` methods (not `&mut self`), so caching this frame's rows
     /// on `self` for reuse here would need either widening several rail-render signatures to
     /// `&mut self` or a `RefCell`-style interior-mutability cache - both a more invasive
     /// restructure than this redundant-but-cheap computation is worth fixing in this pass.
     fn render_status_urgency_counters(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows = self.build_session_rows(cx);
+        let rows = self.build_agent_rows(cx);
         div().flex().items_center().gap(px(8.0)).children(
             rail::urgency_counts(&rows)
                 .into_iter()
@@ -182,8 +182,8 @@ impl AdeApp {
     }
 
     /// `N agents · X% cpu · Y GB` - agent count is a real count of currently open
-    /// [`SessionKind::Claude`]/[`SessionKind::Codex`] sessions; cpu/mem are the real,
-    /// periodically-sampled [`Self::process_stats`] aggregated across those sessions' real pids
+    /// [`AgentKind::Claude`]/[`AgentKind::Codex`] agents; cpu/mem are the real,
+    /// periodically-sampled [`Self::process_stats`] aggregated across those agents' real pids
     /// via [`process_stats::aggregate_process_stats`]. A field with no real sample known yet for
     /// *any* agent shows `...` for that one piece rather than a fabricated `0%`/`0 B` - see that
     /// function's own docs for exactly when that is: a single un-sampleable pid (e.g. a real
@@ -192,9 +192,9 @@ impl AdeApp {
     /// `agent_pids` isn't additionally filtered on `TerminalPane::is_running()`: a pid mid-EOF-
     /// poll (the routine "just exited, not yet reaped" case the aggregation fix above targets)
     /// still reports `is_running() == true` for up to `MAX_EOF_POLL_TICKS` by design, so that
-    /// filter wouldn't actually exclude the zombie pid this fix cares about. A pid whose session
+    /// filter wouldn't actually exclude the zombie pid this fix cares about. A pid whose agent
     /// has genuinely gone (`is_running() == false`) already has no pid at all
-    /// (`TerminalPane::pid` returns `None` once its `session` is cleared), so it's already
+    /// (`TerminalPane::pid` returns `None` once its `agent` is cleared), so it's already
     /// excluded by the `filter_map` below without a separate `is_running` check.
     ///
     /// CPU% is normalized to total real system capacity (0-100%) by dividing the raw,
@@ -210,15 +210,15 @@ impl AdeApp {
     /// the cpu/mem fields entirely rather than showing a `...% cpu` that can never resolve.
     #[cfg(target_os = "linux")]
     fn render_status_agents_cluster(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let agent_sessions: Vec<&Session> = self
-            .sessions
+        let agents: Vec<&Agent> = self
+            .agents
             .iter()
-            .filter(|session| matches!(session.kind, SessionKind::Claude | SessionKind::Codex))
+            .filter(|agent| matches!(agent.kind, AgentKind::Claude | AgentKind::Codex))
             .collect();
-        let agent_count = agent_sessions.len();
-        let agent_pids: Vec<u32> = agent_sessions
+        let agent_count = agents.len();
+        let agent_pids: Vec<u32> = agents
             .iter()
-            .filter_map(|session| session.pane.read(cx).pid())
+            .filter_map(|agent| agent.pane.read(cx).pid())
             .collect();
 
         let (cpu_total, rss_total) =
@@ -250,9 +250,9 @@ impl AdeApp {
     #[cfg(not(target_os = "linux"))]
     fn render_status_agents_cluster(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let agent_count = self
-            .sessions
+            .agents
             .iter()
-            .filter(|session| matches!(session.kind, SessionKind::Claude | SessionKind::Codex))
+            .filter(|agent| matches!(agent.kind, AgentKind::Claude | AgentKind::Codex))
             .count();
         self.render_status_text(format!("{agent_count} agents"))
     }
@@ -292,7 +292,7 @@ impl AdeApp {
 
     /// Whichever [`code_view::ParsedFile`] is genuinely, currently on screen in Surface C's File
     /// view - `None` whenever that's not true (Settings is open and covering the whole
-    /// workspace, a session tab is active, the Diff view is showing, or
+    /// workspace, an agent tab is active, the Diff view is showing, or
     /// [`Self::file_view_cache`] hasn't caught up with a just-opened file yet). The shared gate
     /// for every status-bar field that only makes sense for a real, currently-viewed file
     /// (`ln N`, indent width, line-ending, `UTF-8`, the diagnostics error count) - without it,
@@ -437,11 +437,11 @@ impl AdeApp {
             }))
     }
 
-    /// The real session-jump keycap hint (`secondary-1`..`secondary-8`) - reuses
-    /// [`Self::session_jump_keys`], the exact same computation `Self::render_tab_strip`'s own
+    /// The real agent-jump keycap hint (`secondary-1`..`secondary-8`) - reuses
+    /// [`Self::agent_jump_keys`], the exact same computation `Self::render_tab_strip`'s own
     /// right-aligned cluster uses, not a second copy that could drift from what's really bound.
-    fn render_status_session_hint(&self) -> impl IntoElement {
-        let jump_keys = self.session_jump_keys();
+    fn render_status_agent_hint(&self) -> impl IntoElement {
+        let jump_keys = self.agent_jump_keys();
         div()
             .flex()
             .items_center()
@@ -453,7 +453,7 @@ impl AdeApp {
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_size(self.ui_text_size(10.5))
                     .text_color(theme::text::FAINT)
-                    .child("session"),
+                    .child("agent"),
             )
     }
 

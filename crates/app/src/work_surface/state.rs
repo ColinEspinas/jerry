@@ -1,8 +1,8 @@
-//! Pure logic for Zone 2 (work surface): tab strip, session context bar, and the
+//! Pure logic for Zone 2 (work surface): tab strip, agent context bar, and the
 //! CLI/terminal pane header/footer.
 //!
 //! Deliberately GPUI-free, mirroring `crate::rail::status`'s own split: this module only maps
-//! already-known facts (a [`SessionKind`], a [`Status`], a `bool`) onto *which*
+//! already-known facts (a [`AgentKind`], a [`Status`], a `bool`) onto *which*
 //! colours/labels/actions a Zone 2 element should show, so that mapping is directly
 //! unit-testable without a live GPUI window. Turning these into actual `gpui::Div` trees (and
 //! wiring click handlers) happens one layer up, in `crate::root`, which has the
@@ -15,49 +15,49 @@ use gpui::Rgba;
 use crate::rail::status::Status;
 use crate::sidebar::file_tree::LangChip;
 use crate::theme;
-use crate::work_surface::sessions::{SessionId, SessionKind};
+use crate::work_surface::agents::{AgentId, AgentKind};
 
-/// One entry in a worktree's combined tab-strip order (GitHub issue #16) - either a session tab
-/// or a file tab. `Sessions`/`crate::root::AdeApp::open_files` remain the real storage for
+/// One entry in a worktree's combined tab-strip order (GitHub issue #16) - either an agent tab
+/// or a file tab. `Agents`/`crate::root::AdeApp::open_files` remain the real storage for
 /// *existence* and all process/buffer behaviour (spawning, closing, PTY lifecycle, edit-buffer
 /// state) - this only records where a tab sits *visually*, so the two groups can interleave in
 /// one strip instead of always rendering as two rigid blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TabRef {
-    Session(SessionId),
+    Agent(AgentId),
     File(PathBuf),
 }
 
 /// Reconciles a worktree's stored tab order (`crate::root::AdeApp::tab_order`) against what's
-/// *actually* open right now: drops any entry that no longer exists (a closed session, a closed
-/// file tab), then appends anything open that isn't in `stored` yet (a freshly spawned session,
-/// a freshly opened file) in `sessions_for_cwd`/`open_files`'s own order - the same "just append
+/// *actually* open right now: drops any entry that no longer exists (a closed agent, a closed
+/// file tab), then appends anything open that isn't in `stored` yet (a freshly spawned agent,
+/// a freshly opened file) in `agents_for_cwd`/`open_files`'s own order - the same "just append
 /// at the end" position a brand new tab has always landed at.
 ///
 /// Pure and idempotent: calling it again on its own output, with the same
-/// `sessions_for_cwd`/`open_files`, changes nothing. That's what lets
+/// `agents_for_cwd`/`open_files`, changes nothing. That's what lets
 /// `crate::root::AdeApp::combined_tab_order` call this fresh on every render instead of caching
 /// a mutated copy - only a real drag-drop (`crate::root::AdeApp::reorder_tab`) needs to persist a
 /// changed `Vec<TabRef>` back into `tab_order`.
 pub fn reconcile_tab_order(
     stored: &[TabRef],
-    sessions_for_cwd: &[SessionId],
+    agents_for_cwd: &[AgentId],
     open_files: &[PathBuf],
 ) -> Vec<TabRef> {
     let mut order: Vec<TabRef> = stored
         .iter()
         .filter(|tab_ref| match tab_ref {
-            TabRef::Session(id) => sessions_for_cwd.contains(id),
+            TabRef::Agent(id) => agents_for_cwd.contains(id),
             TabRef::File(path) => open_files.contains(path),
         })
         .cloned()
         .collect();
-    for id in sessions_for_cwd {
+    for id in agents_for_cwd {
         if !order
             .iter()
-            .any(|tab_ref| matches!(tab_ref, TabRef::Session(existing) if existing == id))
+            .any(|tab_ref| matches!(tab_ref, TabRef::Agent(existing) if existing == id))
         {
-            order.push(TabRef::Session(*id));
+            order.push(TabRef::Agent(*id));
         }
     }
     for path in open_files {
@@ -74,7 +74,7 @@ pub fn reconcile_tab_order(
 /// Moves `dragged` to sit immediately before `target` (or immediately after it, if
 /// `insert_after`) in `order` - the real backing for the unified tab strip's drag-to-reorder
 /// gesture (`crate::root::AdeApp::reorder_tab`), used regardless of whether `dragged`/`target`
-/// are the same kind (`TabRef::Session`/`TabRef::File`) or not, which is GitHub issue #16's real
+/// are the same kind (`TabRef::Agent`/`TabRef::File`) or not, which is GitHub issue #16's real
 /// "any tab can cross into either group" ask - there is no separate per-kind reorder function to
 /// keep in sync. A no-op if either entry is missing from `order`, or if they're the same entry.
 pub fn move_tab_order(
@@ -114,26 +114,26 @@ pub const TRANSPARENT: Rgba = Rgba {
     a: 0.0,
 };
 
-/// The agent tint `(fg, bg)` for a session's badge/chip. [`SessionKind::Shell`] isn't an agent,
+/// The agent tint `(fg, bg)` for an agent's badge/chip. [`AgentKind::Shell`] isn't an agent,
 /// so it gets a neutral chip instead of an invented tint.
-pub fn agent_tint(kind: SessionKind) -> (Rgba, Rgba) {
+pub fn agent_tint(kind: AgentKind) -> (Rgba, Rgba) {
     match kind {
-        SessionKind::Claude => (theme::agent::SONNET.0.into(), theme::agent::SONNET.1.into()),
-        SessionKind::Codex => (theme::agent::CODEX.0.into(), theme::agent::CODEX.1.into()),
-        SessionKind::Shell => (theme::text::DIM.into(), theme::surface::CHIP_NEUTRAL.into()),
+        AgentKind::Claude => (theme::agent::SONNET.0.into(), theme::agent::SONNET.1.into()),
+        AgentKind::Codex => (theme::agent::CODEX.0.into(), theme::agent::CODEX.1.into()),
+        AgentKind::Shell => (theme::text::DIM.into(), theme::surface::CHIP_NEUTRAL.into()),
     }
 }
 
 /// The agent badge's single-character initial.
-pub fn agent_initial(kind: SessionKind) -> &'static str {
+pub fn agent_initial(kind: AgentKind) -> &'static str {
     match kind {
-        SessionKind::Claude => "C",
-        SessionKind::Codex => "X",
-        SessionKind::Shell => "$",
+        AgentKind::Claude => "C",
+        AgentKind::Codex => "X",
+        AgentKind::Shell => "$",
     }
 }
 
-/// Which of the tab strip's two chip shapes a session's tab draws: agent CLI gets a `❯` glyph,
+/// Which of the tab strip's two chip shapes an agent's tab draws: agent CLI gets a `❯` glyph,
 /// terminal gets the pane glyph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabChipKind {
@@ -141,10 +141,10 @@ pub enum TabChipKind {
     Term,
 }
 
-pub fn tab_chip_kind(kind: SessionKind) -> TabChipKind {
+pub fn tab_chip_kind(kind: AgentKind) -> TabChipKind {
     match kind {
-        SessionKind::Claude | SessionKind::Codex => TabChipKind::Cli,
-        SessionKind::Shell => TabChipKind::Term,
+        AgentKind::Claude | AgentKind::Codex => TabChipKind::Cli,
+        AgentKind::Shell => TabChipKind::Term,
     }
 }
 
@@ -156,7 +156,7 @@ pub struct ChipColors {
     pub fg: Rgba,
 }
 
-pub fn tab_chip_colors(kind: SessionKind, active: bool) -> ChipColors {
+pub fn tab_chip_colors(kind: AgentKind, active: bool) -> ChipColors {
     if active {
         let (fg, bg) = agent_tint(kind);
         ChipColors { bg, fg }
@@ -169,7 +169,7 @@ pub fn tab_chip_colors(kind: SessionKind, active: bool) -> ChipColors {
 }
 
 /// A file tab's chip colours - the file's language chip when active, dimmed to the exact same
-/// `bg`/`fg` [`tab_chip_colors`] dims a session tab's chip to when inactive.
+/// `bg`/`fg` [`tab_chip_colors`] dims an agent tab's chip to when inactive.
 pub fn file_tab_chip_colors(lang: LangChip, active: bool) -> ChipColors {
     if active {
         ChipColors {
@@ -211,8 +211,8 @@ pub fn tab_colors(active: bool) -> TabColors {
 }
 
 /// The CLI/terminal pane header's pty-state text (`attached · waiting on stdin` / `attached ·
-/// streaming` / `exited N` / `not started`). This app has no detach/resume concept (a session is
-/// exactly one live process for its whole lifetime - see `crate::work_surface::sessions`), so a `detached ·
+/// streaming` / `exited N` / `not started`). This app has no detach/resume concept (an agent is
+/// exactly one live process for its whole lifetime - see `crate::work_surface::agents`), so a `detached ·
 /// resumable` state is never produced. Reads the same `is_running`/exit-code facts
 /// `crate::rail::status::derive_status` consumes, rather than a second heuristic that could drift from
 /// the status pill shown right next to it.
@@ -291,19 +291,19 @@ pub fn action_button_colors(style: ActionStyle) -> ActionColors {
 /// clickable but silently does nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
-    /// Sends a `Ctrl-C` to the session's pty (`TerminalPane::interrupt`).
+    /// Sends a `Ctrl-C` to the agent's pty (`TerminalPane::interrupt`).
     Interrupt,
-    /// Finds-or-spawns a `Shell` session in the same cwd and selects it.
+    /// Finds-or-spawns a `Shell` agent in the same cwd and selects it.
     OpenTerminal,
-    /// Closes this tab and spawns a fresh session of the same kind/cwd - an approximate
-    /// stand-in for `Retry`/`Resume` (this app has no saved-session resumability to actually
+    /// Closes this tab and spawns a fresh agent of the same kind/cwd - an approximate
+    /// stand-in for `Retry`/`Resume` (this app has no saved-agent resumability to actually
     /// resume *from* - see [`pty_state_label`] on the same gap).
     Respawn,
-    /// Closes this tab (`Sessions::close`) - the same action as the context bar's own `Archive`
+    /// Closes this tab (`Agents::close`) - the same action as the context bar's own `Archive`
     /// button.
     Archive,
     /// `crate::worktree_history::flow::AdeApp::keep_all_changes` (Revision R10): a real,
-    /// undoable `wt_core::undo::commit_all_changes` on this session's worktree.
+    /// undoable `wt_core::undo::commit_all_changes` on this agent's worktree.
     KeepAllChanges,
     /// `crate::worktree_history::flow::AdeApp::request_discard_worktree` (Revision R10): a real
     /// `wt_core::undo::discard_worktree`, behind the same two-click confirmation as the rail
@@ -326,7 +326,7 @@ pub struct FooterAction {
     pub keycap: Option<&'static str>,
     pub style: ActionStyle,
     /// Whether this action kind has real backing logic wired up at all (a *static* fact,
-    /// independent of this session's current state - the render call site layers further,
+    /// independent of this agent's current state - the render call site layers further,
     /// state-dependent enablement on top of this). `false` always means rendered dimmed and
     /// non-interactive, never a clickable-looking no-op.
     pub implemented: bool,
@@ -461,9 +461,9 @@ mod tests {
 
     #[test]
     fn agent_kinds_get_the_cli_chip_and_shell_gets_the_terminal_chip() {
-        assert_eq!(tab_chip_kind(SessionKind::Claude), TabChipKind::Cli);
-        assert_eq!(tab_chip_kind(SessionKind::Codex), TabChipKind::Cli);
-        assert_eq!(tab_chip_kind(SessionKind::Shell), TabChipKind::Term);
+        assert_eq!(tab_chip_kind(AgentKind::Claude), TabChipKind::Cli);
+        assert_eq!(tab_chip_kind(AgentKind::Codex), TabChipKind::Cli);
+        assert_eq!(tab_chip_kind(AgentKind::Shell), TabChipKind::Term);
     }
 
     fn same(a: Rgba, b: Rgba) -> bool {
@@ -472,8 +472,8 @@ mod tests {
 
     #[test]
     fn an_active_cli_chip_is_tinted_with_its_own_agent_colour_not_a_shared_default() {
-        let claude = tab_chip_colors(SessionKind::Claude, true);
-        let codex = tab_chip_colors(SessionKind::Codex, true);
+        let claude = tab_chip_colors(AgentKind::Claude, true);
+        let codex = tab_chip_colors(AgentKind::Codex, true);
         assert!(
             !same(claude.bg, codex.bg),
             "two different agents must not share a tab chip colour"
@@ -496,22 +496,22 @@ mod tests {
     }
 
     #[test]
-    fn an_inactive_file_tab_chip_is_dimmed_to_the_same_neutral_a_session_tab_chip_uses() {
+    fn an_inactive_file_tab_chip_is_dimmed_to_the_same_neutral_a_agent_tab_chip_uses() {
         let rs = LangChip {
             label: "rs",
             fg: theme::lang::RS.0.into(),
             bg: theme::lang::RS.1.into(),
         };
         let file_colors = file_tab_chip_colors(rs, false);
-        let session_colors = tab_chip_colors(SessionKind::Shell, false);
-        assert!(same(file_colors.bg, session_colors.bg));
-        assert!(same(file_colors.fg, session_colors.fg));
+        let agent_colors = tab_chip_colors(AgentKind::Shell, false);
+        assert!(same(file_colors.bg, agent_colors.bg));
+        assert!(same(file_colors.fg, agent_colors.fg));
     }
 
     #[test]
     fn an_inactive_chip_is_always_dimmed_to_the_same_neutral_regardless_of_kind() {
-        let claude = tab_chip_colors(SessionKind::Claude, false);
-        let shell = tab_chip_colors(SessionKind::Shell, false);
+        let claude = tab_chip_colors(AgentKind::Claude, false);
+        let shell = tab_chip_colors(AgentKind::Shell, false);
         assert!(same(claude.bg, shell.bg));
         assert!(same(claude.fg, shell.fg));
         assert!(same(claude.bg, theme::border::ZONE.into()));
@@ -557,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn a_running_and_recently_active_session_reports_streaming() {
+    fn a_running_and_recently_active_agent_reports_streaming() {
         assert_eq!(
             pty_state_label(true, Status::Run, None),
             "attached \u{b7} streaming"
@@ -646,12 +646,12 @@ mod tests {
         }
     }
 
-    /// A fresh worktree (nothing dragged yet) must render its sessions first, in creation order,
+    /// A fresh worktree (nothing dragged yet) must render its agents first, in creation order,
     /// then its file tabs, in `open_files`' own order - exactly the old two-block layout, so this
     /// revision's interleaving layer is a strict superset of the old behaviour, not a visible
     /// change until a real drag happens.
     #[test]
-    fn reconcile_with_no_stored_order_appends_sessions_then_files_in_their_own_order() {
+    fn reconcile_with_no_stored_order_appends_agents_then_files_in_their_own_order() {
         let order = reconcile_tab_order(
             &[],
             &[1, 2],
@@ -660,8 +660,8 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                TabRef::Session(1),
-                TabRef::Session(2),
+                TabRef::Agent(1),
+                TabRef::Agent(2),
                 TabRef::File(PathBuf::from("a.rs")),
                 TabRef::File(PathBuf::from("b.rs")),
             ]
@@ -669,71 +669,71 @@ mod tests {
     }
 
     /// The real interleaving case (GitHub issue #16): a stored order with a file tab sitting
-    /// between two session tabs must survive reconciliation unchanged, as long as every entry in
+    /// between two agent tabs must survive reconciliation unchanged, as long as every entry in
     /// it still exists.
     #[test]
     fn reconcile_preserves_a_stored_interleaved_order() {
         let stored = vec![
-            TabRef::Session(1),
+            TabRef::Agent(1),
             TabRef::File(PathBuf::from("a.rs")),
-            TabRef::Session(2),
+            TabRef::Agent(2),
         ];
         let order = reconcile_tab_order(&stored, &[1, 2], &[PathBuf::from("a.rs")]);
         assert_eq!(order, stored);
     }
 
-    /// A session closed (or a file tab closed) since the order was last stored must be dropped,
+    /// A agent closed (or a file tab closed) since the order was last stored must be dropped,
     /// not left as a dangling reference to something `crate::root::AdeApp::render_tab_strip`
     /// would otherwise try to render.
     #[test]
     fn reconcile_drops_entries_that_no_longer_exist() {
         let stored = vec![
-            TabRef::Session(1),
+            TabRef::Agent(1),
             TabRef::File(PathBuf::from("a.rs")),
-            TabRef::Session(2),
+            TabRef::Agent(2),
         ];
         let order = reconcile_tab_order(&stored, &[2], &[]);
-        assert_eq!(order, vec![TabRef::Session(2)]);
+        assert_eq!(order, vec![TabRef::Agent(2)]);
     }
 
-    /// A brand new session/file not yet in the stored order must be appended at the end, never
+    /// A brand new agent/file not yet in the stored order must be appended at the end, never
     /// silently dropped or inserted somewhere the user never asked for.
     #[test]
     fn reconcile_appends_newly_opened_tabs_not_yet_in_the_stored_order() {
-        let stored = vec![TabRef::Session(1)];
+        let stored = vec![TabRef::Agent(1)];
         let order = reconcile_tab_order(&stored, &[1, 2], &[PathBuf::from("a.rs")]);
         assert_eq!(
             order,
             vec![
-                TabRef::Session(1),
-                TabRef::Session(2),
+                TabRef::Agent(1),
+                TabRef::Agent(2),
                 TabRef::File(PathBuf::from("a.rs")),
             ]
         );
     }
 
     /// The real cross-kind drag this revision exists to unlock: dropping a file tab so it lands
-    /// immediately before a session tab must actually interleave them, not just reorder within
+    /// immediately before an agent tab must actually interleave them, not just reorder within
     /// each tab's own kind.
     #[test]
-    fn move_tab_order_drops_a_file_tab_before_a_session_tab() {
+    fn move_tab_order_drops_a_file_tab_before_a_agent_tab() {
         let mut order = vec![
-            TabRef::Session(1),
-            TabRef::Session(2),
+            TabRef::Agent(1),
+            TabRef::Agent(2),
             TabRef::File(PathBuf::from("a.rs")),
         ];
         move_tab_order(
             &mut order,
             &TabRef::File(PathBuf::from("a.rs")),
-            &TabRef::Session(2),
+            &TabRef::Agent(2),
             false,
         );
         assert_eq!(
             order,
             vec![
-                TabRef::Session(1),
+                TabRef::Agent(1),
                 TabRef::File(PathBuf::from("a.rs")),
-                TabRef::Session(2),
+                TabRef::Agent(2),
             ]
         );
     }
@@ -743,11 +743,11 @@ mod tests {
     /// half of the hovered tab) is for.
     #[test]
     fn move_tab_order_respects_insert_after() {
-        let mut order = vec![TabRef::Session(1), TabRef::Session(2), TabRef::Session(3)];
-        move_tab_order(&mut order, &TabRef::Session(1), &TabRef::Session(2), true);
+        let mut order = vec![TabRef::Agent(1), TabRef::Agent(2), TabRef::Agent(3)];
+        move_tab_order(&mut order, &TabRef::Agent(1), &TabRef::Agent(2), true);
         assert_eq!(
             order,
-            vec![TabRef::Session(2), TabRef::Session(1), TabRef::Session(3)]
+            vec![TabRef::Agent(2), TabRef::Agent(1), TabRef::Agent(3)]
         );
     }
 
@@ -755,11 +755,11 @@ mod tests {
     /// an unknown dragged entry, or an unknown target must all be real no-ops.
     #[test]
     fn move_tab_order_is_a_no_op_for_an_unknown_or_identical_entry() {
-        let original = vec![TabRef::Session(1), TabRef::File(PathBuf::from("a.rs"))];
+        let original = vec![TabRef::Agent(1), TabRef::File(PathBuf::from("a.rs"))];
         let mut order = original.clone();
-        move_tab_order(&mut order, &TabRef::Session(1), &TabRef::Session(1), false);
-        move_tab_order(&mut order, &TabRef::Session(99), &TabRef::Session(1), false);
-        move_tab_order(&mut order, &TabRef::Session(1), &TabRef::Session(99), false);
+        move_tab_order(&mut order, &TabRef::Agent(1), &TabRef::Agent(1), false);
+        move_tab_order(&mut order, &TabRef::Agent(99), &TabRef::Agent(1), false);
+        move_tab_order(&mut order, &TabRef::Agent(1), &TabRef::Agent(99), false);
         assert_eq!(order, original);
     }
 }

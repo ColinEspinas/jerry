@@ -6,7 +6,7 @@
 //!
 //! - [`render`] - the band itself: the macOS traffic-light cluster, the Windows/Linux
 //!   caption buttons, and the left/right cluster composition.
-//! - [`menu`] - the Windows/Linux `File Edit View Session Help` dropdowns: which rows each
+//! - [`menu`] - the Windows/Linux `File Edit View Agent Help` dropdowns: which rows each
 //!   one offers and what real `AdeApp` method each row calls.
 //!
 //! Both glob-import this module (`use super::*`), which is why the shared imports they need
@@ -27,7 +27,7 @@ use crate::settings::state as settings;
 use crate::theme;
 use crate::title_bar::menu::TitleMenu;
 #[cfg(test)]
-use crate::work_surface::sessions::{SessionId, SessionKind};
+use crate::work_surface::agents::{AgentId, AgentKind};
 use crate::work_surface::state as work_surface;
 use crate::worktree_history::flow as worktree_history;
 #[cfg(test)]

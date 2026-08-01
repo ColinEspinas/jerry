@@ -734,7 +734,7 @@ fn build_highlight_config(
 /// as - but it makes the first request for *any* grammar compile *all four*. That cost is not
 /// hypothetical and it does not always land on a background thread: `CodeView::Diff` is the
 /// default view, and `crate::code_surface`'s `ensure_diff_highlight_cache` calls into here
-/// synchronously on the main thread, so opening the first `.rs` diff of a session paid the
+/// synchronously on the main thread, so opening the first `.rs` diff of an agent paid the
 /// TypeScript, TSX *and* Python query-compile cost for grammars that diff would never use. Per-
 /// grammar slots mean a `.rs` file pays for Rust only.
 ///

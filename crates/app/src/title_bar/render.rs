@@ -1,6 +1,6 @@
 //! The title-bar band itself: the macOS traffic-light cluster, the Windows/Linux caption
 //! buttons (minimise/maximise/close), and the left/right cluster composition around them.
-//! The five `File Edit View Session Help` dropdowns those labels open live in
+//! The five `File Edit View Agent Help` dropdowns those labels open live in
 //! [`super::menu`].
 
 use super::*;

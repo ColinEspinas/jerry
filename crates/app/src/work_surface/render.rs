@@ -5,11 +5,11 @@ use crate::root::widgets::{
 };
 use gpui::DragMoveEvent;
 
-/// Defines one `JumpToSessionN` action handler forwarding a literal position to
-/// [`AdeApp::jump_to_session_at`]. Each `actions!`-generated struct is a distinct action type
+/// Defines one `JumpToAgentN` action handler forwarding a literal position to
+/// [`AdeApp::jump_to_agent_at`]. Each `actions!`-generated struct is a distinct action type
 /// with no positional data, so GPUI needs one `on_action` handler per keystroke regardless; this
 /// macro just keeps the eight near-identical bodies from drifting from each other.
-macro_rules! session_jump_action_handler {
+macro_rules! agent_jump_action_handler {
     ($fn_name:ident, $action:ty, $position:expr) => {
         pub(crate) fn $fn_name(
             &mut self,
@@ -17,65 +17,65 @@ macro_rules! session_jump_action_handler {
             window: &mut Window,
             cx: &mut Context<Self>,
         ) {
-            self.jump_to_session_at($position, window, cx);
+            self.jump_to_agent_at($position, window, cx);
         }
     };
 }
 
 impl AdeApp {
-    pub(crate) fn new_session(
+    pub(crate) fn new_agent(
         &mut self,
-        kind: SessionKind,
+        kind: AgentKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cwd = self.active_session_cwd();
-        self.sessions.spawn(
+        let cwd = self.active_agent_cwd();
+        self.agents.spawn(
             kind,
             cwd,
             self.settings.appearance.terminal_font_size,
             window,
             cx,
         );
-        self.focus_newly_spawned_session(window, cx);
+        self.focus_newly_spawned_agent(window, cx);
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
         cx.notify();
     }
 
-    /// Moves focus onto the session [`Sessions::spawn`] just made active - but only when neither
+    /// Moves focus onto the agent [`Agents::spawn`] just made active - but only when neither
     /// a file tab ([`Self::render_center_pane`] renders the file tab in that case, not a
-    /// session's `TerminalPane`) nor Settings ([`Self::settings_open`] - Settings replaces the
-    /// entire workspace body, per `crate::root::mod`'s own docs, so no session's pane is
+    /// agent's `TerminalPane`) nor Settings ([`Self::settings_open`] - Settings replaces the
+    /// entire workspace body, per `crate::root::mod`'s own docs, so no agent's pane is
     /// rendered anywhere while it's showing) is occupying the centre pane instead, since focusing
-    /// a session's pane while either is true would point `Window::focus` at a node nothing in the
-    /// rendered tree tracks. Reachable with Settings open via the title bar's Session menu (New
+    /// an agent's pane while either is true would point `Window::focus` at a node nothing in the
+    /// rendered tree tracks. Reachable with Settings open via the title bar's Agent menu (New
     /// Terminal/New Agent Pane), which is an unconditional sibling of the Settings/workspace-body
     /// swap.
-    pub(crate) fn focus_newly_spawned_session(
+    pub(crate) fn focus_newly_spawned_agent(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.open_change.is_none() && !self.settings_open {
-            self.sessions.focus_active(window, cx);
+            self.agents.focus_active(window, cx);
         }
     }
 
-    pub(crate) fn handle_new_session_action(
+    pub(crate) fn handle_new_agent_action(
         &mut self,
-        _action: &NewSession,
+        _action: &NewAgent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.new_session(SessionKind::Shell, window, cx);
+        self.new_agent(AgentKind::Shell, window, cx);
     }
 
     /// `Ctrl+W` (GitHub issue #26) - closes whichever tab the centre pane is genuinely showing
     /// right now: a file tab (via [`crate::code_surface::tabs::AdeApp::request_close_file_tab`],
     /// the real unsaved-changes-confirming entry point every other close gesture already uses) if
-    /// [`AdeApp::open_change`] is `Some`, else the globally active session tab (via
-    /// [`Self::close_session`], which already tears down its real child process cleanly - SIGHUP,
+    /// [`AdeApp::open_change`] is `Some`, else the globally active agent tab (via
+    /// [`Self::close_agent`], which already tears down its real child process cleanly - SIGHUP,
     /// a bounded grace period, then `SIGKILL` - see `pty_core::PtySession::shutdown`'s own docs;
     /// nothing here reimplements that). A genuine no-op, never a window close, whenever there is
     /// no real tab to close: Settings is showing over the workspace body (`AdeApp::settings_open`,
@@ -106,25 +106,25 @@ impl AdeApp {
             self.request_close_file_tab(path, window, cx);
             return;
         }
-        if let Some(id) = self.sessions.active_id() {
-            self.close_session(id, window, cx);
+        if let Some(id) = self.agents.active_id() {
+            self.close_agent(id, window, cx);
             cx.notify();
         }
     }
 
-    /// Activates session `id`'s tab and, if it maps to a currently-listed worktree, also selects
-    /// that worktree, keeping the file tree/diff sidebar in sync with the session just clicked
-    /// (the sidebar is still driven by [`Self::selected`] - a `focused_session`-driven Zone 2/3
+    /// Activates agent `id`'s tab and, if it maps to a currently-listed worktree, also selects
+    /// that worktree, keeping the file tree/diff sidebar in sync with the agent just clicked
+    /// (the sidebar is still driven by [`Self::selected`] - a `focused_agent`-driven Zone 2/3
     /// hasn't been rebuilt yet). If a file tab was active, this deactivates it
     /// (`Self::open_change = None`, without closing it - it stays in [`Self::open_files`]) and
-    /// restores focus onto the session's pane via [`restore_focus`].
-    pub(crate) fn select_session(
+    /// restores focus onto the agent's pane via [`restore_focus`].
+    pub(crate) fn select_agent(
         &mut self,
-        id: SessionId,
+        id: AgentId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.sessions.set_active(id, cx);
+        self.agents.set_active(id, cx);
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
         if self.open_change.is_some() {
@@ -136,22 +136,22 @@ impl AdeApp {
             self.dismiss_completions();
             if self.settings_open {
                 // Settings is showing over the whole workspace body right now (reachable here
-                // via the title bar's Session menu cycle rows/Archive Session, unconditional
+                // via the title bar's Agent menu cycle rows/Archive Agent, unconditional
                 // siblings of the Settings/workspace-body swap) - real focus already correctly
                 // lives on `settings_focus_handle`. Discard the captured pre-file-tab target
-                // rather than restoring it onto a session pane `Self::render_settings` isn't
+                // rather than restoring it onto an agent pane `Self::render_settings` isn't
                 // drawing, mirroring `Self::close_palette`'s identical Settings-aware branch
                 // (`self.palette_focus.clear()`).
                 self.code_focus.clear();
             } else {
-                restore_focus(&self.sessions, &mut self.code_focus, window, cx);
+                restore_focus(&self.agents, &mut self.code_focus, window, cx);
             }
         }
         let cwd = self
-            .sessions
+            .agents
             .iter()
-            .find(|session| session.id == id)
-            .map(|session| session.cwd.clone());
+            .find(|agent| agent.id == id)
+            .map(|agent| agent.cwd.clone());
         if let Some(cwd) = cwd {
             if let Some(index) = self.worktrees.iter().position(|item| item.path == cwd) {
                 if self.selected != Some(index) {
@@ -163,12 +163,12 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Derives the [`Status`] for a live session - the single source of truth both
-    /// [`Self::build_session_rows`] (the rail) and the work surface (status pill, pane header/
-    /// footer) read, so the rail and the work surface can never disagree about a session's
+    /// Derives the [`Status`] for a live agent - the single source of truth both
+    /// [`Self::build_agent_rows`] (the rail) and the work surface (status pill, pane header/
+    /// footer) read, so the rail and the work surface can never disagree about an agent's
     /// status.
-    pub(crate) fn session_status(&self, session: &Session, cx: &App) -> Status {
-        let pane = session.pane.read(cx);
+    pub(crate) fn agent_status(&self, agent: &Agent, cx: &App) -> Status {
+        let pane = agent.pane.read(cx);
         let signal = if pane.is_running() {
             status::ProcessSignal::Running {
                 idle: pane.idle_duration().unwrap_or_default(),
@@ -186,121 +186,111 @@ impl AdeApp {
         };
         let has_diff = self
             .diff_cache
-            .get(&session.cwd)
+            .get(&agent.cwd)
             .map(|summary| summary.has_changes)
             .unwrap_or(false);
-        status::derive_status(session.kind, signal, has_diff)
+        status::derive_status(agent.kind, signal, has_diff)
     }
 
     /// The context bar's and idle-status footer's `Archive` action - closes the tab via
-    /// [`Self::close_session`] (see that method's docs for why every close path must go through
-    /// it rather than `Sessions::close` directly).
-    pub(crate) fn archive_session(
+    /// [`Self::close_agent`] (see that method's docs for why every close path must go through
+    /// it rather than `Agents::close` directly).
+    pub(crate) fn archive_agent(
         &mut self,
-        id: SessionId,
+        id: AgentId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.close_session(id, window, cx);
+        self.close_agent(id, window, cx);
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
         cx.notify();
     }
 
-    /// Closes session `id`'s tab (`Sessions::close` tears down its child process and moves focus
-    /// onto whichever session becomes active) and, if `id` is the session whose `Merge` click
+    /// Closes agent `id`'s tab (`Agents::close` tears down its child process and moves focus
+    /// onto whichever agent becomes active) and, if `id` is the agent whose `Merge` click
     /// started [`Self::merge_flow`], cleans that up too (see
-    /// [`Self::clear_merge_flow_for_closed_session`]).
+    /// [`Self::clear_merge_flow_for_closed_agent`]).
     ///
-    /// Every close path - [`Self::archive_session`], [`Self::respawn_session`]'s
+    /// Every close path - [`Self::archive_agent`], [`Self::respawn_agent`]'s
     /// close-then-respawn, and the tab strip's own `×` - must go through this function rather
-    /// than `Sessions::close` directly: previously only `archive_session` cleared `merge_flow`,
-    /// so archiving (or retrying) a mid-merge session left `merge_flow.session_id` pointing at a
-    /// session that no longer existed, permanently disabling the `Merge` button for every
-    /// session (`Self::render_merge_button`'s disabled check never cleared).
+    /// than `Agents::close` directly: previously only `archive_agent` cleared `merge_flow`,
+    /// so archiving (or retrying) a mid-merge agent left `merge_flow.agent_id` pointing at a
+    /// agent that no longer existed, permanently disabling the `Merge` button for every
+    /// agent (`Self::render_merge_button`'s disabled check never cleared).
     ///
-    /// Tells `Sessions::close` to skip its own focus move whenever the centre pane isn't
-    /// actually showing a session's pane right now - a file tab is open, *or* Settings has
-    /// replaced the whole workspace body (`Self::settings_open`, see the title bar's Session
-    /// menu docs - Archive Session is reachable from there while Settings is showing, and
+    /// Tells `Agents::close` to skip its own focus move whenever the centre pane isn't
+    /// actually showing an agent's pane right now - a file tab is open, *or* Settings has
+    /// replaced the whole workspace body (`Self::settings_open`, see the title bar's Agent
+    /// menu docs - Archive Agent is reachable from there while Settings is showing, and
     /// moving focus onto a pane `Self::render_settings` isn't drawing would dangle it exactly
     /// like the file-tab case this guard already covered).
     ///
-    /// If closing `id` leaves its worktree with no session at all (and no file tab either), real
+    /// If closing `id` leaves its worktree with no agent at all (and no file tab either), real
     /// keyboard focus falls back onto [`Self::rail_focus_handle`] - the same fallback
     /// [`Self::select_worktree`] uses for the identical "nothing left to focus" case - so
     /// `Window::focus` never stays pointed at the just-`shutdown()`, no-longer-rendered pane. The
     /// rail's *root*, not its filter field (which this used to target): see
     /// [`Self::rail_focus_handle`]'s own docs for the real keystroke-swallowing bug that was.
-    pub(crate) fn close_session(
-        &mut self,
-        id: SessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn close_agent(&mut self, id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
         let skip_focus_move = self.open_change.is_some() || self.settings_open;
-        self.sessions.close(id, skip_focus_move, window, cx);
+        self.agents.close(id, skip_focus_move, window, cx);
         if self
             .merge_flow
             .as_ref()
-            .is_some_and(|flow| flow.session_id == id)
+            .is_some_and(|flow| flow.agent_id == id)
         {
-            self.clear_merge_flow_for_closed_session(cx);
+            self.clear_merge_flow_for_closed_agent(cx);
         }
-        if self.sessions.active_id().is_none() && self.open_change.is_none() && !self.settings_open
-        {
+        if self.agents.active_id().is_none() && self.open_change.is_none() && !self.settings_open {
             window.focus(&self.rail_focus_handle, cx);
         }
     }
 
-    /// The surface footer's `Interrupt ⌃C` action - sends `Ctrl-C` to the session's pty via
+    /// The surface footer's `Interrupt ⌃C` action - sends `Ctrl-C` to the agent's pty via
     /// `TerminalPane::interrupt`.
-    pub(in crate::work_surface) fn interrupt_session(
-        &mut self,
-        id: SessionId,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
+    pub(in crate::work_surface) fn interrupt_agent(&mut self, id: AgentId, cx: &mut Context<Self>) {
+        let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
             return;
         };
-        let pane = session.pane.clone();
+        let pane = agent.pane.clone();
         pane.update(cx, |pane, cx| pane.interrupt(cx));
     }
 
-    /// The surface footer's `Retry ⌘R` (failed sessions) / `Resume ⌘⏎` (idle sessions) action.
-    /// This app has no saved-session resumability to resume *from* (see
+    /// The surface footer's `Retry ⌘R` (failed agents) / `Resume ⌘⏎` (idle agents) action.
+    /// This app has no saved-agent resumability to resume *from* (see
     /// `crate::work_surface::state::pty_state_label`'s docs), so the honest equivalent is: close this
-    /// tab, then spawn a fresh session of the same kind into the same worktree - not literally
+    /// tab, then spawn a fresh agent of the same kind into the same worktree - not literally
     /// "resume where it left off" (`crate::work_surface::state::ActionKind::Respawn`'s docs name this
     /// trade-off).
-    pub(in crate::work_surface) fn respawn_session(
+    pub(in crate::work_surface) fn respawn_agent(
         &mut self,
-        id: SessionId,
+        id: AgentId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
+        let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
             return;
         };
-        let kind = session.kind;
-        let cwd = session.cwd.clone();
-        self.close_session(id, window, cx);
-        self.sessions.spawn(
+        let kind = agent.kind;
+        let cwd = agent.cwd.clone();
+        self.close_agent(id, window, cx);
+        self.agents.spawn(
             kind,
             cwd,
             self.settings.appearance.terminal_font_size,
             window,
             cx,
         );
-        self.focus_newly_spawned_session(window, cx);
+        self.focus_newly_spawned_agent(window, cx);
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
         cx.notify();
     }
 
-    /// The surface footer's `Open terminal` action - selects an already-open `Shell` session in
-    /// the same worktree, or spawns one if none exists. Each session is its own independent tab/
-    /// process (`crate::work_surface::sessions`'s module docs), so "open terminal" just means "get me a shell
+    /// The surface footer's `Open terminal` action - selects an already-open `Shell` agent in
+    /// the same worktree, or spawns one if none exists. Each agent is its own independent tab/
+    /// process (`crate::work_surface::agents`'s module docs), so "open terminal" just means "get me a shell
     /// in this worktree", the same capability as the rail's "+ New Shell" button.
     pub(in crate::work_surface) fn open_companion_terminal(
         &mut self,
@@ -309,21 +299,21 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let existing = self
-            .sessions
+            .agents
             .iter()
-            .find(|session| session.kind == SessionKind::Shell && session.cwd == cwd)
-            .map(|session| session.id);
+            .find(|agent| agent.kind == AgentKind::Shell && agent.cwd == cwd)
+            .map(|agent| agent.id);
         match existing {
-            Some(id) => self.select_session(id, window, cx),
+            Some(id) => self.select_agent(id, window, cx),
             None => {
-                self.sessions.spawn(
-                    SessionKind::Shell,
+                self.agents.spawn(
+                    AgentKind::Shell,
                     cwd,
                     self.settings.appearance.terminal_font_size,
                     window,
                     cx,
                 );
-                self.focus_newly_spawned_session(window, cx);
+                self.focus_newly_spawned_agent(window, cx);
                 self.prune_confirm_armed = false;
                 self.discard_confirm_armed = None;
                 cx.notify();
@@ -331,33 +321,33 @@ impl AdeApp {
         }
     }
 
-    /// The active worktree's real combined tab order (GitHub issue #16) - every session and file
+    /// The active worktree's real combined tab order (GitHub issue #16) - every agent and file
     /// tab currently open in it, interleaved exactly as [`Self::render_tab_strip`] draws them,
-    /// instead of always "every session, then every file". Reconciled fresh from
+    /// instead of always "every agent, then every file". Reconciled fresh from
     /// [`Self::tab_order`]'s stored order plus whatever's *actually* open right now
     /// (`work_surface::state::reconcile_tab_order`'s own docs on why this is safe to call on
     /// every render rather than caching a mutated copy) - [`Self::tab_order`] itself only records
-    /// a user's real drag-chosen order, never which tabs exist; that's still `Sessions`/
+    /// a user's real drag-chosen order, never which tabs exist; that's still `Agents`/
     /// [`Self::open_files`]'s job.
     pub(crate) fn combined_tab_order(&self) -> Vec<work_surface::TabRef> {
-        let cwd = self.active_session_cwd();
+        let cwd = self.active_agent_cwd();
         let stored = self.tab_order.get(&cwd).map(Vec::as_slice).unwrap_or(&[]);
-        let session_ids: Vec<SessionId> = self
-            .sessions
+        let agent_ids: Vec<AgentId> = self
+            .agents
             .iter_for_cwd(cwd.clone())
-            .map(|session| session.id)
+            .map(|agent| agent.id)
             .collect();
-        work_surface::reconcile_tab_order(stored, &session_ids, &self.open_files)
+        work_surface::reconcile_tab_order(stored, &agent_ids, &self.open_files)
     }
 
     /// The unified tab strip's real drag-to-reorder entry point (GitHub issue #16) - moves
     /// `dragged` to sit immediately before (or, if `insert_after`, immediately after) `target` in
-    /// the active worktree's own combined tab order, regardless of whether either is a session or
+    /// the active worktree's own combined tab order, regardless of whether either is an agent or
     /// a file tab (`work_surface::state::move_tab_order`'s own docs on why this is one function,
     /// not a per-kind pair). Persists the result into [`Self::tab_order`], keyed by the active
     /// worktree's cwd, so it survives the next render's [`Self::combined_tab_order`]
-    /// reconciliation and, for session tabs, a later worktree switch away and back. Never
-    /// restarts a pty or reloads a file buffer - `Sessions`/[`Self::open_files`] themselves are
+    /// reconciliation and, for agent tabs, a later worktree switch away and back. Never
+    /// restarts a pty or reloads a file buffer - `Agents`/[`Self::open_files`] themselves are
     /// untouched; only this ordering layer changes.
     pub(in crate::work_surface) fn reorder_tab(
         &mut self,
@@ -366,14 +356,14 @@ impl AdeApp {
         insert_after: bool,
         cx: &mut Context<Self>,
     ) {
-        let cwd = self.active_session_cwd();
+        let cwd = self.active_agent_cwd();
         let mut order = self.combined_tab_order();
         work_surface::move_tab_order(&mut order, &dragged, &target, insert_after);
         self.tab_order.insert(cwd, order);
         cx.notify();
     }
 
-    /// One tab's own `on_drag_move::<DraggedTab>` handler (both [`Self::render_session_tab`] and
+    /// One tab's own `on_drag_move::<DraggedTab>` handler (both [`Self::render_agent_tab`] and
     /// [`Self::render_file_tab`] register this, each closing over its own `hovered` [`work_surface::
     /// TabRef`]) - real per-tab mouse tracking during a drag, not a container-level listener:
     /// `on_drag_move`'s own doc comment and `crate::root::scrollbar`'s module docs both confirm
@@ -407,7 +397,7 @@ impl AdeApp {
         }
     }
 
-    /// One tab's own `on_drop::<DraggedTab>` handler (both [`Self::render_session_tab`] and
+    /// One tab's own `on_drop::<DraggedTab>` handler (both [`Self::render_agent_tab`] and
     /// [`Self::render_file_tab`] register this) - reads which half of `target`'s own tab the
     /// cursor last landed on from [`Self::tab_drag_insertion`] (defaulting to "before" if the
     /// drop lands on a tab [`Self::update_tab_drag_insertion`] never actually recorded for - a
@@ -427,28 +417,26 @@ impl AdeApp {
         self.tab_drag_insertion = None;
     }
 
-    /// Every session open in the *currently selected* worktree (`Self::active_session_cwd`), in
-    /// the same order [`Self::combined_tab_order`] renders them - never Sessions' own raw
-    /// creation order once a real drag has interleaved them differently, and never every session
+    /// Every agent open in the *currently selected* worktree (`Self::active_agent_cwd`), in
+    /// the same order [`Self::combined_tab_order`] renders them - never Agents' own raw
+    /// creation order once a real drag has interleaved them differently, and never every agent
     /// across every worktree, per this revision's whole point (see `crate::root::mod`'s "One
     /// rail row per worktree" docs). The real per-worktree tab-strip order both
-    /// [`Self::render_tab_strip`] and [`Self::session_jump_keys`]/[`Self::jump_to_session_at`]
+    /// [`Self::render_tab_strip`] and [`Self::agent_jump_keys`]/[`Self::jump_to_agent_at`]
     /// share, so the tabs shown and the tabs a jump keycap can reach can never disagree.
-    pub(crate) fn current_worktree_sessions(&self) -> impl Iterator<Item = &Session> {
+    pub(crate) fn current_worktree_agents(&self) -> impl Iterator<Item = &Agent> {
         let order = self.combined_tab_order();
         order.into_iter().filter_map(move |tab_ref| match tab_ref {
-            work_surface::TabRef::Session(id) => {
-                self.sessions.iter().find(|session| session.id == id)
-            }
+            work_surface::TabRef::Agent(id) => self.agents.iter().find(|agent| agent.id == id),
             work_surface::TabRef::File(_) => None,
         })
     }
 
     /// The tab strip: one tab per entry of [`Self::combined_tab_order`], in that exact order -
-    /// [`Self::render_session_tab`] for a `TabRef::Session`, [`Self::render_file_tab`] for a
-    /// `TabRef::File` - so a session tab and a file tab can sit side by side in either order
-    /// (GitHub issue #16), rather than always "every session, then every file" - followed by the
-    /// `+` menu button ([`Self::render_tab_strip_plus`]) and right-aligned session-jump keycaps.
+    /// [`Self::render_agent_tab`] for a `TabRef::Agent`, [`Self::render_file_tab`] for a
+    /// `TabRef::File` - so an agent tab and a file tab can sit side by side in either order
+    /// (GitHub issue #16), rather than always "every agent, then every file" - followed by the
+    /// `+` menu button ([`Self::render_tab_strip_plus`]) and right-aligned agent-jump keycaps.
     pub(in crate::work_surface) fn render_tab_strip(
         &self,
         cx: &mut Context<Self>,
@@ -465,9 +453,9 @@ impl AdeApp {
 
         for tab_ref in self.combined_tab_order() {
             match tab_ref {
-                work_surface::TabRef::Session(id) => {
-                    if let Some(session) = self.sessions.iter().find(|session| session.id == id) {
-                        bar = bar.child(self.render_session_tab(session, cx));
+                work_surface::TabRef::Agent(id) => {
+                    if let Some(agent) = self.agents.iter().find(|agent| agent.id == id) {
+                        bar = bar.child(self.render_agent_tab(agent, cx));
                     }
                 }
                 work_surface::TabRef::File(path) => {
@@ -478,7 +466,7 @@ impl AdeApp {
 
         bar = bar.child(self.render_tab_strip_plus(cx));
 
-        let jump_keys = self.session_jump_keys();
+        let jump_keys = self.agent_jump_keys();
 
         bar.child(div().flex_1()).child(
             div()
@@ -493,21 +481,21 @@ impl AdeApp {
                         .font(font(theme::font::SANS))
                         .text_size(px(10.0))
                         .text_color(theme::text::PATH)
-                        .child("session"),
+                        .child("agent"),
                 ),
         )
     }
 
-    /// The real `secondary-1`..`secondary-8` session-jump keycap labels: one per session open in
-    /// the *currently selected* worktree (`Self::current_worktree_sessions`), capped at 8 since
+    /// The real `secondary-1`..`secondary-8` agent-jump keycap labels: one per agent open in
+    /// the *currently selected* worktree (`Self::current_worktree_agents`), capped at 8 since
     /// those are the only ones actually bound (`crate::default_key_bindings`) - never a keycap
     /// advertising a shortcut that silently does nothing. Shared by [`Self::render_tab_strip`]'s
-    /// own right-aligned cluster and the status bar's session hint (`status_bar::render::
-    /// render_status_session_hint`), so the two can never independently drift on what's really
+    /// own right-aligned cluster and the status bar's agent hint (`status_bar::render::
+    /// render_status_agent_hint`), so the two can never independently drift on what's really
     /// bound.
-    pub(crate) fn session_jump_keys(&self) -> Vec<String> {
-        let session_count = self.current_worktree_sessions().count().min(8);
-        (1..=session_count).map(|n| n.to_string()).collect()
+    pub(crate) fn agent_jump_keys(&self) -> Vec<String> {
+        let agent_count = self.current_worktree_agents().count().min(8);
+        (1..=agent_count).map(|n| n.to_string()).collect()
     }
 
     /// A file tab: language chip (`file_tree::lang_chip_for_name`, dimmed via
@@ -517,8 +505,8 @@ impl AdeApp {
     /// [`crate::code_surface::tabs::AdeApp::request_close_file_tab`] (never [`Self::close_file_tab`]
     /// directly - see that method's own docs for the real unsaved-changes confirmation this keeps
     /// every close gesture honest about), stopping propagation so a close never also activates
-    /// (the same pattern [`render_session_tab`]'s close button uses). Shares active/inactive bg/
-    /// underline/label colours with session tabs (`work_surface::tab_colors`).
+    /// (the same pattern [`render_agent_tab`]'s close button uses). Shares active/inactive bg/
+    /// underline/label colours with agent tabs (`work_surface::tab_colors`).
     pub(in crate::work_surface) fn render_file_tab(
         &self,
         path: &Path,
@@ -585,7 +573,7 @@ impl AdeApp {
                     this.request_close_file_tab(middle_click_path.clone(), window, cx);
                 }),
             )
-            // Real drag-to-reorder, unified across session and file tabs (GitHub issue #16) -
+            // Real drag-to-reorder, unified across agent and file tabs (GitHub issue #16) -
             // see `DraggedTab`'s own docs for the shared mechanism.
             .on_drag(drag_value, |dragged, _position, _window, cx| {
                 cx.new(|_| dragged.clone())
@@ -686,7 +674,7 @@ impl AdeApp {
 
     /// The tab strip's `+` menu button - toggles [`Self::plus_menu_open`] (unconditionally
     /// spawning a shell is the rail's separate `+` -
-    /// [`crate::rail::render::render_new_session_button`]). A `gpui::canvas` child captures
+    /// [`crate::rail::render::render_new_agent_button`]). A `gpui::canvas` child captures
     /// this button's painted bounds into [`Self::plus_button_bounds`] every render, which
     /// [`Self::render_plus_menu`] positions the popover off of. Opening the menu also refreshes
     /// [`Self::load_agent_rows`], so the "New agent pane" row's sub-label
@@ -747,7 +735,7 @@ impl AdeApp {
     /// the panel stops that click from bubbling up (`cx.stop_propagation()`). Positioned off
     /// [`Self::plus_button_bounds`].
     ///
-    /// Five rows: *New terminal* ([`Self::new_session`] with [`SessionKind::Shell`]), *New file*
+    /// Five rows: *New terminal* ([`Self::new_agent`] with [`AgentKind::Shell`]), *New file*
     /// ([`Self::start_new_file`]), *New agent pane* ([`Self::new_agent_pane`]), *Open file…*
     /// ([`Self::open_palette`], scoped to [`palette::PaletteScope::Files`]), and *Next changed
     /// file* ([`Self::next_changed_file`]). *New terminal*, *New agent pane*, and *Next changed
@@ -816,7 +804,7 @@ impl AdeApp {
                         )
                         .on_click(cx.listener(
                             |this, _event: &ClickEvent, window, cx| {
-                                this.new_session(SessionKind::Shell, window, cx);
+                                this.new_agent(AgentKind::Shell, window, cx);
                                 this.plus_menu_open = false;
                                 cx.notify();
                             },
@@ -838,7 +826,7 @@ impl AdeApp {
                         .on_click(cx.listener(
                             |this, _event: &ClickEvent, window, cx| {
                                 this.plus_menu_open = false;
-                                let cwd = this.active_session_cwd();
+                                let cwd = this.active_agent_cwd();
                                 this.start_new_file(cwd, window, cx);
                             },
                         )),
@@ -910,7 +898,7 @@ impl AdeApp {
     /// installed, or `AGENT_KINDS[0]` if none are (or `agent_rows` hasn't been populated yet).
     /// Display-only - [`Self::new_agent_pane`] runs its own detection independently, off the
     /// foreground thread, at the moment it actually spawns.
-    pub(crate) fn resolved_new_agent_kind(&self) -> SessionKind {
+    pub(crate) fn resolved_new_agent_kind(&self) -> AgentKind {
         settings::AGENT_KINDS
             .into_iter()
             .find(|kind| {
@@ -927,11 +915,11 @@ impl AdeApp {
     /// installed, rather than blocking the click on a filesystem walk.
     ///
     /// If no configured agent is installed, this spawns `AGENT_KINDS[0]` anyway, same as the
-    /// session toolbar's `+ claude`/`+ codex` buttons when that binary isn't on `$PATH`: the
+    /// agent toolbar's `+ claude`/`+ codex` buttons when that binary isn't on `$PATH`: the
     /// process fails to spawn and a non-panicking spawn error shows in the new tab
     /// (`TerminalPane::spawn_error`).
     pub(in crate::work_surface) fn new_agent_pane(&mut self, cx: &mut Context<Self>) {
-        let cwd = self.active_session_cwd();
+        let cwd = self.active_agent_cwd();
         let task = cx.spawn(async move |this, cx| {
             let installed = cx
                 .background_executor()
@@ -943,18 +931,18 @@ impl AdeApp {
                     })
                 })
                 .await;
-            // Needs `Window` access to move focus onto the newly spawned session's pane
-            // (`Self::focus_newly_spawned_session`) - `Entity::update_in` provides it.
+            // Needs `Window` access to move focus onto the newly spawned agent's pane
+            // (`Self::focus_newly_spawned_agent`) - `Entity::update_in` provides it.
             let _ = this.update_in(cx, |this, window, cx| {
                 let kind = installed.unwrap_or(settings::AGENT_KINDS[0]);
-                this.sessions.spawn(
+                this.agents.spawn(
                     kind,
                     cwd,
                     this.settings.appearance.terminal_font_size,
                     window,
                     cx,
                 );
-                this.focus_newly_spawned_session(window, cx);
+                this.focus_newly_spawned_agent(window, cx);
                 this.prune_confirm_armed = false;
                 cx.notify();
             });
@@ -967,7 +955,7 @@ impl AdeApp {
 
     /// The `+` menu's "Next changed file" action (`]`) - opens the next changed file after the
     /// active file tab as a tab, wrapping around to the first once the last is passed (so a
-    /// repeated `]` press cycles indefinitely, matching how the session-jump keycaps and palette
+    /// repeated `]` press cycles indefinitely, matching how the agent-jump keycaps and palette
     /// arrow keys already treat "next"/"previous"). If the active file isn't itself a changed
     /// file, or nothing is active, this opens the first changed file. No-op if there's no loaded
     /// diff, or it has no changed files.
@@ -992,11 +980,11 @@ impl AdeApp {
         self.open_change_diff(next_path, window, cx);
     }
 
-    /// The tab strip's session-jump keycaps (`secondary-1`..`secondary-8`) - jumps to the
-    /// session at 1-indexed `position` in the same order [`Self::render_tab_strip`] iterates
-    /// (`Self::current_worktree_sessions`), via [`Self::select_session`]. No-op if fewer than
-    /// `position` sessions are currently open in the selected worktree.
-    pub(crate) fn jump_to_session_at(
+    /// The tab strip's agent-jump keycaps (`secondary-1`..`secondary-8`) - jumps to the
+    /// agent at 1-indexed `position` in the same order [`Self::render_tab_strip`] iterates
+    /// (`Self::current_worktree_agents`), via [`Self::select_agent`]. No-op if fewer than
+    /// `position` agents are currently open in the selected worktree.
+    pub(crate) fn jump_to_agent_at(
         &mut self,
         position: usize,
         window: &mut Window,
@@ -1004,41 +992,41 @@ impl AdeApp {
     ) {
         let Some(id) = position
             .checked_sub(1)
-            .and_then(|index| self.current_worktree_sessions().nth(index))
-            .map(|session| session.id)
+            .and_then(|index| self.current_worktree_agents().nth(index))
+            .map(|agent| agent.id)
         else {
             return;
         };
-        self.select_session(id, window, cx);
+        self.select_agent(id, window, cx);
     }
 
-    /// The Windows/Linux title bar's Session menu "Next session"/"Previous session" rows
+    /// The Windows/Linux title bar's Agent menu "Next agent"/"Previous agent" rows
     /// (`crate::title_bar::menu::AdeApp::render_title_menu`) - `delta` is `1`/`-1`. Cycles
-    /// through [`Self::current_worktree_sessions`] in the same order
-    /// [`Self::jump_to_session_at`] indexes - **never** every session across every worktree
+    /// through [`Self::current_worktree_agents`] in the same order
+    /// [`Self::jump_to_agent_at`] indexes - **never** every agent across every worktree
     /// (a real, live-reproduced bug found in this revision's own self-audit: an earlier version
-    /// cycled `self.sessions` directly, so "Next Session" could jump to a *different* worktree's
-    /// session, which [`Self::select_session`] then silently promotes into a full
+    /// cycled `self.agents` directly, so "Next Agent" could jump to a *different* worktree's
+    /// agent, which [`Self::select_agent`] then silently promotes into a full
     /// [`Self::select_worktree`] switch - discarding any unsaved `edit_buffers` content for the
     /// worktree just left via `reset_per_worktree_ui_state`. A menu row labeled "cycle tabs" must
     /// never have that side effect) - wrapping around both ends (mirroring
     /// [`Self::next_changed_file`]'s own cyclic-index convention for "next" over an existing
-    /// ordered list), via the same real [`Self::select_session`] every tab-strip click and jump
-    /// keycap already goes through - no separate "next session" subsystem, just a cyclic index
-    /// over the existing per-worktree list. No-op with fewer than two sessions in the selected
-    /// worktree (nothing to cycle to) or no active session at all (both real, reachable states -
-    /// the latter only while every session has been closed).
-    pub(crate) fn select_relative_session(
+    /// ordered list), via the same real [`Self::select_agent`] every tab-strip click and jump
+    /// keycap already goes through - no separate "next agent" subsystem, just a cyclic index
+    /// over the existing per-worktree list. No-op with fewer than two agents in the selected
+    /// worktree (nothing to cycle to) or no active agent at all (both real, reachable states -
+    /// the latter only while every agent has been closed).
+    pub(crate) fn select_relative_agent(
         &mut self,
         delta: isize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ids: Vec<SessionId> = self.current_worktree_sessions().map(|s| s.id).collect();
+        let ids: Vec<AgentId> = self.current_worktree_agents().map(|s| s.id).collect();
         if ids.len() < 2 {
             return;
         }
-        let Some(active_id) = self.sessions.active_id() else {
+        let Some(active_id) = self.agents.active_id() else {
             return;
         };
         let Some(current_index) = ids.iter().position(|id| *id == active_id) else {
@@ -1046,18 +1034,18 @@ impl AdeApp {
         };
         let len = ids.len() as isize;
         let next_index = (current_index as isize + delta).rem_euclid(len) as usize;
-        self.select_session(ids[next_index], window, cx);
+        self.select_agent(ids[next_index], window, cx);
     }
 
     /// [`NewTerminal`]'s `ctrl-shift-T` action handler - the `+` menu's "New terminal" row's own
-    /// keybinding, spawning a [`SessionKind::Shell`] session like the row's click handler does.
+    /// keybinding, spawning a [`AgentKind::Shell`] agent like the row's click handler does.
     pub(crate) fn handle_new_terminal_action(
         &mut self,
         _action: &NewTerminal,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.new_session(SessionKind::Shell, window, cx);
+        self.new_agent(AgentKind::Shell, window, cx);
     }
 
     /// [`NewAgentPane`]'s `secondary-shift-n` action handler - see [`Self::new_agent_pane`].
@@ -1080,39 +1068,39 @@ impl AdeApp {
         self.next_changed_file(window, cx);
     }
 
-    session_jump_action_handler!(handle_jump_to_session_1_action, JumpToSession1, 1);
-    session_jump_action_handler!(handle_jump_to_session_2_action, JumpToSession2, 2);
-    session_jump_action_handler!(handle_jump_to_session_3_action, JumpToSession3, 3);
-    session_jump_action_handler!(handle_jump_to_session_4_action, JumpToSession4, 4);
-    session_jump_action_handler!(handle_jump_to_session_5_action, JumpToSession5, 5);
-    session_jump_action_handler!(handle_jump_to_session_6_action, JumpToSession6, 6);
-    session_jump_action_handler!(handle_jump_to_session_7_action, JumpToSession7, 7);
-    session_jump_action_handler!(handle_jump_to_session_8_action, JumpToSession8, 8);
+    agent_jump_action_handler!(handle_jump_to_agent_1_action, JumpToAgent1, 1);
+    agent_jump_action_handler!(handle_jump_to_agent_2_action, JumpToAgent2, 2);
+    agent_jump_action_handler!(handle_jump_to_agent_3_action, JumpToAgent3, 3);
+    agent_jump_action_handler!(handle_jump_to_agent_4_action, JumpToAgent4, 4);
+    agent_jump_action_handler!(handle_jump_to_agent_5_action, JumpToAgent5, 5);
+    agent_jump_action_handler!(handle_jump_to_agent_6_action, JumpToAgent6, 6);
+    agent_jump_action_handler!(handle_jump_to_agent_7_action, JumpToAgent7, 7);
+    agent_jump_action_handler!(handle_jump_to_agent_8_action, JumpToAgent8, 8);
 
     /// One tab: a 14×14 kind chip, the label (resolved binary name for an agent CLI tab, or
-    /// `terminal` for a shell tab), and a `×` that closes it (`Sessions::close`, tearing down
+    /// `terminal` for a shell tab), and a `×` that closes it (`Agents::close`, tearing down
     /// the process). Split into a `flex_1` clickable content row plus a `flex_none` 1px
     /// underline bar, rather than a single div with two differently-coloured borders, because
     /// GPUI's `Style::border_color` is one colour for every edge
     /// (`vendor/zed/crates/gpui/src/style.rs`) - it can't give the right border (always
     /// `theme::border::INNER`) and the active/inactive-dependent underline two different colours
     /// on the same div.
-    pub(in crate::work_surface) fn render_session_tab(
+    pub(in crate::work_surface) fn render_agent_tab(
         &self,
-        session: &Session,
+        agent: &Agent,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let id = session.id;
-        let is_active = self.sessions.active_id() == Some(id);
-        let chip_kind = work_surface::tab_chip_kind(session.kind);
+        let id = agent.id;
+        let is_active = self.agents.active_id() == Some(id);
+        let chip_kind = work_surface::tab_chip_kind(agent.kind);
         let label = match chip_kind {
-            work_surface::TabChipKind::Cli => session.pane.read(cx).program_label(),
+            work_surface::TabChipKind::Cli => agent.pane.read(cx).program_label(),
             work_surface::TabChipKind::Term => "terminal".to_string(),
         };
         let is_mono = matches!(chip_kind, work_surface::TabChipKind::Cli);
         let colors = work_surface::tab_colors(is_active);
-        let tab_ref = work_surface::TabRef::Session(id);
-        let drag_value = DraggedTab::Session {
+        let tab_ref = work_surface::TabRef::Agent(id);
+        let drag_value = DraggedTab::Agent {
             id,
             label: label.clone(),
         };
@@ -1122,7 +1110,7 @@ impl AdeApp {
         };
 
         div()
-            .id(("session-tab", id))
+            .id(("agent-tab", id))
             .relative()
             .flex()
             .flex_none()
@@ -1130,18 +1118,18 @@ impl AdeApp {
             .border_r_1()
             .border_color(theme::border::INNER)
             .bg(colors.bg)
-            // Middle-click closes any session/terminal tab too (GitHub issue #26) - the same
-            // `Self::close_session` real teardown (`TerminalPane::shutdown`'s SIGHUP/grace/
+            // Middle-click closes any agent/terminal tab too (GitHub issue #26) - the same
+            // `Self::close_agent` real teardown (`TerminalPane::shutdown`'s SIGHUP/grace/
             // SIGKILL - see that method's own docs) every other close path already uses.
             .on_mouse_down(
                 gpui::MouseButton::Middle,
                 cx.listener(move |this, _event: &gpui::MouseDownEvent, window, cx| {
                     cx.stop_propagation();
-                    this.close_session(id, window, cx);
+                    this.close_agent(id, window, cx);
                     cx.notify();
                 }),
             )
-            // Real drag-to-reorder, unified across session and file tabs (GitHub issue #16) -
+            // Real drag-to-reorder, unified across agent and file tabs (GitHub issue #16) -
             // see `DraggedTab`'s own docs for the shared mechanism. No `can_drop` predicate
             // needed - the `on_drop::<DraggedTab>` type parameter alone already rejects a drop of
             // any other dragged-value type.
@@ -1165,7 +1153,7 @@ impl AdeApp {
             })
             .child(
                 div()
-                    .id(("session-tab-hit", id))
+                    .id(("agent-tab-hit", id))
                     .flex_1()
                     .flex()
                     .items_center()
@@ -1173,9 +1161,9 @@ impl AdeApp {
                     .px(px(13.0))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                        this.select_session(id, window, cx);
+                        this.select_agent(id, window, cx);
                     }))
-                    .child(render_tab_chip(session.kind, is_active))
+                    .child(render_tab_chip(agent.kind, is_active))
                     .child(
                         div()
                             .font(font(if is_mono {
@@ -1190,7 +1178,7 @@ impl AdeApp {
                     )
                     .child(
                         div()
-                            .id(("close-session-tab", id))
+                            .id(("close-agent-tab", id))
                             .px(px(2.0))
                             .cursor_pointer()
                             .font(font(theme::font::MONO))
@@ -1200,7 +1188,7 @@ impl AdeApp {
                             .child("\u{d7}")
                             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                                 cx.stop_propagation();
-                                this.close_session(id, window, cx);
+                                this.close_agent(id, window, cx);
                                 cx.notify();
                             })),
                     ),
@@ -1208,31 +1196,31 @@ impl AdeApp {
             .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline))
     }
 
-    /// The session context bar: agent badge/name, a divider, branch, the worktree path (the one
+    /// The agent context bar: agent badge/name, a divider, branch, the worktree path (the one
     /// flexible, ellipsising child - every other child is `flex_none` and non-wrapping, so the
     /// bar never wraps when the centre narrows), a status pill, and `Merge`/`Archive`.
-    pub(in crate::work_surface) fn render_session_context_bar(
+    pub(in crate::work_surface) fn render_agent_context_bar(
         &self,
-        session: &Session,
+        agent: &Agent,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let status_value = self.session_status(session, cx);
-        let (agent_fg, agent_bg) = work_surface::agent_tint(session.kind);
-        let agent_initial = work_surface::agent_initial(session.kind);
-        // `SessionKind` only tracks which CLI binary is running, not which model it's
-        // configured to use, so `session.kind.label()` ("Claude"/"Codex"/"Shell") is the
+        let status_value = self.agent_status(agent, cx);
+        let (agent_fg, agent_bg) = work_surface::agent_tint(agent.kind);
+        let agent_initial = work_surface::agent_initial(agent.kind);
+        // `AgentKind` only tracks which CLI binary is running, not which model it's
+        // configured to use, so `agent.kind.label()` ("Claude"/"Codex"/"Shell") is the
         // closest honest substitute for a model name this app never actually observes.
-        let agent_label = session.kind.label();
+        let agent_label = agent.kind.label();
         let branch = self
             .worktrees
             .iter()
-            .find(|item| item.path == session.cwd)
+            .find(|item| item.path == agent.cwd)
             .and_then(|item| item.branch.clone());
-        let worktree_path = session.cwd.display().to_string();
-        let id = session.id;
+        let worktree_path = agent.cwd.display().to_string();
+        let id = agent.id;
 
         div()
-            .id("session-context-bar")
+            .id("agent-context-bar")
             .flex()
             .flex_none()
             .items_center()
@@ -1298,19 +1286,19 @@ impl AdeApp {
     }
 
     /// The context bar's `Merge` button - starts [`Self::start_merge`]. Disabled (dimmed,
-    /// non-interactive) whenever any merge flow is already active, own session or not (only one
+    /// non-interactive) whenever any merge flow is already active, own agent or not (only one
     /// runs at a time - see [`Self::start_merge`]'s docs), and shows `Merging…` in place of
-    /// `Merge` while this session's own attempt is the one running.
+    /// `Merge` while this agent's own attempt is the one running.
     pub(in crate::work_surface) fn render_merge_button(
         &self,
-        id: SessionId,
+        id: AgentId,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active_for_this_session = self
+        let active_for_this_agent = self
             .merge_flow
             .as_ref()
-            .is_some_and(|flow| flow.session_id == id);
-        let running = active_for_this_session
+            .is_some_and(|flow| flow.agent_id == id);
+        let running = active_for_this_agent
             && matches!(
                 self.merge_flow.as_ref().map(|flow| &flow.state),
                 Some(merge::MergeFlowState::Running)
@@ -1347,10 +1335,10 @@ impl AdeApp {
         }
     }
 
-    /// The context bar's `Archive` button - see [`Self::archive_session`].
+    /// The context bar's `Archive` button - see [`Self::archive_agent`].
     pub(in crate::work_surface) fn render_archive_button(
         &self,
-        id: SessionId,
+        id: AgentId,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
@@ -1369,14 +1357,14 @@ impl AdeApp {
             .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
             .child("Archive")
             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                this.archive_session(id, window, cx);
+                this.archive_agent(id, window, cx);
             }))
     }
 
-    /// Surface A/B's shared header: the resolved program label (this app has no saved-session
-    /// resumability, so there's no resume argument to show alongside it), a `Shell` session's
+    /// Surface A/B's shared header: the resolved program label (this app has no saved-agent
+    /// resumability, so there's no resume argument to show alongside it), a `Shell` agent's
     /// cwd, and a hint row (`mod + click a path to open it`, and a click-only `clear`) rendered
-    /// for every session kind - `TerminalPane` behaves identically for shell and agent sessions
+    /// for every agent kind - `TerminalPane` behaves identically for shell and agents
     /// (see its module docs), so link-click and `clear` are exactly as real for a `Claude`/
     /// `Codex` panic frame as for a shell prompt.
     ///
@@ -1386,7 +1374,7 @@ impl AdeApp {
     /// rather than showing a decorative keycap for one (the same precedent
     /// [`Self::render_plus_menu`]'s "Open file…" row sets).
     ///
-    /// A `Claude`/`Codex` session's pid is shown once, in the info footer below
+    /// A `Claude`/`Codex` agent's pid is shown once, in the info footer below
     /// ([`Self::render_pty_info_footer`]) - not duplicated here.
     ///
     /// `clear` is click-only, not a global keybinding, even though the design shows `mod+K`:
@@ -1402,16 +1390,16 @@ impl AdeApp {
     /// never reaches the pty in the first place (`crate::terminal::pane::keystroke_to_bytes`).
     pub(in crate::work_surface) fn render_pty_header(
         &self,
-        session: &Session,
+        agent: &Agent,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let pane = session.pane.read(cx);
+        let pane = agent.pane.read(cx);
         let program_label = pane.program_label();
         let is_running = pane.is_running();
         let exit_code = pane.exit_status().map(|status| status.exit_code());
-        let status_value = self.session_status(session, cx);
+        let status_value = self.agent_status(agent, cx);
         let state_label = work_surface::pty_state_label(is_running, status_value, exit_code);
-        let is_wsl_shell = session.kind == SessionKind::Shell && env_info::is_wsl();
+        let is_wsl_shell = agent.kind == AgentKind::Shell && env_info::is_wsl();
         let label_text = if is_wsl_shell {
             format!("{program_label} \u{b7} wsl")
         } else {
@@ -1438,8 +1426,8 @@ impl AdeApp {
                     .child(label_text),
             );
 
-        let header = match session.kind {
-            SessionKind::Shell => header.child(
+        let header = match agent.kind {
+            AgentKind::Shell => header.child(
                 div()
                     .flex_none()
                     .max_w(px(280.0))
@@ -1448,15 +1436,15 @@ impl AdeApp {
                     .font(font(theme::font::MONO))
                     .text_size(px(10.5))
                     .text_color(theme::text::GHOST)
-                    .child(session.cwd.display().to_string()),
+                    .child(agent.cwd.display().to_string()),
             ),
-            // No per-kind header content for an agent session - pid is shown once, in the info
+            // No per-kind header content for an agent - pid is shown once, in the info
             // footer below.
-            SessionKind::Claude | SessionKind::Codex => header,
+            AgentKind::Claude | AgentKind::Codex => header,
         };
 
         let macos = self.window_controls_style().is_macos();
-        let pane_entity = session.pane.clone();
+        let pane_entity = agent.pane.clone();
         let header = header.child(div().flex_1()).child(
             div()
                 .id("pty-header-hints")
@@ -1492,17 +1480,17 @@ impl AdeApp {
     }
 
     /// The terminal pane's info footer: pid, grid dimensions, the environment chip, and a hint
-    /// about file:line references. Rendered for every session kind - `TerminalPane` is the same
+    /// about file:line references. Rendered for every agent kind - `TerminalPane` is the same
     /// component behind a `Shell` tab and a `Claude`/`Codex` tab (see that module's docs), so pid
     /// and grid dimensions are equally meaningful for either. Distinct from, and rendered
-    /// alongside, [`Self::render_pty_footer`] - the session-level Interrupt/Retry/Archive action
+    /// alongside, [`Self::render_pty_footer`] - the agent-level Interrupt/Retry/Archive action
     /// footer.
     pub(in crate::work_surface) fn render_pty_info_footer(
         &self,
-        session: &Session,
+        agent: &Agent,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let pane = session.pane.read(cx);
+        let pane = agent.pane.read(cx);
         let pid = pane.pid();
         let (cols, rows) = pane.grid_dimensions();
 
@@ -1554,21 +1542,21 @@ impl AdeApp {
         )
     }
 
-    /// Surface A/B's shared footer: git-level actions appropriate to the session's status - see
+    /// Surface A/B's shared footer: git-level actions appropriate to the agent's status - see
     /// `crate::work_surface::state::footer_actions`/[`Self::render_footer_action_button`] for which
     /// actions are implemented vs. disabled. No longer shows a `JERRY` wordmark (deliberate
     /// deviation from the design mockup, per direct user request - see this crate's `lib.rs`/
     /// `BUILD-LOG.md` for context, not a bug fix).
     pub(in crate::work_surface) fn render_pty_footer(
         &self,
-        session: &Session,
+        agent: &Agent,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let status_value = self.session_status(session, cx);
-        let is_running = session.pane.read(cx).is_running();
+        let status_value = self.agent_status(agent, cx);
+        let is_running = agent.pane.read(cx).is_running();
         let actions = work_surface::footer_actions(status_value);
-        let id = session.id;
-        let cwd = session.cwd.clone();
+        let id = agent.id;
+        let cwd = agent.cwd.clone();
 
         let mut footer = div()
             .id("pty-footer")
@@ -1586,7 +1574,7 @@ impl AdeApp {
             let mut enabled = action.implemented;
             // A live, merely-idle shell has nothing to "resume" (see
             // `crate::work_surface::state::ActionKind::Respawn`'s docs) - disable it in that case
-            // rather than letting a click spawn a redundant duplicate session.
+            // rather than letting a click spawn a redundant duplicate agent.
             if action.kind == work_surface::ActionKind::Respawn
                 && status_value == Status::Idle
                 && is_running
@@ -1609,7 +1597,7 @@ impl AdeApp {
             // Busy labels are keyed off the *specific* in-flight kind, not just "something is
             // running" - a real, live-reproduced bug an audit caught: keying this off the bare
             // in-flight flag alone made every visible `Discard worktree` button across every
-            // session read "discarding…" while an unrelated `Keep all` was running.
+            // agent read "discarding…" while an unrelated `Keep all` was running.
             let label = match action.kind {
                 work_surface::ActionKind::DiscardWorktree
                     if self.worktree_history_op_in_flight
@@ -1648,7 +1636,7 @@ impl AdeApp {
     /// a button that looks clickable but silently does nothing.
     pub(in crate::work_surface) fn render_footer_action_button(
         &self,
-        id: SessionId,
+        id: AgentId,
         cwd: PathBuf,
         action: work_surface::FooterAction,
         label: String,
@@ -1718,12 +1706,12 @@ impl AdeApp {
                 .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
                 .on_click(
                     cx.listener(move |this, _event: &ClickEvent, window, cx| match kind {
-                        work_surface::ActionKind::Interrupt => this.interrupt_session(id, cx),
+                        work_surface::ActionKind::Interrupt => this.interrupt_agent(id, cx),
                         work_surface::ActionKind::OpenTerminal => {
                             this.open_companion_terminal(cwd.clone(), window, cx)
                         }
-                        work_surface::ActionKind::Respawn => this.respawn_session(id, window, cx),
-                        work_surface::ActionKind::Archive => this.archive_session(id, window, cx),
+                        work_surface::ActionKind::Respawn => this.respawn_agent(id, window, cx),
+                        work_surface::ActionKind::Archive => this.archive_agent(id, window, cx),
                         work_surface::ActionKind::KeepAllChanges => this.keep_all_changes(id, cx),
                         work_surface::ActionKind::DiscardWorktree => {
                             this.request_discard_worktree(id, window, cx)
@@ -1740,7 +1728,7 @@ impl AdeApp {
 
     /// The centre pane's content: the unified tab strip ([`Self::render_tab_strip`]) always
     /// renders first, above either the active file tab's Surface C
-    /// (`Self::render_code_surface`) if [`Self::open_change`] names one, or the active session's
+    /// (`Self::render_code_surface`) if [`Self::open_change`] names one, or the active agent's
     /// toolbar/context-bar/pty otherwise.
     ///
     /// A file opened via a Changes-row click (`Self::open_change_diff`) always has a `DiffFile`
@@ -1781,14 +1769,14 @@ impl AdeApp {
             self.open_diff_file_cache = diff_file;
         }
 
-        match self.sessions.active() {
-            Some(session) => {
+        match self.agents.active() {
+            Some(agent) => {
                 let body = if self
                     .merge_flow
                     .as_ref()
-                    .is_some_and(|flow| flow.session_id == session.id)
+                    .is_some_and(|flow| flow.agent_id == agent.id)
                 {
-                    self.render_merge_flow_surface(session, cx)
+                    self.render_merge_flow_surface(agent, cx)
                 } else {
                     div()
                         .id("pty-surface")
@@ -1799,21 +1787,21 @@ impl AdeApp {
                         .min_w_0()
                         .overflow_hidden()
                         .bg(theme::surface::PTY)
-                        .child(self.render_pty_header(session, cx))
+                        .child(self.render_pty_header(agent, cx))
                         .child(
                             div()
                                 .flex_1()
                                 .min_h_0()
                                 .min_w_0()
                                 .overflow_hidden()
-                                .child(session.pane.clone().into_any_element()),
+                                .child(agent.pane.clone().into_any_element()),
                         )
-                        .child(self.render_pty_info_footer(session, cx))
-                        .child(self.render_pty_footer(session, cx))
+                        .child(self.render_pty_info_footer(agent, cx))
+                        .child(self.render_pty_footer(agent, cx))
                         .into_any_element()
                 };
                 surface
-                    .child(self.render_session_context_bar(session, cx))
+                    .child(self.render_agent_context_bar(agent, cx))
                     .child(body)
             }
             None => surface.child(
@@ -1827,7 +1815,7 @@ impl AdeApp {
                     .text_size(px(11.5))
                     .text_color(theme::text::FAINT)
                     .child(
-                        "no sessions open in this worktree - start one with the tab strip's + menu",
+                        "no agents open in this worktree - start one with the tab strip's + menu",
                     ),
             ),
         }
@@ -1842,7 +1830,7 @@ impl AdeApp {
 /// (`crate::keymap::resolve_combo`'s output), rendered via [`render_keycap_row`] at
 /// [`KeycapSize::Hint`].
 /// One row in either the tab strip's `+` menu ([`AdeApp::render_plus_menu`]) or the Windows/
-/// Linux title bar's real File/Edit/View/Session/Help dropdowns
+/// Linux title bar's real File/Edit/View/Agent/Help dropdowns
 /// (`crate::title_bar::menu::AdeApp::render_title_menu`) - shared here since both are the same
 /// "labeled trigger opens a small popover of real actions" pattern, first built for the `+`
 /// menu and reused as-is (not re-derived) for the title-bar menus.
@@ -1925,14 +1913,11 @@ pub(crate) fn render_dropdown_menu_row(
     .child(render_keycap_row(&keys, KeycapSize::Hint))
 }
 
-/// The tab strip's 14×14 kind chip - a `❯` glyph tinted with the session's agent colour for
+/// The tab strip's 14×14 kind chip - a `❯` glyph tinted with the agent's agent colour for
 /// agent CLI tabs, or a pane glyph (a bar plus a prompt mark) for terminal tabs. Turns
 /// `work_surface::tab_chip_kind`/`tab_chip_colors`'s mapping into GPUI elements; no
 /// chip-selection logic lives here.
-pub(in crate::work_surface) fn render_tab_chip(
-    kind: SessionKind,
-    active: bool,
-) -> gpui::AnyElement {
+pub(in crate::work_surface) fn render_tab_chip(kind: AgentKind, active: bool) -> gpui::AnyElement {
     let colors = work_surface::tab_chip_colors(kind, active);
     let base = div()
         .flex_none()
@@ -1979,9 +1964,9 @@ pub(in crate::work_surface) fn render_tab_chip(
 }
 
 /// The unified tab strip's drag-to-reorder value (GitHub issue #16) - both
-/// [`AdeApp::render_session_tab`] and [`AdeApp::render_file_tab`]'s `on_drag`/`on_drag_move`/
+/// [`AdeApp::render_agent_tab`] and [`AdeApp::render_file_tab`]'s `on_drag`/`on_drag_move`/
 /// `on_drop` share this one type (rather than the two separate, kind-locked types this revision
-/// replaces) precisely so a session tab can be dropped onto a file tab and vice versa: GPUI's
+/// replaces) precisely so an agent tab can be dropped onto a file tab and vice versa: GPUI's
 /// `on_drop::<T>`/`on_drag_move::<T>` dispatch purely on the dragged value's concrete type
 /// (verified against `vendor/zed/crates/gpui/src/elements/div.rs`, and
 /// `crate::root::scrollbar`'s own module docs on that exact dispatch rule), so two distinct types
@@ -1993,14 +1978,14 @@ pub(in crate::work_surface) fn render_tab_chip(
 /// the same choice Zed's own `DraggedTab` makes - keeps what's being dragged legible.
 #[derive(Clone)]
 pub(in crate::work_surface) enum DraggedTab {
-    Session { id: SessionId, label: String },
+    Agent { id: AgentId, label: String },
     File { path: PathBuf, label: String },
 }
 
 impl DraggedTab {
     fn label(&self) -> &str {
         match self {
-            DraggedTab::Session { label, .. } => label,
+            DraggedTab::Agent { label, .. } => label,
             DraggedTab::File { label, .. } => label,
         }
     }
@@ -2009,7 +1994,7 @@ impl DraggedTab {
     /// [`AdeApp::reorder_tab`] actually moves, regardless of which concrete kind was dragged.
     pub(in crate::work_surface) fn tab_ref(&self) -> work_surface::TabRef {
         match self {
-            DraggedTab::Session { id, .. } => work_surface::TabRef::Session(*id),
+            DraggedTab::Agent { id, .. } => work_surface::TabRef::Agent(*id),
             DraggedTab::File { path, .. } => work_surface::TabRef::File(path.clone()),
         }
     }
@@ -2048,7 +2033,7 @@ fn render_tab_insertion_caret(insert_after: bool) -> impl IntoElement {
         .when(!insert_after, |el| el.left(px(0.0)))
 }
 
-/// The session context bar's status pill: a coloured dot plus label in the status colour.
+/// The agent context bar's status pill: a coloured dot plus label in the status colour.
 pub(in crate::work_surface) fn render_status_pill(status: Status) -> impl IntoElement {
     div()
         .flex_none()
@@ -2079,9 +2064,9 @@ pub(in crate::work_surface) fn render_status_pill(status: Status) -> impl IntoEl
 }
 
 /// Regression coverage for this revision's core claim: each worktree gets one rail entry, and
-/// its sessions become tabs scoped to whichever worktree's rail row is selected - the exact
+/// its agents become tabs scoped to whichever worktree's rail row is selected - the exact
 /// behavior `crate::root::mod`'s "One rail row per worktree" module docs describe. Also covers
-/// the real drag-to-reorder mechanism (`DraggedSessionTab`'s own docs).
+/// the real drag-to-reorder mechanism (`DraggedAgentTab`'s own docs).
 #[cfg(test)]
 mod tab_scoping_tests {
     use super::*;
@@ -2111,11 +2096,11 @@ mod tab_scoping_tests {
     }
 
     /// The exact bug `crate::rail::state::build_worktree_rows` fixes at the pure-logic level
-    /// (`crate::rail::state::tests::build_worktree_rows_folds_every_session_in_a_worktree_not_just_the_first`),
-    /// proven here end to end through the real `Sessions`/`AdeApp` plumbing: two sessions
+    /// (`crate::rail::state::tests::build_worktree_rows_folds_every_agent_in_a_worktree_not_just_the_first`),
+    /// proven here end to end through the real `Agents`/`AdeApp` plumbing: two agents
     /// spawned into the same worktree must both show up as that worktree's tabs.
     #[gpui::test]
-    fn multiple_sessions_in_one_worktree_all_show_as_tabs_under_it(cx: &mut TestAppContext) {
+    fn multiple_agents_in_one_worktree_all_show_as_tabs_under_it(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let wt_a = tempfile::tempdir().expect("tempdir a");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
@@ -2125,15 +2110,15 @@ mod tab_scoping_tests {
         });
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
-            app.sessions.spawn(
-                SessionKind::Shell,
+            app.agents.spawn(
+                AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 window,
                 cx,
             );
-            app.sessions.spawn(
-                SessionKind::Claude,
+            app.agents.spawn(
+                AgentKind::Claude,
                 wt_a.path().to_path_buf(),
                 12.0,
                 window,
@@ -2141,26 +2126,26 @@ mod tab_scoping_tests {
             );
         });
 
-        let ids: Vec<SessionId> = app.read_with(cx, |app, _| {
-            app.current_worktree_sessions().map(|s| s.id).collect()
+        let ids: Vec<AgentId> = app.read_with(cx, |app, _| {
+            app.current_worktree_agents().map(|s| s.id).collect()
         });
         assert_eq!(
             ids.len(),
             2,
-            "both sessions spawned into wt-a must show as tabs under it - not just the first \
+            "both agents spawned into wt-a must show as tabs under it - not just the first \
              one found (the exact bug the old ProjectChild model had)"
         );
     }
 
     /// The real gap this revision's own self-audit found: switching to a worktree with *no*
-    /// open session leaves `Sessions::focus_active` with nothing to focus (a genuine no-op), so
-    /// a previously-focused session's pane - now unrendered once the tab strip's own
+    /// open agent leaves `Agents::focus_active` with nothing to focus (a genuine no-op), so
+    /// a previously-focused agent's pane - now unrendered once the tab strip's own
     /// per-worktree filter applies - would otherwise leave `Window::focus` dangling, breaking
     /// every global keybinding (including ⌘P itself) until the next click.
     /// `Self::select_worktree`'s own fallback (redirecting focus to `Self::filter_focus_handle`
-    /// whenever the newly selected worktree has no session to focus) closes this.
+    /// whenever the newly selected worktree has no agent to focus) closes this.
     #[gpui::test]
-    fn ctrl_p_still_works_after_switching_to_a_worktree_with_no_open_session(
+    fn ctrl_p_still_works_after_switching_to_a_worktree_with_no_open_agent(
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2172,11 +2157,11 @@ mod tab_scoping_tests {
             app.worktrees = vec![worktree_item(wt_empty.path().to_path_buf(), "empty")];
         });
 
-        // Explicitly focus the initial shell session (the real, concrete "focus is on a live
-        // terminal pane" starting state this bug needs), then switch to the session-less
+        // Explicitly focus the initial shell agent (the real, concrete "focus is on a live
+        // terminal pane" starting state this bug needs), then switch to the agent-less
         // worktree - the exact transition the fix targets.
         app.update_in(cx, |app, window, cx| {
-            app.sessions.focus_active(window, cx);
+            app.agents.focus_active(window, cx);
             app.select_worktree(0, window, cx);
         });
 
@@ -2189,7 +2174,7 @@ mod tab_scoping_tests {
 
         assert!(
             app.read_with(cx, |app, _| app.palette_open),
-            "a real {key} keystroke after switching to a session-less worktree must still open \
+            "a real {key} keystroke after switching to an agent-less worktree must still open \
              the palette - before the fix, focus was left dangling on the previous worktree's \
              now-unrendered terminal pane"
         );
@@ -2198,7 +2183,7 @@ mod tab_scoping_tests {
     /// Switching the rail selection to a different worktree must show that worktree's own tabs,
     /// not the previously selected worktree's - the centre-pane-follows-the-rail invariant, and
     /// the exact behavior `crate::root::mod`'s "One rail row per worktree" docs describe: never
-    /// showing/pointing at the previously selected worktree's session.
+    /// showing/pointing at the previously selected worktree's agent.
     #[gpui::test]
     fn switching_worktree_selection_shows_that_worktrees_own_tabs(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2212,16 +2197,16 @@ mod tab_scoping_tests {
 
         let (id_a, id_b) = app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
-            let id_a = app.sessions.spawn(
-                SessionKind::Shell,
+            let id_a = app.agents.spawn(
+                AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 window,
                 cx,
             );
             app.select_worktree(1, window, cx);
-            let id_b = app.sessions.spawn(
-                SessionKind::Shell,
+            let id_b = app.agents.spawn(
+                AgentKind::Shell,
                 wt_b.path().to_path_buf(),
                 12.0,
                 window,
@@ -2230,20 +2215,20 @@ mod tab_scoping_tests {
             (id_a, id_b)
         });
 
-        // Still on wt-b (the last selection) - its tab strip must show only its own session.
-        let current: Vec<SessionId> = app.read_with(cx, |app, _| {
-            app.current_worktree_sessions().map(|s| s.id).collect()
+        // Still on wt-b (the last selection) - its tab strip must show only its own agent.
+        let current: Vec<AgentId> = app.read_with(cx, |app, _| {
+            app.current_worktree_agents().map(|s| s.id).collect()
         });
         assert_eq!(current, vec![id_b]);
         assert_eq!(
-            app.read_with(cx, |app, _| app.sessions.active_id()),
+            app.read_with(cx, |app, _| app.agents.active_id()),
             Some(id_b)
         );
 
         // Switch back to wt-a - must show id_a, never id_b.
         app.update_in(cx, |app, window, cx| app.select_worktree(0, window, cx));
-        let current: Vec<SessionId> = app.read_with(cx, |app, _| {
-            app.current_worktree_sessions().map(|s| s.id).collect()
+        let current: Vec<AgentId> = app.read_with(cx, |app, _| {
+            app.current_worktree_agents().map(|s| s.id).collect()
         });
         assert_eq!(
             current,
@@ -2251,9 +2236,9 @@ mod tab_scoping_tests {
             "switching back to wt-a must show its own tab, not wt-b's"
         );
         assert_eq!(
-            app.read_with(cx, |app, _| app.sessions.active_id()),
+            app.read_with(cx, |app, _| app.agents.active_id()),
             Some(id_a),
-            "the active session must follow the selected worktree"
+            "the active agent must follow the selected worktree"
         );
     }
 
@@ -2272,15 +2257,15 @@ mod tab_scoping_tests {
 
         let (id1, id2) = app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
-            let id1 = app.sessions.spawn(
-                SessionKind::Shell,
+            let id1 = app.agents.spawn(
+                AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 window,
                 cx,
             );
-            let id2 = app.sessions.spawn(
-                SessionKind::Shell,
+            let id2 = app.agents.spawn(
+                AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 window,
@@ -2289,37 +2274,37 @@ mod tab_scoping_tests {
             (id1, id2)
         });
         assert_eq!(
-            app.read_with(cx, |app, _| app.sessions.active_id()),
+            app.read_with(cx, |app, _| app.agents.active_id()),
             Some(id2)
         );
 
-        app.update_in(cx, |app, window, cx| app.close_session(id2, window, cx));
+        app.update_in(cx, |app, window, cx| app.close_agent(id2, window, cx));
 
         assert_eq!(
-            app.read_with(cx, |app, _| app.sessions.active_id()),
+            app.read_with(cx, |app, _| app.agents.active_id()),
             Some(id1),
             "closing the active tab must fall back to the remaining sibling in the same worktree"
         );
-        let current: Vec<SessionId> = app.read_with(cx, |app, _| {
-            app.current_worktree_sessions().map(|s| s.id).collect()
+        let current: Vec<AgentId> = app.read_with(cx, |app, _| {
+            app.current_worktree_agents().map(|s| s.id).collect()
         });
         assert_eq!(current, vec![id1]);
     }
 
-    /// The degenerate case, and the real reason `Sessions::close`'s fallback had to become
+    /// The degenerate case, and the real reason `Agents::close`'s fallback had to become
     /// worktree-scoped rather than a same-`Vec` neighbor: closing the *last* tab in one worktree
-    /// must never fall back to a different worktree's own still-open session, even though it
+    /// must never fall back to a different worktree's own still-open agent, even though it
     /// might sit right next to it in the flat underlying storage.
     ///
     /// Also real, live-reproduced coverage for another instance of this project's own "focus
     /// left pointing at something unrendered" bug class (see `crate::root::focus`'s module doc):
-    /// before the fix, `Self::close_session` left `Window::focus` dangling on the
-    /// just-`shutdown()` `TerminalPane` in this exact case (`self.sessions.active = None`, and
-    /// `Sessions::focus_active` is a real no-op with nothing active) - so a real ⌘P afterward,
+    /// before the fix, `Self::close_agent` left `Window::focus` dangling on the
+    /// just-`shutdown()` `TerminalPane` in this exact case (`self.agents.active = None`, and
+    /// `Agents::focus_active` is a real no-op with nothing active) - so a real ⌘P afterward,
     /// not just checking `active_id() == None`, is what actually proves focus isn't dangling,
     /// matching every other test for this bug class in this project.
     #[gpui::test]
-    fn closing_the_last_tab_in_a_worktree_never_falls_back_to_a_different_worktrees_session(
+    fn closing_the_last_tab_in_a_worktree_never_falls_back_to_a_different_worktrees_agent(
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2333,8 +2318,8 @@ mod tab_scoping_tests {
 
         let id_a = app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
-            app.sessions.spawn(
-                SessionKind::Shell,
+            app.agents.spawn(
+                AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 window,
@@ -2343,8 +2328,8 @@ mod tab_scoping_tests {
         });
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(1, window, cx);
-            app.sessions.spawn(
-                SessionKind::Shell,
+            app.agents.spawn(
+                AgentKind::Shell,
                 wt_b.path().to_path_buf(),
                 12.0,
                 window,
@@ -2354,14 +2339,14 @@ mod tab_scoping_tests {
 
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
-            app.close_session(id_a, window, cx);
+            app.close_agent(id_a, window, cx);
         });
 
         assert_eq!(
-            app.read_with(cx, |app, _| app.sessions.active_id()),
+            app.read_with(cx, |app, _| app.agents.active_id()),
             None,
-            "closing the only tab in wt-a must leave it with no active session, never silently \
-             fall back to wt-b's own still-open session"
+            "closing the only tab in wt-a must leave it with no active agent, never silently \
+             fall back to wt-b's own still-open agent"
         );
 
         let key = if cfg!(target_os = "macos") {
@@ -2374,30 +2359,30 @@ mod tab_scoping_tests {
             app.read_with(cx, |app, _| app.palette_open),
             "a real {key} keystroke after closing the last tab in a worktree must still open \
              the palette - before the fix, Window::focus was left dangling on the just-closed \
-             session's now-unmounted pane, with nothing real for the next keystroke to reach"
+             agent's now-unmounted pane, with nothing real for the next keystroke to reach"
         );
     }
 
-    /// Real drag-to-reorder, unified across session and file tabs (GitHub issue #16): dropping
-    /// one session tab onto another must actually change the *combined* tab order
-    /// (`Self::current_worktree_sessions`, which now reads `Self::combined_tab_order` rather than
-    /// `Sessions`' own raw creation order - see that method's own docs on why).
+    /// Real drag-to-reorder, unified across agent and file tabs (GitHub issue #16): dropping
+    /// one agent tab onto another must actually change the *combined* tab order
+    /// (`Self::current_worktree_agents`, which now reads `Self::combined_tab_order` rather than
+    /// `Agents`' own raw creation order - see that method's own docs on why).
     #[gpui::test]
-    fn drag_reordering_two_session_tabs_changes_their_order(cx: &mut TestAppContext) {
+    fn drag_reordering_two_agent_tabs_changes_their_order(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
         let (initial_id, id2, id3) = app.update_in(cx, |app, window, cx| {
-            let initial_id = app.sessions.active_id().expect("initial shell session");
-            let id2 = app.sessions.spawn(
-                SessionKind::Shell,
+            let initial_id = app.agents.active_id().expect("initial shell agent");
+            let id2 = app.agents.spawn(
+                AgentKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
                 window,
                 cx,
             );
-            let id3 = app.sessions.spawn(
-                SessionKind::Shell,
+            let id3 = app.agents.spawn(
+                AgentKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
                 window,
@@ -2406,23 +2391,23 @@ mod tab_scoping_tests {
             (initial_id, id2, id3)
         });
 
-        let before: Vec<SessionId> = app.read_with(cx, |app, _| {
-            app.current_worktree_sessions().map(|s| s.id).collect()
+        let before: Vec<AgentId> = app.read_with(cx, |app, _| {
+            app.current_worktree_agents().map(|s| s.id).collect()
         });
         assert_eq!(before, vec![initial_id, id2, id3]);
 
         // The real drop handler's own logic: drag id3, drop it before `initial_id`'s tab.
         app.update(cx, |app, cx| {
             app.reorder_tab(
-                work_surface::TabRef::Session(id3),
-                work_surface::TabRef::Session(initial_id),
+                work_surface::TabRef::Agent(id3),
+                work_surface::TabRef::Agent(initial_id),
                 false,
                 cx,
             );
         });
 
-        let after: Vec<SessionId> = app.read_with(cx, |app, _| {
-            app.current_worktree_sessions().map(|s| s.id).collect()
+        let after: Vec<AgentId> = app.read_with(cx, |app, _| {
+            app.current_worktree_agents().map(|s| s.id).collect()
         });
         assert_eq!(
             after,
@@ -2440,32 +2425,32 @@ mod tab_scoping_tests {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         let initial_id = app.read_with(cx, |app, _| {
-            app.sessions.active_id().expect("initial shell session")
+            app.agents.active_id().expect("initial shell agent")
         });
 
         app.update(cx, |app, cx| {
             app.reorder_tab(
-                work_surface::TabRef::Session(initial_id),
-                work_surface::TabRef::Session(initial_id),
+                work_surface::TabRef::Agent(initial_id),
+                work_surface::TabRef::Agent(initial_id),
                 false,
                 cx,
             );
             app.reorder_tab(
-                work_surface::TabRef::Session(9999),
-                work_surface::TabRef::Session(initial_id),
+                work_surface::TabRef::Agent(9999),
+                work_surface::TabRef::Agent(initial_id),
                 false,
                 cx,
             );
             app.reorder_tab(
-                work_surface::TabRef::Session(initial_id),
-                work_surface::TabRef::Session(9999),
+                work_surface::TabRef::Agent(initial_id),
+                work_surface::TabRef::Agent(9999),
                 false,
                 cx,
             );
         });
 
-        let after: Vec<SessionId> = app.read_with(cx, |app, _| {
-            app.current_worktree_sessions().map(|s| s.id).collect()
+        let after: Vec<AgentId> = app.read_with(cx, |app, _| {
+            app.current_worktree_agents().map(|s| s.id).collect()
         });
         assert_eq!(
             after,
@@ -2474,24 +2459,24 @@ mod tab_scoping_tests {
         );
     }
 
-    /// Exactly the globally active session's pane may poll at the frame-accurate foreground
+    /// Exactly the globally active agent's pane may poll at the frame-accurate foreground
     /// cadence (`TerminalPane::is_foreground`); every other open pane must be demoted to the
-    /// background cadence - through every real mutator of "which session is active": spawn,
-    /// tab click (`select_session`), closing the active tab, and switching to a session-less
+    /// background cadence - through every real mutator of "which agent is active": spawn,
+    /// tab click (`select_agent`), closing the active tab, and switching to an agent-less
     /// worktree. A pane wrongly left foreground silently re-grows the measured multi-pane
     /// foreground-drain regression this flag exists to bound (see
     /// `crate::terminal::pane::BACKGROUND_POLL_INTERVAL`'s docs); one wrongly left background would lag
     /// the very pane the user is watching.
     #[gpui::test]
-    fn only_the_active_sessions_pane_polls_at_the_foreground_cadence(cx: &mut TestAppContext) {
+    fn only_the_active_agents_pane_polls_at_the_foreground_cadence(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let wt_empty = tempfile::tempdir().expect("tempdir empty");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
         let foreground_ids =
-            |app: &gpui::Entity<AdeApp>, cx: &mut TestAppContext| -> Vec<SessionId> {
+            |app: &gpui::Entity<AdeApp>, cx: &mut TestAppContext| -> Vec<AgentId> {
                 app.read_with(cx, |app, cx| {
-                    app.sessions
+                    app.agents
                         .iter()
                         .filter(|s| s.pane.read(cx).is_foreground())
                         .map(|s| s.id)
@@ -2500,9 +2485,9 @@ mod tab_scoping_tests {
             };
 
         let (first_id, second_id) = app.update_in(cx, |app, window, cx| {
-            let first_id = app.sessions.active_id().expect("initial shell session");
-            let second_id = app.sessions.spawn(
-                SessionKind::Shell,
+            let first_id = app.agents.active_id().expect("initial shell agent");
+            let second_id = app.agents.spawn(
+                AgentKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
                 window,
@@ -2511,16 +2496,16 @@ mod tab_scoping_tests {
             (first_id, second_id)
         });
 
-        // Spawning made the new session active - it alone must be foreground.
+        // Spawning made the new agent active - it alone must be foreground.
         assert_eq!(
             foreground_ids(&app, cx),
             vec![second_id],
-            "after spawn, only the newly active session's pane may be foreground"
+            "after spawn, only the newly active agent's pane may be foreground"
         );
 
-        // A real tab click: the clicked session's pane is promoted, the old one demoted.
+        // A real tab click: the clicked agent's pane is promoted, the old one demoted.
         app.update_in(cx, |app, window, cx| {
-            app.select_session(first_id, window, cx);
+            app.select_agent(first_id, window, cx);
         });
         assert_eq!(
             foreground_ids(&app, cx),
@@ -2530,7 +2515,7 @@ mod tab_scoping_tests {
 
         // Closing the active tab promotes the surviving sibling.
         app.update_in(cx, |app, window, cx| {
-            app.sessions.close(first_id, false, window, cx);
+            app.agents.close(first_id, false, window, cx);
         });
         assert_eq!(
             foreground_ids(&app, cx),
@@ -2538,7 +2523,7 @@ mod tab_scoping_tests {
             "closing the active tab must hand the foreground cadence to the promoted sibling"
         );
 
-        // Switching to a worktree with no sessions: nothing is active, nothing is watchable -
+        // Switching to a worktree with no agents: nothing is active, nothing is watchable -
         // every pane must be background.
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt_empty.path().to_path_buf(), "empty")];
@@ -2548,28 +2533,28 @@ mod tab_scoping_tests {
         });
         assert_eq!(
             foreground_ids(&app, cx),
-            Vec::<SessionId>::new(),
-            "with no active session, no pane may keep the foreground cadence"
+            Vec::<AgentId>::new(),
+            "with no active agent, no pane may keep the foreground cadence"
         );
     }
 
     /// The real cross-kind capability GitHub issue #16 exists to unlock: a file tab dragged so it
-    /// lands between two session tabs must actually interleave them in the combined tab order,
+    /// lands between two agent tabs must actually interleave them in the combined tab order,
     /// not just reorder within its own kind - the exact case the old, kind-locked
-    /// `DraggedSessionTab`/`DraggedFileTab` types could never produce (GPUI's `on_drop::<T>`
+    /// `DraggedAgentTab`/`DraggedFileTab` types could never produce (GPUI's `on_drop::<T>`
     /// dispatches purely on the dragged value's concrete type, so a `DraggedFileTab` could never
-    /// be dropped onto a session tab's `on_drop::<DraggedSessionTab>` handler or vice versa).
+    /// be dropped onto an agent tab's `on_drop::<DraggedAgentTab>` handler or vice versa).
     #[gpui::test]
-    fn dragging_a_file_tab_between_two_session_tabs_interleaves_them(cx: &mut TestAppContext) {
+    fn dragging_a_file_tab_between_two_agent_tabs_interleaves_them(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let file_path = repo.path().join("a.txt");
         std::fs::write(&file_path, "hello\n").expect("write a.txt");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
         let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
-            let initial_id = app.sessions.active_id().expect("initial shell session");
-            let second_id = app.sessions.spawn(
-                SessionKind::Shell,
+            let initial_id = app.agents.active_id().expect("initial shell agent");
+            let second_id = app.agents.spawn(
+                AgentKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
                 window,
@@ -2583,19 +2568,19 @@ mod tab_scoping_tests {
         assert_eq!(
             before,
             vec![
-                work_surface::TabRef::Session(initial_id),
-                work_surface::TabRef::Session(second_id),
+                work_surface::TabRef::Agent(initial_id),
+                work_surface::TabRef::Agent(second_id),
                 work_surface::TabRef::File(PathBuf::from("a.txt")),
             ],
-            "with no drag yet, sessions come first (creation order), then files - the old \
+            "with no drag yet, agents come first (creation order), then files - the old \
              two-block layout"
         );
 
-        // The real cross-kind drop: drag the file tab so it lands between the two session tabs.
+        // The real cross-kind drop: drag the file tab so it lands between the two agent tabs.
         app.update(cx, |app, cx| {
             app.reorder_tab(
                 work_surface::TabRef::File(PathBuf::from("a.txt")),
-                work_surface::TabRef::Session(second_id),
+                work_surface::TabRef::Agent(second_id),
                 false,
                 cx,
             );
@@ -2605,11 +2590,11 @@ mod tab_scoping_tests {
         assert_eq!(
             after,
             vec![
-                work_surface::TabRef::Session(initial_id),
+                work_surface::TabRef::Agent(initial_id),
                 work_surface::TabRef::File(PathBuf::from("a.txt")),
-                work_surface::TabRef::Session(second_id),
+                work_surface::TabRef::Agent(second_id),
             ],
-            "the file tab must now sit between the two session tabs - the real cross-group \
+            "the file tab must now sit between the two agent tabs - the real cross-group \
              interleaving this revision exists to unlock"
         );
     }
@@ -2625,9 +2610,9 @@ mod tab_scoping_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
         let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
-            let initial_id = app.sessions.active_id().expect("initial shell session");
-            let second_id = app.sessions.spawn(
-                SessionKind::Shell,
+            let initial_id = app.agents.active_id().expect("initial shell agent");
+            let second_id = app.agents.spawn(
+                AgentKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
                 window,
@@ -2639,13 +2624,13 @@ mod tab_scoping_tests {
         // Simulates what a real `on_drag_move` tick over the right half of `second_id`'s tab
         // would already have recorded, just before the drop.
         app.update(cx, |app, _cx| {
-            app.tab_drag_insertion = Some((work_surface::TabRef::Session(second_id), true));
+            app.tab_drag_insertion = Some((work_surface::TabRef::Agent(second_id), true));
         });
 
         app.update(cx, |app, cx| {
             app.drop_dragged_tab(
-                work_surface::TabRef::Session(initial_id),
-                work_surface::TabRef::Session(second_id),
+                work_surface::TabRef::Agent(initial_id),
+                work_surface::TabRef::Agent(second_id),
                 cx,
             );
         });
@@ -2654,8 +2639,8 @@ mod tab_scoping_tests {
         assert_eq!(
             order,
             vec![
-                work_surface::TabRef::Session(second_id),
-                work_surface::TabRef::Session(initial_id),
+                work_surface::TabRef::Agent(second_id),
+                work_surface::TabRef::Agent(initial_id),
             ],
             "insert_after == true must land the dragged tab immediately after the target, not \
              before"

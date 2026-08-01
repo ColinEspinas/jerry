@@ -334,7 +334,7 @@ pub(crate) const MENU_GROUP_DIVIDER_HEIGHT: Pixels = px(9.0);
 /// [`theme::border::DIVIDER`], the same token the title bar's own left-cluster rule uses, inset
 /// `mx(10.0)` so it lines up flush with a menu row's own `px(10.0)` label column.
 ///
-/// The app's one in-menu divider, shared by the title bar's File/Edit/View/Session/Help menus
+/// The app's one in-menu divider, shared by the title bar's File/Edit/View/Agent/Help menus
 /// (where it was first built, as `title_bar::menu`'s `render_title_menu_divider`) and the file
 /// tree's right-click context menu, whose groups (GitHub issue #19 §1) shipped with no visual
 /// separation at all. See [`MENU_GROUP_DIVIDER_HEIGHT`] for the height both of those menus

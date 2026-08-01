@@ -43,16 +43,16 @@ impl AdeApp {
     }
 
     /// The Review footer's `Keep all` action - a real `wt_core::undo::commit_all_changes` on
-    /// session `id`'s worktree. Not gated by any confirmation (unlike
+    /// agent `id`'s worktree. Not gated by any confirmation (unlike
     /// [`Self::request_discard_worktree`]): it's non-destructive.
-    pub(crate) fn keep_all_changes(&mut self, id: SessionId, cx: &mut Context<Self>) {
+    pub(crate) fn keep_all_changes(&mut self, id: AgentId, cx: &mut Context<Self>) {
         if self.worktree_history_op_in_flight.is_some() {
             return;
         }
-        let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
+        let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
             return;
         };
-        let worktree_path = session.cwd.clone();
+        let worktree_path = agent.cwd.clone();
         let branch_display = self.branch_display_for(&worktree_path);
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
@@ -91,10 +91,10 @@ impl AdeApp {
     /// force-removes a worktree directory, preserving uncommitted/untracked content in a real git
     /// stash first (see [`wt_core::undo::discard_worktree`]'s own docs), but not undoable from
     /// within this app). The first click only arms [`AdeApp::discard_confirm_armed`] for `id`; a
-    /// second click on the *same* session's button while armed actually runs it.
+    /// second click on the *same* agent's button while armed actually runs it.
     pub(crate) fn request_discard_worktree(
         &mut self,
-        id: SessionId,
+        id: AgentId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -114,21 +114,21 @@ impl AdeApp {
     /// Runs the real, already-confirmed discard - only ever reached through
     /// [`Self::request_discard_worktree`]'s second click. `_window` is accepted (not read
     /// directly) purely to match every other footer-button click handler's signature - the real
-    /// `Window` [`Self::close_session`] needs on success is obtained fresh, asynchronously, via
+    /// `Window` [`Self::close_agent`] needs on success is obtained fresh, asynchronously, via
     /// `update_in` in the completion handler below (see this module's own docs).
     pub(in crate::worktree_history) fn execute_discard_worktree(
         &mut self,
-        id: SessionId,
+        id: AgentId,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.worktree_history_op_in_flight.is_some() {
             return;
         }
-        let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
+        let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
             return;
         };
-        let worktree_path = session.cwd.clone();
+        let worktree_path = agent.cwd.clone();
         let repo_path = self.focused_repo_path();
         let branch_display = self.branch_display_for(&worktree_path);
         self.worktree_history_op_in_flight = Some(WorktreeHistoryOpKind::Discard);
@@ -141,7 +141,7 @@ impl AdeApp {
                 .spawn(async move { wt_core::undo::discard_worktree(&repo_path, &worktree_path) })
                 .await;
             // `update_in` (not plain `update`): a successful discard closes the now-cwd-less
-            // session tab, and `Self::close_session` needs a real `Window` to move focus off it -
+            // agent tab, and `Self::close_agent` needs a real `Window` to move focus off it -
             // see `vendor/zed/crates/gpui/src/app/async_context.rs`'s `AsyncApp::with_window`,
             // the same mechanism `Self::trigger_goto_definition`'s own completion handler already
             // relies on for the identical reason.
@@ -161,8 +161,8 @@ impl AdeApp {
                         } else {
                             format!("discarded {branch_display}")
                         });
-                        // The session's cwd no longer exists.
-                        this.close_session(id, window, cx);
+                        // The agent's cwd no longer exists.
+                        this.close_agent(id, window, cx);
                         this.refresh_after_worktree_history_op(cx);
                     }
                     Err(err) => {
@@ -243,16 +243,16 @@ mod worktree_history_regression_tests {
         path
     }
 
-    /// Spawns a real `Shell` session (a real pty) in `cwd` and returns its id - the same
-    /// `sessions.spawn` call `AdeApp::new_session` itself makes.
-    fn spawn_session(
+    /// Spawns a real `Shell` agent (a real pty) in `cwd` and returns its id - the same
+    /// `agents.spawn` call `AdeApp::new_agent` itself makes.
+    fn spawn_agent(
         app: &Entity<AdeApp>,
         cx: &mut gpui::VisualTestContext,
         cwd: PathBuf,
-    ) -> SessionId {
+    ) -> AgentId {
         app.update_in(cx, |app, window, cx| {
-            app.sessions.spawn(
-                SessionKind::Shell,
+            app.agents.spawn(
+                AgentKind::Shell,
                 cwd,
                 app.settings.appearance.terminal_font_size,
                 window,
@@ -268,7 +268,7 @@ mod worktree_history_regression_tests {
         fs::write(feature.join("new.txt"), "from feature\n").expect("write");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_session(&app, cx, feature.clone());
+        let id = spawn_agent(&app, cx, feature.clone());
         let head_before = git_output(&feature, &["rev-parse", "HEAD"]);
 
         app.update(cx, |app, cx| app.keep_all_changes(id, cx));
@@ -305,8 +305,8 @@ mod worktree_history_regression_tests {
         fs::write(feature_b.join("b.txt"), "b\n").expect("write");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id_a = spawn_session(&app, cx, feature_a.clone());
-        let id_b = spawn_session(&app, cx, feature_b.clone());
+        let id_a = spawn_agent(&app, cx, feature_a.clone());
+        let id_b = spawn_agent(&app, cx, feature_b.clone());
 
         app.update(cx, |app, cx| app.keep_all_changes(id_a, cx));
         assert!(app.read_with(cx, |app, _| app.worktree_history_op_in_flight.is_some()));
@@ -330,15 +330,13 @@ mod worktree_history_regression_tests {
     }
 
     #[gpui::test]
-    fn discard_worktree_two_click_confirm_removes_it_and_closes_its_session(
-        cx: &mut TestAppContext,
-    ) {
+    fn discard_worktree_two_click_confirm_removes_it_and_closes_its_agent(cx: &mut TestAppContext) {
         let repo = init_repo();
         let feature = add_worktree(repo.path(), "feature", "feature-wt");
         fs::write(feature.join("scratch.txt"), "wip\n").expect("write untracked");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_session(&app, cx, feature.clone());
+        let id = spawn_agent(&app, cx, feature.clone());
 
         // Click 1: arm.
         app.update_in(cx, |app, window, cx| {
@@ -363,11 +361,11 @@ mod worktree_history_regression_tests {
         );
         assert!(
             app.read_with(cx, |app, _| app
-                .sessions
+                .agents
                 .iter()
                 .find(|s| s.id == id)
                 .is_none()),
-            "the now-cwd-less session tab must have been closed"
+            "the now-cwd-less agent tab must have been closed"
         );
     }
 
@@ -390,7 +388,7 @@ mod worktree_history_regression_tests {
         .expect("write ignored file");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_session(&app, cx, feature.clone());
+        let id = spawn_agent(&app, cx, feature.clone());
         app.update_in(cx, |app, window, cx| {
             app.request_discard_worktree(id, window, cx)
         });

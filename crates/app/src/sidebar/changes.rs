@@ -12,10 +12,10 @@ use std::path::{Path, PathBuf};
 use gpui::Rgba;
 
 use crate::theme;
-use crate::work_surface::sessions::SessionId;
+use crate::work_surface::agents::AgentId;
 use wt_core::diff::{DiffFile, DiffHunk, DiffLineKind, FileChangeStatus};
 
-/// Which agent session(s) wrote each changed file in one worktree's diff -
+/// Which agent(s) wrote each changed file in one worktree's diff -
 /// `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §4 ("Where numbers live")'s
 /// `by: 's1'`, or `by: ['s1', 's9']` when more than one agent touched the same file. Keyed by a
 /// [`DiffFile::path`] (or `old_path`, before a rename - callers decide which path they're asking
@@ -31,7 +31,7 @@ use wt_core::diff::{DiffFile, DiffHunk, DiffLineKind, FileChangeStatus};
 /// yet", never fabricated as "no agent touched it".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Authorship {
-    by_path: HashMap<PathBuf, Vec<SessionId>>,
+    by_path: HashMap<PathBuf, Vec<AgentId>>,
 }
 
 impl Authorship {
@@ -39,24 +39,24 @@ impl Authorship {
         Self::default()
     }
 
-    /// Every session id recorded as having written `path`, in the order [`Self::record`] saw
+    /// Every agent id recorded as having written `path`, in the order [`Self::record`] saw
     /// them - empty (never fabricated) when nothing has recorded authorship for it yet, which
     /// today is every path (see this type's own docs).
-    pub fn authors_for(&self, path: &Path) -> &[SessionId] {
+    pub fn authors_for(&self, path: &Path) -> &[AgentId] {
         self.by_path.get(path).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// Records `session` as (one of) `path`'s authors. Idempotent: recording the same session
+    /// Records `agent` as (one of) `path`'s authors. Idempotent: recording the same agent
     /// against the same path twice does not duplicate the entry, so [`Self::authors_for`]'s
     /// length is always the real distinct-author count, not an edit-tool-call count.
-    pub fn record(&mut self, path: PathBuf, session: SessionId) {
+    pub fn record(&mut self, path: PathBuf, agent: AgentId) {
         let authors = self.by_path.entry(path).or_default();
-        if !authors.contains(&session) {
-            authors.push(session);
+        if !authors.contains(&agent) {
+            authors.push(agent);
         }
     }
 
-    /// `true` when more than one distinct session has written `path` - the design's amber
+    /// `true` when more than one distinct agent has written `path` - the design's amber
     /// shared-file warning: the rail's worktree-row `⚠ N` and the Changes panel's amber
     /// author-chip ring both key off this per-file check.
     pub fn has_multiple_authors(&self, path: &Path) -> bool {
@@ -72,7 +72,7 @@ impl Authorship {
             .count()
     }
 
-    /// How many of `paths` `session` is a recorded author of - the rail agent row's
+    /// How many of `paths` `agent` is a recorded author of - the rail agent row's
     /// `review ready` trailing text (`design_handoff_jerry_ade/revision 3/
     /// REVISION-2026-07-31.md` §2.3: "`12 files` ... here the count **is** the ask - the size of
     /// the review handed to you"). Deliberately per-agent, unlike [`Self::shared_file_count`]
@@ -80,12 +80,12 @@ impl Authorship {
     /// is mine".
     pub fn file_count_for<'a>(
         &self,
-        session: SessionId,
+        agent: AgentId,
         paths: impl IntoIterator<Item = &'a Path>,
     ) -> usize {
         paths
             .into_iter()
-            .filter(|path| self.authors_for(path).contains(&session))
+            .filter(|path| self.authors_for(path).contains(&agent))
             .count()
     }
 }
@@ -678,13 +678,13 @@ mod tests {
         let authorship = Authorship::new();
         assert_eq!(
             authorship.authors_for(Path::new("src/main.rs")),
-            &[] as &[SessionId]
+            &[] as &[AgentId]
         );
         assert!(!authorship.has_multiple_authors(Path::new("src/main.rs")));
     }
 
     #[test]
-    fn recording_one_session_makes_it_the_sole_author() {
+    fn recording_one_agent_makes_it_the_sole_author() {
         let mut authorship = Authorship::new();
         authorship.record(PathBuf::from("src/main.rs"), 1);
         assert_eq!(authorship.authors_for(Path::new("src/main.rs")), &[1]);
@@ -692,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn recording_the_same_session_twice_does_not_duplicate_it() {
+    fn recording_the_same_agent_twice_does_not_duplicate_it() {
         let mut authorship = Authorship::new();
         authorship.record(PathBuf::from("src/main.rs"), 1);
         authorship.record(PathBuf::from("src/main.rs"), 1);
@@ -700,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn two_distinct_sessions_writing_the_same_file_is_a_shared_file() {
+    fn two_distinct_agents_writing_the_same_file_is_a_shared_file() {
         let mut authorship = Authorship::new();
         authorship.record(PathBuf::from("src/main.rs"), 1);
         authorship.record(PathBuf::from("src/main.rs"), 9);
@@ -734,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn file_count_for_only_counts_paths_this_session_authored() {
+    fn file_count_for_only_counts_paths_this_agent_authored() {
         let mut authorship = Authorship::new();
         authorship.record(PathBuf::from("src/main.rs"), 1);
         authorship.record(PathBuf::from("src/main.rs"), 9);
@@ -750,17 +750,17 @@ mod tests {
         assert_eq!(
             authorship.file_count_for(1, paths.iter().map(PathBuf::as_path)),
             2,
-            "session 1 wrote main.rs and lib.rs, not other.rs or untouched.rs"
+            "agent 1 wrote main.rs and lib.rs, not other.rs or untouched.rs"
         );
         assert_eq!(
             authorship.file_count_for(9, paths.iter().map(PathBuf::as_path)),
             2,
-            "session 9 wrote main.rs and other.rs, not lib.rs or untouched.rs"
+            "agent 9 wrote main.rs and other.rs, not lib.rs or untouched.rs"
         );
         assert_eq!(
             authorship.file_count_for(42, paths.iter().map(PathBuf::as_path)),
             0,
-            "a session with no recorded authorship anywhere gets a real 0, not a stray match"
+            "an agent with no recorded authorship anywhere gets a real 0, not a stray match"
         );
     }
 }

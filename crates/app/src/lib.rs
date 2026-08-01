@@ -1,10 +1,10 @@
 //! `app`: the ADE desktop application shell.
 //!
 //! A three-pane GPUI window: a left sidebar listing the target repository's real git
-//! worktrees (via `wt-core`) with session/tab controls for spawning agent CLIs or shells
-//! into them, a tabbed center pane of real terminal sessions (via `pty-core` +
+//! worktrees (via `wt-core`) with agent/tab controls for spawning agent CLIs or shells
+//! into them, a tabbed center pane of real terminal agents (via `pty-core` +
 //! `alacritty_terminal`), and a right sidebar showing the active worktree's real file tree
-//! (via `std::fs::read_dir`). See `crate::root`, `crate::work_surface::sessions`, `crate::terminal::pane`,
+//! (via `std::fs::read_dir`). See `crate::root`, `crate::work_surface::agents`, `crate::terminal::pane`,
 //! and `crate::terminal::grid` for the interesting design decisions (entity/state model,
 //! blocking-call offloading, terminal grid rendering).
 
@@ -51,7 +51,7 @@ use gpui::{
 /// Ctrl. Binding `"cmd-k"` left the shortcut on Super+K while `crate::keymap`'s rendering
 /// (correctly) showed a `Ctrl` keycap on those platforms: `Ctrl+K` did nothing, and `Ctrl+,`
 /// fell through to whatever had keyboard focus and typed a literal `,` into it (e.g. a live
-/// terminal session).
+/// terminal agent).
 ///
 /// `"secondary"` (same file, lines 143-150) is GPUI's own answer to exactly this: it resolves to
 /// the `platform` modifier on macOS and `control` everywhere else, at compile time - the same OS
@@ -74,9 +74,9 @@ use gpui::{
 ///   that decision accepts. The `+` menu row itself is still a working, click-only way to open
 ///   the palette scoped to files.
 /// - `"]"` (Next changed file) has no modifier, and is scoped to `Some("diff && !file-editor")`
-///   rather than global - the only one of this app's bindings with a non-`'rail'`/`'session'`
+///   rather than global - the only one of this app's bindings with a non-`'rail'`/`'agent'`
 ///   context. A global `"]"` would swallow a literal `]` typed into any focused terminal/agent
-///   session (closing a bracket, an array literal, a regex class) - the same bug class as above.
+///   agent (closing a bracket, an array literal, a regex class) - the same bug class as above.
 ///   Scoping to `"diff"` (`crate::code_surface`'s `.key_context("diff")` on the Surface C
 ///   container) means it only fires while a file tab already has focus, matching the design's
 ///   intent: `]` cycles *through an already-open review*, not a global "jump into reviewing"
@@ -88,8 +88,8 @@ use gpui::{
 ///   actively being edited, reproduced live by typing `]` into real content. `!`/`&&` are real,
 ///   supported `KeyBindingContextPredicate` syntax (`vendor/zed/crates/gpui/src/keymap/
 ///   context.rs:172-420`'s own `Not`/`And` variants and parser), not invented here.
-/// - `"secondary-1"` through `"secondary-8"` back the tab strip's session-jump keycaps
-///   (`root::AdeApp::jump_to_session_at`), expanding the design's `mod+1…8` spec into eight
+/// - `"secondary-1"` through `"secondary-8"` back the tab strip's agent-jump keycaps
+///   (`root::AdeApp::jump_to_agent_at`), expanding the design's `mod+1…8` spec into eight
 ///   individually bound keystrokes since GPUI has no "N" wildcard keystroke component.
 /// - The `Editor*` entries (Revision R8.5a's real File view text editing) are scoped to
 ///   `Some("file-editor")`, a real *additional* context alongside `"diff"` above - both live on
@@ -104,7 +104,7 @@ use gpui::{
 ///   real, live-verified bug this was. The read-only Diff view genuinely never receives a single
 ///   one of these bindings: its context string never gains `"file-editor"`. Plain letters/arrows
 ///   are deliberately *not* globally bound (unlike, say, `f12`) - binding them at `None` scope
-///   would swallow ordinary typing in every focused terminal session the same way an unscoped
+///   would swallow ordinary typing in every focused terminal agent the same way an unscoped
 ///   `"]"` would have (see that entry's own docs above) - `"file-editor"` is the only context
 ///   they're ever active in. `EditorSave` is `"secondary-s"`, following this list's own
 ///   `"secondary-"` convention (verified against this same list: no other entry already claims
@@ -181,7 +181,7 @@ use gpui::{
 ///   would need claiming there.
 pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
     vec![
-        gpui::KeyBinding::new("secondary-n", root::NewSession, None),
+        gpui::KeyBinding::new("secondary-n", root::NewAgent, None),
         // The palette's real shortcut, matching the VS Code/Sublime "command palette" convention
         // directly rather than reusing "secondary-k". "secondary-k" was the original binding, but
         // the file-editor's real `"ctrl-k ctrl-d"` chord (multi-cursor "skip occurrence",
@@ -203,14 +203,14 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("ctrl-shift-t", root::NewTerminal, None),
         gpui::KeyBinding::new("secondary-shift-n", root::NewAgentPane, None),
         gpui::KeyBinding::new("]", root::NextChangedFile, Some("diff && !file-editor")),
-        gpui::KeyBinding::new("secondary-1", root::JumpToSession1, None),
-        gpui::KeyBinding::new("secondary-2", root::JumpToSession2, None),
-        gpui::KeyBinding::new("secondary-3", root::JumpToSession3, None),
-        gpui::KeyBinding::new("secondary-4", root::JumpToSession4, None),
-        gpui::KeyBinding::new("secondary-5", root::JumpToSession5, None),
-        gpui::KeyBinding::new("secondary-6", root::JumpToSession6, None),
-        gpui::KeyBinding::new("secondary-7", root::JumpToSession7, None),
-        gpui::KeyBinding::new("secondary-8", root::JumpToSession8, None),
+        gpui::KeyBinding::new("secondary-1", root::JumpToAgent1, None),
+        gpui::KeyBinding::new("secondary-2", root::JumpToAgent2, None),
+        gpui::KeyBinding::new("secondary-3", root::JumpToAgent3, None),
+        gpui::KeyBinding::new("secondary-4", root::JumpToAgent4, None),
+        gpui::KeyBinding::new("secondary-5", root::JumpToAgent5, None),
+        gpui::KeyBinding::new("secondary-6", root::JumpToAgent6, None),
+        gpui::KeyBinding::new("secondary-7", root::JumpToAgent7, None),
+        gpui::KeyBinding::new("secondary-8", root::JumpToAgent8, None),
         gpui::KeyBinding::new("backspace", root::EditorBackspace, Some("file-editor")),
         gpui::KeyBinding::new("delete", root::EditorDelete, Some("file-editor")),
         // Narrowed to `!completions` (Revision R8.5b) - see the `Completions*` entries below and
@@ -481,7 +481,7 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
             root::FileTreePaste,
             Some("file-tree && !tree-editing && !tree-delete-confirm"),
         ),
-        // `Ctrl+W` (GitHub issue #26) - closes the focused tab (file or session), via
+        // `Ctrl+W` (GitHub issue #26) - closes the focused tab (file or agent), via
         // `crate::work_surface::render::AdeApp::handle_close_focused_tab_action`'s own docs for
         // exactly what "focused" resolves to and why this can never close the window (this app
         // registers no window-close keybinding anywhere in this list, on any platform, so there
@@ -490,7 +490,7 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         // conflict class: plain `Ctrl+W` is `crate::terminal::pane::keystroke_to_bytes`'s own real
         // `unix-word-rerase` control byte (`0x17`), a standard readline word-backspace a focused
         // shell needs unclaimed - a global binding here would swallow it in every focused
-        // terminal/agent session on Linux/Windows, the same bug class this list's own
+        // terminal/agent on Linux/Windows, the same bug class this list's own
         // `"]"`/`secondary-z` entries already document (`secondary-p` deliberately accepts this
         // exact class of collision instead - see that binding's own docs for why). A
         // terminal/agent tab is still always closeable via the tab strip's own `×` or
@@ -600,7 +600,7 @@ mod undo_scoping_matrix_tests {
             "a dangling focus handle - GPUI's empty-context dispatch-root fallback",
             "any surface with no key context of its own (the Settings overlay, the tab strip) - \
              only the root div's baseline tag",
-            "a focused terminal session",
+            "a focused terminal agent",
             "the read-only Diff view",
             "the editable File view",
             "the editable File view with the completions popup open",

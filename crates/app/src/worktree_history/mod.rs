@@ -7,9 +7,9 @@
 //! of that file - the same convention `crate::root` established for its own submodules.
 
 use crate::root::*;
-use crate::work_surface::sessions::SessionId;
+use crate::work_surface::agents::AgentId;
 #[cfg(test)]
-use crate::work_surface::sessions::SessionKind;
+use crate::work_surface::agents::AgentKind;
 use gpui::{Context, Window};
 use std::path::Path;
 #[cfg(test)]

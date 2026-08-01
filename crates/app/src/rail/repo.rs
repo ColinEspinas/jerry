@@ -36,7 +36,7 @@ use crate::rail::worktrees::WorktreeItem;
 /// Stable identity for one added repo. A plain, process-local monotonic counter
 /// (`crate::root::AdeApp::next_repo_id`) - **not** derived from the path, since a repo can be
 /// removed and re-added (or its directory renamed) without the identity a worktree's `repo:`
-/// reference points at needing to change mid-session. Never persisted itself: [`RepoState`]
+/// reference points at needing to change mid-agent. Never persisted itself: [`RepoState`]
 /// re-derives a fresh id per entry on every load (see that type's docs), since nothing durable
 /// outside one running process needs to reference a specific numeric id across a restart yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

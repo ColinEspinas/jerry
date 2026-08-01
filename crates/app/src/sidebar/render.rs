@@ -40,7 +40,7 @@ impl AdeApp {
             self.tree_context_menu = None;
             self.tree_inline_edit = None;
             if self.tree_focus_handle.is_focused(window) {
-                restore_focus(&self.sessions, &mut self.code_focus, window, cx);
+                restore_focus(&self.agents, &mut self.code_focus, window, cx);
             }
             // 1 again, one level removed, and invisible to the check above: an *overlay* can be
             // holding the tree's handle as its own return target while the overlay itself has
@@ -1453,7 +1453,7 @@ impl AdeApp {
 
     /// The Changes row's 12×12 review checkbox - toggled via [`Self::toggle_reviewed`]. Stops
     /// propagation on click so checking a box never also opens the row's diff, mirroring
-    /// `Self::render_session_tab`'s nested-clickable-child pattern (its tab-close `×`).
+    /// `Self::render_agent_tab`'s nested-clickable-child pattern (its tab-close `×`).
     pub(in crate::sidebar) fn render_review_checkbox(
         &self,
         path: PathBuf,
@@ -1617,7 +1617,7 @@ impl AdeApp {
     ///
     /// Speaks this app's own established dropdown-row language rather than one invented here.
     /// Every value below is `crate::work_surface::render::render_dropdown_menu_row`'s - the row
-    /// shared by the tab strip's `+` menu and the title bar's File/Edit/View/Session/Help menus,
+    /// shared by the tab strip's `+` menu and the title bar's File/Edit/View/Agent/Help menus,
     /// and the closest thing this app has to a specified menu row (the design handoff's
     /// `revision/CHANGELOG.md` specifies that popover; it has no context-menu spec of its own).
     /// That function is deliberately *not* reused: its row is a fixed chip + label + sub-label +
@@ -2583,7 +2583,7 @@ mod fold_state_tests {
         );
     }
 
-    /// §2: a mid-session refresh of the same worktree (what an agent creating or deleting files
+    /// §2: a mid-agent refresh of the same worktree (what an agent creating or deleting files
     /// causes, via `create_new_file`'s own reload) must not reset fold state.
     #[gpui::test]
     fn reloading_the_same_worktrees_tree_keeps_the_fold_state(cx: &mut TestAppContext) {

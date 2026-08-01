@@ -1,5 +1,5 @@
 //! The top-level three-pane window: a left worktree sidebar, a tabbed center pane of
-//! terminal sessions, and a right file tree, composed as GPUI entities.
+//! terminal agents, and a right file tree, composed as GPUI entities.
 //!
 //! ## What lives here, and what doesn't
 //!
@@ -29,22 +29,22 @@
 //! resolves. `crate::sidebar::file_tree::build_file_tree`'s `std::fs::read_dir` walk follows the same
 //! pattern.
 //!
-//! ## One rail row per worktree; sessions are tabs scoped to it
+//! ## One rail row per worktree; agents are tabs scoped to it
 //!
-//! [`crate::work_surface::sessions::Sessions`] holds any number of independent, simultaneously-running
-//! terminal sessions (a plain shell, or an agent CLI), each pinned to the worktree it was
-//! started in. The session rail shows exactly one row per worktree
-//! (`crate::rail::state::WorktreeRow`, aggregating every session open in it), and the centre pane's tab
+//! [`crate::work_surface::agents::Agents`] holds any number of independent, simultaneously-running
+//! terminal agents (a plain shell, or an agent CLI), each pinned to the worktree it was
+//! started in. The agent rail shows exactly one row per worktree
+//! (`crate::rail::state::WorktreeRow`, aggregating every agent open in it), and the centre pane's tab
 //! strip (`AdeApp::render_tab_strip`) only ever shows the *currently selected* worktree's own
-//! sessions - never a flat, unscoped list of every session across every worktree.
+//! agents - never a flat, unscoped list of every agent across every worktree.
 //!
 //! Selecting a worktree in the sidebar still never spawns or kills anything - but, unlike
-//! before this revision, it *does* change which session is "active"
-//! (`crate::work_surface::sessions::Sessions::activate_for_worktree`, called from [`AdeApp::select_worktree`]):
-//! the active session must always belong to the selected worktree, or the centre pane would show
+//! before this revision, it *does* change which agent is "active"
+//! (`crate::work_surface::agents::Agents::activate_for_worktree`, called from [`AdeApp::select_worktree`]):
+//! the active agent must always belong to the selected worktree, or the centre pane would show
 //! one worktree's terminal while the rail highlights another. [`AdeApp::selected`] itself still
-//! drives the file tree, and which worktree `active_session_cwd` resolves to for the *next* "New
-//! terminal"/"New agent pane" click - that part is unchanged. Spawning a session is still always
+//! drives the file tree, and which worktree `active_agent_cwd` resolves to for the *next* "New
+//! terminal"/"New agent pane" click - that part is unchanged. Spawning an agent is still always
 //! its own explicit action, never an implicit side effect of browsing.
 
 use std::collections::{HashMap, HashSet};
@@ -83,7 +83,7 @@ use crate::status_bar::process_stats;
 use crate::text_history;
 use crate::theme;
 use crate::title_bar::menu as title_bar;
-use crate::work_surface::sessions::{SessionId, SessionKind, Sessions};
+use crate::work_surface::agents::{AgentId, AgentKind, Agents};
 use crate::work_surface::state as work_surface;
 use crate::worktree_history::flow as worktree_history;
 
@@ -104,7 +104,7 @@ use crate::sidebar::render::RightSidebarView;
 // read-only viewer, and a hover must already have resolved before F12 can navigate. No-ops when
 // nothing has been clicked yet, or the click wasn't on a `.rs` file.
 //
-// `JumpToSession1`..`JumpToSession8` are eight distinct zero-sized actions, one per keystroke,
+// `JumpToAgent1`..`JumpToAgent8` are eight distinct zero-sized actions, one per keystroke,
 // since a bound `KeyBinding` maps one literal keystroke to one action value and `actions!`-
 // generated unit structs carry no data a single handler could branch on by position.
 // The `Editor*` actions below (Revision R8.5a) back the File view's real text editing -
@@ -129,21 +129,21 @@ use crate::sidebar::render::RightSidebarView;
 actions!(
     app,
     [
-        NewSession,
+        NewAgent,
         TogglePalette,
         ToggleSettings,
         GotoDefinition,
         NewTerminal,
         NewAgentPane,
         NextChangedFile,
-        JumpToSession1,
-        JumpToSession2,
-        JumpToSession3,
-        JumpToSession4,
-        JumpToSession5,
-        JumpToSession6,
-        JumpToSession7,
-        JumpToSession8,
+        JumpToAgent1,
+        JumpToAgent2,
+        JumpToAgent3,
+        JumpToAgent4,
+        JumpToAgent5,
+        JumpToAgent6,
+        JumpToAgent7,
+        JumpToAgent8,
         EditorBackspace,
         EditorDelete,
         EditorEnter,
@@ -192,7 +192,7 @@ actions!(
 
 /// How often `crate::rail::state::compute_status_snapshot`'s background `git` status/diff refresh
 /// re-runs. Coarser than `crate::terminal::pane`'s 8ms poll since this spawns real `git` child
-/// processes per worktree/session path, not a cheap channel `try_recv`.
+/// processes per worktree/agent path, not a cheap channel `try_recv`.
 pub(crate) const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// GitHub issue #12's "keep a low-frequency polling fallback" - the worktree list is re-parsed
@@ -268,7 +268,7 @@ pub struct AdeApp {
     /// `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.0).
     pub(crate) repos: Vec<Repo>,
     /// Which of [`Self::repos`] is "the" repo for every currently-single-repo-scoped piece of
-    /// state this app still has (the file tree, the diff, a fresh session's cwd, `worktrees`
+    /// state this app still has (the file tree, the diff, a fresh agent's cwd, `worktrees`
     /// below) - see [`Self::focused_repo`]/[`Self::focused_repo_path`]. `None` only when
     /// [`Self::repos`] is empty, which nothing in this phase's startup path (`Self::
     /// new_with_settings`) ever produces - it always adds and focuses exactly one repo, mirroring
@@ -318,12 +318,12 @@ pub struct AdeApp {
     /// later refresh on its own, since refreshes happen every few seconds and a notice that
     /// vanished before it could be read would defeat the point of showing it.
     pub(crate) worktree_selection_notice: Option<String>,
-    /// The session rail's own real overlay scrollbar handle (GitHub issue #30) - a plain
+    /// The agent rail's own real overlay scrollbar handle (GitHub issue #30) - a plain
     /// `gpui::ScrollHandle`: `crate::rail::render::AdeApp::render_rail_list` renders every row
     /// eagerly, not through a `uniform_list`.
     pub(crate) rail_scroll_handle: gpui::ScrollHandle,
     pub(crate) selected: Option<usize>,
-    pub(crate) sessions: Sessions,
+    pub(crate) agents: Agents,
     pub(crate) file_tree: Vec<FileTreeEntry>,
     pub(crate) file_tree_root: PathBuf,
     pub(crate) file_tree_error: Option<String>,
@@ -349,7 +349,7 @@ pub struct AdeApp {
     /// [`Self::current_diff`]'s docs for exactly which [`DiffLoadState`]/[`DiffBase`]
     /// combinations count).
     pub(crate) diff_totals: Option<(u32, u32)>,
-    /// Which agent session(s) wrote each file in [`Self::diff_state`]'s currently loaded diff
+    /// Which agent(s) wrote each file in [`Self::diff_state`]'s currently loaded diff
     /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §4's `by: 's1'`/`by:
     /// ['s1','s9']` record) - see [`changes::Authorship`]'s own docs for why this is always empty
     /// today (no real authorship tracking exists yet; this phase only defines the shape a later
@@ -415,7 +415,7 @@ pub struct AdeApp {
     /// bind-mounted `$HOME` with an unbounded budget would allocate millions of `PathBuf`s on a
     /// background thread and then hand them all to `rebuild_palette_file_candidates`. Each click
     /// raises the bound and the row keeps reporting where the walk stopped, so the listing is
-    /// never *silently* cut off - which is what issue #18 §4 actually asks for. Session-scoped
+    /// never *silently* cut off - which is what issue #18 §4 actually asks for. Agent-scoped
     /// and per-worktree: reset on every worktree switch, since "show me more of *this* tree"
     /// says nothing about the next one.
     pub(crate) file_tree_limit_override: Option<usize>,
@@ -441,7 +441,7 @@ pub struct AdeApp {
     /// The file tree's keyboard-focus target. `track_focus`'d by
     /// `crate::sidebar::render::AdeApp::render_file_tree`'s container, which is also the node
     /// carrying the `"file-tree"` `key_context` every tree keybinding is scoped to - so
-    /// `Ctrl+C`/`Ctrl+X`/`Ctrl+V` can never match while a terminal session has focus. See
+    /// `Ctrl+C`/`Ctrl+X`/`Ctrl+V` can never match while a terminal agent has focus. See
     /// `crate::sidebar::tree_ops`'s module docs.
     pub(crate) tree_focus_handle: FocusHandle,
     /// The file tree container's real painted bounds, captured by a `gpui::canvas` child each
@@ -464,17 +464,17 @@ pub struct AdeApp {
     /// its checkbox is checked. No backend "review" concept exists yet; this is purely local UI
     /// state that `Self::render_changes_header`'s progress bar and count read directly.
     pub(crate) reviewed_files: HashSet<PathBuf>,
-    /// Ordered list of currently-open file tabs, rendered after every session's own tab by
+    /// Ordered list of currently-open file tabs, rendered after every agent's own tab by
     /// `Self::render_tab_strip`. No duplicates: opening an already-open file just activates its
     /// existing entry (`Self::push_open_file`). Removed only on explicit tab close
     /// (`Self::close_file_tab`) or leaving the owning worktree (`reset_per_worktree_ui_state`) -
     /// these are worktree-relative paths, meaningless (or collision-prone) once the worktree
     /// changes.
     pub(crate) open_files: Vec<PathBuf>,
-    /// Which file tab (if any) the centre pane is showing instead of a session -
+    /// Which file tab (if any) the centre pane is showing instead of an agent -
     /// `Some(path)` iff `path` is also in [`Self::open_files`]. Set by a Changes row
     /// (`Self::open_change_diff`), a Files-tree row (`Self::open_file_view`), or an already-open
-    /// tab (`Self::activate_file_tab`); cleared by selecting a session tab or closing the active
+    /// tab (`Self::activate_file_tab`); cleared by selecting an agent tab or closing the active
     /// tab down to none left.
     pub(crate) open_change: Option<PathBuf>,
     /// `Some(path)` for one real "arming" click/keystroke on a *dirty* file tab's close
@@ -711,18 +711,18 @@ pub struct AdeApp {
     /// arrow keys and run by Enter.
     pub(crate) palette_selected: usize,
     pub(crate) palette_focus_handle: FocusHandle,
-    /// Pre-open focus target and active session for [`Self::palette_focus_handle`] - see
+    /// Pre-open focus target and active agent for [`Self::palette_focus_handle`] - see
     /// [`OverlayFocus`]/[`restore_focus`].
     pub(crate) palette_focus: OverlayFocus,
     /// The palette's file-candidate list (`crate::palette::state::FileCandidate`, one per non-directory
     /// [`Self::file_tree`] entry, up to `Settings.file_tree.max_entries`) - built once by
     /// [`Self::rebuild_palette_file_candidates`] when `file_tree`/the diff reload, not rebuilt on
     /// every `Self::build_palette_groups` call (which runs on every render while the palette is
-    /// open, up to ~30x/sec during a streaming session). Session/command candidates aren't
-    /// cached the same way: they're few, and a session's status dot is genuinely live per-render
+    /// open, up to ~30x/sec during a streaming agent). Agent/command candidates aren't
+    /// cached the same way: they're few, and an agent's status dot is genuinely live per-render
     /// data with no stable invalidation point.
     pub(crate) palette_file_candidates: Vec<palette::FileCandidate>,
-    /// The session rail's user-adjustable width (240-340px), dragged via the resize handle on
+    /// The agent rail's user-adjustable width (240-340px), dragged via the resize handle on
     /// the rail's right edge (see [`Self::apply_pane_resize`]/`crate::root::layout::rail_width_for_cursor`).
     pub(crate) rail_width: Pixels,
     /// The files/changes panel's user-adjustable width - see [`Self::rail_width`]'s docs,
@@ -744,7 +744,7 @@ pub struct AdeApp {
     /// The rail's filter query - filters the rendered worktree/agent rows (see
     /// `crate::rail::state::filter_worktree_rows`). Carries a real per-widget undo history
     /// (GitHub issue #17 - see [`text_history::TextField`]); unlike the palette's, this widget
-    /// lives for the whole session, so its history does too.
+    /// lives for the whole agent, so its history does too.
     pub(crate) filter_query: text_history::TextField,
     /// Explicit per-worktree expand/collapse overrides for the rail's worktree rows
     /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.2: "caret state is
@@ -756,31 +756,31 @@ pub struct AdeApp {
     pub(crate) rail_collapse_overrides: HashMap<PathBuf, bool>,
     pub(crate) filter_focus_handle: FocusHandle,
     /// The rail's *root container*'s focus handle - the app's real "nowhere else to put focus"
-    /// fallback target (`Self::select_worktree`, `Self::close_session`, `Self::cancel_new_file`),
+    /// fallback target (`Self::select_worktree`, `Self::close_agent`, `Self::cancel_new_file`),
     /// deliberately **not** [`Self::filter_focus_handle`].
     ///
     /// Those three sites used to fall back onto the filter field itself, which an adversarial
     /// audit found had become a real, reachable bug once GitHub issue #17 tagged that field
-    /// `"text-input"`: closing the last session focused a text input the user never asked to type
+    /// `"text-input"`: closing the last agent focused a text input the user never asked to type
     /// in, and `Ctrl+Z` there resolved to `TextUndo` against an empty field - a silently swallowed
     /// keystroke with no feedback. The rail's root div carries no key context of its own, so
     /// focusing *it* keeps the focused `FocusId` genuinely findable in the next rendered frame -
     /// the actual invariant the fallback exists to protect - without claiming to be a text widget.
     pub(crate) rail_focus_handle: FocusHandle,
-    /// Real `+N -M`/has-changes totals per worktree or session cwd, refreshed by the
+    /// Real `+N -M`/has-changes totals per worktree or agent cwd, refreshed by the
     /// periodic background task started in `Self::new` - see `crate::rail::state::
     /// compute_status_snapshot`'s docs. Read (never written outside that task's completion
-    /// callback) by `Self::build_session_rows` each render.
+    /// callback) by `Self::build_agent_rows` each render.
     pub(crate) diff_cache: HashMap<PathBuf, rail::DiffSummary>,
     /// Real clean/merged notes per worktree path, from the same periodic refresh as
-    /// [`Self::diff_cache`] - powers "by project" mode's session-less worktree rows and the
+    /// [`Self::diff_cache`] - powers "by project" mode's agent-less worktree rows and the
     /// rail footer's `prune` action.
     pub(crate) worktree_notes: HashMap<PathBuf, rail::WorktreeNote>,
-    /// Real `wt_core::diff::AheadBehind` counts per worktree/session cwd, from the same
+    /// Real `wt_core::diff::AheadBehind` counts per worktree/agent cwd, from the same
     /// periodic refresh as [`Self::diff_cache`] - the status bar's `↑2 ↓0` indicator for the
-    /// active session's worktree.
+    /// active agent's worktree.
     pub(crate) ahead_behind_cache: HashMap<PathBuf, wt_core::diff::AheadBehind>,
-    /// Real, live per-pid CPU%/memory samples for every currently open session's process
+    /// Real, live per-pid CPU%/memory samples for every currently open agent's process
     /// (`crate::status_bar::process_stats`), refreshed by the same periodic background task as
     /// [`Self::diff_cache`] - see `Self::start_status_polling`'s docs for why this rides the
     /// same timer rather than a second, independent polling loop. Keyed by OS pid; an entry is
@@ -813,7 +813,7 @@ pub struct AdeApp {
     /// busy label ("keeping…"/"discarding…") can honestly reflect what's actually running instead
     /// of guessing from which button happens to be visible (a real, live-reproduced bug an audit
     /// caught: a running "keep all changes" made every visible `Discard worktree` button across
-    /// every session read "discarding…"). A single field shared across both, not two independent
+    /// every agent read "discarding…"). A single field shared across both, not two independent
     /// guards: these are the only operations that ever mutate real git history or a worktree's
     /// own existence for this feature, so fully serializing them (a second click of either while
     /// one is in flight is a no-op, mirroring [`Self::prune_in_flight`]'s own
@@ -827,9 +827,9 @@ pub struct AdeApp {
     /// deliberately its own render slot, independent of [`Self::prune_status`] (see that
     /// method's own docs for why sharing one slot with `prune_status` was a real bug: an
     /// unrelated prune click could permanently hide every future worktree-history status for the
-    /// rest of the session).
+    /// rest of the agent).
     pub(crate) worktree_history_status: Option<String>,
-    /// `Some(id)` after one click on session `id`'s "Discard worktree" footer button, cleared by
+    /// `Some(id)` after one click on agent `id`'s "Discard worktree" footer button, cleared by
     /// most other gestures in the meantime (mirroring [`Self::prune_confirm_armed`]'s own "most
     /// other gestures disarm it" discipline, applied everywhere that field is - see
     /// `crate::worktree_history::flow::AdeApp::request_discard_worktree`'s own docs for why this
@@ -838,7 +838,7 @@ pub struct AdeApp {
     /// arming *this* field's own sibling ([`Self::prune_confirm_armed`]'s first, arming click)
     /// does not clear this one, and vice versa - only each field's own confirm/cancel/execute
     /// paths, and a handful of other real navigation gestures, clear it.
-    pub(crate) discard_confirm_armed: Option<SessionId>,
+    pub(crate) discard_confirm_armed: Option<AgentId>,
     /// Whether the Settings surface is currently replacing the three-zone body - see
     /// [`Self::open_settings`]/[`Self::close_settings`], which use the same
     /// capture-and-restore shape as [`Self::palette_open`].
@@ -863,7 +863,7 @@ pub struct AdeApp {
     /// if run inline. `Vec::new()` until the first load completes.
     pub(crate) agent_rows: Vec<settings::AgentRow>,
     /// The context bar's `Merge` action and Surface D's conflict-resolution flow - see
-    /// [`crate::merge::state::MergeFlow`]'s docs. `None` when no session has an in-flight merge or
+    /// [`crate::merge::state::MergeFlow`]'s docs. `None` when no agent has an in-flight merge or
     /// unresolved conflict.
     pub(crate) merge_flow: Option<merge::MergeFlow>,
     /// `true` for the duration of an in-flight `Complete merge`/`Abort merge` git operation -
@@ -889,7 +889,7 @@ pub struct AdeApp {
     /// [`Self::edit_buffers`]. `None` whenever no hand-edit is in progress, including while a
     /// merge conflict is showing but the user hasn't toggled hand-edit mode on for the active
     /// file. Torn down (`crate::merge::flow::AdeApp::clear_merge_edit_state`) at every real
-    /// merge-flow-ending point (abort/complete/dismiss/session-close) and by a fresh
+    /// merge-flow-ending point (abort/complete/dismiss/agent-close) and by a fresh
     /// [`Self::start_merge`], and whenever the flow's own active file (matched by path) advances
     /// past whatever file this hand-edit is for.
     pub(crate) merge_edit: Option<merge::MergeEditState>,
@@ -976,7 +976,7 @@ pub struct AdeApp {
     pub(crate) _worktree_history_task: Option<Task<()>>,
     pub(crate) _agent_rows_task: Option<Task<()>>,
     pub(crate) _merge_task: Option<Task<()>>,
-    /// `Self::clear_merge_flow_for_closed_session`'s best-effort abort - kept separate from
+    /// `Self::clear_merge_flow_for_closed_agent`'s best-effort abort - kept separate from
     /// [`Self::_merge_task`] so a cleanup-triggered abort can never overwrite (and thus cancel)
     /// an in-flight `complete_merge_flow`/`abort_merge_flow` commit, which would strand
     /// [`Self::merge_op_in_flight`] at `true` and let `git merge --abort` race an in-flight
@@ -1248,7 +1248,7 @@ pub struct AdeApp {
     pub(crate) title_menu_button_bounds: [gpui::Bounds<Pixels>; title_bar::TitleMenu::ALL.len()],
     /// Every in-flight [`Self::new_agent_pane`] background `$PATH` detection - a [`TaskPool`]
     /// rather than a single slot, so two rapid "New agent pane" clicks each produce their own
-    /// session instead of the second cancelling the first's still-in-flight search.
+    /// agent instead of the second cancelling the first's still-in-flight search.
     pub(crate) _new_agent_pane_task: TaskPool,
     /// Real "New file" creation state (`crate::root::new_file`) - `Some` only while the inline
     /// name prompt is showing. See [`new_file::NewFileInputState`]'s own docs.
@@ -1259,11 +1259,11 @@ pub struct AdeApp {
     /// convention. Cleared by [`Self::start_new_file`]/[`Self::create_new_file`]'s own success
     /// path.
     pub(crate) new_file_error: Option<String>,
-    /// Each worktree's own real, drag-chosen tab order (GitHub issue #16) - session and file
+    /// Each worktree's own real, drag-chosen tab order (GitHub issue #16) - agent and file
     /// tabs interleaved, keyed by that worktree's cwd. Never itself the source of truth for
-    /// which tabs exist (`Sessions`/[`Self::open_files`] still are - see
+    /// which tabs exist (`Agents`/[`Self::open_files`] still are - see
     /// [`Self::combined_tab_order`]'s own docs); only [`Self::reorder_tab`] writes to it, and a
-    /// worktree with no entry here simply renders its sessions then its files, exactly the old
+    /// worktree with no entry here simply renders its agents then its files, exactly the old
     /// two-block layout.
     pub(crate) tab_order: HashMap<PathBuf, Vec<work_surface::TabRef>>,
     /// The unified tab strip's real, precise drop-target indicator (GitHub issue #16's "better
@@ -1585,7 +1585,7 @@ impl AdeApp {
     /// Makes `id` [`Self::focused_repo`] - a no-op if `id` isn't (or is no longer) in
     /// [`Self::repos`], so a stale id from a closed-over click handler can never point focus at
     /// nothing. Deliberately synchronous and cheap: unlike [`Self::select_worktree`], changing
-    /// which *repo* is focused doesn't yet reload anything (the file tree/diff/sessions are still
+    /// which *repo* is focused doesn't yet reload anything (the file tree/diff/agents are still
     /// single-repo-scoped fields this phase doesn't rewire - see [`Self::worktrees`]'s own docs),
     /// so there is nothing to kick off here beyond the assignment itself.
     pub(crate) fn focus_repo(&mut self, id: RepoId) {
@@ -1685,21 +1685,21 @@ impl Render for AdeApp {
             // frame, so `!terminal` (and any future negated-context predicate) evaluates its
             // real, intended logic everywhere.
             .key_context("app")
-            .on_action(cx.listener(Self::handle_new_session_action))
+            .on_action(cx.listener(Self::handle_new_agent_action))
             .on_action(cx.listener(Self::handle_toggle_palette_action))
             .on_action(cx.listener(Self::handle_toggle_settings_action))
             .on_action(cx.listener(Self::handle_goto_definition_action))
             .on_action(cx.listener(Self::handle_new_terminal_action))
             .on_action(cx.listener(Self::handle_new_agent_pane_action))
             .on_action(cx.listener(Self::handle_next_changed_file_action))
-            .on_action(cx.listener(Self::handle_jump_to_session_1_action))
-            .on_action(cx.listener(Self::handle_jump_to_session_2_action))
-            .on_action(cx.listener(Self::handle_jump_to_session_3_action))
-            .on_action(cx.listener(Self::handle_jump_to_session_4_action))
-            .on_action(cx.listener(Self::handle_jump_to_session_5_action))
-            .on_action(cx.listener(Self::handle_jump_to_session_6_action))
-            .on_action(cx.listener(Self::handle_jump_to_session_7_action))
-            .on_action(cx.listener(Self::handle_jump_to_session_8_action))
+            .on_action(cx.listener(Self::handle_jump_to_agent_1_action))
+            .on_action(cx.listener(Self::handle_jump_to_agent_2_action))
+            .on_action(cx.listener(Self::handle_jump_to_agent_3_action))
+            .on_action(cx.listener(Self::handle_jump_to_agent_4_action))
+            .on_action(cx.listener(Self::handle_jump_to_agent_5_action))
+            .on_action(cx.listener(Self::handle_jump_to_agent_6_action))
+            .on_action(cx.listener(Self::handle_jump_to_agent_7_action))
+            .on_action(cx.listener(Self::handle_jump_to_agent_8_action))
             .on_action(cx.listener(Self::handle_close_focused_tab_action))
             .child(self.render_title_bar(cx))
             // The Settings surface (`design_handoff_jerry_ade/README.md`: "a separate surface,
@@ -1755,7 +1755,7 @@ impl Render for AdeApp {
 }
 
 impl AdeApp {
-    /// The three-zone workspace body (session rail, centre pane, files/changes panel) - pulled
+    /// The three-zone workspace body (agent rail, centre pane, files/changes panel) - pulled
     /// out of [`Render::render`] so it and [`Self::render_settings`] can both be
     /// [`gpui::AnyElement`]-branched as a single child, the same pattern
     /// `vendor/zed/crates/gpui/src/util.rs`'s `Styled::when_else` uses.
@@ -1866,33 +1866,33 @@ pub(crate) struct OverlayFocus {
     /// The focus target in place immediately before this overlay opened (`window.focused(cx)`,
     /// `None` on a fresh window) - restored by [`restore_focus`] on close.
     return_focus: Option<FocusHandle>,
-    /// Which session was active when [`Self::capture`] ran - compared against the active
-    /// session at restore time so [`restore_focus`] can tell whether `return_focus` is still
-    /// safe to restore (it may belong to a session that's no longer active).
-    opened_session: Option<SessionId>,
+    /// Which agent was active when [`Self::capture`] ran - compared against the active
+    /// agent at restore time so [`restore_focus`] can tell whether `return_focus` is still
+    /// safe to restore (it may belong to an agent that's no longer active).
+    opened_agent: Option<AgentId>,
 }
 
 impl OverlayFocus {
-    /// Records the current focus target and active session. Callers that must only capture on
+    /// Records the current focus target and active agent. Callers that must only capture on
     /// a genuine closed-to-open transition (not every subsequent navigation while already open -
     /// see [`AdeApp::focus_code_surface`]) guard the call themselves; this always captures
     /// unconditionally when called.
-    pub(crate) fn capture(&mut self, window: &Window, sessions: &Sessions, cx: &App) {
+    pub(crate) fn capture(&mut self, window: &Window, agents: &Agents, cx: &App) {
         self.return_focus = window.focused(cx);
-        self.opened_session = sessions.active_id();
+        self.opened_agent = agents.active_id();
     }
 
     /// Discards captured state without restoring it. Three real callers: [`AdeApp::close_palette`]'s
     /// Settings-showing-underneath branch and [`AdeApp::close_palette_keeping_result_focus`],
     /// both of which put focus somewhere real themselves instead of going through
-    /// [`restore_focus`], and `crate::work_surface::render`'s session teardown.
+    /// [`restore_focus`], and `crate::work_surface::render`'s agent teardown.
     pub(crate) fn clear(&mut self) {
         self.return_focus = None;
-        self.opened_session = None;
+        self.opened_agent = None;
     }
 
     /// Forgets a captured target that is about to stop being rendered, leaving [`restore_focus`]
-    /// to fall back to the active session's pane instead of focusing a node GPUI can no longer
+    /// to fall back to the active agent's pane instead of focusing a node GPUI can no longer
     /// find in the frame.
     ///
     /// This exists for a real, reproduced case (found by the `tree-focus-bugfixes` branch's own
@@ -1913,31 +1913,28 @@ impl OverlayFocus {
 /// The shared focus-restore-on-close step for every overlay that captured a pre-open target via
 /// [`OverlayFocus::capture`] - see this type's own docs for the invariant this closes.
 ///
-/// If the active session changed while the surface was open, the captured handle is skipped in
-/// favor of the *current* active session's terminal pane (a handle from a no-longer-active
-/// session would be just as dangling as the overlay's own). Otherwise the captured handle is
-/// restored, falling back to the active session's pane if nothing was focused before. A free
+/// If the active agent changed while the surface was open, the captured handle is skipped in
+/// favor of the *current* active agent's terminal pane (a handle from a no-longer-active
+/// agent would be just as dangling as the overlay's own). Otherwise the captured handle is
+/// restored, falling back to the active agent's pane if nothing was focused before. A free
 /// function, not an `AdeApp` method, since every caller already holds `&mut self` and needs to
 /// pass `&mut self.some_field` alongside it. Deliberately doesn't call `cx.notify()` - every
 /// caller has its own surface-specific state change around this call and issues its own single
 /// `cx.notify()` once everything, this restore included, is done.
 pub(crate) fn restore_focus(
-    sessions: &Sessions,
+    agents: &Agents,
     overlay_focus: &mut OverlayFocus,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let session_changed = sessions.active_id() != overlay_focus.opened_session;
-    let restore_target = if session_changed {
+    let agent_changed = agents.active_id() != overlay_focus.opened_agent;
+    let restore_target = if agent_changed {
         None
     } else {
         overlay_focus.return_focus.take()
     };
-    let focus_target = restore_target.or_else(|| {
-        sessions
-            .active()
-            .map(|session| session.pane.focus_handle(cx))
-    });
+    let focus_target =
+        restore_target.or_else(|| agents.active().map(|agent| agent.pane.focus_handle(cx)));
     if let Some(handle) = focus_target {
         window.focus(&handle, cx);
     }
