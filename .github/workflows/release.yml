@@ -11,80 +11,21 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
-  # Same "run tests before shipping" gate on all three platforms, so a release never
-  # ships from a platform where the workspace's own test suite is red. Kept as its own
-  # job (rather than a step reused by each build job) so its pass/fail shows up as an
-  # independent status per platform in the Actions UI, matching ci.yml's existing
-  # per-platform job layout.
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: linux
-          - os: macos-latest
-            name: macos
-          - os: windows-latest
-            name: windows
-    name: Test (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 1
-
-      - name: Install Linux system dependencies
-        if: matrix.name == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            clang \
-            cmake \
-            pkg-config \
-            libfontconfig-dev \
-            libvulkan1 \
-            mesa-vulkan-drivers \
-            libwayland-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libx11-xcb-dev
-
-      - name: Install Rust 1.95.0
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95.0"
-
-      - name: Cache cargo/target
-        uses: Swatinem/rust-cache@v2
-
-      # Skips the same environment-dependent tests ci.yml's own comments already document
-      # as not viable on a stock GitHub-hosted runner, rather than running blind and
-      # failing releases on gaps that are already known and out of scope here: the
-      # `lsp_*_wiring_tests`/`vue_two_server_wiring_tests` modules each spin up a real
-      # rust-analyzer/pyright/typescript-language-server/vue-language-server ("real X"
-      # is this workspace's own naming convention for integration tests against the
-      # genuine external tool, not a mock) - none of which are installed on
-      # ubuntu-latest/macos-latest/windows-latest, so every one of them fails with
-      # "the real <server> client never became Ready" rather than a real product bug.
-      # `diff_render_tests::repeated_refreshes_of_the_same_open_diff_reuse_the_cached_highlighting`
-      # is ci.yml's own named "known cache flake". Installing four real language
-      # servers on three OSes is real, separate follow-up work (tracked the same way
-      # ci.yml's own build-only narrowing calls out fuller CI as follow-up), not
-      # something to take on inside this release workflow.
-      - name: cargo test --workspace
-        run: |
-          cargo test --workspace -- \
-            --skip lsp_diagnostics_wiring_tests \
-            --skip lsp_hover_wiring_tests \
-            --skip vue_two_server_wiring_tests \
-            --skip lsp_failed_status_chip_tests \
-            --skip diff_render_tests::repeated_refreshes_of_the_same_open_diff_reuse_the_cached_highlighting
-
+  # Build-only signal per platform before packaging, deliberately matching ci.yml's own
+  # "build, test, clippy, fmt" -> build-only narrowing on this exact workspace: a real
+  # `v0.0.1-test` tag run of a fuller `cargo test --workspace` step here hit the same
+  # environment gaps ci.yml's own comments already document - the `lsp_*_wiring_tests`/
+  # `vue_two_server_wiring_tests` modules each spin up a real rust-analyzer/pyright/
+  # typescript-language-server/vue-language-server ("real X" is this workspace's own
+  # naming convention for integration tests against the genuine external tool, not a
+  # mock), none of which are installed on ubuntu-latest/macos-latest/windows-latest, so
+  # every one of them failed with "the real <server> client never became Ready" rather
+  # than a real product bug, plus ci.yml's own named `diff_render_tests` "known cache
+  # flake". Installing four real language servers on three OSes to run the full suite
+  # here is real, separate follow-up work, same as ci.yml's own comments already track
+  # fuller CI as follow-up rather than something to take on inside this release
+  # workflow.
   build:
-    needs: test
     strategy:
       fail-fast: false
       matrix:
