@@ -4812,3 +4812,56 @@ them against an unmodified `master` checkout (both passed there in isolation, an
 disappeared on every subsequent full run against this fix, on the same machine, with no other
 changes) - consistent with this file's own prior documented finding that `code_surface::diff_view`
 and timing-sensitive async tests are sensitive to system load under a full-workspace run.
+## Live worktree panel refresh via real fs watcher + poll fallback (GitHub issue #12)
+
+**Root cause.** The worktrees panel was populated once at `AdeApp` startup and never
+invalidated afterward. A `git worktree add`/`remove`/`prune`/`lock` run from an external
+terminal, or a branch switch inside a worktree, left the in-IDE panel silently stale - a
+phantom entry for a worktree that no longer existed could even still be selected, and would
+then error out on use rather than simply not being there.
+
+**`wt-core`: authoritative parsing instead of reimplemented state.** Added
+`list_worktrees_porcelain`/`parse_worktree_list_porcelain`/`git_common_dir`, parsing real
+`git worktree list --porcelain` output (which correctly handles worktree paths containing
+spaces, unlike the ambiguous human-readable table form the panel effectively depended on
+before). Locked/prunable state is resolved by `git` itself in this output rather than
+reimplemented by inspecting `.git/worktrees/*/locked` files by hand, so it can't drift from
+git's own notion of worktree health.
+
+**`app`: one watcher, one poll fallback, one real refresh path.** `crate::rail::worktree_watch`
+wires a real `notify` filesystem watcher on `$GIT_COMMON_DIR/worktrees` (recursive) and
+`$GIT_COMMON_DIR/HEAD`, debounced, so `git worktree add`/`remove`/`lock` and branch switches are
+picked up as they happen. Backing it is a 5s poll fallback (`AdeApp::start_worktree_watch`) for
+the one class of change with no filesystem-watchable signature - a worktree directory deleted by
+hand out from under git's own bookkeeping. `WorktreeItem` gained `is_bare`/`is_detached`/
+`short_sha`/`lock_reason`/`is_broken`/`broken_reason`, and a prunable/missing worktree now
+surfaces `error: Some(..)` too - every existing "is this worktree usable" gate in the app
+already treated `error.is_some()` as unselectable, so this reuses that gate rather than adding a
+second one. `AdeApp::load_worktrees` is the single real refresh path: the watcher, the poll
+fallback, startup, and every explicit in-IDE mutation (add/remove/lock from the UI itself) all
+call through it - deliberately no separate optimistic-insert path that could disagree with a
+watcher-triggered refresh. It also runs the new `rail::worktrees::recover_selection`: the
+currently active worktree survives a refresh by path identity even if its position in the list
+moved, or falls back to the main worktree with a dismissible notice if the active one actually
+disappeared out from under the user.
+
+**Testing.** Real integration tests throughout rather than mocked git state: temp git repos with
+real `git worktree add`/`remove`/`lock` invocations, real `notify` filesystem events (not a
+simulated debounce tick), and real GPUI `AdeApp` end to end for the selection-recovery and
+error-surfacing paths - see `crates/wt-core/src/lib.rs`, `crates/app/src/rail/worktrees.rs`,
+`crates/app/src/rail/worktree_watch.rs`, and
+`crates/app/src/root/state.rs::load_worktrees_integration_tests`.
+
+**Rebase.** This branch was cut from an older master tip; rebased onto current master
+(through PR #55, movable tabs) with no conflicts - a clean linear replay, nothing to resolve.
+
+**Gates**, from this project's usual Linux sandbox (`export
+LIBRARY_PATH=/tmp/x11-deps/prefix/usr/lib/x86_64-linux-gnu`): `cargo fmt --all -- --check`,
+`cargo build --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` all clean.
+`cargo test --workspace --lib -- --test-threads=1`: **1269 passed, 0 failed** across all four
+crates on the final, clean run (`app` 1087, `lsp-core` 44, `pty-core` 14, `wt-core` 124). One
+earlier run of the full suite hit the known pre-existing `code_surface::diff_view::
+diff_render_tests` flake
+(`repeated_refreshes_of_the_same_open_diff_reuse_the_cached_highlighting`), unrelated to this
+change (`diff_view.rs` untouched anywhere in this diff) - confirmed it passes cleanly in
+isolation, and the subsequent full-suite re-run above was clean.

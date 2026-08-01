@@ -1,5 +1,7 @@
 use super::*;
 use crate::root::widgets::{render_keycap_row, text_tooltip, KeycapSize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 impl AdeApp {
     pub(crate) fn toggle_rail_mode(&mut self, cx: &mut Context<Self>) {
@@ -249,6 +251,58 @@ impl AdeApp {
         self._status_poll_task = Some(task);
     }
 
+    /// Starts the worktree panel's live-refresh loop (GitHub issue #12): a real `notify`
+    /// filesystem watcher (`crate::rail::worktree_watch::spawn_worktree_watcher`, stored in
+    /// [`Self::_worktree_watcher`] to keep it alive) plus the [`WORKTREE_WATCH_POLL_INTERVAL`]
+    /// poll fallback the issue asks for, both driving the exact same
+    /// [`Self::load_worktrees`] real re-parse - never a separate, divergent code path.
+    ///
+    /// The loop itself ticks every [`WORKTREE_WATCH_TICK`] (short - this is what gets a real
+    /// watcher event in front of [`Self::load_worktrees`] well under a second, not the 5s poll
+    /// interval) and, each tick, refreshes if either is true:
+    /// - the watcher's [`crate::rail::worktree_watch::DirtyFlag`] is set (a real filesystem
+    ///   change was observed) - after a [`WORKTREE_WATCH_SETTLE`] pause to coalesce a burst of
+    ///   events from one `git worktree` invocation into a single refresh, per the issue's own
+    ///   debounce requirement;
+    /// - [`WORKTREE_WATCH_POLL_INTERVAL`] has elapsed since the last refresh regardless - the
+    ///   backstop for changes with no filesystem-watchable signature at all (a worktree
+    ///   directory deleted by hand - see [`crate::rail::worktree_watch`]'s module docs).
+    pub(crate) fn start_worktree_watch(&mut self, cx: &mut Context<Self>) {
+        let repo_path = self.repo_path.clone();
+        let dirty: worktree_watch::DirtyFlag = Arc::new(AtomicBool::new(false));
+        self._worktree_watcher = worktree_watch::spawn_worktree_watcher(&repo_path, dirty.clone());
+
+        let task = cx.spawn(async move |this, cx| {
+            let mut last_refresh = Instant::now();
+            loop {
+                cx.background_executor().timer(WORKTREE_WATCH_TICK).await;
+
+                let watcher_fired = dirty.load(Ordering::SeqCst);
+                if watcher_fired {
+                    // Let a burst of events from one `git worktree` invocation settle before
+                    // acting, then clear whatever accumulated during the settle window too -
+                    // it's all being answered by the single refresh about to run either way.
+                    cx.background_executor().timer(WORKTREE_WATCH_SETTLE).await;
+                    dirty.store(false, Ordering::SeqCst);
+                }
+                let poll_due = last_refresh.elapsed() >= WORKTREE_WATCH_POLL_INTERVAL;
+
+                if !watcher_fired && !poll_due {
+                    continue;
+                }
+                last_refresh = Instant::now();
+
+                let updated = this.update(cx, |this, cx| {
+                    this.load_worktrees(cx);
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        });
+        self._worktree_watch_task = Some(task);
+    }
+
     /// The prune candidate list: every worktree that is a prune candidate on its own merits
     /// ([`rail::is_prunable`]) **and** has no live session running with its cwd inside it -
     /// see [`rail::prunable_worktree_paths`]'s docs for why that second condition matters.
@@ -383,6 +437,10 @@ impl AdeApp {
             .when_some(self.render_worktrees_error_banner(), |el, banner| {
                 el.child(banner)
             })
+            .when_some(
+                self.render_worktree_selection_notice_banner(cx),
+                |el, banner| el.child(banner),
+            )
             .child(
                 div()
                     .relative()
@@ -409,7 +467,7 @@ impl AdeApp {
             .child(self.render_rail_footer(cx))
     }
 
-    /// A visible error banner for [`Self::worktrees_error`] (`wt_core::list_worktrees`
+    /// A visible error banner for [`Self::worktrees_error`] (`wt_core::list_worktrees_porcelain`
     /// failing outright, e.g. a corrupt repository) - shown as a standing banner rather than
     /// replacing the whole session list, so already-open sessions stay usable even when the
     /// worktree listing itself is broken.
@@ -428,6 +486,42 @@ impl AdeApp {
                 .text_size(self.ui_text_size(10.0))
                 .text_color(theme::status::FAIL)
                 .child(format!("failed to list worktrees: {error}")),
+        )
+    }
+
+    /// GitHub issue #12's "the user is notified" selection-recovery banner - shown when
+    /// [`Self::load_worktrees`] found the previously selected worktree gone (or newly broken)
+    /// and fell [`Self::selected`] back to the main worktree
+    /// ([`Self::worktree_selection_notice`]'s own docs). Amber (`theme::status::ASK`/`ASK_BG`),
+    /// not the hard-failure red [`Self::render_worktrees_error_banner`] uses above - this is
+    /// "something changed out from under you", not "the listing itself is broken". Click to
+    /// dismiss, mirroring `crate::sidebar::render::AdeApp::render_file_tree`'s own
+    /// `tree_op_error` banner.
+    pub(in crate::rail) fn render_worktree_selection_notice_banner(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let notice = self.worktree_selection_notice.clone()?;
+        Some(
+            div()
+                .id("rail-worktree-selection-notice")
+                .flex_none()
+                .w_full()
+                .cursor_pointer()
+                .px(px(10.0))
+                .py(px(6.0))
+                .bg(theme::status::ASK_BG)
+                .border_b_1()
+                .border_color(theme::border::RAIL_INNER)
+                .font(font(theme::font::MONO))
+                .text_size(self.ui_text_size(10.0))
+                .text_color(theme::status::ASK)
+                .tooltip(text_tooltip("Click to dismiss"))
+                .child(notice)
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.worktree_selection_notice = None;
+                    cx.notify();
+                })),
         )
     }
 
@@ -995,6 +1089,29 @@ impl AdeApp {
                     ),
             );
 
+        // GitHub issue #12's "locked worktrees are visually marked, with the lock reason
+        // surfaced (tooltip is fine)" - `row.note.is_locked` alone (already threaded through
+        // `build_worktree_entries` from `WorktreeItem::is_locked`) is what drives the `·
+        // locked`/`locked` text `WorktreeNote::label` already renders in the stat column above;
+        // this adds the *reason* as a tooltip on the whole row. Looked up from `self.worktrees`
+        // by path rather than threaded onto `WorktreeRow` itself - `WorktreeNote` is shared with
+        // the periodic status-poll snapshot (`crate::rail::state::compute_status_snapshot`) and
+        // already has a lot of call sites; a worktree list is always small, so a linear lookup
+        // here per row per render is real but negligible cost next to everything else this
+        // function already computes.
+        if row.note.is_locked {
+            let lock_reason = self
+                .worktrees
+                .iter()
+                .find(|item| item.path == row.path)
+                .and_then(|item| item.lock_reason.clone());
+            let tooltip_text = match lock_reason {
+                Some(reason) => format!("Locked: {reason}"),
+                None => "Locked".to_string(),
+            };
+            container = container.tooltip(text_tooltip(tooltip_text));
+        }
+
         // The most urgently-waiting open session's own question preview, if any - matches the
         // old per-session row's card exactly, just picked from among this worktree's several
         // possible tabs rather than always having exactly one to show.
@@ -1199,7 +1316,13 @@ mod prune_regression_tests {
             label: branch.to_string(),
             branch: Some(branch.to_string()),
             is_main: false,
+            is_bare: false,
+            is_detached: false,
+            short_sha: None,
             is_locked: false,
+            lock_reason: None,
+            is_broken: false,
+            broken_reason: None,
             error: None,
         });
         app.worktree_notes.insert(

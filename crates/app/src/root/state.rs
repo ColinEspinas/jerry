@@ -86,6 +86,7 @@ impl AdeApp {
             repo_path: repo_path.clone(),
             worktrees: Vec::new(),
             worktrees_error: None,
+            worktree_selection_notice: None,
             rail_scroll_handle: gpui::ScrollHandle::new(),
             selected: None,
             sessions: Sessions::new(),
@@ -218,6 +219,8 @@ impl AdeApp {
             #[cfg(test)]
             merge_edit_save_test_delay: None,
             _load_worktrees_task: None,
+            _worktree_watcher: None,
+            _worktree_watch_task: None,
             _load_file_tree_task: None,
             _load_diff_task: None,
             _file_load_task: None,
@@ -330,17 +333,38 @@ impl AdeApp {
         this.load_file_tree(repo_path.clone(), cx);
         this.load_diff(repo_path, cx);
         this.start_status_polling(cx);
+        this.start_worktree_watch(cx);
         this
     }
 
+    /// The **one** real code path that (re)populates [`Self::worktrees`] - GitHub issue #12.
+    /// Called on startup, after every explicit in-IDE worktree mutation
+    /// (`Self::execute_prune`, the merge/undo flows' own `load_worktrees` calls), *and* by the
+    /// live watcher/poll refresh loop (`crate::rail::worktree_watch`,
+    /// `Self::start_worktree_watch`) - there is no separate "optimistic insert" that patches
+    /// [`Self::worktrees`] directly anywhere else in this crate, so the panel can never diverge
+    /// from a real `git worktree list --porcelain` re-parse.
+    ///
+    /// Also runs [`crate::rail::worktrees::recover_selection`] against the previously selected
+    /// worktree (by path - the only stable identity a worktree has across a refresh) every time:
+    /// still present and usable → [`Self::selected`] is remapped to its new index with no other
+    /// effect; gone or newly broken → falls back to the main worktree and sets
+    /// [`Self::worktree_selection_notice`]. See that function's docs for the full state machine.
     pub(crate) fn load_worktrees(&mut self, cx: &mut Context<Self>) {
         let repo_path = self.repo_path.clone();
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { wt_core::list_worktrees(&repo_path) })
+                .spawn(async move { wt_core::list_worktrees_porcelain(&repo_path) })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                // Captured *before* `this.worktrees` is overwritten below - `recover_selection`
+                // needs the old entry's own path/label, which won't exist in the new list.
+                let previously_selected = this
+                    .selected
+                    .and_then(|index| this.worktrees.get(index))
+                    .cloned();
+
                 match result {
                     Ok(results) => {
                         this.worktrees = worktrees::build_worktree_items(results);
@@ -351,6 +375,36 @@ impl AdeApp {
                         this.worktrees_error = Some(err.to_string());
                     }
                 }
+
+                match worktrees::recover_selection(previously_selected.as_ref(), &this.worktrees) {
+                    worktrees::SelectionRecovery::NoPriorSelection => {}
+                    worktrees::SelectionRecovery::Unchanged(index) => {
+                        this.selected = Some(index);
+                    }
+                    worktrees::SelectionRecovery::FellBackToMain { new_index, notice } => {
+                        this.selected = new_index;
+                        this.worktree_selection_notice = Some(notice);
+                        // The file tree/diff panes were pointed at the worktree that just
+                        // vanished - re-root them at wherever selection landed (or the repo
+                        // root, if even the main worktree is gone) rather than leaving them
+                        // showing a directory that no longer resolves to anything real. This is
+                        // deliberately *not* a full `Self::select_worktree` call: that also
+                        // moves real keyboard focus, which needs a `&mut Window` this
+                        // background-task callback doesn't have (see its own docs) - a refresh
+                        // triggered by an external `git worktree remove`/a background poll tick
+                        // has no user click to anchor a focus change to in the first place.
+                        let new_root = new_index
+                            .and_then(|index| this.worktrees.get(index))
+                            .map(|item| item.path.clone())
+                            .unwrap_or_else(|| this.repo_path.clone());
+                        this.set_file_tree_root(new_root.clone());
+                        this.file_tree = Vec::new();
+                        this.reload_expanded_dirs_from_fold_state();
+                        this.load_file_tree(new_root.clone(), cx);
+                        this.load_diff(new_root, cx);
+                    }
+                }
+
                 this.load_disk_usage(cx);
                 cx.notify();
             });
@@ -499,6 +553,9 @@ impl AdeApp {
         }
         let path = item.path.clone();
         self.selected = Some(index);
+        // A real, explicit user selection supersedes any stale "fell back to main" notice a
+        // previous refresh may have left up - see `Self::worktree_selection_notice`'s own docs.
+        self.worktree_selection_notice = None;
         // Makes this worktree's own last-active tab (or its first session, or none) the
         // globally active one - see `Sessions::activate_for_worktree`'s own docs for why this
         // invariant ("the active session always belongs to the selected worktree") is the real
@@ -873,5 +930,285 @@ mod tests {
         );
 
         assert!(edit_buffers.is_empty());
+    }
+}
+
+/// GitHub issue #12's real, end-to-end proof: `Self::load_worktrees` against a *real* temp git
+/// repository, driven by *real* `git worktree add`/`remove`/`lock` commands (not a mocked-away
+/// `wt_core`) - the panel really does converge to whatever `git` itself now reports, and
+/// selection recovery really does fall back to the main worktree with a real notice when the
+/// selected one really vanishes. The watcher's own OS-level event delivery has its own real,
+/// non-`gpui` test coverage in `crate::rail::worktree_watch`'s test module (no deterministic/
+/// simulated clock exists there to drive a real `notify` background thread through
+/// `cx.run_until_parked()`); what's proven here is the other half - that a refresh, however
+/// triggered, produces a correct in-app list.
+#[cfg(test)]
+mod load_worktrees_integration_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "user.name", "Test User"]);
+        fs::write(dir.path().join("base.txt"), "base\n").expect("write");
+        git(dir.path(), &["add", "base.txt"]);
+        git(dir.path(), &["commit", "-m", "initial"]);
+        dir
+    }
+
+    fn add_worktree(repo_path: &Path, branch: &str, name: &str) -> PathBuf {
+        let container = TempDir::new().expect("tempdir");
+        let path = container.path().join(name);
+        drop(container);
+        git(
+            repo_path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                path.to_str().expect("utf8 path"),
+            ],
+        );
+        path
+    }
+
+    #[gpui::test]
+    fn a_real_worktree_add_appears_after_a_refresh(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.worktrees.len()),
+            1,
+            "only the main worktree exists before the real `git worktree add`"
+        );
+
+        let feature = add_worktree(repo.path(), "feature", "added-wt");
+
+        app.update(cx, |app, cx| app.load_worktrees(cx));
+        cx.run_until_parked();
+
+        let worktrees = app.read_with(cx, |app, _| app.worktrees.clone());
+        assert_eq!(worktrees.len(), 2, "the real new worktree must now appear");
+        let added = worktrees
+            .iter()
+            .find(|item| item.path == feature)
+            .expect("the added worktree's path must be present");
+        assert_eq!(added.branch.as_deref(), Some("feature"));
+        assert!(added.error.is_none());
+    }
+
+    #[gpui::test]
+    fn a_real_worktree_remove_disappears_after_a_refresh(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let feature = add_worktree(repo.path(), "feature", "removed-wt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        assert_eq!(app.read_with(cx, |app, _| app.worktrees.len()), 2);
+
+        wt_core::remove_worktree(repo.path(), &feature, false).expect("remove_worktree");
+
+        app.update(cx, |app, cx| app.load_worktrees(cx));
+        cx.run_until_parked();
+
+        let worktrees = app.read_with(cx, |app, _| app.worktrees.clone());
+        assert_eq!(
+            worktrees.len(),
+            1,
+            "the removed worktree must be gone, not left as a phantom entry"
+        );
+        assert!(!worktrees.iter().any(|item| item.path == feature));
+    }
+
+    #[gpui::test]
+    fn a_real_lock_with_reason_is_reflected_after_a_refresh(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let feature = add_worktree(repo.path(), "feature", "locked-wt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "on a USB drive",
+                feature.to_str().expect("utf8 path"),
+            ],
+        );
+
+        app.update(cx, |app, cx| app.load_worktrees(cx));
+        cx.run_until_parked();
+
+        let worktrees = app.read_with(cx, |app, _| app.worktrees.clone());
+        let locked = worktrees
+            .iter()
+            .find(|item| item.path == feature)
+            .expect("the locked worktree must still be present");
+        assert!(locked.is_locked);
+        assert_eq!(locked.lock_reason.as_deref(), Some("on a USB drive"));
+    }
+
+    /// The real reproduction of the issue's "prunable / missing worktree" case: the working
+    /// directory is deleted by hand, not via `git worktree remove` - `git` itself (not a guess
+    /// on this app's side) is what flags it prunable, and a refresh must mark it broken rather
+    /// than silently listing it as a healthy, selectable row.
+    #[gpui::test]
+    fn a_manually_deleted_worktree_directory_is_marked_broken_after_a_refresh(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let feature = add_worktree(repo.path(), "feature", "gone-wt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        fs::remove_dir_all(&feature).expect("manually delete the worktree directory");
+
+        app.update(cx, |app, cx| app.load_worktrees(cx));
+        cx.run_until_parked();
+
+        let worktrees = app.read_with(cx, |app, _| app.worktrees.clone());
+        let broken = worktrees
+            .iter()
+            .find(|item| item.path == feature)
+            .expect("the now-broken entry must still be listed, not silently dropped");
+        assert!(broken.is_broken);
+        assert!(
+            broken.error.is_some(),
+            "a broken worktree must fail the usability gate every selection/spawn call site uses"
+        );
+    }
+
+    #[gpui::test]
+    fn selection_survives_a_refresh_when_the_selected_worktree_is_still_present(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let feature = add_worktree(repo.path(), "feature", "stays-wt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let feature_index = app
+            .read_with(cx, |app, _| {
+                app.worktrees.iter().position(|item| item.path == feature)
+            })
+            .expect("the added worktree must be in the list");
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(feature_index, window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.selected),
+            Some(feature_index)
+        );
+
+        app.update(cx, |app, cx| app.load_worktrees(cx));
+        cx.run_until_parked();
+
+        let (selected_path, notice) = app.read_with(cx, |app, _| {
+            (
+                app.selected
+                    .and_then(|i| app.worktrees.get(i))
+                    .map(|item| item.path.clone()),
+                app.worktree_selection_notice.clone(),
+            )
+        });
+        assert_eq!(
+            selected_path,
+            Some(feature),
+            "selection must be remapped to the same real path after a refresh, not reset"
+        );
+        assert_eq!(
+            notice, None,
+            "no notice should appear when the selected worktree is still present"
+        );
+    }
+
+    /// GitHub issue #12's own acceptance criterion: "the currently active worktree stays
+    /// highlighted across refreshes; if it disappears, the user is notified and the selection
+    /// falls back to the main worktree" - proven here against a *real* `wt_core::remove_worktree`
+    /// call, not a directly-mutated `worktrees` vec.
+    #[gpui::test]
+    fn selecting_a_worktree_then_really_removing_it_falls_back_to_main_with_a_notice(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let feature = add_worktree(repo.path(), "feature", "vanishes-wt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let feature_index = app
+            .read_with(cx, |app, _| {
+                app.worktrees.iter().position(|item| item.path == feature)
+            })
+            .expect("the added worktree must be in the list");
+        let main_path = app.read_with(cx, |app, _| app.repo_path.clone());
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(feature_index, window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.selected),
+            Some(feature_index)
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.worktree_selection_notice.clone()),
+            None
+        );
+
+        wt_core::remove_worktree(repo.path(), &feature, false).expect("remove_worktree");
+
+        app.update(cx, |app, cx| app.load_worktrees(cx));
+        cx.run_until_parked();
+
+        let (selected_path, notice) = app.read_with(cx, |app, _| {
+            (
+                app.selected
+                    .and_then(|i| app.worktrees.get(i))
+                    .map(|item| item.path.clone()),
+                app.worktree_selection_notice.clone(),
+            )
+        });
+        assert_eq!(
+            selected_path,
+            Some(main_path),
+            "selection must fall back to the real main worktree once the selected one is gone"
+        );
+        let notice = notice.expect("a real notice must be shown when selection falls back");
+        assert!(notice.to_lowercase().contains("main"));
+
+        // A real, explicit re-selection clears the stale notice - `Self::select_worktree`'s own
+        // documented contract.
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.worktree_selection_notice.clone()),
+            None,
+            "a real user re-selection must clear the stale fallback notice"
+        );
     }
 }
