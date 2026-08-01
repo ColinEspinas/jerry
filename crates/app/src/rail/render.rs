@@ -575,33 +575,22 @@ impl AdeApp {
         )
     }
 
-    /// Header 36 (`Agents` label, grouping toggle, `+`/⌘N) - README's "Rail chrome".
+    /// Header 36 - Revision R12 §2.1: "Rail header keeps only the `+` new-session button." No
+    /// section-title label - this used to say `AGENTS` (a leftover from the pre-R12 flat rail,
+    /// carried through a rename to fix its vocabulary without checking it against this
+    /// requirement) but the spec is explicit that the header has nothing but the button itself.
     pub(in crate::rail) fn render_rail_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("rail-header")
             .flex()
             .flex_none()
             .items_center()
-            .justify_between()
+            .justify_end()
             .px(px(10.0))
             .h(theme::band::RAIL_HEADER)
             .border_b_1()
             .border_color(theme::border::RAIL_INNER)
-            .child(
-                div()
-                    .font(font(theme::font::SANS))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_size(self.ui_text_size(10.0))
-                    .text_color(theme::text::FAINT)
-                    .child("AGENTS"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(self.render_new_agent_button(cx)),
-            )
+            .child(self.render_new_agent_button(cx))
     }
 
     /// The `+` control with its real, platform-resolved `mod+N` keycap pair (`⌘N` on macOS,
@@ -701,7 +690,7 @@ impl AdeApp {
                             .child(if has_query {
                                 self.filter_query.as_str().to_string()
                             } else {
-                                "filter agents".to_string()
+                                "filter worktrees and agents".to_string()
                             })
                             .debug_selector(|| "rail-filter-text".to_string()),
                     )

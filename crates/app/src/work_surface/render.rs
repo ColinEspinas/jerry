@@ -1218,6 +1218,11 @@ impl AdeApp {
         let chip_kind = work_surface::tab_chip_kind(agent.kind);
         let is_mono = matches!(chip_kind, work_surface::TabChipKind::Cli);
         let colors = work_surface::tab_colors(is_active);
+        // §3: "5px status square that keeps reporting while you read another tab" - the same
+        // real `Status` the rail's own agent row and context bar already derive this agent's
+        // colour from, so the tab strip can never disagree with either about what state an
+        // agent is in.
+        let status_color: gpui::Rgba = self.agent_status(agent, cx).color();
         let tab_ref = work_surface::TabRef::Agent(id);
         let drag_value = DraggedTab::Agent {
             id,
@@ -1297,19 +1302,11 @@ impl AdeApp {
                     )
                     .child(
                         div()
-                            .id(("close-agent-tab", id))
-                            .px(px(2.0))
-                            .cursor_pointer()
-                            .font(font(theme::font::MONO))
-                            .text_size(px(11.0))
-                            .text_color(theme::text::GHOST)
-                            .hover(|el| el.text_color(theme::button::DANGER_FG))
-                            .child("\u{d7}")
-                            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                                cx.stop_propagation();
-                                this.close_agent(id, window, cx);
-                                cx.notify();
-                            })),
+                            .flex_none()
+                            .w(px(5.0))
+                            .h(px(5.0))
+                            .rounded(px(2.5))
+                            .bg(status_color),
                     ),
             )
             .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline))

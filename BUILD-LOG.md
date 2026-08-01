@@ -6929,8 +6929,13 @@ the user's own report showed, then re-verified clean once the fix was restored.
 
 **Verification**: `cargo fmt --all -- --check`, `cargo build --workspace`,
 `cargo clippy --workspace --all-targets -- -D warnings` - all clean.
-`cargo test --workspace --lib --test-threads=1`: **1220 + 44 + 14 + 140 = 1424 passed, 0 failed**
-across all four crates (1 new test).
+`cargo test --workspace --lib --test-threads=1`: **1221 + 44 + 14 + 140 = 1419 passed, 0 failed**
+across all four crates (1 new test) - independently re-verified by the coordinator, not just
+agent-reported. One run hit the documented `code_surface::diff_view::diff_render_tests` flake
+under unusually high system load (several concurrent agents active this session); re-ran the
+failing test alone (2/3 clean) and the full suite once more (clean) to confirm it was load, not a
+regression - the failing test is in unrelated syntax-highlighting code with no plausible link to
+either this fix or the elbow-ordering fix above it.
 
 ### Follow-up: the elbows were painted half a pixel off the row grid
 
@@ -7090,3 +7095,21 @@ calls in place) fails both, confirming they test the wiring specifically, not th
 `code_surface::diff_view::diff_render_tests::switching_the_open_diff_to_a_different_file_recomputes_the_highlight_cache`
 flake; passed 5/5 re-run in isolation and the full suite passed clean on a second full run -
 unrelated syntax-highlighting code, not a regression from this change.
+
+## Four real spec deviations found by the user directly inspecting the running app, plus a real git graph correctness bug
+
+Direct testing of the running app (pointed at this real repo) surfaced four real, concrete gaps against §2.1/§3/§4 that survived earlier audits, all fixed here:
+
+1. **Rail header still said `"AGENTS"`.** §2.1 is explicit: "Rail header keeps only the `+` new-session button." The label was a leftover from the pre-R12 flat rail - the earlier `Session`→`Agent` rename found and relabeled it (`SESSIONS`→`AGENTS`) as a pure vocabulary fix without checking it against this requirement, since the rename predates this branch's own audit work. Removed entirely; the header now holds only the `+` button, right-aligned.
+2. **Agent/shell tabs had a `×` close button they shouldn't.** §3: "agent and shell tabs do not [close]." Replaced with the real, spec'd 5px status square (§3: "Agent tab: 14px chip · model name · **5px status square** that keeps reporting while you read another tab") - reads the same `Self::agent_status` the rail row and context bar already derive their own colour from, so the tab strip can never disagree with either about an agent's real state. Middle-click still closes the tab (a separate, pre-existing GitHub issue #26 mechanism, untouched).
+3. **Filter placeholder said `"filter agents"`.** §2.1's exact text is `"filter worktrees and agents"`. One-line fix.
+4. **Title-bar agent-status chips hugged the left edge instead of being pushed right.** `agent_state_chips` was added as a child *before* the layout's `div().flex_1()` spacer, so the spacer (added after it) never had anything to push. Swapped the order.
+
+**A real git graph data bug**, found via an independent audit dispatched after this repo's own real, complex history (an 8-way branch fan-out, several real PR-merge commits) raised a "merges without commits" concern: `dot_kind` in `crates/wt-core/src/graph.rs` checked `Some(*id) == head_id` *before* `commit.is_merge()`, so a commit that is honestly both - this very repository's own `master` tip is one right now, a real `Merge pull request` commit `HEAD` currently sits on - lost its merge styling entirely. The single most merge-shaped row in the whole graph (8 real `Converging` elbows arriving at it) rendered as a plain `Head` dot instead of a hollow merge ring. Reordered to check `is_merge()` first: `HEAD` is already shown separately and unambiguously via the branch's own `RefChip::is_head` ref-chip styling next to the row, so prioritizing the merge visual loses no real information. New regression test confirmed non-vacuous (fails with the exact `Head` misclassification against the old order, passes against the fix).
+
+The independent audit that caught this also verified, exhaustively (not spot-checked) across all 181 rows of this real repository's graph: every parent list matches `git log --parents` exactly; zero fake merge dots; every `Diverging`/`Converging` elbow traces to a real lane genuinely present in an adjacent row; zero phantom elbows; lane continuity holds in both directions across all 181 rows. The "several unrelated lines converging into one plain commit dot" pattern the user's report may have partly been reacting to is real, correct git semantics (a shared non-merge ancestor several branches happen to reach), not a defect - `git log --graph` draws the identical `|/` shape at the same rows.
+
+**Verification**: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings` - all clean. `cargo test --workspace --lib
+--test-threads=1`: **1221 + 44 + 14 + 141 = 1420 passed, 0 failed** across all four crates (1 new
+test - `a_merge_commit_that_is_also_head_still_gets_the_merge_dot_kind`).

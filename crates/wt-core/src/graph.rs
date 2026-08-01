@@ -248,10 +248,16 @@ pub fn build_graph(
         let Some(commit) = nodes.remove(id) else {
             continue;
         };
-        let dot_kind = if Some(*id) == head_id {
-            DotKind::Head
-        } else if commit.is_merge() {
+        // `is_merge()` is checked *before* the `head_id` comparison, not after: a commit can
+        // honestly be both at once (this repository's own `master` tip is one right now - a
+        // real `Merge pull request` commit HEAD currently sits on), and merge-ness is the
+        // rarer, more structurally significant fact to lose - HEAD is already shown
+        // separately and unambiguously via the branch's own `RefChip::is_head` styling next
+        // to this row, so nothing is actually lost by not also ringing the dot for it here.
+        let dot_kind = if commit.is_merge() {
             DotKind::Merge
+        } else if Some(*id) == head_id {
+            DotKind::Head
         } else {
             DotKind::Commit
         };
@@ -1212,6 +1218,42 @@ mod tests {
         assert!(
             feature_row.lane > 0,
             "feature commit should not render on the trunk lane"
+        );
+    }
+
+    #[test]
+    fn a_merge_commit_that_is_also_head_still_gets_the_merge_dot_kind() {
+        // A real, reproduced bug: `dot_kind` checked `head_id` before `commit.is_merge()`, so
+        // a commit that is honestly both (this repository's own `master` tip is one right now)
+        // lost its merge styling entirely - the single most merge-shaped row in the graph
+        // rendered as a plain `Head` dot instead. `HEAD` is already shown separately and
+        // unambiguously via the branch's own ref-chip styling, so prioritizing `Merge` here
+        // loses no real information.
+        let repo = init_repo();
+        commit_at(repo.path(), "a.txt", "1", "base", 1_700_000_000);
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        commit_at(repo.path(), "b.txt", "1", "feature work", 1_700_000_100);
+        git(repo.path(), &["checkout", "main"]);
+        merge_at(
+            repo.path(),
+            "feature",
+            "Merge branch 'feature'",
+            1_700_000_200,
+        );
+        // `main`'s own real HEAD is now this merge commit - no further commits after it.
+
+        let graph = build_graph(repo.path(), GraphScope::All, 0).expect("build_graph");
+        let head_row = &graph.rows[0];
+        assert_eq!(head_row.commit.subject, "Merge branch 'feature'");
+        assert!(
+            head_row.commit.is_merge(),
+            "sanity check: HEAD really is a merge commit"
+        );
+        assert!(
+            matches!(head_row.dot_kind, DotKind::Merge),
+            "a commit that is both HEAD and a real merge must still render as Merge, not Head - \
+             got {:?}",
+            head_row.dot_kind
         );
     }
 
