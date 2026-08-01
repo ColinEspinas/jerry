@@ -6799,3 +6799,94 @@ way: `doc_lazy_continuation` on a doc comment where a mid-sentence `- see ...` r
 unindented markdown list continuation - reworded, not suppressed). `cargo test --workspace --lib
 --test-threads=1`: **1212 + 44 + 14 + 139 = 1409 passed, 0 failed** across all four crates - no
 `code_surface::diff_view` flake this run.
+
+## Git graph: the boxy multi-row elbow rectangle
+
+Reported again as "the git graph's lane/elbow alignment is broken", with a screenshot showing long
+vertical lines running down for many rows and terminating in one flat, boxy horizontal bar, plus
+dots that appeared to have no line reaching them at all. The obvious suspicion - that one of the
+earlier elbow fixes had been lost in one of this branch's two rebases - turned out to be wrong.
+`git diff 0b059f0 HEAD -- crates/app/src/graph_view/render.rs` touches nothing in
+`elbow_geometry`, `CurveBox`, `StraightSegment` or `render_graph_lane_canvas`'s elbow loop, and
+every one of the twenty existing `elbow_geometry_tests` still passed. All the prior fixes are
+intact.
+
+### The real root cause
+
+Every one of those tests builds exactly **one** elbow. A row can hold many, and that is the case
+nobody had ever looked at.
+
+`elbow_geometry`'s `waist_y` is a function of the row height and the elbow kind and nothing else,
+so every `Converging` elbow in one row paints its horizontal stroke on the *same* pixel row, and
+their spans nest - the elbow arriving from lane 8 covers every column the elbow arriving from lane
+1 occupies, including the arc that turns lane 1's line onto the waist. `render_graph_lane_canvas`
+painted them in `row.elbows`' own order, and `wt_core::graph::layout_lanes` Step 2 emits
+`Converging` elbows by *ascending* lane. So the furthest lane was painted last, on top, and wiped
+out every nearer elbow outright.
+
+This repository's own history renders exactly that shape. Dumping `build_graph`'s real output for
+`/home/colin/spike/ade` (a scratch `examples/dump_graph.rs`, since removed) shows master's `HEAD`
+row as:
+
+```
+50 lane=0 Head segs=[0,1e,2e,3e,4e,5e,6e,7e,8e,9s] elbows=[1->0C,...,8->0C,0->9D]
+```
+
+Eight worktree branches share that commit as their parent, so eight lanes run straight down for
+sixteen rows and then all converge in one row. Rasterizing the real geometry to ASCII (a throwaway
+harness that replays `elbow_geometry`/`lane_segment_span`/the stub-skip logic into a character
+grid) made the failure unmistakable. Before:
+
+```
+30 |         0          111           222           333           444
+31 |         0   44444444444444444444444444444444444444444444444444
+32 |         0 444
+```
+
+One flat full-width bar in lane 4's colour, and lanes 1-3 simply stop dead. Long verticals plus a
+flat bar is precisely the "boxy rectangle" in the screenshot, and lanes whose arc got overpainted
+are precisely the "dots with no line reaching them". After:
+
+```
+30 |         0          111           222           333           444
+31 |         0   11111111222222222222223333333333333344444444444444
+32 |         0 111
+```
+
+Each lane visibly curves onto the waist in its own colour, the horizontal changes colour at every
+lane it crosses, and the innermost elbow owns the arc that lands on the dot - the shape a commit
+graph actually wants.
+
+### The change
+
+One new pure function, `elbow_paint_order`, and one call site. It pairs each elbow with its own
+index in `GraphRow::elbows` (so the `graph-row-N-elbow-K-...` debug selectors keep pointing at the
+layout's numbering, not at paint position) and sorts by *descending* horizontal lane span, stably.
+Longest first, shortest last. Nothing about the single-elbow geometry moved - it was never wrong.
+
+The `Diverging` mirror (an octopus merge opening several lanes off one dot) had the identical
+latent defect and is covered by the same ordering; the two kinds sit on opposite waists so they
+never contend with each other.
+
+### Tests
+
+- `every_elbow_in_a_crowded_row_keeps_its_own_lanes_arc_visible` - the real regression test, and
+  deliberately stated on painted pixels rather than on the sort. It replays a whole row's elbows
+  into a per-column owner map in `elbow_paint_order`'s order, using each elbow's real
+  `elbow_geometry` output, and asserts that every elbow's own far-lane column still belongs to
+  that elbow afterwards. Three rows: this repository's real eight-`Converging` `HEAD` row, a
+  four-way `Diverging` octopus merge, and a non-contiguous `[1, 3, 6]` set that includes an
+  adjacent-lane elbow whose two curve boxes overlap. Reverting the sort to the old order fails it
+  with `lane 1's own arc column was painted over by elbow Elbow { from_lane: 8, to_lane: 0, kind:
+  Converging }` - it is not passing by construction.
+- `the_paint_order_keeps_each_elbows_own_layout_index_for_its_debug_tag` - pins that reordering
+  the paint sequence does not renumber the debug selectors the existing
+  `graph_elbow_render_tests` look real paint bounds up by.
+
+### Gates
+
+`cargo fmt --all -- --check`, `cargo build --workspace` and
+`cargo clippy --workspace --all-targets -- -D warnings` all clean. `cargo test --workspace --lib
+--test-threads=1`: **1220 + 44 + 14 + 139 = 1417 passed, 0 failed** across all four crates - no
+`code_surface::diff_view` flake this run either.
+
