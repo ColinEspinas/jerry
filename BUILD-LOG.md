@@ -3930,3 +3930,55 @@ diff_render_tests` flake - a different test in that module than the two previous
 this repo's own notes (`repeated_refreshes_of_the_same_open_diff_reuse_the_cached_highlighting`
 this time), same timing-sensitive family, `diff_view.rs` untouched anywhere by this change -
 confirmed it passes cleanly in isolation, and the subsequent full-suite re-run above was clean.
+
+## Heuristic file-authorship + activity-text engine (Revision R12)
+
+Adds `crate::rail::authorship`, a self-contained, GPUI-free module implementing the v1 heuristic
+approximation for Revision R12's `by: ['s1','s9']` change-row attribution and the rail's live
+"what is it doing" activity text (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md`,
+§2.3/§4). Real per-CLI structured tool-call integration is explicitly out of scope for v1 and
+documented in the module as the upgrade path - this is a correlation heuristic, not a source of
+ground truth, and is described as such rather than dressed up as more than it is.
+
+- `attribute_authorship(files, sessions) -> HashMap<PathBuf, Vec<SessionId>>` correlates each
+  changed file's mtime against every session's last-output time, symmetric within a 12s
+  `CORRELATION_WINDOW` (the reasoning for that window is documented on the constant itself).
+  Supports multi-session attribution for the same file - two agents touching the same file inside
+  the window both show up. A file with no plausible author is simply absent from the map, never a
+  falsely-confident empty `Vec`.
+- `extract_activity(recent_text) -> Option<String>` pattern-matches a gerund verb + filename
+  ("writing auth.rs") or a progress fraction ("bench 3 of 5", "148/312") from a session's recent
+  terminal text, preferring whichever match is most recent. Returns `None` when nothing
+  recognizable is found, rather than fabricating a status.
+- Both take plain `Duration`/`String` inputs rather than `Instant`/`SystemTime`, so the pure logic
+  is unit-testable without real clocks or a live pty - see the module's "Clock domain" docs for why
+  `Instant` and `SystemTime` can't be compared directly and how callers are expected to bridge that
+  gap themselves.
+
+Plumbing in `crate::terminal::pane::TerminalPane`, chosen as the smaller-blast-radius option
+versus changing pty-core's single-consumer `mpsc::Receiver`:
+- A bounded 8KiB tap (`recent_output`) on the pty output already being drained once per poll tick,
+  exposed via `recent_output_text()`.
+- `time_since_last_output()`, reusing the existing `activity_at` tracking (`crate::rail::status`'s
+  Run/Ask heuristic) but not gated on `is_running()`, so a session that just finished writing a
+  file and exited can still be credited for it.
+
+**Not wired into rail state/render yet** - that's a later phase, and depends on the parallel
+data-model task's `Authorship`/activity shapes landing on `Status`/`SessionRow` first. This
+module's public API is the intended call surface for both that task and the eventual render
+wiring; nothing in this pass claims to show authorship in the UI, and nothing does.
+
+**Rebase.** This branch had one commit sitting on an old `master` tip (predating the movable-tabs
+work). Rebased onto current `origin/master` (through `088f0b0`, the issue-16 movable-tabs merge) -
+a clean, conflict-free replay with no manual resolution needed, since this module and its two
+`pane.rs`/`mod.rs` touch points don't overlap anything the tab-strip work changed.
+
+**Gates**, from this project's usual Linux sandbox (`export
+LIBRARY_PATH=/tmp/x11-deps/prefix/usr/lib/x86_64-linux-gnu`): `cargo fmt --all -- --check`,
+`cargo build --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` all clean.
+`cargo test --workspace --lib -- --test-threads=1`: **1252 passed, 0 failed** across all four
+crates on the final, clean run (`app` 1087, `lsp-core` 44, `pty-core` 14, `wt-core` 107). One
+earlier full run hit the known pre-existing `code_surface::diff_view::diff_render_tests` flake
+(`switching_the_open_diff_to_a_different_file_recomputes_the_highlight_cache`), already documented
+above in this file as a real, unrelated timing race - `diff_view.rs` untouched anywhere by this
+change - confirmed it passes cleanly in isolation, and the subsequent full-suite re-run was clean.
