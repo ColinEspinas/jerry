@@ -2613,6 +2613,7 @@ mod tests {
     /// precisely because this is the failure mode a stand-in would be easiest to fake: a stopped
     /// process is genuinely still alive, genuinely still holds its end of the pipe open, and
     /// genuinely never drains it - exactly what a deadlocked or thrashing real server does.
+    #[cfg(unix)]
     #[test]
     fn a_real_but_frozen_server_fails_the_write_within_the_budget_instead_of_hanging_forever() {
         let project = write_scratch_project("fn main() {\n    let x: i32 = 1;\n}\n");
@@ -2673,6 +2674,7 @@ mod tests {
     /// out the same wedged pipe all over again. Fanned across hover, completions and every
     /// diagnostics-pull retry, that is the difference between reporting a dead server promptly and
     /// appearing to hang for minutes.
+    #[cfg(unix)]
     #[test]
     fn a_connection_already_known_dead_fails_further_writes_immediately() {
         let project = write_scratch_project("fn main() {}\n");
@@ -2738,6 +2740,7 @@ mod tests {
     ///
     /// Driven against a real, `SIGSTOP`ped rust-analyzer, with a real second thread genuinely
     /// contending for the real mutex.
+    #[cfg(unix)]
     #[test]
     fn a_writer_queued_behind_one_that_gives_up_is_refused_rather_than_corrupting_the_stream() {
         let project = write_scratch_project("fn main() {}\n");
