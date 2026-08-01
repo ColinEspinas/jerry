@@ -845,6 +845,11 @@ pub mod lang {
     pub const VUE: (ColorToken, ColorToken) = (hex(0x5cb87f), hex(0x16261e)); // "vue"
     pub const PY: (ColorToken, ColorToken) = (hex(0xc9b04a), hex(0x2a2612)); // "py"
     pub const GO: (ColorToken, ColorToken) = (hex(0x5fa8c4), hex(0x152730)); // "go"
+                                                                             // GitHub issue #32 - three new hues, each picked to stay visually distinct from every
+                                                                             // existing chip above rather than reusing a near-identical tint of an unrelated language.
+    pub const JSON: (ColorToken, ColorToken) = (hex(0xb8bcc4), hex(0x24262b)); // "jsn"
+    pub const YAML: (ColorToken, ColorToken) = (hex(0x8aa8cf), hex(0x1c2530)); // "yml"
+    pub const C: (ColorToken, ColorToken) = (hex(0x9a8cc9), hex(0x231f30)); // "c"
     pub const UNKNOWN: (ColorToken, ColorToken) = (hex(0x6b7178), hex(0x23272b));
     // "."
 }

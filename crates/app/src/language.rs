@@ -538,7 +538,8 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
         chip_colors: theme::lang::TOML,
         lsp: None,
         settings_row: None,
-        highlighter: None,
+        // Real `tree-sitter-toml-ng` grammar, GitHub issue #32.
+        highlighter: Some(crate::code_surface::code_view::highlight_toml),
     },
     ExtensionEntry {
         extension: "md",
@@ -657,8 +658,64 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
             note: "installs when the first .go file opens",
             install_url: "https://go.dev/gopls/",
         }),
-        // No real Go `tree-sitter` grammar dependency in this workspace.
-        highlighter: None,
+        // Real `tree-sitter-go` grammar, GitHub issue #32 - independent of, and unrelated to,
+        // `lsp` still being `None` above.
+        highlighter: Some(crate::code_surface::code_view::highlight_go),
+    },
+    ExtensionEntry {
+        extension: "json",
+        display_name: "JSON",
+        lsp_language_id: "json",
+        chip_label: "jsn",
+        chip_colors: theme::lang::JSON,
+        lsp: None,
+        settings_row: None,
+        highlighter: Some(crate::code_surface::code_view::highlight_json),
+    },
+    ExtensionEntry {
+        extension: "yaml",
+        display_name: "YAML",
+        lsp_language_id: "yaml",
+        chip_label: "yml",
+        chip_colors: theme::lang::YAML,
+        lsp: None,
+        settings_row: None,
+        highlighter: Some(crate::code_surface::code_view::highlight_yaml),
+    },
+    ExtensionEntry {
+        extension: "yml",
+        display_name: "YAML",
+        lsp_language_id: "yaml",
+        chip_label: "yml",
+        chip_colors: theme::lang::YAML,
+        lsp: None,
+        settings_row: None,
+        // `.yml` and `.yaml` are the same real language under two conventional extensions - no
+        // grammar or chip distinguishes them, matching how `.ts`/`.js` already share plumbing
+        // where the underlying grammar genuinely is the same.
+        highlighter: Some(crate::code_surface::code_view::highlight_yaml),
+    },
+    ExtensionEntry {
+        extension: "c",
+        display_name: "C",
+        lsp_language_id: "c",
+        chip_label: "c",
+        chip_colors: theme::lang::C,
+        lsp: None,
+        settings_row: None,
+        highlighter: Some(crate::code_surface::code_view::highlight_c),
+    },
+    ExtensionEntry {
+        extension: "h",
+        display_name: "C Header",
+        lsp_language_id: "c",
+        chip_label: "c",
+        chip_colors: theme::lang::C,
+        lsp: None,
+        settings_row: None,
+        // A header has no real syntax this grammar treats differently from a `.c` file - see
+        // `crate::code_surface::code_view::highlight_c`'s own docs.
+        highlighter: Some(crate::code_surface::code_view::highlight_c),
     },
 ];
 
@@ -1202,19 +1259,21 @@ mod tests {
         with_highlighter.sort_unstable();
         assert_eq!(
             with_highlighter,
-            vec!["js", "jsx", "py", "rs", "ts", "tsx"],
+            vec![
+                "c", "go", "h", "js", "json", "jsx", "py", "rs", "toml", "ts", "tsx", "yaml", "yml"
+            ],
             "this is the real, current set of extensions with a genuine tree-sitter grammar \
              dependency - a change here should be a deliberate decision, not a silent drift"
         );
     }
 
     /// The other half of the same guard: extensions with no real `tree-sitter` grammar dependency
-    /// in this workspace (TOML/Markdown/SQL never had one; Vue's and Go's lack of one is
-    /// independent of whether either spawns a real server) must not carry a stray, fabricated
-    /// `highlighter`.
+    /// in this workspace (Markdown/SQL never had one - GitHub issue #32's own stated remaining
+    /// scope; Vue's lack of one is independent of whether it spawns a real server) must not carry
+    /// a stray, fabricated `highlighter`.
     #[test]
     fn extensions_with_no_real_grammar_have_no_highlighter_wired() {
-        for ext in ["toml", "md", "sql", "vue", "go"] {
+        for ext in ["md", "sql", "vue"] {
             let entry = entry_for_extension(Some(ext))
                 .unwrap_or_else(|| panic!("{ext} should have a real registry entry"));
             assert!(

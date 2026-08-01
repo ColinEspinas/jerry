@@ -5,9 +5,10 @@
 //! (only [`gpui::Rgba`] is used, for plain colour data), mirroring this crate's split between
 //! pure logic modules and `crate::root`'s `Div` construction.
 //!
-//! `.rs`/`.ts`/`.tsx`/`.js`/`.jsx`/`.py` get real syntax spans; other extensions (including
-//! `.vue` - see `crate::language`'s docs for why this phase doesn't spawn an LSP client for it,
-//! unrelated to highlighting) render as plain monospace text.
+//! `.rs`/`.ts`/`.tsx`/`.js`/`.jsx`/`.py`/`.toml`/`.go`/`.json`/`.yaml`/`.yml`/`.c`/`.h` get real
+//! syntax spans; other extensions (including `.vue` - see `crate::language`'s docs for why this
+//! phase doesn't spawn an LSP client for it, unrelated to highlighting, and `.md`/`.sql` - a real,
+//! stated follow-up, GitHub issue #32's own remaining scope) render as plain monospace text.
 //!
 //! ## How highlighting actually works here
 //!
@@ -280,17 +281,27 @@ enum Grammar {
     TypeScript,
     Tsx,
     Python,
+    Toml,
+    Go,
+    Json,
+    Yaml,
+    C,
 }
 
 impl Grammar {
     /// Every real grammar, in [`Grammar::index`] order - the single list both
     /// [`HIGHLIGHT_CONFIGS`]' slot count and this module's own coverage tests are derived from, so
     /// adding a grammar cannot leave either behind.
-    const ALL: [Grammar; 4] = [
+    const ALL: [Grammar; 9] = [
         Grammar::Rust,
         Grammar::TypeScript,
         Grammar::Tsx,
         Grammar::Python,
+        Grammar::Toml,
+        Grammar::Go,
+        Grammar::Json,
+        Grammar::Yaml,
+        Grammar::C,
     ];
 
     const COUNT: usize = Self::ALL.len();
@@ -304,6 +315,11 @@ impl Grammar {
             Grammar::TypeScript => 1,
             Grammar::Tsx => 2,
             Grammar::Python => 3,
+            Grammar::Toml => 4,
+            Grammar::Go => 5,
+            Grammar::Json => 6,
+            Grammar::Yaml => 7,
+            Grammar::C => 8,
         }
     }
 
@@ -313,6 +329,11 @@ impl Grammar {
             Grammar::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Grammar::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Grammar::Python => tree_sitter_python::LANGUAGE.into(),
+            Grammar::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
+            Grammar::Go => tree_sitter_go::LANGUAGE.into(),
+            Grammar::Json => tree_sitter_json::LANGUAGE.into(),
+            Grammar::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+            Grammar::C => tree_sitter_c::LANGUAGE.into(),
         }
     }
 
@@ -322,6 +343,11 @@ impl Grammar {
             Grammar::TypeScript => "typescript",
             Grammar::Tsx => "tsx",
             Grammar::Python => "python",
+            Grammar::Toml => "toml",
+            Grammar::Go => "go",
+            Grammar::Json => "json",
+            Grammar::Yaml => "yaml",
+            Grammar::C => "c",
         }
     }
 }
@@ -413,14 +439,46 @@ impl Grammar {
 ///   `${...}` substitution) - see [`HighlightKind::Embedded`]'s own docs (via `theme::syntax`) for
 ///   why this rarely shows through in practice despite being a real, live capture.
 ///
-/// Deliberately still absent, each a real capture found while verifying the above but out of
-/// scope for issue #31's own "at minimum" list, and each still falls through to
-/// [`HighlightKind::Text`] rather than being forced into an unrelated bucket: `function.builtin`
-/// (Python's builtin-function-call heuristic; already reads as `Function` anyway, since
-/// `"function"`'s single dot-part is a subset match), `function.macro` (Rust's `println!`-style
-/// invocations; same reasoning), `label` (Rust lifetimes), `punctuation.special` (the `${`/`}`
-/// delimiters of an embedded interpolation), `string.special` (JavaScript's `/regex/` literals;
-/// already reads as `String`, since `"string"` is a subset match of `"string.special"`'s parts).
+/// GitHub issue #32 ("add language highlight support") added five more grammars and, with them,
+/// five more real registered names - each checked against that grammar's own bundled
+/// `queries/highlights.scm`, not guessed:
+///
+/// - **`boolean`** (`-toml`'s `(boolean) @boolean`, `-yaml`'s `(boolean_scalar) @boolean`) ->
+///   [`HighlightKind::ConstantBuiltin`], the same bucket `true`/`false` already reach through the
+///   original four grammars' own `constant.builtin` capture.
+/// - **`delimiter`** (`-c`'s plain `"." @delimiter`/`";" @delimiter` - distinct from the
+///   already-registered `punctuation.delimiter`, one dot-part short of it) ->
+///   [`HighlightKind::PunctuationDelimiter`], the bucket its dotted cousin already reaches.
+/// - **`label`** (`-c`'s `(statement_identifier) @label`, a goto target; `-yaml`'s
+///   `[(anchor_name)(alias_name)] @label`, an anchor/alias reference) ->
+///   [`HighlightKind::Variable`]. This also newly classifies a real capture one of the original
+///   four already emitted: `-rust`'s own `@label` is a lifetime annotation (`'a`). Harmless -
+///   `theme::syntax::VARIABLE` is a direct alias of `theme::syntax::TEXT` (see that module's
+///   docs), the same colour an unclassified lifetime already rendered as.
+/// - **`punctuation.special`** (`-yaml`'s `["*" "&" "---" "..."] @punctuation.special`, anchor/
+///   alias sigils and document markers) -> [`HighlightKind::Operator`]. Also newly classifies a
+///   real, previously-unregistered capture from the original four: `-javascript`'s own
+///   template-literal `${`/`}` interpolation delimiters carry this same name - again harmless,
+///   since `theme::syntax::OPERATOR` is also a direct `TEXT` alias.
+/// - **`string.special.key`** (`-json`'s `key: (_) @string.special.key`, an object key) ->
+///   [`HighlightKind::Property`], not [`HighlightKind::String`]: a JSON key is semantically a
+///   property name, matching how the other grammars already classify a struct/object field name.
+///   Registered as its own, more-specific 3-part name specifically to *win* over the
+///   already-registered plain `"string"` (which would otherwise also match, by the "most parts
+///   wins" rule described above, and misclassify it as a plain string value).
+///
+/// Two more real captures the new grammars emit needed **no** new registration, already resolving
+/// correctly through an existing, less-specific entry via that same "fewer parts still matches"
+/// rule: `-go`'s `@function.builtin` and `-c`'s `@function.special` (a `#define` macro name) both
+/// already read as [`HighlightKind::Function`] through the plain `"function"` entry, and `-toml`'s
+/// own `@string.special` (its date/time literals) already reads as [`HighlightKind::String`]
+/// through the plain `"string"` entry - the identical reasoning [`HighlightKind::String`]'s own
+/// pre-existing JavaScript-`/regex/`-literal case below already relied on.
+///
+/// Still deliberately absent, each a real capture found while verifying the above but out of
+/// scope for this list, and each still falls through to [`HighlightKind::Text`] rather than being
+/// forced into an unrelated bucket: `function.macro` (Rust's `println!`-style invocations; reads
+/// as `Function` anyway via the same subset match).
 const HIGHLIGHT_NAMES: &[&str] = &[
     "keyword",
     "function",
@@ -447,6 +505,11 @@ const HIGHLIGHT_NAMES: &[&str] = &[
     "punctuation.delimiter",
     "attribute",
     "embedded",
+    "boolean",
+    "delimiter",
+    "label",
+    "punctuation.special",
+    "string.special.key",
 ];
 
 /// [`HIGHLIGHT_NAMES`]' positional parallel array: which real [`HighlightKind`] each recognized
@@ -510,6 +573,11 @@ const HIGHLIGHT_KINDS: [HighlightKind; HIGHLIGHT_NAMES.len()] = [
     HighlightKind::PunctuationDelimiter,
     HighlightKind::Attribute,
     HighlightKind::Embedded,
+    HighlightKind::ConstantBuiltin,
+    HighlightKind::PunctuationDelimiter,
+    HighlightKind::Variable,
+    HighlightKind::Operator,
+    HighlightKind::Property,
 ];
 
 /// Real supplement appended after `tree-sitter-python`'s own bundled `queries/highlights.scm`,
@@ -614,6 +682,44 @@ const PYTHON_HIGHLIGHTS_SUPPLEMENT: &str = r#"
 (call function: (attribute attribute: (identifier) @function.method))
 "#;
 
+/// Real supplement appended after `tree-sitter-go`'s own bundled query (see
+/// [`highlight_query_for`]) - GitHub issue #32's own "last-pattern-wins" gotcha, same root cause
+/// as [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]'s rule 5. `-go`'s own query declares its real
+/// `(function_declaration name: (identifier) @function)`/call-expression rules *before* its later,
+/// blanket `(identifier) @variable` (its own "Identifiers" section) - so without this, every real
+/// function name and call in a `.go` file loses to the blanket rule and renders as `Variable`
+/// (harmless in that it's a direct `TEXT` alias, but a real, avoidable loss of the same
+/// `Function` colouring Rust/TypeScript/Python/C all get for the identical construct). Restating
+/// the three real function rules last, verbatim from `-go`'s own query, puts that back.
+const GO_HIGHLIGHTS_SUPPLEMENT: &str = r#"
+(call_expression
+  function: (identifier) @function)
+
+(call_expression
+  function: (identifier) @function.builtin
+  (#match? @function.builtin "^(append|cap|close|complex|copy|delete|imag|len|make|new|panic|print|println|real|recover)$"))
+
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @function.method))
+
+(function_declaration
+  name: (identifier) @function)
+"#;
+
+/// Real supplement appended after `tree-sitter-json`'s own bundled query (see
+/// [`highlight_query_for`]) - the same "last-pattern-wins" gotcha as [`GO_HIGHLIGHTS_SUPPLEMENT`],
+/// found the same way (a real, run test, not assumed from reading the query alone). `-json`'s own
+/// query declares its real `(pair key: (_) @string.special.key)` *before* its later, blanket
+/// `(string) @string` - and a JSON object key genuinely is a `(string)` node too, so without this
+/// every real key loses to the blanket rule and renders as a plain string value (`String`)
+/// instead of the more accurate `Property` this module's own docs above describe. Restating the
+/// key rule last, verbatim from `-json`'s own query, puts that back.
+const JSON_HIGHLIGHTS_SUPPLEMENT: &str = r#"
+(pair
+  key: (_) @string.special.key)
+"#;
+
 /// Real supplement appended after the composed JavaScript + TypeScript query (see
 /// [`highlight_query_for`]), repairing two regressions that a live old-vs-new diff over real
 /// TypeScript caught. Both come from the same root cause: `tree-sitter-typescript`'s own
@@ -687,6 +793,17 @@ fn highlight_query_for(grammar: Grammar) -> String {
             tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
             tree_sitter_typescript::HIGHLIGHTS_QUERY
         ),
+        Grammar::Toml => tree_sitter_toml_ng::HIGHLIGHTS_QUERY.to_string(),
+        Grammar::Go => format!(
+            "{}\n{GO_HIGHLIGHTS_SUPPLEMENT}",
+            tree_sitter_go::HIGHLIGHTS_QUERY
+        ),
+        Grammar::Json => format!(
+            "{}\n{JSON_HIGHLIGHTS_SUPPLEMENT}",
+            tree_sitter_json::HIGHLIGHTS_QUERY
+        ),
+        Grammar::Yaml => tree_sitter_yaml::HIGHLIGHTS_QUERY.to_string(),
+        Grammar::C => tree_sitter_c::HIGHLIGHT_QUERY.to_string(),
     }
 }
 
@@ -696,11 +813,13 @@ fn highlight_query_for(grammar: Grammar) -> String {
 /// Both the injection and the locals query are deliberately empty, and both omissions are real
 /// decisions rather than gaps left to fill in later:
 ///
-/// - **Injections.** None of this app's four grammars need one. TSX parses JSX as part of its own
+/// - **Injections.** None of this app's nine grammars need one. TSX parses JSX as part of its own
 ///   single grammar rather than as an injected language, and the only injections the Rust and
 ///   Python query files describe are things like SQL-in-a-string-literal, which this app has no
 ///   second grammar to inject *into* anyway. Passing the injection query without a real
 ///   `injection_callback` able to supply those grammars would add machinery that could never fire.
+///   None of the five GitHub-issue-#32 grammars bundle a real `queries/injections.scm` either -
+///   verified directly against each one's own `queries/` directory, not assumed.
 /// - **Locals.** `tree-sitter-typescript` ships a `locals.scm`, and feeding it would switch on
 ///   `tree-sitter-highlight`'s local-variable tracking, which exists to let a query colour a
 ///   variable *reference* like its *definition*. This app's six buckets do not distinguish
@@ -731,7 +850,8 @@ fn build_highlight_config(
 ///
 /// Caching them *separately* is the part that was gotten wrong first and is worth recording. A
 /// single `OnceLock<HashMap<..>>` populated in one pass reads naturally and is what this started
-/// as - but it makes the first request for *any* grammar compile *all four*. That cost is not
+/// as - but it makes the first request for *any* grammar compile *every one of them*. That cost
+/// is not
 /// hypothetical and it does not always land on a background thread: `CodeView::Diff` is the
 /// default view, and `crate::code_surface`'s `ensure_diff_highlight_cache` calls into here
 /// synchronously on the main thread, so opening the first `.rs` diff of an agent paid the
@@ -816,6 +936,38 @@ pub fn highlight_tsx(source: &str) -> Vec<HighlightSpan> {
 /// does - plus [`PYTHON_HIGHLIGHTS_SUPPLEMENT`], see there.
 pub fn highlight_python(source: &str) -> Vec<HighlightSpan> {
     highlight_with(source, Grammar::Python)
+}
+
+/// Parses `source` with `tree-sitter-toml-ng` and classifies it the same way [`highlight_rust`]
+/// does - GitHub issue #32.
+pub fn highlight_toml(source: &str) -> Vec<HighlightSpan> {
+    highlight_with(source, Grammar::Toml)
+}
+
+/// Parses `source` with `tree-sitter-go` and classifies it the same way [`highlight_rust`] does -
+/// GitHub issue #32.
+pub fn highlight_go(source: &str) -> Vec<HighlightSpan> {
+    highlight_with(source, Grammar::Go)
+}
+
+/// Parses `source` with `tree-sitter-json` and classifies it the same way [`highlight_rust`]
+/// does - GitHub issue #32.
+pub fn highlight_json(source: &str) -> Vec<HighlightSpan> {
+    highlight_with(source, Grammar::Json)
+}
+
+/// Parses `source` with `tree-sitter-yaml` and classifies it the same way [`highlight_rust`]
+/// does - GitHub issue #32. Used for both `.yaml` and `.yml` (the same real grammar; there is no
+/// separate `.yml`-only variant, matching how `.js` reuses the plain TypeScript grammar).
+pub fn highlight_yaml(source: &str) -> Vec<HighlightSpan> {
+    highlight_with(source, Grammar::Yaml)
+}
+
+/// Parses `source` with `tree-sitter-c` and classifies it the same way [`highlight_rust`] does -
+/// GitHub issue #32. Used for both `.c` and `.h` (a header is still real C syntax to this
+/// grammar; there is no separate declarations-only variant).
+pub fn highlight_c(source: &str) -> Vec<HighlightSpan> {
+    highlight_with(source, Grammar::C)
 }
 
 /// The one real highlighting path every language wrapper above funnels into: run the official
@@ -1924,6 +2076,181 @@ mod tests {
         );
     }
 
+    // GitHub issue #32: the five new grammars. Each test parses a real, minimal snippet and
+    // checks the exact real capture this module's own docs above claim for it - not just "some
+    // colour or other".
+
+    const SAMPLE_TOML: &str = "name = \"jerry\"\ncount = 3\nenabled = true\nbuilt = 1979-05-27\n";
+
+    #[test]
+    fn toml_key_is_classified_as_property() {
+        let spans = highlight_toml(SAMPLE_TOML);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_TOML, "name"),
+            HighlightKind::Property
+        );
+    }
+
+    #[test]
+    fn toml_string_value_is_classified_as_string() {
+        let spans = highlight_toml(SAMPLE_TOML);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_TOML, "\"jerry\""),
+            HighlightKind::String
+        );
+    }
+
+    #[test]
+    fn toml_boolean_is_classified_as_constant_builtin() {
+        let spans = highlight_toml(SAMPLE_TOML);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_TOML, "true"),
+            HighlightKind::ConstantBuiltin
+        );
+    }
+
+    /// `(local_date) @string.special` - real, and deliberately left to fall through to the plain
+    /// `"string"` entry rather than getting its own registration - see this module's own docs on
+    /// why.
+    #[test]
+    fn toml_date_literal_is_classified_as_string() {
+        let spans = highlight_toml(SAMPLE_TOML);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_TOML, "1979-05-27"),
+            HighlightKind::String
+        );
+    }
+
+    const SAMPLE_GO: &str =
+        "package main\n\nfunc add(x int) int {\n\treturn len(fmt.Sprint(x))\n}\n";
+
+    #[test]
+    fn go_func_keyword_is_classified_as_keyword() {
+        let spans = highlight_go(SAMPLE_GO);
+        assert_eq!(kind_at(&spans, SAMPLE_GO, "func"), HighlightKind::Keyword);
+    }
+
+    #[test]
+    fn go_function_definition_name_is_classified_as_function() {
+        let spans = highlight_go(SAMPLE_GO);
+        assert_eq!(kind_at(&spans, SAMPLE_GO, "add"), HighlightKind::Function);
+    }
+
+    /// `@function.builtin` (`len`) needs no new registration of its own - it already reads as
+    /// `Function` through the plain `"function"` entry's subset match, same as a call to `add`.
+    #[test]
+    fn go_builtin_function_call_is_classified_as_function() {
+        let spans = highlight_go(SAMPLE_GO);
+        assert_eq!(kind_at(&spans, SAMPLE_GO, "len("), HighlightKind::Function);
+    }
+
+    const SAMPLE_JSON: &str = "{\n  \"name\": \"jerry\",\n  \"count\": 3\n}\n";
+
+    #[test]
+    fn json_object_key_is_classified_as_property_not_string() {
+        let spans = highlight_json(SAMPLE_JSON);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_JSON, "\"name\""),
+            HighlightKind::Property,
+            "a real JSON key must win the more-specific string.special.key registration over \
+             the plain string entry"
+        );
+    }
+
+    #[test]
+    fn json_string_value_is_classified_as_string_not_property() {
+        let spans = highlight_json(SAMPLE_JSON);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_JSON, "\"jerry\""),
+            HighlightKind::String
+        );
+    }
+
+    #[test]
+    fn json_number_value_is_classified_as_number() {
+        let spans = highlight_json(SAMPLE_JSON);
+        assert_eq!(kind_at(&spans, SAMPLE_JSON, "3"), HighlightKind::Number);
+    }
+
+    const SAMPLE_YAML: &str = "anchor: &base\n  enabled: true\nalias: *base\ncount: 3\n";
+
+    #[test]
+    fn yaml_key_is_classified_as_property() {
+        let spans = highlight_yaml(SAMPLE_YAML);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_YAML, "count"),
+            HighlightKind::Property
+        );
+    }
+
+    #[test]
+    fn yaml_boolean_is_classified_as_constant_builtin() {
+        let spans = highlight_yaml(SAMPLE_YAML);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_YAML, "true"),
+            HighlightKind::ConstantBuiltin
+        );
+    }
+
+    /// `(anchor_name) @label` - the new, cross-language `"label"` registration's YAML half (its
+    /// C half is a goto target - see `c_goto_label_is_classified_as_variable` below).
+    #[test]
+    fn yaml_anchor_name_is_classified_as_variable() {
+        let spans = highlight_yaml(SAMPLE_YAML);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_YAML, "base\n"),
+            HighlightKind::Variable
+        );
+    }
+
+    /// `"&"/"*" @punctuation.special` - the new `"punctuation.special"` registration.
+    #[test]
+    fn yaml_anchor_and_alias_sigils_are_classified_as_operator() {
+        let spans = highlight_yaml(SAMPLE_YAML);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_YAML, "&base"),
+            HighlightKind::Operator
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_YAML, "*base"),
+            HighlightKind::Operator
+        );
+    }
+
+    const SAMPLE_C: &str =
+        "int add(int x) {\n  int total = 0;\n  goto done;\n done:\n  return total;\n}\n";
+
+    #[test]
+    fn c_keyword_is_classified_as_keyword() {
+        let spans = highlight_c(SAMPLE_C);
+        assert_eq!(kind_at(&spans, SAMPLE_C, "return"), HighlightKind::Keyword);
+    }
+
+    #[test]
+    fn c_function_definition_name_is_classified_as_function() {
+        let spans = highlight_c(SAMPLE_C);
+        assert_eq!(kind_at(&spans, SAMPLE_C, "add"), HighlightKind::Function);
+    }
+
+    /// `(statement_identifier) @label` - the new `"label"` registration's C half (a goto target,
+    /// not a lifetime - see this module's own docs on the cross-language unification).
+    #[test]
+    fn c_goto_label_is_classified_as_variable() {
+        let spans = highlight_c(SAMPLE_C);
+        assert_eq!(kind_at(&spans, SAMPLE_C, "done:"), HighlightKind::Variable);
+    }
+
+    /// `";" @delimiter` - the new, plain `"delimiter"` registration, distinct from the
+    /// already-registered `"punctuation.delimiter"`.
+    #[test]
+    fn c_semicolon_is_classified_as_punctuation_delimiter() {
+        let spans = highlight_c(SAMPLE_C);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_C, ";"),
+            HighlightKind::PunctuationDelimiter
+        );
+    }
+
     /// Both halves of the TypeScript query composition, which is the single most breakable part of
     /// this migration: `tree-sitter-typescript`'s own query file defines none of these, so if the
     /// JavaScript query ever stopped being concatenated in, every one of them would silently
@@ -2106,7 +2433,13 @@ mod tests {
         assert!(highlighter_for_extension(Some("js")).is_some());
         assert!(highlighter_for_extension(Some("jsx")).is_some());
         assert!(highlighter_for_extension(Some("py")).is_some());
-        assert!(highlighter_for_extension(Some("toml")).is_none());
+        assert!(highlighter_for_extension(Some("toml")).is_some());
+        assert!(highlighter_for_extension(Some("go")).is_some());
+        assert!(highlighter_for_extension(Some("json")).is_some());
+        assert!(highlighter_for_extension(Some("yaml")).is_some());
+        assert!(highlighter_for_extension(Some("yml")).is_some());
+        assert!(highlighter_for_extension(Some("c")).is_some());
+        assert!(highlighter_for_extension(Some("h")).is_some());
         assert!(highlighter_for_extension(Some("md")).is_none());
         assert!(highlighter_for_extension(Some("vue")).is_none());
         assert!(highlighter_for_extension(None).is_none());
@@ -2433,7 +2766,7 @@ mod tests {
 
     #[test]
     fn highlight_block_on_an_unregistered_extension_is_all_plain_text() {
-        let rendered = highlight_block(["key = \"value\"", "other = 1"], Some("toml"));
+        let rendered = highlight_block(["# a heading", "some *markdown* text"], Some("md"));
         let kinds: HashSet<HighlightKind> = rendered
             .iter()
             .flat_map(|line| &line.runs)

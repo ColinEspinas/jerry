@@ -137,6 +137,21 @@ self_update = { version = "0.44.0", default-features = false, features = [
     "compression-flate2",
     "compression-zip-deflate",
 ] }
+# GitHub issue #32's "add language highlight support... at least support for all common used
+# languages even configuration languages" - five more real grammars, following `tree-sitter-rust`'s
+# own precedent above: plain, unpinned-beyond-`cargo add`'s-own-resolution crates.io packages,
+# since none of these are `vendor/zed`-verified GPUI APIs needing a call-site check, the same
+# treatment `regex`/`unicode-segmentation`/`notify` already get. `tree-sitter-toml-ng`, not
+# `tree-sitter-toml`: the plain-named crate is stuck at a real, stale `0.20.0` (crates.io
+# checked directly), predating the `LanguageFn`-based API this workspace's pinned `tree-sitter =
+# "=0.26.9"` needs; `-ng` is the actively-maintained fork that actually builds against it. See
+# `crate::code_surface::code_view`'s own module docs for the real, verified capture names each
+# grammar's bundled `queries/highlights.scm` was checked against.
+tree-sitter-toml-ng = "0.7.0"
+tree-sitter-json = "0.24.8"
+tree-sitter-yaml = "0.7.2"
+tree-sitter-go = "0.25.0"
+tree-sitter-c = "0.24.2"
 
 # Real per-target `gpui_platform` backend selection (Revision R11, extended in R12 to add
 # real X11 support). `gpui_platform`'s own Cargo.toml
