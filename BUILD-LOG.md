@@ -6691,3 +6691,111 @@ describing a historical, deleted concept, not live code.
 `cargo clippy --workspace --all-targets -- -D warnings` - all clean.
 `cargo test --workspace --lib --test-threads=1`: **1198 + 44 + 14 + 139 = 1395 passed, 0 failed**
 across all four crates.
+
+## Closing the two real §3 gaps a coordinator audit found: the `+` menu's item list, and bare-worktree tab suppression
+
+### The bare-worktree header-bar swap was not, in fact, already on this branch
+
+The audit that kicked this step off reported the bare-worktree label/header-bar swap (`Start an
+agent` button, greyed `no agent` text) as already correct, verified in an earlier pass - only the
+"only the shell tab" suppression was supposedly missing. Checking the real current code before
+touching anything (per this project's own standing rule) found that claim didn't hold: neither
+`current_worktree_is_bare`, `bare_worktree_shell_label`, nor `render_start_agent_button` existed
+anywhere on this branch. `git log`/`git branch --contains` traced why - that whole feature landed
+in `78ea1eb` on the sibling `revision-r12-tabstrip` branch, and this branch (`issue-1-git-graph-a`
+and everything stacked on it) diverged from the shared git-staging commit *before* `78ea1eb`
+landed, so it never got it. The earlier audit was almost certainly run against the sibling branch's
+worktree, not this one's actual head.
+
+`78ea1eb`'s parent is exactly the git-staging commit this branch also descends from, so
+`git cherry-pick -n 78ea1eb` applied cleanly with a real (non-conflicting) auto-merge and the
+whole workspace still built and passed clippy afterward with zero changes needed. Committed that
+cherry-pick on its own before writing anything new, so the bare-worktree label swap, `Start an
+agent` button, and the (unrelated but same-commit) tab-label ordinal disambiguation all exist here
+for real before layering the tab-suppression fix on top of them.
+
+### Gap 1: the `+` menu's item list
+
+The menu already had a real `Git graph` row (added by the git-graph rebase, unrelated to this
+step) - but it sat last, after `Next changed file`, not third as §3 specifies. Moved it up.
+`New agent pane`'s label became `New agent`, and its secondary text - which read the *agent kind's
+model label* (`agent.kind.label()`, e.g. `"Claude"`) - now reads `runs in <branch>` with the real
+selected worktree's branch substituted in, via a new pure helper,
+`work_surface::new_agent_menu_secondary_text`, unit-tested directly (real branch, and the
+`(detached)` fallback for a worktree with no recorded branch) rather than left as an inline
+`format!` only exercisable through the full render path.
+
+`New file` came out. Before deleting it, checked whether it was the *only* way to create a file
+in this app - it is not: the file tree already carries a real, always-visible replacement
+(`crate::sidebar::render::render_file_tree_row`'s per-directory `+` and
+`render_right_sidebar_toggle`'s root-level `+`, both calling the same `Self::start_new_file` the
+menu row called), added independently of this menu row and present regardless of it. Confirmed
+this is a real second entry point, not a hypothetical one, by reading both call sites and their
+own doc comments. So removing the row drops no reachable functionality - no coordinator sign-off
+needed, this one had a real answer. Updated `root/new_file.rs`'s module doc and its
+`NewFileInputState::parent_dir` field doc, both of which described the now-gone menu row as one of
+the two entry points.
+
+### Gap 2: bare worktrees weren't suppressing their file tabs
+
+`current_worktree_is_bare` (from the cherry-pick above) already existed and was already correct;
+what wasn't wired up was `Self::combined_tab_order` actually consulting it. Re-read §3's own
+reasoning for why tab state is worktree-scoped at all (§1: "the open file tabs... the active tab"
+are worktree-scoped facts, and §3: "Each worktree remembers its own active tab and its own open
+files") before picking an implementation: the conservative, spec-consistent reading is
+render-only suppression, never destruction - a worktree going bare (its last real agent archived)
+must not silently forget which files were open, the same way switching worktrees never does.
+
+Implemented in `combined_tab_order` itself, not in the render layer: when every agent for the
+active worktree is a `Shell` (the same bareness test `current_worktree_is_bare` uses, computed
+locally here rather than by calling that method - it goes through `current_worktree_agents` which
+itself calls `combined_tab_order`, so calling it back from inside `combined_tab_order` would
+recurse), the file list handed to `work_surface::reconcile_tab_order` is an empty slice instead of
+the real `Self::open_files()`. `reconcile_tab_order` then drops every `TabRef::File` already in
+the stored order (its own `open_files.contains(path)` filter) and appends none back - but neither
+`Self::open_files_by_worktree` (the real per-worktree storage) nor `Self::tab_order` (the
+persisted drag order) is touched, so the moment a real agent spawns again and the worktree stops
+being bare, the very next `combined_tab_order` call reconciles against the real, untouched
+open-files list and the same file tabs reappear in their original position - nothing was reopened,
+nothing was lost, it just wasn't rendered while bare. Centralizing this in `combined_tab_order`
+rather than only in `render_tab_strip` means the tab-strip drag/drop, jump-keys, and
+`current_worktree_agents` machinery all agree with what's actually shown, for free.
+
+This did surface one real, pre-existing test whose premise no longer held:
+`dragging_a_file_tab_between_two_agent_tabs_interleaves_them` spawned two `Shell` agents (an
+arbitrary choice made before this branch had any bare-worktree concept at all) plus a file tab, to
+exercise drag-reorder interleaving - which is now a genuinely bare worktree by definition, so its
+own file tab got correctly suppressed and the test's first assertion failed. Fixed by changing the
+second spawned agent to a real `Claude` agent instead of a second `Shell` - the test's actual
+subject is cross-kind drag interleaving, which has nothing to do with bareness, and the dedicated
+bare-worktree test below covers that behavior directly instead.
+
+### Tests
+
+Four new ones, plus two pure-logic unit tests for the branch-substitution helper:
+
+- `the_plus_menus_five_rows_match_revision_r12_3_in_order_with_no_new_file_row` - opens the real
+  menu, reads each row's real painted bounds via a new `debug_selector` on
+  `render_dropdown_menu_row` (previously only `.id()`, which `cx.debug_bounds` doesn't read),
+  confirms the five rows sit top-to-bottom in §3's exact order, and confirms both `New file` and
+  the old `New agent pane` label are genuinely absent.
+- `a_real_click_on_the_plus_menus_git_graph_row_opens_the_graph_tab` - a real
+  `cx.simulate_click` against the row's own captured bounds (not a direct `open_git_graph` call),
+  confirming `graph_tab_open`/`graph_tab_active` both flip and the menu closes behind it.
+- `the_new_agent_rows_secondary_text_uses_the_real_selected_worktrees_branch` - seeds a worktree
+  with a real, distinctive branch name, confirms `current_worktree_branch()` resolves it, and
+  confirms the exact composition `render_plus_menu` performs never falls back to a model label.
+- `a_bare_worktrees_tab_strip_shows_only_its_shell_tab_and_preserves_file_tab_state` - spawns a
+  real `Shell` and a real `Claude` agent plus a file tab, confirms all three show up, archives the
+  `Claude` agent, confirms the worktree is now genuinely bare and its file tab is gone from
+  `combined_tab_order` while its entry in `open_files()` survives untouched, then spawns a
+  `Codex` agent and confirms the file tab reappears with no extra work.
+
+### Gates
+
+`cargo fmt --all -- --check`, `cargo build --workspace`, and
+`cargo clippy --workspace --all-targets -- -D warnings` all clean (one real clippy hit along the
+way: `doc_lazy_continuation` on a doc comment where a mid-sentence `- see ...` read as an
+unindented markdown list continuation - reworded, not suppressed). `cargo test --workspace --lib
+--test-threads=1`: **1212 + 44 + 14 + 139 = 1409 passed, 0 failed** across all four crates - no
+`code_surface::diff_view` flake this run.

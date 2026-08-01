@@ -1,5 +1,9 @@
-//! Real "New file" creation - the tab-strip `+` menu's "New file" row and the file tree's own
-//! hover-revealed "+" affordance (`crate::sidebar::render`) both funnel into this module.
+//! Real "New file" creation - the file tree's own always-visible per-directory and root-level
+//! "+" affordances (`crate::sidebar::render`) funnel into this module. The tab-strip `+` menu had
+//! its own "New file" row until Revision R12 §3 pared that menu down to the spec's five items
+//! (*New terminal* / *New agent* / *Git graph* / *Open file…* / *Next changed file*, none of them
+//! "New file"); the file tree's affordances were already a real, always-present second entry
+//! point to this same flow, so removing the menu row dropped no reachable functionality.
 //!
 //! Naming UI: a small, hand-rolled append/backspace-only inline text field
 //! (`Self::handle_new_file_key_down`), the same minimal shape `Self::handle_filter_key_down`
@@ -16,8 +20,8 @@ use std::path::Path;
 /// success) or [`AdeApp::cancel_new_file`] (Escape, or the scrim).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NewFileInputState {
-    /// The real directory the new file will be created in - the selected worktree's root (the
-    /// `+` menu row) or the specific directory row the file tree's own hover "+" was clicked on.
+    /// The real directory the new file will be created in - the file tree's own root-level "+"
+    /// (the worktree root) or the specific directory row whose own "+" was clicked.
     pub(super) parent_dir: PathBuf,
     /// The name typed so far - append/backspace only, mirroring [`AdeApp::filter_query`], with
     /// its own real undo history (GitHub issue #17). The history lives and dies with this prompt,
