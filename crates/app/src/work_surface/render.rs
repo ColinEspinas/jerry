@@ -345,15 +345,29 @@ impl AdeApp {
     /// every render rather than caching a mutated copy) - [`Self::tab_order`] itself only records
     /// a user's real drag-chosen order, never which tabs exist; that's still `Agents`/
     /// [`Self::open_files`]'s job.
+    ///
+    /// A bare worktree (Revision R12 §3: "a bare worktree shows only the shell tab") reconciles
+    /// against an *empty* file list instead of the real [`Self::open_files`] - `reconcile_tab_order`
+    /// then drops every `TabRef::File` already in `stored` (its own `open_files.contains(path)`
+    /// filter) and appends none back. This only hides them from the reconciled order this call
+    /// returns; it never touches [`Self::open_files_by_worktree`] or `stored` itself, so the
+    /// moment a real agent spawns and the worktree stops being bare, the next call reconciles
+    /// against the real (untouched) open-files list again and the same file tabs reappear in
+    /// their original position - nothing was destroyed, only not rendered while bare. Bareness is
+    /// computed locally from `agents_for_cwd` rather than by calling
+    /// [`Self::current_worktree_is_bare`], which itself goes through
+    /// [`Self::current_worktree_agents`] -> this function; calling back into it here would
+    /// recurse.
     pub(crate) fn combined_tab_order(&self) -> Vec<work_surface::TabRef> {
         let cwd = self.active_agent_cwd();
         let stored = self.tab_order.get(&cwd).map(Vec::as_slice).unwrap_or(&[]);
-        let agent_ids: Vec<AgentId> = self
-            .agents
-            .iter_for_cwd(cwd.clone())
-            .map(|agent| agent.id)
-            .collect();
-        work_surface::reconcile_tab_order(stored, &agent_ids, self.open_files())
+        let agents_for_cwd: Vec<&Agent> = self.agents.iter_for_cwd(cwd.clone()).collect();
+        let agent_ids: Vec<AgentId> = agents_for_cwd.iter().map(|agent| agent.id).collect();
+        let is_bare = !agents_for_cwd
+            .iter()
+            .any(|agent| agent.kind != AgentKind::Shell);
+        let open_files: &[PathBuf] = if is_bare { &[] } else { self.open_files() };
+        work_surface::reconcile_tab_order(stored, &agent_ids, open_files)
     }
 
     /// The unified tab strip's real drag-to-reorder entry point (GitHub issue #16) - moves
@@ -779,7 +793,7 @@ impl AdeApp {
     /// [`crate::rail::render::render_new_agent_button`]). A `gpui::canvas` child captures
     /// this button's painted bounds into [`Self::plus_button_bounds`] every render, which
     /// [`Self::render_plus_menu`] positions the popover off of. Opening the menu also refreshes
-    /// [`Self::load_agent_rows`], so the "New agent pane" row's sub-label
+    /// [`Self::load_agent_rows`], so the "New agent" row's icon/chip
     /// ([`Self::resolved_new_agent_kind`]) reflects a reasonably fresh `$PATH` search rather than
     /// a possibly-empty cached snapshot.
     pub(in crate::work_surface) fn render_tab_strip_plus(
@@ -837,16 +851,23 @@ impl AdeApp {
     /// the panel stops that click from bubbling up (`cx.stop_propagation()`). Positioned off
     /// [`Self::plus_button_bounds`].
     ///
-    /// Five rows: *New terminal* ([`Self::new_agent`] with [`AgentKind::Shell`]), *New file*
-    /// ([`Self::start_new_file`]), *New agent pane* ([`Self::new_agent_pane`]), *Open file…*
+    /// Five rows, in the exact order and wording Revision R12 §3 specifies: *New terminal*
+    /// ([`Self::new_agent`] with [`AgentKind::Shell`]), *New agent* (`runs in <branch>` -
+    /// [`Self::new_agent_pane`]), *Git graph* ([`Self::open_git_graph`]), *Open file…*
     /// ([`Self::open_palette`], scoped to [`palette::PaletteScope::Files`]), and *Next changed
-    /// file* ([`Self::next_changed_file`]). *New terminal*, *New agent pane*, and *Next changed
-    /// file* each dispatch the same method their own global keybinding does
-    /// (`crate::default_key_bindings`) and show that binding's keycap; *New file* and *Open
-    /// file…* have no global keybinding of their own (the latter's own real `mod+P` spec is now
-    /// claimed by `TogglePalette` instead - see `crate::default_key_bindings`'s own docs for that
-    /// tradeoff; *New file* simply has no design-specified shortcut) and so show no keycap. Every
-    /// row's click handler also closes the menu.
+    /// file* ([`Self::next_changed_file`]). *New terminal*, *New agent*, *Git graph*, and *Next
+    /// changed file* each dispatch the same method their own global keybinding does
+    /// (`crate::default_key_bindings`) and show that binding's keycap; *Open file…* has no global
+    /// keybinding of its own (its own real `mod+P` spec is now claimed by `TogglePalette`
+    /// instead, see `crate::default_key_bindings`'s own docs for that tradeoff) and so shows no
+    /// keycap. Every row's click handler also closes the menu.
+    ///
+    /// There is no *New file* row - §3's item list names only these five. A worktree's file tree
+    /// (`crate::sidebar::render::render_file_tree_row`/`render_right_sidebar_toggle`) already
+    /// carries its own always-visible `+` affordances (per-directory and root-level), both wired
+    /// to the same real [`Self::start_new_file`] this row used to call, so removing it here drops
+    /// no reachable functionality - it was a second entry point to an action that already has one
+    /// the spec keeps.
     pub(crate) fn render_plus_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let macos = self.window_controls_style().is_macos();
         let bounds = self.plus_button_bounds;
@@ -855,7 +876,8 @@ impl AdeApp {
         let resolved_kind = self.resolved_new_agent_kind();
         let (agent_fg, agent_bg) = work_surface::agent_tint(resolved_kind);
         let agent_initial = work_surface::agent_initial(resolved_kind);
-        let agent_label = resolved_kind.label();
+        let branch = self.current_worktree_branch();
+        let new_agent_secondary = work_surface::new_agent_menu_secondary_text(branch.as_deref());
         let changed_count = self
             .current_diff()
             .map(|diff| diff.files.len())
@@ -914,32 +936,11 @@ impl AdeApp {
                     )
                     .child(
                         render_dropdown_menu_row(
-                            "+",
-                            theme::text::DIM.into(),
-                            theme::surface::CHIP_NEUTRAL.into(),
-                            "New file",
-                            "in this worktree".to_string(),
-                            // No keycap: same reasoning as the "Open file…" row below - no
-                            // global keybinding exists for this (see `Self::start_new_file`'s
-                            // own docs).
-                            Vec::new(),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, window, cx| {
-                                this.plus_menu_open = false;
-                                let cwd = this.active_agent_cwd();
-                                this.start_new_file(cwd, window, cx);
-                            },
-                        )),
-                    )
-                    .child(
-                        render_dropdown_menu_row(
                             agent_initial,
                             agent_fg,
                             agent_bg,
-                            "New agent pane",
-                            agent_label.to_string(),
+                            "New agent",
+                            new_agent_secondary,
                             keymap::resolve_combo("mod+shift+N", macos),
                             true,
                         )
@@ -948,6 +949,23 @@ impl AdeApp {
                                 this.new_agent_pane(cx);
                                 this.plus_menu_open = false;
                                 cx.notify();
+                            },
+                        )),
+                    )
+                    .child(
+                        render_dropdown_menu_row(
+                            "\u{2325}",
+                            theme::graph::TAB_CHIP_FG.into(),
+                            theme::graph::TAB_CHIP_BG.into(),
+                            "Git graph",
+                            "commit history".to_string(),
+                            keymap::resolve_combo("mod+shift+G", macos),
+                            true,
+                        )
+                        .on_click(cx.listener(
+                            |this, _event: &ClickEvent, window, cx| {
+                                this.plus_menu_open = false;
+                                this.open_git_graph(window, cx);
                             },
                         )),
                     )
@@ -991,28 +1009,11 @@ impl AdeApp {
                                 this.next_changed_file(window, cx);
                             },
                         )),
-                    )
-                    .child(
-                        render_dropdown_menu_row(
-                            "\u{2325}",
-                            theme::graph::TAB_CHIP_FG.into(),
-                            theme::graph::TAB_CHIP_BG.into(),
-                            "Git graph",
-                            "commit history".to_string(),
-                            keymap::resolve_combo("mod+shift+G", macos),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, window, cx| {
-                                this.plus_menu_open = false;
-                                this.open_git_graph(window, cx);
-                            },
-                        )),
                     ),
             )
     }
 
-    /// Which agent kind the `+` menu's "New agent pane" row would spawn right now: the first
+    /// Which agent kind the `+` menu's "New agent" row would spawn right now: the first
     /// [`settings::AGENT_KINDS`] entry [`Self::agent_rows`] (refreshed on menu open) confirms is
     /// installed, or `AGENT_KINDS[0]` if none are (or `agent_rows` hasn't been populated yet).
     /// Display-only - [`Self::new_agent_pane`] runs its own detection independently, off the
@@ -1028,7 +1029,7 @@ impl AdeApp {
             .unwrap_or(settings::AGENT_KINDS[0])
     }
 
-    /// The `+` menu's "New agent pane" action (`secondary-shift-n`) - spawns the first
+    /// The `+` menu's "New agent" action (`secondary-shift-n`) - spawns the first
     /// [`settings::AGENT_KINDS`] entry a background `$PATH` search
     /// (`pty_core::resolve_on_path`, the same search [`Self::load_agent_rows`] runs) confirms is
     /// installed, rather than blocking the click on a filesystem walk.
@@ -1217,6 +1218,11 @@ impl AdeApp {
         let chip_kind = work_surface::tab_chip_kind(agent.kind);
         let is_mono = matches!(chip_kind, work_surface::TabChipKind::Cli);
         let colors = work_surface::tab_colors(is_active);
+        // §3: "5px status square that keeps reporting while you read another tab" - the same
+        // real `Status` the rail's own agent row and context bar already derive this agent's
+        // colour from, so the tab strip can never disagree with either about what state an
+        // agent is in.
+        let status_color: gpui::Rgba = self.agent_status(agent, cx).color();
         let tab_ref = work_surface::TabRef::Agent(id);
         let drag_value = DraggedTab::Agent {
             id,
@@ -1296,19 +1302,11 @@ impl AdeApp {
                     )
                     .child(
                         div()
-                            .id(("close-agent-tab", id))
-                            .px(px(2.0))
-                            .cursor_pointer()
-                            .font(font(theme::font::MONO))
-                            .text_size(px(11.0))
-                            .text_color(theme::text::GHOST)
-                            .hover(|el| el.text_color(theme::button::DANGER_FG))
-                            .child("\u{d7}")
-                            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                                cx.stop_propagation();
-                                this.close_agent(id, window, cx);
-                                cx.notify();
-                            })),
+                            .flex_none()
+                            .w(px(5.0))
+                            .h(px(5.0))
+                            .rounded(px(2.5))
+                            .bg(status_color),
                     ),
             )
             .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline))
@@ -2051,6 +2049,7 @@ pub(crate) fn render_dropdown_menu_row(
     };
     let mut row = div()
         .id(format!("dropdown-menu-row-{label}"))
+        .debug_selector(|| format!("dropdown-menu-row-{label}"))
         .flex()
         .items_center()
         .gap(px(9.0))
@@ -2732,6 +2731,13 @@ mod tab_scoping_tests {
     /// `DraggedAgentTab`/`DraggedFileTab` types could never produce (GPUI's `on_drop::<T>`
     /// dispatches purely on the dragged value's concrete type, so a `DraggedFileTab` could never
     /// be dropped onto an agent tab's `on_drop::<DraggedAgentTab>` handler or vice versa).
+    ///
+    /// The second tab spawned here is a real `Claude` agent, not a second `Shell` - Revision
+    /// R12 §3's bare-worktree suppression (`Self::current_worktree_is_bare`) treats "every open
+    /// agent is a `Shell`" as bare and hides file tabs from `Self::combined_tab_order` entirely
+    /// (`a_bare_worktrees_tab_strip_shows_only_its_shell_tab_and_preserves_file_tab_state`
+    /// covers that directly), which would make this drag-interleaving assertion moot for reasons
+    /// that have nothing to do with what this test actually exercises.
     #[gpui::test]
     fn dragging_a_file_tab_between_two_agent_tabs_interleaves_them(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2742,7 +2748,7 @@ mod tab_scoping_tests {
         let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
             let initial_id = app.agents.active_id().expect("initial shell agent");
             let second_id = app.agents.spawn(
-                AgentKind::Shell,
+                AgentKind::Claude,
                 repo.path().to_path_buf(),
                 12.0,
                 window,
@@ -2982,6 +2988,250 @@ mod tab_scoping_tests {
         assert_ne!(
             label, "terminal",
             "the bare-worktree shell label must never fall back to the generic non-bare label"
+        );
+    }
+
+    /// Revision R12 §3's exact `+` menu item list: "*New terminal* · *New agent*
+    /// (`runs in <branch>`) · *Git graph* · *Open file…* · *Next changed file*." Proven against
+    /// the real painted popover (`Self::render_dropdown_menu_row`'s own `debug_selector`, one per
+    /// row, keyed by its label), not just the source order - and confirms there is genuinely no
+    /// "New file" row any more (removed: the file tree already carries a real, always-visible
+    /// replacement, `crate::sidebar::render::render_file_tree_row`/
+    /// `render_right_sidebar_toggle`'s own per-directory and root-level "+" affordances).
+    #[gpui::test]
+    fn the_plus_menus_five_rows_match_revision_r12_3_in_order_with_no_new_file_row(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, cx| {
+            app.plus_menu_open = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let new_terminal = cx
+            .debug_bounds("dropdown-menu-row-New terminal")
+            .expect("\"New terminal\" row must be painted");
+        let new_agent = cx
+            .debug_bounds("dropdown-menu-row-New agent")
+            .expect("\"New agent\" row must be painted");
+        let git_graph = cx
+            .debug_bounds("dropdown-menu-row-Git graph")
+            .expect("\"Git graph\" row must be painted");
+        let open_file = cx
+            .debug_bounds("dropdown-menu-row-Open file\u{2026}")
+            .expect("\"Open file\u{2026}\" row must be painted");
+        let next_changed = cx
+            .debug_bounds("dropdown-menu-row-Next changed file")
+            .expect("\"Next changed file\" row must be painted");
+
+        assert!(
+            new_terminal.origin.y < new_agent.origin.y
+                && new_agent.origin.y < git_graph.origin.y
+                && git_graph.origin.y < open_file.origin.y
+                && open_file.origin.y < next_changed.origin.y,
+            "the five rows must render top to bottom in exactly Revision R12 §3's order: New \
+             terminal, New agent, Git graph, Open file\u{2026}, Next changed file"
+        );
+
+        assert!(
+            cx.debug_bounds("dropdown-menu-row-New file").is_none(),
+            "there must be no \"New file\" row - it is not one of §3's five items, and the file \
+             tree already has a real replacement"
+        );
+        assert!(
+            cx.debug_bounds("dropdown-menu-row-New agent pane")
+                .is_none(),
+            "the row must be relabelled \"New agent\", not the old \"New agent pane\""
+        );
+    }
+
+    /// Revision R12 §3's `+` menu Git graph row, clicked for real (`cx.simulate_click` against
+    /// the row's own painted bounds, not a direct `open_git_graph` call) - must actually open the
+    /// graph tab, and close the menu behind it the same way every other row's click does.
+    #[gpui::test]
+    fn a_real_click_on_the_plus_menus_git_graph_row_opens_the_graph_tab(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, cx| {
+            app.plus_menu_open = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app.graph_tab_open),
+            "premise: the graph tab must not already be open before the click"
+        );
+
+        let git_graph = cx
+            .debug_bounds("dropdown-menu-row-Git graph")
+            .expect("\"Git graph\" row must be painted while the + menu is open");
+        cx.simulate_click(git_graph.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_tab_open && app.graph_tab_active,
+                "a real click on the Git graph row must genuinely open and activate the graph \
+                 tab, not just close the menu"
+            );
+            assert!(
+                !app.plus_menu_open,
+                "the row's click handler must also close the + menu, matching every other row"
+            );
+        });
+    }
+
+    /// Revision R12 §3's `+` menu "New agent" row secondary text (`runs in <branch>`) must come
+    /// from the real selected worktree's own recorded branch - the exact composition
+    /// `Self::render_plus_menu` performs (`Self::current_worktree_branch` piped into
+    /// `work_surface::new_agent_menu_secondary_text`) - not a hardcoded model/kind label the row
+    /// used to show (`agent.kind.label()`, e.g. `"Claude"`).
+    #[gpui::test]
+    fn the_new_agent_rows_secondary_text_uses_the_real_selected_worktrees_branch(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_a = tempfile::tempdir().expect("tempdir a");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(
+                wt_a.path().to_path_buf(),
+                "feature/real-branch",
+            )];
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+        });
+
+        let (branch, secondary) = app.read_with(cx, |app, _| {
+            let branch = app.current_worktree_branch();
+            let secondary = work_surface::new_agent_menu_secondary_text(branch.as_deref());
+            (branch, secondary)
+        });
+
+        assert_eq!(
+            branch.as_deref(),
+            Some("feature/real-branch"),
+            "premise: the selected worktree's real branch must resolve to the seeded value"
+        );
+        assert_eq!(
+            secondary, "runs in feature/real-branch",
+            "the row must show the real branch, substituted in - not a literal placeholder"
+        );
+        assert_ne!(
+            secondary, "Claude",
+            "must never show a model/agent-kind label in the branch's place - the pre-fix bug"
+        );
+    }
+
+    /// Revision R12 §3: "A bare worktree shows only the shell tab." A worktree that had a real
+    /// agent and a file tab open, then had that agent archived (leaving only the default
+    /// `Shell` tab - genuinely bare, per `Self::current_worktree_is_bare`), must stop rendering
+    /// its file tab in `Self::combined_tab_order` - but the file's own entry in
+    /// `Self::open_files_by_worktree` must survive untouched, so the tab reappears (without
+    /// having to reopen the file) the moment a real agent spawns again and the worktree stops
+    /// being bare. This is the conservative "don't render, don't destroy" reading of the spec's
+    /// own per-worktree tab-memory design (§3: "Each worktree remembers its own... open files").
+    #[gpui::test]
+    fn a_bare_worktrees_tab_strip_shows_only_its_shell_tab_and_preserves_file_tab_state(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_a = tempfile::tempdir().expect("tempdir a");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
+        });
+        let claude_id = app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            let shell_id = app.agents.spawn(
+                AgentKind::Shell,
+                wt_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            let claude_id = app.agents.spawn(
+                AgentKind::Claude,
+                wt_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            app.open_files_mut().push(PathBuf::from("README.md"));
+            let _ = shell_id;
+            claude_id
+        });
+
+        let order_with_agent = app.read_with(cx, |app, _| app.combined_tab_order());
+        assert!(
+            order_with_agent
+                .iter()
+                .any(|tab_ref| matches!(tab_ref, work_surface::TabRef::File(path) if path == &PathBuf::from("README.md"))),
+            "premise: the file tab is genuinely open while a real agent is running"
+        );
+        assert!(
+            !app.read_with(cx, |app, _| app.current_worktree_is_bare()),
+            "premise: the worktree is not bare while the Claude agent is running"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.archive_agent(claude_id, window, cx);
+        });
+
+        assert!(
+            app.read_with(cx, |app, _| app.current_worktree_is_bare()),
+            "archiving the only real agent must leave the worktree bare (only its default \
+             Shell tab left)"
+        );
+
+        let order_while_bare = app.read_with(cx, |app, _| app.combined_tab_order());
+        assert!(
+            order_while_bare
+                .iter()
+                .all(|tab_ref| !matches!(tab_ref, work_surface::TabRef::File(_))),
+            "a bare worktree's tab strip must show only its shell tab - no file tabs, even ones \
+             left open from before it went bare"
+        );
+        assert!(
+            order_while_bare.iter().any(
+                |tab_ref| matches!(tab_ref, work_surface::TabRef::Agent(id) if *id != claude_id)
+            ),
+            "the shell tab itself must still be there - only the file tab is suppressed"
+        );
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_files().to_vec()),
+            vec![PathBuf::from("README.md")],
+            "the file's own entry in open_files_by_worktree must survive untouched while bare - \
+             suppression is render-only, never destructive"
+        );
+
+        // Spawning a real agent again makes the worktree non-bare - the file tab must reappear
+        // with zero extra work, since its underlying state was never touched.
+        app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Codex,
+                wt_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+        });
+        let order_after_respawn = app.read_with(cx, |app, _| app.combined_tab_order());
+        assert!(
+            order_after_respawn
+                .iter()
+                .any(|tab_ref| matches!(tab_ref, work_surface::TabRef::File(path) if path == &PathBuf::from("README.md"))),
+            "the file tab must reappear once the worktree is no longer bare - its state was \
+             preserved, not destroyed, while suppressed"
         );
     }
 }

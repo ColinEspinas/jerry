@@ -575,33 +575,22 @@ impl AdeApp {
         )
     }
 
-    /// Header 36 (`Agents` label, grouping toggle, `+`/⌘N) - README's "Rail chrome".
+    /// Header 36 - Revision R12 §2.1: "Rail header keeps only the `+` new-session button." No
+    /// section-title label - this used to say `AGENTS` (a leftover from the pre-R12 flat rail,
+    /// carried through a rename to fix its vocabulary without checking it against this
+    /// requirement) but the spec is explicit that the header has nothing but the button itself.
     pub(in crate::rail) fn render_rail_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("rail-header")
             .flex()
             .flex_none()
             .items_center()
-            .justify_between()
+            .justify_end()
             .px(px(10.0))
             .h(theme::band::RAIL_HEADER)
             .border_b_1()
             .border_color(theme::border::RAIL_INNER)
-            .child(
-                div()
-                    .font(font(theme::font::SANS))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_size(self.ui_text_size(10.0))
-                    .text_color(theme::text::FAINT)
-                    .child("AGENTS"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(self.render_new_agent_button(cx)),
-            )
+            .child(self.render_new_agent_button(cx))
     }
 
     /// The `+` control with its real, platform-resolved `mod+N` keycap pair (`⌘N` on macOS,
@@ -679,6 +668,16 @@ impl AdeApp {
                     .flex()
                     .items_center()
                     .gap(px(2.0))
+                    // GitHub issue #45 / live report: the caret used to be a fixed trailing
+                    // child, which put it visually *after* the placeholder text whenever
+                    // `filter_query` was empty. It now sits before the placeholder (the real
+                    // cursor position, 0, for an empty field - matching
+                    // `crate::palette::render::AdeApp::render_palette_caret`'s own empty-query
+                    // placement) and after the real typed text once there is any, never
+                    // appended past whatever placeholder string happens to render.
+                    .when(!has_query, |el| {
+                        el.child(self.render_simple_input_caret("rail-filter-caret"))
+                    })
                     .child(
                         div()
                             .font(font(theme::font::MONO))
@@ -691,10 +690,13 @@ impl AdeApp {
                             .child(if has_query {
                                 self.filter_query.as_str().to_string()
                             } else {
-                                "filter agents".to_string()
-                            }),
+                                "filter worktrees and agents".to_string()
+                            })
+                            .debug_selector(|| "rail-filter-text".to_string()),
                     )
-                    .child(self.render_simple_input_caret()),
+                    .when(has_query, |el| {
+                        el.child(self.render_simple_input_caret("rail-filter-caret"))
+                    }),
             )
     }
 
@@ -1841,6 +1843,116 @@ mod rail_row_tests {
             1,
             "sanity check: the *displayed* rows really did narrow to the one matching worktree \
              - proving the filter query took effect at all, just not on the header count"
+        );
+    }
+}
+
+/// GitHub issue #45 ("Input blink only on focused input or file") plus a live follow-up report:
+/// the rail filter's caret used to be a fixed trailing child, painted *after* the placeholder
+/// text whenever `filter_query` was empty, instead of at the real cursor position (0). Real
+/// interaction coverage, mirroring `crate::palette::render::palette_caret_tests`' own
+/// measured-bounds technique rather than only reading the render code.
+#[cfg(test)]
+mod rail_filter_caret_tests {
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+    use std::time::Duration;
+
+    #[gpui::test]
+    fn caret_sits_before_the_placeholder_when_empty_and_after_the_text_once_typed(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update_in(cx, |app, window, cx| {
+            window.focus(&app.filter_focus_handle, cx);
+        });
+        cx.run_until_parked();
+
+        let empty_caret = cx
+            .debug_bounds("rail-filter-caret")
+            .expect("the caret should have really painted with an empty filter");
+        let placeholder = cx
+            .debug_bounds("rail-filter-text")
+            .expect("the placeholder text should have really painted");
+        assert!(
+            empty_caret.origin.x <= placeholder.origin.x,
+            "with an empty filter, the real caret must sit before (at or left of) the \
+             placeholder's own start x, not after it - got caret {:?} vs placeholder {:?}",
+            empty_caret,
+            placeholder,
+        );
+
+        cx.simulate_input("main");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.as_str().to_string()),
+            "main",
+            "sanity check: real typed filter"
+        );
+
+        let typed_caret = cx
+            .debug_bounds("rail-filter-caret")
+            .expect("the caret should have really painted with a typed filter");
+        let typed_text = cx
+            .debug_bounds("rail-filter-text")
+            .expect("the real typed text should have really painted");
+        assert!(
+            typed_caret.origin.x >= typed_text.origin.x + typed_text.size.width,
+            "with a typed filter, the real caret must sit at or after the typed text's own \
+             right edge, not before it - got caret {:?} vs text {:?}",
+            typed_caret,
+            typed_text,
+        );
+        assert!(
+            typed_caret.origin.x > empty_caret.origin.x,
+            "the caret's real measured horizontal position must differ between the \
+             empty-filter state (before the placeholder) and a typed-filter state (after the \
+             real text) - got {:?} vs {:?}",
+            empty_caret.origin.x,
+            typed_caret.origin.x,
+        );
+    }
+
+    /// GitHub issue #45's own title, taken literally: the caret must actually *blink* (not just
+    /// exist) once this field is focused - proving `filter_focus_handle`'s real wiring into
+    /// `crate::root::caret_blink`'s shared loop by advancing the real (simulated) clock past one
+    /// full interval and observing `caret_blink_visible` really flip, the same live-loop proof
+    /// `crate::code_surface::editing`'s own rehighlight-debounce tests use for their timers.
+    /// `cx.simulate_input` (not a bare `window.focus`) is what actually forces the window to
+    /// redraw and diff its own focus path in this test harness - the real trigger
+    /// `on_focus`/`on_blur` listeners fire from (see `gpui::Window::focus`'s own deferred-effect
+    /// doc comment) - matching how a real user always focuses a field by clicking or tabbing
+    /// into it and then typing, never focus with no further interaction.
+    #[gpui::test]
+    fn focusing_the_rail_filter_starts_the_real_shared_blink_loop(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        // `on_focus`/`on_blur` (`AdeApp::wire_caret_blink`'s own mechanism) only fire while GPUI
+        // considers the window itself "active" - a real, freshly opened test window starts out
+        // not active at all.
+        app.update_in(cx, |_app, window, _cx| window.activate_window());
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            window.focus(&app.filter_focus_handle, cx);
+        });
+        cx.simulate_input("m");
+        assert!(
+            app.read_with(cx, |app, _| app.caret_blink_visible),
+            "a fresh focus must start solid/visible"
+        );
+
+        cx.background_executor.advance_clock(
+            crate::root::caret_blink::CARET_BLINK_INTERVAL + Duration::from_millis(50),
+        );
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.caret_blink_visible),
+            "focusing the rail filter must have started the real, live shared blink task - if \
+             `filter_focus_handle` were never wired into `AdeApp::wire_caret_blink`, no timer \
+             would be running at all and this flag would still be stuck solid"
         );
     }
 }

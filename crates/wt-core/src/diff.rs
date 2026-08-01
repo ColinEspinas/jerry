@@ -650,19 +650,31 @@ fn prepare_shadow_index(worktree_path: &Path) -> Result<tempfile::NamedTempFile,
         }
     };
 
-    let mut shadow = tempfile::NamedTempFile::new().map_err(Error::WorktreeIo)?;
-    // A repository whose index has never been written (e.g. immediately after `git init`,
-    // before any commit) has no index file on disk yet; falling back to an empty temp file
-    // in that case mirrors git's own "missing index == empty index" behavior rather than
-    // being an error. In practice `diff_against_base` already returns `NoBaseFound` for an
-    // unborn `HEAD` before reaching this point, so the index should always exist here, but
-    // this stays defensive rather than failing outright if it somehow doesn't.
-    if let Ok(real_index_bytes) = std::fs::read(&real_index_path) {
-        use std::io::Write as _;
-        shadow
-            .write_all(&real_index_bytes)
-            .map_err(Error::WorktreeIo)?;
-        shadow.flush().map_err(Error::WorktreeIo)?;
+    let shadow = tempfile::NamedTempFile::new().map_err(Error::WorktreeIo)?;
+    match std::fs::read(&real_index_path) {
+        Ok(real_index_bytes) => {
+            use std::io::Write as _;
+            (&shadow)
+                .write_all(&real_index_bytes)
+                .map_err(Error::WorktreeIo)?;
+            (&shadow).flush().map_err(Error::WorktreeIo)?;
+        }
+        Err(_) => {
+            // A repository whose index has never been written (e.g. immediately after
+            // `git init`, before any commit), or one whose index momentarily can't be read
+            // (a real interleaving hazard: an agent CLI's own `git add`/`git commit`
+            // rewriting the index at the exact moment this reads it), has no real bytes to
+            // seed the shadow copy with. `NamedTempFile::new()` above already created a
+            // real, empty *file* at this path though - and an empty-but-*existing* file is
+            // not what git treats as "no index yet": confirmed directly (`GIT_INDEX_FILE`
+            // pointed at a 0-byte file makes real `git add` fail outright with `fatal: ...
+            // index file smaller than expected`, exit 128), where a path that simply
+            // doesn't exist at all is instead treated as a fresh empty index and succeeds.
+            // Delete the placeholder so the path git sees is genuinely missing, not merely
+            // empty - `git add` below then creates a real index there from scratch, exactly
+            // as it would for a brand-new repository's very first `git add`.
+            std::fs::remove_file(shadow.path()).map_err(Error::WorktreeIo)?;
+        }
     }
 
     let add_args: Vec<OsString> = vec![
@@ -1353,6 +1365,55 @@ mod tests {
             status_text.contains("?? brand_new.txt"),
             "the real index must be untouched by the shadow index trick, got status: \
              {status_text}"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_real_index_does_not_fail_the_whole_diff() {
+        // Reproduces a real, confirmed bug: `prepare_shadow_index` used to fall back to an
+        // empty *existing* temp file when the real index couldn't be read, on the (wrong)
+        // assumption that this "mirrors git's own missing index == empty index behavior."
+        // Verified directly with real git commands that it does not: `GIT_INDEX_FILE`
+        // pointed at a genuinely nonexistent path is treated as a fresh empty index (real
+        // `git add` succeeds), but pointed at an existing 0-byte file it fails outright
+        // (`fatal: ... index file smaller than expected`, exit 128) - a completely
+        // different, fatal code path. `diff_against_base` surfaced that fatal to the whole
+        // Changes panel as "failed to compute diff: ...".
+        let repo = init_repo();
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        fs::write(repo.path().join("brand_new.txt"), "content nobody staged\n").expect("write");
+
+        // Simulate the real index being genuinely unreadable at the moment
+        // `prepare_shadow_index` reads it - a fresh worktree with no index written yet, or
+        // (the more likely real-world trigger) an agent CLI's own concurrent `git add`/
+        // `git commit` rewriting it in the same window. `git rev-parse --git-path index`
+        // matches exactly what `prepare_shadow_index` itself resolves.
+        let index_path_output = Command::new("git")
+            .current_dir(repo.path())
+            .args(["rev-parse", "--git-path", "index"])
+            .output()
+            .expect("git rev-parse --git-path index");
+        let index_path = repo
+            .path()
+            .join(String::from_utf8_lossy(&index_path_output.stdout).trim());
+        assert!(
+            index_path.exists(),
+            "sanity check: a real index must exist after a commit"
+        );
+        fs::remove_file(&index_path)
+            .expect("remove the real index to simulate it being unreadable");
+
+        let result = diff_against_base(repo.path())
+            .expect("a missing real index must not fail the whole diff computation");
+        let DiffBase::Diff(diff) = result else {
+            panic!("expected DiffBase::Diff, got {result:?}");
+        };
+        assert!(
+            diff.files
+                .iter()
+                .any(|f| f.path == Path::new("brand_new.txt")),
+            "the diff must still compute (and still see the real untracked file) even when \
+             the real index couldn't be read to seed the shadow copy"
         );
     }
 

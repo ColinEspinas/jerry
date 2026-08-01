@@ -1509,9 +1509,13 @@ mod text_undo_scoping_tests {
         );
     }
 
-    /// The rail's agent filter - the fourth and last of this app's hand-rolled single-line
-    /// inputs. Also covers that `Esc`-clearing a filter is a real, undoable step rather than a
-    /// silent loss.
+    /// The rail's agent filter - one of this app's several hand-rolled single-line inputs (this
+    /// comment used to claim it was "the fourth and last", which had already gone stale by the
+    /// time GitHub issue #45's audit found two more real ones - the git graph tab's own branches
+    /// filter and the "New file" prompt - that undo/redo already covered independently but whose
+    /// *carets* had never been wired up at all; see `crate::root::caret_blink`'s own docs).
+    /// Also covers that `Esc`-clearing a filter is a real, undoable step rather than a silent
+    /// loss.
     #[gpui::test]
     fn secondary_z_in_the_rail_filter_undoes_it_including_a_real_escape_clear(
         cx: &mut TestAppContext,

@@ -274,8 +274,8 @@ impl AdeApp {
                         )
                     }),
             )
-            .when_some(agent_state_chips, |el, chips| el.child(chips))
             .child(div().flex_1())
+            .when_some(agent_state_chips, |el, chips| el.child(chips))
             .when(!macos, |el| el.child(self.render_windows_caption_buttons()))
     }
 

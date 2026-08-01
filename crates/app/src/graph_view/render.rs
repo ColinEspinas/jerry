@@ -402,6 +402,10 @@ impl AdeApp {
         if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
             return;
         }
+        // GitHub issue #27's "solid mid-keystroke" - see `crate::rail::render::AdeApp::
+        // handle_filter_key_down`'s identical reasoning. Missing here (GitHub issue #45) is
+        // exactly why this field never blinked in the first place.
+        self.reset_caret_blink(cx);
         let changed = match keystroke.key.as_str() {
             "backspace" => self.graph_state.branches_filter.pop(Instant::now()),
             "escape" => self.graph_state.branches_filter.clear(Instant::now()),
@@ -1466,17 +1470,37 @@ impl AdeApp {
             .child(
                 div()
                     .flex_1()
-                    .font(font(theme::font::MONO))
-                    .text_size(px(10.5))
-                    .text_color(if has_query {
-                        theme::text::DIM
-                    } else {
-                        theme::text::GHOST
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    // GitHub issue #45 / live report: this filter row had *no* caret element at
+                    // all - `branches_filter_focus_handle` was never threaded into
+                    // `AdeApp::wire_caret_blink` (see `Self::new_with_settings`'s own comment on
+                    // why it's wired separately, after `graph_state` exists), so there was
+                    // nothing to paint here regardless. Now matches
+                    // `crate::rail::render::AdeApp::render_rail_filter_row`'s own fixed
+                    // before-placeholder / after-text placement.
+                    .when(!has_query, |el| {
+                        el.child(self.render_simple_input_caret("graph-branches-filter-caret"))
                     })
-                    .child(if has_query {
-                        self.graph_state.branches_filter.as_str().to_string()
-                    } else {
-                        "filter branches".to_string()
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.5))
+                            .text_color(if has_query {
+                                theme::text::DIM
+                            } else {
+                                theme::text::GHOST
+                            })
+                            .child(if has_query {
+                                self.graph_state.branches_filter.as_str().to_string()
+                            } else {
+                                "filter branches".to_string()
+                            })
+                            .debug_selector(|| "graph-branches-filter-text".to_string()),
+                    )
+                    .when(has_query, |el| {
+                        el.child(self.render_simple_input_caret("graph-branches-filter-caret"))
                     }),
             )
             .child(
@@ -1911,6 +1935,37 @@ fn elbow_color_lane(kind: ElbowKind, from_lane: usize, to_lane: usize) -> usize 
     }
 }
 
+/// The order `render_graph_lane_canvas` paints one row's elbows in, paired with each elbow's own
+/// index in `row.elbows` so its `debug_selector` tag stays tied to the layout's own numbering
+/// rather than to paint position.
+///
+/// Every elbow of one kind in one row shares a single `waist_y` (see [`elbow_geometry`] - it is a
+/// function of the row height and the kind, nothing else), so *N* elbows landing on the same lane
+/// all paint their horizontal stroke on the very same pixel row, and their spans nest: the elbow
+/// from the furthest lane covers the whole stretch every nearer one occupies, its own arc columns
+/// included.
+///
+/// In `row.elbows`' own order that is fatal. `wt_core::graph::layout_lanes` Step 2 emits
+/// `Converging` elbows by ascending lane, so the *furthest* lane is painted **last** and wipes out
+/// every nearer elbow outright - not just its bridge but the arc that turns that lane's line onto
+/// the waist. This repository's own history renders exactly that: master's `HEAD` is the shared
+/// parent of eight worktree branches, so its row carries eight `Converging` elbows, and it painted
+/// as one flat full-width bar in lane 8's colour with the other seven lanes' lines stopping dead at
+/// the top of the row - a boxy rectangle where eight separate coloured curves belong. The
+/// single-elbow geometry was never wrong (`elbow_geometry_tests` covers one elbow exhaustively and
+/// all of it still passes); what was missing is that a row can hold more than one.
+///
+/// Painting longest span first and shortest last nests them the other way up, which is the shape a
+/// commit graph actually wants: the horizontal changes colour at every lane it crosses, each lane's
+/// own arc sits on top of the strokes running past it, and the innermost elbow owns the arc that
+/// lands on the dot. `sort_by_key` is stable, so equal spans keep the layout's own order.
+fn elbow_paint_order(elbows: &[wt_core::graph::Elbow]) -> Vec<(usize, wt_core::graph::Elbow)> {
+    let mut ordered: Vec<(usize, wt_core::graph::Elbow)> =
+        elbows.iter().copied().enumerate().collect();
+    ordered.sort_by_key(|(_, elbow)| std::cmp::Reverse(elbow.from_lane.abs_diff(elbow.to_lane)));
+    ordered
+}
+
 /// The vertical span (`top`, `height`) one plain lane segment occupies in its row.
 ///
 /// Pure and GPUI-element-free, like `elbow_geometry`/`elbow_color_lane`, so it is directly testable
@@ -2051,6 +2106,25 @@ fn render_graph_lane_canvas(
     let mut canvas = div()
         .relative()
         .flex_none()
+        // Pinned to the row's own top edge, never centred in it. `render_graph_row` is
+        // `.h(ROW).border_b_1()` and GPUI's taffy layout is *border-box* (`Style::to_taffy`,
+        // `vendor/zed/crates/gpui/src/taffy.rs`, never sets `box_sizing`, so taffy's own
+        // `BoxSizing::BorderBox` default applies) - so the row is 26 tall on the outside but its
+        // content box is only 25, while this canvas is a full `ROW` = 26. Under the row's
+        // `.items_center()` that centres to `(25 - 26) / 2` = **-0.5px**, and every horizontal 1px
+        // stroke in here - the elbow bridge's `h(px(1.0))` and both curve boxes' `border_t_1()`/
+        // `border_b_1()` - then lands on a half-pixel boundary and renders smeared across two
+        // physical pixel rows at half intensity, while the vertical lane lines (x is untouched)
+        // stay crisp. That is the reported "the lines and elbows do not align correctly
+        // vertically", and it is also why four earlier rounds of 1px elbow-seam fixes each only
+        // half-worked: the geometry was computed on an integer grid and every test measured that
+        // integer grid, but the whole canvas was painted half a pixel off it.
+        //
+        // The row has no *top* border, so its content-box top is its border-box top: pinning here
+        // puts the canvas on whole pixels and keeps consecutive canvases exactly `ROW` apart. The
+        // 1px it now overflows past the content box is the row's own separator border, which lane
+        // lines must run through anyway for a line to read as continuous across rows.
+        .self_start()
         .overflow_hidden()
         .w(graph_lane_canvas_width(lane_count))
         .h(row_h)
@@ -2104,7 +2178,7 @@ fn render_graph_lane_canvas(
         canvas = canvas.child(line);
     }
 
-    for (elbow_index, elbow) in row.elbows.iter().enumerate() {
+    for (elbow_index, elbow) in elbow_paint_order(&row.elbows) {
         let x_from = lane_x(elbow.from_lane);
         let x_to = lane_x(elbow.to_lane);
         let geo = elbow_geometry(elbow.kind, x_from, x_to, row_h);
@@ -3570,6 +3644,131 @@ mod elbow_geometry_tests {
         }
     }
 
+    /// The x-range one whole elbow paints on its own `waist_y` row. Both curve boxes contribute
+    /// their *full* box width, not just the straight part of the border: a rounded corner's arc
+    /// still terminates on the waist row at the far end of the corner square, so the whole width is
+    /// ink. The bridge is included for completeness - it always sits between the two boxes.
+    fn waist_ink(geo: &ElbowGeometry) -> (Pixels, Pixels) {
+        let left = geo.entry.left.min(geo.exit.left).min(geo.straight.left);
+        let right = geo
+            .entry
+            .right()
+            .max(geo.exit.right())
+            .max(geo.straight.left + geo.straight.width);
+        (left, right)
+    }
+
+    fn column(x: Pixels) -> usize {
+        f32::from(x).round() as usize
+    }
+
+    #[test]
+    fn every_elbow_in_a_crowded_row_keeps_its_own_lanes_arc_visible() {
+        // The real regression test for a row carrying *several* elbows at once - the case every
+        // other test in this module misses, because they all build exactly one elbow.
+        //
+        // `elbow_geometry`'s `waist_y` depends only on the row height and the elbow kind, so every
+        // elbow of one kind in one row paints its horizontal stroke on the very same pixel row, and
+        // their spans nest: an elbow reaching lane 8 covers every column an elbow reaching lane 1
+        // occupies, that nearer elbow's own arc included. Painted in `row.elbows`' own order
+        // (`layout_lanes` emits `Converging` by ascending lane) the furthest one lands last and
+        // erases all the rest - which is exactly what this repository's own history rendered:
+        // master's `HEAD` is the shared parent of eight worktree branches, and its row painted as
+        // one flat full-width bar in the highest lane's colour with seven lanes' lines stopping
+        // dead at the top of the row, instead of eight separate coloured curves.
+        //
+        // The invariant that has to hold, stated on painted pixels rather than on the sort itself:
+        // after the whole row is painted in `elbow_paint_order`, the column of each elbow's own
+        // *far* lane - the branch end that has to visibly turn onto the waist - still belongs to
+        // that elbow. Under the old order every lane but the furthest fails this.
+        for (kind, far_lanes, dot_lane) in [
+            // Eight branch tips sharing one ancestor: this repository's own real `HEAD` row.
+            (
+                ElbowKind::Converging,
+                vec![1usize, 2, 3, 4, 5, 6, 7, 8],
+                0usize,
+            ),
+            // The mirror: an octopus merge opening several lanes from one dot.
+            (ElbowKind::Diverging, vec![1, 2, 3, 4], 0),
+            // Non-contiguous lanes, and one adjacent-lane elbow whose two boxes overlap.
+            (ElbowKind::Converging, vec![1, 3, 6], 0),
+        ] {
+            let elbows: Vec<wt_core::graph::Elbow> = far_lanes
+                .iter()
+                .map(|&far| match kind {
+                    ElbowKind::Converging => wt_core::graph::Elbow {
+                        from_lane: far,
+                        to_lane: dot_lane,
+                        kind,
+                    },
+                    ElbowKind::Diverging => wt_core::graph::Elbow {
+                        from_lane: dot_lane,
+                        to_lane: far,
+                        kind,
+                    },
+                })
+                .collect();
+
+            let lane_count = far_lanes.iter().max().expect("at least one lane") + 1;
+            let mut owner: Vec<Option<usize>> =
+                vec![None; column(graph_lane_canvas_width(lane_count))];
+            for (index, elbow) in elbow_paint_order(&elbows) {
+                let geo = elbow_geometry(
+                    elbow.kind,
+                    lane_x(elbow.from_lane),
+                    lane_x(elbow.to_lane),
+                    ROW_H,
+                );
+                let (left, right) = waist_ink(&geo);
+                for cell in owner.iter_mut().take(column(right)).skip(column(left)) {
+                    *cell = Some(index);
+                }
+            }
+
+            for (index, (elbow, &far)) in elbows.iter().zip(far_lanes.iter()).enumerate() {
+                assert_eq!(
+                    owner[column(lane_x(far))],
+                    Some(index),
+                    "{kind:?} row {far_lanes:?}: lane {far}'s own arc column was painted over by \
+                     elbow {:?} - that lane's line ends in mid-air instead of curving onto the \
+                     waist, which is the boxy full-width bar this ordering exists to prevent",
+                    owner[column(lane_x(far))]
+                        .map(|winner| elbows[winner])
+                        .expect("some elbow must own the column"),
+                );
+                let _ = elbow;
+            }
+        }
+    }
+
+    #[test]
+    fn the_paint_order_keeps_each_elbows_own_layout_index_for_its_debug_tag() {
+        // Reordering must not renumber the `graph-row-N-elbow-K-...` selectors: `K` is the elbow's
+        // index in `GraphRow::elbows` (what `graph_elbow_render_tests` looks paint bounds up by),
+        // not its position in the paint sequence.
+        let elbows = vec![
+            wt_core::graph::Elbow {
+                from_lane: 1,
+                to_lane: 0,
+                kind: ElbowKind::Converging,
+            },
+            wt_core::graph::Elbow {
+                from_lane: 5,
+                to_lane: 0,
+                kind: ElbowKind::Converging,
+            },
+        ];
+        let ordered = elbow_paint_order(&elbows);
+        assert_eq!(
+            ordered.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            vec![1, 0],
+            "the widest elbow paints first, but both keep their own layout index"
+        );
+        for (index, elbow) in ordered {
+            assert_eq!(elbow, elbows[index]);
+        }
+    }
+
     #[test]
     fn a_diverging_elbows_color_follows_the_branch_merged_in_not_the_branch_it_lands_in() {
         // from_lane is always own_lane (the branch merged *into*) for Diverging - a real user
@@ -4053,6 +4252,63 @@ mod graph_elbow_render_tests {
         );
     }
 
+    /// The real regression test for the reported "the lines and elbows do not align correctly
+    /// vertically", and for a whole class of subpixel bugs the sibling tiling test below cannot
+    /// see: it only ever compares one lane canvas against *another* lane canvas, so a constant
+    /// offset shared by every row passes it untouched.
+    ///
+    /// `render_graph_row` is `.h(ROW).border_b_1()`, and GPUI's taffy layout is border-box
+    /// (`Style::to_taffy` in `vendor/zed/crates/gpui/src/taffy.rs` never sets `box_sizing`, so
+    /// taffy's `BoxSizing::BorderBox` default applies) - so the row's *content* box is 25px while
+    /// the lane canvas is a full `ROW` = 26px. The row's own `.items_center()` then centred it to
+    /// `(25 - 26) / 2` = -0.5px, and every horizontal 1px stroke in the canvas - the elbow's
+    /// straight bridge and both curve boxes' horizontal borders - landed on a half-pixel boundary,
+    /// rendering smeared over two physical pixel rows while the vertical lane lines stayed crisp.
+    /// `render_graph_lane_canvas`'s `.self_start()` is what holds this.
+    ///
+    /// Asserted on the canvas' offset *within its own row*, and on the offset being a whole
+    /// pixel - the two facts the centring broke, neither of which any existing test looked at.
+    #[gpui::test]
+    fn every_lane_canvas_sits_on_whole_pixels_at_its_own_rows_top_edge(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded(cx, seed_converging_history);
+        let row_count = app.read_with(cx, |app, _| {
+            let GraphLoadState::Loaded(graph) = &app.graph_state.load else {
+                panic!("graph must have loaded");
+            };
+            graph.rows.len()
+        });
+        assert!(
+            row_count >= 4,
+            "sanity check: this fixture must produce several real rows, got {row_count}"
+        );
+
+        for index in 0..row_count {
+            let row_selector: &'static str =
+                Box::leak(format!("graph-row-{index}").into_boxed_str());
+            let canvas_selector: &'static str =
+                Box::leak(format!("graph-row-{index}-lane-canvas").into_boxed_str());
+            let row = cx
+                .debug_bounds(row_selector)
+                .unwrap_or_else(|| panic!("{row_selector} must be painted"));
+            let canvas = cx
+                .debug_bounds(canvas_selector)
+                .unwrap_or_else(|| panic!("{canvas_selector} must be painted"));
+
+            assert_eq!(
+                canvas.origin.y, row.origin.y,
+                "row {index}'s lane canvas must start on its row's own top edge, not be centred \
+                 in the shorter content box the row's bottom border leaves behind"
+            );
+            let y = f32::from(canvas.origin.y);
+            assert_eq!(
+                y,
+                y.round(),
+                "row {index}'s lane canvas sits at {y}, off the whole-pixel grid - every 1px \
+                 horizontal stroke inside it renders smeared across two physical pixel rows"
+            );
+        }
+    }
+
     /// The layout fact `render_graph_lane_canvas`'s `overflow_hidden()` rests on, and the real
     /// paint-level regression for the "lines disappearing at elbow connections when hovering"
     /// report. That clip is what stops an elbow's straight lead-out from spilling into the next
@@ -4503,6 +4759,141 @@ mod graph_focus_tests {
         assert!(
             !app.read_with(cx, |app, _| app.graph_tab_open),
             "middle-clicking the graph tab must close it, same as a file or agent tab"
+        );
+    }
+
+    /// GitHub issue #45 ("Input blink only on focused input or file") plus a live follow-up
+    /// report: this filter row had *no* caret element at all - confirmed by reading
+    /// `render_graph_branches_filter_row` before this fix, and `branches_filter_focus_handle`
+    /// was never threaded through `AdeApp::wire_caret_blink` either (it didn't exist yet when
+    /// that call in `Self::new_with_settings` was first wired - the Branches panel is a later
+    /// Revision R12 addition). Real interaction coverage, mirroring
+    /// `crate::rail::render::rail_filter_caret_tests`' own measured-bounds technique.
+    #[gpui::test]
+    fn caret_sits_before_the_placeholder_when_empty_and_after_the_text_once_typed(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded(cx);
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+            app.set_graph_right_panel(GraphRightPanel::Branches, cx);
+            window.focus(&app.graph_state.branches_filter_focus_handle, cx);
+        });
+        cx.run_until_parked();
+
+        let empty_caret = cx.debug_bounds("graph-branches-filter-caret").expect(
+            "the caret should have really painted with an empty filter - before this fix, \
+                 no caret element existed here at all, so this selector would never resolve",
+        );
+        let placeholder = cx
+            .debug_bounds("graph-branches-filter-text")
+            .expect("the placeholder text should have really painted");
+        assert!(
+            empty_caret.origin.x <= placeholder.origin.x,
+            "with an empty filter, the real caret must sit before (at or left of) the \
+             placeholder's own start x, not after it - got caret {:?} vs placeholder {:?}",
+            empty_caret,
+            placeholder,
+        );
+
+        cx.simulate_input("main");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .graph_state
+                .branches_filter
+                .as_str()
+                .to_string()),
+            "main",
+            "sanity check: real typed filter"
+        );
+
+        let typed_caret = cx
+            .debug_bounds("graph-branches-filter-caret")
+            .expect("the caret should have really painted with a typed filter");
+        let typed_text = cx
+            .debug_bounds("graph-branches-filter-text")
+            .expect("the real typed text should have really painted");
+        assert!(
+            typed_caret.origin.x >= typed_text.origin.x + typed_text.size.width,
+            "with a typed filter, the real caret must sit at or after the typed text's own \
+             right edge, not before it - got caret {:?} vs text {:?}",
+            typed_caret,
+            typed_text,
+        );
+        assert!(
+            typed_caret.origin.x > empty_caret.origin.x,
+            "the caret's real measured horizontal position must differ between the \
+             empty-filter state (before the placeholder) and a typed-filter state (after the \
+             real text) - got {:?} vs {:?}",
+            empty_caret.origin.x,
+            typed_caret.origin.x,
+        );
+    }
+
+    /// GitHub issue #45's own title, taken literally: before this fix,
+    /// `branches_filter_focus_handle` was never wired into `AdeApp::wire_caret_blink` at all, so
+    /// *blurring* it never called the real [`AdeApp::stop_caret_blink`] that pins the shared
+    /// flag straight to "dimmed" the instant focus leaves - the same real, immediate effect
+    /// every already-wired handle has always had.
+    ///
+    /// This deliberately checks *blur*, not *focus*: typing into the field also calls
+    /// `Self::reset_caret_blink` directly (`Self::handle_branches_filter_key_down`'s own real
+    /// "solid mid-keystroke" behaviour, GitHub issue #27) regardless of whether
+    /// `branches_filter_focus_handle` is wired into the shared loop at all - so a test that only
+    /// focuses-then-types would pass even with the wiring gap this fix closes, and prove
+    /// nothing about it. Blurring is the one real effect that only a genuine `AdeApp::
+    /// wire_caret_blink` subscription produces: an *immediate*, synchronous flip to
+    /// `caret_blink_visible == false`, not something that could be explained by the still-live
+    /// timer from the earlier keystroke (which hasn't been given time to fire - the background
+    /// clock is never advanced in this test).
+    #[gpui::test]
+    fn blurring_the_branches_filter_stops_the_real_shared_blink_loop(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded(cx);
+        app.update_in(cx, |_app, window, _cx| window.activate_window());
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+            app.set_graph_right_panel(GraphRightPanel::Branches, cx);
+            window.focus(&app.graph_state.branches_filter_focus_handle, cx);
+        });
+        // `open_git_graph` kicks off a real, async `load_graph` (a background `gix` commit
+        // walk) - the Branches panel only actually renders its filter row (rather than the
+        // "open the graph to see branches" placeholder `render_graph_branches_panel` shows
+        // while `current_graph()` is still `None`) once that finishes. Parked here first, the
+        // same way the sibling position test above does, so `cx.simulate_input` below dispatches
+        // against a frame that genuinely has the filter row - and therefore its focus - in it.
+        cx.run_until_parked();
+
+        cx.simulate_input("m");
+        assert!(
+            app.read_with(cx, |app, _| app.caret_blink_visible),
+            "sanity check: typing must leave the caret solid/visible, whether that came from \
+             this fix's own on-focus wiring or `handle_branches_filter_key_down`'s pre-existing \
+             `reset_caret_blink` call"
+        );
+
+        // Move real keyboard focus to a genuinely different, real, *unwired* handle
+        // (`AdeApp::rail_focus_handle`, the rail's own always-present container fallback, never
+        // itself a caret-bearing input) - and force the same real redraw a live blur event
+        // needs to be observed (`rail::render::rail_filter_caret_tests`' own identical
+        // `cx.simulate_input`-forces-a-redraw finding), via a harmless, unbound plain keystroke
+        // rather than typing into a real field.
+        app.update_in(cx, |app, window, cx| {
+            window.focus(&app.rail_focus_handle, cx);
+        });
+        cx.simulate_keystrokes("x");
+
+        assert!(
+            !app.read_with(cx, |app, _| app.caret_blink_visible),
+            "blurring the branches filter must have immediately pinned the shared caret to \
+             dimmed/non-blinking (`AdeApp::stop_caret_blink`) - before this fix, \
+             `branches_filter_focus_handle` was never threaded through \
+             `AdeApp::wire_caret_blink`, so nothing would have reacted to it losing focus at \
+             all, and the caret would have stayed solid/visible until whatever timer the \
+             earlier keystroke started eventually fired on its own"
         );
     }
 }

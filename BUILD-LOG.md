@@ -6691,3 +6691,425 @@ describing a historical, deleted concept, not live code.
 `cargo clippy --workspace --all-targets -- -D warnings` - all clean.
 `cargo test --workspace --lib --test-threads=1`: **1198 + 44 + 14 + 139 = 1395 passed, 0 failed**
 across all four crates.
+
+## Closing the two real §3 gaps a coordinator audit found: the `+` menu's item list, and bare-worktree tab suppression
+
+### The bare-worktree header-bar swap was not, in fact, already on this branch
+
+The audit that kicked this step off reported the bare-worktree label/header-bar swap (`Start an
+agent` button, greyed `no agent` text) as already correct, verified in an earlier pass - only the
+"only the shell tab" suppression was supposedly missing. Checking the real current code before
+touching anything (per this project's own standing rule) found that claim didn't hold: neither
+`current_worktree_is_bare`, `bare_worktree_shell_label`, nor `render_start_agent_button` existed
+anywhere on this branch. `git log`/`git branch --contains` traced why - that whole feature landed
+in `78ea1eb` on the sibling `revision-r12-tabstrip` branch, and this branch (`issue-1-git-graph-a`
+and everything stacked on it) diverged from the shared git-staging commit *before* `78ea1eb`
+landed, so it never got it. The earlier audit was almost certainly run against the sibling branch's
+worktree, not this one's actual head.
+
+`78ea1eb`'s parent is exactly the git-staging commit this branch also descends from, so
+`git cherry-pick -n 78ea1eb` applied cleanly with a real (non-conflicting) auto-merge and the
+whole workspace still built and passed clippy afterward with zero changes needed. Committed that
+cherry-pick on its own before writing anything new, so the bare-worktree label swap, `Start an
+agent` button, and the (unrelated but same-commit) tab-label ordinal disambiguation all exist here
+for real before layering the tab-suppression fix on top of them.
+
+### Gap 1: the `+` menu's item list
+
+The menu already had a real `Git graph` row (added by the git-graph rebase, unrelated to this
+step) - but it sat last, after `Next changed file`, not third as §3 specifies. Moved it up.
+`New agent pane`'s label became `New agent`, and its secondary text - which read the *agent kind's
+model label* (`agent.kind.label()`, e.g. `"Claude"`) - now reads `runs in <branch>` with the real
+selected worktree's branch substituted in, via a new pure helper,
+`work_surface::new_agent_menu_secondary_text`, unit-tested directly (real branch, and the
+`(detached)` fallback for a worktree with no recorded branch) rather than left as an inline
+`format!` only exercisable through the full render path.
+
+`New file` came out. Before deleting it, checked whether it was the *only* way to create a file
+in this app - it is not: the file tree already carries a real, always-visible replacement
+(`crate::sidebar::render::render_file_tree_row`'s per-directory `+` and
+`render_right_sidebar_toggle`'s root-level `+`, both calling the same `Self::start_new_file` the
+menu row called), added independently of this menu row and present regardless of it. Confirmed
+this is a real second entry point, not a hypothetical one, by reading both call sites and their
+own doc comments. So removing the row drops no reachable functionality - no coordinator sign-off
+needed, this one had a real answer. Updated `root/new_file.rs`'s module doc and its
+`NewFileInputState::parent_dir` field doc, both of which described the now-gone menu row as one of
+the two entry points.
+
+### Gap 2: bare worktrees weren't suppressing their file tabs
+
+`current_worktree_is_bare` (from the cherry-pick above) already existed and was already correct;
+what wasn't wired up was `Self::combined_tab_order` actually consulting it. Re-read §3's own
+reasoning for why tab state is worktree-scoped at all (§1: "the open file tabs... the active tab"
+are worktree-scoped facts, and §3: "Each worktree remembers its own active tab and its own open
+files") before picking an implementation: the conservative, spec-consistent reading is
+render-only suppression, never destruction - a worktree going bare (its last real agent archived)
+must not silently forget which files were open, the same way switching worktrees never does.
+
+Implemented in `combined_tab_order` itself, not in the render layer: when every agent for the
+active worktree is a `Shell` (the same bareness test `current_worktree_is_bare` uses, computed
+locally here rather than by calling that method - it goes through `current_worktree_agents` which
+itself calls `combined_tab_order`, so calling it back from inside `combined_tab_order` would
+recurse), the file list handed to `work_surface::reconcile_tab_order` is an empty slice instead of
+the real `Self::open_files()`. `reconcile_tab_order` then drops every `TabRef::File` already in
+the stored order (its own `open_files.contains(path)` filter) and appends none back - but neither
+`Self::open_files_by_worktree` (the real per-worktree storage) nor `Self::tab_order` (the
+persisted drag order) is touched, so the moment a real agent spawns again and the worktree stops
+being bare, the very next `combined_tab_order` call reconciles against the real, untouched
+open-files list and the same file tabs reappear in their original position - nothing was reopened,
+nothing was lost, it just wasn't rendered while bare. Centralizing this in `combined_tab_order`
+rather than only in `render_tab_strip` means the tab-strip drag/drop, jump-keys, and
+`current_worktree_agents` machinery all agree with what's actually shown, for free.
+
+This did surface one real, pre-existing test whose premise no longer held:
+`dragging_a_file_tab_between_two_agent_tabs_interleaves_them` spawned two `Shell` agents (an
+arbitrary choice made before this branch had any bare-worktree concept at all) plus a file tab, to
+exercise drag-reorder interleaving - which is now a genuinely bare worktree by definition, so its
+own file tab got correctly suppressed and the test's first assertion failed. Fixed by changing the
+second spawned agent to a real `Claude` agent instead of a second `Shell` - the test's actual
+subject is cross-kind drag interleaving, which has nothing to do with bareness, and the dedicated
+bare-worktree test below covers that behavior directly instead.
+
+### Tests
+
+Four new ones, plus two pure-logic unit tests for the branch-substitution helper:
+
+- `the_plus_menus_five_rows_match_revision_r12_3_in_order_with_no_new_file_row` - opens the real
+  menu, reads each row's real painted bounds via a new `debug_selector` on
+  `render_dropdown_menu_row` (previously only `.id()`, which `cx.debug_bounds` doesn't read),
+  confirms the five rows sit top-to-bottom in §3's exact order, and confirms both `New file` and
+  the old `New agent pane` label are genuinely absent.
+- `a_real_click_on_the_plus_menus_git_graph_row_opens_the_graph_tab` - a real
+  `cx.simulate_click` against the row's own captured bounds (not a direct `open_git_graph` call),
+  confirming `graph_tab_open`/`graph_tab_active` both flip and the menu closes behind it.
+- `the_new_agent_rows_secondary_text_uses_the_real_selected_worktrees_branch` - seeds a worktree
+  with a real, distinctive branch name, confirms `current_worktree_branch()` resolves it, and
+  confirms the exact composition `render_plus_menu` performs never falls back to a model label.
+- `a_bare_worktrees_tab_strip_shows_only_its_shell_tab_and_preserves_file_tab_state` - spawns a
+  real `Shell` and a real `Claude` agent plus a file tab, confirms all three show up, archives the
+  `Claude` agent, confirms the worktree is now genuinely bare and its file tab is gone from
+  `combined_tab_order` while its entry in `open_files()` survives untouched, then spawns a
+  `Codex` agent and confirms the file tab reappears with no extra work.
+
+### Gates
+
+`cargo fmt --all -- --check`, `cargo build --workspace`, and
+`cargo clippy --workspace --all-targets -- -D warnings` all clean (one real clippy hit along the
+way: `doc_lazy_continuation` on a doc comment where a mid-sentence `- see ...` read as an
+unindented markdown list continuation - reworded, not suppressed). `cargo test --workspace --lib
+--test-threads=1`: **1212 + 44 + 14 + 139 = 1409 passed, 0 failed** across all four crates - no
+`code_surface::diff_view` flake this run.
+
+## Git graph: the boxy multi-row elbow rectangle
+
+Reported again as "the git graph's lane/elbow alignment is broken", with a screenshot showing long
+vertical lines running down for many rows and terminating in one flat, boxy horizontal bar, plus
+dots that appeared to have no line reaching them at all. The obvious suspicion - that one of the
+earlier elbow fixes had been lost in one of this branch's two rebases - turned out to be wrong.
+`git diff 0b059f0 HEAD -- crates/app/src/graph_view/render.rs` touches nothing in
+`elbow_geometry`, `CurveBox`, `StraightSegment` or `render_graph_lane_canvas`'s elbow loop, and
+every one of the twenty existing `elbow_geometry_tests` still passed. All the prior fixes are
+intact.
+
+### The real root cause
+
+Every one of those tests builds exactly **one** elbow. A row can hold many, and that is the case
+nobody had ever looked at.
+
+`elbow_geometry`'s `waist_y` is a function of the row height and the elbow kind and nothing else,
+so every `Converging` elbow in one row paints its horizontal stroke on the *same* pixel row, and
+their spans nest - the elbow arriving from lane 8 covers every column the elbow arriving from lane
+1 occupies, including the arc that turns lane 1's line onto the waist. `render_graph_lane_canvas`
+painted them in `row.elbows`' own order, and `wt_core::graph::layout_lanes` Step 2 emits
+`Converging` elbows by *ascending* lane. So the furthest lane was painted last, on top, and wiped
+out every nearer elbow outright.
+
+This repository's own history renders exactly that shape. Dumping `build_graph`'s real output for
+`/home/colin/spike/ade` (a scratch `examples/dump_graph.rs`, since removed) shows master's `HEAD`
+row as:
+
+```
+50 lane=0 Head segs=[0,1e,2e,3e,4e,5e,6e,7e,8e,9s] elbows=[1->0C,...,8->0C,0->9D]
+```
+
+Eight worktree branches share that commit as their parent, so eight lanes run straight down for
+sixteen rows and then all converge in one row. Rasterizing the real geometry to ASCII (a throwaway
+harness that replays `elbow_geometry`/`lane_segment_span`/the stub-skip logic into a character
+grid) made the failure unmistakable. Before:
+
+```
+30 |         0          111           222           333           444
+31 |         0   44444444444444444444444444444444444444444444444444
+32 |         0 444
+```
+
+One flat full-width bar in lane 4's colour, and lanes 1-3 simply stop dead. Long verticals plus a
+flat bar is precisely the "boxy rectangle" in the screenshot, and lanes whose arc got overpainted
+are precisely the "dots with no line reaching them". After:
+
+```
+30 |         0          111           222           333           444
+31 |         0   11111111222222222222223333333333333344444444444444
+32 |         0 111
+```
+
+Each lane visibly curves onto the waist in its own colour, the horizontal changes colour at every
+lane it crosses, and the innermost elbow owns the arc that lands on the dot - the shape a commit
+graph actually wants.
+
+### The change
+
+One new pure function, `elbow_paint_order`, and one call site. It pairs each elbow with its own
+index in `GraphRow::elbows` (so the `graph-row-N-elbow-K-...` debug selectors keep pointing at the
+layout's numbering, not at paint position) and sorts by *descending* horizontal lane span, stably.
+Longest first, shortest last. Nothing about the single-elbow geometry moved - it was never wrong.
+
+The `Diverging` mirror (an octopus merge opening several lanes off one dot) had the identical
+latent defect and is covered by the same ordering; the two kinds sit on opposite waists so they
+never contend with each other.
+
+### Tests
+
+- `every_elbow_in_a_crowded_row_keeps_its_own_lanes_arc_visible` - the real regression test, and
+  deliberately stated on painted pixels rather than on the sort. It replays a whole row's elbows
+  into a per-column owner map in `elbow_paint_order`'s order, using each elbow's real
+  `elbow_geometry` output, and asserts that every elbow's own far-lane column still belongs to
+  that elbow afterwards. Three rows: this repository's real eight-`Converging` `HEAD` row, a
+  four-way `Diverging` octopus merge, and a non-contiguous `[1, 3, 6]` set that includes an
+  adjacent-lane elbow whose two curve boxes overlap. Reverting the sort to the old order fails it
+  with `lane 1's own arc column was painted over by elbow Elbow { from_lane: 8, to_lane: 0, kind:
+  Converging }` - it is not passing by construction.
+- `the_paint_order_keeps_each_elbows_own_layout_index_for_its_debug_tag` - pins that reordering
+  the paint sequence does not renumber the debug selectors the existing
+  `graph_elbow_render_tests` look real paint bounds up by.
+
+### Gates
+
+`cargo fmt --all -- --check`, `cargo build --workspace` and
+`cargo clippy --workspace --all-targets -- -D warnings` all clean. `cargo test --workspace --lib
+--test-threads=1`: **1220 + 44 + 14 + 139 = 1417 passed, 0 failed** across all four crates - no
+`code_surface::diff_view` flake this run either.
+
+## The Changes panel could fail outright on a real, unremarkable git state: an unreadable index
+
+A user-reported error, shown raw in the Changes panel: `failed to compute diff: git add
+--intent-to-add -A -- . exited with status 128: ... fatal: unable to write new index file`, with
+`warning: adding embedded git repository: vendor/zed` printed just before it. The warning turned
+out to be a red herring - confirmed directly: a real repo with 18 real embedded/nested-`.git`
+directories (this project's own checkout, full of `.wt-*` worktree directories) still lets `git
+add -A -- .` succeed with exit 0, warnings and all. Embedded-repo warnings alone are advisory, not
+fatal.
+
+The real bug is in `wt_core::diff::prepare_shadow_index`, and it doesn't need an embedded repo to
+trigger: it builds a throwaway, `--intent-to-add`-augmented copy of the worktree's real index
+(so `git diff` picks up untracked files as additions) by copying the real index's bytes into a
+`tempfile::NamedTempFile`. Its own doc comment claimed that if the real index can't be read (a
+fresh worktree with no index written yet, or - the far more likely real-world trigger in this
+app specifically - an agent CLI's own concurrent `git add`/`git commit` rewriting the index at the
+exact moment this reads it), falling back to leaving the temp file empty "mirrors git's own
+missing index == empty index behavior." Verified directly with real git commands that this claim
+is false: `GIT_INDEX_FILE` pointed at a path that genuinely does not exist is treated as a fresh,
+empty index (`git add` succeeds); pointed at an *existing* empty (0-byte) file, it fails hard -
+`fatal: ... index file smaller than expected`, exit 128 - a completely different code path,
+because `NamedTempFile::new()` had already created a real, empty file on disk at that path before
+the fallback ever ran.
+
+Fixed by deleting the placeholder file (`std::fs::remove_file`) instead of leaving it empty
+whenever the real index can't be read, so the path `GIT_INDEX_FILE` names is genuinely missing,
+not merely empty - `git add` then creates a real index there from scratch, exactly as it would
+for a brand-new repository's very first `git add`.
+
+New regression test `a_missing_or_unreadable_real_index_does_not_fail_the_whole_diff`: deletes the
+real index (via the same `git rev-parse --git-path index` resolution `prepare_shadow_index` itself
+uses) after a real commit, then asserts `diff_against_base` still succeeds and still sees a real
+untracked file. Confirmed non-vacuous by temporarily reverting just the fix (restoring the old
+"leave it empty" fallback) and re-running this one test alone: it fails with the exact
+`GitCommand { ... exit: Code(128), stderr: "fatal: ... index file smaller than expected" }` shape
+the user's own report showed, then re-verified clean once the fix was restored.
+
+**Verification**: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings` - all clean.
+`cargo test --workspace --lib --test-threads=1`: **1221 + 44 + 14 + 140 = 1419 passed, 0 failed**
+across all four crates (1 new test) - independently re-verified by the coordinator, not just
+agent-reported. One run hit the documented `code_surface::diff_view::diff_render_tests` flake
+under unusually high system load (several concurrent agents active this session); re-ran the
+failing test alone (2/3 clean) and the full suite once more (clean) to confirm it was load, not a
+regression - the failing test is in unrelated syntax-highlighting code with no plausible link to
+either this fix or the elbow-ordering fix above it.
+
+### Follow-up: the elbows were painted half a pixel off the row grid
+
+The fix above was real but it was not the whole report. Pressed again with "the lines and elbows
+do not align correctly vertically", the answer turned out to be a subpixel layout bug that every
+existing test was structurally blind to.
+
+`render_graph_row` is `.h(ROW).border_b_1()` on a `.flex().items_center()` row, and GPUI's taffy
+layout is **border-box**: `Style::to_taffy` (`vendor/zed/crates/gpui/src/taffy.rs`) maps `size` and
+`border` across and fills the rest with `..Default::default()`, never setting `box_sizing`, so
+taffy's own `BoxSizing::BorderBox` default applies. The row is therefore 26px on the outside but
+its *content* box is only 25px, while `render_graph_lane_canvas` is a full `ROW` = 26px. Under
+`.items_center()` that centres to `(25 - 26) / 2` = **-0.5px**. Measured on real painted bounds,
+every row:
+
+```
+row 0: row.y=129px | canvas.y=128.5px | delta=-0.5px
+row 1: row.y=155px | canvas.y=154.5px | delta=-0.5px
+```
+
+Every horizontal 1px stroke in the canvas - the elbow bridge's `h(px(1.0))` and both curve boxes'
+`border_t_1()`/`border_b_1()` - then sat on a half-pixel boundary and rendered smeared across two
+physical pixel rows at half intensity, while the vertical lane lines (x is untouched) stayed
+crisp. Crisp verticals against smeared horizontals is exactly what "elbows don't line up
+vertically" looks like, and it is very probably why four earlier rounds of 1px elbow-seam fixes
+each only half-worked: the geometry was computed on an integer grid, every test measured that same
+integer grid, and then the whole canvas was painted half a pixel off it.
+
+Fixed with `.self_start()` on the lane canvas. The row has no *top* border, so its content-box top
+is its border-box top; pinning there puts the canvas back on whole pixels and keeps consecutive
+canvases exactly `ROW` apart. The 1px it now overflows past the content box is the row's own
+separator border, which lane lines have to run through anyway for a line to read as continuous
+across rows.
+
+Why nothing caught it: `consecutive_lane_canvases_tile_exactly_so_the_row_clip_loses_no_line` only
+ever compares one lane canvas against *another* lane canvas. A constant offset shared by every row
+keeps both its invariants (each canvas is `ROW` tall, each sits `ROW` below the last) perfectly
+intact. It passes against the bug - verified by reverting the fix and re-running it.
+
+New test `every_lane_canvas_sits_on_whole_pixels_at_its_own_rows_top_edge` closes that gap by
+measuring the canvas against **its own row**: `canvas.origin.y == row.origin.y`, and
+`y == y.round()`. Reverting `.self_start()` fails it with `left: 128.5px / right: 129px` while the
+tiling test beside it still passes - the precise blind spot, now covered.
+
+### Gates (both changes)
+
+`cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy --workspace --all-targets --
+-D warnings` all clean. `cargo test --workspace --lib -- --test-threads=1`: **1221 + 44 + 14 + 140
+= 1419 passed, 0 failed**. One run of the full serialized suite had
+`lsp::client::lsp_diagnostics_wiring_tests::rust_analyzer_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions`
+blow its wall-clock deadline under load; it passes 3/3 in isolation in ~3s and the clean rerun
+above passes it too - a real-rust-analyzer timing flake, not a regression.
+
+
+## GitHub issue #45 and a live report: carets glued to the end of placeholder text, and two real inputs never wired to the shared blink loop at all
+
+Two reports, investigated together since the live one's symptoms ("displays at the end of the
+placeholder", "a lot of inputs are missing carets") pointed straight at issue #45's own title
+("Input blink only on focused input or file"): whichever mechanism drives the caret was, in some
+sense, only really correct for a couple of surfaces.
+
+### Inventory: exactly six real, hand-rolled text inputs, not a sprawling pile
+
+`grep -rn "TextField::new()" crates/app/src/` found the app's *entire* real inventory of
+hand-rolled single-line inputs (the code editor and the merge-conflict editor use a completely
+different, already-correct, real-cursor-position-aware `EditBuffer` - out of scope, per the
+task, and untouched here):
+
+- `AdeApp::palette_query` (command palette search) - `crate::palette::render::render_palette_caret`
+- `AdeApp::filter_query` (rail agent/worktree filter) - `crate::rail::render`
+- `AdeApp::settings_keymap_filter` (Settings › Keybindings filter) - `crate::settings::render`
+- the file tree's inline rename/new-file/new-folder editor - `crate::sidebar::tree_ops`
+- `GraphTabState::branches_filter` (git graph tab's Branches panel filter) - `crate::graph_view::render`
+- `NewFileInputState::name` (the "New file" prompt) - `crate::root::new_file`
+
+Two of these (the palette, the tree's inline editor) were already correct. The other four had
+two independent, real bugs:
+
+**Bug 1 - caret glued to the end of the placeholder.** `crate::root::widgets::AdeApp::
+render_simple_input_caret` is the one shared helper `render_rail_filter_row` and
+`render_settings_keymap_filter_row` both used, and it was always rendered as the row's *last*
+child, regardless of whether the row's other child was the real typed text or the placeholder
+string. With an empty filter, that put a blinking bar visually appended after `"filter worktrees
+and agents"`/`"filter N bindings"` - exactly the live report's "displays at the end of the
+placeholder but should not". `crate::palette::render::render_palette_caret` had already solved
+this correctly (caret before the placeholder at the real cursor position, 0; after the real text
+once there's any) - `render_simple_input_caret` just never got the same treatment.
+
+**Bug 2 - two inputs' carets weren't wired into the shared blink loop, or rendered at all.**
+`AdeApp::wire_caret_blink` (called once, from `Self::new_with_settings`) is the one place that
+threads a caret-bearing `FocusHandle` into the shared `on_focus`/`on_blur` subscriptions that
+start/stop the blink loop. It listed six handles. `GraphTabState::branches_filter_focus_handle`
+(added later, when the git graph tab's Branches panel shipped) and `AdeApp::new_file_focus_handle`
+were never among them - and, compounding it, `render_graph_branches_filter_row` and
+`render_new_file_prompt` never called `render_simple_input_caret` (or anything else) at all, so
+these two fields had no caret element in the tree whatsoever. That's the live report's "a lot of
+inputs are missing carets" - not hyperbole, a literal, confirmed-by-reading-the-render-code gap
+in two real, reachable surfaces.
+
+### The fix
+
+- `render_simple_input_caret` now takes a `debug_selector` and each call site places it the same
+  way the palette already does: before the placeholder while the field is empty, after the real
+  text once there's any (`crates/app/src/root/widgets.rs`,
+  `crates/app/src/rail/render.rs:render_rail_filter_row`,
+  `crates/app/src/settings/render.rs:render_settings_keymap_filter_row`).
+- `render_graph_branches_filter_row` and `render_new_file_prompt` gained the same caret, in the
+  same shared helper, rather than a third hand-rolled implementation.
+- `Self::new_with_settings` (`crates/app/src/root/state.rs`) threads
+  `branches_filter_focus_handle` and `new_file_focus_handle` into `AdeApp::wire_caret_blink` too -
+  in a second call right after the constructor's own `Self { .. }` literal, since both handles
+  live *inside* `this` (one nested in `graph_state`) and don't exist yet at the point the first
+  six are wired.
+- `handle_branches_filter_key_down`/`handle_new_file_key_down` gained the same
+  `self.reset_caret_blink(cx)` call on every real keystroke every other hand-rolled field's own
+  key handler already had (issue #27's "solid mid-keystroke") - missing here is exactly why
+  neither field ever blinked at all before this, wiring or not.
+
+Left alone, deliberately: the Changes panel's commit-message box, which the live report's own
+phrasing plausibly meant - reading `render_commit_composer`, it's genuinely non-interactive
+today (no `track_focus`, no `on_key_down` - "no real agent-drafted message generation to redraft
+*from* yet" per its own doc comment), so there's no caret bug there because there's no real text
+input there yet. Six inputs, not "every hand-rolled field reimplements this slightly
+differently, several of them wrong" at some much larger scale - a small, closed set, matching the
+task's own "if this turns out to be a couple of real callers, fix it" case rather than its
+"stop and report" one.
+
+### Tests
+
+Four new position tests (one per fixed field) measure the caret's real painted x position via
+`VisualTestContext::debug_bounds`, mirroring `palette_caret_tests`' own established technique:
+before the placeholder when empty, at or after the real text once typed, and genuinely different
+between the two states. Reverting each fix (restoring the caret to its old fixed trailing
+position, or removing it outright for the two previously-caretless fields) fails the matching
+test with the real symptom - confirmed non-vacuous by hand for all four before restoring.
+
+The two wiring-specific tests (`blurring_the_branches_filter_stops_the_real_shared_blink_loop`,
+`blurring_the_new_file_prompt_stops_the_real_shared_blink_loop`) needed a real, subtle harness
+fact: GPUI's `on_focus`/`on_blur` listeners only fire while the window itself is considered
+"active" (`Window::window_active`, gated in `crates/gpui/src/window.rs`'s own focus-event code),
+and a fresh `gpui::test` window starts out *not* active - `window.activate_window()` (which a
+real, focused desktop window always effectively has already) is required before either listener
+ever fires at all. Without it, every attempt at a focus/blur-driven test passed or failed for the
+wrong reason (a same-field `reset_caret_blink` call on typing masks a missing `wire_caret_blink`
+subscription entirely) - the tests instead check that *blurring* a freshly-focused, freshly-typed
+field immediately pins the shared caret to dimmed (`AdeApp::stop_caret_blink`'s own synchronous
+effect), the one observable behaviour that only a genuine `on_blur` subscription produces and a
+keystroke's own `reset_caret_blink` cannot explain. Reverting the `wire_caret_blink` addition in
+`Self::new_with_settings` alone (leaving the render fix and the keystroke-time `reset_caret_blink`
+calls in place) fails both, confirming they test the wiring specifically, not the render fix.
+
+### Gates
+
+`cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy --workspace --all-targets --
+-D warnings` all clean. `cargo test --workspace --lib -- --test-threads=1`: **1229 + 44 + 14 + 141
+= 1428 passed, 0 failed** (8 new tests). One run hit the documented
+`code_surface::diff_view::diff_render_tests::switching_the_open_diff_to_a_different_file_recomputes_the_highlight_cache`
+flake; passed 5/5 re-run in isolation and the full suite passed clean on a second full run -
+unrelated syntax-highlighting code, not a regression from this change.
+
+## Four real spec deviations found by the user directly inspecting the running app, plus a real git graph correctness bug
+
+Direct testing of the running app (pointed at this real repo) surfaced four real, concrete gaps against §2.1/§3/§4 that survived earlier audits, all fixed here:
+
+1. **Rail header still said `"AGENTS"`.** §2.1 is explicit: "Rail header keeps only the `+` new-session button." The label was a leftover from the pre-R12 flat rail - the earlier `Session`→`Agent` rename found and relabeled it (`SESSIONS`→`AGENTS`) as a pure vocabulary fix without checking it against this requirement, since the rename predates this branch's own audit work. Removed entirely; the header now holds only the `+` button, right-aligned.
+2. **Agent/shell tabs had a `×` close button they shouldn't.** §3: "agent and shell tabs do not [close]." Replaced with the real, spec'd 5px status square (§3: "Agent tab: 14px chip · model name · **5px status square** that keeps reporting while you read another tab") - reads the same `Self::agent_status` the rail row and context bar already derive their own colour from, so the tab strip can never disagree with either about an agent's real state. Middle-click still closes the tab (a separate, pre-existing GitHub issue #26 mechanism, untouched).
+3. **Filter placeholder said `"filter agents"`.** §2.1's exact text is `"filter worktrees and agents"`. One-line fix.
+4. **Title-bar agent-status chips hugged the left edge instead of being pushed right.** `agent_state_chips` was added as a child *before* the layout's `div().flex_1()` spacer, so the spacer (added after it) never had anything to push. Swapped the order.
+
+**A real git graph data bug**, found via an independent audit dispatched after this repo's own real, complex history (an 8-way branch fan-out, several real PR-merge commits) raised a "merges without commits" concern: `dot_kind` in `crates/wt-core/src/graph.rs` checked `Some(*id) == head_id` *before* `commit.is_merge()`, so a commit that is honestly both - this very repository's own `master` tip is one right now, a real `Merge pull request` commit `HEAD` currently sits on - lost its merge styling entirely. The single most merge-shaped row in the whole graph (8 real `Converging` elbows arriving at it) rendered as a plain `Head` dot instead of a hollow merge ring. Reordered to check `is_merge()` first: `HEAD` is already shown separately and unambiguously via the branch's own `RefChip::is_head` ref-chip styling next to the row, so prioritizing the merge visual loses no real information. New regression test confirmed non-vacuous (fails with the exact `Head` misclassification against the old order, passes against the fix).
+
+The independent audit that caught this also verified, exhaustively (not spot-checked) across all 181 rows of this real repository's graph: every parent list matches `git log --parents` exactly; zero fake merge dots; every `Diverging`/`Converging` elbow traces to a real lane genuinely present in an adjacent row; zero phantom elbows; lane continuity holds in both directions across all 181 rows. The "several unrelated lines converging into one plain commit dot" pattern the user's report may have partly been reacting to is real, correct git semantics (a shared non-merge ancestor several branches happen to reach), not a defect - `git log --graph` draws the identical `|/` shape at the same rows.
+
+**Verification**: `cargo fmt --all -- --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings` - all clean. `cargo test --workspace --lib
+--test-threads=1`: **1221 + 44 + 14 + 141 = 1420 passed, 0 failed** across all four crates (1 new
+test - `a_merge_commit_that_is_also_head_still_gets_the_merge_dot_kind`).

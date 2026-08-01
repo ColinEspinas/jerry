@@ -245,6 +245,17 @@ pub fn bare_worktree_shell_label(program: &str, branch: Option<&str>) -> String 
     }
 }
 
+/// The `+` menu's "New agent" row secondary text (`design_handoff_jerry_ade/revision 3/
+/// REVISION-2026-07-31.md` §3: "*New agent* (`runs in <branch>`)") - the real, currently selected
+/// worktree's branch substituted in, never a hardcoded model/kind name (that was the pre-fix
+/// bug: the row showed `agent.kind.label()`, e.g. `"Claude"`, which is not what this spec item
+/// asks for at all). Falls back to `(detached)` for a worktree with no recorded branch, mirroring
+/// `crate::work_surface::render::AdeApp::render_agent_context_bar`'s own branch fallback so the
+/// two don't invent two different placeholder strings for the same "no branch" fact.
+pub fn new_agent_menu_secondary_text(branch: Option<&str>) -> String {
+    format!("runs in {}", branch.unwrap_or("(detached)"))
+}
+
 /// Appends a ` #N` ordinal (1-based, in order of appearance) to every label that repeats within
 /// `labels`, so two agents on the same model in one worktree never render two identical tab
 /// labels (`sonnet-4.5`, `sonnet-4.5` -> `sonnet-4.5 #1`, `sonnet-4.5 #2` - Revision R12 §3). A
@@ -703,6 +714,25 @@ mod tests {
     #[test]
     fn a_bare_worktrees_shell_label_falls_back_to_the_program_name_when_detached() {
         assert_eq!(bare_worktree_shell_label("bash", None), "bash");
+    }
+
+    /// Revision R12 §3's exact spec wording for the `+` menu's "New agent" row.
+    #[test]
+    fn the_new_agent_menu_row_shows_the_real_branch_never_a_model_name() {
+        assert_eq!(
+            new_agent_menu_secondary_text(Some("feature/real-branch")),
+            "runs in feature/real-branch"
+        );
+        assert_ne!(
+            new_agent_menu_secondary_text(Some("feature/real-branch")),
+            "Claude",
+            "must never show a model/agent-kind label in place of the branch"
+        );
+    }
+
+    #[test]
+    fn the_new_agent_menu_row_falls_back_to_detached_with_no_recorded_branch() {
+        assert_eq!(new_agent_menu_secondary_text(None), "runs in (detached)");
     }
 
     #[test]
