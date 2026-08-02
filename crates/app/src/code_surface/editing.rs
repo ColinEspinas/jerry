@@ -2951,9 +2951,10 @@ mod editing_tests {
     /// are computed from - stayed on whatever it was the last time something else happened to
     /// reload it (a worktree switch, a tree op via `crate::sidebar::tree_ops::AdeApp::
     /// refresh_after_file_op`), never the save itself. This drives a real `git`-backed repo one
-    /// branch off `main` (so there is a real base to diff against - `DiffBase::OnDefaultBranch`
-    /// would otherwise report no changes regardless of what's on disk, per `wt_core::diff::
-    /// diff_against_base`'s own docs), saves a real edit through the app, and asserts the
+    /// branch off `main` (so there is a real base to diff against and this hits `DiffBase::Diff`
+    /// specifically, not the `DiffBase::NoBase` uncommitted-vs-HEAD fallback a same-branch setup
+    /// would also report changes through, per `wt_core::diff::diff_against_base`'s own docs),
+    /// saves a real edit through the app, and asserts the
     /// reloaded `diff_state` reports the file as changed without any other trigger in between.
     #[gpui::test]
     fn saving_a_file_immediately_refreshes_diff_state_for_issue_89(cx: &mut TestAppContext) {

@@ -45,16 +45,12 @@ impl AdeApp {
                         // Fold the +n/-n totals here, off the UI thread, rather than
                         // recomputing them on every render.
                         let diff_result = wt_core::diff::diff_against_base(&root).map(|base| {
-                            let totals = match &base {
-                                DiffBase::Diff(diff) => Some(diff.files.iter().fold(
-                                    (0u32, 0u32),
-                                    |(add, del), file| {
-                                        let (file_add, file_del) = changes::diff_file_stats(file);
-                                        (add + file_add, del + file_del)
-                                    },
-                                )),
-                                DiffBase::NoBaseFound | DiffBase::OnDefaultBranch { .. } => None,
-                            };
+                            let totals = base.diff().map(|diff| {
+                                diff.files.iter().fold((0u32, 0u32), |(add, del), file| {
+                                    let (file_add, file_del) = changes::diff_file_stats(file);
+                                    (add + file_add, del + file_del)
+                                })
+                            });
                             (base, totals)
                         });
                         let staged_result = wt_core::stage::staged_paths(&root);
@@ -741,12 +737,14 @@ impl AdeApp {
         }
     }
 
-    /// The currently loaded diff, if any - `None` while loading/erroring, or when the worktree is
-    /// on its default branch / has no detectable base (see [`wt_core::diff::DiffBase`]). The
-    /// single source every view that shows diff state reads.
+    /// The currently loaded diff, if any - `None` only while loading/erroring, or when `HEAD`
+    /// itself is unborn (see [`wt_core::diff::DiffBase::diff`]). A worktree on its default
+    /// branch or with no detectable base still yields `Some` here, showing its real uncommitted
+    /// changes instead (GitHub issue #108). The single source every view that shows diff state
+    /// reads.
     pub(crate) fn current_diff(&self) -> Option<&WorktreeDiff> {
         match &self.diff_state {
-            DiffLoadState::Loaded(DiffBase::Diff(diff)) => Some(diff),
+            DiffLoadState::Loaded(base) => base.diff(),
             _ => None,
         }
     }

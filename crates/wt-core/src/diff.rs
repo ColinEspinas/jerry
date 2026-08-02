@@ -20,8 +20,10 @@
 //!
 //! If none of these yield a branch, or the selected worktree's branch *is* the detected
 //! default branch, or no merge-base exists between the two histories, [`diff_against_base`]
-//! returns [`DiffBase::NoBaseFound`] or [`DiffBase::OnDefaultBranch`] rather than fabricating
-//! a base.
+//! returns [`DiffBase::NoBase`] rather than fabricating a base branch to diff against - but it
+//! still computes a real `git diff HEAD` of uncommitted changes for that case (GitHub issue
+//! #108), so `DiffBase::NoBase` is not "nothing to show". [`DiffBase::NoBaseFound`] is reserved
+//! for the one case where even that fallback is impossible: `HEAD` itself is unborn.
 //!
 //! ## What the diff includes
 //!
@@ -152,16 +154,41 @@ pub struct WorktreeDiff {
 /// The outcome of trying to compute a worktree's diff against its base.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffBase {
-    /// A usable base was found; here is the diff against it (possibly with zero changed
+    /// A usable base branch was found; here is the diff against it (possibly with zero changed
     /// files, if the worktree exactly matches its base).
     Diff(WorktreeDiff),
-    /// The worktree's own branch *is* the detected default branch, so there is no meaningful
-    /// "base" to diff against.
-    OnDefaultBranch { branch: String },
-    /// No sensible base could be found at all: no default branch could be detected, `HEAD`
-    /// is unborn (a brand new repository with no commits), or the two histories share no
-    /// common ancestor.
+    /// No meaningful base *branch* to diff against - either this worktree's own branch *is*
+    /// the detected default branch (`branch: Some(name)`), or none could be detected, or the
+    /// two histories share no common ancestor (`branch: None` for either of those). `HEAD` is
+    /// still a real, born commit though, so `uncommitted` is a genuine `git diff HEAD` (staged
+    /// and unstaged local edits) rather than a fabricated "nothing to show" - see GitHub issue
+    /// #108: a worktree on its default branch (or with no detectable base) still deserves to
+    /// show real, reviewable changes if it has any.
+    NoBase {
+        branch: Option<String>,
+        uncommitted: WorktreeDiff,
+    },
+    /// Truly nothing to diff, even uncommitted changes: `HEAD` itself is unborn (a brand new
+    /// repository with no commits yet), so there is no commit to diff the working tree against.
     NoBaseFound,
+}
+
+impl DiffBase {
+    /// The real diff content this outcome carries, if any - `Some` for both [`DiffBase::Diff`]
+    /// (a real base branch) and [`DiffBase::NoBase`] (no real base branch, but real uncommitted
+    /// changes against `HEAD` instead), `None` only for [`DiffBase::NoBaseFound`]. Every
+    /// consumer that wants to *show* a diff regardless of why - the Changes sidebar, tab diff
+    /// stats, the rail's per-worktree summary - should read through this rather than matching
+    /// `Diff` alone, or it would silently drop GitHub issue #108's fallback.
+    pub fn diff(&self) -> Option<&WorktreeDiff> {
+        match self {
+            DiffBase::Diff(diff)
+            | DiffBase::NoBase {
+                uncommitted: diff, ..
+            } => Some(diff),
+            DiffBase::NoBaseFound => None,
+        }
+    }
 }
 
 /// Compute the real diff of the worktree at `worktree_path` against its base, per this
@@ -180,37 +207,68 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
 
     let Some(worktree_head_id) = worktree_head_id else {
         // Unborn HEAD: a freshly initialized repository with no commits yet has nothing to
-        // diff against any base.
+        // diff against any base - not even its own uncommitted changes, since there is no
+        // commit to diff the working tree against.
         return Ok(DiffBase::NoBaseFound);
     };
+    let worktree_head_sha = worktree_head_id.detach().to_string();
 
     let Some((base_branch, base_commit_id)) = detect_default_base(&repo)? else {
-        return Ok(DiffBase::NoBaseFound);
+        let uncommitted = compute_diff(
+            worktree_path,
+            &worktree_head_sha,
+            worktree_branch.unwrap_or_default(),
+        )?;
+        return Ok(DiffBase::NoBase {
+            branch: None,
+            uncommitted,
+        });
     };
 
     if worktree_branch.as_deref() == Some(base_branch.as_str()) {
-        return Ok(DiffBase::OnDefaultBranch {
-            branch: base_branch,
+        let uncommitted = compute_diff(worktree_path, &worktree_head_sha, base_branch.clone())?;
+        return Ok(DiffBase::NoBase {
+            branch: Some(base_branch),
+            uncommitted,
         });
     }
 
     let merge_base_id = match repo.merge_base(worktree_head_id.detach(), base_commit_id) {
         Ok(id) => id.detach(),
         Err(gix::repository::merge_base::Error::NotFound { .. }) => {
-            return Ok(DiffBase::NoBaseFound);
+            // A real default branch exists, but shares no common ancestor with this worktree's
+            // history - still real uncommitted changes to show against `HEAD`, same as the
+            // on-default-branch case just above.
+            let uncommitted = compute_diff(worktree_path, &worktree_head_sha, base_branch.clone())?;
+            return Ok(DiffBase::NoBase {
+                branch: Some(base_branch),
+                uncommitted,
+            });
         }
         Err(source) => return Err(Error::MergeBase(Box::new(source))),
     };
 
-    let merge_base_sha = merge_base_id.to_string();
-    // Defensive: this is about to be handed to a spawned `git` process as an argument. It
-    // was just produced by `gix` as a real object id, but double-checking it's actually a
+    let diff = compute_diff(worktree_path, &merge_base_id.to_string(), base_branch)?;
+    Ok(DiffBase::Diff(diff))
+}
+
+/// Runs `git diff <commit_sha>` against the worktree's real working tree (see the module docs'
+/// "What the diff includes" section) and folds the result into a [`WorktreeDiff`]. `label_branch`
+/// is purely descriptive - the real base branch name for [`DiffBase::Diff`], or whatever branch
+/// name is available (possibly none) for the [`DiffBase::NoBase`] uncommitted-vs-`HEAD` fallback.
+fn compute_diff(
+    worktree_path: &Path,
+    commit_sha: &str,
+    label_branch: String,
+) -> Result<WorktreeDiff, Error> {
+    // Defensive: this is about to be handed to a spawned `git` process as an argument. Every
+    // caller just produced it from a real `gix` object id, but double-checking it's actually a
     // hex string (rather than something that could be misparsed as a flag) costs nothing and
     // means a future change to how it's derived can't silently turn into a git-argument
     // injection.
-    if merge_base_sha.is_empty() || !merge_base_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if commit_sha.is_empty() || !commit_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Error::WorktreeIo(std::io::Error::other(
-            "merge-base id was not a hex object id",
+            "commit id was not a hex object id",
         )));
     }
 
@@ -230,7 +288,7 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
         "--no-color".into(),
         "--no-ext-diff".into(),
         "-M".into(),
-        merge_base_sha.clone().into(),
+        commit_sha.into(),
     ];
     let (output, output_truncated) = capture_git_stdout(
         worktree_path,
@@ -241,12 +299,12 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
     let text = String::from_utf8_lossy(&output);
     let (files, files_truncated) = parse_git_diff(&text);
 
-    Ok(DiffBase::Diff(WorktreeDiff {
-        base_branch,
-        base_commit: merge_base_sha,
+    Ok(WorktreeDiff {
+        base_branch: label_branch,
+        base_commit: commit_sha.to_string(),
         files,
         truncated: output_truncated || files_truncated,
-    }))
+    })
 }
 
 /// Merge-state of a worktree's `HEAD` against the repository's detected default base branch
@@ -1004,15 +1062,49 @@ mod tests {
     }
 
     #[test]
-    fn on_default_branch_yields_no_base() {
+    fn on_default_branch_with_nothing_uncommitted_yields_an_empty_diff() {
         let repo = init_repo();
         let result = diff_against_base(repo.path()).expect("diff_against_base");
-        assert_eq!(
-            result,
-            DiffBase::OnDefaultBranch {
-                branch: "main".to_string()
-            }
+        let DiffBase::NoBase {
+            branch,
+            uncommitted,
+        } = result
+        else {
+            panic!("expected DiffBase::NoBase, got {result:?}");
+        };
+        assert_eq!(branch, Some("main".to_string()));
+        assert!(
+            uncommitted.files.is_empty(),
+            "a clean worktree really has nothing uncommitted to show"
         );
+    }
+
+    /// GitHub issue #108: a worktree left on its own default branch used to report
+    /// `DiffBase::OnDefaultBranch` unconditionally, hiding real uncommitted edits from the
+    /// Changes sidebar. `diff_against_base` must fall back to a real `git diff HEAD` instead.
+    #[test]
+    fn on_default_branch_with_real_uncommitted_changes_shows_them() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "hello\nedited on main\n").expect("write");
+        fs::write(repo.path().join("new.txt"), "brand new\n").expect("write");
+
+        let result = diff_against_base(repo.path()).expect("diff_against_base");
+        // `DiffBase::diff()` - the one accessor every real UI consumer should read through -
+        // must surface this the same way it surfaces a real `Diff`.
+        let via_diff_accessor = result.diff().cloned();
+
+        let DiffBase::NoBase {
+            branch,
+            uncommitted,
+        } = result
+        else {
+            panic!("expected DiffBase::NoBase, got {result:?}");
+        };
+        assert_eq!(branch, Some("main".to_string()));
+        let paths: Vec<&Path> = uncommitted.files.iter().map(|f| f.path.as_path()).collect();
+        assert!(paths.contains(&Path::new("file.txt")));
+        assert!(paths.contains(&Path::new("new.txt")));
+        assert_eq!(via_diff_accessor, Some(uncommitted));
     }
 
     #[test]
@@ -1529,10 +1621,12 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_histories_yield_no_base_found() {
+    fn unrelated_histories_yield_no_base_with_a_real_uncommitted_diff() {
         // Two branches in the same repo with genuinely no common ancestor (an orphan
         // branch) - `gix::Repository::merge_base` must report `NotFound`, which
-        // `diff_against_base` should surface as `NoBaseFound` rather than an `Err`.
+        // `diff_against_base` surfaces as `DiffBase::NoBase` (GitHub issue #108: real
+        // uncommitted changes are still worth showing, even with no comparable base branch)
+        // rather than an `Err` or a fabricated `NoBaseFound`.
         let repo = init_repo();
         git(repo.path(), &["checkout", "--orphan", "unrelated"]);
         git(repo.path(), &["rm", "-rf", "--cached", "."]);
@@ -1544,9 +1638,19 @@ mod tests {
         .expect("write");
         git(repo.path(), &["add", "other.txt"]);
         git(repo.path(), &["commit", "-m", "unrelated root commit"]);
+        fs::write(repo.path().join("other.txt"), "edited after commit\n").expect("write");
 
         let result = diff_against_base(repo.path()).expect("diff_against_base");
-        assert_eq!(result, DiffBase::NoBaseFound);
+        let DiffBase::NoBase {
+            branch,
+            uncommitted,
+        } = result
+        else {
+            panic!("expected DiffBase::NoBase, got {result:?}");
+        };
+        assert_eq!(branch, Some("main".to_string()));
+        assert_eq!(uncommitted.files.len(), 1);
+        assert_eq!(uncommitted.files[0].path, Path::new("other.txt"));
     }
 
     #[test]
