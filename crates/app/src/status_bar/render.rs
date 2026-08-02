@@ -37,7 +37,15 @@ impl AdeApp {
     /// divider · ...".
     fn render_status_bar_left(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mut segments: Vec<gpui::AnyElement> = Vec::new();
-        // Shown first, and only while genuinely set - the real, transient feedback from
+        // Shown first - persistent, actionable "a real update is available/ready" information
+        // (GitHub issue #87, `crate::updater`) outranks the worktree-history notice just below,
+        // which is only ever a one-off, self-clearing completion message. Renders nothing at all
+        // (`None`) unless there's genuinely something to say - see
+        // `crate::updater::render::AdeApp::render_status_update_notice`'s own docs.
+        if let Some(update_notice) = self.render_status_update_notice(cx) {
+            segments.push(update_notice);
+        }
+        // Shown next, and only while genuinely set - the real, transient feedback from
         // "keep all changes"/"discard worktree" (Revision R10). See this method's own docs for
         // why this lives here, in the status bar, rather than the rail footer's own status slot.
         if let Some(notice) = self.render_status_worktree_history_notice() {

@@ -84,6 +84,7 @@ use crate::status_bar::process_stats;
 use crate::text_history;
 use crate::theme;
 use crate::title_bar::menu as title_bar;
+use crate::updater;
 use crate::work_surface::agents::{AgentId, AgentKind, Agents};
 use crate::work_surface::state as work_surface;
 use crate::worktree_history::flow as worktree_history;
@@ -912,6 +913,18 @@ pub struct AdeApp {
     /// unrelated prune click could permanently hide every future worktree-history status for the
     /// rest of the agent).
     pub(crate) worktree_history_status: Option<String>,
+    /// Real GitHub-releases-backed update detection (GitHub issue #87, `crate::updater`) - the
+    /// single source of truth for the status bar's update chip
+    /// (`crate::updater::render::AdeApp::render_status_update_notice`) and every real
+    /// `self_update` background call's own effect on it (`crate::updater::flow`). `Idle` covers
+    /// "never checked", "genuinely up to date", and "the last *check* failed" alike - see
+    /// [`updater::state::UpdateState`]'s own docs for why those three collapse into one variant.
+    pub(crate) update_state: updater::state::UpdateState,
+    /// Guards [`Self::check_for_update`] against a second, racing check spawning while one is
+    /// already in flight (the periodic loop's own tick landing on top of a manual palette
+    /// click, or vice versa) - the same single-flag-per-feature discipline
+    /// [`Self::prune_in_flight`]/[`Self::worktree_history_op_in_flight`] already establish.
+    pub(crate) update_check_in_flight: bool,
     /// `Some(id)` after one click on agent `id`'s "Discard worktree" footer button, cleared by
     /// most other gestures in the meantime (mirroring [`Self::prune_confirm_armed`]'s own "most
     /// other gestures disarm it" discipline, applied everywhere that field is - see
@@ -1057,6 +1070,20 @@ pub struct AdeApp {
     /// [`Self::worktree_history_op_in_flight`] - see that field's own docs for why one slot
     /// shared across both is sufficient discipline here.
     pub(crate) _worktree_history_task: Option<Task<()>>,
+    /// The real startup-plus-periodic update-check loop
+    /// (`crate::updater::flow::AdeApp::start_update_check_loop`) - matches
+    /// [`Self::_worktree_watch_task`]'s own "must be kept alive for the real background work to
+    /// keep running" discipline. Deliberately *not* reassigned by an individual
+    /// `crate::updater::flow::AdeApp::check_for_update` call (including the ones this same loop
+    /// itself makes on every tick) - see that method's own docs for the real self-cancellation
+    /// hazard reserving this field to the loop alone avoids.
+    pub(crate) _update_check_task: Option<Task<()>>,
+    /// The single in-flight `crate::updater::flow::AdeApp::start_update_download` background
+    /// task - real download+extract+self-replace, guarded the same
+    /// single-flight-per-feature way [`Self::_worktree_history_task`] is (see that field's own
+    /// docs), keyed off [`Self::update_state`] itself rather than a separate bool, since
+    /// `Downloading` already is that "one is in flight" signal.
+    pub(crate) _update_download_task: Option<Task<()>>,
     pub(crate) _agent_rows_task: Option<Task<()>>,
     pub(crate) _merge_task: Option<Task<()>>,
     /// `Self::clear_merge_flow_for_closed_agent`'s best-effort abort - kept separate from

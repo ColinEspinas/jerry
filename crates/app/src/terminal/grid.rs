@@ -21,8 +21,9 @@
 //!   `screen_lines`/`columns` - see [`GridSize`].
 //! - `Term<T>` only requires `T: EventListener` for `renderable_content`/the `Handler` impl.
 //!   This pane polls the grid directly every tick (see `crate::terminal::pane`'s poll loop)
-//!   rather than reacting to events (title changes, bell, clipboard, ...), so
-//!   [`NoopEventListener`] just drops them.
+//!   rather than reacting to most events (title changes, bell, clipboard, ...), which
+//!   [`PtyWriteQueue`] does still drop. `Event::PtyWrite` is the one real exception - see that
+//!   type's own docs for why dropping it is a genuine correctness bug, not a scope cut.
 //! - Feeding bytes: `Processor::<StdSyncHandler>::advance(&mut self, handler: &mut H, bytes:
 //!   &[u8]) where H: Handler` (`vte-0.15.0/src/ansi.rs:298`); `Term<T: EventListener>`
 //!   implements `Handler`. `alacritty_terminal` re-exports its exact `vte` dependency as
@@ -79,13 +80,39 @@ impl Dimensions for GridSize {
     }
 }
 
-/// A no-op [`EventListener`] - see the module docs' API surface section for why dropping every
-/// event is deliberate here, not a stub for missing behavior.
-#[derive(Debug, Clone, Copy)]
-struct NoopEventListener;
+/// Captures [`AlacEvent::PtyWrite`] and drops every other [`AlacEvent`] (title changes, bell,
+/// clipboard, ...) - see the module docs' API surface section for why those others are a
+/// deliberate scope cut.
+///
+/// `PtyWrite` is different: `alacritty_terminal`'s own `Handler` impl for `Term` emits it
+/// whenever the VT parser sees a query the *terminal* (not the running program) is supposed to
+/// answer back into the pty's stdin - e.g. `ESC[6n` (Device Status Report / cursor position
+/// report), already correctly formatted as `ESC[<row>;<col>R` by `Term::device_status`
+/// (`term/mod.rs:1332`, verified against the pinned rev's real source per this module's own API
+/// surface docs). Dropping it (this type's predecessor, `NoopEventListener`, did) isn't just a
+/// missed nicety: on real Windows hardware, ConPTY sends exactly this query as part of its own
+/// startup handshake and blocks its *entire* output stream - the child process's own banner,
+/// prompt, everything - until it receives a real answer. A terminal that never answers doesn't
+/// just render `ESC[6n` oddly, it hangs the pty forever after that first, tiny query - confirmed
+/// live: a real Windows build spawned a real `cmd.exe`, the child process itself stayed alive
+/// and idle at its own prompt, and `pty-core`'s reader thread read exactly the 4-byte query and
+/// then never read another byte, because ConPTY was sitting there waiting on the CPR reply this
+/// listener used to throw away.
+///
+/// `Rc<RefCell<..>>`, not a channel: [`EventListener::send_event`] takes `&self`
+/// (`Term<T>` only ever holds a `T`, no `&mut` access once constructed), and this needs to be
+/// cheaply `Clone`d so [`TerminalGrid`] can hand `Term::new` its own copy while keeping one to
+/// drain from - a `Rc`'d interior-mutable buffer is the direct way to satisfy both without a
+/// background thread/channel this is far too small to warrant.
+#[derive(Debug, Clone, Default)]
+struct PtyWriteQueue(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
 
-impl EventListener for NoopEventListener {
-    fn send_event(&self, _event: AlacEvent) {}
+impl EventListener for PtyWriteQueue {
+    fn send_event(&self, event: AlacEvent) {
+        if let AlacEvent::PtyWrite(text) = event {
+            self.0.borrow_mut().extend_from_slice(text.as_bytes());
+        }
+    }
 }
 
 /// One rendered grid cell: a character plus the styling attributes this pane's renderer draws.
@@ -224,9 +251,12 @@ fn grid_cell_from_alacritty(cell: &AlacCell, is_cursor: bool) -> GridCell {
 /// `pty-core`, fed in through [`TerminalGrid::append_bytes`]) are parsed as real ANSI/VT100 and
 /// land in a real cursor-addressed grid.
 pub struct TerminalGrid {
-    term: Term<NoopEventListener>,
+    term: Term<PtyWriteQueue>,
     processor: Processor<StdSyncHandler>,
     size: GridSize,
+    /// The other half of the `Term`'s own [`PtyWriteQueue`] - see that type's docs for why this
+    /// is an `Rc`'d clone rather than reading straight off `term`.
+    pending_pty_writes: PtyWriteQueue,
     /// `true` once the backing process has exited; the grid stops changing after this but
     /// keeps whatever it last rendered, mirroring step 3's `TerminalBuffer::ended`.
     pub ended: bool,
@@ -238,19 +268,34 @@ impl TerminalGrid {
             rows: rows.max(1) as usize,
             cols: cols.max(1) as usize,
         };
-        let term = Term::new(Config::default(), &size, NoopEventListener);
+        let pending_pty_writes = PtyWriteQueue::default();
+        let term = Term::new(Config::default(), &size, pending_pty_writes.clone());
         Self {
             term,
             processor: Processor::new(),
             size,
+            pending_pty_writes,
             ended: false,
         }
     }
 
     /// Feeds a chunk of raw pty bytes into the VT100 parser (`Processor::advance`), which
-    /// drives the real `Term` grid state (cursor movement, SGR colors, screen clears, etc.).
+    /// drives the real `Term` grid state (cursor movement, SGR colors, screen clears, etc.) and
+    /// may also queue bytes into [`Self::pending_pty_writes`] for [`Self::take_pending_pty_writes`]
+    /// to hand back to the pty - see [`PtyWriteQueue`]'s own docs.
     pub fn append_bytes(&mut self, bytes: &[u8]) {
         self.processor.advance(&mut self.term, bytes);
+    }
+
+    /// Drains and returns any bytes the VT parser generated in response to a terminal query
+    /// (e.g. a cursor position report for `ESC[6n`) during the most recent [`Self::append_bytes`]
+    /// call(s) - the caller (`crate::terminal::pane`'s poll loop) is responsible for actually
+    /// writing these back to the pty's stdin via `PtySession::write_input`. Empty on every call
+    /// that didn't just process a query-generating sequence, which is the overwhelmingly common
+    /// case - a plain `Vec` (not an `Option`) so the caller can check emptiness without an extra
+    /// match arm.
+    pub fn take_pending_pty_writes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut *self.pending_pty_writes.0.borrow_mut())
     }
 
     /// Resizes the grid to match a new pty size. Must be called alongside `PtySession::resize`
@@ -329,6 +374,45 @@ mod tests {
         let rows = grid.visible_rows();
         assert_eq!(rows.len(), 5);
         assert!(row_text(&rows[0]).starts_with("hello"));
+    }
+
+    /// [`PtyWriteQueue`]'s real regression coverage: a Device Status Report query (`ESC[6n`,
+    /// "where's the cursor?") must produce a real, correctly formatted `ESC[<row>;<col>R` reply
+    /// queued for the pty - not silently dropped, which is exactly what real Windows ConPTY
+    /// hangs on during its own startup handshake (see [`PtyWriteQueue`]'s own docs for the live
+    /// Windows repro this fixes). Uses `\x1b[3;5H` first (the same cursor-positioning sequence
+    /// [`cursor_positioning_places_text_at_the_addressed_cell`] already proves lands the cursor
+    /// correctly) so the expected reply has a real, non-default row/col to check against - a
+    /// query answered from the default `1;1` cursor position wouldn't tell a wrong-position bug
+    /// apart from a right one.
+    #[test]
+    fn a_cursor_position_query_is_queued_as_a_real_reply_not_dropped() {
+        let mut grid = TerminalGrid::new(5, 20);
+        assert!(
+            grid.take_pending_pty_writes().is_empty(),
+            "sanity check: nothing queued before any query was ever sent"
+        );
+
+        grid.append_bytes(b"\x1b[3;5H");
+        assert!(
+            grid.take_pending_pty_writes().is_empty(),
+            "sanity check: moving the cursor alone must not itself queue a reply"
+        );
+
+        grid.append_bytes(b"\x1b[6n");
+        let reply = grid.take_pending_pty_writes();
+        assert_eq!(
+            reply, b"\x1b[3;5R",
+            "a real cursor position report for row 3, col 5 must be queued, matching what \
+             alacritty_terminal's own Term::device_status formats - not dropped, and not some \
+             other row/col"
+        );
+
+        assert!(
+            grid.take_pending_pty_writes().is_empty(),
+            "the queue must be genuinely drained by the previous take_pending_pty_writes call, \
+             not left with the same reply queued forever"
+        );
     }
 
     /// The key proof that this is real cursor-addressed grid emulation rather than a plain-text

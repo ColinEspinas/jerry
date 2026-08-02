@@ -258,6 +258,7 @@ impl AdeApp {
                 self.set_window_controls_style(WindowControlsStyle::WindowsLinuxStyle, cx);
             }
             palette::PaletteCommand::OpenGitGraph => self.open_git_graph(window, cx),
+            palette::PaletteCommand::CheckForUpdates => self.check_for_update(cx),
         }
     }
 

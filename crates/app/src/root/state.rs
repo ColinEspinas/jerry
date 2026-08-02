@@ -250,6 +250,8 @@ impl AdeApp {
             prune_in_flight: false,
             worktree_history_op_in_flight: None,
             worktree_history_status: None,
+            update_state: updater::state::UpdateState::Idle,
+            update_check_in_flight: false,
             discard_confirm_armed: None,
             settings_open: false,
             settings_nav_scroll_handle: gpui::ScrollHandle::new(),
@@ -286,6 +288,8 @@ impl AdeApp {
             _disk_usage_task: None,
             _prune_task: None,
             _worktree_history_task: None,
+            _update_check_task: None,
+            _update_download_task: None,
             _agent_rows_task: None,
             _merge_task: None,
             _merge_cleanup_task: None,
@@ -429,6 +433,10 @@ impl AdeApp {
         this.load_diff(repo_path, cx);
         this.start_status_polling(cx);
         this.start_worktree_watch(cx);
+        // GitHub issue #87: a real startup check, plus the periodic loop that keeps re-checking
+        // for as long as the app runs - see `crate::updater::flow::AdeApp::
+        // start_update_check_loop`'s own docs.
+        this.start_update_check_loop(cx);
         this
     }
 
