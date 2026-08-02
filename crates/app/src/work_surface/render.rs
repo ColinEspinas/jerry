@@ -377,6 +377,16 @@ impl AdeApp {
     /// [`Self::current_worktree_is_bare`], which itself goes through
     /// [`Self::current_worktree_agents`] -> this function; calling back into it here would
     /// recurse.
+    ///
+    /// One exception, a real bug this revision fixes (GitHub issue #100): [`Self::open_change`]
+    /// itself is always kept in the reconciled list even while bare. Nothing gates opening a
+    /// *file* on the worktree having a real agent - the Files tree stays clickable regardless -
+    /// so without this, clicking a file in an already-bare worktree made it the real, on-screen
+    /// centre-pane content ([`Self::render_center_pane`] reads `open_change` directly, with no
+    /// bareness check of its own) while this function's blanket suppression still hid every file
+    /// tab, including the one whose content was genuinely on screen. Every *other* file - one
+    /// that was open before the worktree went bare, or the shell's own scrollback - still hides
+    /// exactly as documented above.
     pub(crate) fn combined_tab_order(&self) -> Vec<work_surface::TabRef> {
         let cwd = self.active_agent_cwd();
         // A worktree `Self::tab_order` hasn't been touched for yet *this session* falls back to
@@ -406,7 +416,18 @@ impl AdeApp {
         let is_bare = !agents_for_cwd
             .iter()
             .any(|agent| agent.kind != AgentKind::Shell);
-        let open_files: &[PathBuf] = if is_bare { &[] } else { self.open_files() };
+        let bare_open_change_only;
+        let open_files: &[PathBuf] = if is_bare {
+            // GitHub issue #100: the Files tree stays clickable regardless of bareness, so
+            // `Self::open_change` can point at a file that has never been anything but bare -
+            // `Self::render_center_pane` will show it as real, on-screen content either way. The
+            // one open file that's actually visible right now must never be tab-less, even
+            // though every *other* file tab still hides per this function's own docs above.
+            bare_open_change_only = self.open_change.clone().into_iter().collect::<Vec<_>>();
+            &bare_open_change_only
+        } else {
+            self.open_files()
+        };
         work_surface::reconcile_tab_order(stored, &agent_ids, open_files, self.graph_tab_open)
     }
 
@@ -3753,6 +3774,60 @@ mod tab_scoping_tests {
                 .any(|tab_ref| matches!(tab_ref, work_surface::TabRef::File(path) if path == &PathBuf::from("README.md"))),
             "the file tab must reappear once the worktree is no longer bare - its state was \
              preserved, not destroyed, while suppressed"
+        );
+    }
+
+    /// GitHub issue #100: opening a file via the real `Self::open_file_view` entry point (the
+    /// Files tree row click handler - it never checks bareness, so a bare worktree's tree stays
+    /// fully clickable) while the worktree was *already* bare, with no prior real agent, must
+    /// still produce a real tab for it - not just real on-screen content
+    /// (`Self::render_center_pane` reads `Self::open_change` directly, with no bareness check of
+    /// its own) with nothing selected in the strip. This is the one exception to
+    /// `a_bare_worktrees_tab_strip_shows_only_its_shell_tab_and_preserves_file_tab_state`'s own
+    /// blanket suppression, and that test's own `open_files_mut().push(..)` (bypassing
+    /// `open_change`) is why it never caught this - the real open path always sets both.
+    #[gpui::test]
+    fn opening_a_file_in_an_already_bare_worktree_still_gets_a_real_tab(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_a = tempfile::tempdir().expect("tempdir a");
+        std::fs::write(wt_a.path().join("README.md"), "hello\n").expect("write README.md");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            app.agents.spawn(
+                AgentKind::Shell,
+                wt_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.current_worktree_is_bare()),
+            "premise: only a default Shell tab exists - no real agent has ever run here"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(wt_a.path().join("README.md"), window, cx);
+        });
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(PathBuf::from("README.md")),
+            "premise: the file really is open and active, exactly like `render_center_pane` \
+             would render it - a bare worktree's file tree stays fully clickable"
+        );
+        let order = app.read_with(cx, |app, _| app.combined_tab_order());
+        assert!(
+            order
+                .iter()
+                .any(|tab_ref| matches!(tab_ref, work_surface::TabRef::File(path) if path == &PathBuf::from("README.md"))),
+            "the file that is genuinely on screen right now must have a real tab, even while \
+             the worktree is bare - the pre-fix bug left it with none at all"
         );
     }
 }
