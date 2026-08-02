@@ -309,15 +309,24 @@ impl FoldState {
     /// `owned` is the set of [`worktree_key`]s this instance has recorded anything for. Keys in
     /// `owned` are taken from `self` (including *absence* - that's how "collapse all" deletes an
     /// entry); every other key on disk is passed through untouched.
+    ///
+    /// GitHub issue #90: wrapped in `crate::persisted_state_lock::with_locked_merge` - "New
+    /// Window" made this load-merge-save cycle reachable *concurrently within one process*, not
+    /// just across two separate `jerry` processes (which the `owned`-scoped merge above already
+    /// handled) - see that module's own docs for the real race two truly concurrent callers could
+    /// otherwise hit, and why one process-wide lock, shared with `crate::rail::repo::RepoState`/
+    /// `crate::work_surface::tab_order_state::TabOrderState`'s own identical methods, is enough.
     pub fn save_merged_at(&self, path: &Path, owned: &BTreeSet<String>) -> io::Result<()> {
-        let mut merged = FoldState::load_at(path);
-        for key in owned {
-            match self.worktrees.get(key) {
-                Some(entry) => merged.worktrees.insert(key.clone(), entry.clone()),
-                None => merged.worktrees.remove(key),
-            };
-        }
-        merged.save_at(path)
+        crate::persisted_state_lock::with_locked_merge(|| {
+            let mut merged = FoldState::load_at(path);
+            for key in owned {
+                match self.worktrees.get(key) {
+                    Some(entry) => merged.worktrees.insert(key.clone(), entry.clone()),
+                    None => merged.worktrees.remove(key),
+                };
+            }
+            merged.save_at(path)
+        })
     }
 
     /// Every directory currently recorded as expanded for `root`, as absolute paths ready to be

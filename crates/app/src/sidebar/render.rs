@@ -3109,7 +3109,14 @@ mod fold_state_tests {
         settings: settings_store::Settings,
     ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
         cx.add_window_view(|window, cx| {
-            AdeApp::new_with_settings(repo_path, settings, Some(settings_path), window, cx)
+            AdeApp::new_with_settings(
+                Some(repo_path),
+                true,
+                settings,
+                Some(settings_path),
+                window,
+                cx,
+            )
         })
     }
 

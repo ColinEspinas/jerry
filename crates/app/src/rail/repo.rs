@@ -123,6 +123,14 @@ pub fn repo_key(path: &Path) -> Option<String> {
 #[serde(default)]
 pub struct RepoState {
     pub repos: BTreeMap<String, RepoRecord>,
+    /// GitHub issue #90's "remembers the last-opened folder" - the [`repo_key`] of whichever
+    /// repo [`crate::root::AdeApp::focus_repo`] most recently focused, so a fresh launch with no
+    /// CLI argument can reopen it automatically. `None` for a user who has never focused a repo
+    /// at all (or an on-disk file predating this field - `#[serde(default)]` on the struct
+    /// covers that the same way every other field here already does). Deliberately a bare key,
+    /// not a `PathBuf`: it is only ever compared against [`Self::repos`]' own keys
+    /// ([`Self::last_focused_existing_path`]), never read as a path directly.
+    pub last_focused: Option<String>,
 }
 
 /// One repo's persisted record - just its display name today. The map key (a [`repo_key`]) is
@@ -255,14 +263,63 @@ impl RepoState {
         path: &Path,
         owned: &std::collections::BTreeSet<String>,
     ) -> io::Result<()> {
-        let mut merged = RepoState::load_at(path);
-        for key in owned {
-            match self.repos.get(key) {
-                Some(entry) => merged.repos.insert(key.clone(), entry.clone()),
-                None => merged.repos.remove(key),
-            };
+        // GitHub issue #90: "New Window" made this file's own load-merge-save cycle reachable
+        // *concurrently within one process* for the first time - two independent `AdeApp`
+        // instances, each with its own async writer loop (`crate::root::AdeApp::
+        // persist_repo_state`), can now both be mid-`save_merged_at` against the exact same real
+        // `repos.toml` at once. The `owned`-scoped merge below already protects against two
+        // separate *processes* stomping each other's keys (see this method's own docs above), but
+        // that protection assumes each `load_at` genuinely observes the other's already-completed
+        // write - which two truly concurrent calls do not guarantee: both could `load_at` the same
+        // pre-write state, merge their own `owned` keys into their own independent copy, and then
+        // whichever `save_at` lands second would silently overwrite the first's freshly-written
+        // keys with its own now-stale copy of everything else. `persisted_state_lock::
+        // with_locked_merge` closes that window - see its own module docs for why one shared,
+        // process-wide (not per-path) lock is enough, and why `crate::sidebar::fold_state`/
+        // `crate::work_surface::tab_order_state`'s own `save_merged_at` methods share the exact
+        // same lock rather than each rolling an independent copy.
+        crate::persisted_state_lock::with_locked_merge(|| {
+            let mut merged = RepoState::load_at(path);
+            for key in owned {
+                match self.repos.get(key) {
+                    Some(entry) => merged.repos.insert(key.clone(), entry.clone()),
+                    None => merged.repos.remove(key),
+                };
+            }
+            // `last_focused` is a single global value, not per-repo, so it doesn't fit the
+            // per-key `owned` merge loop above - `self.last_focused` (this process's own current
+            // idea of "which repo did I last focus") always wins over whatever another process
+            // last wrote, the same last-writer-wins tradeoff this file's own multi-instance design
+            // already accepts for everything else it persists. Only overwritten when `self`
+            // genuinely has an opinion: `Self::repo_state_snapshot`'s only real caller derives
+            // this from a live `AdeApp::focused_repo()`, which is `None` only when `Self::repos`
+            // is itself empty - a state `persist_repo_state`'s own callers (`add_repo`/
+            // `focus_repo`) never reach, but guarded here anyway rather than let some future
+            // caller silently blank out a real remembered repo another process just wrote.
+            if self.last_focused.is_some() {
+                merged.last_focused = self.last_focused.clone();
+            }
+            merged.save_at(path)
+        })
+    }
+
+    /// GitHub issue #90's own real "still valid" check for [`Self::last_focused`]: `None` unless
+    /// it names a repo genuinely present in [`Self::repos`] *and* that repo's own path still
+    /// exists on disk right now. A remembered repo that was since deleted or moved must fall back
+    /// to a genuinely empty startup rather than a broken/error one - see
+    /// `crate::root::AdeApp::new_with_settings`'s own docs for how the caller uses this.
+    pub fn last_focused_existing_path(&self) -> Option<PathBuf> {
+        let key = self.last_focused.as_ref()?;
+        if !self.repos.contains_key(key) {
+            return None;
         }
-        merged.save_at(path)
+        let path = PathBuf::from(key);
+        // `is_dir`, not `exists` - an independent audit's real finding: a repo's own real
+        // checkout is a directory, so a real path that now names a plain file (replaced by hand,
+        // or by some other program, after this was last remembered) must fall back to empty the
+        // same way a fully deleted path already does, rather than being treated as "still a real
+        // repo" and failing downstream once something tries to actually read it as one.
+        path.is_dir().then_some(path)
     }
 }
 
@@ -421,6 +478,173 @@ mod tests {
         assert!(
             !RepoState::load_at(&path).repos.contains_key("/repo/a"),
             "removing a repo must survive the merge as a real deletion"
+        );
+    }
+
+    /// GitHub issue #90's own real "still valid" check - the four cases
+    /// [`RepoState::last_focused_existing_path`]'s own docs enumerate.
+    #[test]
+    fn last_focused_existing_path_is_none_when_nothing_was_ever_remembered() {
+        let state = RepoState::default();
+        assert_eq!(state.last_focused_existing_path(), None);
+    }
+
+    #[test]
+    fn last_focused_existing_path_is_none_when_the_key_is_not_a_known_repo() {
+        // `last_focused` names a key that was never actually added to `repos` (e.g. a hand-
+        // edited file, or a repo since removed) - must not resolve to a path anyway.
+        let state = RepoState {
+            last_focused: Some("/repo/never-added".to_string()),
+            ..RepoState::default()
+        };
+        assert_eq!(state.last_focused_existing_path(), None);
+    }
+
+    #[test]
+    fn last_focused_existing_path_is_none_when_the_remembered_directory_no_longer_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gone = dir.path().join("deleted-repo");
+        std::fs::create_dir(&gone).expect("mkdir");
+        let key = gone.to_str().expect("utf8 path").to_string();
+
+        let mut state = RepoState::default();
+        state.repos.insert(
+            key.clone(),
+            RepoRecord {
+                name: "deleted-repo".to_string(),
+            },
+        );
+        state.last_focused = Some(key);
+        // The directory is removed *after* being recorded - simulating a repo that was open,
+        // remembered, and has since been deleted or moved.
+        std::fs::remove_dir(&gone).expect("rmdir");
+
+        assert_eq!(
+            state.last_focused_existing_path(),
+            None,
+            "a deleted/moved remembered folder must fall back to empty, not a broken path"
+        );
+    }
+
+    /// The other real "no longer a usable repo" case an independent audit found this method
+    /// missing: the remembered path still `exists()` (so a plain `exists()` check would wrongly
+    /// accept it), but a real directory was replaced by a plain file - `is_dir()` is the real
+    /// check that must reject this, not merely "something is there".
+    #[test]
+    fn last_focused_existing_path_is_none_when_the_remembered_path_was_replaced_by_a_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let replaced = dir.path().join("was-a-repo");
+        std::fs::create_dir(&replaced).expect("mkdir");
+        let key = replaced.to_str().expect("utf8 path").to_string();
+
+        let mut state = RepoState::default();
+        state.repos.insert(
+            key.clone(),
+            RepoRecord {
+                name: "was-a-repo".to_string(),
+            },
+        );
+        state.last_focused = Some(key);
+
+        // The directory is removed and replaced with a plain file of the same name - the path
+        // still `exists()`, but is no longer a real, usable repo checkout.
+        std::fs::remove_dir(&replaced).expect("rmdir");
+        std::fs::write(&replaced, "not a repo").expect("write");
+        assert!(replaced.exists(), "sanity check: the path still exists");
+        assert!(
+            !replaced.is_dir(),
+            "sanity check: it is a file now, not a directory"
+        );
+
+        assert_eq!(
+            state.last_focused_existing_path(),
+            None,
+            "a remembered path replaced by a plain file must fall back to empty, not be treated \
+             as a still-usable repo"
+        );
+    }
+
+    #[test]
+    fn last_focused_existing_path_resolves_a_real_known_and_still_existing_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = dir.path().to_str().expect("utf8 path").to_string();
+
+        let mut state = RepoState::default();
+        state.repos.insert(
+            key.clone(),
+            RepoRecord {
+                name: "repo".to_string(),
+            },
+        );
+        state.last_focused = Some(key);
+
+        assert_eq!(
+            state.last_focused_existing_path(),
+            Some(dir.path().to_path_buf())
+        );
+    }
+
+    /// [`RepoState::save_merged_at`] must persist `last_focused` too, not just `repos` - the
+    /// real mechanism GitHub issue #90's "remembers the last-opened folder" needs.
+    #[test]
+    fn save_merged_at_persists_last_focused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("repos.toml");
+        let owned: std::collections::BTreeSet<String> =
+            ["/repo/a".to_string()].into_iter().collect();
+
+        let mut state = RepoState::default();
+        state.repos.insert(
+            "/repo/a".to_string(),
+            RepoRecord {
+                name: "a".to_string(),
+            },
+        );
+        state.last_focused = Some("/repo/a".to_string());
+        state.save_merged_at(&path, &owned).expect("save");
+
+        let reloaded = RepoState::load_at(&path);
+        assert_eq!(reloaded.last_focused, Some("/repo/a".to_string()));
+    }
+
+    /// `last_focused` is a real, single global value - a later save from the same instance with
+    /// a genuine new focus must overwrite whatever the previous save left, even across two
+    /// separate `save_merged_at` calls simulating two real `AdeApp::focus_repo` calls.
+    #[test]
+    fn save_merged_at_overwrites_a_previous_last_focused_with_a_newer_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("repos.toml");
+        let owned: std::collections::BTreeSet<String> =
+            ["/repo/a".to_string(), "/repo/b".to_string()]
+                .into_iter()
+                .collect();
+
+        let mut state = RepoState::default();
+        state.repos.insert(
+            "/repo/a".to_string(),
+            RepoRecord {
+                name: "a".to_string(),
+            },
+        );
+        state.repos.insert(
+            "/repo/b".to_string(),
+            RepoRecord {
+                name: "b".to_string(),
+            },
+        );
+        state.last_focused = Some("/repo/a".to_string());
+        state.save_merged_at(&path, &owned).expect("save a focused");
+        assert_eq!(
+            RepoState::load_at(&path).last_focused,
+            Some("/repo/a".to_string())
+        );
+
+        state.last_focused = Some("/repo/b".to_string());
+        state.save_merged_at(&path, &owned).expect("save b focused");
+        assert_eq!(
+            RepoState::load_at(&path).last_focused,
+            Some("/repo/b".to_string()),
+            "focusing repo B afterwards must really overwrite the previously persisted repo A"
         );
     }
 }

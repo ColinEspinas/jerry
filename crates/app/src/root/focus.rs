@@ -199,7 +199,8 @@ pub(crate) mod palette_focus_tests {
     ) -> (Entity<AdeApp>, &mut gpui::VisualTestContext) {
         cx.add_window_view(|window, cx| {
             AdeApp::new_with_settings(
-                repo_path,
+                Some(repo_path),
+                true,
                 settings_store::Settings::default(),
                 None,
                 window,

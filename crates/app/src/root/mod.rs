@@ -851,6 +851,12 @@ pub struct AdeApp {
     /// focusing *it* keeps the focused `FocusId` genuinely findable in the next rendered frame -
     /// the actual invariant the fallback exists to protect - without claiming to be a text widget.
     pub(crate) rail_focus_handle: FocusHandle,
+    /// GitHub issue #90's empty-state view's own focus target (`Self::render_empty_state`) - the
+    /// same "focus something real rather than leave `Window::focus == None`" discipline
+    /// [`Self::rail_focus_handle`]'s own docs give, applied to a window with no repo focused at
+    /// all, where the rail (and everything else `render_workspace_body` renders) isn't part of
+    /// the tree in the first place.
+    pub(crate) empty_state_focus_handle: FocusHandle,
     /// Real `+N -M`/has-changes totals per worktree or agent cwd, refreshed by the
     /// periodic background task started in `Self::new` - see `crate::rail::state::
     /// compute_status_snapshot`'s docs. Read (never written outside that task's completion
@@ -1460,6 +1466,11 @@ pub struct AdeApp {
     /// (`Self::start_choose_icon_pack_folder`) - a single slot, matching
     /// [`Self::_custom_theme_import_task`]'s own one-dialog-at-a-time reasoning.
     pub(crate) _icon_pack_choose_task: Option<Task<()>>,
+    /// The in-flight "Open Folder…" real native directory-picker task (GitHub issue #90,
+    /// `Self::start_choose_repo_folder`, wired to the File menu's own row -
+    /// `crate::title_bar::menu::AdeApp::file_menu_rows`) - a single slot, matching
+    /// [`Self::_icon_pack_choose_task`]'s own one-dialog-at-a-time reasoning.
+    pub(crate) _repo_folder_choose_task: Option<Task<()>>,
 }
 
 impl AdeApp {
@@ -1675,16 +1686,23 @@ impl AdeApp {
             .and_then(|id| self.repos.iter().find(|repo| repo.id == id))
     }
 
-    /// [`Self::focused_repo`]'s path, falling back to [`Self::repos`]' first entry (defensive,
-    /// should [`Self::focused_repo`] ever point at an id no longer in the list) and finally to an
-    /// empty path when [`Self::repos`] itself is empty - not reachable today (every real startup
-    /// path, [`Self::new_with_settings`], always adds and focuses one repo first, and this phase
-    /// has no way to remove one afterward), but an honest fallback rather than a panic if that
-    /// ever changes.
+    /// [`Self::focused_repo`]'s path, or an empty [`PathBuf`] when nothing is focused at all
+    /// (GitHub issue #90's genuinely empty window, or a stale [`Self::focused_repo`] id no longer
+    /// in [`Self::repos`] - defensive, not reachable through any real mutator today).
+    ///
+    /// Deliberately **not** `self.repos.first()` - an independent audit found this exact fallback
+    /// was a real, reachable bug: [`Self::repos`] is populated from the *whole* persisted
+    /// `repos.toml` (every repo this user has ever opened, in any window), not just the one this
+    /// window has focused, so falling back to its first entry could silently resolve to a
+    /// completely different, unopened repo's real path - and every real repo-scoped operation
+    /// this app has (spawning an agent, committing, discarding a worktree) reads its target
+    /// through this method or [`Self::active_agent_cwd`]. Every call site that can run with no
+    /// repo focused must check [`Self::focused_repo`]/[`Self::focused_repo_path`]'s emptiness
+    /// itself instead - see [`crate::work_surface::render::AdeApp::new_agent`]'s own docs for the
+    /// concrete exploit this was found through and the real guard that closes it.
     pub(crate) fn focused_repo_path(&self) -> PathBuf {
         self.focused_repo()
             .map(|repo| repo.path.clone())
-            .or_else(|| self.repos.first().map(|repo| repo.path.clone()))
             .unwrap_or_default()
     }
 
@@ -1730,10 +1748,147 @@ impl AdeApp {
     /// which *repo* is focused doesn't yet reload anything (the file tree/diff/agents are still
     /// single-repo-scoped fields this phase doesn't rewire - see [`Self::worktrees`]'s own docs),
     /// so there is nothing to kick off here beyond the assignment itself.
-    pub(crate) fn focus_repo(&mut self, id: RepoId) {
+    ///
+    /// GitHub issue #90: also persists this as [`repo::RepoState::last_focused`] (via
+    /// [`Self::persist_repo_state`], the same real writer [`Self::add_repo`] already calls) - "the
+    /// app remembers the last-opened folder and reopens it automatically next launch" needs every
+    /// real focus change recorded, not just the one a fresh repo's own `add_repo` call happens to
+    /// trigger. A no-op call (unknown `id`) persists nothing new, since [`Self::focused_repo`]
+    /// never actually changed.
+    pub(crate) fn focus_repo(&mut self, id: RepoId, cx: &mut Context<Self>) {
         if self.repos.iter().any(|repo| repo.id == id) {
             self.focused_repo = Some(id);
+            self.persist_repo_state(cx);
         }
+    }
+
+    /// GitHub issue #90's "Open Folder…" (`crate::title_bar::menu`'s File-menu row) and the
+    /// empty-state view's own "Open Folder" button (`Self::render_empty_state`) both funnel
+    /// through here: `path` becomes a real, focused repo in the *current* window, and every
+    /// single-repo-scoped piece of state this app still has is reset/reloaded against it via
+    /// [`Self::reset_repo_scoped_state`] (the exact same reset [`Self::select_worktree`] applies
+    /// on every worktree switch, extracted so this real "switch to an entirely different repo"
+    /// gesture can share it rather than reimplementing a partial copy) - unlike plain
+    /// [`Self::add_repo`] + [`Self::focus_repo`] alone, which (per their own docs) don't reload
+    /// anything, since until now the only place that combination ran was startup, where the
+    /// caller went on to do the reload itself right afterwards ([`Self::new_with_settings`]).
+    ///
+    /// An independent audit of this method's first version found (and this now fixes) three real
+    /// gaps beyond the incomplete state reset above:
+    /// - it never (re)started [`Self::start_worktree_watch`]/[`Self::start_status_polling`] - a
+    ///   window that starts empty and only later opens a folder never got rail status polling at
+    ///   all, and a window switching from repo A to repo B kept its watcher bound to A's path.
+    ///   Both are safe to call unconditionally here: assigning a fresh `Task`/watcher to their own
+    ///   field drops (and so cancels) whatever was previously running there, so this can never
+    ///   leave two loops running at once.
+    /// - a genuinely empty window's Settings/palette overlay may have captured
+    ///   [`Self::empty_state_focus_handle`] as its own "return focus to" target
+    ///   ([`OverlayFocus::capture`]) - once a real repo is focused, [`Self::render_empty_state`]
+    ///   stops being part of the rendered tree at all, so restoring focus to it later would
+    ///   silently dangle every global keybinding. [`OverlayFocus::forget_target`] is this
+    ///   project's own established fix for exactly this class of bug (see its own docs).
+    /// - every agent open before this call belonged to whatever repo (or the empty state) was
+    ///   focused *before* it - this app's worktree list/tab-strip filtering is still single-
+    ///   repo-scoped (see [`Self::repos`]' own docs: nothing yet renders more than the focused
+    ///   repo's own worktrees), so once focus moves to `path` none of them can be reached through
+    ///   this window's UI ever again. A deliberate choice, not an accidental process leak: shut
+    ///   every one of them down cleanly via the same real PTY teardown [`Self::close_agent`]
+    ///   always uses, rather than leaving their processes running invisibly until the whole
+    ///   window closes. Skipped entirely when `path` resolves to the repo *already* focused (a
+    ///   plain re-affirmation, not a real switch) - closing and immediately not respawning that
+    ///   exact repo's own agents would be a real, surprising regression for that case.
+    ///
+    /// Idempotent against a repo already known to this window (re-opening an already-added repo
+    /// just re-focuses and reloads it, rather than duplicating anything) - the same
+    /// [`Self::add_repo`] guarantee this builds on. A repo with no agent open yet in its own root
+    /// (a genuinely new repo, or one added but never focused before - by construction, always the
+    /// case whenever `path` differs from what was focused before, now that stale agents are
+    /// closed above) gets one spawned here, the same "a fresh window starts with one shell in the
+    /// repo root" default [`Self::new_with_settings`] gives a CLI-launched repo.
+    pub(crate) fn open_repo_in_current_window(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previously_focused_id = self.focused_repo().map(|repo| repo.id);
+        let id = self.add_repo(path.clone(), cx);
+        let switching_repos = previously_focused_id != Some(id);
+        self.focus_repo(id, cx);
+
+        self.settings_focus
+            .forget_target(&self.empty_state_focus_handle);
+        self.palette_focus
+            .forget_target(&self.empty_state_focus_handle);
+
+        if switching_repos {
+            let stale_ids: Vec<AgentId> = self.agents.iter().map(|agent| agent.id).collect();
+            for stale_id in stale_ids {
+                self.close_agent(stale_id, window, cx);
+            }
+        }
+
+        if self.agents.iter_for_cwd(path.clone()).next().is_none() {
+            self.agents.spawn(
+                AgentKind::Shell,
+                path.clone(),
+                self.settings.appearance.terminal_font_size,
+                window,
+                cx,
+            );
+        }
+        self.agents.activate_for_worktree(&path, cx);
+        self.selected = None;
+        self.worktree_selection_notice = None;
+        self.reset_repo_scoped_state(path, window, cx);
+        self.load_worktrees(cx);
+        self.start_worktree_watch(cx);
+        self.start_status_polling(cx);
+    }
+
+    /// GitHub issue #90's real, native "Open Folder…" picker - `gpui::App::prompt_for_paths`
+    /// (`directories: true`), the identical real API `crate::settings::render::AdeApp::
+    /// start_choose_icon_pack_folder` already uses for the same reason (a native OS directory
+    /// dialog, not an in-app fake one). On a real chosen directory, hands it to
+    /// [`Self::open_repo_in_current_window`] - via `this.update_in`, not a plain `this.update`,
+    /// since that reload needs a real `&mut Window` (moving keyboard focus onto whatever agent
+    /// ends up active) that a background task resuming after this dialog's own `.await` doesn't
+    /// otherwise have.
+    pub(crate) fn start_choose_repo_folder(&mut self, cx: &mut Context<Self>) {
+        // Guards against a real, reachable re-entry bug an independent audit found: a second
+        // click (the File menu's own row, or the empty-state view's button) while a real native
+        // picker from the *first* click is still open would otherwise replace
+        // `_repo_folder_choose_task`, dropping (and so cancelling, per GPUI's "dropping a `Task`
+        // cancels it" semantics - `crate::work_surface::agents::Agents::spawn`'s own docs use the
+        // identical reasoning) the first click's still-pending picker task out from under the
+        // dialog the user is actually looking at. A no-op second click here is the honest fix -
+        // exactly one native "Open" dialog can be in flight from this app at a time. The spawned
+        // task below clears this same field back to `None` the instant the dialog resolves
+        // (whichever way), so this guard only ever blocks a real second click while one is
+        // genuinely still open - never every click after the first.
+        if self._repo_folder_choose_task.is_some() {
+            return;
+        }
+        let paths_receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open".into()),
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let result = paths_receiver.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this._repo_folder_choose_task = None;
+                let Ok(Ok(Some(mut paths))) = result else {
+                    return;
+                };
+                let Some(path) = paths.pop() else {
+                    return;
+                };
+                this.open_repo_in_current_window(path, window, cx);
+            });
+        });
+        self._repo_folder_choose_task = Some(task);
     }
 
     /// [`Self::repos`], reduced to the on-disk shape [`repo::RepoState::save_merged_at`] expects -
@@ -1752,6 +1907,12 @@ impl AdeApp {
                 );
             }
         }
+        // GitHub issue #90: the real "last opened folder" this instance currently believes -
+        // `None` only when nothing is focused at all (a genuinely empty window that has never
+        // opened a repo, e.g. from `crate::title_bar::menu`'s "New Window" row), which
+        // `RepoState::save_merged_at`'s own docs already explain is deliberately never persisted
+        // over another process's real remembered value.
+        state.last_focused = self.focused_repo().and_then(|r| repo::repo_key(&r.path));
         state
     }
 
@@ -1852,6 +2013,16 @@ impl Render for AdeApp {
             // `settings_open`.
             .child(if self.settings_open {
                 self.render_settings(cx).into_any_element()
+            } else if self.focused_repo().is_none() {
+                // GitHub issue #90: a genuinely empty window (no CLI argument, nothing ever
+                // persisted/remembered, or `crate::title_bar::menu`'s own "New Window" row) - see
+                // `Self::render_empty_state`'s own docs. Checked before `render_workspace_body`
+                // because that method (and everything it renders - the rail, tab strip, file
+                // tree) assumes a real focused repo throughout; this is deliberately *not*
+                // `self.repos.is_empty()`, since a "New Window" can genuinely have known-but-
+                // unfocused repos in that list (loaded from the same persisted `repos.toml`
+                // every window in this process shares) while still wanting its own empty view.
+                self.render_empty_state(cx).into_any_element()
             } else {
                 self.render_workspace_body(cx).into_any_element()
             })
@@ -2008,6 +2179,67 @@ impl AdeApp {
                     .child(self.render_resize_handle(ResizeTarget::Panel, cx)),
             )
     }
+
+    /// GitHub issue #90's genuinely empty state - rendered by [`Render::render`] in place of
+    /// [`Self::render_workspace_body`] whenever [`Self::focused_repo`] is `None`: a fresh launch
+    /// with no CLI argument and nothing ever persisted (or a remembered folder that no longer
+    /// exists), or a brand-new window opened via `crate::title_bar::menu`'s "New Window" row.
+    ///
+    /// Deliberately minimal - a centered message plus one real, working affordance - rather than
+    /// an inert placeholder: the "Open Folder…" button below calls the exact same
+    /// [`Self::start_choose_repo_folder`] real native-picker flow the File menu's own "Open
+    /// Folder…" row does (`crate::title_bar::menu::AdeApp::file_menu_rows`), so a user landing
+    /// here has a genuine way out of the empty state without needing to already know about the
+    /// title bar. The title bar and status bar stay real, unconditional siblings around this (see
+    /// [`Render::render`]'s own docs), so Settings/File-menu/Quit are all still reachable from
+    /// here exactly as they are from the normal workspace view.
+    ///
+    /// `track_focus`es [`Self::empty_state_focus_handle`] - the same "never leave `Window::focus`
+    /// dangling" reasoning [`Self::rail_focus_handle`]'s own docs give, applied to a window whose
+    /// rendered tree has no rail/tab-strip/file-tree at all to fall back onto instead.
+    fn render_empty_state(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("empty-state")
+            .track_focus(&self.empty_state_focus_handle)
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap(px(10.0))
+            .bg(theme::surface::WINDOW)
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(14.0))
+                    .text_color(theme::text::STRONG)
+                    .child("No folder open"),
+            )
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .text_size(px(11.0))
+                    .text_color(theme::text::DIM)
+                    .child("Open a folder to browse its files, worktrees, and agents."),
+            )
+            .child(
+                div().pt(px(6.0)).child(
+                    widgets::render_modal_button(
+                        "empty-state-open-folder",
+                        "Open Folder\u{2026}",
+                        false,
+                    )
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, _window, cx| {
+                            this.start_choose_repo_folder(cx);
+                        },
+                    )),
+                ),
+            )
+    }
 }
 
 /// The real "where to restore keyboard focus to once this overlay closes, and whether that
@@ -2143,7 +2375,8 @@ mod settings_persist_tests {
     ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
         cx.add_window_view(|window, cx| {
             AdeApp::new_with_settings(
-                repo_path,
+                Some(repo_path),
+                true,
                 settings_store::Settings::default(),
                 Some(settings_path),
                 window,
@@ -2304,7 +2537,8 @@ mod repo_list_tests {
     ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
         cx.add_window_view(|window, cx| {
             AdeApp::new_with_settings(
-                repo_path,
+                Some(repo_path),
+                true,
                 settings_store::Settings::default(),
                 Some(settings_path),
                 window,
@@ -2384,7 +2618,7 @@ mod repo_list_tests {
         let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
 
         let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
-        app.update(cx, |app, _cx| app.focus_repo(repo_b_id));
+        app.update(cx, |app, cx| app.focus_repo(repo_b_id, cx));
 
         app.read_with(cx, |app, _| {
             assert_eq!(app.focused_repo_path(), repo_b.path());
@@ -2400,7 +2634,7 @@ mod repo_list_tests {
         let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         let focused_before = app.read_with(cx, |app, _| app.focused_repo_path());
 
-        app.update(cx, |app, _cx| app.focus_repo(RepoId(u64::MAX)));
+        app.update(cx, |app, cx| app.focus_repo(RepoId(u64::MAX), cx));
 
         app.read_with(cx, |app, _| {
             assert_eq!(app.focused_repo_path(), focused_before);
@@ -2487,6 +2721,544 @@ mod repo_list_tests {
             "this instance's own save must not have erased the other instance's already-\
              persisted repo"
         );
+    }
+
+    /// GitHub issue #90: a window with no CLI argument (`repo_path: None`) that is allowed to
+    /// consult persisted state (`use_remembered_repo: true` - the real process-launch case) and
+    /// a fresh settings directory - nothing has ever been persisted - opens in a genuinely empty
+    /// state: no repo focused, and none of the single-repo-scoped startup work
+    /// (`Self::new_with_settings`'s own docs) ran at all.
+    #[gpui::test]
+    fn no_cli_arg_and_nothing_persisted_is_a_genuinely_empty_window(cx: &mut TestAppContext) {
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        let (app, _cx) = cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                None,
+                true,
+                settings_store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        });
+
+        app.read_with(_cx, |app, _| {
+            assert!(app.repos.is_empty(), "nothing was ever added or persisted");
+            assert_eq!(app.focused_repo(), None);
+            assert!(
+                app.agents.is_empty(),
+                "a genuinely empty window must not spawn an initial shell agent - there is no \
+                 repo root to spawn one into"
+            );
+        });
+    }
+
+    /// GitHub issue #90's own headline behaviour: focusing a repo (via [`AdeApp::focus_repo`])
+    /// persists it as [`RepoState::last_focused`], and a *second*, independently-constructed
+    /// `AdeApp` sharing the same real settings path, given `repo_path: None,
+    /// use_remembered_repo: true` (the real process-launch path with no CLI argument), reopens
+    /// that exact repo automatically - "the app remembers the last-opened folder and reopens it
+    /// automatically next launch".
+    #[gpui::test]
+    fn a_fresh_launch_with_no_cli_arg_reopens_the_remembered_last_focused_repo(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        // "Launch 1": a real CLI-argument launch against `repo`, which focuses (and so persists)
+        // it.
+        let (_first, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_path.clone(),
+        );
+        cx.run_until_parked();
+
+        // "Launch 2": an independent `AdeApp`, sharing the same real settings path, with no CLI
+        // argument at all.
+        let (second, cx) = cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                None,
+                true,
+                settings_store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        second.read_with(cx, |app, _| {
+            assert_eq!(
+                app.focused_repo_path(),
+                repo.path(),
+                "the second launch must have reopened the first launch's own remembered repo"
+            );
+            assert_eq!(app.repos.len(), 1);
+            assert!(
+                !app.agents.is_empty(),
+                "a real, reopened repo must get its usual initial shell agent, exactly like a \
+                 real CLI-argument launch does"
+            );
+        });
+    }
+
+    /// The other half of "remembers the last-opened folder": a remembered repo whose directory
+    /// has since been deleted or moved must fall back to a genuinely empty window, not a broken
+    /// or crashing one.
+    #[gpui::test]
+    fn a_remembered_repo_that_no_longer_exists_falls_back_to_a_genuinely_empty_window(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let repo_path = repo.path().to_path_buf();
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        let (_first, cx) =
+            open_test_app_with_real_settings_path(cx, repo_path.clone(), settings_path.clone());
+        cx.run_until_parked();
+
+        // The remembered repo's own directory is now gone.
+        drop(repo);
+        assert!(!repo_path.exists());
+
+        let (second, cx) = cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                None,
+                true,
+                settings_store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        second.read_with(cx, |app, _| {
+            assert_eq!(
+                app.focused_repo(),
+                None,
+                "a deleted/moved remembered repo must never be focused"
+            );
+            assert!(app.agents.is_empty());
+        });
+    }
+
+    /// GitHub issue #90's "New Window" semantics: `use_remembered_repo: false` (what
+    /// `crate::title_bar::menu`'s "New Window" row passes) must open a genuinely empty window
+    /// even when a real, still-existing last-focused repo *is* on record - unlike the real
+    /// process-launch path (`use_remembered_repo: true`, proven by
+    /// [`a_fresh_launch_with_no_cli_arg_reopens_the_remembered_last_focused_repo`] above), which
+    /// would reopen this exact repo.
+    #[gpui::test]
+    fn use_remembered_repo_false_stays_empty_even_with_a_real_remembered_repo(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        let (_first, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_path.clone(),
+        );
+        cx.run_until_parked();
+
+        let (second, cx) = cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                None,
+                false,
+                settings_store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        second.read_with(cx, |app, _| {
+            assert_eq!(
+                app.focused_repo(),
+                None,
+                "a 'New Window' must open empty regardless of what's remembered"
+            );
+            assert!(app.agents.is_empty());
+        });
+    }
+
+    /// [`AdeApp::open_repo_in_current_window`] - the shared real flow behind both the File menu's
+    /// "Open Folder…" row and the empty-state view's own button - genuinely focuses the chosen
+    /// repo in an already-running, previously-empty window and reloads its worktrees/file tree/
+    /// diff/initial agent, mirroring what a real CLI-argument launch does.
+    #[gpui::test]
+    fn open_repo_in_current_window_focuses_and_reloads_a_real_repo_from_empty(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo.path().join("a.txt"), "hello\n").expect("write");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                None,
+                true,
+                settings_store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.focused_repo(), None, "sanity check: starts empty");
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(repo.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.focused_repo_path(), repo.path());
+            assert!(
+                !app.agents.is_empty(),
+                "opening a folder must spawn a real initial shell agent for it"
+            );
+            assert!(
+                !app.file_tree.is_empty(),
+                "opening a folder must really load its file tree"
+            );
+        });
+    }
+
+    /// Critical fix (independent audit): `Self::open_repo_in_current_window` used to only reset
+    /// four fields (`staged_files`/`open_change`/`expanded_dirs`/`selected_tree_path`), leaving
+    /// every other per-repo UI control - a tree error banner, the commit composer popover, an
+    /// armed prune confirmation, and more - still armed against the *old* repo after switching to
+    /// a new one. `Self::reset_repo_scoped_state` (shared with `Self::select_worktree`) now
+    /// covers all of it; this proves a representative sample of the fields the original version
+    /// missed are really cleared by a real Open Folder switch, not just the original four.
+    #[gpui::test]
+    fn open_repo_in_current_window_clears_stale_ui_state_from_the_previous_repo(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = tempfile::tempdir().expect("tempdir");
+        let repo_b = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo_b.path().join("y.txt"), "b\n").expect("write");
+
+        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        // Arm several pieces of real per-repo UI state against repo A - the same kinds of state
+        // `Self::select_worktree` already resets on every worktree switch (GitHub issues #12/#19),
+        // which the original `open_repo_in_current_window` did not.
+        app.update(cx, |app, cx| {
+            app.tree_op_error = Some("stale tree error from repo A".to_string());
+            app.commit_menu_open = true;
+            app.prune_confirm_armed = true;
+            cx.notify();
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(repo_b.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.focused_repo_path(), repo_b.path());
+            assert_eq!(
+                app.tree_op_error, None,
+                "opening a different folder must clear a stale tree error from the old repo"
+            );
+            assert!(
+                !app.commit_menu_open,
+                "the old repo's commit composer popover must not stay open"
+            );
+            assert!(
+                !app.prune_confirm_armed,
+                "an armed prune confirmation from the old repo must not survive the switch"
+            );
+        });
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Critical fix (independent audit): the original `open_repo_in_current_window` never
+    /// (re)started the real status-polling loop or the worktree filesystem watcher - a window
+    /// that starts empty and only later opens a folder never got either at all. `repo` is a real
+    /// `git init`-ed directory, not a bare `tempfile::tempdir()`: `spawn_worktree_watcher` returns
+    /// `None` for a path that isn't inside a real git repository at all
+    /// (`wt_core::git_common_dir` failing), so a bare tempdir would make this test pass "by
+    /// accident" - `_worktree_watcher` would read `None` regardless of whether the real fix ever
+    /// ran, proving nothing about the watcher half of the fix.
+    #[gpui::test]
+    fn open_repo_in_current_window_starts_status_polling_and_worktree_watch(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                None,
+                true,
+                settings_store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        });
+        app.read_with(cx, |app, _| {
+            assert!(
+                app._status_poll_task.is_none(),
+                "sanity check: a genuinely empty window never starts real status polling"
+            );
+            assert!(
+                app._worktree_watch_task.is_none(),
+                "sanity check: a genuinely empty window never starts the real worktree watcher"
+            );
+            assert!(app._worktree_watcher.is_none());
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(repo.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app._status_poll_task.is_some(),
+                "opening a folder must start real status polling"
+            );
+            assert!(
+                app._worktree_watch_task.is_some(),
+                "opening a folder must start the real worktree watcher's own poll-fallback loop"
+            );
+            assert!(
+                app._worktree_watcher.is_some(),
+                "opening a real git repo must really start a real OS-level filesystem watcher \
+                 for it, not just the poll-fallback loop"
+            );
+        });
+    }
+
+    /// The other real half of Critical fix 2: a window switching from one real repo to another
+    /// must *rebind* the watcher to the new path, not leave it silently still watching the old
+    /// one. Proven by making the second repo a bare, non-git directory:
+    /// `spawn_worktree_watcher` can only ever return `None` for it
+    /// (`wt_core::git_common_dir` fails for a non-repository path) - so `_worktree_watcher`
+    /// reading `None` after the switch is genuine proof `Self::start_worktree_watch` really ran
+    /// again with repo B's own path, not proof of nothing (a stale watcher still pointed at repo
+    /// A - a real git repo - would have kept this field `Some`, silently masking the bug this
+    /// test exists to catch).
+    #[gpui::test]
+    fn open_repo_in_current_window_rebinds_the_worktree_watcher_to_the_new_repo(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = tempfile::tempdir().expect("tempdir");
+        git(repo_a.path(), &["init", "-b", "main"]);
+        let repo_b = tempfile::tempdir().expect("tempdir");
+
+        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                app._worktree_watcher.is_some(),
+                "sanity check: repo A is a real git repo, so startup should have gotten a real \
+                 watcher for it"
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(repo_b.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app._worktree_watcher.is_none(),
+                "switching to repo B (not a real git repository) must really rebind the watcher \
+                 to B's own path and get a real None back for it - a stale watcher left over \
+                 from repo A would still read Some here"
+            );
+        });
+    }
+
+    /// Critical fix (independent audit): switching folders used to leave the previous repo's real
+    /// agent processes running but permanently unreachable through this window's own UI (this
+    /// app's worktree list/tab strip are still single-repo-scoped - see `Self::repos`' own docs).
+    /// A deliberate choice, not an accidental leak: `Self::open_repo_in_current_window` now shuts
+    /// every one of them down cleanly via the same real PTY teardown `Self::close_agent` always
+    /// uses.
+    #[gpui::test]
+    fn open_repo_in_current_window_closes_the_previous_repos_agents(cx: &mut TestAppContext) {
+        let repo_a = tempfile::tempdir().expect("tempdir");
+        let repo_b = tempfile::tempdir().expect("tempdir");
+
+        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.agents.iter().count(),
+                1,
+                "sanity check: repo A's own initial shell agent"
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(repo_b.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.agents
+                    .iter()
+                    .filter(|agent| agent.cwd == repo_a.path())
+                    .count(),
+                0,
+                "repo A's own agent must have really been closed, not merely hidden from the UI"
+            );
+            assert_eq!(
+                app.agents.iter().count(),
+                1,
+                "repo B should have exactly its own fresh initial shell agent"
+            );
+        });
+    }
+
+    /// Critical fix (independent audit): a genuinely empty window's Settings overlay can capture
+    /// [`AdeApp::empty_state_focus_handle`] as its own "return focus to" target
+    /// ([`OverlayFocus::capture`]) - once a real repo is focused, `Self::render_empty_state` stops
+    /// being part of the rendered tree at all, so restoring focus there later would silently
+    /// dangle every global keybinding. `Self::open_repo_in_current_window` must forget that target
+    /// ([`OverlayFocus::forget_target`]) before Settings closes.
+    #[gpui::test]
+    fn open_repo_in_current_window_forgets_a_dangling_empty_state_focus_target(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                None,
+                true,
+                settings_store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        });
+
+        let empty_state_handle = app.read_with(cx, |app, _| app.empty_state_focus_handle.clone());
+        app.update_in(cx, |app, window, cx| {
+            window.focus(&empty_state_handle, cx);
+            app.open_settings(window, cx);
+        });
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(repo.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.close_settings(window, cx);
+        });
+        cx.run_until_parked();
+
+        let focused = app.update_in(cx, |_app, window, cx| window.focused(cx));
+        assert_ne!(
+            focused.as_ref(),
+            Some(&empty_state_handle),
+            "closing Settings must never restore focus onto the no-longer-rendered empty-state \
+             handle"
+        );
+    }
+
+    /// Critical fix (independent audit): a genuinely empty window has no real repo root to spawn
+    /// a new agent into - `Self::focused_repo_path`'s own `Self::repos.first()` fallback (removed)
+    /// used to let `Self::active_agent_cwd` silently resolve to some *other*, unopened repo's real
+    /// path, so `secondary-n`/`ctrl-shift-T`'s own handlers could spawn a real, invisible PTY
+    /// there. `Self::new_agent`/`Self::new_agent_pane` now refuse outright with no focused repo -
+    /// this proves both real entry points genuinely spawn nothing.
+    #[gpui::test]
+    fn new_agent_and_new_agent_pane_are_no_ops_with_no_focused_repo(cx: &mut TestAppContext) {
+        let other_repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        // A real *other* repo is known to this process (persisted from a previous focus) - the
+        // exact precondition the audit's concrete exploit needed (`Self::repos` non-empty while
+        // this window's own `Self::focused_repo` is `None`).
+        let repo_state_path = repo::repo_state_path_for(&settings_path);
+        let mut seed = RepoState::default();
+        let canonical = repo::repo_key(other_repo.path()).expect("repo key");
+        seed.repos.insert(
+            canonical,
+            crate::rail::repo::RepoRecord {
+                name: "other-repo".to_string(),
+            },
+        );
+        seed.save_at(&repo_state_path).expect("seed save");
+
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                None,
+                true,
+                settings_store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.focused_repo(), None, "sanity check: starts empty");
+            assert!(
+                !app.repos.is_empty(),
+                "sanity check: a real other repo is known, just not focused"
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.new_agent(AgentKind::Shell, window, cx);
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.handle_new_agent_pane_action(&NewAgentPane, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.agents.is_empty(),
+                "neither real entry point may spawn a PTY with no repo genuinely focused, even \
+                 with an unrelated real repo known to this process"
+            );
+        });
     }
 }
 

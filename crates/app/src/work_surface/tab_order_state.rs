@@ -206,15 +206,22 @@ impl TabOrderState {
     /// actually owns into whatever is currently on disk, then writes the result via
     /// [`Self::save_at`] - identical reasoning to
     /// `crate::sidebar::fold_state::FoldState::save_merged_at`.
+    ///
+    /// GitHub issue #90: wrapped in `crate::persisted_state_lock::with_locked_merge` - see that
+    /// module's own docs for the real intra-process concurrent-writer race "New Window" made
+    /// reachable here, and why one process-wide lock, shared with `crate::rail::repo::RepoState`/
+    /// `crate::sidebar::fold_state::FoldState`'s own identical methods, is enough to close it.
     pub fn save_merged_at(&self, path: &Path, owned: &BTreeSet<String>) -> io::Result<()> {
-        let mut merged = TabOrderState::load_at(path);
-        for key in owned {
-            match self.worktrees.get(key) {
-                Some(entry) => merged.worktrees.insert(key.clone(), entry.clone()),
-                None => merged.worktrees.remove(key),
-            };
-        }
-        merged.save_at(path)
+        crate::persisted_state_lock::with_locked_merge(|| {
+            let mut merged = TabOrderState::load_at(path);
+            for key in owned {
+                match self.worktrees.get(key) {
+                    Some(entry) => merged.worktrees.insert(key.clone(), entry.clone()),
+                    None => merged.worktrees.remove(key),
+                };
+            }
+            merged.save_at(path)
+        })
     }
 
     /// `root`'s real, currently-recorded file order, as absolute paths ready to feed into
