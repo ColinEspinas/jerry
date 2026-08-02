@@ -7113,3 +7113,84 @@ The independent audit that caught this also verified, exhaustively (not spot-che
 `cargo clippy --workspace --all-targets -- -D warnings` - all clean. `cargo test --workspace --lib
 --test-threads=1`: **1221 + 44 + 14 + 141 = 1420 passed, 0 failed** across all four crates (1 new
 test - `a_merge_commit_that_is_also_head_still_gets_the_merge_dot_kind`).
+
+## Fix: switching terminals from the rail with no file tab open never moved keyboard focus (GitHub issue #112)
+
+Live report: with several terminals open, switching between them from the rail eventually made
+them appear to "merge" into one - typed input seemed to go nowhere, or land on the wrong tab.
+
+`AdeApp::select_agent` (`crates/app/src/work_surface/render.rs`) only ever moved real
+`Window::focus` in two of its three reachable branches: when it deactivated an open file tab (via
+`restore_focus`), and when the clicked agent belonged to a *different* worktree (via
+`select_worktree`, which itself routes through `reset_repo_scoped_state`'s own
+`focus_newly_spawned_agent` call). Switching between two terminals already open in the *same*
+worktree with no file tab active - the ordinary case for a rail click - fell through to
+`cx.notify()` with no focus call at all. `render_center_pane` only mounts the newly active
+agent's `TerminalPane`, so `Window::focus` stayed pointed at the previous terminal's now-unmounted
+handle; GPUI's `focus_node_id_in_rendered_frame` then falls back to the window root once a
+handle isn't found in the rendered frame, which sits outside `TerminalPane`'s `"terminal"` key
+context - typed keys either went nowhere or fell through to normally-suppressed global bindings
+(e.g. Ctrl+W). This is the same "an active-agent switch forgot to move `Window::focus`" bug class
+already found and fixed for `Agents::spawn`/`close`/`archive_agent` (see this file's own history);
+`select_agent`'s same-worktree branch was the one path that had never been covered.
+
+Fixed by capturing whether a file tab was open (`had_open_file_tab`, before the branch that clears
+`Self::open_change`) and calling the existing `focus_newly_spawned_agent(window, cx)` helper - the
+same shared "move focus unless a file tab/Settings is showing" guard `reset_repo_scoped_state`
+already reuses for the cross-worktree case, despite its spawn-specific name - only when that flag
+is `false`. Deliberately not an unconditional call after the existing branches: `restore_focus`'s
+fallback for a *reselected* already-active agent (that had a file tab open) restores a more
+precise captured target than "the active agent's pane," and calling `focus_newly_spawned_agent`
+unconditionally would silently override that.
+
+New regression test `window_focus_follows_a_same_worktree_terminal_switch`
+(`work_surface::render::tab_scoping_tests`) spawns two shell agents in one worktree and asserts
+`window.focused(cx)` lands on each one's own pane after `select_agent`, matching this file's
+existing `ctrl_p_still_works_after_...`-style focus regression tests for the sibling bugs.
+
+**Verification**: `cargo build --workspace`, `cargo clippy --workspace --all-targets -- -D
+warnings`, `cargo fmt --all -- --check` - all clean. `cargo test --workspace`: **1388 passed, 10
+failed** - all 10 failures are pre-existing and environment-specific (LSP wiring tests needing
+network access for `npm install typescript@5`, `rust-analyzer`/`pyright` readiness timeouts in
+this sandbox, and one GPU-paint check), none in `work_surface::render` or touching agent-focus
+logic; the new test and every other `work_surface::render` test pass.
+
+## Follow-up on the same live report: the rail was auto-collapsing the worktree the user was actively looking at (GitHub issue #112)
+
+After the focus fix above, a live follow-up report from the same user described a related but
+distinct symptom on the fixed build: switching between two open terminals in the rail eventually
+"closed" both, leaving a single row labeled with the worktree's branch (e.g. `main`) - but the tab
+strip still listed both terminals the whole time, so nothing had actually closed.
+
+Root cause, unrelated to the focus bug: `Self::worktree_is_expanded`
+(`crates/app/src/rail/render.rs`) collapses a worktree's rail row to a single summary line whenever
+its most urgent agent's status is `Status::Idle`, absent an explicit per-worktree override from the
+collapse caret (§2.2: "Worktrees whose most urgent agent is idle start collapsed" - real, spec'd,
+covered by `worktree_is_expanded_defaults_to_the_real_idle_rooted_rule`). A shell agent reads as
+`Idle` once it's gone quiet past `status::RUN_RECENT_OUTPUT_WINDOW` - an ordinary, real occurrence
+(a shell sitting at its prompt between commands), not a fault. The gap: the *currently selected*
+worktree - the one whose terminals the user is actively switching between - was never exempted
+from this default, so its row could silently collapse mid-use, replacing both visible terminal rows
+with the one-line summary the report described. Purely a rail rendering/collapse-state issue; the
+real `Agents` list (and so the tab strip) was never touched, which is exactly why both terminals
+stayed listed there throughout.
+
+Confirmed with the user directly (not assumed) that the intended fix is to exempt the active
+worktree, not to change the idle-collapse default itself for every other worktree - it still
+reduces rail clutter for worktrees the user isn't currently looking at, same as before.
+
+Fixed by adding one condition to `worktree_is_expanded`'s no-override branch:
+`self.active_agent_cwd() == row.path` (the same real comparison `render_worktree_row`'s own
+`is_selected` already uses) as an alternative to the plain non-idle check. An explicit caret click
+still wins over this exemption, unchanged from how it already won over the plain idle default -
+deliberately collapsing the active worktree stays possible and remembered.
+
+New regression test `the_selected_worktree_never_idle_collapses_by_default`
+(`rail::render::rail_row_tests`) proves the exemption itself, and also proves the override still
+wins over it. The existing `worktree_is_expanded_defaults_to_the_real_idle_rooted_rule` was
+adjusted to select a second, unrelated worktree instead of the one it inspects - otherwise this fix
+would have made it vacuous (the row it checks would itself become exempt).
+
+**Verification**: `cargo test --workspace -p app rail::render::rail_row_tests` - 6 passed, 0
+failed. `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all -- --check` -
+both clean.
