@@ -1102,6 +1102,20 @@ impl AdeApp {
                                 // poll to notice the new mtime (see `force_refresh_blame_for_
                                 // save`'s own docs).
                                 this.force_refresh_blame_for_save(&blame_refresh_path, cx);
+                                // GitHub issue #89: a save is a real, un-committed change to the
+                                // working tree, but nothing else on this path ever re-derives
+                                // `AdeApp::diff_state` from it - the file tree's "M"/"A" marks and
+                                // the Changes/diff view are both only ever recomputed by an
+                                // explicit `load_diff` (see `crate::sidebar::tree_ops::AdeApp::
+                                // refresh_after_file_op`'s own docs for the same "nothing polls
+                                // the working tree" story for tree operations). Without this call
+                                // a freshly-saved edit would sit on disk, correctly written, yet
+                                // both the tree and the diff view would keep showing the file as
+                                // unchanged until some unrelated trigger (a worktree switch, a
+                                // tree op) happened to reload it. `diff_root` doesn't change here
+                                // (a save never moves which worktree is being diffed), so this is
+                                // just a reload of the same root, not a switch.
+                                this.load_diff(this.diff_root.clone(), cx);
                             }
                             Err(err) => {
                                 this.file_save_error = Some((path.clone(), err.to_string()));
@@ -2204,6 +2218,7 @@ fn token_at_offset(
 #[cfg(test)]
 mod editing_tests {
     use super::*;
+    use crate::code_surface::{DiffBase, DiffLoadState};
     use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
 
@@ -2912,6 +2927,89 @@ mod editing_tests {
         assert!(!app.read_with(cx, |app, _| app.edit_buffer(&relative).unwrap().is_dirty()));
         let on_disk = std::fs::read_to_string(&file_path).expect("read back");
         assert_eq!(on_disk, "well hello\n");
+    }
+
+    /// `.output()`, not `.status()` - see `crate::sidebar::render::virtualization_tests::git`'s
+    /// own comment for why (a 40-line "create mode 100644" dump would otherwise land in every
+    /// test run's output here too).
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// GitHub issue #89 ("Changes not showing in editor and file tree"): saving a file never
+    /// called `AdeApp::load_diff`, so `AdeApp::diff_state` - the one thing both the file tree's
+    /// "M"/"A" marks (`crate::sidebar::render::tree_change_marks`) and the Changes/diff view
+    /// are computed from - stayed on whatever it was the last time something else happened to
+    /// reload it (a worktree switch, a tree op via `crate::sidebar::tree_ops::AdeApp::
+    /// refresh_after_file_op`), never the save itself. This drives a real `git`-backed repo one
+    /// branch off `main` (so there is a real base to diff against - `DiffBase::OnDefaultBranch`
+    /// would otherwise report no changes regardless of what's on disk, per `wt_core::diff::
+    /// diff_against_base`'s own docs), saves a real edit through the app, and asserts the
+    /// reloaded `diff_state` reports the file as changed without any other trigger in between.
+    #[gpui::test]
+    fn saving_a_file_immediately_refreshes_diff_state_for_issue_89(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        let file_path = write_file(repo.path(), "sample.txt", "one\ntwo\nthree\n");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        let relative = PathBuf::from("sample.txt");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let changed_before_edit = app.read_with(cx, |app, _| match &app.diff_state {
+            DiffLoadState::Loaded(DiffBase::Diff(diff)) => {
+                diff.files.iter().any(|file| file.path == relative)
+            }
+            _ => false,
+        });
+        assert!(
+            !changed_before_edit,
+            "sanity check: a freshly checked-out `feature` branch with no edits yet must not \
+             already report `sample.txt` as changed, or this test would prove nothing"
+        );
+
+        open_file_for_editing(&app, cx, file_path.clone());
+        app.update_in(cx, |app, window, cx| {
+            app.replace_text_in_range(None, "zero\n", window, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.save_active_file(cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read back"),
+            "zero\none\ntwo\nthree\n",
+            "sanity check: the edit must have actually reached disk"
+        );
+
+        let changed_after_save = app.read_with(cx, |app, _| match &app.diff_state {
+            DiffLoadState::Loaded(DiffBase::Diff(diff)) => {
+                diff.files.iter().any(|file| file.path == relative)
+            }
+            _ => false,
+        });
+        assert!(
+            changed_after_save,
+            "GitHub issue #89: saving a file must immediately reload `AdeApp::diff_state` \
+             (via `AdeApp::load_diff`) so the file tree's change marks and the Changes/diff \
+             view reflect the just-saved uncommitted edit, rather than requiring an unrelated \
+             trigger to notice it"
+        );
     }
 
     /// Regression coverage for a real bug caught while writing test (f) above: an earlier version
