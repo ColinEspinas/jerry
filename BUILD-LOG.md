@@ -7113,3 +7113,44 @@ The independent audit that caught this also verified, exhaustively (not spot-che
 `cargo clippy --workspace --all-targets -- -D warnings` - all clean. `cargo test --workspace --lib
 --test-threads=1`: **1221 + 44 + 14 + 141 = 1420 passed, 0 failed** across all four crates (1 new
 test - `a_merge_commit_that_is_also_head_still_gets_the_merge_dot_kind`).
+
+## Fix: switching terminals from the rail with no file tab open never moved keyboard focus (GitHub issue #112)
+
+Live report: with several terminals open, switching between them from the rail eventually made
+them appear to "merge" into one - typed input seemed to go nowhere, or land on the wrong tab.
+
+`AdeApp::select_agent` (`crates/app/src/work_surface/render.rs`) only ever moved real
+`Window::focus` in two of its three reachable branches: when it deactivated an open file tab (via
+`restore_focus`), and when the clicked agent belonged to a *different* worktree (via
+`select_worktree`, which itself routes through `reset_repo_scoped_state`'s own
+`focus_newly_spawned_agent` call). Switching between two terminals already open in the *same*
+worktree with no file tab active - the ordinary case for a rail click - fell through to
+`cx.notify()` with no focus call at all. `render_center_pane` only mounts the newly active
+agent's `TerminalPane`, so `Window::focus` stayed pointed at the previous terminal's now-unmounted
+handle; GPUI's `focus_node_id_in_rendered_frame` then falls back to the window root once a
+handle isn't found in the rendered frame, which sits outside `TerminalPane`'s `"terminal"` key
+context - typed keys either went nowhere or fell through to normally-suppressed global bindings
+(e.g. Ctrl+W). This is the same "an active-agent switch forgot to move `Window::focus`" bug class
+already found and fixed for `Agents::spawn`/`close`/`archive_agent` (see this file's own history);
+`select_agent`'s same-worktree branch was the one path that had never been covered.
+
+Fixed by capturing whether a file tab was open (`had_open_file_tab`, before the branch that clears
+`Self::open_change`) and calling the existing `focus_newly_spawned_agent(window, cx)` helper - the
+same shared "move focus unless a file tab/Settings is showing" guard `reset_repo_scoped_state`
+already reuses for the cross-worktree case, despite its spawn-specific name - only when that flag
+is `false`. Deliberately not an unconditional call after the existing branches: `restore_focus`'s
+fallback for a *reselected* already-active agent (that had a file tab open) restores a more
+precise captured target than "the active agent's pane," and calling `focus_newly_spawned_agent`
+unconditionally would silently override that.
+
+New regression test `window_focus_follows_a_same_worktree_terminal_switch`
+(`work_surface::render::tab_scoping_tests`) spawns two shell agents in one worktree and asserts
+`window.focused(cx)` lands on each one's own pane after `select_agent`, matching this file's
+existing `ctrl_p_still_works_after_...`-style focus regression tests for the sibling bugs.
+
+**Verification**: `cargo build --workspace`, `cargo clippy --workspace --all-targets -- -D
+warnings`, `cargo fmt --all -- --check` - all clean. `cargo test --workspace`: **1388 passed, 10
+failed** - all 10 failures are pre-existing and environment-specific (LSP wiring tests needing
+network access for `npm install typescript@5`, `rust-analyzer`/`pyright` readiness timeouts in
+this sandbox, and one GPU-paint check), none in `work_surface::render` or touching agent-focus
+logic; the new test and every other `work_surface::render` test pass.

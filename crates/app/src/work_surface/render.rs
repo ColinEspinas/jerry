@@ -179,7 +179,8 @@ impl AdeApp {
         // *after* `set_active` above: its `restore_focus` fallback resolves to
         // `Self::agents.active()`, which by this point is already the agent just selected.
         self.leave_graph_tab(window, cx);
-        if self.open_change.is_some() {
+        let had_open_file_tab = self.open_change.is_some();
+        if had_open_file_tab {
             self.open_change = None;
             self.refresh_open_diff_file_cache();
             self.hover = None;
@@ -211,6 +212,22 @@ impl AdeApp {
                     return;
                 }
             }
+        }
+        // GitHub issue #112: when no file tab was showing, nothing above moves real keyboard
+        // focus - `restore_focus` only runs inside the `had_open_file_tab` branch, and a
+        // same-worktree agent switch (the common case for a rail/tab-strip click between two
+        // already-open terminals) never reaches `select_worktree` either. Left as-is, `Window::
+        // focus` stays on the previously-active agent's `TerminalPane` handle, which
+        // `render_center_pane` no longer mounts once a different agent becomes active - GPUI's
+        // dispatch then falls back to the window root, outside the `"terminal"` key context, so
+        // typed input silently goes nowhere and normally-suppressed global bindings (e.g. Ctrl+W)
+        // fire instead. `had_open_file_tab` is checked, not `self.open_change.is_none()` (always
+        // true here since the branch above clears it): reusing `focus_newly_spawned_agent`
+        // unconditionally would override `restore_focus`'s more precise restore target when
+        // re-selecting an already-active agent that had a file tab open (Revision R8.5b's
+        // captured-overlay-focus mechanism).
+        if !had_open_file_tab {
+            self.focus_newly_spawned_agent(window, cx);
         }
         cx.notify();
     }
@@ -2540,7 +2557,7 @@ mod tab_scoping_tests {
     use super::*;
     use crate::rail::worktrees::WorktreeItem;
     use crate::root::focus::palette_focus_tests;
-    use gpui::TestAppContext;
+    use gpui::{Focusable, TestAppContext};
 
     fn worktree_item(path: PathBuf, label: &str) -> WorktreeItem {
         WorktreeItem {
@@ -3793,6 +3810,70 @@ mod tab_scoping_tests {
                 .any(|tab_ref| matches!(tab_ref, work_surface::TabRef::File(path) if path == &PathBuf::from("README.md"))),
             "the file tab must reappear once the worktree is no longer bare - its state was \
              preserved, not destroyed, while suppressed"
+        );
+    }
+
+    /// GitHub issue #112: switching between two terminals open in the *same* worktree - the
+    /// common case for a rail/tab-strip click - must move real keyboard focus onto the newly
+    /// selected terminal's own pane. Before the fix, `select_agent`'s same-worktree/no-file-tab
+    /// branch never called `Window::focus` at all: `Window::focus` stayed on the previously
+    /// active terminal's now-unmounted `TerminalPane` handle, so GPUI's dispatch fell back to
+    /// the window root - outside the `"terminal"` key context - and typed input into the
+    /// terminal that visibly looked selected silently went nowhere (or fell through to
+    /// normally-suppressed global bindings instead), which reads to a user as the two terminals
+    /// having "merged" into one.
+    #[gpui::test]
+    fn window_focus_follows_a_same_worktree_terminal_switch(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let first_id = app.read_with(cx, |app, _| {
+            app.agents.active_id().expect("the initial shell agent")
+        });
+        let second_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            )
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.select_agent(first_id, window, cx);
+        });
+        let first_pane_handle = app.update(cx, |app, cx| {
+            app.agents
+                .active()
+                .expect("the first agent")
+                .pane
+                .focus_handle(cx)
+        });
+        assert_eq!(
+            app.update_in(cx, |_app, window, cx| window.focused(cx))
+                .as_ref(),
+            Some(&first_pane_handle),
+            "premise: selecting the first terminal moves real focus onto its own pane"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.select_agent(second_id, window, cx);
+        });
+        let second_pane_handle = app.update(cx, |app, cx| {
+            app.agents
+                .active()
+                .expect("the second agent")
+                .pane
+                .focus_handle(cx)
+        });
+        assert_eq!(
+            app.update_in(cx, |_app, window, cx| window.focused(cx))
+                .as_ref(),
+            Some(&second_pane_handle),
+            "switching to the second terminal (no file tab open, same worktree) must move real \
+             keyboard focus onto its own pane too, not leave it dangling on the first terminal's \
+             now-unmounted handle"
         );
     }
 
