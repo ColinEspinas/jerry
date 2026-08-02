@@ -1372,6 +1372,15 @@ impl AdeApp {
         // colour from, so the tab strip can never disagree with either about what state an
         // agent is in.
         let status_color: gpui::Rgba = self.agent_status(agent, cx).color();
+        // GitHub issue #96: every other tab kind (`Self::render_file_tab`, `render_graph_tab`)
+        // has always had a real, clickable `×` in this same spot - agent tabs never actually
+        // grew one despite this function's own doc comment above claiming they had, leaving
+        // middle-click (GitHub issue #26) as the only, undiscoverable way to close one.
+        let close_color = if is_active {
+            theme::text::DIMMER
+        } else {
+            theme::text::DISABLED
+        };
         let tab_ref = work_surface::TabRef::Agent(id);
         let drag_value = DraggedTab::Agent {
             id,
@@ -1467,6 +1476,26 @@ impl AdeApp {
                             .h(px(5.0))
                             .rounded(px(2.5))
                             .bg(status_color),
+                    )
+                    .child(
+                        div()
+                            .id(("close-agent-tab", id))
+                            .w(px(15.0))
+                            .h(px(15.0))
+                            .rounded(theme::radius::CHIP)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|el| el.bg(theme::surface::TAB_CLOSE_HOVER))
+                            .font(font(theme::font::MONO))
+                            .text_size(px(11.0))
+                            .text_color(close_color)
+                            .child("\u{d7}")
+                            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.close_agent(id, window, cx);
+                            })),
                     ),
             )
             .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline));
