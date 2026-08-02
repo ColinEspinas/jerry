@@ -17,7 +17,7 @@ use std::time::Duration;
 use crate::rail::repo::RepoId;
 use crate::rail::status::Status;
 use crate::work_surface::agents::AgentKind;
-use wt_core::diff::{AheadBehind, DiffBase, DiffLineKind, WorktreeDiff, WorktreeMergeStatus};
+use wt_core::diff::{AheadBehind, DiffLineKind, WorktreeDiff, WorktreeMergeStatus};
 
 /// One agent, reduced to exactly what the rail row needs to render - built in `crate::root`
 /// from a `crate::work_surface::agents::Agent` plus a `wt_core::diff::diff_against_base` result for its
@@ -576,19 +576,23 @@ pub fn compute_status_snapshot(
     let mut ahead_behind = HashMap::with_capacity(unique_diff_paths.len());
     for path in unique_diff_paths {
         let summary = match wt_core::diff::diff_against_base(&path) {
-            Ok(DiffBase::Diff(diff)) => {
-                let (add, del) = sum_diff_stat(&diff);
-                DiffSummary {
-                    add,
-                    del,
-                    has_changes: !diff.files.is_empty(),
+            // `DiffBase::diff()` covers both a real base-branch diff and GitHub issue #108's
+            // on-default-branch/no-base uncommitted-vs-HEAD fallback - either way, real content
+            // worth reflecting in this row's summary.
+            Ok(base) => match base.diff() {
+                Some(diff) => {
+                    let (add, del) = sum_diff_stat(diff);
+                    DiffSummary {
+                        add,
+                        del,
+                        has_changes: !diff.files.is_empty(),
+                    }
                 }
-            }
-            // On the default branch, no base found, or a real error reading this one path:
-            // no reviewable diff, but not a reason to fail the whole snapshot.
-            Ok(DiffBase::OnDefaultBranch { .. } | DiffBase::NoBaseFound) | Err(_) => {
-                DiffSummary::default()
-            }
+                // `HEAD` itself is unborn: a real error reading this one path is treated the
+                // same way - no reviewable diff, but not a reason to fail the whole snapshot.
+                None => DiffSummary::default(),
+            },
+            Err(_) => DiffSummary::default(),
         };
         if let Ok(Some(counts)) = wt_core::diff::ahead_behind_against_base(&path) {
             ahead_behind.insert(path.clone(), counts);

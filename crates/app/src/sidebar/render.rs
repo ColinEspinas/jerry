@@ -3043,10 +3043,10 @@ mod virtualization_tests {
         }
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["commit", "-m", "initial"]);
-        // On the default branch there is no base to diff against
-        // (`wt_core::diff::DiffBase::OnDefaultBranch`), so this has to be a real feature branch
-        // for `AdeApp::current_diff` to ever be `Some` - the same setup this crate's existing
-        // real-diff tests use.
+        // A real feature branch, so this hits `wt_core::diff::DiffBase::Diff` against a real
+        // merge-base rather than `DiffBase::NoBase`'s uncommitted-vs-HEAD fallback (GitHub issue
+        // #108) - the same setup this crate's existing real-diff tests use, and the shape this
+        // test's 40 changed rows need to exercise virtualization against.
         git(repo.path(), &["checkout", "-b", "feature"]);
         for index in 0..40 {
             fs::write(
@@ -4232,8 +4232,8 @@ mod commit_composer_tests {
     /// A real feature-branch repo with two files genuinely changed relative to `main`'s
     /// merge-base - the same shape
     /// `virtualization_tests::a_changes_row_far_below_the_viewport_is_never_painted` already
-    /// establishes for `AdeApp::current_diff` to be real and `Some` (there is no base to diff
-    /// against on the default branch itself - `wt_core::diff::DiffBase::OnDefaultBranch`).
+    /// establishes, so this hits `wt_core::diff::DiffBase::Diff` against a real merge-base
+    /// rather than `DiffBase::NoBase`'s uncommitted-vs-HEAD fallback (GitHub issue #108).
     fn changes_test_repo() -> TempDir {
         let repo = TempDir::new().expect("tempdir");
         git(repo.path(), &["init", "-b", "main"]);

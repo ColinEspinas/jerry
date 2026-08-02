@@ -19,20 +19,19 @@ impl AdeApp {
                 theme::status::FAIL,
             ),
             DiffLoadState::Loaded(DiffBase::NoBaseFound) => (
-                "no base branch could be detected for this worktree (no origin/HEAD, no \
-                 local main/master, and no fallback branch found)"
+                "no base branch could be detected for this worktree, and HEAD is unborn (no \
+                 commits yet), so there is nothing to diff at all"
                     .to_string(),
                 theme::text::FAINT,
             ),
-            DiffLoadState::Loaded(DiffBase::OnDefaultBranch { branch }) => (
-                format!(
-                    "this worktree is on the default branch ({branch}); nothing to diff against"
-                ),
-                theme::text::FAINT,
-            ),
-            // Unreachable in practice (callers check `current_diff()` first); matched explicitly
-            // so a future `DiffBase` variant isn't silently swallowed by a wildcard.
-            DiffLoadState::Loaded(DiffBase::Diff(_)) => (String::new(), theme::text::FAINT),
+            // Unreachable in practice (callers check `current_diff()` first, which is `Some`
+            // for both real variants below via `DiffBase::diff()` - GitHub issue #108's
+            // uncommitted-vs-HEAD fallback means `NoBase` is never actually "nothing to show").
+            // Matched explicitly so a future `DiffBase` variant isn't silently swallowed by a
+            // wildcard.
+            DiffLoadState::Loaded(DiffBase::Diff(_) | DiffBase::NoBase { .. }) => {
+                (String::new(), theme::text::FAINT)
+            }
         };
         render_sidebar_message(text, color.into())
     }
