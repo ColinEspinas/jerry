@@ -1422,6 +1422,22 @@ pub struct AdeApp {
     /// here, which only matters if a previous drag's cancel-cleanup somehow missed - a defensive
     /// property, not a real multi-drag scenario GPUI itself allows.
     pub(crate) dragging_tab: Option<work_surface::TabRef>,
+    /// A real drop's own settle-in animation (GitHub issue #16's "dropping animates the tab
+    /// settling into its slot") - `Some((tab, id))` for the tab [`Self::drop_dragged_tab`] most
+    /// recently placed, `id` a fresh [`Self::next_tab_settle_id`] value so
+    /// `Self::render_file_tab`/`Self::render_agent_tab`'s own `gpui::AnimationExt::with_animation`
+    /// call always restarts rather than reusing GPUI's per-element-id animation state from a
+    /// previous drop of the very same tab (GPUI keys that state purely off the id string - see
+    /// `vendor/zed/crates/gpui/src/elements/animation.rs`'s own `AnimationState`). Left set after
+    /// the animation naturally finishes rather than explicitly cleared: a finished one-shot
+    /// `Animation` just keeps resolving to its own end state (full opacity) on every later
+    /// render, so a stale value here is harmless, and GPUI itself stops scheduling animation
+    /// frames for it once done (`AnimationElement::request_layout`'s own `if !done {
+    /// request_animation_frame() }`).
+    pub(crate) dropped_tab_settle: Option<(work_surface::TabRef, u64)>,
+    /// The next fresh id [`Self::drop_dragged_tab`] will stamp into [`Self::dropped_tab_settle`] -
+    /// see that field's own docs for why a fresh id matters every time.
+    pub(crate) next_tab_settle_id: u64,
     /// User-authored themes loaded from `~/.config/jerry/themes/*.toml` at construction time
     /// (GitHub issue #5) - real, additional `crate::settings::custom_theme::CustomTheme` entries
     /// layered on top of the six built-in `settings::THEME_DEFS`, not a replacement for them. See

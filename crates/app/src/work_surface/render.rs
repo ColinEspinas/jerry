@@ -3,7 +3,8 @@ use crate::root::widgets::{
     render_action_keycap_row, render_env_chip, render_hint_pair, render_keycap_row, text_tooltip,
     KeycapSize,
 };
-use gpui::DragMoveEvent;
+use gpui::{Animation, AnimationExt, DragMoveEvent};
+use std::time::Duration;
 
 /// Defines one `JumpToAgentN` action handler forwarding a literal position to
 /// [`AdeApp::jump_to_agent_at`]. Each `actions!`-generated struct is a distinct action type
@@ -525,6 +526,8 @@ impl AdeApp {
             .tab_drag_insertion
             .as_ref()
             .is_some_and(|(hovered, after)| *hovered == target && *after);
+        self.next_tab_settle_id += 1;
+        self.dropped_tab_settle = Some((dragged.clone(), self.next_tab_settle_id));
         self.reorder_tab(dragged, target, insert_after, cx);
         self.tab_drag_insertion = None;
         self.dragging_tab = None;
@@ -738,7 +741,7 @@ impl AdeApp {
         &self,
         path: &Path,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
         let is_active = self.open_change.as_deref() == Some(path);
         let file_name = path
             .file_name()
@@ -780,10 +783,11 @@ impl AdeApp {
             _ => None,
         };
         let is_dragging = self.dragging_tab.as_ref() == Some(&tab_ref);
+        let settle_animation_id = tab_settle_animation_id(&self.dropped_tab_settle, &tab_ref);
         let this_entity = cx.entity();
         let tab_ref_for_drag = tab_ref.clone();
 
-        div()
+        let tab_div = div()
             .id(format!("file-tab-{key}"))
             .relative()
             .flex()
@@ -909,7 +913,23 @@ impl AdeApp {
                             })),
                     ),
             )
-            .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline))
+            .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline));
+
+        // A real drop's own settle-in fade (GitHub issue #16's "dropping animates the tab
+        // settling into its slot") - see `tab_settle_animation_id`'s own docs for why a fresh id
+        // is required, and why this branches to `gpui::AnyElement` rather than a plain
+        // `.when_some` (`gpui::AnimationExt::with_animation` returns a different wrapper type,
+        // not `Self`).
+        match settle_animation_id {
+            Some(id) => tab_div
+                .with_animation(
+                    id,
+                    Animation::new(TAB_SETTLE_ANIMATION_DURATION),
+                    |el, delta| el.opacity(0.55 + 0.45 * delta),
+                )
+                .into_any_element(),
+            None => tab_div.into_any_element(),
+        }
     }
 
     /// The tab strip's `+` menu button - toggles [`Self::plus_menu_open`] (unconditionally
@@ -1341,7 +1361,7 @@ impl AdeApp {
         agent: &Agent,
         label: String,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
         let id = agent.id;
         let is_active = self.agents.active_id() == Some(id);
         let chip_kind = work_surface::tab_chip_kind(agent.kind);
@@ -1362,10 +1382,11 @@ impl AdeApp {
             _ => None,
         };
         let is_dragging = self.dragging_tab.as_ref() == Some(&tab_ref);
+        let settle_animation_id = tab_settle_animation_id(&self.dropped_tab_settle, &tab_ref);
         let this_entity = cx.entity();
         let tab_ref_for_drag = tab_ref.clone();
 
-        div()
+        let tab_div = div()
             .id(("agent-tab", id))
             .relative()
             .flex()
@@ -1448,7 +1469,20 @@ impl AdeApp {
                             .bg(status_color),
                     ),
             )
-            .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline))
+            .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline));
+
+        // A real drop's own settle-in fade - see `Self::render_file_tab`'s identical handling
+        // for why this branches to `gpui::AnyElement`.
+        match settle_animation_id {
+            Some(id) => tab_div
+                .with_animation(
+                    id,
+                    Animation::new(TAB_SETTLE_ANIMATION_DURATION),
+                    |el, delta| el.opacity(0.55 + 0.45 * delta),
+                )
+                .into_any_element(),
+            None => tab_div.into_any_element(),
+        }
     }
 
     /// The agent context bar: agent badge/name, a divider, branch, the worktree path (the one
@@ -2363,6 +2397,28 @@ fn render_tab_insertion_caret(insert_after: bool) -> impl IntoElement {
         .when(!insert_after, |el| el.left(px(0.0)))
 }
 
+/// How long a dropped tab's own settle-in fade runs - short and non-blocking, matching the
+/// design handoff's own "animations are short (~120-180ms)" ask (GitHub issue #16 §5).
+const TAB_SETTLE_ANIMATION_DURATION: Duration = Duration::from_millis(150);
+
+/// A fresh `gpui::AnimationExt::with_animation` id for `tab_ref`, if [`AdeApp::dropped_tab_settle`]
+/// says it's the tab a real drop most recently placed - `None` for every other tab, and for a
+/// tab that was never the target of a real drop this session. A distinct `String` per drop
+/// (`Self::drop_dragged_tab`'s own `next_tab_settle_id` counter baked into the id) rather than a
+/// fixed per-tab id, because GPUI keys its own animation progress purely off this id string
+/// (`vendor/zed/crates/gpui/src/elements/animation.rs`'s `AnimationState`) - reusing the same id
+/// across two different drops of the same tab would resume the *first* drop's already-finished
+/// animation instead of starting a fresh one.
+fn tab_settle_animation_id(
+    settle: &Option<(work_surface::TabRef, u64)>,
+    tab_ref: &work_surface::TabRef,
+) -> Option<String> {
+    match settle {
+        Some((settled, id)) if settled == tab_ref => Some(format!("tab-settle-{id}")),
+        _ => None,
+    }
+}
+
 /// The agent context bar's status pill: a coloured dot plus label in the status colour.
 pub(in crate::work_surface) fn render_status_pill(status: Status) -> impl IntoElement {
     div()
@@ -3084,6 +3140,85 @@ mod tab_scoping_tests {
         assert_eq!(
             app.read_with(cx, |app, _| app.tab_drag_insertion.clone()),
             None
+        );
+    }
+
+    /// `tab_settle_animation_id` (the pure logic behind the settle-in fade, GitHub issue #16's
+    /// "dropping animates the tab settling into its slot") must return `Some` only for the tab
+    /// that was actually dropped, and `None` for every other tab, including one dropped in a
+    /// previous, no-longer-current drop.
+    #[test]
+    fn tab_settle_animation_id_matches_only_the_settled_tab() {
+        let dropped = work_surface::TabRef::File(PathBuf::from("a.txt"));
+        let other = work_surface::TabRef::File(PathBuf::from("b.txt"));
+        let settle = Some((dropped.clone(), 7));
+
+        assert_eq!(
+            tab_settle_animation_id(&settle, &dropped),
+            Some("tab-settle-7".to_string())
+        );
+        assert_eq!(tab_settle_animation_id(&settle, &other), None);
+        assert_eq!(tab_settle_animation_id(&None, &dropped), None);
+    }
+
+    /// Two separate drops of the very same tab must get two different animation ids - reusing
+    /// one would resume GPUI's own already-finished animation state for that id instead of
+    /// starting a fresh fade (`tab_settle_animation_id`'s own docs on why).
+    #[test]
+    fn tab_settle_animation_id_is_fresh_across_two_drops_of_the_same_tab() {
+        let tab = work_surface::TabRef::File(PathBuf::from("a.txt"));
+        let first_drop = tab_settle_animation_id(&Some((tab.clone(), 1)), &tab);
+        let second_drop = tab_settle_animation_id(&Some((tab.clone(), 2)), &tab);
+
+        assert_ne!(first_drop, second_drop);
+    }
+
+    /// A real drop (`Self::drop_dragged_tab`) must record `Self::dropped_tab_settle` for exactly
+    /// the tab that was dropped, and a second, later drop of a different tab must overwrite it
+    /// with a fresh id rather than leaving the first tab's own id behind.
+    #[gpui::test]
+    fn drop_dragged_tab_records_a_fresh_settle_id_for_the_dropped_tab(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
+            let initial_id = app.agents.active_id().expect("initial shell agent");
+            let second_id = app.agents.spawn(
+                AgentKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            (initial_id, second_id)
+        });
+
+        app.update(cx, |app, cx| {
+            app.drop_dragged_tab(
+                work_surface::TabRef::Agent(initial_id),
+                work_surface::TabRef::Agent(second_id),
+                cx,
+            );
+        });
+        let (first_settled, first_id) = app
+            .read_with(cx, |app, _| app.dropped_tab_settle.clone())
+            .expect("a real drop must record a settle id");
+        assert_eq!(first_settled, work_surface::TabRef::Agent(initial_id));
+
+        app.update(cx, |app, cx| {
+            app.drop_dragged_tab(
+                work_surface::TabRef::Agent(second_id),
+                work_surface::TabRef::Agent(initial_id),
+                cx,
+            );
+        });
+        let (second_settled, second_id_recorded) = app
+            .read_with(cx, |app, _| app.dropped_tab_settle.clone())
+            .expect("the second real drop must also record a settle id");
+        assert_eq!(second_settled, work_surface::TabRef::Agent(second_id));
+        assert_ne!(
+            first_id, second_id_recorded,
+            "a later drop must never reuse an earlier drop's own settle id"
         );
     }
 
