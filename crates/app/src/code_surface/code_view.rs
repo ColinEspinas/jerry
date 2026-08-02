@@ -232,6 +232,19 @@ pub enum HighlightKind {
     Attribute,
     Embedded,
     Text,
+    /// GitHub issue #104: Markdown's own `text.title` capture (a heading's text) - see
+    /// `theme::syntax::HEADING`'s own docs for why this is a real, dedicated variant rather than
+    /// a reused code bucket.
+    Heading,
+    /// GitHub issue #104: Markdown's `text.uri`/`text.reference` captures (a link's destination
+    /// and its visible label/text) - see `theme::syntax::LINK`'s own docs.
+    Link,
+    /// GitHub issue #104: Markdown's `text.strong` capture (`**bold**`) - see
+    /// `theme::syntax::STRONG`'s own docs on this app's real font-weight rendering limitation.
+    Strong,
+    /// GitHub issue #104: Markdown's `text.emphasis` capture (`*italic*`) - see
+    /// `theme::syntax::EMPHASIS`'s own docs.
+    Emphasis,
 }
 
 /// Maps a [`HighlightKind`] to its real `theme::syntax::*` colour - see that module's own docs
@@ -261,6 +274,10 @@ pub fn color_for_kind(kind: HighlightKind) -> Rgba {
         HighlightKind::Attribute => theme::syntax::ATTRIBUTE.into(),
         HighlightKind::Embedded => theme::syntax::EMBEDDED.into(),
         HighlightKind::Text => theme::syntax::TEXT.into(),
+        HighlightKind::Heading => theme::syntax::HEADING.into(),
+        HighlightKind::Link => theme::syntax::LINK.into(),
+        HighlightKind::Strong => theme::syntax::STRONG.into(),
+        HighlightKind::Emphasis => theme::syntax::EMPHASIS.into(),
     }
 }
 
@@ -286,13 +303,26 @@ enum Grammar {
     Json,
     Yaml,
     C,
+    /// GitHub issue #104: Markdown's own *block* grammar (headings, lists, fenced code blocks,
+    /// ...) - the real top-level entry point [`highlight_markdown`] parses `.md` source with.
+    /// Never assigned to a file extension on its own; [`Grammar::MarkdownInline`] only exists as
+    /// this one's real injection target (see [`build_highlight_config`]'s own docs on why
+    /// Markdown needs two grammars, unlike every other entry here).
+    Markdown,
+    /// GitHub issue #104: Markdown's *inline* grammar (emphasis, links, code spans, ...) - real
+    /// prose content lives inside `(inline)` nodes the block grammar itself never parses further,
+    /// per `tree-sitter-md`'s own `injections.scm` (`(inline) @injection.content (#set!
+    /// injection.language "markdown_inline")`, read directly from the crate). Reached only
+    /// through [`Grammar::Markdown`]'s own injection callback - never a file's own top-level
+    /// grammar.
+    MarkdownInline,
 }
 
 impl Grammar {
     /// Every real grammar, in [`Grammar::index`] order - the single list both
     /// [`HIGHLIGHT_CONFIGS`]' slot count and this module's own coverage tests are derived from, so
     /// adding a grammar cannot leave either behind.
-    const ALL: [Grammar; 9] = [
+    const ALL: [Grammar; 11] = [
         Grammar::Rust,
         Grammar::TypeScript,
         Grammar::Tsx,
@@ -302,6 +332,8 @@ impl Grammar {
         Grammar::Json,
         Grammar::Yaml,
         Grammar::C,
+        Grammar::Markdown,
+        Grammar::MarkdownInline,
     ];
 
     const COUNT: usize = Self::ALL.len();
@@ -320,6 +352,8 @@ impl Grammar {
             Grammar::Json => 6,
             Grammar::Yaml => 7,
             Grammar::C => 8,
+            Grammar::Markdown => 9,
+            Grammar::MarkdownInline => 10,
         }
     }
 
@@ -334,6 +368,8 @@ impl Grammar {
             Grammar::Json => tree_sitter_json::LANGUAGE.into(),
             Grammar::Yaml => tree_sitter_yaml::LANGUAGE.into(),
             Grammar::C => tree_sitter_c::LANGUAGE.into(),
+            Grammar::Markdown => tree_sitter_md::LANGUAGE.into(),
+            Grammar::MarkdownInline => tree_sitter_md::INLINE_LANGUAGE.into(),
         }
     }
 
@@ -348,6 +384,8 @@ impl Grammar {
             Grammar::Json => "json",
             Grammar::Yaml => "yaml",
             Grammar::C => "c",
+            Grammar::Markdown => "markdown",
+            Grammar::MarkdownInline => "markdown_inline",
         }
     }
 }
@@ -510,6 +548,21 @@ const HIGHLIGHT_NAMES: &[&str] = &[
     "label",
     "punctuation.special",
     "string.special.key",
+    // GitHub issue #104 (Markdown): see `HighlightKind::Heading`/`Link`/`Strong`/`Emphasis`'s own
+    // docs for why these have no reasonable existing-bucket analog.
+    "text.title",
+    "text.literal",
+    "text.uri",
+    "text.reference",
+    "text.strong",
+    "text.emphasis",
+    // `tree-sitter-md`'s own block query's `(code_fence_content) @none` - a real, deliberate
+    // "cancel the enclosing `text.literal` colour for this span" instruction (the surrounding
+    // `(fenced_code_block) @text.literal` is still open otherwise), not a typo or an unused
+    // capture. Registering it here as a real recognized name (mapped to `Text` below) is what
+    // makes `HighlightConfiguration::configure`'s own matching rule actually resolve it, instead
+    // of the span silently inheriting whatever the parent already opened.
+    "none",
 ];
 
 /// [`HIGHLIGHT_NAMES`]' positional parallel array: which real [`HighlightKind`] each recognized
@@ -578,6 +631,13 @@ const HIGHLIGHT_KINDS: [HighlightKind; HIGHLIGHT_NAMES.len()] = [
     HighlightKind::Variable,
     HighlightKind::Operator,
     HighlightKind::Property,
+    HighlightKind::Heading,
+    HighlightKind::String,
+    HighlightKind::Link,
+    HighlightKind::Link,
+    HighlightKind::Strong,
+    HighlightKind::Emphasis,
+    HighlightKind::Text,
 ];
 
 /// Real supplement appended after `tree-sitter-python`'s own bundled `queries/highlights.scm`,
@@ -804,36 +864,84 @@ fn highlight_query_for(grammar: Grammar) -> String {
         ),
         Grammar::Yaml => tree_sitter_yaml::HIGHLIGHTS_QUERY.to_string(),
         Grammar::C => tree_sitter_c::HIGHLIGHT_QUERY.to_string(),
+        Grammar::Markdown => tree_sitter_md::HIGHLIGHT_QUERY_BLOCK.to_string(),
+        Grammar::MarkdownInline => tree_sitter_md::HIGHLIGHT_QUERY_INLINE.to_string(),
     }
 }
+
+/// A real, hand-written injection query - **not** `tree_sitter_md::INJECTION_QUERY_BLOCK`
+/// (the crate's own bundled `queries/injections.scm`) verbatim, because that file's `(inline)
+/// @injection.content (#set! injection.language "markdown_inline")` pattern has two real bugs
+/// when driven through `tree-sitter-highlight`'s own generic injection engine (both found by
+/// direct empirical testing - a standalone `Highlighter`/`HighlightConfiguration` reproduction
+/// outside this app entirely, not assumed from reading the crate's source):
+///
+/// 1. **Missing the required outer-paren wrapping.** A pattern's own `#set!` predicates must be
+///    grouped in the *same* top-level S-expression as the node pattern they apply to - `((inline)
+///    @injection.content (#set! ...))`, not `(inline) @injection.content (#set! ...)` - or
+///    tree-sitter parses each `#set!` as its own disconnected top-level pattern, and
+///    `injection_for_match` never sees the property at all. `tree-sitter-rust`'s own
+///    `queries/injections.scm` uses the correct, wrapped form; `tree-sitter-md`'s own file does
+///    not, for its `(inline)` pattern.
+/// 2. **Missing `#set! injection.include-children`.** `tree-sitter-highlight` excludes an
+///    `@injection.content` node's own *children* from the reparsed range by default (its own real
+///    design: "for other injections, only the content node's own content is reparsed"). The block
+///    grammar's own `(inline)` node is not the pure leaf it looks like - it carries real, unnamed
+///    child tokens for a handful of characters (`*`, `.`, ...) it scans for its own block-level
+///    heuristics - so without this flag, exactly the delimiter characters `**bold**`/`*italic*`/...
+///    depend on get excluded from what `Grammar::MarkdownInline` ever sees, and every inline
+///    capture silently fails to fire (confirmed directly: the exact same source highlights
+///    correctly once this one predicate is added, nothing else changed).
+///
+/// The bundled file's other real capability - marking fenced-code-block content, HTML blocks, and
+/// YAML/TOML frontmatter for injection into *other* languages by name (`"rust"`, `"html"`, ...) -
+/// is deliberately not reproduced here: this app's `injection_callback` only ever resolves
+/// `"markdown_inline"`, so those patterns would never fire anyway. Real cross-language injection
+/// into an arbitrary fenced code block's own language is a separate, larger feature (fuzzy
+/// matching an arbitrary fence info string against this app's existing per-extension grammar
+/// registry) left for a future revision, not fabricated here.
+const MARKDOWN_INJECTION_QUERY: &str = r#"
+((inline) @injection.content
+ (#set! injection.language "markdown_inline")
+ (#set! injection.include-children))
+"#;
 
 /// Builds `grammar`'s real [`HighlightConfiguration`], already
 /// [`HighlightConfiguration::configure`]d against [`HIGHLIGHT_NAMES`].
 ///
-/// Both the injection and the locals query are deliberately empty, and both omissions are real
-/// decisions rather than gaps left to fill in later:
+/// The locals query is deliberately always empty, and the injection query is empty for every
+/// grammar except [`Grammar::Markdown`] - both real decisions, not gaps left to fill in later:
 ///
-/// - **Injections.** None of this app's nine grammars need one. TSX parses JSX as part of its own
-///   single grammar rather than as an injected language, and the only injections the Rust and
+/// - **Injections.** Every grammar except `Markdown` needs none: TSX parses JSX as part of its
+///   own single grammar rather than as an injected language, and the only injections the Rust and
 ///   Python query files describe are things like SQL-in-a-string-literal, which this app has no
-///   second grammar to inject *into* anyway. Passing the injection query without a real
-///   `injection_callback` able to supply those grammars would add machinery that could never fire.
-///   None of the five GitHub-issue-#32 grammars bundle a real `queries/injections.scm` either -
-///   verified directly against each one's own `queries/` directory, not assumed.
+///   second grammar to inject *into* anyway. Passing an injection query without a real
+///   `injection_callback` able to supply those grammars would add machinery that could never
+///   fire. None of the five GitHub-issue-#32 grammars bundle a real `queries/injections.scm`
+///   either - verified directly against each one's own `queries/` directory, not assumed.
+///   `Markdown` is the one real exception (GitHub issue #104): its own bundled block grammar
+///   genuinely never parses prose content itself, only the injected `Grammar::MarkdownInline` -
+///   see [`MARKDOWN_INJECTION_QUERY`]'s own docs. `MarkdownInline`'s own `injections.scm` (HTML/
+///   LaTeX) is left empty here for the identical "no callback able to supply those grammars"
+///   reason.
 /// - **Locals.** `tree-sitter-typescript` ships a `locals.scm`, and feeding it would switch on
 ///   `tree-sitter-highlight`'s local-variable tracking, which exists to let a query colour a
-///   variable *reference* like its *definition*. This app's six buckets do not distinguish
-///   variables at all - every plain identifier is `Text` - so that machinery has nothing to
-///   express here, and enabling it would only add per-parse scope-tracking cost for an outcome
-///   that cannot differ.
+///   variable *reference* like its *definition*. This app's buckets do not distinguish variables
+///   at all - every plain identifier is `Text` - so that machinery has nothing to express here,
+///   and enabling it would only add per-parse scope-tracking cost for an outcome that cannot
+///   differ.
 fn build_highlight_config(
     grammar: Grammar,
 ) -> Result<HighlightConfiguration, tree_sitter::QueryError> {
+    let injection_query = match grammar {
+        Grammar::Markdown => MARKDOWN_INJECTION_QUERY,
+        _ => "",
+    };
     let mut config = HighlightConfiguration::new(
         grammar.language(),
         grammar.name(),
         &highlight_query_for(grammar),
-        "",
+        injection_query,
         "",
     )?;
     config.configure(HIGHLIGHT_NAMES);
@@ -1003,7 +1111,67 @@ fn highlight_with(source: &str, grammar: Grammar) -> Vec<HighlightSpan> {
     let Ok(events) = highlighter.highlight(config, source.as_bytes(), None, |_| None) else {
         return Vec::new();
     };
+    fold_highlight_events(events)
+}
 
+/// Parses `source` with `tree-sitter-md`'s real block grammar and classifies it through the same
+/// `tree-sitter-highlight` engine [`highlight_with`] uses - GitHub issue #104. Unlike every other
+/// grammar in this module, Markdown's own block grammar never parses prose content itself: real
+/// text (emphasis, links, code spans, ...) lives inside `(inline)` nodes the block grammar leaves
+/// opaque, and only [`Grammar::MarkdownInline`] - reached through a real
+/// `injection_callback` this function supplies, resolving exactly the one language name
+/// `MARKDOWN_INJECTION_QUERY`'s own `(#set! injection.language "markdown_inline")` rule ever
+/// requests - actually parses it. Without this callback, every real markdown document would
+/// render as a single flat `Text` region: verified directly by testing this function with
+/// `|_| None` in place first (`inline_content_is_never_left_as_a_single_flat_text_region`'s own
+/// premise).
+pub fn highlight_markdown(source: &str) -> Vec<HighlightSpan> {
+    let Some(block_config) = highlight_config(Grammar::Markdown) else {
+        return Vec::new();
+    };
+    let Some(inline_config) = highlight_config(Grammar::MarkdownInline) else {
+        return Vec::new();
+    };
+    let mut highlighter = Highlighter::new();
+    let Ok(events) = highlighter.highlight(block_config, source.as_bytes(), None, |name| {
+        (name == Grammar::MarkdownInline.name()).then_some(inline_config)
+    }) else {
+        return Vec::new();
+    };
+    fold_highlight_events(events)
+}
+
+/// The one real event-folding path both [`highlight_with`] and [`highlight_markdown`] funnel
+/// into: collapses a [`tree_sitter_highlight::Highlighter::highlight`] event stream down into
+/// this app's [`HighlightKind`] buckets.
+///
+/// The event stream is a flat, in-order sequence of `HighlightStart`/`Source`/`HighlightEnd`, and
+/// `HighlightStart`s **nest** - a Rust `\n` escape inside a string literal arrives as a real
+/// `escape` highlight opened while the enclosing `string` one is still open. The innermost open
+/// highlight is therefore the one that wins, which is what the stack below tracks; the engine has
+/// already split the `Source` events at every boundary, so each one falls entirely under exactly
+/// one innermost highlight and no span produced here can ever overlap another. An injected layer
+/// (`highlight_markdown`'s own inline recursion) is no different from this app's own perspective -
+/// `tree-sitter-highlight` already interleaves an injected layer's events into this exact same
+/// flat stream in source-byte order, so this folding logic needs no injection-awareness of its
+/// own.
+///
+/// Every byte of `source` is covered, including whitespace between tokens (as explicit
+/// [`HighlightKind::Text`]). That is a real difference from the hand-rolled walker this replaced,
+/// which emitted spans only for leaf nodes and left the gaps to [`build_lines`]; the rendered
+/// result is identical either way, since `build_lines` fills any gap with exactly that same
+/// `Text`, but it means the span list here is gapless by construction rather than by downstream
+/// repair.
+///
+/// Errors are not expected to be reachable: `Error::Cancelled` requires the cancellation flag this
+/// passes `None` for, and `Error::InvalidLanguage` requires a language the config was not built
+/// with. If one does occur mid-stream, the spans accumulated so far are returned rather than
+/// discarded - partial real highlighting of a file's earlier lines is strictly better for the
+/// reader than dropping the whole file back to plain text, and matches the same best-effort
+/// posture [`highlight_block`] already documents for partial input.
+fn fold_highlight_events(
+    events: impl Iterator<Item = Result<HighlightEvent, tree_sitter_highlight::Error>>,
+) -> Vec<HighlightSpan> {
     let mut spans: Vec<HighlightSpan> = Vec::new();
     let mut open: Vec<HighlightKind> = Vec::new();
     for event in events {
@@ -2251,6 +2419,89 @@ mod tests {
         );
     }
 
+    const SAMPLE_MARKDOWN: &str = "# Title\n\nSome **bold** and *italic* text with `inline code` and a [link](https://example.com).\n\n```rust\nfn main() {}\n```\n";
+
+    /// GitHub issue #104's own core premise: without a real `injection_callback` resolving
+    /// `"markdown_inline"`, the block grammar alone never parses prose content at all, so
+    /// everything inside a paragraph collapses to one flat, unclassified `Text` span. This proves
+    /// the injection actually fires - `text_strong_...`/`text_emphasis_...` below prove the
+    /// specific captures it unlocks.
+    #[test]
+    fn inline_content_is_never_left_as_a_single_flat_text_region() {
+        let spans = highlight_markdown(SAMPLE_MARKDOWN);
+        assert!(
+            spans.iter().any(|span| span.kind != HighlightKind::Text),
+            "a real markdown document must produce at least one non-Text span - if this fails, \
+             the inline grammar injection isn't firing at all"
+        );
+    }
+
+    #[test]
+    fn markdown_heading_text_is_classified_as_heading() {
+        let spans = highlight_markdown(SAMPLE_MARKDOWN);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_MARKDOWN, "Title"),
+            HighlightKind::Heading
+        );
+    }
+
+    #[test]
+    fn markdown_bold_text_is_classified_as_strong() {
+        let spans = highlight_markdown(SAMPLE_MARKDOWN);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_MARKDOWN, "bold"),
+            HighlightKind::Strong
+        );
+    }
+
+    #[test]
+    fn markdown_italic_text_is_classified_as_emphasis() {
+        let spans = highlight_markdown(SAMPLE_MARKDOWN);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_MARKDOWN, "italic"),
+            HighlightKind::Emphasis
+        );
+    }
+
+    #[test]
+    fn markdown_inline_code_is_classified_as_literal_string() {
+        let spans = highlight_markdown(SAMPLE_MARKDOWN);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_MARKDOWN, "inline code"),
+            HighlightKind::String
+        );
+    }
+
+    #[test]
+    fn markdown_link_destination_and_label_are_classified_as_link() {
+        let spans = highlight_markdown(SAMPLE_MARKDOWN);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_MARKDOWN, "https://example.com"),
+            HighlightKind::Link,
+            "the link destination"
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_MARKDOWN, "link"),
+            HighlightKind::Link,
+            "the link's own visible label text"
+        );
+    }
+
+    /// `(code_fence_content) @none` (GitHub issue #104) must actually cancel the surrounding
+    /// `(fenced_code_block) @text.literal`'s own `String` colour for the fence's inner content -
+    /// not silently inherit it, which is what would happen if `"none"` were left unregistered in
+    /// `HIGHLIGHT_NAMES` (see that list's own docs on this exact capture).
+    #[test]
+    fn markdown_fenced_code_block_content_is_not_colored_like_a_string() {
+        let spans = highlight_markdown(SAMPLE_MARKDOWN);
+        assert_ne!(
+            kind_at(&spans, SAMPLE_MARKDOWN, "fn main"),
+            HighlightKind::String,
+            "fenced code content must not inherit the fence's own text.literal colour - this app \
+             does not (yet) inject the fence's own language, so plain Text is the honest result"
+        );
+    }
+
     /// Both halves of the TypeScript query composition, which is the single most breakable part of
     /// this migration: `tree-sitter-typescript`'s own query file defines none of these, so if the
     /// JavaScript query ever stopped being concatenated in, every one of them would silently
@@ -2440,7 +2691,8 @@ mod tests {
         assert!(highlighter_for_extension(Some("yml")).is_some());
         assert!(highlighter_for_extension(Some("c")).is_some());
         assert!(highlighter_for_extension(Some("h")).is_some());
-        assert!(highlighter_for_extension(Some("md")).is_none());
+        assert!(highlighter_for_extension(Some("md")).is_some());
+        assert!(highlighter_for_extension(Some("sql")).is_none());
         assert!(highlighter_for_extension(Some("vue")).is_none());
         assert!(highlighter_for_extension(None).is_none());
     }
@@ -2766,7 +3018,7 @@ mod tests {
 
     #[test]
     fn highlight_block_on_an_unregistered_extension_is_all_plain_text() {
-        let rendered = highlight_block(["# a heading", "some *markdown* text"], Some("md"));
+        let rendered = highlight_block(["-- a comment", "SELECT * FROM t;"], Some("sql"));
         let kinds: HashSet<HighlightKind> = rendered
             .iter()
             .flat_map(|line| &line.runs)
