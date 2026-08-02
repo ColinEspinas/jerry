@@ -135,9 +135,19 @@ jobs:
       # `workflow_dispatch` runs (no tag) publish a draft instead of a real release, so
       # manually testing this workflow never creates a public release out from under a
       # tag that doesn't exist.
+      #
+      # `generate_release_notes` asks GitHub itself (not this workflow) to diff merged
+      # PRs against the previous published release and write a "What's Changed" body -
+      # issue #92's ask, with zero new scripting since this repo's PR titles already
+      # follow the `type(scope): summary` convention (see CONTRIBUTING.md) that reads
+      # fine as a flat list without any PR-label categorization. On a `workflow_dispatch`
+      # draft there's no real tag to diff from, so the generated notes may be rougher/
+      # less precise - harmless, since that path is manual-testing-only (see `draft:`
+      # above), never a public release.
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           draft: ${{ github.event_name == 'workflow_dispatch' }}
+          generate_release_notes: true
           files: dist/*
           fail_on_unmatched_files: true
