@@ -23,6 +23,34 @@ macro_rules! agent_jump_action_handler {
     };
 }
 
+/// A tab chrome click handler - middle-click-to-close and click-to-activate share this exact
+/// shape (`&mut AdeApp, &mut Window, &mut Context<AdeApp>`), factored into a real alias per
+/// clippy's own `type_complexity` suggestion rather than spelling the `Box<dyn Fn(...)>` out
+/// twice in [`TabChromeArgs`].
+pub(crate) type TabChromeClickHandler = Box<dyn Fn(&mut AdeApp, &mut Window, &mut Context<AdeApp>)>;
+
+/// Bundles [`AdeApp::render_tab_chrome`]'s per-kind parameters to keep that function's argument
+/// count under clippy's `too_many_arguments` limit - the same reason
+/// `code_surface::file_view::HoverRenderContext` exists. `on_middle_click`/`on_activate` are
+/// boxed rather than generic type parameters so this struct itself stays non-generic (a distinct
+/// monomorphization per call site would buy nothing here - this is render-path code re-built
+/// every frame regardless).
+pub(crate) struct TabChromeArgs {
+    pub(crate) outer_id: gpui::ElementId,
+    pub(crate) hit_id: gpui::ElementId,
+    pub(crate) tab_ref: work_surface::TabRef,
+    pub(crate) drag_value: DraggedTab,
+    pub(crate) is_active: bool,
+    pub(crate) content: Vec<gpui::AnyElement>,
+    pub(crate) on_middle_click: TabChromeClickHandler,
+    pub(crate) on_activate: TabChromeClickHandler,
+    /// A real GPUI `.debug_selector` (test-only bounds lookup, distinct from `outer_id` - see
+    /// `gpui::app::test_context::VisualTestContext::debug_bounds`'s own docs), for whichever tab
+    /// kind's own tests need to simulate a real mouse event at this tab's painted position rather
+    /// than calling its close/activate handler directly. `None` for kinds with no such test.
+    pub(crate) debug_selector: Option<&'static str>,
+}
+
 impl AdeApp {
     /// Spawns a new agent tab into [`Self::active_agent_cwd`] - the single real chokepoint every
     /// "new terminal"/"new shell" entry point in this app funnels through: `secondary-n`/
@@ -512,7 +540,7 @@ impl AdeApp {
     /// the two apart. A no-op while the dragged tab is hovering over *itself* - dropping a tab on
     /// its own slot is always a no-op ([`work_surface::state::move_tab_order`]'s own docs), so no
     /// caret should invite it either.
-    pub(crate) fn update_tab_drag_insertion(
+    pub(in crate::work_surface) fn update_tab_drag_insertion(
         &mut self,
         hovered: &work_surface::TabRef,
         event: &DragMoveEvent<DraggedTab>,
@@ -537,7 +565,7 @@ impl AdeApp {
     /// drop lands on a tab [`Self::update_tab_drag_insertion`] never actually recorded for - a
     /// drop can still fire on a tab the cursor technically never entered, e.g. a very fast
     /// release), then delegates to [`Self::reorder_tab`], and clears the now-stale caret state.
-    pub(crate) fn drop_dragged_tab(
+    pub(in crate::work_surface) fn drop_dragged_tab(
         &mut self,
         dragged: work_surface::TabRef,
         target: work_surface::TabRef,
@@ -560,7 +588,7 @@ impl AdeApp {
     /// cursor. A plain method (not inlined into the closure) so it's directly testable without
     /// simulating a real GPUI drag gesture, matching [`Self::update_tab_drag_insertion`]/
     /// [`Self::drop_dragged_tab`]'s own precedent.
-    pub(crate) fn start_dragging_tab(
+    pub(in crate::work_surface) fn start_dragging_tab(
         &mut self,
         tab_ref: work_surface::TabRef,
         cx: &mut Context<Self>,
@@ -749,6 +777,151 @@ impl AdeApp {
         (1..=agent_count).map(|n| n.to_string()).collect()
     }
 
+    /// Every tab kind's own `×` close hit box - identical id-suffixing, size, hover, and styling
+    /// regardless of which kind renders it (GitHub issue #103). Before this, `render_file_tab`/
+    /// `render_agent_tab`/`render_graph_tab` each hand-rolled their own copy, which is exactly
+    /// how GitHub issue #96 happened: two of three tab kinds grew a real close button and one
+    /// silently didn't, because no single place guaranteed every kind got the same treatment.
+    /// `tooltip` is `Some` only for [`Self::render_file_tab`]'s own two-gesture "close without
+    /// saving?" cue (GitHub issue #26); every other kind passes `None`.
+    pub(crate) fn render_tab_close_button(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        close_color: theme::ColorToken,
+        tooltip: Option<&'static str>,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(id.into())
+            .w(px(15.0))
+            .h(px(15.0))
+            .rounded(theme::radius::CHIP)
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|el| el.bg(theme::surface::TAB_CLOSE_HOVER))
+            .font(font(theme::font::MONO))
+            .text_size(px(11.0))
+            .text_color(close_color)
+            .child("\u{d7}")
+            .when_some(tooltip, |el, text| el.tooltip(text_tooltip(text)))
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                on_click(this, window, cx);
+            }))
+    }
+
+    /// The shared tab "chrome" every `render_*_tab` wraps its own content in (GitHub issue
+    /// #103): the border, active/inactive background and underline (`work_surface::tab_colors`),
+    /// the opacity dim while this tab's own drag ghost is the real thing following the cursor,
+    /// the full `on_drag`/`on_drag_move`/`on_drop` wiring (GitHub issue #16's unified
+    /// drag-to-reorder system - see [`DraggedTab`]'s own docs), the insertion caret, middle-click
+    /// close, and the drop settle-fade (GitHub issue #16 §5). Every real per-kind visual (chip,
+    /// label, dirty/status dot, the close button itself) is still supplied by the caller as
+    /// `args.content`, in the order it should render - only the chrome around it is shared now,
+    /// which is what makes the exact bug class GitHub issue #96 was structurally impossible:
+    /// there is now exactly one place that wires drag/close/settle-fade for every tab kind, not
+    /// three.
+    pub(crate) fn render_tab_chrome(
+        &self,
+        args: TabChromeArgs,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let TabChromeArgs {
+            outer_id,
+            hit_id,
+            tab_ref,
+            drag_value,
+            is_active,
+            content,
+            on_middle_click,
+            on_activate,
+            debug_selector,
+        } = args;
+        let colors = work_surface::tab_colors(is_active);
+        let insertion_caret = match &self.tab_drag_insertion {
+            Some((target, insert_after)) if *target == tab_ref => Some(*insert_after),
+            _ => None,
+        };
+        let is_dragging = self.dragging_tab.as_ref() == Some(&tab_ref);
+        let settle_animation_id = tab_settle_animation_id(&self.dropped_tab_settle, &tab_ref);
+        let this_entity = cx.entity();
+        let tab_ref_for_drag = tab_ref.clone();
+        let tab_ref_for_drag_move = tab_ref.clone();
+        let tab_ref_for_drop = tab_ref;
+
+        let tab_div = div()
+            .id(outer_id)
+            .when_some(debug_selector, |el, selector| {
+                el.debug_selector(move || selector.to_string())
+            })
+            .relative()
+            .flex()
+            .flex_none()
+            .flex_col()
+            .border_r_1()
+            .border_color(theme::border::INNER)
+            .bg(colors.bg)
+            .when(is_dragging, |el| el.opacity(0.4))
+            .on_mouse_down(
+                gpui::MouseButton::Middle,
+                cx.listener(move |this, _event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    on_middle_click(this, window, cx);
+                }),
+            )
+            .on_drag(drag_value, move |dragged, _position, _window, cx| {
+                this_entity.update(cx, |this, cx| {
+                    this.start_dragging_tab(tab_ref_for_drag.clone(), cx);
+                });
+                cx.new(|_| dragged.clone())
+            })
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<DraggedTab>, _window, cx| {
+                    this.update_tab_drag_insertion(&tab_ref_for_drag_move, event, cx);
+                },
+            ))
+            .on_drop(cx.listener(move |this, dragged: &DraggedTab, _window, cx| {
+                this.drop_dragged_tab(dragged.tab_ref(), tab_ref_for_drop.clone(), cx);
+            }))
+            .when_some(insertion_caret, |el, insert_after| {
+                el.child(render_tab_insertion_caret(insert_after))
+            })
+            .child(
+                div()
+                    .id(hit_id)
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .px(px(13.0))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                        on_activate(this, window, cx);
+                    }))
+                    .children(content),
+            )
+            .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline));
+
+        // A real drop's own settle-in fade (GitHub issue #16's "dropping animates the tab
+        // settling into its slot") - see `tab_settle_animation_id`'s own docs for why a fresh id
+        // is required, and why this branches to `gpui::AnyElement` rather than a plain
+        // `.when_some` (`gpui::AnimationExt::with_animation` returns a different wrapper type,
+        // not `Self`).
+        match settle_animation_id {
+            Some(id) => tab_div
+                .with_animation(
+                    id,
+                    Animation::new(TAB_SETTLE_ANIMATION_DURATION),
+                    |el, delta| el.opacity(0.55 + 0.45 * delta),
+                )
+                .into_any_element(),
+            None => tab_div.into_any_element(),
+        }
+    }
+
     /// A file tab: language chip (`file_tree::lang_chip_for_name`, dimmed via
     /// `work_surface::file_tab_chip_colors` when inactive), file name, and a close hit box.
     /// Clicking the body activates the tab ([`Self::activate_file_tab`]); clicking `×`, middle-
@@ -799,158 +972,78 @@ impl AdeApp {
             path: path.to_path_buf(),
             label: file_name.clone(),
         };
-        let insertion_caret = match &self.tab_drag_insertion {
-            Some((target, insert_after)) if *target == tab_ref => Some(*insert_after),
-            _ => None,
-        };
-        let is_dragging = self.dragging_tab.as_ref() == Some(&tab_ref);
-        let settle_animation_id = tab_settle_animation_id(&self.dropped_tab_settle, &tab_ref);
-        let this_entity = cx.entity();
-        let tab_ref_for_drag = tab_ref.clone();
 
-        let tab_div = div()
-            .id(format!("file-tab-{key}"))
-            .relative()
-            .flex()
-            .flex_none()
-            .flex_col()
-            .border_r_1()
-            .border_color(theme::border::INNER)
-            .bg(colors.bg)
-            // The original slot dims while its own drag ghost (`DraggedTab::render`) is the real
-            // thing following the cursor (GitHub issue #16's "the original slot renders dimmed"
-            // ask) - `Self::dragging_tab`'s own docs on why this can't be derived from GPUI's
-            // `has_active_drag()` alone (no public access to *which* tab is being dragged).
-            .when(is_dragging, |el| el.opacity(0.4))
-            // Middle-click closes any file tab outright (GitHub issue #26), same real
-            // `request_close_file_tab` entry point as `×`/`Ctrl+W` - so a dirty tab still gets the
-            // real unsaved-changes confirmation rather than a middle-click silently bypassing it.
-            .on_mouse_down(
-                gpui::MouseButton::Middle,
-                cx.listener(move |this, _event: &gpui::MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
+        let close_button = self.render_tab_close_button(
+            format!("close-file-tab-{key}"),
+            close_color,
+            // Real, visible confirmation cue (GitHub issue #26) - see `close_color`'s own docs
+            // above for why `is_close_armed` never leaves this a silent internal-only flag.
+            is_close_armed.then_some("Unsaved changes - click × again to close without saving"),
+            move |this, window, cx| {
+                this.request_close_file_tab(close_path.clone(), window, cx);
+            },
+            cx,
+        );
+        let mut content: Vec<gpui::AnyElement> = vec![
+            div()
+                .flex_none()
+                .w(px(14.0))
+                .h(px(14.0))
+                .rounded(theme::radius::CHIP)
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(chip_colors.bg)
+                .font(font(theme::font::MONO))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_size(px(7.0))
+                .text_color(chip_colors.fg)
+                .child(lang.label)
+                .into_any_element(),
+            div()
+                .font(font(theme::font::MONO))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_size(self.ui_text_size(11.0))
+                .text_color(colors.label)
+                .child(file_name)
+                .into_any_element(),
+        ];
+        if is_dirty {
+            content.push(
+                div()
+                    .id(format!("file-tab-dirty-{key}"))
+                    .flex_none()
+                    .w(px(6.0))
+                    .h(px(6.0))
+                    .rounded(theme::radius::CHIP)
+                    .bg(theme::status::ASK)
+                    .into_any_element(),
+            );
+        }
+        content.push(close_button.into_any_element());
+
+        self.render_tab_chrome(
+            TabChromeArgs {
+                outer_id: format!("file-tab-{key}").into(),
+                hit_id: format!("file-tab-hit-{key}").into(),
+                tab_ref,
+                drag_value,
+                is_active,
+                content,
+                // Middle-click closes any file tab outright (GitHub issue #26), same real
+                // `request_close_file_tab` entry point as `×`/`Ctrl+W` - so a dirty tab still
+                // gets the real unsaved-changes confirmation rather than a middle-click silently
+                // bypassing it.
+                on_middle_click: Box::new(move |this, window, cx| {
                     this.request_close_file_tab(middle_click_path.clone(), window, cx);
                 }),
-            )
-            // Real drag-to-reorder, unified across agent and file tabs (GitHub issue #16) -
-            // see `DraggedTab`'s own docs for the shared mechanism. Also records
-            // `Self::dragging_tab` so this tab's own slot can dim itself above - `on_drag`'s own
-            // constructor callback only receives `&mut App`, not `Context<Self>`, hence the
-            // captured `this_entity` handle to reach back into `AdeApp` from it.
-            .on_drag(drag_value, move |dragged, _position, _window, cx| {
-                this_entity.update(cx, |this, cx| {
-                    this.start_dragging_tab(tab_ref_for_drag.clone(), cx);
-                });
-                cx.new(|_| dragged.clone())
-            })
-            .on_drag_move(cx.listener({
-                let tab_ref = tab_ref.clone();
-                move |this, event: &DragMoveEvent<DraggedTab>, _window, cx| {
-                    this.update_tab_drag_insertion(&tab_ref, event, cx);
-                }
-            }))
-            .on_drop(cx.listener({
-                let target = tab_ref.clone();
-                move |this, dragged: &DraggedTab, _window, cx| {
-                    this.drop_dragged_tab(dragged.tab_ref(), target.clone(), cx);
-                }
-            }))
-            .when_some(insertion_caret, |el, insert_after| {
-                el.child(render_tab_insertion_caret(insert_after))
-            })
-            .child(
-                div()
-                    .id(format!("file-tab-hit-{key}"))
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .gap(px(7.0))
-                    .px(px(13.0))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                        this.activate_file_tab(activate_path.clone(), window, cx);
-                    }))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(14.0))
-                            .h(px(14.0))
-                            .rounded(theme::radius::CHIP)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(chip_colors.bg)
-                            .font(font(theme::font::MONO))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(px(7.0))
-                            .text_color(chip_colors.fg)
-                            .child(lang.label),
-                    )
-                    .child(
-                        div()
-                            .font(font(theme::font::MONO))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(self.ui_text_size(11.0))
-                            .text_color(colors.label)
-                            .child(file_name),
-                    )
-                    .when(is_dirty, |el| {
-                        el.child(
-                            div()
-                                .id(format!("file-tab-dirty-{key}"))
-                                .flex_none()
-                                .w(px(6.0))
-                                .h(px(6.0))
-                                .rounded(theme::radius::CHIP)
-                                .bg(theme::status::ASK),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id(format!("close-file-tab-{key}"))
-                            .w(px(15.0))
-                            .h(px(15.0))
-                            .rounded(theme::radius::CHIP)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .hover(|el| el.bg(theme::surface::TAB_CLOSE_HOVER))
-                            .font(font(theme::font::MONO))
-                            .text_size(px(11.0))
-                            .text_color(close_color)
-                            .child("\u{d7}")
-                            // Real, visible confirmation cue (GitHub issue #26) - see
-                            // `close_color`'s own docs above for why `is_close_armed` never leaves
-                            // this a silent internal-only flag.
-                            .when(is_close_armed, |el| {
-                                el.tooltip(text_tooltip(
-                                    "Unsaved changes - click × again to close without saving",
-                                ))
-                            })
-                            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                                cx.stop_propagation();
-                                this.request_close_file_tab(close_path.clone(), window, cx);
-                            })),
-                    ),
-            )
-            .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline));
-
-        // A real drop's own settle-in fade (GitHub issue #16's "dropping animates the tab
-        // settling into its slot") - see `tab_settle_animation_id`'s own docs for why a fresh id
-        // is required, and why this branches to `gpui::AnyElement` rather than a plain
-        // `.when_some` (`gpui::AnimationExt::with_animation` returns a different wrapper type,
-        // not `Self`).
-        match settle_animation_id {
-            Some(id) => tab_div
-                .with_animation(
-                    id,
-                    Animation::new(TAB_SETTLE_ANIMATION_DURATION),
-                    |el, delta| el.opacity(0.55 + 0.45 * delta),
-                )
-                .into_any_element(),
-            None => tab_div.into_any_element(),
-        }
+                on_activate: Box::new(move |this, window, cx| {
+                    this.activate_file_tab(activate_path.clone(), window, cx);
+                }),
+                debug_selector: None,
+            },
+            cx,
+        )
     }
 
     /// The tab strip's `+` menu button - toggles [`Self::plus_menu_open`] (unconditionally
@@ -1393,10 +1486,6 @@ impl AdeApp {
         // colour from, so the tab strip can never disagree with either about what state an
         // agent is in.
         let status_color: gpui::Rgba = self.agent_status(agent, cx).color();
-        // GitHub issue #96: every other tab kind (`Self::render_file_tab`, `render_graph_tab`)
-        // has always had a real, clickable `×` in this same spot - agent tabs never actually
-        // grew one despite this function's own doc comment above claiming they had, leaving
-        // middle-click (GitHub issue #26) as the only, undiscoverable way to close one.
         let close_color = if is_active {
             theme::text::DIMMER
         } else {
@@ -1407,132 +1496,61 @@ impl AdeApp {
             id,
             label: label.clone(),
         };
-        let insertion_caret = match &self.tab_drag_insertion {
-            Some((target, insert_after)) if *target == tab_ref => Some(*insert_after),
-            _ => None,
-        };
-        let is_dragging = self.dragging_tab.as_ref() == Some(&tab_ref);
-        let settle_animation_id = tab_settle_animation_id(&self.dropped_tab_settle, &tab_ref);
-        let this_entity = cx.entity();
-        let tab_ref_for_drag = tab_ref.clone();
 
-        let tab_div = div()
-            .id(("agent-tab", id))
-            .relative()
-            .flex()
-            .flex_none()
-            .flex_col()
-            .border_r_1()
-            .border_color(theme::border::INNER)
-            .bg(colors.bg)
-            // The original slot dims while its own drag ghost is the real thing following the
-            // cursor - see `Self::render_file_tab`'s identical `is_dragging` handling for why.
-            .when(is_dragging, |el| el.opacity(0.4))
-            // Middle-click closes any agent/terminal tab too (GitHub issue #26) - the same
-            // `Self::close_agent` real teardown (`TerminalPane::shutdown`'s SIGHUP/grace/
-            // SIGKILL - see that method's own docs) every other close path already uses.
-            .on_mouse_down(
-                gpui::MouseButton::Middle,
-                cx.listener(move |this, _event: &gpui::MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
+        let close_button = self.render_tab_close_button(
+            ("close-agent-tab", id),
+            close_color,
+            None,
+            move |this, window, cx| {
+                this.close_agent(id, window, cx);
+            },
+            cx,
+        );
+        let content: Vec<gpui::AnyElement> = vec![
+            render_tab_chip(agent.kind, is_active).into_any_element(),
+            div()
+                .font(font(if is_mono {
+                    theme::font::MONO
+                } else {
+                    theme::font::SANS
+                }))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_size(self.ui_text_size(if is_mono { 11.0 } else { 11.5 }))
+                .text_color(colors.label)
+                .child(label)
+                .into_any_element(),
+            div()
+                .flex_none()
+                .w(px(5.0))
+                .h(px(5.0))
+                .rounded(px(2.5))
+                .bg(status_color)
+                .into_any_element(),
+            close_button.into_any_element(),
+        ];
+
+        self.render_tab_chrome(
+            TabChromeArgs {
+                outer_id: ("agent-tab", id).into(),
+                hit_id: ("agent-tab-hit", id).into(),
+                tab_ref,
+                drag_value,
+                is_active,
+                content,
+                // Middle-click closes any agent/terminal tab too (GitHub issue #26) - the same
+                // `Self::close_agent` real teardown (`TerminalPane::shutdown`'s SIGHUP/grace/
+                // SIGKILL - see that method's own docs) every other close path already uses.
+                on_middle_click: Box::new(move |this, window, cx| {
                     this.close_agent(id, window, cx);
                     cx.notify();
                 }),
-            )
-            // Real drag-to-reorder, unified across agent and file tabs (GitHub issue #16) -
-            // see `DraggedTab`'s own docs for the shared mechanism. No `can_drop` predicate
-            // needed - the `on_drop::<DraggedTab>` type parameter alone already rejects a drop of
-            // any other dragged-value type. Also records `Self::dragging_tab` - see
-            // `Self::render_file_tab`'s identical wiring for why `this_entity` is captured.
-            .on_drag(drag_value, move |dragged, _position, _window, cx| {
-                this_entity.update(cx, |this, cx| {
-                    this.start_dragging_tab(tab_ref_for_drag.clone(), cx);
-                });
-                cx.new(|_| dragged.clone())
-            })
-            .on_drag_move(cx.listener({
-                let tab_ref = tab_ref.clone();
-                move |this, event: &DragMoveEvent<DraggedTab>, _window, cx| {
-                    this.update_tab_drag_insertion(&tab_ref, event, cx);
-                }
-            }))
-            .on_drop(cx.listener({
-                let target = tab_ref.clone();
-                move |this, dragged: &DraggedTab, _window, cx| {
-                    this.drop_dragged_tab(dragged.tab_ref(), target.clone(), cx);
-                }
-            }))
-            .when_some(insertion_caret, |el, insert_after| {
-                el.child(render_tab_insertion_caret(insert_after))
-            })
-            .child(
-                div()
-                    .id(("agent-tab-hit", id))
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .gap(px(7.0))
-                    .px(px(13.0))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                        this.select_agent(id, window, cx);
-                    }))
-                    .child(render_tab_chip(agent.kind, is_active))
-                    .child(
-                        div()
-                            .font(font(if is_mono {
-                                theme::font::MONO
-                            } else {
-                                theme::font::SANS
-                            }))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(self.ui_text_size(if is_mono { 11.0 } else { 11.5 }))
-                            .text_color(colors.label)
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(5.0))
-                            .h(px(5.0))
-                            .rounded(px(2.5))
-                            .bg(status_color),
-                    )
-                    .child(
-                        div()
-                            .id(("close-agent-tab", id))
-                            .w(px(15.0))
-                            .h(px(15.0))
-                            .rounded(theme::radius::CHIP)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .hover(|el| el.bg(theme::surface::TAB_CLOSE_HOVER))
-                            .font(font(theme::font::MONO))
-                            .text_size(px(11.0))
-                            .text_color(close_color)
-                            .child("\u{d7}")
-                            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                                cx.stop_propagation();
-                                this.close_agent(id, window, cx);
-                            })),
-                    ),
-            )
-            .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline));
-
-        // A real drop's own settle-in fade - see `Self::render_file_tab`'s identical handling
-        // for why this branches to `gpui::AnyElement`.
-        match settle_animation_id {
-            Some(id) => tab_div
-                .with_animation(
-                    id,
-                    Animation::new(TAB_SETTLE_ANIMATION_DURATION),
-                    |el, delta| el.opacity(0.55 + 0.45 * delta),
-                )
-                .into_any_element(),
-            None => tab_div.into_any_element(),
-        }
+                on_activate: Box::new(move |this, window, cx| {
+                    this.select_agent(id, window, cx);
+                }),
+                debug_selector: None,
+            },
+            cx,
+        )
     }
 
     /// The agent context bar: agent badge/name, a divider, branch, the worktree path (the one
@@ -2414,7 +2432,7 @@ impl DraggedTab {
 
     /// This dragged value's own identity as a [`work_surface::TabRef`] - what
     /// [`AdeApp::reorder_tab`] actually moves, regardless of which concrete kind was dragged.
-    pub(crate) fn tab_ref(&self) -> work_surface::TabRef {
+    pub(in crate::work_surface) fn tab_ref(&self) -> work_surface::TabRef {
         match self {
             DraggedTab::Agent { id, .. } => work_surface::TabRef::Agent(*id),
             DraggedTab::File { path, .. } => work_surface::TabRef::File(path.clone()),
@@ -2449,7 +2467,7 @@ impl Render for DraggedTab {
 /// edge if `insert_after` is `true` (immediately after) - replacing the old whole-tab `border_l`
 /// highlight, which never distinguished "before" from "after" the hovered tab, with an
 /// unambiguous "it lands exactly here" caret instead.
-pub(crate) fn render_tab_insertion_caret(insert_after: bool) -> impl IntoElement {
+pub(in crate::work_surface) fn render_tab_insertion_caret(insert_after: bool) -> impl IntoElement {
     div()
         .absolute()
         .top(px(0.0))
@@ -2462,7 +2480,8 @@ pub(crate) fn render_tab_insertion_caret(insert_after: bool) -> impl IntoElement
 
 /// How long a dropped tab's own settle-in fade runs - short and non-blocking, matching the
 /// design handoff's own "animations are short (~120-180ms)" ask (GitHub issue #16 §5).
-pub(crate) const TAB_SETTLE_ANIMATION_DURATION: Duration = Duration::from_millis(150);
+pub(in crate::work_surface) const TAB_SETTLE_ANIMATION_DURATION: Duration =
+    Duration::from_millis(150);
 
 /// A fresh `gpui::AnimationExt::with_animation` id for `tab_ref`, if [`AdeApp::dropped_tab_settle`]
 /// says it's the tab a real drop most recently placed - `None` for every other tab, and for a
@@ -2472,7 +2491,7 @@ pub(crate) const TAB_SETTLE_ANIMATION_DURATION: Duration = Duration::from_millis
 /// (`vendor/zed/crates/gpui/src/elements/animation.rs`'s `AnimationState`) - reusing the same id
 /// across two different drops of the same tab would resume the *first* drop's already-finished
 /// animation instead of starting a fresh one.
-pub(crate) fn tab_settle_animation_id(
+pub(in crate::work_surface) fn tab_settle_animation_id(
     settle: &Option<(work_surface::TabRef, u64)>,
     tab_ref: &work_surface::TabRef,
 ) -> Option<String> {

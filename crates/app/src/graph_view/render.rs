@@ -6,11 +6,8 @@ use super::*;
 use crate::root::widgets::{render_sidebar_message, render_tag_pill};
 use crate::settings::widgets;
 use crate::sidebar::changes;
-use crate::work_surface::render::{
-    render_dropdown_menu_row, render_tab_insertion_caret, tab_settle_animation_id, DraggedTab,
-    TAB_SETTLE_ANIMATION_DURATION,
-};
-use gpui::{Animation, AnimationExt, BoxShadow, DragMoveEvent, KeyDownEvent, Pixels};
+use crate::work_surface::render::{render_dropdown_menu_row, DraggedTab, TabChromeArgs};
+use gpui::{BoxShadow, KeyDownEvent, Pixels};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use wt_core::graph::{DotKind, ElbowKind, Graph, GraphRow, GraphScope, RefKind};
 
@@ -584,118 +581,53 @@ pub(crate) fn render_graph_tab(app: &AdeApp, cx: &mut Context<AdeApp>) -> gpui::
     let drag_value = DraggedTab::Graph {
         label: "Git graph".to_string(),
     };
-    let insertion_caret = match &app.tab_drag_insertion {
-        Some((target, insert_after)) if *target == tab_ref => Some(*insert_after),
-        _ => None,
-    };
-    let is_dragging = app.dragging_tab.as_ref() == Some(&tab_ref);
-    let settle_animation_id = tab_settle_animation_id(&app.dropped_tab_settle, &tab_ref);
-    let this_entity = cx.entity();
-    let tab_ref_for_drag = tab_ref.clone();
 
-    let tab_div = div()
-        .id("graph-tab")
-        .debug_selector(|| "graph-tab".to_string())
-        .relative()
-        .flex()
-        .flex_none()
-        .flex_col()
-        .border_r_1()
-        .border_color(theme::border::INNER)
-        .bg(colors.bg)
-        // Mirrors `AdeApp::render_file_tab`'s own dimmed-original-slot precedent (GitHub issue
-        // #16) - see `AdeApp::dragging_tab`'s own docs for why this can't be derived from GPUI's
-        // `has_active_drag()` alone.
-        .when(is_dragging, |el| el.opacity(0.4))
-        // Middle-click closes the graph tab too (GitHub issue #26) - the same real
-        // `close_git_graph_tab` teardown the `×` button already uses, matching file/agent tabs.
-        .on_mouse_down(
-            gpui::MouseButton::Middle,
-            cx.listener(move |this, _event: &gpui::MouseDownEvent, window, cx| {
-                cx.stop_propagation();
+    let close_button = app.render_tab_close_button(
+        "close-graph-tab",
+        close_color,
+        None,
+        |this, window, cx| {
+            this.close_git_graph_tab(window, cx);
+        },
+        cx,
+    );
+    let content: Vec<gpui::AnyElement> = vec![
+        render_graph_tab_chip().into_any_element(),
+        div()
+            .font(font(theme::font::MONO))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(app.ui_text_size(11.0))
+            .text_color(colors.label)
+            .child("Git graph")
+            .into_any_element(),
+        close_button.into_any_element(),
+    ];
+
+    app.render_tab_chrome(
+        TabChromeArgs {
+            outer_id: "graph-tab".into(),
+            hit_id: "graph-tab-hit".into(),
+            tab_ref,
+            drag_value,
+            is_active,
+            content,
+            // Middle-click closes the graph tab too (GitHub issue #26) - the same real
+            // `close_git_graph_tab` teardown the `×` button already uses, matching file/agent
+            // tabs.
+            on_middle_click: Box::new(|this, window, cx| {
                 this.close_git_graph_tab(window, cx);
             }),
-        )
-        // Real drag-to-reorder, unified with agent/file tabs (GitHub issue #93) - see
-        // `AdeApp::render_file_tab`'s own docs for the shared mechanism.
-        .on_drag(drag_value, move |dragged, _position, _window, cx| {
-            this_entity.update(cx, |this, cx| {
-                this.start_dragging_tab(tab_ref_for_drag.clone(), cx);
-            });
-            cx.new(|_| dragged.clone())
-        })
-        .on_drag_move(cx.listener({
-            let tab_ref = tab_ref.clone();
-            move |this, event: &DragMoveEvent<DraggedTab>, _window, cx| {
-                this.update_tab_drag_insertion(&tab_ref, event, cx);
-            }
-        }))
-        .on_drop(cx.listener({
-            let target = tab_ref.clone();
-            move |this, dragged: &DraggedTab, _window, cx| {
-                this.drop_dragged_tab(dragged.tab_ref(), target.clone(), cx);
-            }
-        }))
-        .when_some(insertion_caret, |el, insert_after| {
-            el.child(render_tab_insertion_caret(insert_after))
-        })
-        .child(
-            div()
-                .id("graph-tab-hit")
-                .flex_1()
-                .flex()
-                .items_center()
-                .gap(px(7.0))
-                .px(px(13.0))
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                    this.open_git_graph(window, cx);
-                }))
-                .child(render_graph_tab_chip())
-                .child(
-                    div()
-                        .font(font(theme::font::MONO))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_size(app.ui_text_size(11.0))
-                        .text_color(colors.label)
-                        .child("Git graph"),
-                )
-                .child(
-                    div()
-                        .id("close-graph-tab")
-                        .w(px(15.0))
-                        .h(px(15.0))
-                        .rounded(theme::radius::CHIP)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .hover(|el| el.bg(theme::surface::TAB_CLOSE_HOVER))
-                        .font(font(theme::font::MONO))
-                        .text_size(px(11.0))
-                        .text_color(close_color)
-                        .child("\u{d7}")
-                        .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.close_git_graph_tab(window, cx);
-                        })),
-                ),
-        )
-        .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline));
-
-    // A real drop's own settle-in fade (GitHub issue #16 §5, extended to the graph tab by
-    // GitHub issue #93) - see `tab_settle_animation_id`'s own docs for why this branches to
-    // `gpui::AnyElement` rather than a plain `.when_some`.
-    match settle_animation_id {
-        Some(id) => tab_div
-            .with_animation(
-                id,
-                Animation::new(TAB_SETTLE_ANIMATION_DURATION),
-                |el, delta| el.opacity(0.55 + 0.45 * delta),
-            )
-            .into_any_element(),
-        None => tab_div.into_any_element(),
-    }
+            on_activate: Box::new(|this, window, cx| {
+                this.open_git_graph(window, cx);
+            }),
+            // `middle_clicking_the_graph_tab_closes_it_like_every_other_tab_kind`'s own real
+            // mouse-position simulation (`cx.debug_bounds("graph-tab")`) needs this - the only
+            // tab-kind test that simulates a real click rather than calling the close handler
+            // directly.
+            debug_selector: Some("graph-tab"),
+        },
+        cx,
+    )
 }
 
 /// The tab's own fork-glyph chip: `#2a2030` bg, `#c98fbf` fork glyph drawn from four rects (two
