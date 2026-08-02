@@ -251,6 +251,26 @@ impl AdeApp {
                     window.start_window_move();
                 }
             }))
+            // GitHub issue #106: double-clicking empty title-bar space must maximize/restore the
+            // window, the same real OS convention every native title bar gives for free -
+            // matching `vendor/zed/crates/platform_title_bar/src/platform_title_bar.rs`'s own
+            // split: macOS gets `Window::titlebar_double_click` (the real "zoom" gesture macOS
+            // itself defines, which can also *minimize* depending on the user's own System
+            // Settings, unlike a plain maximize toggle), everywhere else gets `Window::
+            // zoom_window`. [`Self::render_windows_caption_buttons`]'s own maximize button
+            // already calls `zoom_window` too, so this is the same real control, not a second
+            // one. `ClickEvent::click_count()` (not two `on_mouse_down` events) is GPUI's own
+            // real double-click detection, consistent with every other click handler in this
+            // app.
+            .on_click(cx.listener(move |_this, event: &ClickEvent, window, _cx| {
+                if event.click_count() == 2 {
+                    if macos {
+                        window.titlebar_double_click();
+                    } else {
+                        window.zoom_window();
+                    }
+                }
+            }))
             .child(if macos {
                 self.render_macos_title_bar_left()
             } else {
@@ -551,6 +571,39 @@ mod caption_button_tests {
             "clicking the real close caption button should have called the real \
              `Window::remove_window`, closing this window - the exact same real GPUI window- \
              control API the macOS dot cluster's own close dot already used"
+        );
+    }
+
+    /// GitHub issue #106's own real `click_count() == 2` guard on the title bar's double-click-
+    /// to-maximize handler - a *single* click on empty title-bar space must not call `Window::
+    /// zoom_window`/`Window::titlebar_double_click` at all. The positive case (a real double
+    /// click really does maximize) can't be driven live here for the same reason minimise/
+    /// maximise have no live-click test above: the test backend's `zoom_window`/
+    /// `titlebar_double_click` are `unimplemented!()` and would panic the test process - verified
+    /// manually against a real running window instead. This test is what a bug letting a *single*
+    /// click reach that same call would actually crash, so it's real coverage of the guard, not a
+    /// placeholder.
+    #[gpui::test]
+    fn a_single_click_on_empty_title_bar_space_never_reaches_the_maximize_call(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        let _ = app;
+
+        // Well clear of the left cluster (macOS dots / Windows-Linux menu labels) and the right
+        // caption buttons - genuinely empty title-bar space, the same area a real double-click
+        // would land on to maximize the window.
+        cx.simulate_click(gpui::point(px(400.0), px(19.0)), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.windows().len(),
+            1,
+            "a single click must never reach the real zoom/maximize call - if it did, the test \
+             backend's own `unimplemented!()` for that call would have panicked this test process \
+             instead of reaching this assertion"
         );
     }
 }
