@@ -352,6 +352,7 @@ impl AdeApp {
             tab_order_owned: std::collections::BTreeSet::new(),
             _tab_order_save_task: None,
             tab_drag_insertion: None,
+            dragging_tab: None,
             custom_themes,
             custom_theme_load_errors,
             custom_theme_status: None,
