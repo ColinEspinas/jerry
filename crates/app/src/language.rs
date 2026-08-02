@@ -549,7 +549,8 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
         chip_colors: theme::lang::MD,
         lsp: None,
         settings_row: None,
-        highlighter: None,
+        // Real `tree-sitter-md` block+inline grammar, GitHub issue #104.
+        highlighter: Some(crate::code_surface::code_view::highlight_markdown),
     },
     ExtensionEntry {
         extension: "sql",
@@ -1260,7 +1261,8 @@ mod tests {
         assert_eq!(
             with_highlighter,
             vec![
-                "c", "go", "h", "js", "json", "jsx", "py", "rs", "toml", "ts", "tsx", "yaml", "yml"
+                "c", "go", "h", "js", "json", "jsx", "md", "py", "rs", "toml", "ts", "tsx", "yaml",
+                "yml"
             ],
             "this is the real, current set of extensions with a genuine tree-sitter grammar \
              dependency - a change here should be a deliberate decision, not a silent drift"
@@ -1268,12 +1270,12 @@ mod tests {
     }
 
     /// The other half of the same guard: extensions with no real `tree-sitter` grammar dependency
-    /// in this workspace (Markdown/SQL never had one - GitHub issue #32's own stated remaining
-    /// scope; Vue's lack of one is independent of whether it spawns a real server) must not carry
-    /// a stray, fabricated `highlighter`.
+    /// in this workspace (SQL never had one - GitHub issue #32's own stated remaining scope;
+    /// Vue's lack of one is independent of whether it spawns a real server; Markdown gained a
+    /// real one in GitHub issue #104) must not carry a stray, fabricated `highlighter`.
     #[test]
     fn extensions_with_no_real_grammar_have_no_highlighter_wired() {
-        for ext in ["md", "sql", "vue"] {
+        for ext in ["sql", "vue"] {
             let entry = entry_for_extension(Some(ext))
                 .unwrap_or_else(|| panic!("{ext} should have a real registry entry"));
             assert!(

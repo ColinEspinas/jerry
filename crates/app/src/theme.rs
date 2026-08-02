@@ -659,6 +659,30 @@ pub mod syntax {
     /// capture covers - not worth a colour of its own.
     pub const EMBEDDED: ColorToken = TEXT;
 
+    /// GitHub issue #104's own real, prose-specific buckets - Markdown's `text.title`/
+    /// `text.uri`/`text.reference`/`text.emphasis`/`text.strong` have no reasonable existing
+    /// code-highlighting analog (unlike every other capture this app has ever wired, which is
+    /// force-fittable onto an existing bucket - see this module's own fallback-chain docs above),
+    /// so they get their own honestly-named [`crate::code_surface::code_view::HighlightKind`]
+    /// variants and real, distinct hues rather than a confusing reuse of e.g. `KEYWORD` for a
+    /// heading. Real, chosen values, not yet visually verified in a running window (this
+    /// environment cannot screenshot GPUI output) - see that limitation noted in this repo's own
+    /// session history.
+    pub const HEADING: ColorToken = TYPE;
+    /// `text.uri`/`text.reference` (a link's destination and its visible label/text) - reuses
+    /// [`FUNCTION`]'s blue, the conventional "this is a link" hue in most editors/themes.
+    pub const LINK: ColorToken = FUNCTION;
+    /// `text.strong` (`**bold**`) - a real, distinct hue since this app's rendering pipeline has
+    /// no per-run font-weight support yet (`RenderedLine::runs` only carries `(SharedString,
+    /// HighlightKind)` - no style/weight field), so a colour is the only real signal available
+    /// for now; a brighter tint of [`TEXT`] rather than [`TEXT`] itself, so bold prose still reads
+    /// as more prominent than plain text even without real bold rendering.
+    pub const STRONG: ColorToken = hex(0xd4dae4);
+    /// `text.emphasis` (`*italic*`) - same real font-style limitation as [`STRONG`]; a soft
+    /// lavender, distinct from [`super::syntax::KEYWORD`]'s stronger purple, so emphasis reads as
+    /// a milder stylistic cue rather than a structural one.
+    pub const EMPHASIS: ColorToken = hex(0xc9a8d9);
+
     pub const CARET: ColorToken = hex(0x5a9ad4);
     /// The code editor's real selection fill opacity (GitHub issue #27) while genuinely
     /// focused - applied on top of [`CARET`], the same color the solid caret itself paints, so
