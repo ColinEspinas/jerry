@@ -1280,6 +1280,10 @@ mod tests {
                 "Files tree: copy",
                 "Files tree: cut",
                 "Files tree: paste",
+                // GitHub issue #105's `Delete` - the only file-tree binding not excluded from
+                // `"tree-delete-confirm"` too, since it must fire on both the arming press and
+                // the confirming one.
+                "Files tree: delete (asks for confirmation)",
                 // GitHub issue #26's `Ctrl+W` - closes the focused tab, scoped `Some("!terminal")`.
                 "Close focused tab",
             ]
@@ -1341,6 +1345,10 @@ mod tests {
         // `EditorCollapseCursors` resolves in the File view), `CompletionsInvoke` under plain
         // `"file-editor"` (1), and `CloseFocusedTab` under `Some("!terminal")` (1, the same real
         // terminal-control-byte conflict class `"ctrl-shift-t"` above already established).
+        // GitHub issue #105 added 1 more real scoped binding, `FileTreeDelete` (`Delete`, `Some(
+        // "file-tree && !tree-editing")`) - see `crate::default_key_bindings`'s own docs for why
+        // it, alone among the file-tree bindings, is not also excluded from
+        // `"tree-delete-confirm"`.
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings, &[]);
         assert!(!rows.is_empty());
@@ -1348,13 +1356,13 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            70,
+            71,
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
              every real Completions* binding (5) plus every real merge-editor binding (18) plus \
              TextUndo/TextRedo (3, GitHub issue #17) plus every real \
-             file-tree binding (5, GitHub issue #19) plus every real word-wise Editor* binding \
-             (8, GitHub issue #27) plus every real multi-cursor Editor* binding (4, GitHub issue \
-             #28) plus every real GitHub issue #26 binding (7, not counting \
+             file-tree binding (6, GitHub issues #19 and #105) plus every real word-wise Editor* \
+             binding (8, GitHub issue #27) plus every real multi-cursor Editor* binding (4, \
+             GitHub issue #28) plus every real GitHub issue #26 binding (7, not counting \
              EditorCollapseCursors above, which is issue #28's own action) to be scoped, not \
              global"
         );
@@ -1363,7 +1371,7 @@ mod tests {
                 .iter()
                 .filter(|row| row.command.starts_with("Files tree: "))
                 .count()
-                == 5,
+                == 6,
             "every file-tree binding must be reported as scoped - a globally-bound Ctrl+C would \
              be exactly the keystroke-swallowing bug class this list's own docs catalogue"
         );
