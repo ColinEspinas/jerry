@@ -470,10 +470,12 @@ impl LspClient {
         // Canonicalized so the `file://` URI sent as this workspace folder's root is the same
         // symlink-resolved path every other `path_to_uri` call (e.g. from `did_open`) will
         // independently arrive at for a file underneath it, rather than assuming the caller
-        // already passed a canonical path.
-        let repo_root = repo_root
-            .canonicalize()
-            .map_err(|_| LspError::InvalidRoot(repo_root.to_path_buf()))?;
+        // already passed a canonical path. `canonicalize` (this module's own, not
+        // `Path::canonicalize`) - see that function's own docs for the real Windows gotcha this
+        // avoids in both the `current_dir` this becomes below and the `rootUri` [`path_to_uri`]
+        // builds from it.
+        let repo_root =
+            canonicalize(repo_root).map_err(|_| LspError::InvalidRoot(repo_root.to_path_buf()))?;
 
         let name = config.name;
         let resolved_binary = resolve_server_binary(name, config.binary)?;
@@ -1369,12 +1371,27 @@ fn path_to_uri(path: &Path) -> Result<Uri, LspError> {
     // Best-effort canonicalization for consistency with `LspClient::spawn`'s own root-URI
     // canonicalization; falls back to the given path as-is if canonicalization fails (e.g. a
     // caller checking a path that doesn't exist on disk).
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical = canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let url = url::Url::from_file_path(&canonical)
         .map_err(|_| LspError::InvalidPath(path.to_path_buf()))?;
     url.as_str()
         .parse::<Uri>()
         .map_err(|_| LspError::InvalidPath(path.to_path_buf()))
+}
+
+/// `std::fs::canonicalize`, except on Windows it also simplifies the result away from the
+/// verbatim `\\?\C:\...` UNC-prefixed form back to the legacy `C:\...` one whenever that's safe
+/// (`dunce::canonicalize`'s own real job - see this crate's `Cargo.toml` for why a small, focused
+/// dependency rather than a hand-rolled reimplementation) - GitHub issue #46's real, remaining
+/// Windows gotcha after the `.cmd`-shim resolution fix above: `std::fs::canonicalize` itself
+/// always returns the verbatim form on Windows, and plenty of real, non-UNC-aware Windows
+/// programs - a native binary like rust-analyzer, not an npm shim, so unaffected by that earlier
+/// fix - don't reliably accept it as a working directory or handle a `file://` URI built from
+/// one. A real no-op on every other platform (verified directly against `dunce`'s own source:
+/// its `#[cfg(not(windows))]` branch is a bare `fs::canonicalize` passthrough), so this changes
+/// nothing here on Linux/macOS.
+fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    dunce::canonicalize(path)
 }
 
 /// The inverse of [`path_to_uri`] - see [`LspClient::path_for_uri`]'s docs for why this
@@ -1668,6 +1685,30 @@ fn run_stderr_drain_loop(stderr: std::process::ChildStderr, server: &'static str
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// GitHub issue #46's own real, remaining Windows gotcha - `canonicalize`'s own docs. Not a
+    /// no-op check: this is a genuine round trip against a real temp directory, proving the
+    /// function still resolves a real path correctly (matching `std::fs::canonicalize`'s own
+    /// contract on every platform this test actually runs on, and - documented, not run here,
+    /// see `crate::client::canonicalize`'s own docs on why this sandbox can't verify the
+    /// Windows-specific simplification directly - `dunce`'s own real behavior on Windows).
+    #[test]
+    fn canonicalize_resolves_a_real_directory() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let resolved = canonicalize(dir.path()).expect("a real, existing directory must resolve");
+        assert!(resolved.is_dir());
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(dir.path()).expect("std canonicalize")
+        );
+    }
+
+    #[test]
+    fn canonicalize_reports_a_real_error_for_a_missing_path() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let missing = dir.path().join("does-not-exist");
+        assert!(canonicalize(&missing).is_err());
+    }
 
     /// Writes a minimal, valid cargo project to a fresh tempdir: a `Cargo.toml` and a
     /// `src/main.rs`. No external crates.io dependencies, so `cargo metadata`/rust-analyzer's

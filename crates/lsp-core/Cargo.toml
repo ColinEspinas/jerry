@@ -43,6 +43,16 @@ url = "2"
 # never the `.cmd`/`.bat` shim `npm install -g` actually produces on that platform, even
 # though it's genuinely on `PATH` and `resolve_on_path` already finds it).
 pty-core = { path = "../pty-core" }
+# GitHub issue #46's own remaining, real Windows gotcha after the `.cmd`-resolution fix above:
+# `std::fs::canonicalize` on Windows returns a verbatim `\\?\C:\...`-prefixed path, which many
+# real Windows programs (rust-analyzer very plausibly among them, given the reported symptom -
+# see `LspClient::spawn`'s own docs) don't handle the same way as the legacy `C:\...` form. A
+# small, focused, no-dependency-of-its-own crate purpose-built for exactly this - not worth
+# hand-rolling the real edge cases (when a verbatim path genuinely can't be simplified, e.g. one
+# that's actually too long for the legacy form) - see `crate::client::canonicalize`'s own docs.
+# A real no-op on non-Windows (verified directly against its own source: `#[cfg(not(windows))]
+# fn canonicalize(path) { fs::canonicalize(path) }`), so this is zero behavioral change there.
+dunce = "1.0.5"
 
 # Process-tree kill (SIGTERM-then-SIGKILL, plus a `/proc` descendant sweep so a `cargo
 # check`/`rustc` child rust-analyzer spawned while indexing doesn't survive as an orphan) -
