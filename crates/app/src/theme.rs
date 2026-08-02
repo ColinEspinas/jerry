@@ -388,9 +388,12 @@ pub mod surface {
     pub const KEYCAP_HINT: ColorToken = hex(0x15181a);
     pub const CHIP_NEUTRAL: ColorToken = hex(0x23272b);
     pub const CURRENT_LINE: ColorToken = hex(0x181c20);
-    /// The Windows/Linux title bar's close caption button's hover fill (`Jerry.dc.html`:
-    /// `style-hover="background:#8c3a38"`).
-    pub const TITLE_BAR_CLOSE_HOVER: ColorToken = hex(0x8c3a38);
+    /// The Windows/Linux title bar's close caption button's hover fill. The design handoff
+    /// (`Jerry.dc.html`: `style-hover="background:#8c3a38"`, unchanged through revision 3) spec'd
+    /// a muted maroon; Colin asked for this to be the real Windows Fluent Design close-hover red
+    /// (`#E81123`, the same color Windows 10/11's own native title bar uses) instead - a
+    /// deliberate override of the handoff, not a stale-spec bug.
+    pub const TITLE_BAR_CLOSE_HOVER: ColorToken = hex(0xe81123);
     /// The tab strip's `+` menu popover row hover fill - distinct from [`ROW_HOVER`]/
     /// [`ROW_HOVER_ALT`].
     pub const PLUS_MENU_ROW_HOVER: ColorToken = hex(0x1d2226);
