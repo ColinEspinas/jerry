@@ -470,6 +470,18 @@ impl AdeApp {
         });
     }
 
+    /// The row menu's "Rebase onto this commit" action - GitHub issue #1's own "rebase branch
+    /// (interactive or not)", the non-interactive half. Replays the current worktree's own
+    /// branch on top of `sha` (`wt_core::rewrite::rebase_onto`); see
+    /// [`Self::request_graph_cherry_pick`]'s own docs on real-conflict handling, which applies
+    /// identically here. Interactive rebase (commit reordering/squash/edit) is a real, stated
+    /// follow-up - it needs its own commit-selection UI, not just a single click.
+    pub(crate) fn request_graph_rebase_onto(&mut self, sha: String, cx: &mut Context<Self>) {
+        self.run_graph_remote_op("Rebase", cx, move |root| {
+            wt_core::rewrite::rebase_onto(&root, &sha)
+        });
+    }
+
     /// Shared plumbing behind [`Self::request_graph_fetch`]/[`Self::request_graph_pull`]/
     /// [`Self::request_graph_push`]: guards against a double-click starting a second, overlapping
     /// git subprocess (`GraphTabState::remote_op_in_flight`), runs `op` on the background
@@ -1339,9 +1351,14 @@ impl AdeApp {
                         }
                     })))
                     .child(render_dropdown_menu_row(
-                        "\u{2191}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Rebase onto this commit", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
+                        "\u{2191}", theme::button::BLUE_FG.into(), theme::surface::CHIP_NEUTRAL.into(),
+                        "Rebase onto this commit", String::new(), Vec::new(), true,
+                    ).on_click(cx.listener({
+                        let sha = sha.clone();
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.request_graph_rebase_onto(sha.clone(), cx);
+                        }
+                    })))
                     .child(render_dropdown_menu_row(
                         "\u{2191}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
                         "Interactive rebase from here", "not implemented yet".to_string(), Vec::new(), false,
@@ -5531,6 +5548,61 @@ mod graph_remote_action_tests {
             Some("Revert".to_string()),
             "a successful revert must report real success, not the old 'not implemented yet' \
              stub text"
+        );
+    }
+
+    #[gpui::test]
+    async fn rebase_onto_really_replays_the_branch_and_reports_success(cx: &mut TestAppContext) {
+        let (local, app, cx) = open_seeded_local_repo(cx);
+        // A second branch line the app's own worktree branch will be rebased onto.
+        git(local.path(), &["checkout", "-b", "target-branch"]);
+        commit(local.path(), "b.txt", "target content", "target advances");
+        let target_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+        git(local.path(), &["checkout", "main"]);
+        commit(local.path(), "c.txt", "own content", "own work");
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_rebase_onto(target_sha, cx);
+        });
+        cx.run_until_parked();
+
+        let log = git_output(local.path(), &["log", "--format=%s"]);
+        assert_eq!(
+            log, "own work\ntarget advances\nbase",
+            "the real click must have run a real git rebase replaying this worktree's own \
+             commit on top of the target branch's tip"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
+            Some("Rebase".to_string()),
+            "a successful rebase must report real success, not the old 'not implemented yet' \
+             stub text"
+        );
+    }
+
+    #[gpui::test]
+    async fn rebase_onto_a_real_conflict_surfaces_as_a_real_status_message_not_a_crash(
+        cx: &mut TestAppContext,
+    ) {
+        let (local, app, cx) = open_seeded_local_repo(cx);
+        git(local.path(), &["checkout", "-b", "target-branch"]);
+        commit(local.path(), "a.txt", "target change", "target advances");
+        let target_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+        git(local.path(), &["checkout", "main"]);
+        commit(local.path(), "a.txt", "conflicting own change", "own work");
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_rebase_onto(target_sha, cx);
+        });
+        cx.run_until_parked();
+
+        let status = app.read_with(cx, |app, _| app.graph_state.status_message.clone());
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Rebase failed:")),
+            "a real conflicting rebase must surface as a real, visible failure message, not a \
+             silent success or a panic - got {status:?}"
         );
     }
 }
