@@ -230,7 +230,9 @@ impl AdeApp {
             tree_context_menu: None,
             tree_inline_edit: None,
             tree_clipboard: None,
-            tree_delete_confirm: None,
+            tree_undo_stack: Vec::new(),
+            tree_redo_stack: Vec::new(),
+            tree_undo_backup_counter: 0,
             tree_op_error: None,
             tree_focus_handle,
             file_tree_bounds: gpui::Bounds::default(),
@@ -863,7 +865,7 @@ impl AdeApp {
     /// open before" - reached through different UI gestures; before this extraction,
     /// `open_repo_in_current_window` only reset four of these fields
     /// (`staged_files`/`open_change`/`expanded_dirs`/`selected_tree_path`), leaving every other
-    /// one - `tree_delete_confirm`, `tree_clipboard`, `tree_context_menu`, `tree_inline_edit`,
+    /// one - `tree_undo_stack`/`tree_redo_stack`, `tree_clipboard`, `tree_context_menu`, `tree_inline_edit`,
     /// `discard_confirm_armed`, `prune_confirm_armed`, `commit_menu_open`, every file/LSP/blame
     /// cache and in-flight task - armed against whatever repo was open *before* the folder was
     /// switched. Concretely: arming a delete confirmation on `<old repo>/x`, opening a different
@@ -927,7 +929,11 @@ impl AdeApp {
         self.tree_context_menu = None;
         self.tree_inline_edit = None;
         self.tree_clipboard = None;
-        self.tree_delete_confirm = None;
+        // Every entry names an absolute path in whatever was just left, same reasoning as the
+        // fields just above - undoing/redoing after a switch must never reach into a different
+        // worktree/repo. `clear_tree_undo_history` also best-effort cleans up any orphaned
+        // delete backups this leaves unreachable.
+        self.clear_tree_undo_history();
         self.tree_op_error = None;
         // "Show me the whole listing" was a decision about whatever was left.
         self.file_tree_limit_override = None;

@@ -450,19 +450,16 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("shift-tab", root::EditorDedent, Some("merge-editor")),
         gpui::KeyBinding::new("escape", root::EditorEscape, Some("merge-editor")),
         // GitHub issue #19's file-tree bindings. Every one is scoped to
-        // `"file-tree && !tree-editing && !tree-delete-confirm"`, and all three terms are
-        // load-bearing - see `crate::sidebar::tree_ops`'s own module docs for the full
-        // reasoning. The short version: `secondary-c`/`secondary-x`/`secondary-v` at `None`
-        // scope would claim the control bytes `crate::terminal::pane::keystroke_to_bytes` hands
-        // a focused shell (Ctrl+C is SIGINT - binding it globally would risk making it
-        // impossible to interrupt a running agent CLI), the exact bug class this list's `"]"`
-        // and `secondary-z` entries above already document (`secondary-p` is a deliberate
-        // *exception* to it, not a precedent for avoiding it - see that binding's own docs);
-        // `!tree-editing` is what keeps them
-        // from firing while one of the tree's own inline name editors has the keystroke; and
-        // `!tree-delete-confirm` the same while the modal delete confirmation is up (`F2` or
-        // `Shift+F10` firing *behind* a modal scrim was a real finding in this change's own
-        // review). Both negated terms follow the `"file-editor && !completions"` shape above.
+        // `"file-tree && !tree-editing"`, and both terms are load-bearing - see
+        // `crate::sidebar::tree_ops`'s own module docs for the full reasoning. The short version:
+        // `secondary-c`/`secondary-x`/`secondary-v` at `None` scope would claim the control bytes
+        // `crate::terminal::pane::keystroke_to_bytes` hands a focused shell (Ctrl+C is SIGINT -
+        // binding it globally would risk making it impossible to interrupt a running agent CLI),
+        // the exact bug class this list's `"]"` and `secondary-z` entries above already document
+        // (`secondary-p` is a deliberate *exception* to it, not a precedent for avoiding it - see
+        // that binding's own docs); `!tree-editing` is what keeps them from firing while one of
+        // the tree's own inline name editors has the keystroke. It follows the
+        // `"file-editor && !completions"` shape above.
         //
         // `shift-f10` is the only context-menu keystroke bound. The dedicated Menu/Application
         // key that some keyboards also carry is deliberately *not* bound: gpui's key names come
@@ -472,43 +469,52 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new(
             "shift-f10",
             root::FileTreeContextMenu,
-            Some("file-tree && !tree-editing && !tree-delete-confirm"),
+            Some("file-tree && !tree-editing"),
         ),
         gpui::KeyBinding::new(
             "f2",
             root::FileTreeRename,
-            Some("file-tree && !tree-editing && !tree-delete-confirm"),
+            Some("file-tree && !tree-editing"),
         ),
         gpui::KeyBinding::new(
             "secondary-c",
             root::FileTreeCopy,
-            Some("file-tree && !tree-editing && !tree-delete-confirm"),
+            Some("file-tree && !tree-editing"),
         ),
         gpui::KeyBinding::new(
             "secondary-x",
             root::FileTreeCut,
-            Some("file-tree && !tree-editing && !tree-delete-confirm"),
+            Some("file-tree && !tree-editing"),
         ),
         gpui::KeyBinding::new(
             "secondary-v",
             root::FileTreePaste,
-            Some("file-tree && !tree-editing && !tree-delete-confirm"),
+            Some("file-tree && !tree-editing"),
         ),
         // GitHub issue #105: "remove file" had no keyboard shortcut at all - only reachable via
         // a right-click's own "Delete" menu row (`crate::sidebar::context_menu::MenuAction::
         // Delete`'s own `keystroke_spec()` deliberately returns `None`, unlike every other
-        // mutating row) or `Shift+F10` opening the menu. `Some("file-tree && !tree-editing")`
-        // - not `!tree-delete-confirm` too, unlike every binding above it - is deliberate:
-        // `crate::sidebar::tree_ops::AdeApp::handle_file_tree_delete_action` is the one handler
-        // that must fire in *both* halves of the arm/confirm flow (a first press arms via
-        // `request_tree_delete_for_selection`, a second press while the confirmation panel is up
-        // runs the real delete via `confirm_tree_delete`), so excluding `tree-delete-confirm`
-        // here would make the confirming second press unreachable by keyboard. `!tree-editing`
-        // is kept because an inline rename box's own `Delete`/`Backspace` presses must edit the
-        // filename text, not arm a tree delete underneath it.
+        // mutating row) or `Shift+F10` opening the menu. Delete runs immediately, with no
+        // confirmation step of its own (undo/redo replaced it - see `crate::sidebar::tree_ops`'s
+        // own module docs), so this needs no different scoping from the bindings just above it.
         gpui::KeyBinding::new(
             "delete",
             root::FileTreeDelete,
+            Some("file-tree && !tree-editing"),
+        ),
+        // The file tree's own undo/redo (GitHub issue #105) - deliberately distinct actions from
+        // `TextUndo`/`TextRedo` (`Some("text-input")`, scoped to real text-typing surfaces): while
+        // an inline name editor is open, `"text-input"` is what routes `Ctrl+Z` to *that* undo
+        // instead, which is exactly why `FileTreeUndo`/`FileTreeRedo` share `!tree-editing` with
+        // every other file-tree binding above.
+        gpui::KeyBinding::new(
+            "secondary-z",
+            root::FileTreeUndo,
+            Some("file-tree && !tree-editing"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-shift-z",
+            root::FileTreeRedo,
             Some("file-tree && !tree-editing"),
         ),
         // `Ctrl+W` (GitHub issue #26) - closes the focused tab (file or agent), via
@@ -666,8 +672,6 @@ mod undo_scoping_matrix_tests {
              new-file prompt)",
             "the focused file tree, no overlay open",
             "the file tree's inline name editor (new file / new folder / rename)",
-            "the file tree's modal delete confirmation",
-            "the file tree's inline name editor with the delete confirmation over it",
         ]
     }
 
@@ -730,8 +734,7 @@ mod undo_scoping_matrix_tests {
             // this app used to also have (removed - GitHub issue #47), with the tree's own key
             // handler never even seeing the keystroke (it returns early on a
             // `control`/`platform` modifier).
-            true, false, // the modal delete confirmation - no text being typed
-            true,  // the name editor, delete confirmation over it
+            true,
         ];
         // A stack added without a matching expectation would otherwise silently drop a row from
         // this matrix rather than fail it (`zip` truncates to the shortest input).

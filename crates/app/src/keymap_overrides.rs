@@ -196,17 +196,17 @@ pub fn real_context_stacks() -> Vec<Vec<&'static str>> {
         vec!["app", "merge-editor text-input"],
         vec!["app", "text-input"],
         // The file tree (GitHub issue #19), built by calling the *same* function the renderer
-        // calls, over all four of its inputs - not by restating its literals here. See
+        // calls, over both of its inputs - not by restating its literals here. See
         // [`file_tree_key_context`] for why that indirection is load-bearing rather than tidy.
-        vec!["app", file_tree_key_context(false, false)],
-        vec!["app", file_tree_key_context(true, false)],
-        vec!["app", file_tree_key_context(false, true)],
-        vec!["app", file_tree_key_context(true, true)],
+        vec!["app", file_tree_key_context(false)],
+        vec!["app", file_tree_key_context(true)],
     ]
 }
 
-/// The file tree's real key context, as a function of its two independent modal states: whether an
-/// inline name editor is open, and whether the delete confirmation is up.
+/// The file tree's real key context, as a function of its one remaining modal state: whether an
+/// inline name editor is open. (GitHub issue #105 removed the other one, the delete
+/// confirmation - delete now runs immediately, with no modal state of its own to add a context
+/// word for.)
 ///
 /// This lives here, beside [`real_context_stacks`], rather than inline in
 /// `crate::sidebar::render::AdeApp::file_tree_shell` where it is used, because the two must never
@@ -218,22 +218,14 @@ pub fn real_context_stacks() -> Vec<Vec<&'static str>> {
 /// rather than merely test-detectable - a guard that has to be extended by hand every time the
 /// thing it guards grows is not a guard.
 ///
-/// `"text-input"` is emitted for both editor-open cases: an inline name editor is a real
-/// text-typing surface, and the tag is what routes `Ctrl+Z` mid-filename to `TextUndo`.
-///
-/// `(true, true)` is a deliberate over-approximation: no real gesture sequence reaches it, because
-/// arming a delete goes through the context menu and
-/// `crate::sidebar::tree_ops::AdeApp::open_tree_context_menu` cancels any open inline editor
-/// first (asserted by that module's own
-/// `arming_a_delete_is_not_reachable_while_an_inline_name_editor_is_open`). It is enumerated
-/// anyway: an enumeration that quietly assumes reachability is how the empty-stack hole in this
-/// list's own history happened, and over-approximating costs at worst one extra rebind warning.
-pub fn file_tree_key_context(inline_edit: bool, delete_confirm: bool) -> &'static str {
-    match (inline_edit, delete_confirm) {
-        (true, true) => "file-tree tree-editing tree-delete-confirm text-input",
-        (true, false) => "file-tree tree-editing text-input",
-        (false, true) => "file-tree tree-delete-confirm",
-        (false, false) => "file-tree",
+/// `"text-input"` is emitted for the editor-open case: an inline name editor is a real
+/// text-typing surface, and the tag is what routes `Ctrl+Z` mid-filename to `TextUndo` rather
+/// than `FileTreeUndo`.
+pub fn file_tree_key_context(inline_edit: bool) -> &'static str {
+    if inline_edit {
+        "file-tree tree-editing text-input"
+    } else {
+        "file-tree"
     }
 }
 
@@ -744,7 +736,7 @@ mod tests {
 
         // Every literal any of those sites can emit must appear verbatim in the enumeration.
         //
-        // The file tree's four are *derived* from `file_tree_key_context`, which is also what the
+        // The file tree's two are *derived* from `file_tree_key_context`, which is also what the
         // renderer calls - so for the tree this loop is now a tautology, and deliberately so:
         // the guarantee moved out of the test and into the structure, where drift is impossible
         // rather than merely detectable. Stated plainly because a tautological assertion that
@@ -755,9 +747,9 @@ mod tests {
         // one could gain a fourth arm and only the hand-edit of this array would catch it. Giving
         // it the same treatment is the real fix and is not done here.
         let known: Vec<&str> = real_context_stacks().into_iter().flatten().collect();
-        let tree_literals: Vec<&str> = [(false, false), (true, false), (false, true), (true, true)]
+        let tree_literals: Vec<&str> = [false, true]
             .into_iter()
-            .map(|(edit, confirm)| file_tree_key_context(edit, confirm))
+            .map(file_tree_key_context)
             .collect();
         for literal in [
             "app",

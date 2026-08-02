@@ -391,16 +391,15 @@ impl AdeApp {
     }
 }
 
-/// The fill behind a centered modal panel - the file tree's delete confirmation
-/// (`crate::sidebar::render::AdeApp::render_tree_delete_confirm`) and the New file prompt
-/// (`crate::root::new_file::AdeApp::render_new_file_prompt`), this app's only two.
+/// The fill behind a centered modal panel - the New file prompt
+/// (`crate::root::new_file::AdeApp::render_new_file_prompt`).
 ///
 /// Derived from `theme::surface::SCRIM`, the design handoff's own scrim colour
-/// (`design_handoff_jerry_ade/revision/README.md`: "Scrim rgba(6,7,8,.62)"), rather than the raw
-/// `gpui::black()` both modals used to hard-code - a literal colour rather than a token, which is
-/// exactly what this app's theming discipline exists to keep out. The alpha stays at the 0.35
-/// both modals already used: a small centered dialog does not dim as hard as the palette, which
-/// replaces the entire workspace and uses the designed 0.62.
+/// (`design_handoff_jerry_ade/revision/README.md`: "Scrim rgba(6,7,8,.62)"), rather than a raw
+/// `gpui::black()` literal - a literal colour rather than a token, which is exactly what this
+/// app's theming discipline exists to keep out. The alpha stays at 0.35: a small centered dialog
+/// does not dim as hard as the palette, which replaces the entire workspace and uses the
+/// designed 0.62.
 pub(crate) fn modal_scrim_bg() -> gpui::Rgba {
     theme::surface::SCRIM.resolve().opacity(0.35)
 }
@@ -411,10 +410,8 @@ pub(crate) fn modal_scrim_bg() -> gpui::Rgba {
 ///
 /// Shape is `crate::work_surface::render::render_footer_action_button`'s: `h(23)`, `px(10)`,
 /// `theme::radius::BUTTON` - the 4px "buttons" radius the design handoff calls for, not the 3px
-/// `radius::CHIP` meant for chips and keycaps. Carries a real hover fill; the delete
-/// confirmation's two buttons shipped with none at all, so the only clickable controls in that
-/// dialog were also the only ones in the app that gave no feedback under the pointer. The caller
-/// attaches its own `.on_click`.
+/// `radius::CHIP` meant for chips and keycaps. Carries a real hover fill. The caller attaches its
+/// own `.on_click`.
 pub(crate) fn render_modal_button(
     id: &'static str,
     label: impl Into<gpui::SharedString>,

@@ -17,7 +17,7 @@
 //! things stop that here, and it is worth being precise about which one does what, because a
 //! first draft of these docs got it wrong and this project's own revert-verification caught it:
 //!
-//! 1. **The `key_context` predicate**, `Some("file-tree && !tree-editing && !tree-delete-confirm")` (see
+//! 1. **The `key_context` predicate**, `Some("file-tree && !tree-editing")` (see
 //!    `crate::default_key_bindings`). `Window::dispatch_key_event` resolves bindings against the
 //!    context stack of the *focused node's own dispatch path*, before any listener is consulted
 //!    (`vendor/zed/crates/gpui/src/window.rs`'s `dispatch_key` call). A focused terminal pane is
@@ -49,8 +49,20 @@
 //! tree). It is the same shape as Revision R8.5b's `"file-editor && !completions"` fix, and it is
 //! revert-verified by
 //! `tree_ops_regression_tests::shift_f10_while_an_inline_editor_is_open_neither_opens_a_menu_nor_disturbs_the_name`,
-//! which fails against a bare `Some("file-tree")`. `!tree-delete-confirm` is the same mechanism
-//! again, for the modal delete confirmation.
+//! which fails against a bare `Some("file-tree")`.
+//!
+//! ## Delete has no confirmation - undo does that job instead (GitHub issue #105)
+//!
+//! An earlier version of this module armed a delete behind a modal confirmation panel and only
+//! removed anything once a second, explicit click confirmed it. That is gone: [`Self::
+//! request_tree_delete`] now runs the real delete immediately, the same single-gesture shape
+//! every other tree mutation (rename, cut/paste move) already had. What replaced the safety net
+//! is [`Self::tree_undo_stack`]/[`Self::tree_redo_stack`] - a real, app-owned undo history for
+//! delete, rename, and cut/paste-move alike (never for copy, which never destroys or relocates
+//! anything to begin with). A delete's own undo entry carries a real backup of the deleted
+//! content (see [`Self::tree_undo_backup_root`]'s own docs for why a copy, not a reliance on
+//! whatever the OS trash happens to support restoring), so undo works identically whether the
+//! resolved [`file_ops::DeleteMechanism`] was `Trash` or `Permanent`.
 
 use super::*;
 use crate::sidebar::context_menu::{ContextTarget, MenuAction};
@@ -147,44 +159,28 @@ pub(crate) struct TreeClipboard {
     pub(crate) mode: ClipboardMode,
 }
 
-/// A delete that has been *requested* but not yet confirmed. Holding the resolved
-/// [`DeleteMechanism`] here - rather than resolving it when the confirmation is accepted - is
-/// what makes the confirmation copy honest: the words the user agreed to ("Move to Trash" vs
-/// "Delete permanently") and the command that then runs come from the same value.
+/// One reversible file-tree operation, most recent last in [`AdeApp::tree_undo_stack`]/
+/// [`AdeApp::tree_redo_stack`] - see [`AdeApp::undo_tree_op`]'s own docs for how each variant is
+/// actually reversed and replayed.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PendingTreeDelete {
-    pub(crate) path: PathBuf,
-    pub(crate) is_dir: bool,
-    pub(crate) mechanism: DeleteMechanism,
-}
-
-impl PendingTreeDelete {
-    /// The confirm button's label - the exact promise being made.
-    pub(crate) fn confirm_label(&self) -> &'static str {
-        match self.mechanism {
-            DeleteMechanism::Trash { .. } => "Move to Trash",
-            DeleteMechanism::Permanent => "Delete permanently",
-        }
-    }
-
-    /// The sentence above the buttons. The permanent branch says so in as many words, and names
-    /// *why* there is no trash, rather than implying the app chose not to use one.
-    pub(crate) fn explanation(&self) -> String {
-        let what = if self.is_dir {
-            "this folder and everything in it"
-        } else {
-            "this file"
-        };
-        match self.mechanism {
-            DeleteMechanism::Trash { .. } => {
-                format!("Move {what} to the system trash (restorable from your file manager).")
-            }
-            DeleteMechanism::Permanent => format!(
-                "Permanently delete {what}. No OS trash command is available here, so this \
-                 cannot be undone from inside or outside this app."
-            ),
-        }
-    }
+pub(crate) enum TreeUndoEntry {
+    /// A rename or a cut/paste move - both are the same real shape, a path relocated from
+    /// `old_path` to `new_path` via [`file_ops::move_path`], and both undo/redo the same way
+    /// (move it back, or move it there again).
+    Relocate {
+        old_path: PathBuf,
+        new_path: PathBuf,
+    },
+    /// A real, already-applied delete. `backup_path` is real content this app copied out before
+    /// removing `original_path` - see [`AdeApp::tree_undo_backup_root`]'s own docs for where and
+    /// why. `mechanism` is the resolution [`file_ops::resolve_delete_mechanism`] made for the
+    /// original delete, replayed as-is on redo.
+    Delete {
+        original_path: PathBuf,
+        is_dir: bool,
+        backup_path: PathBuf,
+        mechanism: DeleteMechanism,
+    },
 }
 
 /// `path` with a leading `old` replaced by `new` - `None` when `path` is unrelated to `old`.
@@ -195,6 +191,30 @@ pub(crate) fn remap_path(path: &Path, old: &Path, new: &Path) -> Option<PathBuf>
         return Some(new.to_path_buf());
     }
     path.strip_prefix(old).ok().map(|rest| new.join(rest))
+}
+
+/// Removes a delete's own backup copy - best-effort, since by the time this runs nothing can
+/// reach it anymore (it has either been superseded by a fresh one, or its `TreeUndoEntry` has
+/// been dropped from both stacks entirely).
+fn remove_tree_undo_backup(backup_path: &Path, is_dir: bool) {
+    let _ = if is_dir {
+        std::fs::remove_dir_all(backup_path)
+    } else {
+        std::fs::remove_file(backup_path)
+    };
+}
+
+/// [`remove_tree_undo_backup`] for a whole [`TreeUndoEntry`] - a no-op for `Relocate`, which
+/// never has a backup to begin with.
+fn cleanup_tree_undo_backup(entry: &TreeUndoEntry) {
+    if let TreeUndoEntry::Delete {
+        backup_path,
+        is_dir,
+        ..
+    } = entry
+    {
+        remove_tree_undo_backup(backup_path, *is_dir);
+    }
 }
 
 impl AdeApp {
@@ -481,17 +501,9 @@ impl AdeApp {
             return;
         }
         if self.tree_inline_edit.is_none() {
-            if keystroke.key == "escape" {
-                // The delete confirmation is checked *first*: it is a modal on top of everything
-                // else the tree can show, so one Escape must dismiss the thing in front, not
-                // something behind it.
-                if self.tree_delete_confirm.is_some() {
-                    self.cancel_tree_delete(cx);
-                    cx.stop_propagation();
-                } else if self.tree_context_menu.is_some() {
-                    self.close_tree_context_menu(cx);
-                    cx.stop_propagation();
-                }
+            if keystroke.key == "escape" && self.tree_context_menu.is_some() {
+                self.close_tree_context_menu(cx);
+                cx.stop_propagation();
             }
             return;
         }
@@ -667,6 +679,13 @@ impl AdeApp {
                         let old = path.clone();
                         self.tree_inline_edit = None;
                         self.rename_open_paths(&old, &destination, cx);
+                        self.push_tree_undo_entry(
+                            TreeUndoEntry::Relocate {
+                                old_path: old,
+                                new_path: destination,
+                            },
+                            cx,
+                        );
                         self.refresh_after_file_op(cx);
                     }
                     Err(err) => {
@@ -784,6 +803,13 @@ impl AdeApp {
                 // The entry is no longer where the clipboard says it is; a second paste would
                 // fail against a path that no longer exists.
                 self.tree_clipboard = None;
+                self.push_tree_undo_entry(
+                    TreeUndoEntry::Relocate {
+                        old_path: entry.path,
+                        new_path: destination.clone(),
+                    },
+                    cx,
+                );
                 self.reveal_in_tree(&destination, cx);
                 self.selected_tree_path = Some(destination);
                 self.refresh_after_file_op(cx);
@@ -811,14 +837,14 @@ impl AdeApp {
 
     /// Runs a real [`file_ops::copy_path`] on the background executor and applies the result on
     /// the foreground thread - the same "gather / compute / write back" shape
-    /// [`AdeApp::load_file_tree`] and [`Self::confirm_tree_delete`] use.
+    /// [`AdeApp::load_file_tree`] and [`Self::delete_path_with_mechanism`] use.
     ///
     /// Background, not inline in the click handler, and that is a correctness point rather than a
     /// micro-optimization: `copy_path` recurses over a whole directory tree, so duplicating a
     /// `node_modules`-sized folder from a click listener would freeze the window for as long as
     /// the copy took. An earlier version of this method did exactly that, contradicting this
-    /// module's sibling `confirm_tree_delete` (whose own docs insist on "never the foreground
-    /// thread") - found in review.
+    /// module's own delete path (whose own docs insist on "never the foreground thread") - found
+    /// in review.
     ///
     /// Nothing that could race a concurrent operation is captured: the destination name is
     /// resolved by the caller immediately before this runs, and a collision that appears in
@@ -871,20 +897,18 @@ impl AdeApp {
 
     // ---------------------------------------------------------------- delete
 
-    /// Arms the delete confirmation. **Never deletes anything itself** - the real removal only
-    /// happens in [`Self::confirm_tree_delete`], which is reachable only from the confirmation
-    /// panel's own button (issue #19 §3: "Delete asks for confirmation").
-    ///
-    /// The mechanism is resolved here, against a real `$PATH` probe, so the panel can name what
-    /// will actually happen.
+    /// GitHub issue #105: runs the real delete immediately - no confirmation step. `Self::
+    /// tree_undo_stack` (via `Self::delete_path_with_real_undo`'s own docs) is what makes that
+    /// safe: a real backup of the content is copied out before anything is removed, so `Self::
+    /// undo_tree_op` can restore it regardless of which `DeleteMechanism` was used.
     pub(in crate::sidebar) fn request_tree_delete(
         &mut self,
         path: PathBuf,
         is_dir: bool,
         cx: &mut Context<Self>,
     ) {
-        // The one hard boundary on the app's single irreversible operation: whatever route got
-        // here, the path must be a plain, normal-component path genuinely inside the agent's
+        // The one hard boundary on the app's single most destructive operation: whatever route
+        // got here, the path must be a plain, normal-component path genuinely inside the agent's
         // worktree. Every real caller already satisfies this (the targets come from the tree's
         // own walk), which is exactly why it is worth stating as a checked precondition rather
         // than an assumption - a future caller that passes something else gets a refusal, not a
@@ -898,27 +922,12 @@ impl AdeApp {
                 cx,
             );
         }
-        let mechanism =
-            file_ops::resolve_delete_mechanism(std::env::consts::OS, &path, |program| {
-                pty_core::resolve_on_path(program).is_some()
-            });
-        self.tree_delete_confirm = Some(PendingTreeDelete {
-            path,
-            is_dir,
-            mechanism,
-        });
-        cx.notify();
+        self.delete_path_with_real_undo(path, is_dir, true, cx);
     }
 
-    pub(in crate::sidebar) fn cancel_tree_delete(&mut self, cx: &mut Context<Self>) {
-        if self.tree_delete_confirm.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    /// The `Delete` keyboard shortcut's own arming step - mirrors
-    /// [`Self::start_tree_rename_for_selection`]'s "resolve `is_dir` off the live tree, not the
-    /// filesystem" pattern so a stale/renamed selection can't race a real `stat` call.
+    /// The `Delete` keyboard shortcut's own handler - mirrors [`Self::start_tree_rename_for_selection`]'s
+    /// "resolve `is_dir` off the live tree, not the filesystem" pattern so a stale/renamed
+    /// selection can't race a real `stat` call.
     pub(in crate::sidebar) fn request_tree_delete_for_selection(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.selected_tree_path.clone() else {
             return;
@@ -935,56 +944,278 @@ impl AdeApp {
         self.request_tree_delete(path, is_dir, cx);
     }
 
-    /// Runs the confirmed delete. A trash-backed delete shells out to the resolved command on
-    /// the background executor (never the foreground thread); a permanent one runs
-    /// [`file_ops::delete_permanently`] there for the same reason.
+    /// [`Self::delete_path_with_real_undo`], resolving a real [`DeleteMechanism`] against this
+    /// machine's actual `$PATH` first.
+    fn delete_path_with_real_undo(
+        &mut self,
+        path: PathBuf,
+        is_dir: bool,
+        clear_redo: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mechanism =
+            file_ops::resolve_delete_mechanism(std::env::consts::OS, &path, |program| {
+                pty_core::resolve_on_path(program).is_some()
+            });
+        self.delete_path_with_mechanism(path, is_dir, mechanism, clear_redo, cx);
+    }
+
+    /// A real mechanism resolution, injectable so tests can force [`DeleteMechanism::Permanent`]
+    /// rather than letting the real `$PATH` probe resolve `Trash` and move a test fixture into
+    /// the developer's own real trash - the same seam the pre-issue-#105 confirmation flow's
+    /// tests used (arm, then overwrite the armed mechanism before confirming). There is no more
+    /// "armed" state to overwrite now that delete runs immediately, so this exists in its place.
+    #[cfg(test)]
+    pub(in crate::sidebar) fn request_tree_delete_with_mechanism_for_test(
+        &mut self,
+        path: PathBuf,
+        is_dir: bool,
+        mechanism: DeleteMechanism,
+        cx: &mut Context<Self>,
+    ) {
+        self.delete_path_with_mechanism(path, is_dir, mechanism, true, cx);
+    }
+
+    /// The real delete's shared core, used by a fresh, user-initiated delete (`Self::
+    /// request_tree_delete`, `clear_redo: true` - a genuinely new edit invalidates whatever was
+    /// redoable), by `Self::redo_tree_op` replaying a previously-undone delete (`clear_redo:
+    /// false` - redo must not wipe out *other* still-pending redo entries above it in the stack),
+    /// and by `Self::request_tree_delete_with_mechanism_for_test`.
+    ///
+    /// Backs up `path`'s real content to `Self::tree_undo_backup_root` *before* removing
+    /// anything: if that copy fails, nothing is deleted at all, since a delete with no real
+    /// backup would be exactly the unrecoverable operation removing the confirmation dialog was
+    /// supposed to stop being. Both the backup copy and the real removal (a trash-backed delete
+    /// shells out to the resolved command; a permanent one runs [`file_ops::delete_permanently`])
+    /// run on the background executor, never the foreground thread.
     ///
     /// A failed trash command is reported as a real error and **does not** fall back to a
-    /// permanent delete: the user confirmed "move to trash", and quietly escalating that into an
-    /// irreversible removal because a command failed would be exactly the kind of dishonest
-    /// convenience this app avoids.
-    pub(in crate::sidebar) fn confirm_tree_delete(&mut self, cx: &mut Context<Self>) {
-        let Some(pending) = self.tree_delete_confirm.take() else {
-            return;
-        };
-        let path = pending.path.clone();
-        let mechanism = pending.mechanism.clone();
+    /// permanent delete: quietly escalating a trash-move into an irreversible removal because a
+    /// command failed would be exactly the kind of dishonest convenience this app avoids.
+    fn delete_path_with_mechanism(
+        &mut self,
+        path: PathBuf,
+        is_dir: bool,
+        mechanism: DeleteMechanism,
+        clear_redo: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let backup_path = self.next_tree_undo_backup_path(&path);
         let label = path.display().to_string();
         let task = cx.spawn(async move |this, cx| {
-            let outcome =
-                cx.background_executor()
-                    .spawn({
-                        let path = path.clone();
-                        async move {
-                            match mechanism {
-                                DeleteMechanism::Trash { program, args } => {
-                                    match std::process::Command::new(program).args(&args).status() {
-                                        Ok(status) if status.success() => Ok(()),
-                                        Ok(status) => Err(format!(
-                                            "{program} exited with {status} while trashing {label}"
-                                        )),
-                                        Err(err) => Err(format!("failed to run {program}: {err}")),
-                                    }
+            let outcome = cx
+                .background_executor()
+                .spawn({
+                    let path = path.clone();
+                    let backup_path = backup_path.clone();
+                    let mechanism = mechanism.clone();
+                    async move {
+                        if let Some(parent) = backup_path.parent() {
+                            std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+                        }
+                        file_ops::copy_path(&path, &backup_path).map_err(|err| err.to_string())?;
+                        match mechanism {
+                            DeleteMechanism::Trash { program, args } => {
+                                match std::process::Command::new(program).args(&args).status() {
+                                    Ok(status) if status.success() => Ok(()),
+                                    Ok(status) => Err(format!(
+                                        "{program} exited with {status} while trashing {label}"
+                                    )),
+                                    Err(err) => Err(format!("failed to run {program}: {err}")),
                                 }
-                                DeleteMechanism::Permanent => file_ops::delete_permanently(&path)
-                                    .map_err(|err| err.to_string()),
+                            }
+                            DeleteMechanism::Permanent => {
+                                file_ops::delete_permanently(&path).map_err(|err| err.to_string())
                             }
                         }
-                    })
-                    .await;
+                    }
+                })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 match outcome {
                     Ok(()) => {
                         this.forget_deleted_paths(&path, cx);
+                        let entry = TreeUndoEntry::Delete {
+                            original_path: path,
+                            is_dir,
+                            backup_path,
+                            mechanism,
+                        };
+                        if clear_redo {
+                            this.push_tree_undo_entry(entry, cx);
+                        } else {
+                            this.tree_undo_stack.push(entry);
+                        }
                         this.refresh_after_file_op(cx);
                     }
-                    Err(message) => this.report_tree_op_error(message, cx),
+                    Err(message) => {
+                        // Best-effort: nothing can ever reach this copy now, and leaving it
+                        // behind would silently leak into the OS temp directory on every failed
+                        // delete attempt.
+                        let _ = std::fs::remove_dir_all(&backup_path)
+                            .or_else(|_| std::fs::remove_file(&backup_path));
+                        this.report_tree_op_error(message, cx);
+                    }
                 }
                 cx.notify();
             });
         });
         self._tree_delete_task = Some(task);
         cx.notify();
+    }
+
+    // ---------------------------------------------------------------- undo/redo (GitHub #105)
+
+    /// Where a delete's real content is copied to before it's removed, until `Self::
+    /// undo_tree_op` restores it or it becomes permanently unreachable (`Self::
+    /// clear_tree_redo_stack`/`Self::clear_tree_undo_history`, whichever drops it first). A plain
+    /// OS temp directory, not anywhere under the worktree itself: a delete's own undo must
+    /// survive the delete succeeding, so it can never live inside what was just removed, and it
+    /// must never show up in the tree's own walk or `git status` as a stray file. Scoped by this
+    /// process's own pid so two running instances never collide.
+    fn tree_undo_backup_root(&self) -> PathBuf {
+        std::env::temp_dir().join(format!("jerry-tree-undo-{}", std::process::id()))
+    }
+
+    /// A fresh, real path under [`Self::tree_undo_backup_root`] to back a about-to-be-deleted
+    /// path up to - named with a monotonic counter ([`AdeApp::tree_undo_backup_counter`]), not
+    /// the deleted name alone, so two deletes of same-named entries (different folders, or the
+    /// same folder across an undo/redo cycle) never collide.
+    fn next_tree_undo_backup_path(&mut self, original: &Path) -> PathBuf {
+        let name = original
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "entry".to_string());
+        let counter = self.tree_undo_backup_counter;
+        self.tree_undo_backup_counter += 1;
+        self.tree_undo_backup_root()
+            .join(format!("{counter}-{name}"))
+    }
+
+    /// Records a real, already-applied tree edit and clears [`AdeApp::tree_redo_stack`] - the
+    /// same "a fresh edit invalidates redo" rule every undo/redo stack in this app follows. Every
+    /// real, user-initiated edit (rename, cut/paste move, a fresh delete) goes through this;
+    /// `Self::undo_tree_op`/`Self::redo_tree_op` push/pop the two stacks directly instead, since
+    /// replaying an undo/redo must never wipe out *other* pending redo entries.
+    fn push_tree_undo_entry(&mut self, entry: TreeUndoEntry, cx: &mut Context<Self>) {
+        self.tree_undo_stack.push(entry);
+        self.clear_tree_redo_stack();
+        cx.notify();
+    }
+
+    /// Drops every entry in [`AdeApp::tree_redo_stack`], best-effort cleaning up any `Delete`
+    /// entries' backups along the way - nothing can reach them once they're gone.
+    fn clear_tree_redo_stack(&mut self) {
+        for dropped in self.tree_redo_stack.drain(..) {
+            cleanup_tree_undo_backup(&dropped);
+        }
+    }
+
+    /// Drops every recorded tree-undo/redo entry, best-effort cleaning up any `Delete` entries'
+    /// backups - see [`crate::root::state::AdeApp::reset_repo_scoped_state`]'s own docs for why a
+    /// worktree/repo switch must never leave undo/redo pointed at paths in a different one.
+    pub(crate) fn clear_tree_undo_history(&mut self) {
+        for entry in self
+            .tree_undo_stack
+            .drain(..)
+            .chain(self.tree_redo_stack.drain(..))
+        {
+            cleanup_tree_undo_backup(&entry);
+        }
+    }
+
+    /// `Ctrl+Z` while the file tree is focused (`crate::root::FileTreeUndo`) - reverses the most
+    /// recent entry in [`AdeApp::tree_undo_stack`], in place.
+    ///
+    /// A `Relocate` (rename or cut/paste move) is reversed by moving `new_path` back to
+    /// `old_path` ([`file_ops::move_path`]) - always a same-filesystem `fs::rename`, since both
+    /// paths live inside the same worktree.
+    ///
+    /// A `Delete` is reversed by *copying* `backup_path` back to `original_path` ([`file_ops::
+    /// copy_path`], not `move_path`): `backup_path` lives under [`Self::tree_undo_backup_root`],
+    /// a plain OS temp directory not guaranteed to share a filesystem with the worktree, where a
+    /// `rename`-based restore could fail with a real cross-device error. Copying also leaves the
+    /// backup intact for a later [`Self::redo_tree_op`] to clean up, rather than needing a fresh
+    /// one.
+    ///
+    /// A restore/move that fails (the original location has since been reoccupied by something
+    /// else) reports a real error and pushes the entry straight back onto the undo stack, rather
+    /// than silently discarding it or leaving the app's own bookkeeping out of sync with what's
+    /// really on disk.
+    pub(in crate::sidebar) fn undo_tree_op(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.tree_undo_stack.pop() else {
+            return;
+        };
+        match &entry {
+            TreeUndoEntry::Relocate { old_path, new_path } => {
+                if let Err(err) = file_ops::move_path(new_path, old_path) {
+                    self.tree_undo_stack.push(entry);
+                    return self.report_tree_op_error(err.to_string(), cx);
+                }
+                self.rename_open_paths(new_path, old_path, cx);
+                self.reveal_in_tree(old_path, cx);
+                self.selected_tree_path = Some(old_path.clone());
+            }
+            TreeUndoEntry::Delete {
+                original_path,
+                backup_path,
+                ..
+            } => {
+                if let Some(parent) = original_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(err) = file_ops::copy_path(backup_path, original_path) {
+                    self.tree_undo_stack.push(entry);
+                    return self.report_tree_op_error(err.to_string(), cx);
+                }
+                self.reveal_in_tree(original_path, cx);
+                self.selected_tree_path = Some(original_path.clone());
+            }
+        }
+        self.focus_file_tree(window, cx);
+        self.refresh_after_file_op(cx);
+        self.tree_redo_stack.push(entry);
+    }
+
+    /// `Ctrl+Shift+Z`/`Ctrl+Y` while the file tree is focused (`crate::root::FileTreeRedo`) -
+    /// re-applies the most recently undone entry.
+    ///
+    /// A `Relocate` replays the original move (`old_path` -> `new_path`). A `Delete` re-runs a
+    /// real delete of `original_path` through [`Self::delete_path_with_real_undo`] (`clear_redo:
+    /// false`, so any *other* pending redo entries above this one survive) rather than reusing
+    /// the old backup as-is: content at `original_path` may have changed since it was restored,
+    /// and a redo should capture what's really there now, the same as any other fresh delete.
+    /// The superseded old backup is cleaned up first, since nothing can reach it once this runs.
+    pub(in crate::sidebar) fn redo_tree_op(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.tree_redo_stack.pop() else {
+            return;
+        };
+        match entry {
+            TreeUndoEntry::Relocate { old_path, new_path } => {
+                if let Err(err) = file_ops::move_path(&old_path, &new_path) {
+                    self.tree_redo_stack
+                        .push(TreeUndoEntry::Relocate { old_path, new_path });
+                    return self.report_tree_op_error(err.to_string(), cx);
+                }
+                self.rename_open_paths(&old_path, &new_path, cx);
+                self.reveal_in_tree(&new_path, cx);
+                self.selected_tree_path = Some(new_path.clone());
+                self.focus_file_tree(window, cx);
+                self.refresh_after_file_op(cx);
+                self.tree_undo_stack
+                    .push(TreeUndoEntry::Relocate { old_path, new_path });
+            }
+            TreeUndoEntry::Delete {
+                original_path,
+                is_dir,
+                backup_path,
+                ..
+            } => {
+                remove_tree_undo_backup(&backup_path, is_dir);
+                self.focus_file_tree(window, cx);
+                self.delete_path_with_real_undo(original_path, is_dir, false, cx);
+            }
+        }
     }
 
     /// Drops the app state that pointed at a path that no longer exists - open tabs and their
@@ -1168,24 +1399,35 @@ impl AdeApp {
         self.paste_into_selection(cx);
     }
 
-    /// `Delete` while the tree is focused (`crate::root::FileTreeDelete`). Bound with the context
-    /// predicate `"file-tree && !tree-editing"` - deliberately *not* excluding
-    /// `"tree-delete-confirm"` too, unlike Copy/Cut/Paste/Rename, because this single action must
-    /// serve both gestures of the arm/confirm flow: a first press with nothing armed arms the
-    /// confirmation (via [`Self::request_tree_delete_for_selection`]); a second press while the
-    /// panel from that same arming is still up runs the real delete (via
-    /// [`Self::confirm_tree_delete`]), the same as clicking that panel's own confirm button.
+    /// `Delete` while the tree is focused (`crate::root::FileTreeDelete`) - GitHub issue #105:
+    /// runs the delete immediately, no confirming second press.
     pub(in crate::sidebar) fn handle_file_tree_delete_action(
         &mut self,
         _action: &crate::root::FileTreeDelete,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.tree_delete_confirm.is_some() {
-            self.confirm_tree_delete(cx);
-        } else {
-            self.request_tree_delete_for_selection(cx);
-        }
+        self.request_tree_delete_for_selection(cx);
+    }
+
+    /// `Ctrl/⌘+Z` while the tree is focused (`crate::root::FileTreeUndo`).
+    pub(in crate::sidebar) fn handle_file_tree_undo_action(
+        &mut self,
+        _action: &crate::root::FileTreeUndo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.undo_tree_op(window, cx);
+    }
+
+    /// `Ctrl/⌘+Shift+Z` while the tree is focused (`crate::root::FileTreeRedo`).
+    pub(in crate::sidebar) fn handle_file_tree_redo_action(
+        &mut self,
+        _action: &crate::root::FileTreeRedo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.redo_tree_op(window, cx);
     }
 
     // ---------------------------------------------------------------- misc actions
@@ -1574,51 +1816,18 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// §3: "Delete asks for confirmation". One click on the menu row must arm the confirmation
-    /// and remove nothing at all.
+    /// GitHub issue #105: Delete no longer asks for confirmation - clicking the menu row (or
+    /// pressing the keyboard shortcut) removes the file immediately, and the deleted file's tab
+    /// and buffer go with it. `DeleteMechanism` is forced to `Permanent` via `Self::
+    /// request_tree_delete_with_mechanism_for_test` rather than letting the real resolution run:
+    /// on a developer machine with `gio` installed the real resolution is `Trash`, and running it
+    /// here would move a test fixture into the developer's own `~/.local/share/Trash`. The
+    /// resolution logic itself is covered purely in `crate::sidebar::file_ops`'s own tests; what
+    /// this test exercises is the real removal, state repair, and undo bookkeeping.
     #[gpui::test]
-    fn a_single_delete_click_only_arms_a_confirmation_and_removes_nothing(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
-        seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
-
-        let victim = repo.path().join("README.md");
-        app.update_in(cx, |app, window, cx| {
-            app.open_tree_context_menu(ContextTarget::File(victim.clone()), 40.0, 60.0, window, cx);
-            app.run_tree_menu_action(MenuAction::Delete, window, cx);
-        });
-        cx.run_until_parked();
-
-        assert!(
-            victim.exists(),
-            "a single click on Delete must never remove anything - it only asks"
-        );
-        app.read_with(cx, |app, _| {
-            let pending = app
-                .tree_delete_confirm
-                .as_ref()
-                .expect("the confirmation must be armed");
-            assert_eq!(pending.path, victim);
-            assert!(!pending.is_dir);
-            assert!(
-                app.tree_context_menu.is_none(),
-                "the menu must close so the row can't be clicked a second time by accident"
-            );
-        });
-    }
-
-    /// The other half: the confirmation's own button really does delete, and the deleted file's
-    /// tab and buffer go with it.
-    ///
-    /// The pending delete's mechanism is forced to `Permanent` after the real
-    /// [`AdeApp::request_tree_delete`] has resolved it: on a developer machine with `gio`
-    /// installed the real resolution is `Trash`, and running it here would move a test fixture
-    /// into the developer's own `~/.local/share/Trash`. The resolution logic itself is covered
-    /// purely in `crate::sidebar::file_ops`' own tests; what this test exercises is
-    /// [`AdeApp::confirm_tree_delete`]'s real removal and state repair.
-    #[gpui::test]
-    fn a_confirmed_delete_really_removes_the_file_and_its_tab(cx: &mut TestAppContext) {
+    fn deleting_a_file_removes_it_immediately_and_records_a_real_undo_entry(
+        cx: &mut TestAppContext,
+    ) {
         let repo = TempDir::new().expect("tempdir");
         seed(&repo);
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
@@ -1627,15 +1836,18 @@ mod tree_ops_regression_tests {
         let victim = repo.path().join("src/util.rs");
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(victim.clone(), window, cx);
-            app.request_tree_delete(victim.clone(), false, cx);
-            app.tree_delete_confirm.as_mut().expect("armed").mechanism = DeleteMechanism::Permanent;
-            app.confirm_tree_delete(cx);
+            app.request_tree_delete_with_mechanism_for_test(
+                victim.clone(),
+                false,
+                DeleteMechanism::Permanent,
+                cx,
+            );
         });
         cx.run_until_parked();
 
         assert!(
             !victim.exists(),
-            "the confirmed delete must really remove it"
+            "the delete must really remove it, with no confirmation step"
         );
         app.read_with(cx, |app, _| {
             assert!(
@@ -1643,11 +1855,209 @@ mod tree_ops_regression_tests {
                 "the deleted file's tab must not survive it"
             );
             assert!(!app.edit_buffer_contains(Path::new("src/util.rs")));
-            assert!(app.tree_delete_confirm.is_none());
+            let entry = app
+                .tree_undo_stack
+                .last()
+                .expect("the delete must have recorded a real undo entry");
+            match entry {
+                TreeUndoEntry::Delete {
+                    original_path,
+                    is_dir,
+                    backup_path,
+                    ..
+                } => {
+                    assert_eq!(original_path, &victim);
+                    assert!(!is_dir);
+                    assert!(
+                        backup_path.exists(),
+                        "the backup must be real, on-disk content, not just a recorded path"
+                    );
+                }
+                other => panic!("expected TreeUndoEntry::Delete, got {other:?}"),
+            }
         });
     }
 
-    /// A guard on the app's one irreversible operation.
+    /// GitHub issue #105: undo/redo replaces the confirmation dialog as the safety net for
+    /// delete. `Ctrl+Z` must really restore the deleted file's real content from its backup, and
+    /// `Ctrl+Shift+Z` must really delete it again.
+    #[gpui::test]
+    fn undoing_then_redoing_a_delete_restores_then_removes_the_file_again(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let victim = repo.path().join("src/util.rs");
+        let original_content = fs::read_to_string(&victim).expect("read fixture");
+        app.update(cx, |app, cx| {
+            app.request_tree_delete_with_mechanism_for_test(
+                victim.clone(),
+                false,
+                DeleteMechanism::Permanent,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(!victim.exists(), "premise: the file is really gone");
+
+        app.update_in(cx, |app, window, cx| {
+            app.undo_tree_op(window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            fs::read_to_string(&victim).expect("restored file"),
+            original_content,
+            "undo must restore the exact real content, not just an empty placeholder"
+        );
+        app.read_with(cx, |app, _| {
+            assert!(app.tree_undo_stack.is_empty());
+            assert_eq!(app.tree_redo_stack.len(), 1);
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.redo_tree_op(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(!victim.exists(), "redo must really delete it again");
+        app.read_with(cx, |app, _| {
+            assert!(app.tree_redo_stack.is_empty());
+            assert_eq!(app.tree_undo_stack.len(), 1);
+        });
+    }
+
+    /// The same real undo/redo, for a rename - the other half of GitHub issue #105's scope
+    /// beyond delete.
+    #[gpui::test]
+    fn undoing_then_redoing_a_rename_restores_then_reapplies_it(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let old = repo.path().join("src/main.rs");
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(old.clone(), window, cx);
+            app.start_tree_rename(old.clone(), false, window, cx);
+            app.tree_inline_edit.as_mut().expect("editor").name =
+                text_history::TextField::seeded("renamed.rs");
+            app.commit_tree_inline_edit(window, cx);
+        });
+        cx.run_until_parked();
+        let renamed = repo.path().join("src/renamed.rs");
+        assert!(renamed.exists());
+        assert!(!old.exists());
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.tree_undo_stack.len(), 1);
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.undo_tree_op(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(old.exists(), "undo must restore the original name");
+        assert!(!renamed.exists());
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.open_files().to_vec(),
+                vec![PathBuf::from("src/main.rs")],
+                "the open tab must follow the undo back to the original path"
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.redo_tree_op(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(renamed.exists(), "redo must reapply the rename");
+        assert!(!old.exists());
+    }
+
+    /// Cut/paste is a move, the same `Relocate` shape a rename is - undo/redo must work
+    /// identically for it.
+    #[gpui::test]
+    fn undoing_a_cut_and_paste_move_restores_the_original_location(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let original = repo.path().join("README.md");
+        app.update(cx, |app, cx| {
+            app.set_tree_clipboard(original.clone(), ClipboardMode::Cut, cx);
+            app.paste_into_dir(&repo.path().join("src"), cx);
+        });
+        cx.run_until_parked();
+        let moved = repo.path().join("src/README.md");
+        assert!(moved.exists());
+        assert!(!original.exists());
+
+        app.update_in(cx, |app, window, cx| {
+            app.undo_tree_op(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            original.exists(),
+            "undo must move it back to where it was cut from"
+        );
+        assert!(!moved.exists());
+    }
+
+    /// The same "a fresh edit invalidates redo" rule every undo/redo stack in this app follows -
+    /// undoing a delete, then making a genuinely new edit, must drop the now-unreachable redo
+    /// entry (and best-effort clean up its backup, though that part isn't directly observable
+    /// from a test).
+    #[gpui::test]
+    fn a_fresh_edit_after_an_undo_clears_the_redo_stack(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let victim = repo.path().join("src/util.rs");
+        app.update(cx, |app, cx| {
+            app.request_tree_delete_with_mechanism_for_test(
+                victim.clone(),
+                false,
+                DeleteMechanism::Permanent,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.undo_tree_op(window, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.tree_redo_stack.len(),
+                1,
+                "premise: one entry is redoable"
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_tree_rename(repo.path().join("README.md"), false, window, cx);
+            app.tree_inline_edit.as_mut().expect("editor").name =
+                text_history::TextField::seeded("renamed.md");
+            app.commit_tree_inline_edit(window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.tree_redo_stack.is_empty(),
+                "a genuinely new edit must clear whatever was redoable"
+            );
+            assert_eq!(
+                app.tree_undo_stack.len(),
+                1,
+                "the new edit itself must be the one thing left to undo"
+            );
+        });
+    }
+
+    /// A guard on the app's one most destructive operation.
     #[gpui::test]
     fn deleting_something_outside_the_worktree_is_refused_outright(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -1663,8 +2073,8 @@ mod tree_ops_regression_tests {
 
         app.read_with(cx, |app, _| {
             assert!(
-                app.tree_delete_confirm.is_none(),
-                "a path outside the worktree must not even reach a confirmation"
+                app.tree_undo_stack.is_empty(),
+                "a path outside the worktree must not even reach a real delete"
             );
             assert!(app.tree_op_error.is_some(), "and it must say so");
         });
@@ -2082,22 +2492,11 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// `crate::keymap_overrides::file_tree_key_context`'s `(true, true)` arm - an inline name
-    /// editor open *and* the delete confirmation armed - is enumerated in `real_context_stacks()`
-    /// as a deliberate over-approximation. This asserts the reason it is safe to leave the
-    /// `"text-input"` word on that arm: the state has no real gesture path into it.
-    ///
-    /// Arming a delete goes through the context menu, and [`AdeApp::open_tree_context_menu`]
-    /// cancels any open inline editor first. Both audits of the merge that added the tag raised
-    /// this arm - keeping `"text-input"` there means `Ctrl+Z` behind the scrim would edit a name
-    /// field the user cannot see, but guarding the handlers instead would silently swallow the
-    /// keystroke, which is this project's most-repeated bug class. Proving the state unreachable
-    /// is what makes both concerns moot; asserting it is what stops a later refactor from
-    /// quietly making it reachable.
+    /// A right-click while a name is being typed must not leave the editor open underneath a menu
+    /// whose actions all act on a different path - [`AdeApp::open_tree_context_menu`] cancels any
+    /// open inline editor first.
     #[gpui::test]
-    fn arming_a_delete_is_not_reachable_while_an_inline_name_editor_is_open(
-        cx: &mut TestAppContext,
-    ) {
+    fn opening_the_context_menu_cancels_an_open_inline_editor(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
         seed(&repo);
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
@@ -2109,10 +2508,8 @@ mod tree_ops_regression_tests {
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
             assert!(app.tree_inline_edit.is_some(), "sanity check: editor open");
-            assert!(app.tree_delete_confirm.is_none());
         });
 
-        // The only real way to arm a delete: open the row's context menu first.
         app.update_in(cx, |app, window, cx| {
             app.open_tree_context_menu(
                 ContextTarget::File(repo.path().join("README.md")),
@@ -2127,9 +2524,7 @@ mod tree_ops_regression_tests {
         app.read_with(cx, |app, _| {
             assert!(
                 app.tree_inline_edit.is_none(),
-                "opening the context menu must cancel the inline editor - that is what makes the \
-                 \"editor open + delete armed\" context stack unreachable, and so makes leaving \
-                 `\"text-input\"` on that arm safe"
+                "opening the context menu must cancel the inline editor"
             );
         });
     }
@@ -2211,13 +2606,16 @@ mod tree_ops_regression_tests {
     /// delete confirmation's own scrim.
     #[test]
     fn every_file_tree_binding_is_scoped_away_from_the_inline_editor() {
-        let expected = "file-tree && !tree-editing && !tree-delete-confirm";
+        let expected = "file-tree && !tree-editing";
         let tree_actions = [
             "app::FileTreeContextMenu",
             "app::FileTreeRename",
             "app::FileTreeCopy",
             "app::FileTreeCut",
             "app::FileTreePaste",
+            "app::FileTreeDelete",
+            "app::FileTreeUndo",
+            "app::FileTreeRedo",
         ];
         let bindings = crate::default_key_bindings();
         let mut seen = Vec::new();
@@ -2567,10 +2965,12 @@ mod tree_ops_regression_tests {
                 app.lsp_synced_version.insert(renamed_relative.clone(), 3);
             });
             app.update(cx, |app, cx| {
-                app.request_tree_delete(renamed.clone(), false, cx);
-                app.tree_delete_confirm.as_mut().expect("armed").mechanism =
-                    DeleteMechanism::Permanent;
-                app.confirm_tree_delete(cx);
+                app.request_tree_delete_with_mechanism_for_test(
+                    renamed.clone(),
+                    false,
+                    DeleteMechanism::Permanent,
+                    cx,
+                );
             });
             cx.run_until_parked();
 
@@ -2658,47 +3058,10 @@ mod tree_ops_regression_tests {
                  palette - before the fix, focus was left dangling on the now-unrendered tree"
             );
         }
-
-        /// The delete confirmation is a modal. While it is up, the tree's own bindings must not
-        /// fire behind its scrim, and Escape must dismiss it.
-        #[gpui::test]
-        fn the_delete_confirmation_is_modal_to_the_trees_own_keybindings(cx: &mut TestAppContext) {
-            let repo = TempDir::new().expect("tempdir");
-            seed(&repo);
-            let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-            cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
-            cx.run_until_parked();
-
-            app.update_in(cx, |app, window, cx| {
-                app.selected_tree_path = Some(repo.path().join("README.md"));
-                app.focus_file_tree(window, cx);
-                app.request_tree_delete(repo.path().join("README.md"), false, cx);
-            });
-            cx.run_until_parked();
-
-            cx.simulate_keystrokes("f2");
-            cx.simulate_keystrokes("shift-f10");
-            app.read_with(cx, |app, _| {
-                assert!(
-                    app.tree_inline_edit.is_none() && app.tree_context_menu.is_none(),
-                    "F2/Shift+F10 must not fire behind the modal's own scrim"
-                );
-                assert!(app.tree_delete_confirm.is_some(), "and it stays up");
-            });
-
-            cx.simulate_keystrokes("escape");
-            app.read_with(cx, |app, _| {
-                assert!(
-                    app.tree_delete_confirm.is_none(),
-                    "escape must dismiss the confirmation"
-                );
-            });
-            assert!(repo.path().join("README.md").exists());
-        }
     }
 
-    /// A worktree switch must not leave a cut entry, a half-typed name, an open menu or an armed
-    /// delete pointing at the worktree just left.
+    /// A worktree switch must not leave a cut entry, a half-typed name, an open menu, or a
+    /// recorded undo/redo entry pointing at the worktree just left.
     #[gpui::test]
     fn switching_worktrees_clears_every_tree_operation_in_flight(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2752,13 +3115,25 @@ mod tree_ops_regression_tests {
             // ever ran - it would have passed against a reset that dropped that field entirely.
             app.open_tree_context_menu(ContextTarget::Empty, 10.0, 10.0, window, cx);
             app.start_tree_rename(repo.path().join("README.md"), false, window, cx);
-            app.request_tree_delete(repo.path().join("README.md"), false, cx);
+            // A recorded undo/redo entry - the fourth piece of in-flight tree state, replacing
+            // the pre-issue-#105 armed delete confirmation. Seeded directly rather than through a
+            // real delete/rename, since only the bookkeeping reset (not the real file op) is
+            // under test here.
+            app.tree_undo_stack.push(TreeUndoEntry::Relocate {
+                old_path: repo.path().join("a.txt"),
+                new_path: repo.path().join("b.txt"),
+            });
+            app.tree_redo_stack.push(TreeUndoEntry::Relocate {
+                old_path: repo.path().join("c.txt"),
+                new_path: repo.path().join("d.txt"),
+            });
             assert!(
                 app.tree_clipboard.is_some()
                     && app.tree_inline_edit.is_some()
                     && app.tree_context_menu.is_some()
-                    && app.tree_delete_confirm.is_some(),
-                "premise: all four must genuinely be live before the switch"
+                    && !app.tree_undo_stack.is_empty()
+                    && !app.tree_redo_stack.is_empty(),
+                "premise: all five must genuinely be live before the switch"
             );
             app.select_worktree(1, window, cx);
         });
@@ -2768,7 +3143,8 @@ mod tree_ops_regression_tests {
             assert!(app.tree_clipboard.is_none());
             assert!(app.tree_inline_edit.is_none());
             assert!(app.tree_context_menu.is_none());
-            assert!(app.tree_delete_confirm.is_none());
+            assert!(app.tree_undo_stack.is_empty());
+            assert!(app.tree_redo_stack.is_empty());
         });
         assert!(repo.path().join("README.md").exists());
     }
@@ -2897,20 +3273,27 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// GitHub issue #105: `Delete` had no keyboard shortcut at all. This drives the real two-press
-    /// flow through the keymap (not by calling `request_tree_delete`/`confirm_tree_delete`
-    /// directly): a first press arms the confirmation, a second removes the file - the same
-    /// outcome as clicking the row's own context-menu "Delete" then the confirmation panel's
-    /// button, but reachable from the keyboard.
+    /// GitHub issue #105: `Delete` had no keyboard shortcut at all. This drives the real
+    /// keystroke through the keymap (not by calling `Self::request_tree_delete` directly) to
+    /// prove the binding really reaches `Self::request_tree_delete_for_selection`.
+    ///
+    /// Deliberately does **not** `cx.run_until_parked()` after the keystroke: this test
+    /// environment has a real `gio` on `$PATH`, so letting the spawned background task actually
+    /// run would move a real test fixture into the developer's own trash - the same hygiene
+    /// concern `Self::request_tree_delete_with_mechanism_for_test` exists for elsewhere. Mechanism
+    /// resolution and spawning the delete task both happen synchronously, before anything
+    /// destructive runs, so checking `_tree_delete_task` right after dispatch - without ever
+    /// draining the executor - proves the keystroke reached the real delete path without letting
+    /// the real removal command run. `deleting_a_file_removes_it_immediately_and_records_a_real_undo_entry`
+    /// covers the real end-to-end removal, with a mechanism it fully controls.
     #[gpui::test]
-    fn the_delete_key_arms_then_confirms_the_selected_files_removal(cx: &mut TestAppContext) {
+    fn the_delete_key_reaches_the_real_delete_handler(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
         seed(&repo);
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
         cx.run_until_parked();
 
-        let victim = repo.path().join("README.md");
         let row = cx
             .debug_bounds("file-tree-row-README.md")
             .expect("the file row must be painted");
@@ -2919,28 +3302,11 @@ mod tree_ops_regression_tests {
 
         cx.simulate_keystrokes("delete");
         app.read_with(cx, |app, _| {
-            let pending = app
-                .tree_delete_confirm
-                .as_ref()
-                .expect("the first press must arm the confirmation");
-            assert_eq!(pending.path, victim);
-        });
-        assert!(victim.exists(), "arming must not remove anything");
-
-        // Forced the same way `a_confirmed_delete_really_removes_the_file_and_its_tab` does, so
-        // this test doesn't move a real fixture into a developer machine's own trash.
-        app.update(cx, |app, _cx| {
-            app.tree_delete_confirm.as_mut().expect("armed").mechanism = DeleteMechanism::Permanent;
-        });
-
-        cx.simulate_keystrokes("delete");
-        cx.run_until_parked();
-        assert!(
-            !victim.exists(),
-            "the second press, while already armed, must run the real delete"
-        );
-        app.read_with(cx, |app, _| {
-            assert!(app.tree_delete_confirm.is_none());
+            assert!(
+                app._tree_delete_task.is_some(),
+                "the Delete keystroke must reach AdeApp::request_tree_delete_for_selection and \
+                 spawn a real delete task"
+            );
         });
     }
 
@@ -3109,39 +3475,5 @@ mod tests {
         assert!(!is_inside_worktree(root, Path::new("/repo")));
         assert!(!is_inside_worktree(root, Path::new("/elsewhere/a.rs")));
         assert!(!is_inside_worktree(root, Path::new("/repo/../escape.rs")));
-    }
-
-    #[test]
-    fn a_pending_delete_says_exactly_what_it_will_do() {
-        let trash = PendingTreeDelete {
-            path: PathBuf::from("/repo/a.rs"),
-            is_dir: false,
-            mechanism: DeleteMechanism::Trash {
-                program: "gio",
-                args: Vec::new(),
-            },
-        };
-        assert_eq!(trash.confirm_label(), "Move to Trash");
-        assert!(trash.explanation().contains("trash"));
-
-        let permanent = PendingTreeDelete {
-            path: PathBuf::from("/repo/src"),
-            is_dir: true,
-            mechanism: DeleteMechanism::Permanent,
-        };
-        assert_eq!(permanent.confirm_label(), "Delete permanently");
-        assert!(
-            permanent.explanation().contains("Permanently")
-                && permanent
-                    .explanation()
-                    .contains("folder and everything in it"),
-            "a permanent delete of a folder must say both of those things out loud: {}",
-            permanent.explanation()
-        );
-        assert!(
-            !permanent.explanation().to_lowercase().contains("trash to")
-                && !permanent.explanation().starts_with("Move"),
-            "the permanent branch must never claim a trash that doesn't happen"
-        );
     }
 }
