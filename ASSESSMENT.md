@@ -276,3 +276,49 @@ end to end, for reasons unrelated to this change. What could be verified cleanly
 change actually added or touches (`cargo test -p app --lib code_surface::`, 235 tests, 0 failed),
 `cargo build --workspace`, `cargo fmt --all -- --check`, and `cargo clippy --workspace --exclude
 lsp-core --all-targets -- -D warnings` - see BUILD-LOG.md's own entry for the exact commands.
+
+## Addendum: repo selection from the rail (GitHub issue #113)
+
+**Real, end to end**: clicking a repo's header in the rail - even one with zero open worktrees -
+now really checks it out: `AdeApp::checkout_repo_from_rail` (`crates/app/src/root/mod.rs`) focuses
+it, loads its real file tree via the same `reset_repo_scoped_state` `open_repo_in_current_window`/
+`select_worktree` already share, and (unlike "Open Folder…") deliberately leaves it with nothing
+open rather than auto-spawning a shell - a genuinely empty repo is now a real, reachable "focused,
+nothing open yet" state instead of an invisible one. `render_repo_group`
+(`crates/app/src/rail/render.rs`) no longer drops a repo's whole group from the rail when it has
+no rows; its header always renders, is always clickable, and now carries its own `+` that opens
+the exact same real tab-strip plus-menu popover (`render_plus_menu`), correctly anchored to
+*whichever* button actually opened it (`Self::plus_menu_repo_anchor`) rather than always the tab
+strip's own bounds - not a second, reimplemented spawn path. Four `#[gpui::test]`s drive the
+checkout/plus-menu behavior through real `cx.simulate_click`s against real painted bounds, not by
+calling handlers directly; a fifth proves every agent belonging to the previously-focused repo is
+really torn down (removed from `Agents`'s own list, mirroring the identical
+`open_repo_in_current_window` regression test's technique) when a different repo is checked out
+from the rail.
+
+**Fixed after an independent checker audit** (same worktree, same commit): the header's `N wt`
+count and empty-state message used to assert a real, specific, false claim - `0 wt`/"no worktrees
+open yet" - for every repo *other* than the focused one, because that data was never loaded, not
+because those repos really have zero worktrees. `RepoGroup`/`RepoWorktrees` now carry a real
+`rows_loaded: bool` (true only for the focused repo), and the render side uses it to show an
+honest "— wt" / "not loaded yet" instead of fabricating a zero. See BUILD-LOG.md's follow-up entry
+for the other four issues that same audit found and fixed (a missing regression test for the
+rail's one-click agent teardown, one dead line plus a self-contradicting doc comment, the plus-menu
+anchor bug just mentioned, and a `cursor_pointer` gating miss) - none change the "real, end to end"
+verdict above, they tighten it.
+
+**Real, but a narrower promise than it may sound**: "worktrees whose tabs were previously open
+resume" only holds *within* one repo, worktree-to-worktree (`Agents::active_by_cwd`, unaffected by
+this change). It does **not** hold repo-to-repo: every repo switch - this new rail gesture
+included, mirroring `open_repo_in_current_window`'s own pre-existing behavior - closes every
+currently open agent, since none of them stay reachable through this app's still single-repo-
+scoped tab strip once focus moves elsewhere. Revisiting a repo you've already left in the same
+session gets its file tabs back (`open_files_by_worktree` is keyed by absolute path and never
+cleared on a switch) but not its terminal/agent tabs, which were genuinely killed, not hidden.
+
+**Not built**: cross-restart persistence of which tabs were open per repo (the task's own stretch
+goal) - deliberately not attempted. It would need more than a new TOML file: the same-repo-kills-
+agents behavior above would need to change first for "restore tabs" to mean anything real across a
+restart, and that's a materially bigger behavioral change than this bounded slice took on. Startup
+behavior (which repo/tabs a fresh launch lands in, GitHub issue #90's "resume last-focused repo")
+was left completely untouched, on purpose - not evaluated, not partially rewired, not stubbed.

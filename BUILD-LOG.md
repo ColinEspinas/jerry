@@ -7241,3 +7241,263 @@ warnings`, `cargo fmt --all -- --check` - all clean. `cargo test --workspace -p 
 pre-existing and environment-specific (LSP wiring/GPU-paint tests, already documented elsewhere in
 this log), none touching indent guides; both new indent-guide-paint tests and the persistence test
 pass.
+
+## GitHub issue #113: an empty repo had no way to be selected from the rail at all
+
+The report was concrete and code-level, not a guess: `render_repo_group` built the repo header
+(name, `N wt` count, waiting badge) but never attached an `.on_click()`, unlike
+`render_worktree_row`, which is wired to `select_worktree_by_path`. Worse, `render_rail_list`
+went further and dropped a repo's *entire* group - header included - from the rail whenever it
+had nothing to show under it (`groups.iter().all(|group| group.rows.is_empty())`), replacing it
+with a generic "no worktrees found" message. Since `build_repo_groups` only ever populates real
+row data for `Self::focused_repo` (every other known repo gets an unconditionally empty
+`all_rows`/`rows` - a separate, already-documented, single-repo-scoped data limitation, untouched
+here), any repo the user hadn't already focused was, in practice, invisible in the rail - there
+was no click target to check it out from, and no visual trace it was even known to the app.
+
+### The fix: a real checkout path that deliberately does *not* auto-spawn anything
+
+`AdeApp::checkout_repo_from_rail` (`crates/app/src/root/mod.rs`) is the rail-native sibling of
+the existing `open_repo_in_current_window` (GitHub issue #90's "Open Folder…"): it shares that
+method's real reload (`reset_repo_scoped_state`, `start_worktree_watch`/`start_status_polling`,
+forgetting a dangling `empty_state_focus_handle` overlay target, and closing every agent that
+belonged to whichever repo was focused before - since none of them stay reachable through this
+app's still single-repo-scoped tab strip once focus moves elsewhere, the identical "shut them
+down cleanly rather than leak the PTYs" reasoning `open_repo_in_current_window` already
+documents). It deliberately does **not** call `add_repo` (the clicked repo is already a known
+`Self::repos` entry - every row the rail renders came from there) and does **not** spawn an
+initial shell the way "Open Folder…" always does: the whole point of this gesture is that
+clicking a zero-worktree repo header must land in a real "focused, nothing open yet" state, not
+silently open an unwanted terminal. A no-op if the id is unknown (mirrors `focus_repo`'s own
+guard) or already focused (a re-click of the repo already showing must not reset its live UI
+state - proven by a dedicated regression test that arms `commit_menu_open` first and checks it
+survives the click).
+
+`render_repo_group` (`crates/app/src/rail/render.rs`) now always renders every repo's header,
+regardless of `rows`/`all_rows` - `render_rail_list`'s "drop the whole group" shortcut is gone,
+replaced with a real inline message ("no worktrees open yet" vs. "no worktrees match this
+filter", distinguishing a genuinely empty repo from one the filter box is hiding, the same
+distinction the whole-rail empty message already made) rendered *under* the still-real header
+rather than instead of it. The header itself gained `cursor_pointer`, a hover affordance gated on
+not already being the focused repo (mirroring `render_worktree_row`'s own `is_selected`
+convention), and an `on_click` wired straight to `checkout_repo_from_rail`.
+
+### The second half: a rail-native `+` that reuses the real plus menu, not a second spawn path
+
+The issue's second requirement - "let the user create a terminal / agent session from the rail"
+- turned out to need almost no new plumbing once the checkout half worked: `render_center_pane`
+already renders the tab strip (and so its own real `+` menu) unconditionally whenever a repo is
+focused, regardless of whether that repo has zero worktrees, and already shows "no agents open in
+this worktree - start one with the tab strip's + menu" when `Agents::active()` is `None` - which
+it always is for a just-checked-out repo, since (as established above) a non-focused repo can
+never have a live agent by construction. `AdeApp::new_agent`/`new_agent_pane` already resolve
+their spawn target via `active_agent_cwd()`, which falls back to `focused_repo_path()` with no
+worktree selected - so once `checkout_repo_from_rail` runs, every existing "New terminal"/"New
+agent" entry point already spawns into the right place with zero changes.
+
+What was still missing was a rail-native affordance, so `render_repo_group` also gained a small
+`+` (`Self::render_repo_group_new_button`) on the header itself: its click handler checks the
+repo out (a no-op if already focused) and then does exactly what `render_tab_strip_plus`'s own
+click handler does - sets `plus_menu_open = true` and refreshes `load_agent_rows` - rather than
+reimplementing any of the five real actions `render_plus_menu` already dispatches (New terminal,
+New agent, Git graph, Open file…, Next changed file). The popover that opens is the literal same
+one the tab strip's own `+` opens (same field, same render function, positioned off the tab
+strip's own captured bounds) - clicking "New terminal" from a repo checked out via the rail's `+`
+spawns a real shell with `cwd` equal to that repo's root, proven end to end by a test that clicks
+the rail's `+`, then clicks the real "New terminal" row the popover renders, and asserts the
+spawned agent's `cwd`.
+
+### What this does *not* do: cross-repo tab persistence (the stretch goal, explicitly skipped)
+
+The task's stretch goal - a small TOML-backed store (mirroring `tab_order_state.rs`'s pattern)
+persisting which tabs were open per repo across a real app restart - was not attempted. Read
+closely, in-memory "remembers within this session" turns out to be a narrower promise than it
+sounds: `open_repo_in_current_window` (and now `checkout_repo_from_rail`, which mirrors it)
+already closes *every* currently open agent whenever focus moves to a different repo, since this
+app's tab strip is still single-repo-scoped and an agent belonging to whatever was left becomes
+permanently unreachable through the UI otherwise. That means `Agents::active_by_cwd` can only
+ever hold live entries for whichever repo is currently focused - switching from repo A to repo B
+and back to A does **not** restore A's terminal/agent tabs, because they were genuinely killed on
+the way out, not merely hidden. What *does* survive a repo-to-repo round trip for free:
+`open_files_by_worktree` (keyed by absolute worktree path, never cleared on a repo switch) really
+does restore open **file** tabs if you return to the exact same worktree path later in the same
+session. Building real cross-restart tab persistence properly - deciding whether it should also
+stop closing agents on a repo switch, which is a materially bigger behavioral change than "add a
+TOML file" - was judged out of scope for this bounded slice; shipping a half version (e.g. a
+`repos.toml`-adjacent file that records tab intent but can't actually act on it without the
+bigger agents-don't-die-on-switch change) would have been exactly the kind of stubbed
+functionality this project's own rules forbid. Startup behavior (which repo/tabs a fresh launch
+lands in) was left completely untouched for the same reason - the task was explicit that a
+half-fix there could regress the existing "resume last-focused repo" behavior GitHub issue #90
+already built.
+
+### Tests
+
+Three new `#[gpui::test]`s in a new `crates/app/src/rail/render.rs` `repo_checkout_tests` module,
+following `rail_row_tests`' own established pattern (`palette_focus_tests::open_test_app`, real
+`cx.simulate_click` against `cx.debug_bounds`, not calling handlers directly where the bug was in
+the render tree itself):
+`clicking_an_empty_repos_header_checks_it_out` adds a second real repo via `add_repo` (never
+focused, so `build_repo_groups` genuinely gives it zero rows - the exact precondition the bug
+needed), confirms its group still renders one, then drives a real click on the header's painted
+bounds and asserts the repo is really focused and its file tree really loaded.
+`clicking_the_already_focused_repos_header_does_not_reset_it` arms `commit_menu_open` and proves
+a second click on the same header leaves it alone.
+`the_repo_headers_plus_button_opens_the_real_plus_menu_targeting_that_repo` drives the full path
+end to end: click repo B's `+`, confirm it's now focused and the real menu is open, click the
+real "New terminal" row, and assert the spawned agent's `cwd` is repo B's.
+
+### Gates
+
+`cargo fmt --all -- --check`, `cargo build --workspace`, and
+`cargo clippy --workspace --all-targets -- -D warnings` all clean (this sandbox needed
+`~/.local/opt/build-env.sh`'s `PKG_CONFIG_PATH`/`LIBRARY_PATH`/`LD_LIBRARY_PATH` exports pointed
+at a locally-built `deps-prefix` for `cargo build` to link at all - a plain `cargo build` fails
+with a missing-`libxkbcommon`/`libxkbcommon-x11` linker error otherwise, the same real x11-backend
+system-library gap ASSESSMENT.md already documents, unrelated to this change). `cargo test
+--workspace`: **1391 + 173 + 14 = 1578 passed, 9 failed** in `app` plus **35 passed, 16 failed**
+in `lsp-core` (`wt-core` and `pty-core` both fully clean). Every one of the 25 failures is a
+pre-existing, real-external-tooling-dependent LSP test - `lsp::client`, `code_surface::lsp_ui`,
+and `code_surface::file_view::lsp_failed_status_chip_tests` in `app`, `client::tests` in
+`lsp-core` - none in `rail`, `root`, or `work_surface`, the only modules this change touches.
+Confirmed environmental, not a regression: `pyright`/`typescript-language-server`/
+`vue-language-server` aren't installed in this sandbox at all (`which` finds none of them), the
+`lsp-core` `typescript_language_server_*` failures are a literal `npm install typescript@5 into
+the scratch project failed` (no network), and even the installed `rust-analyzer` fails its own
+handshake here (`ConnectionClosed`) - the exact class of "real process spawns... hung or
+crashed... under this sandbox specifically" gap ASSESSMENT.md's multi-cursor-editing addendum
+already disclosed for a different, unrelated change. The 3 new regression tests above pass
+individually (`cargo test -p app --lib rail::render::repo_checkout_tests`: 3 passed, 0 failed) and
+inside the full run.
+
+## GitHub issue #113 follow-up: an independent checker audit found five real problems in the fix above
+
+An independent checker agent re-read the diff above against this project's own "no fake
+functionality" rule and flagged five real issues, two of them CRITICAL. All five are fixed here,
+in the same worktree/branch as the original fix (amended into the same commit rather than
+stacked, since this closes out the same logical change before it ships).
+
+### CRITICAL: `0 wt` and "no worktrees open yet" were fabricated claims for every non-focused repo
+
+`build_repo_groups` only ever populates real `all_rows`/`rows` for `Self::focused_repo` - every
+other repo's worktree/agent data was simply never loaded into memory (a real, already-documented,
+pre-existing single-repo-scoped data limitation, not something the original #113 fix caused).
+Before that fix, a group with empty rows was dropped from the rail entirely, so this never
+surfaced as a visible lie. Once every repo's header started rendering unconditionally, the
+header's `format!("{} wt", group.all_rows.len())` and the new "no worktrees open yet" empty
+message both started asserting a real, specific claim - "this repo has zero worktrees" - about a
+repo whose data was never actually fetched and might genuinely have five worktrees on disk. Exactly
+the "UI element asserting state the app hasn't actually loaded" pattern `CONTRIBUTING.md`'s "no
+fake functionality" rule exists to catch.
+
+The fix: `RepoWorktrees`/`RepoGroup` (`crates/app/src/rail/state.rs`) both gained a real
+`rows_loaded: bool` field, set to `is_focused` at the one place `build_repo_groups`
+(`crates/app/src/rail/render.rs`) constructs a `RepoWorktrees` per repo - `true` only for the
+repo whose data really was loaded this render. `render_repo_group` now branches on it: the header
+shows an honest em dash (`— wt`) instead of a literal `0` when `!rows_loaded`, and the inline
+empty-state message says "not loaded yet – click to open" instead of the false "no worktrees open
+yet" for that same case - falling back to the original two-way "no worktrees open yet" vs. "no
+worktrees match this filter" distinction only once `rows_loaded` is genuinely `true`. A new test,
+`group_worktrees_by_repo_carries_rows_loaded_through_unchanged` (`rail::state::tests`), proves the
+field survives `group_worktrees_by_repo`'s own transform unchanged; a second,
+`build_repo_groups_marks_only_the_focused_repos_data_as_really_loaded`
+(`rail::render::repo_checkout_tests`), drives it through a real, live `AdeApp` with two real repos
+and asserts the focused one reports `true` and the other `false`.
+
+### CRITICAL: `checkout_repo_from_rail`'s one-click agent teardown had zero regression coverage
+
+The checker's concern wasn't that this is new destructive behavior - closing every open agent on a
+repo switch is pre-existing behavior `open_repo_in_current_window` already has, and
+`checkout_repo_from_rail` deliberately mirrors it (documented at length in both methods' own doc
+comments) - it's that the *gesture* to trigger it got much cheaper: one click on a rail row, versus
+"File > Open Folder… > pick a directory" before, with no test proving the teardown is real for the
+new path.
+
+Judgment call: no confirmation dialog was added. `open_repo_in_current_window` - the exact same
+destructive behavior, reachable today via "Open Folder…", the File menu, and the empty-state
+button - has never had one, and adding a two-click confirm only to the rail's new entry point
+while leaving every existing entry point silent would be an inconsistent, arbitrary distinction a
+user can't reason about ("closing my terminals is dangerous from the rail but not from the File
+menu?"). The two-click confirms that do exist in this codebase (`prune_confirm_armed`,
+`discard_confirm_armed`) gate a single worktree's/agent's own destructive action, not a whole-repo
+switch - there's no existing precedent for gating this specific kind of action, and inventing one
+asymmetrically for just this new call site would be a bigger, uninvited behavioral change. What
+the checker asked for as the real minimum bar - test coverage - was missing and is now real: a new
+`checkout_repo_from_rail_closes_the_previous_repos_agents` test
+(`root::repo_list_tests`), mirroring `open_repo_in_current_window_closes_the_previous_repos_agents`
+exactly (same "assert the closed repo's agents are gone from `Agents`'s own list" technique, since
+`Agents::close` always calls `TerminalPane::shutdown` before removing an agent from that list -
+there's no separate "is the PTY really dead" probe anywhere else in this codebase to mirror
+instead), but spawns *two* real agents in repo A first (the initial shell plus a spawned Claude
+session) to prove more than just the trivial single-agent case is really torn down, and additionally
+asserts `checkout_repo_from_rail` does **not** auto-spawn a fallback shell into repo B (unlike
+`open_repo_in_current_window`), since that's the one real behavioral difference between the two
+methods this test needed to also pin down.
+
+### Dead code: `activate_for_worktree` could never do anything in `checkout_repo_from_rail`
+
+The call sat right after the loop that unconditionally closes every currently open agent. By
+construction, `checkout_repo_from_rail` early-returns before that point if `id` was already the
+focused repo, and this app's tab strip is single-repo-scoped (only one repo's agents are ever open
+at once) - so by the time `activate_for_worktree(&path, cx)` ran, `self.agents` was always empty,
+and `Agents::activate_for_worktree` itself confirms why that's a true no-op: `remembered` is
+filtered against `self.agents.iter().any(...)` (empty), the `.or_else` fallback searches
+`self.agents` again (still empty), so `id` resolves to `None` and `sync_pane_cadence` loops over
+zero agents. The surrounding doc comment made it worse, not just redundant: it opened with
+"Whatever agents `id`'s repo already had open earlier in *this* window's session come back exactly
+as they were" and then, three lines later, explained the exact mechanism (every repo switch closes
+every agent) that makes that first sentence false for this method specifically. Removed the dead
+call outright (there is no live path where it does anything) and rewrote the doc comment to state
+the one true thing this method does instead: `id`'s repo comes up genuinely empty, on purpose,
+matching this method's own "focused, nothing open yet" design goal documented earlier in the same
+comment block.
+
+### Minor: the rail's own `+` opened the tab strip's popover, anchored to the tab strip's button
+
+`render_plus_menu` (`crates/app/src/work_surface/render.rs`) always positioned itself off
+`Self::plus_button_bounds` - a field only ever written by the tab strip's own `+` button's
+`gpui::canvas`. Clicking a rail repo header's `+` opened the real, correct menu targeting the
+right repo, but visually anchored to wherever the tab strip's `+` happened to be, not the rail
+button that was actually clicked.
+
+Fixed with the same `gpui::canvas` idiom the tab strip's own `+` already uses, adapted for the
+one real complication: unlike the tab strip's single `+`, one rail `+` paints per repo group,
+every frame, regardless of which one (if any) gets clicked - so a single shared bounds field would
+just hold whichever repo happened to render last. `Self::rail_plus_button_bounds` is a
+`HashMap<RepoId, Bounds<Pixels>>` instead (`crates/app/src/root/mod.rs`), each repo header's `+`
+writing its own entry; a new `Self::plus_menu_repo_anchor: Option<RepoId>` records which button
+opened the popover (`None` for the tab strip's own, `Some(repo_id)` for that repo's rail button),
+set explicitly by both click handlers. `render_plus_menu` looks up the anchor's bounds from
+whichever source `plus_menu_repo_anchor` says, falling back to `plus_button_bounds` defensively if
+that repo's header somehow hasn't painted yet.
+
+### Minor: `cursor_pointer` on the already-focused repo's own no-op header click
+
+The repo header applied `cursor_pointer()` unconditionally even though clicking the already-
+focused repo's own header is a documented no-op (`checkout_repo_from_rail`'s own early-return
+guard) - inconsistent with this file's own established convention (the comment near line 1407)
+that a non-actionable control drops `cursor_pointer()`/hover/`on_click` entirely. Fixed by folding
+`cursor_pointer()` into the same `.when(!is_focused_repo, ...)` block that already gated the hover
+affordance, rather than leaving it as a separate, ungated call.
+
+### Gates
+
+Same four commands as the original #113 entry above, re-run from the same worktree after this
+follow-up pass. `cargo build --workspace`: clean. `cargo fmt --all -- --check`: clean, no diff.
+`cargo clippy --workspace --all-targets -- -D warnings`: clean, zero warnings. `cargo test
+--workspace`: **1393 passed, 10 failed** in `app` (plus `lsp_core`/`pty_core`/`wt_core` all fully
+filtered/clean in this run's `-p app` scoping - see below). Of the 10 `app` failures: 9 are the
+same pre-existing, real-external-tooling-dependent LSP tests the original entry above already
+disclosed (`lsp::client::lsp_diagnostics_wiring_tests`, `code_surface::lsp_ui`,
+`code_surface::file_view::lsp_failed_status_chip_tests` - `npm install typescript@5` failing with
+no network, `pyright`/`rust-analyzer` never reaching a ready/clean state within their deadlines);
+the 10th,
+`title_bar::render::agent_state_chip_live_tests::a_second_real_spawned_agent_flips_the_live_chip_from_singular_to_plural`,
+is a real-PTY-timing flake under this run's heavy parallel load (`--test-threads` default) -
+confirmed by re-running it alone (`cargo test -p app --lib
+title_bar::render::agent_state_chip_live_tests::a_second_real_spawned_agent_flips_the_live_chip_from_singular_to_plural
+-- --test-threads=1`: 1 passed, 0 failed), and unrelated to any file this follow-up (or the
+original #113 fix) touches. Every new/modified test this follow-up added ran green both scoped
+(`cargo test -p app --lib rail:: -- --test-threads=4`: 98 passed; `cargo test -p app --lib root::
+-- --test-threads=4`: 110 passed; `cargo test -p app --lib work_surface:: -- --test-threads=4`: 75
+passed) and by exact name in isolation.

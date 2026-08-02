@@ -409,6 +409,14 @@ pub struct RepoWorktrees {
     /// currently visible on screen is a real, separate UI concern from what the header reports
     /// about the repo's real state.
     pub rows: Vec<WorktreeRow>,
+    /// Whether `all_rows`/`rows` reflect this repo's real, live worktree data - `true` only for
+    /// the currently focused repo (see [`group_worktrees_by_repo`]'s own docs for why every other
+    /// repo's worktree/agent data simply hasn't been loaded into memory yet, a real pre-existing
+    /// data-model limitation, not something this field papers over). An empty `all_rows` with
+    /// `rows_loaded: false` means "unpopulated" - a repo that may genuinely have several
+    /// worktrees on disk that just haven't been fetched - and must never be rendered the same way
+    /// as an empty `all_rows` with `rows_loaded: true`, which really does mean zero worktrees.
+    pub rows_loaded: bool,
 }
 
 /// One repo group in the rail - `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md`
@@ -426,6 +434,10 @@ pub struct RepoGroup {
     /// Ranked by [`WorktreeRow::urgency_rank`], most urgent first - see
     /// [`group_worktrees_by_repo`].
     pub rows: Vec<WorktreeRow>,
+    /// See [`RepoWorktrees::rows_loaded`] - carried through unchanged by
+    /// [`group_worktrees_by_repo`]. The render side must consult this before treating an empty
+    /// `all_rows` as a real "zero worktrees" claim.
+    pub rows_loaded: bool,
 }
 
 impl RepoGroup {
@@ -507,6 +519,7 @@ pub fn group_worktrees_by_repo(repos: Vec<RepoWorktrees>) -> Vec<RepoGroup> {
                 repo_name: repo.repo_name,
                 all_rows,
                 rows,
+                rows_loaded: repo.rows_loaded,
             }
         })
         .collect();
@@ -1076,8 +1089,10 @@ mod tests {
 
     /// A [`RepoWorktrees`] whose `all_rows` and `rows` are the same list - the common case in
     /// these tests, where nothing distinguishes "this repo's real worktree set" from "what's
-    /// currently rendered under it". [`repo_worktrees_split`] below is for the tests that need
-    /// the two to diverge.
+    /// currently rendered under it". `rows_loaded` is always `true` here (these tests model a
+    /// repo whose data really has been loaded) - [`repo_worktrees_split`] below is for the tests
+    /// that need `all_rows`/`rows` to diverge, and [`repo_worktrees_unloaded`] for the tests that
+    /// need `rows_loaded: false`.
     fn repo_worktrees(id: u64, name: &str, rows: Vec<WorktreeRow>) -> RepoWorktrees {
         repo_worktrees_split(id, name, rows.clone(), rows)
     }
@@ -1086,7 +1101,8 @@ mod tests {
     /// worktree list - what the header counters must read) and `rows` (what's actually
     /// rendered/expanded below the header - what a filter query or a non-focused repo can
     /// legitimately narrow). See [`RepoWorktrees::all_rows`]'s own docs for why the two must
-    /// stay independent.
+    /// stay independent. `rows_loaded` is always `true` here - see [`repo_worktrees_unloaded`]
+    /// for the unpopulated case.
     fn repo_worktrees_split(
         id: u64,
         name: &str,
@@ -1098,6 +1114,22 @@ mod tests {
             repo_name: name.to_string(),
             all_rows,
             rows,
+            rows_loaded: true,
+        }
+    }
+
+    /// A [`RepoWorktrees`] whose data was never fetched - `rows_loaded: false`, `all_rows`/`rows`
+    /// both empty regardless of how many worktrees this repo may really have on disk. Models
+    /// every non-focused repo in [`crate::rail::render::AdeApp::build_repo_groups`]'s own real
+    /// output - see [`RepoWorktrees::rows_loaded`]'s docs for why this must render differently
+    /// from a repo that was really loaded and really has zero worktrees.
+    fn repo_worktrees_unloaded(id: u64, name: &str) -> RepoWorktrees {
+        RepoWorktrees {
+            repo_id: RepoId(id),
+            repo_name: name.to_string(),
+            all_rows: Vec::new(),
+            rows: Vec::new(),
+            rows_loaded: false,
         }
     }
 
@@ -1166,6 +1198,38 @@ mod tests {
         );
         assert_eq!(groups[0].repo_name, "jerry-core");
         assert!(groups[0].rows.is_empty());
+    }
+
+    #[test]
+    fn group_worktrees_by_repo_carries_rows_loaded_through_unchanged() {
+        let groups = group_worktrees_by_repo(vec![
+            repo_worktrees(0, "loaded-repo", Vec::new()),
+            repo_worktrees_unloaded(1, "unloaded-repo"),
+        ]);
+
+        let loaded = groups
+            .iter()
+            .find(|g| g.repo_name == "loaded-repo")
+            .expect("loaded-repo's group must exist");
+        assert!(
+            loaded.rows_loaded,
+            "a repo built via `repo_worktrees` really has its data loaded"
+        );
+
+        let unloaded = groups
+            .iter()
+            .find(|g| g.repo_name == "unloaded-repo")
+            .expect("unloaded-repo's group must exist");
+        assert!(
+            !unloaded.rows_loaded,
+            "a repo whose worktree data was never fetched must carry that through to its \
+             `RepoGroup`, not silently become indistinguishable from a real zero-worktree repo"
+        );
+        assert!(
+            unloaded.all_rows.is_empty() && unloaded.rows.is_empty(),
+            "sanity check: the unloaded repo's rows are empty for the same reason its data was \
+             never fetched, not because it really has zero worktrees"
+        );
     }
 
     #[test]
