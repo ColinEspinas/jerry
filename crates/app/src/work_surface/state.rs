@@ -17,25 +17,36 @@ use crate::sidebar::file_tree::LangChip;
 use crate::theme;
 use crate::work_surface::agents::{AgentId, AgentKind};
 
-/// One entry in a worktree's combined tab-strip order (GitHub issue #16) - either an agent tab
-/// or a file tab. `Agents`/`crate::root::AdeApp::open_files` remain the real storage for
-/// *existence* and all process/buffer behaviour (spawning, closing, PTY lifecycle, edit-buffer
-/// state) - this only records where a tab sits *visually*, so the two groups can interleave in
-/// one strip instead of always rendering as two rigid blocks.
+/// One entry in a worktree's combined tab-strip order (GitHub issue #16, extended by issue #93
+/// to also cover the git graph tab) - an agent tab, a file tab, or the one real git graph tab.
+/// `Agents`/`crate::root::AdeApp::open_files`/`crate::root::AdeApp::graph_tab_open` remain the
+/// real storage for *existence* and all process/buffer/graph-load behaviour - this only records
+/// where a tab sits *visually*, so every kind can interleave in one strip instead of always
+/// rendering as rigid, un-reorderable blocks. `Graph` carries no payload: unlike agents/files,
+/// there is only ever at most one real graph tab per window (`crate::root::AdeApp::
+/// graph_tab_open`'s own "one per window" docs), so there is nothing to distinguish one from
+/// another the way an `AgentId`/`PathBuf` does for its own kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TabRef {
     Agent(AgentId),
     File(PathBuf),
+    Graph,
 }
 
 /// Reconciles a worktree's stored tab order (`crate::root::AdeApp::tab_order`) against what's
 /// *actually* open right now: drops any entry that no longer exists (a closed agent, a closed
-/// file tab), then appends anything open that isn't in `stored` yet (a freshly spawned agent,
-/// a freshly opened file) in `agents_for_cwd`/`open_files`'s own order - the same "just append
-/// at the end" position a brand new tab has always landed at.
+/// file tab, a closed graph tab), then appends anything open that isn't in `stored` yet (a
+/// freshly spawned agent, a freshly opened file, or - GitHub issue #93 - a freshly opened graph
+/// tab) in `agents_for_cwd`/`open_files`/`graph_open`'s own order - the same "just append at the
+/// end" position a brand new tab has always landed at. `graph_open` is a real, live "is the one
+/// graph tab open right now" fact (`crate::root::AdeApp::graph_tab_open`), not itself scoped to
+/// this worktree - only its *position within this worktree's own strip* is, matching how
+/// `crate::root::AdeApp::tab_order` already remembers a different position per worktree for the
+/// same shared agent/file tab identities never do (an agent/file *is* worktree-scoped; the graph
+/// tab's own on-screen slot is what's being remembered here, not a second graph tab).
 ///
 /// Pure and idempotent: calling it again on its own output, with the same
-/// `agents_for_cwd`/`open_files`, changes nothing. That's what lets
+/// `agents_for_cwd`/`open_files`/`graph_open`, changes nothing. That's what lets
 /// `crate::root::AdeApp::combined_tab_order` call this fresh on every render instead of caching
 /// a mutated copy - only a real drag-drop (`crate::root::AdeApp::reorder_tab`) needs to persist a
 /// changed `Vec<TabRef>` back into `tab_order`.
@@ -43,12 +54,14 @@ pub fn reconcile_tab_order(
     stored: &[TabRef],
     agents_for_cwd: &[AgentId],
     open_files: &[PathBuf],
+    graph_open: bool,
 ) -> Vec<TabRef> {
     let mut order: Vec<TabRef> = stored
         .iter()
         .filter(|tab_ref| match tab_ref {
             TabRef::Agent(id) => agents_for_cwd.contains(id),
             TabRef::File(path) => open_files.contains(path),
+            TabRef::Graph => graph_open,
         })
         .cloned()
         .collect();
@@ -67,6 +80,9 @@ pub fn reconcile_tab_order(
         {
             order.push(TabRef::File(path.clone()));
         }
+    }
+    if graph_open && !order.contains(&TabRef::Graph) {
+        order.push(TabRef::Graph);
     }
     order
 }
@@ -779,6 +795,7 @@ mod tests {
             &[],
             &[1, 2],
             &[PathBuf::from("a.rs"), PathBuf::from("b.rs")],
+            false,
         );
         assert_eq!(
             order,
@@ -801,7 +818,7 @@ mod tests {
             TabRef::File(PathBuf::from("a.rs")),
             TabRef::Agent(2),
         ];
-        let order = reconcile_tab_order(&stored, &[1, 2], &[PathBuf::from("a.rs")]);
+        let order = reconcile_tab_order(&stored, &[1, 2], &[PathBuf::from("a.rs")], false);
         assert_eq!(order, stored);
     }
 
@@ -815,7 +832,7 @@ mod tests {
             TabRef::File(PathBuf::from("a.rs")),
             TabRef::Agent(2),
         ];
-        let order = reconcile_tab_order(&stored, &[2], &[]);
+        let order = reconcile_tab_order(&stored, &[2], &[], false);
         assert_eq!(order, vec![TabRef::Agent(2)]);
     }
 
@@ -824,7 +841,7 @@ mod tests {
     #[test]
     fn reconcile_appends_newly_opened_tabs_not_yet_in_the_stored_order() {
         let stored = vec![TabRef::Agent(1)];
-        let order = reconcile_tab_order(&stored, &[1, 2], &[PathBuf::from("a.rs")]);
+        let order = reconcile_tab_order(&stored, &[1, 2], &[PathBuf::from("a.rs")], false);
         assert_eq!(
             order,
             vec![
@@ -833,6 +850,35 @@ mod tests {
                 TabRef::File(PathBuf::from("a.rs")),
             ]
         );
+    }
+
+    /// GitHub issue #93: a freshly opened graph tab, not yet in the stored order, must be
+    /// appended at the end - the same "brand new tab lands last" rule every other kind already
+    /// gets, not silently dropped or given a hardcoded fixed position.
+    #[test]
+    fn reconcile_appends_a_freshly_opened_graph_tab() {
+        let order = reconcile_tab_order(&[], &[1], &[], true);
+        assert_eq!(order, vec![TabRef::Agent(1), TabRef::Graph]);
+    }
+
+    /// The real point of GitHub issue #93: once a drag has recorded the graph tab somewhere
+    /// specific in the stored order, reconciliation must honor that real position - not always
+    /// re-append it at the end - as long as it's still open.
+    #[test]
+    fn reconcile_preserves_a_stored_graph_tab_position() {
+        let stored = vec![TabRef::Graph, TabRef::Agent(1)];
+        let order = reconcile_tab_order(&stored, &[1], &[], true);
+        assert_eq!(order, stored);
+    }
+
+    /// A closed graph tab must be dropped from the order, exactly like a closed agent or file
+    /// tab - not left as a dangling entry `crate::root::AdeApp::render_tab_strip` would try to
+    /// render for a tab that no longer exists.
+    #[test]
+    fn reconcile_drops_a_closed_graph_tab() {
+        let stored = vec![TabRef::Agent(1), TabRef::Graph];
+        let order = reconcile_tab_order(&stored, &[1], &[], false);
+        assert_eq!(order, vec![TabRef::Agent(1)]);
     }
 
     /// The real cross-kind drag this revision exists to unlock: dropping a file tab so it lands
