@@ -393,100 +393,46 @@ impl AdeApp {
     /// a user's real drag-chosen order, never which tabs exist; that's still `Agents`/
     /// [`Self::open_files`]'s job.
     ///
-    /// A bare worktree (Revision R12 §3: "a bare worktree shows only the shell tab") reconciles
-    /// against an *empty* file list instead of the real [`Self::open_files`] - `reconcile_tab_order`
-    /// then drops every `TabRef::File` already in `stored` (its own `open_files.contains(path)`
-    /// filter) and appends none back. This only hides them from the reconciled order this call
-    /// returns; it never touches [`Self::open_files_by_worktree`] or `stored` itself, so the
-    /// moment a real agent spawns and the worktree stops being bare, the next call reconciles
-    /// against the real (untouched) open-files list again and the same file tabs reappear in
-    /// their original position - nothing was destroyed, only not rendered while bare. Bareness is
-    /// computed locally from `agents_for_cwd` rather than by calling
-    /// [`Self::current_worktree_is_bare`], which itself goes through
-    /// [`Self::current_worktree_agents`] -> this function; calling back into it here would
-    /// recurse.
-    ///
-    /// One exception, a real bug this revision fixes (GitHub issue #100): [`Self::open_change`]
-    /// itself is always kept in the reconciled list even while bare. Nothing gates opening a
-    /// *file* on the worktree having a real agent - the Files tree stays clickable regardless -
-    /// so without this, clicking a file in an already-bare worktree made it the real, on-screen
-    /// centre-pane content ([`Self::render_center_pane`] reads `open_change` directly, with no
-    /// bareness check of its own) while this function's blanket suppression still hid every file
-    /// tab, including the one whose content was genuinely on screen. Every *other* file - one
-    /// that was open before the worktree went bare, or the shell's own scrollback - still hides
-    /// exactly as documented above.
+    /// GitHub issue #120: an earlier revision (R12 §3, "a bare worktree shows only the shell
+    /// tab") truncated this to the active file only (or nothing) whenever a worktree had no real
+    /// agent running - reconciling against an empty file list instead of the real
+    /// [`Self::open_files`]. That's gone: every open file tab stays visible regardless of whether
+    /// an agent, or even the default shell, is running - opening and working across files was
+    /// never meant to depend on a shell/agent existing. Bareness still affects how the shell's
+    /// own tab is *labeled* (`Self::current_worktree_agent_tab_labels`'s bare-shell label), just
+    /// not which tabs render at all.
     pub(crate) fn combined_tab_order(&self) -> Vec<work_surface::TabRef> {
         let cwd = self.active_agent_cwd();
         let agents_for_cwd: Vec<&Agent> = self.agents.iter_for_cwd(cwd.clone()).collect();
-        let is_bare = !agents_for_cwd
-            .iter()
-            .any(|agent| agent.kind != AgentKind::Shell);
-        let bare_open_change_only;
-        let open_files: &[PathBuf] = if is_bare {
-            // GitHub issue #100: the Files tree stays clickable regardless of bareness, so
-            // `Self::open_change` can point at a file that has never been anything but bare -
-            // `Self::render_center_pane` will show it as real, on-screen content either way. The
-            // one open file that's actually visible right now must never be tab-less, even
-            // though every *other* file tab still hides per this function's own docs above.
-            bare_open_change_only = self.open_change.clone().into_iter().collect::<Vec<_>>();
-            &bare_open_change_only
-        } else {
-            self.open_files()
-        };
-        self.reconciled_tab_order(&cwd, &agents_for_cwd, open_files)
-    }
-
-    /// The real, full combined tab order, *regardless* of bareness - every file tab genuinely
-    /// open right now, not just the one bareness lets [`Self::combined_tab_order`] render.
-    ///
-    /// GitHub issue #116: [`Self::reorder_tab`] used to reorder within `combined_tab_order`'s own
-    /// bare-truncated view and persist *that* as the worktree's stored order. Dragging the one
-    /// file tab bareness allows onto the strip - an entirely ordinary gesture - silently dropped
-    /// every other open file's position from [`Self::tab_order`] and, if no file tab was visible
-    /// at all, emptied the persisted order for the whole worktree (`TabOrderState::
-    /// set_file_order`'s own empty-list removal). Reordering must always work against the real
-    /// set of open files so a hidden tab's position survives being temporarily unrendered, the
-    /// same way [`Self::combined_tab_order`]'s own docs already promise it does.
-    fn full_tab_order(&self) -> Vec<work_surface::TabRef> {
-        let cwd = self.active_agent_cwd();
-        let agents_for_cwd: Vec<&Agent> = self.agents.iter_for_cwd(cwd.clone()).collect();
-        self.reconciled_tab_order(&cwd, &agents_for_cwd, self.open_files())
-    }
-
-    /// The shared reconciliation step both [`Self::combined_tab_order`] and [`Self::
-    /// full_tab_order`] run - the two differ only in which `open_files` list they reconcile
-    /// against (bareness-truncated vs. real).
-    ///
-    /// A worktree [`Self::tab_order`] hasn't been touched for yet *this session* falls back to
-    /// its real, on-disk order (GitHub issue #16's own "persists... and restores on relaunch")
-    /// instead of the empty slice a brand new session would otherwise reconcile against - see
-    /// [`Self::tab_order`]'s own docs. Recomputed fresh each call rather than cached back into
-    /// [`Self::tab_order`]: `crate::work_surface::tab_order_state::TabOrderState` is already
-    /// fully loaded in memory (no I/O here), and leaving [`Self::tab_order`] itself untouched
-    /// until a real drag happens is what keeps [`Self::tab_order_owned`] scoped to worktrees this
-    /// instance has actually *changed*, not merely visited.
-    fn reconciled_tab_order(
-        &self,
-        cwd: &Path,
-        agents_for_cwd: &[&Agent],
-        open_files: &[PathBuf],
-    ) -> Vec<work_surface::TabRef> {
+        let agent_ids: Vec<AgentId> = agents_for_cwd.iter().map(|agent| agent.id).collect();
+        // `Self::tab_order` hasn't been touched for yet *this session* falls back to its real,
+        // on-disk order (GitHub issue #16's own "persists... and restores on relaunch") instead
+        // of the empty slice a brand new session would otherwise reconcile against - see
+        // `Self::tab_order`'s own docs. Recomputed fresh each call rather than cached back into
+        // `Self::tab_order`: `crate::work_surface::tab_order_state::TabOrderState` is already
+        // fully loaded in memory (no I/O here), and leaving `Self::tab_order` itself untouched
+        // until a real drag happens is what keeps `Self::tab_order_owned` scoped to worktrees
+        // this instance has actually *changed*, not merely visited.
         let persisted_fallback;
-        let stored: &[work_surface::TabRef] = match self.tab_order.get(cwd) {
+        let stored: &[work_surface::TabRef] = match self.tab_order.get(&cwd) {
             Some(order) => order.as_slice(),
             None => {
                 persisted_fallback = self
                     .tab_order_state
-                    .file_order(cwd)
+                    .file_order(&cwd)
                     .into_iter()
-                    .filter_map(|absolute| absolute.strip_prefix(cwd).ok().map(Path::to_path_buf))
+                    .filter_map(|absolute| absolute.strip_prefix(&cwd).ok().map(Path::to_path_buf))
                     .map(work_surface::TabRef::File)
                     .collect::<Vec<_>>();
                 &persisted_fallback
             }
         };
-        let agent_ids: Vec<AgentId> = agents_for_cwd.iter().map(|agent| agent.id).collect();
-        work_surface::reconcile_tab_order(stored, &agent_ids, open_files, self.graph_tab_open)
+        work_surface::reconcile_tab_order(
+            stored,
+            &agent_ids,
+            self.open_files(),
+            self.graph_tab_open,
+        )
     }
 
     /// The unified tab strip's real drag-to-reorder entry point (GitHub issue #16) - moves
@@ -506,9 +452,7 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let cwd = self.active_agent_cwd();
-        // The real, full order - not `Self::combined_tab_order`'s bare-truncated render view.
-        // See `Self::full_tab_order`'s own docs (GitHub issue #116) for the bug this avoids.
-        let mut order = self.full_tab_order();
+        let mut order = self.combined_tab_order();
         work_surface::move_tab_order(&mut order, &dragged, &target, insert_after);
         self.tab_order.insert(cwd.clone(), order.clone());
 
@@ -3723,18 +3667,15 @@ mod tab_scoping_tests {
         );
     }
 
-    /// Revision R12 §3: "A bare worktree shows only the shell tab." A worktree that had a real
-    /// agent and a file tab open, then had that agent archived (leaving only the default
-    /// `Shell` tab - genuinely bare, per `Self::current_worktree_is_bare`), must stop rendering
-    /// its file tab in `Self::combined_tab_order` - but the file's own entry in
-    /// `Self::open_files_by_worktree` must survive untouched, so the tab reappears (without
-    /// having to reopen the file) the moment a real agent spawns again and the worktree stops
-    /// being bare. This is the conservative "don't render, don't destroy" reading of the spec's
-    /// own per-worktree tab-memory design (§3: "Each worktree remembers its own... open files").
+    /// GitHub issue #120: an earlier revision (R12 §3, "a bare worktree shows only the shell
+    /// tab") suppressed every open file tab in `Self::combined_tab_order` the moment a worktree
+    /// went bare (no real agent, only its default `Shell` tab left). That's gone - a file tab
+    /// opened before the worktree went bare must keep rendering, unchanged, exactly as it does
+    /// with a real agent running. Bareness affects the shell's own tab *label* only (`Self::
+    /// current_worktree_agent_tab_labels`'s bare-shell label - see the neighboring test), not
+    /// which tabs render.
     #[gpui::test]
-    fn a_bare_worktrees_tab_strip_shows_only_its_shell_tab_and_preserves_file_tab_state(
-        cx: &mut TestAppContext,
-    ) {
+    fn a_bare_worktrees_tab_strip_still_shows_every_open_file_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let wt_a = tempfile::tempdir().expect("tempdir a");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
@@ -3789,54 +3730,30 @@ mod tab_scoping_tests {
         assert!(
             order_while_bare
                 .iter()
-                .all(|tab_ref| !matches!(tab_ref, work_surface::TabRef::File(_))),
-            "a bare worktree's tab strip must show only its shell tab - no file tabs, even ones \
-             left open from before it went bare"
+                .any(|tab_ref| matches!(tab_ref, work_surface::TabRef::File(path) if path == &PathBuf::from("README.md"))),
+            "the file tab must keep rendering while bare - opening and working across files must \
+             never depend on an agent or even a shell running"
         );
         assert!(
             order_while_bare.iter().any(
                 |tab_ref| matches!(tab_ref, work_surface::TabRef::Agent(id) if *id != claude_id)
             ),
-            "the shell tab itself must still be there - only the file tab is suppressed"
+            "the shell tab itself must still be there too"
         );
 
         assert_eq!(
             app.read_with(cx, |app, _| app.open_files().to_vec()),
             vec![PathBuf::from("README.md")],
-            "the file's own entry in open_files_by_worktree must survive untouched while bare - \
-             suppression is render-only, never destructive"
-        );
-
-        // Spawning a real agent again makes the worktree non-bare - the file tab must reappear
-        // with zero extra work, since its underlying state was never touched.
-        app.update_in(cx, |app, window, cx| {
-            app.agents.spawn(
-                AgentKind::Codex,
-                wt_a.path().to_path_buf(),
-                12.0,
-                window,
-                cx,
-            );
-        });
-        let order_after_respawn = app.read_with(cx, |app, _| app.combined_tab_order());
-        assert!(
-            order_after_respawn
-                .iter()
-                .any(|tab_ref| matches!(tab_ref, work_surface::TabRef::File(path) if path == &PathBuf::from("README.md"))),
-            "the file tab must reappear once the worktree is no longer bare - its state was \
-             preserved, not destroyed, while suppressed"
+            "and the file's own entry in open_files_by_worktree is of course untouched"
         );
     }
 
     /// GitHub issue #100: opening a file via the real `Self::open_file_view` entry point (the
     /// Files tree row click handler - it never checks bareness, so a bare worktree's tree stays
     /// fully clickable) while the worktree was *already* bare, with no prior real agent, must
-    /// still produce a real tab for it - not just real on-screen content
-    /// (`Self::render_center_pane` reads `Self::open_change` directly, with no bareness check of
-    /// its own) with nothing selected in the strip. This is the one exception to
-    /// `a_bare_worktrees_tab_strip_shows_only_its_shell_tab_and_preserves_file_tab_state`'s own
-    /// blanket suppression, and that test's own `open_files_mut().push(..)` (bypassing
-    /// `open_change`) is why it never caught this - the real open path always sets both.
+    /// still produce a real tab for it. GitHub issue #120 later made this the *only* real
+    /// behavior left to test here - once bareness stopped suppressing file tabs at all, this
+    /// stopped being a carved-out exception to anything.
     #[gpui::test]
     fn opening_a_file_in_an_already_bare_worktree_still_gets_a_real_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3882,17 +3799,13 @@ mod tab_scoping_tests {
         );
     }
 
-    /// GitHub issue #116: dragging the one file tab bareness allows onto the strip used to
-    /// reorder within `combined_tab_order`'s own bare-truncated view and persist *that* as the
-    /// worktree's real stored order - silently dropping every other open file's position. Three
-    /// files are opened (only the last, `c.txt`, stays visible once the worktree goes bare - the
-    /// same `open_change` exception `opening_a_file_in_an_already_bare_worktree_still_gets_a_real_tab`
-    /// covers), the one visible tab is dragged relative to the shell tab while bare, and then a
-    /// real agent respawns - `a.txt`/`b.txt` must still be there, not silently discarded.
+    /// GitHub issue #116 (real dragging-while-bare tab-order corruption, fixed against an earlier
+    /// revision where bareness truncated `combined_tab_order` to a single visible file tab) plus
+    /// #120 (that truncation is gone entirely - see `a_bare_worktrees_tab_strip_still_shows_every_open_file_tab`).
+    /// With no truncation left, dragging while bare is now just an ordinary drag - this keeps
+    /// direct coverage that it still persists every open file's position correctly.
     #[gpui::test]
-    fn dragging_the_one_visible_tab_while_bare_does_not_discard_the_hidden_file_tabs(
-        cx: &mut TestAppContext,
-    ) {
+    fn dragging_a_tab_while_bare_persists_every_open_files_position(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let wt_a = tempfile::tempdir().expect("tempdir a");
         std::fs::write(wt_a.path().join("a.txt"), "a\n").expect("write a.txt");
@@ -3903,9 +3816,9 @@ mod tab_scoping_tests {
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
         });
-        let shell_id = app.update_in(cx, |app, window, cx| {
+        app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
-            let shell_id = app.agents.spawn(
+            app.agents.spawn(
                 AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
@@ -3915,7 +3828,6 @@ mod tab_scoping_tests {
             app.open_file_view(wt_a.path().join("a.txt"), window, cx);
             app.open_file_view(wt_a.path().join("b.txt"), window, cx);
             app.open_file_view(wt_a.path().join("c.txt"), window, cx);
-            shell_id
         });
         assert!(
             app.read_with(cx, |app, _| app.current_worktree_is_bare()),
@@ -3927,47 +3839,45 @@ mod tab_scoping_tests {
                 .iter()
                 .filter(|t| matches!(t, work_surface::TabRef::File(_)))
                 .count(),
-            1,
-            "premise: only the active file (c.txt) is rendered while bare"
+            3,
+            "premise: every open file tab renders even while bare (GitHub issue #120)"
         );
 
         app.update(cx, |app, cx| {
             app.reorder_tab(
                 work_surface::TabRef::File(PathBuf::from("c.txt")),
-                work_surface::TabRef::Agent(shell_id),
+                work_surface::TabRef::File(PathBuf::from("a.txt")),
                 false,
                 cx,
             );
         });
         cx.run_until_parked();
 
-        app.update_in(cx, |app, window, cx| {
-            app.agents.spawn(
-                AgentKind::Codex,
-                wt_a.path().to_path_buf(),
-                12.0,
-                window,
-                cx,
-            );
-        });
-        let order_after_respawn = app.read_with(cx, |app, _| app.combined_tab_order());
+        let order_after_drag = app.read_with(cx, |app, _| app.combined_tab_order());
         for name in ["a.txt", "b.txt", "c.txt"] {
             assert!(
-                order_after_respawn.iter().any(
+                order_after_drag.iter().any(
                     |tab_ref| matches!(tab_ref, work_surface::TabRef::File(path) if path == &PathBuf::from(name))
                 ),
-                "{name} must still be in the tab order after dragging the one visible tab while \
-                 bare - the pre-fix bug dropped every other file tab's position"
+                "{name} must still be in the tab order after the drag"
             );
         }
+        assert!(
+            order_after_drag
+                .iter()
+                .position(|t| t == &work_surface::TabRef::File(PathBuf::from("c.txt")))
+                < order_after_drag
+                    .iter()
+                    .position(|t| t == &work_surface::TabRef::File(PathBuf::from("a.txt"))),
+            "the real drag must have really moved c.txt in front of a.txt"
+        );
 
         let cwd = wt_a.path().to_path_buf();
         let persisted = app.read_with(cx, |app, _| app.tab_order_state.file_order(&cwd));
         assert_eq!(
             persisted.len(),
             3,
-            "the on-disk persisted order must also keep all three files, not just the one that \
-             was visible during the drag"
+            "the on-disk persisted order must keep all three files"
         );
     }
 }
