@@ -865,10 +865,23 @@ impl AdeApp {
     /// otherwise the real default (§2.2: "Worktrees whose most urgent agent is idle start
     /// collapsed"). An agent-less row has no caret at all, so this is only ever consulted
     /// (via [`Self::render_worktree_row`]) when `row.agents` is non-empty.
+    ///
+    /// GitHub issue #112 (live follow-up report): the worktree currently selected
+    /// ([`Self::active_agent_cwd`] - the same real comparison [`Self::render_worktree_row`]'s own
+    /// `is_selected` uses) is exempt from the idle-collapse default, absent an explicit override.
+    /// Without this, a worktree the user is actively switching terminals within could silently
+    /// collapse out from under them the moment its most urgent agent's status crossed into
+    /// `Idle` (an ordinary, real occurrence - a shell sitting at its prompt between commands),
+    /// replacing both visible terminal rows with a single collapsed summary row and reading, from
+    /// the report, as the terminals having "merged into one" - no data was ever lost (the tab
+    /// strip stays untouched by this purely rail-side collapse), but the row the user was looking
+    /// at should never vanish out from under active use. An explicit caret click still always
+    /// wins over this, same as it already does over the plain idle default - a user who
+    /// deliberately collapses the active worktree gets to keep it collapsed.
     pub(in crate::rail) fn worktree_is_expanded(&self, row: &WorktreeRow) -> bool {
         match self.rail_collapse_overrides.get(&row.path) {
             Some(expanded) => *expanded,
-            None => row.aggregate_status() != Status::Idle,
+            None => self.active_agent_cwd() == row.path || row.aggregate_status() != Status::Idle,
         }
     }
 
@@ -1575,17 +1588,30 @@ mod rail_row_tests {
     /// §2.2: "Worktrees whose most urgent agent is idle start collapsed" - proven here against
     /// a real running agent (never collapsed by default) and a real idle one (collapsed by
     /// default), through `Self::worktree_is_expanded`, the single real place that default lives.
+    ///
+    /// Selects a *second*, unrelated worktree rather than `wt` itself (GitHub issue #112 live
+    /// follow-up: the currently selected worktree is now exempt from this default - see
+    /// `Self::worktree_is_expanded`'s own docs) so this test keeps proving the plain idle-rooted
+    /// rule in isolation; `the_selected_worktree_never_idle_collapses_by_default` below covers
+    /// the exemption itself.
     #[gpui::test]
     fn worktree_is_expanded_defaults_to_the_real_idle_rooted_rule(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let wt = tempfile::tempdir().expect("tempdir wt");
+        let other_wt = tempfile::tempdir().expect("tempdir other wt");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
-            app.worktrees = vec![worktree_item(wt.path().to_path_buf(), "wt")];
+            app.worktrees = vec![
+                worktree_item(wt.path().to_path_buf(), "wt"),
+                worktree_item(other_wt.path().to_path_buf(), "other-wt"),
+            ];
         });
         app.update_in(cx, |app, window, cx| {
-            app.select_worktree(0, window, cx);
+            // Select `other_wt`, not `wt` - `wt` (whose row this test inspects) must be the
+            // real not-currently-selected case, or the new selected-worktree exemption would
+            // make this test vacuous.
+            app.select_worktree(1, window, cx);
             app.agents
                 .spawn(AgentKind::Shell, wt.path().to_path_buf(), 12.0, window, cx);
         });
@@ -1622,6 +1648,66 @@ mod rail_row_tests {
         assert!(
             !app.read_with(cx, |app, _| app.worktree_is_expanded(&idle_row)),
             "an idle-rooted worktree must default to collapsed"
+        );
+    }
+
+    /// GitHub issue #112 (live follow-up report): a worktree the user is actively switching
+    /// terminals within - the one [`crate::root::AdeApp::active_agent_cwd`] currently reports -
+    /// must never auto-collapse just because its most urgent agent's status happens to cross into
+    /// `Idle` (an ordinary occurrence - a shell sitting at its prompt between commands). Before
+    /// this exemption, that real, wall-clock-driven Idle transition would silently collapse the
+    /// row out from under active use, replacing both visible terminal rows with a single
+    /// collapsed summary line and reading, from the report, as the terminals having "merged into
+    /// one" - even though nothing was ever closed (the tab strip stayed untouched the whole
+    /// time). An explicit caret click still wins over the exemption, same as it already wins over
+    /// the plain idle default.
+    #[gpui::test]
+    fn the_selected_worktree_never_idle_collapses_by_default(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt = tempfile::tempdir().expect("tempdir wt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt.path().to_path_buf(), "wt")];
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            app.agents
+                .spawn(AgentKind::Shell, wt.path().to_path_buf(), 12.0, window, cx);
+        });
+        cx.run_until_parked();
+
+        let running_row = app.read_with(cx, |app, cx| {
+            app.build_worktree_rows(cx)
+                .into_iter()
+                .find(|row| row.path == wt.path())
+                .expect("the seeded worktree must produce a row")
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.active_agent_cwd()),
+            wt.path(),
+            "premise: `wt` really is the currently selected worktree"
+        );
+
+        // Same idle-forcing technique as the sibling test above.
+        let idle_row = rail::WorktreeRow {
+            agents: Vec::new(),
+            ..running_row
+        };
+        assert_eq!(idle_row.aggregate_status(), Status::Idle, "sanity check");
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_is_expanded(&idle_row)),
+            "the selected worktree must stay expanded even once idle, with no explicit override"
+        );
+
+        // An explicit caret click still wins over the selection exemption - the user's own
+        // choice to collapse the active worktree must be honored, not silently overridden back.
+        app.update(cx, |app, cx| {
+            app.toggle_worktree_collapsed(wt.path().to_path_buf(), true, cx);
+        });
+        assert!(
+            !app.read_with(cx, |app, _| app.worktree_is_expanded(&idle_row)),
+            "an explicit collapse override must still win even for the selected worktree"
         );
     }
 

@@ -7154,3 +7154,43 @@ failed** - all 10 failures are pre-existing and environment-specific (LSP wiring
 network access for `npm install typescript@5`, `rust-analyzer`/`pyright` readiness timeouts in
 this sandbox, and one GPU-paint check), none in `work_surface::render` or touching agent-focus
 logic; the new test and every other `work_surface::render` test pass.
+
+## Follow-up on the same live report: the rail was auto-collapsing the worktree the user was actively looking at (GitHub issue #112)
+
+After the focus fix above, a live follow-up report from the same user described a related but
+distinct symptom on the fixed build: switching between two open terminals in the rail eventually
+"closed" both, leaving a single row labeled with the worktree's branch (e.g. `main`) - but the tab
+strip still listed both terminals the whole time, so nothing had actually closed.
+
+Root cause, unrelated to the focus bug: `Self::worktree_is_expanded`
+(`crates/app/src/rail/render.rs`) collapses a worktree's rail row to a single summary line whenever
+its most urgent agent's status is `Status::Idle`, absent an explicit per-worktree override from the
+collapse caret (§2.2: "Worktrees whose most urgent agent is idle start collapsed" - real, spec'd,
+covered by `worktree_is_expanded_defaults_to_the_real_idle_rooted_rule`). A shell agent reads as
+`Idle` once it's gone quiet past `status::RUN_RECENT_OUTPUT_WINDOW` - an ordinary, real occurrence
+(a shell sitting at its prompt between commands), not a fault. The gap: the *currently selected*
+worktree - the one whose terminals the user is actively switching between - was never exempted
+from this default, so its row could silently collapse mid-use, replacing both visible terminal rows
+with the one-line summary the report described. Purely a rail rendering/collapse-state issue; the
+real `Agents` list (and so the tab strip) was never touched, which is exactly why both terminals
+stayed listed there throughout.
+
+Confirmed with the user directly (not assumed) that the intended fix is to exempt the active
+worktree, not to change the idle-collapse default itself for every other worktree - it still
+reduces rail clutter for worktrees the user isn't currently looking at, same as before.
+
+Fixed by adding one condition to `worktree_is_expanded`'s no-override branch:
+`self.active_agent_cwd() == row.path` (the same real comparison `render_worktree_row`'s own
+`is_selected` already uses) as an alternative to the plain non-idle check. An explicit caret click
+still wins over this exemption, unchanged from how it already won over the plain idle default -
+deliberately collapsing the active worktree stays possible and remembered.
+
+New regression test `the_selected_worktree_never_idle_collapses_by_default`
+(`rail::render::rail_row_tests`) proves the exemption itself, and also proves the override still
+wins over it. The existing `worktree_is_expanded_defaults_to_the_real_idle_rooted_rule` was
+adjusted to select a second, unrelated worktree instead of the one it inspects - otherwise this fix
+would have made it vacuous (the row it checks would itself become exempt).
+
+**Verification**: `cargo test --workspace -p app rail::render::rail_row_tests` - 6 passed, 0
+failed. `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all -- --check` -
+both clean.
