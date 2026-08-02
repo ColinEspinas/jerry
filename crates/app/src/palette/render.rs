@@ -560,8 +560,8 @@ impl AdeApp {
         // `.track_focus()` of their own, so they never steal keyboard focus away from it. That
         // means this caret is never actually rendered while unfocused (closing the palette stops
         // rendering it at all), so unlike the code editor's own caret there's no separate
-        // "dimmed unfocused" case to paint here - `caret_blink_visible` alone is the real, whole
-        // answer for whether to paint it this frame.
+        // "hidden while unfocused" case to paint here - `caret_blink_visible` alone is the real,
+        // whole answer for whether to paint it this frame.
         let visible = self.caret_blink_visible;
         div()
             .flex_none()

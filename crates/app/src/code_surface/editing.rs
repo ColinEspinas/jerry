@@ -1423,10 +1423,11 @@ pub(in crate::code_surface) struct EditableLineContext<'a> {
 /// `start_x` again for [`settings_store::CaretStyle::Line`] callers with nothing convenient to
 /// measure it from.
 ///
-/// Returns `None` exactly when the caret should be invisible this frame: mid-blink "off" phase
-/// while genuinely focused (`is_focused && !blink_visible`) - never while unfocused, which always
-/// paints a real, dimmed, non-blinking caret instead (issue #27's own explicit ask), never
-/// nothing at all.
+/// Returns `None` exactly when the caret should be invisible this frame: the surface isn't
+/// focused at all (GitHub issue #107 - an earlier version instead painted a dimmed, non-blinking
+/// caret while unfocused; Colin asked for it to disappear entirely, like every other
+/// unfocused-state affordance in this app), or - while genuinely focused - mid-blink "off" phase
+/// (`!blink_visible`).
 pub(crate) fn caret_paint_quad(
     start_x: Pixels,
     end_x: Pixels,
@@ -1436,16 +1437,10 @@ pub(crate) fn caret_paint_quad(
     is_focused: bool,
     blink_visible: bool,
 ) -> Option<PaintQuad> {
-    if is_focused && !blink_visible {
+    if !is_focused || !blink_visible {
         return None;
     }
-    let color = if is_focused {
-        theme::syntax::CARET.resolve()
-    } else {
-        theme::syntax::CARET
-            .resolve()
-            .opacity(theme::syntax::CARET_UNFOCUSED_OPACITY)
-    };
+    let color = theme::syntax::CARET.resolve();
     // At most one real char's width (never negative - `end_x` can equal `start_x` for a
     // `Line`-style caller, or a real end-of-line caret with nothing after it to measure).
     let char_width = (end_x - start_x).max(gpui::px(1.0));
@@ -1581,9 +1576,9 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 .text_system()
                 .shape_line(line_text.clone(), font_size, &runs, None);
 
-            // GitHub issue #27: "selection remains visible (dimmed) when the editor loses
-            // focus" / "unfocused editors show a dimmed, non-blinking caret" - both the
-            // selection fill and the caret itself read this same real, live focus check, not two
+            // GitHub issue #27's "selection remains visible (dimmed) when the editor loses
+            // focus" and GitHub issue #107's "the caret disappears entirely when unfocused" both
+            // read this same real, live focus check for the selection fill and the caret, not two
             // independently-derived ones that could disagree.
             let is_focused = focus_handle_for_measure.is_focused(window);
             let selection_opacity = if is_focused {
@@ -1660,18 +1655,27 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                     )
                 })
                 .collect();
-            let secondary_cursor_quads: Vec<_> = secondary_cursors_local
-                .iter()
-                .map(|offset| {
-                    fill(
-                        Bounds::new(
-                            point(bounds.left() + shaped.x_for_index(*offset), bounds.top()),
-                            size(gpui::px(2.0), bounds.bottom() - bounds.top()),
-                        ),
-                        theme::editor::CARET,
-                    )
-                })
-                .collect();
+            // GitHub issue #107: hidden entirely while unfocused, matching the primary caret
+            // above - secondary cursors don't have their own blink treatment (see this row's own
+            // docs on why every cursor stays identically solid whenever visible), but they still
+            // need this same one gate, or an unfocused buffer would show ghost secondary carets
+            // with no primary one, a real, new inconsistency this fix would otherwise introduce.
+            let secondary_cursor_quads: Vec<_> = if is_focused {
+                secondary_cursors_local
+                    .iter()
+                    .map(|offset| {
+                        fill(
+                            Bounds::new(
+                                point(bounds.left() + shaped.x_for_index(*offset), bounds.top()),
+                                size(gpui::px(2.0), bounds.bottom() - bounds.top()),
+                            ),
+                            theme::editor::CARET,
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             (
                 shaped,
                 selection_quad,
@@ -1703,16 +1707,13 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
             for quad in secondary_selection_quads {
                 window.paint_quad(quad);
             }
-            // The primary caret's own visibility (blink phase, unfocused dimming) is already
-            // fully decided by `caret_paint_quad` above - `cursor_quad` is `None` exactly when
-            // it shouldn't paint this frame, so no extra `is_focused` gate belongs here (GitHub
-            // issue #27's own docs on `caret_paint_quad` are explicit about this). Secondary
-            // cursors don't have their own blink/dim treatment yet (see this row's own docs on
-            // why multi-cursor deliberately keeps every cursor identically styled), so they paint
-            // unconditionally too, matching the primary selection's own always-visible-when-
-            // present treatment above - the alternative (secondary cursors vanishing on focus
-            // loss while the primary caret stays dimly visible) would be a real, visible
-            // inconsistency between cursors in the same buffer.
+            // The primary caret's own visibility (blink phase, hidden entirely while unfocused)
+            // is already fully decided by `caret_paint_quad` above - `cursor_quad` is `None`
+            // exactly when it shouldn't paint this frame, so no extra `is_focused` gate belongs
+            // here (that function's own docs are explicit about this). `secondary_cursor_quads`
+            // is built with the matching `is_focused` gate already applied (see its own
+            // computation above), so both paint loops stay consistent with no further checks
+            // needed at the paint site itself.
             if let Some(cursor_quad) = cursor_quad {
                 window.paint_quad(cursor_quad);
             }
@@ -2213,6 +2214,48 @@ fn token_at_offset(
         }
     }
     None
+}
+
+/// GitHub issue #107: an unfocused caret must vanish entirely, not just dim. Pure-function
+/// coverage of [`caret_paint_quad`] directly - no GPUI window needed, since it takes its focus/
+/// blink state as plain arguments.
+#[cfg(test)]
+mod caret_paint_quad_tests {
+    use super::*;
+
+    fn quad(is_focused: bool, blink_visible: bool) -> Option<PaintQuad> {
+        caret_paint_quad(
+            gpui::px(0.0),
+            gpui::px(8.0),
+            gpui::px(0.0),
+            gpui::px(16.0),
+            settings_store::CaretStyle::Line,
+            is_focused,
+            blink_visible,
+        )
+    }
+
+    #[test]
+    fn a_focused_and_blink_visible_caret_paints() {
+        assert!(quad(true, true).is_some());
+    }
+
+    #[test]
+    fn a_focused_but_blinked_off_caret_paints_nothing() {
+        assert!(quad(true, false).is_none());
+    }
+
+    #[test]
+    fn an_unfocused_caret_paints_nothing_regardless_of_blink_phase() {
+        assert!(
+            quad(false, true).is_none(),
+            "unfocused must be invisible even mid-blink-on"
+        );
+        assert!(
+            quad(false, false).is_none(),
+            "unfocused must be invisible mid-blink-off too"
+        );
+    }
 }
 
 #[cfg(test)]

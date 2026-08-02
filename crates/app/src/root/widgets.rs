@@ -291,11 +291,8 @@ impl AdeApp {
     /// paint time - `Window` isn't threaded through every one of this helper's several render-
     /// tree ancestors, and a canvas's paint closures always receive it regardless of what the
     /// surrounding `render_*` call chain's own signatures carry. Mirrors `caret_paint_quad`'s own
-    /// rule exactly: focused *and* blink-visible paints solid, focused-but-blinked-off paints
-    /// nothing, unfocused paints a dim, non-blinking caret (`theme::syntax::
-    /// CARET_UNFOCUSED_OPACITY` - the same constant the code editor's own caret uses, not a
-    /// second, independently-chosen value for this surface) rather than vanishing outright -
-    /// consistent with every other caret-bearing surface's unfocused treatment in this app.
+    /// rule exactly (GitHub issue #107): focused *and* blink-visible paints solid, anything else -
+    /// focused-but-blinked-off, or simply unfocused - paints nothing at all.
     pub(crate) fn render_simple_input_caret(
         &self,
         selector: &'static str,
@@ -329,17 +326,15 @@ impl AdeApp {
 
 /// [`AdeApp::render_simple_input_caret`]'s paint decision, pulled out as a pure function so it's
 /// directly unit-testable without a real GPUI window/focus simulation - mirrors
-/// `crate::code_surface::editing::caret_paint_quad`'s own three-way rule (focused-and-blinking
-/// solid / focused-and-blinked-off nothing / unfocused dim-and-steady) exactly, just returning an
-/// opacity instead of a ready-made [`gpui::PaintQuad`] since this caller's color/bounds aren't
-/// available outside the canvas paint closure.
+/// `crate::code_surface::editing::caret_paint_quad`'s own rule (GitHub issue #107): solid only
+/// while genuinely focused and blink-visible, nothing at all otherwise, just returning an opacity
+/// instead of a ready-made [`gpui::PaintQuad`] since this caller's color/bounds aren't available
+/// outside the canvas paint closure.
 fn simple_input_caret_opacity(is_focused: bool, blink_visible: bool) -> Option<f32> {
-    if is_focused && !blink_visible {
-        None
-    } else if is_focused {
+    if is_focused && blink_visible {
         Some(1.0)
     } else {
-        Some(theme::syntax::CARET_UNFOCUSED_OPACITY)
+        None
     }
 }
 
@@ -502,13 +497,15 @@ mod simple_input_caret_opacity_tests {
         );
     }
 
+    /// GitHub issue #107: an earlier version painted a dim, non-blinking caret while unfocused.
+    /// Colin asked for it to disappear entirely instead, the same way every other unfocused-state
+    /// affordance in this app already does.
     #[test]
-    fn an_unfocused_input_paints_dim_not_invisible() {
+    fn an_unfocused_input_paints_nothing_at_all() {
         assert_eq!(
             simple_input_caret_opacity(false, true),
-            Some(crate::theme::syntax::CARET_UNFOCUSED_OPACITY),
-            "unfocused must still show a real, dim, non-blinking caret - matching every other \
-             caret-bearing surface's unfocused treatment in this app - not vanish outright"
+            None,
+            "unfocused must paint nothing, regardless of the shared blink flag's phase"
         );
     }
 }

@@ -696,10 +696,6 @@ pub mod syntax {
     /// "selection remains visible (dimmed) when the editor loses focus") - still genuinely
     /// visible, just clearly de-emphasized relative to the focused case above.
     pub const SELECTION_UNFOCUSED_OPACITY: f32 = 0.14;
-    /// The caret's own opacity while the editor is unfocused (issue #27: "unfocused editors show
-    /// a dimmed, non-blinking caret") - solid, never blinking, just dimmer than the focused
-    /// (1.0-opacity) caret.
-    pub const CARET_UNFOCUSED_OPACITY: f32 = 0.35;
     pub const ERROR_UNDERLINE: ColorToken = hex(0xe0625c); // 2px dotted
     pub const HOVER_UNDERLINE: ColorToken = hex(0x4d7ba8); // 1px solid
 

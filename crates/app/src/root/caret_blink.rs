@@ -16,8 +16,8 @@
 //! [`AdeApp::settings`]'s `appearance.caret_blink` (see
 //! `crate::settings::store::AppearanceSettings::caret_blink`'s own docs) is the real, persisted
 //! "no blink" setting the issue asks for: when `false`, [`spawn_blink_task`] never starts a
-//! timer at all, so the caret stays permanently solid (still hidden/dimmed while unfocused,
-//! same as the blinking case - see each surface's own render call site).
+//! timer at all, so the caret stays permanently solid (still hidden while unfocused, same as the
+//! blinking case - see each surface's own render call site).
 //!
 //! `gpui::App::reduce_motion`/`set_reduce_motion` (`vendor` GPUI's real, available mechanism for
 //! "respect reduced motion" - `crates/gpui/src/app.rs:1010,1016` at the pinned revision) is
@@ -76,9 +76,8 @@ impl AdeApp {
     }
 
     /// A real focus loss: the loop stops outright (no timer keeps running against an unfocused
-    /// caret) - each surface's own render call site is responsible for painting the real,
-    /// dimmed, non-blinking unfocused caret (issue #27's own "unfocused editors show a dimmed,
-    /// non-blinking caret"), not this module.
+    /// caret) - each surface's own render call site is responsible for hiding the caret entirely
+    /// while unfocused (GitHub issue #107), not this module.
     pub(crate) fn stop_caret_blink(&mut self, cx: &mut Context<Self>) {
         self.caret_blink_visible = false;
         self._caret_blink_task = Task::ready(());

@@ -732,8 +732,8 @@ mod new_file_caret_tests {
 
         assert!(
             !app.read_with(cx, |app, _| app.caret_blink_visible),
-            "blurring the \"New file\" prompt must have immediately pinned the shared caret to \
-             dimmed/non-blinking (`AdeApp::stop_caret_blink`) - before this fix, \
+            "blurring the \"New file\" prompt must have immediately pinned the shared caret-blink \
+             flag off (`AdeApp::stop_caret_blink`) - before this fix, \
              `new_file_focus_handle` was never threaded through `AdeApp::wire_caret_blink`, so \
              nothing would have reacted to it losing focus at all, and the caret would have \
              stayed solid/visible until whatever timer the earlier keystroke started eventually \
