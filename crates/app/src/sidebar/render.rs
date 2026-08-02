@@ -775,6 +775,7 @@ impl AdeApp {
             .on_action(cx.listener(Self::handle_file_tree_copy_action))
             .on_action(cx.listener(Self::handle_file_tree_cut_action))
             .on_action(cx.listener(Self::handle_file_tree_paste_action))
+            .on_action(cx.listener(Self::handle_file_tree_delete_action))
             .on_action(cx.listener(Self::handle_tree_text_undo))
             .on_action(cx.listener(Self::handle_tree_text_redo))
             .on_key_down(cx.listener(Self::handle_tree_key_down))
@@ -1085,13 +1086,21 @@ impl AdeApp {
                     this.toggle_dir_expanded(path.clone(), cx);
                 }));
         } else {
-            // Opens the file in Surface C's File view - see `Self::open_file_view`'s docs.
+            // GitHub issue #105: uses `Self::open_file_view_from_tree_click`, not
+            // `Self::open_file_view` - a file click is a real *selection* gesture, the same as a
+            // folder click just above (which has always kept tree focus), so this must never move
+            // keyboard focus onto the editor the way every other `open_file_view` caller wants.
+            // See that function's own docs for the real bug this fixes: every
+            // `"file-tree"`-scoped shortcut (`Ctrl+C`/`X`/`V`, `F2`, `Shift+F10`) went dead the
+            // instant a file was clicked, since that used to be the one tree gesture that silently
+            // handed focus away.
             let path = entry.path.clone();
             row = row
                 .cursor_pointer()
                 .hover(|el| el.bg(theme::surface::ROW_HOVER))
                 .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                    this.open_file_view(path.clone(), window, cx);
+                    this.open_file_view_from_tree_click(path.clone(), window, cx);
+                    this.focus_file_tree(window, cx);
                 }));
         }
 

@@ -134,11 +134,23 @@ impl AdeApp {
     /// real on-disk path, used only for the tree reveal. They are passed separately rather than
     /// derived one from the other because the two callers resolve against *different* roots -
     /// see [`Self::open_change_diff`]'s own docs for the real state in which they differ.
+    ///
+    /// `focus_editor` controls point 2 above - `true` for every caller except the Files tree's
+    /// own row click (GitHub issue #105): a click there is a real *selection* gesture the same
+    /// way a folder click already is, and folder clicks have always kept keyboard focus on
+    /// `Self::tree_focus_handle` rather than handing it to the editor. Before this, only file
+    /// rows silently broke that symmetry - `open_and_focus_file` unconditionally moved focus off
+    /// the tree the instant a file was clicked, so every `"file-tree"`-scoped shortcut (`Ctrl+C`/
+    /// `X`/`V`, `F2`, `Shift+F10`) went dead the moment the single most common selection gesture
+    /// happened. `false` never transiently focuses the editor at all (rather than focusing it and
+    /// immediately handing focus back to the tree), so no editor-focus/-blur side effect ever
+    /// fires for a plain tree click.
     fn open_and_focus_file(
         &mut self,
         relative: PathBuf,
         absolute: PathBuf,
         view: code_view::CodeView,
+        focus_editor: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -159,7 +171,9 @@ impl AdeApp {
         // its own `code_focus.capture()` never captures a handle that's about to stop being
         // rendered. See `crate::graph_view::render::AdeApp::leave_graph_tab`'s own docs.
         self.leave_graph_tab(window, cx);
-        self.focus_code_surface(window, cx);
+        if focus_editor {
+            self.focus_code_surface(window, cx);
+        }
         self.push_open_file(&relative);
         self.open_change = Some(relative);
         self.code_view = view;
@@ -215,15 +229,47 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let absolute = self.diff_root.join(&path);
-        self.open_and_focus_file(path, absolute, code_view::CodeView::Diff, window, cx);
+        self.open_and_focus_file(path, absolute, code_view::CodeView::Diff, true, window, cx);
     }
 
-    /// Opens `path` (absolute) directly in Surface C's File view - the Files-tree row click
-    /// handler, go-to-definition, a terminal path link, a just-created file, and a palette file
-    /// result with no diff to show.
+    /// Opens `path` (absolute) directly in Surface C's File view - go-to-definition, a terminal
+    /// path link, a just-created file, and a palette file result with no diff to show. The Files
+    /// tree's own row click uses [`Self::open_file_view_from_tree_click`] instead (GitHub issue
+    /// #105) - see that function's own docs for why it needs different focus behavior than every
+    /// other caller here.
     pub(crate) fn open_file_view(
         &mut self,
         path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_file_view_with_focus(path, true, window, cx);
+    }
+
+    /// The Files tree's own row click handler (GitHub issue #105) - opens `path` exactly like
+    /// [`Self::open_file_view`], but never moves keyboard focus onto the editor. A file click is
+    /// a real *selection* gesture, the same as a folder click - and a folder click has always
+    /// kept focus on [`Self::tree_focus_handle`] rather than handing it away. Before this, only
+    /// file rows broke that symmetry: clicking a file silently moved focus off the tree, so every
+    /// `"file-tree"`-scoped shortcut (`Ctrl+C`/`X`/`V`, `F2`, `Shift+F10`) went dead the instant
+    /// the single most common selection gesture happened. Never transiently focuses the editor at
+    /// all (rather than focusing it and immediately handing focus back), so no editor-focus/-blur
+    /// side effect ever fires for a plain tree click - `crate::sidebar::render`'s own row click
+    /// handler is responsible for explicitly (re)confirming tree focus afterward, the same way
+    /// the folder-click handler already does.
+    pub(crate) fn open_file_view_from_tree_click(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_file_view_with_focus(path, false, window, cx);
+    }
+
+    fn open_file_view_with_focus(
+        &mut self,
+        path: PathBuf,
+        focus_editor: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -236,7 +282,14 @@ impl AdeApp {
             .strip_prefix(&self.file_tree_root)
             .map(|relative| relative.to_path_buf())
             .unwrap_or_else(|_| path.clone());
-        self.open_and_focus_file(relative, path, code_view::CodeView::File, window, cx);
+        self.open_and_focus_file(
+            relative,
+            path,
+            code_view::CodeView::File,
+            focus_editor,
+            window,
+            cx,
+        );
     }
 
     /// Activates a file tab (the tab strip's click handler), as opposed to

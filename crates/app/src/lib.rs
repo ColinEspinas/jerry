@@ -494,6 +494,23 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
             root::FileTreePaste,
             Some("file-tree && !tree-editing && !tree-delete-confirm"),
         ),
+        // GitHub issue #105: "remove file" had no keyboard shortcut at all - only reachable via
+        // a right-click's own "Delete" menu row (`crate::sidebar::context_menu::MenuAction::
+        // Delete`'s own `keystroke_spec()` deliberately returns `None`, unlike every other
+        // mutating row) or `Shift+F10` opening the menu. `Some("file-tree && !tree-editing")`
+        // - not `!tree-delete-confirm` too, unlike every binding above it - is deliberate:
+        // `crate::sidebar::tree_ops::AdeApp::handle_file_tree_delete_action` is the one handler
+        // that must fire in *both* halves of the arm/confirm flow (a first press arms via
+        // `request_tree_delete_for_selection`, a second press while the confirmation panel is up
+        // runs the real delete via `confirm_tree_delete`), so excluding `tree-delete-confirm`
+        // here would make the confirming second press unreachable by keyboard. `!tree-editing`
+        // is kept because an inline rename box's own `Delete`/`Backspace` presses must edit the
+        // filename text, not arm a tree delete underneath it.
+        gpui::KeyBinding::new(
+            "delete",
+            root::FileTreeDelete,
+            Some("file-tree && !tree-editing"),
+        ),
         // `Ctrl+W` (GitHub issue #26) - closes the focused tab (file or agent), via
         // `crate::work_surface::render::AdeApp::handle_close_focused_tab_action`'s own docs for
         // exactly what "focused" resolves to and why this can never close the window (this app

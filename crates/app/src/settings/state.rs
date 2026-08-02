@@ -584,6 +584,7 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::FileTreeCopy" => Some("Files tree: copy"),
         "app::FileTreeCut" => Some("Files tree: cut"),
         "app::FileTreePaste" => Some("Files tree: paste"),
+        "app::FileTreeDelete" => Some("Files tree: delete (asks for confirmation)"),
         _ => None,
     }
 }
