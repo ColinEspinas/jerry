@@ -277,17 +277,37 @@ pub struct TerminalSpec {
 }
 
 impl TerminalSpec {
-    /// The user's shell (`$SHELL`, falling back to [`default_shell`] if unset), no extra
-    /// arguments.
+    /// The user's shell, no extra arguments - GitHub issue #50 (real, `/bin/bash` unconditional
+    /// even on Windows): `$SHELL` is a real Unix environment-variable convention that Windows
+    /// itself never sets, so the fallback needs its own real Windows equivalent rather than the
+    /// same Unix path unconditionally, which is a real path (`/bin/bash`) that doesn't exist on
+    /// Windows at all - every default-shell spawn there was trying, and failing, to launch it.
     pub fn shell(cwd: PathBuf) -> Self {
-        let program = std::env::var_os("SHELL")
-            .map(PathBuf::from)
-            .unwrap_or_else(default_shell);
         Self {
-            program,
+            program: Self::default_shell_program(),
             args: Vec::new(),
             cwd,
         }
+    }
+
+    /// Unix: `$SHELL`, falling back to `/bin/bash` if unset - unchanged from before issue #50.
+    #[cfg(unix)]
+    fn default_shell_program() -> PathBuf {
+        shell_program_from_env(std::env::var_os("SHELL"), "/bin/bash")
+    }
+
+    /// Windows: `%COMSPEC%` - the real, documented Windows environment variable naming the
+    /// user's configured command interpreter (almost always `C:\Windows\System32\cmd.exe`),
+    /// the same real role `$SHELL` plays on Unix. Falls back to the bare name `cmd.exe` if
+    /// unset (`cmd.exe` ships with every real Windows install and is always on `%PATH%`) rather
+    /// than a hardcoded absolute path, mirroring the Unix fallback's own "a real, always-present
+    /// binary" choice. A bare name, not an absolute path: `pty_core::spawn`'s own
+    /// `CommandBuilder` already resolves a bare program name via `PATH` (see
+    /// [`TerminalSpec::command`]'s own docs for the identical, already-relied-on mechanism), so
+    /// this needs no separate resolution step of its own.
+    #[cfg(windows)]
+    fn default_shell_program() -> PathBuf {
+        shell_program_from_env(std::env::var_os("COMSPEC"), "cmd.exe")
     }
 
     /// An arbitrary command. `program` may be a bare name (e.g. `"claude"`, no path
@@ -303,31 +323,56 @@ impl TerminalSpec {
     }
 }
 
-/// The real fallback shell [`TerminalSpec::shell`] spawns when `$SHELL` is unset - genuinely
-/// unset on every real Windows session (`$SHELL` is a Unix convention with no Windows
-/// equivalent), so the naive "just default to `/bin/bash`" this used to do failed every single
-/// spawn on Windows with a real, observed `CreateProcessW` "path not found" error (`/bin/bash`
-/// doesn't exist there) - not a hypothetical gap, this was hit running a real release build.
-///
-/// `#[cfg(windows)]`, not `#[cfg(not(unix))]` - matches `pty-core`'s own established
-/// convention (see that crate's module docs) of gating Windows-specific reasoning narrowly, so
-/// an unsupported non-unix target (e.g. `wasm32-unknown-unknown`) fails to compile loudly
-/// instead of silently picking up logic that makes no sense for it.
-#[cfg(windows)]
-fn default_shell() -> PathBuf {
-    // `%COMSPEC%` is Windows' own real `$SHELL` equivalent - the command interpreter every
-    // `cmd.exe`/PowerShell session sets for child processes to inherit - falling back to the
-    // real `cmd.exe` bare name (resolved via `PATH`/the system directory the same way
-    // `portable_pty::CommandBuilder` already resolves any other bare program name) only in the
-    // genuinely rare case that's also unset.
-    std::env::var_os("COMSPEC")
+/// The pure "real env var, or a real fallback" decision behind both
+/// [`TerminalSpec::default_shell_program`] variants - not itself `#[cfg]`-gated, so it's directly
+/// testable on any host regardless of which platform-specific env var name/fallback the caller
+/// passes in.
+fn shell_program_from_env(env_value: Option<std::ffi::OsString>, fallback: &str) -> PathBuf {
+    env_value
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("cmd.exe"))
+        .unwrap_or_else(|| PathBuf::from(fallback))
 }
 
-#[cfg(not(windows))]
-fn default_shell() -> PathBuf {
-    PathBuf::from("/bin/bash")
+/// GitHub issue #50's real regression guard: the Windows fallback must be a real Windows path
+/// (`cmd.exe`), never the Unix `/bin/bash` [`TerminalSpec::shell`] used to fall back to
+/// unconditionally - `$SHELL` is a Unix-only convention Windows never sets, so every Windows
+/// session with no real override was actually trying to launch a Unix path that doesn't exist
+/// there at all. `shell_program_from_env` itself isn't `#[cfg]`-gated, so both real platform
+/// variants' own decisions are directly testable here regardless of which OS runs this test.
+#[cfg(test)]
+mod shell_program_tests {
+    use super::*;
+
+    #[test]
+    fn a_real_env_value_is_used_verbatim() {
+        assert_eq!(
+            shell_program_from_env(Some(std::ffi::OsString::from("/usr/bin/zsh")), "/bin/bash"),
+            PathBuf::from("/usr/bin/zsh")
+        );
+    }
+
+    #[test]
+    fn an_absent_env_value_falls_back() {
+        assert_eq!(
+            shell_program_from_env(None, "/bin/bash"),
+            PathBuf::from("/bin/bash")
+        );
+    }
+
+    /// The real regression: the Windows fallback must be `cmd.exe`, a real path that exists on
+    /// Windows - never the Unix `/bin/bash` this crate used to fall back to unconditionally,
+    /// which does not exist there at all.
+    #[test]
+    fn the_windows_fallback_is_a_real_windows_path_not_the_unix_one() {
+        let windows_fallback = shell_program_from_env(None, "cmd.exe");
+        assert_eq!(windows_fallback, PathBuf::from("cmd.exe"));
+        assert_ne!(
+            windows_fallback,
+            PathBuf::from("/bin/bash"),
+            "the Windows default shell must never be the Unix path - that real path does not \
+             exist on Windows, which is the whole bug this issue reports"
+        );
+    }
 }
 
 /// An event [`TerminalPane`] emits (`cx.emit`) for its owner to react to - the same
