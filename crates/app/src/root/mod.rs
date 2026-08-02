@@ -191,6 +191,8 @@ actions!(
         FileTreeCut,
         FileTreePaste,
         FileTreeDelete,
+        FileTreeUndo,
+        FileTreeRedo,
     ]
 );
 
@@ -446,10 +448,21 @@ pub struct AdeApp {
     /// The tree's own cut/copy buffer - a real filesystem entry, deliberately not the system
     /// clipboard (see `crate::sidebar::tree_ops::TreeClipboard`).
     pub(crate) tree_clipboard: Option<tree_ops::TreeClipboard>,
-    /// A delete that has been requested but not yet confirmed. Nothing is ever removed while
-    /// this is merely `Some`; `crate::sidebar::tree_ops::AdeApp::confirm_tree_delete` is the only
-    /// path that acts, and it is only reachable from the confirmation panel's own button.
-    pub(crate) tree_delete_confirm: Option<tree_ops::PendingTreeDelete>,
+    /// Real, already-applied file-tree operations (delete, rename, cut/paste move) that
+    /// `crate::sidebar::tree_ops::AdeApp::undo_tree_op` can reverse, most recent last - the
+    /// file-tree's own undo history, distinct from each text field's own `text_history::
+    /// TextField` undo and from `wt_core::undo`'s git-level commit/discard undo. GitHub issue
+    /// #105: delete no longer asks for confirmation - it happens immediately, and this (plus
+    /// [`Self::tree_undo_backup_root`] for a delete's real content) is what makes that safe.
+    pub(crate) tree_undo_stack: Vec<tree_ops::TreeUndoEntry>,
+    /// Entries [`Self::undo_tree_op`] has popped, most recently undone last - `crate::sidebar::
+    /// tree_ops::AdeApp::redo_tree_op`'s own source. Cleared by the next real (non-undo/redo)
+    /// tree operation, same as every other undo/redo stack in this app.
+    pub(crate) tree_redo_stack: Vec<tree_ops::TreeUndoEntry>,
+    /// Monotonic counter naming each delete's backup file/dir under [`Self::tree_undo_backup_root`],
+    /// guaranteeing two deletes of same-named files never collide there, without pulling in a
+    /// UUID dependency for something this local.
+    pub(crate) tree_undo_backup_counter: u64,
     /// The most recent file-operation failure (a refused rename, a failed trash command),
     /// surfaced under the tree rather than dropped into the log - the same small, honest error
     /// surface [`Self::file_save_error`] uses for a failed save.
@@ -1496,7 +1509,7 @@ pub struct AdeApp {
     /// A real, just-armed "Remove" click on a custom theme card, by name - an adversarial audit
     /// caught the first version of this action deleting the user's file on a single click, unlike
     /// every other destructive action in this app (`Self::prune_confirm_armed`,
-    /// `Self::discard_confirm_armed`, `Self::tree_delete_confirm`). `Self::request_remove_custom_theme`
+    /// `Self::discard_confirm_armed`). `Self::request_remove_custom_theme`
     /// is the one real place this is armed/consumed - a first click on a given name arms it, a
     /// second click on the *same* name actually deletes. Disarmed by leaving the Themes settings
     /// page or reopening Settings (`Self::select_settings_page`/`Self::open_settings`), the same
@@ -2109,9 +2122,10 @@ impl Render for AdeApp {
             .when(self.new_file_input.is_some(), |el| {
                 el.child(self.render_new_file_prompt(cx))
             })
-            // The file tree's context menu and its delete confirmation (GitHub issue #19) -
-            // both are window-positioned overlays, so they live here beside the `+` menu and the
-            // "New file" prompt rather than inside the sidebar's own clipped column.
+            // The file tree's context menu (GitHub issue #19) - a window-positioned overlay, so
+            // it lives here beside the `+` menu and the "New file" prompt rather than inside the
+            // sidebar's own clipped column. Delete no longer has a confirmation overlay of its
+            // own (GitHub issue #105: it runs immediately, reversible via `Self::tree_undo_stack`).
             //
             // Gated on `!settings_open`, which is a real fix rather than defensive padding
             // (found in this change's own review): the Settings surface *replaces* the workspace
@@ -2126,14 +2140,6 @@ impl Render for AdeApp {
                     && self.right_sidebar_view == RightSidebarView::Files
                     && self.tree_context_menu.is_some(),
                 |el| el.child(self.render_tree_context_menu(cx)),
-            )
-            // The delete confirmation deliberately does *not* require the Files tab: it is a
-            // window-level modal the user is mid-way through answering, not a tree affordance,
-            // and hiding it on a tab switch would leave a destructive confirmation armed with no
-            // way to answer or cancel it.
-            .when(
-                !self.settings_open && self.tree_delete_confirm.is_some(),
-                |el| el.child(self.render_tree_delete_confirm(cx)),
             )
             .when(self.palette_open, |el| el.child(self.render_palette(cx)))
     }

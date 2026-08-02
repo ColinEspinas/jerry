@@ -1,8 +1,8 @@
 use super::*;
 use crate::keymap;
 use crate::root::widgets::{
-    modal_scrim_bg, render_keycap_row, render_menu_group_divider, render_modal_button,
-    render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
+    render_keycap_row, render_menu_group_divider, render_sidebar_message, render_tag_pill,
+    text_tooltip, KeycapSize,
 };
 use crate::settings::widgets::ChoiceOption;
 use crate::worktree_history::flow as worktree_history;
@@ -755,17 +755,14 @@ impl AdeApp {
     fn file_tree_shell(&self, body: gpui::AnyElement, cx: &mut Context<Self>) -> gpui::AnyElement {
         // Space-separated context *words*, which is what `KeyBindingContextPredicate`'s
         // identifier terms match against - so `Some("file-tree && !tree-editing")` really does
-        // stop matching the moment `"tree-editing"` is added. Two independent modal states add a
-        // word each (an open inline name editor, and the modal delete confirmation, which would
-        // otherwise let `F2`/`Shift+F10` fire behind its own scrim), and an open editor adds
-        // `"text-input"` on top - GitHub issue #17's one shared tag for every real text-typing
-        // surface, routing `Ctrl+Z` in a rename box to `TextUndo` - see
-        // `crate::sidebar::tree_ops::AdeApp::handle_tree_text_undo`, the listener the tag routes
-        // to.
-        let key_context = crate::keymap_overrides::file_tree_key_context(
-            self.tree_inline_edit.is_some(),
-            self.tree_delete_confirm.is_some(),
-        );
+        // stop matching the moment `"tree-editing"` is added. An open inline name editor adds
+        // that word, plus `"text-input"` on top - GitHub issue #17's one shared tag for every
+        // real text-typing surface, routing `Ctrl+Z` in a rename box to `TextUndo` (not
+        // `FileTreeUndo` - see `crate::sidebar::tree_ops::AdeApp::handle_tree_text_undo`, the
+        // listener the tag routes to instead) rather than the file tree's own undo/redo (GitHub
+        // issue #105).
+        let key_context =
+            crate::keymap_overrides::file_tree_key_context(self.tree_inline_edit.is_some());
         div()
             .id("file-tree-shell")
             .key_context(key_context)
@@ -776,6 +773,8 @@ impl AdeApp {
             .on_action(cx.listener(Self::handle_file_tree_cut_action))
             .on_action(cx.listener(Self::handle_file_tree_paste_action))
             .on_action(cx.listener(Self::handle_file_tree_delete_action))
+            .on_action(cx.listener(Self::handle_file_tree_undo_action))
+            .on_action(cx.listener(Self::handle_file_tree_redo_action))
             .on_action(cx.listener(Self::handle_tree_text_undo))
             .on_action(cx.listener(Self::handle_tree_text_redo))
             .on_key_down(cx.listener(Self::handle_tree_key_down))
@@ -1353,7 +1352,7 @@ impl AdeApp {
                 .child(render_file_tree_footer(
                     self.ui_text_size(10.0),
                     self.window_controls_style().is_macos(),
-                    self.tree_inline_edit.is_none() && self.tree_delete_confirm.is_none(),
+                    self.tree_inline_edit.is_none(),
                 )),
             RightSidebarView::Changes => match self.current_diff() {
                 Some(diff) => {
@@ -2314,9 +2313,8 @@ impl AdeApp {
     /// happened to be under the cursor - and every row under the pointer still painted its
     /// `:hover` fill and its tooltip, because those read `Hitbox::is_hovered` directly and never
     /// consulted the click handlers at all. A `cx.stop_propagation()` in the scrim's own handler
-    /// could only ever have fixed the click half; hover styling is not an event. The same
-    /// `.occlude()` is on `Self::render_tree_delete_confirm`'s scrim, and this app already used
-    /// the identical mechanism for the pane resize handles (`crate::root::resize`).
+    /// could only ever have fixed the click half; hover styling is not an event. This app already
+    /// used the identical mechanism for the pane resize handles (`crate::root::resize`).
     pub(crate) fn render_tree_context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let menu = self.tree_context_menu.clone();
         let macos = self.window_controls_style().is_macos();
@@ -2478,127 +2476,6 @@ impl AdeApp {
         }
 
         row.into_any_element()
-    }
-
-    /// The delete confirmation (issue #19 §3: "Delete asks for confirmation and prefers the OS
-    /// trash over a hard delete where available").
-    ///
-    /// A real modal panel with two explicit buttons rather than this app's other
-    /// "click once to arm, click again to run" pattern
-    /// (`crate::worktree_history::flow::AdeApp::request_discard_worktree`): that shape works for
-    /// a button that stays in one place, but a context-menu row disappears the moment the menu
-    /// closes, so there would be nothing left to click a second time. The confirm button's label
-    /// and the sentence above it both come from the already-resolved
-    /// [`crate::sidebar::tree_ops::PendingTreeDelete::mechanism`], so what is promised here and
-    /// what actually runs cannot disagree.
-    ///
-    /// ## Design language
-    ///
-    /// The panel geometry is `crate::root::new_file::AdeApp::render_new_file_prompt`'s - this
-    /// app's first centered modal and therefore the pattern to match, not to re-derive: scrim +
-    /// `flex/items_center/justify_center`, panel `p(12)` `gap(8)` on
-    /// `theme::surface::PALETTE`/`theme::border::POPOVER`/`theme::radius::CARD`, title SANS 11.5
-    /// MEDIUM `theme::text::HEADING`, body SANS 10.5 `theme::text::DIM`. Three things that were
-    /// genuinely off it are fixed here: the scrim was a raw `gpui::black()` literal rather than a
-    /// theme token (now `crate::root::widgets::modal_scrim_bg`, shared with the New file prompt),
-    /// the two buttons had no hover state at all, and the destructive one was tinted
-    /// `theme::status::FAIL` - the rail's *status* red - rather than `theme::button::DANGER_FG`,
-    /// the pair this app already uses for a destructive control. Both buttons now come from the
-    /// one shared `crate::root::widgets::render_modal_button`.
-    ///
-    /// The scrim `.occlude()`s for the same real reason
-    /// [`Self::render_tree_context_menu`]'s does - see that method's docs.
-    pub(crate) fn render_tree_delete_confirm(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let pending = self.tree_delete_confirm.clone();
-        let name = pending
-            .as_ref()
-            .and_then(|pending| pending.path.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let explanation = pending
-            .as_ref()
-            .map(|pending| pending.explanation())
-            .unwrap_or_default();
-        let confirm_label = pending
-            .as_ref()
-            .map(|pending| pending.confirm_label())
-            .unwrap_or("Delete");
-
-        div()
-            .id("tree-delete-scrim")
-            .absolute()
-            // Starts *below* the title bar, exactly like `crate::palette::render`'s own scrim
-            // does and for the same reason - now a real one, since this layer `.occlude()`s.
-            // A full-window occluding scrim swallows the window's own close/minimise/maximise
-            // caption buttons and the title bar's drag region, so the window could not be closed
-            // or moved while it was up. Reproduced against the real caption button by this
-            // change's own adversarial audit.
-            .top(theme::band::TITLE_BAR)
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .occlude()
-            .bg(modal_scrim_bg())
-            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                this.cancel_tree_delete(cx);
-            }))
-            .child(
-                div()
-                    .id("tree-delete-panel")
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }))
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .w(px(340.0))
-                    .p(px(12.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::CARD)
-                    .child(
-                        div()
-                            .font(font(theme::font::SANS))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(px(11.5))
-                            .text_color(theme::text::HEADING)
-                            .child(format!("Delete \"{name}\"?")),
-                    )
-                    .child(
-                        div()
-                            .font(font(theme::font::SANS))
-                            .text_size(px(10.5))
-                            .text_color(theme::text::DIM)
-                            .child(explanation),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap(px(8.0))
-                            .child(
-                                render_modal_button("tree-delete-cancel", "Cancel", false)
-                                    .on_click(cx.listener(
-                                        |this, _event: &ClickEvent, _window, cx| {
-                                            this.cancel_tree_delete(cx);
-                                        },
-                                    )),
-                            )
-                            .child(
-                                render_modal_button("tree-delete-confirm", confirm_label, true)
-                                    .on_click(cx.listener(
-                                        |this, _event: &ClickEvent, _window, cx| {
-                                            this.confirm_tree_delete(cx);
-                                        },
-                                    )),
-                            ),
-                    ),
-            )
     }
 }
 
