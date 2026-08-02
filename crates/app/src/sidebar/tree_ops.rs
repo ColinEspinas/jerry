@@ -1776,7 +1776,8 @@ mod tree_ops_regression_tests {
         let fold_path = crate::sidebar::fold_state::fold_state_path_for(&settings_path);
         let (app, cx) = cx.add_window_view(|window, cx| {
             AdeApp::new_with_settings(
-                repo.path().to_path_buf(),
+                Some(repo.path().to_path_buf()),
+                true,
                 settings_store::Settings::default(),
                 Some(settings_path),
                 window,

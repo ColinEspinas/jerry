@@ -7,10 +7,29 @@ impl AdeApp {
     /// and delegates to [`Self::new_with_settings`]. Blocking the foreground thread here is a
     /// deliberate exception to this codebase's usual rule: it's a single tiny file read that
     /// runs exactly once, before a window even exists, not a per-render or per-poll cost.
-    pub fn new(repo_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    ///
+    /// GitHub issue #90: `repo_path` is `None` for a fresh launch with no CLI argument (there is
+    /// deliberately no `env::current_dir()` fallback anywhere upstream of this - see
+    /// `crate::main`'s own docs) or for a brand-new window opened via `crate::title_bar::menu`'s
+    /// "New Window" row. `use_remembered_repo` disambiguates those two `None` cases from each
+    /// other - see [`Self::new_with_settings`]'s own docs for exactly what it controls; `Some`
+    /// makes it irrelevant either way, since an explicit path always wins.
+    pub fn new(
+        repo_path: Option<PathBuf>,
+        use_remembered_repo: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let settings_path = settings_store::settings_toml_path();
         let settings = settings_store::Settings::load_or_init();
-        Self::new_with_settings(repo_path, settings, settings_path, window, cx)
+        Self::new_with_settings(
+            repo_path,
+            use_remembered_repo,
+            settings,
+            settings_path,
+            window,
+            cx,
+        )
     }
 
     /// The real constructor - takes an already-resolved [`Settings`] and its optional source
@@ -19,8 +38,35 @@ impl AdeApp {
     /// can each supply their own. Test instances get in-memory-only defaults and a `None` path,
     /// so [`Self::persist_settings`] is a genuine no-op for them, never a write to whatever
     /// machine happens to run `cargo test`.
+    ///
+    /// ## `repo_path`/`use_remembered_repo` (GitHub issue #90)
+    ///
+    /// `repo_path`:
+    /// - `Some(path)`: behaves exactly as this app always has - `path` is added and focused,
+    ///   unconditionally. `use_remembered_repo` has no effect in this case.
+    /// - `None`, `use_remembered_repo == true` (the real process-launch path, `Self::new`'s own
+    ///   `run` caller): looks at whatever [`repo::RepoState`] was just loaded into `repos` below
+    ///   for a real, still-existing last-focused repo
+    ///   ([`repo::RepoState::last_focused_existing_path`]) and focuses that one if there is one -
+    ///   "the app remembers the last-opened folder and reopens it automatically next launch". If
+    ///   there is no such repo (nothing was ever persisted, or the remembered directory has since
+    ///   been deleted/moved), the window opens in a genuinely empty state instead: no crash, no
+    ///   silent fallback to a hardcoded path, just [`Self::focused_repo`] staying `None`.
+    /// - `None`, `use_remembered_repo == false` (`crate::title_bar::menu`'s "New Window" row):
+    ///   always a genuinely empty state, even if a real last-focused repo *is* on record - the
+    ///   issue's own words are explicit that a new window opens empty, "not" whatever folder the
+    ///   window it was opened from happens to have open.
+    ///
+    /// A genuinely empty window ([`Self::focused_repo`] left `None`) skips every single-repo-
+    /// scoped piece of startup work below that would otherwise need a real path to run against -
+    /// no initial shell agent is spawned, and `Self::load_worktrees`/`load_file_tree`/`load_diff`/
+    /// `start_status_polling`/`start_worktree_watch` are never called at all. [`Render`]'s own
+    /// `AdeApp` impl (`crate::root::mod`) renders a dedicated empty-state view instead of the
+    /// three-zone workspace body whenever [`Self::focused_repo`] is `None` - see
+    /// `Self::render_empty_state`'s own docs.
     pub(crate) fn new_with_settings(
-        repo_path: PathBuf,
+        repo_path: Option<PathBuf>,
+        use_remembered_repo: bool,
         settings: settings_store::Settings,
         settings_path: Option<PathBuf>,
         window: &mut Window,
@@ -79,6 +125,20 @@ impl AdeApp {
             next_repo_id += 1;
         }
 
+        // GitHub issue #90: the one real resolution point for "what repo (if any) should this
+        // window start focused on" - see `Self::new_with_settings`'s own docs for the full
+        // decision table. An explicit `repo_path` always wins outright; otherwise, only the real
+        // process-launch path (`use_remembered_repo == true`) ever consults the just-loaded
+        // `RepoState`'s own last-focused marker, and only if it still names a real, existing
+        // directory - `RepoState::last_focused_existing_path` is the one place that "still
+        // exists" check happens, so a deleted/moved remembered folder can never surface as a
+        // broken/error startup state here, only as a genuinely empty one.
+        let resolved_repo_path: Option<PathBuf> = match repo_path {
+            Some(path) => Some(path),
+            None if use_remembered_repo => loaded_repo_state.last_focused_existing_path(),
+            None => None,
+        };
+
         // Built before the `Self` literal below (rather than inline as `cx.focus_handle()` at
         // their own field positions, as every other focus handle in this literal is) because
         // `AdeApp::wire_caret_blink` needs real, already-constructed handles to subscribe to -
@@ -118,9 +178,15 @@ impl AdeApp {
             None => (Vec::new(), Vec::new()),
         };
 
+        // A genuinely empty startup (no `resolved_repo_path`) has no real root to point these
+        // at yet - an empty `PathBuf` is an honest placeholder, never read by anything: every
+        // consumer of `file_tree_root`/`diff_root` lives inside `Self::render_workspace_body`,
+        // which `Render`'s own `AdeApp` impl never calls while `Self::focused_repo` is `None`
+        // (see `Self::render_empty_state`'s own docs).
+        let initial_root = resolved_repo_path.clone().unwrap_or_default();
         let mut this = Self {
-            file_tree_root: repo_path.clone(),
-            diff_root: repo_path.clone(),
+            file_tree_root: initial_root.clone(),
+            diff_root: initial_root,
             repos,
             // Resolved just below the literal, via `Self::add_repo`/`Self::focus_repo` - there is
             // no `self` yet at this point in construction to call them against.
@@ -239,6 +305,7 @@ impl AdeApp {
             rail_collapse_overrides: HashMap::new(),
             filter_focus_handle,
             rail_focus_handle: cx.focus_handle(),
+            empty_state_focus_handle: cx.focus_handle(),
             diff_cache: HashMap::new(),
             worktree_notes: HashMap::new(),
             ahead_behind_cache: HashMap::new(),
@@ -363,6 +430,7 @@ impl AdeApp {
             custom_theme_remove_armed: None,
             icon_pack_status: None,
             _icon_pack_choose_task: None,
+            _repo_folder_choose_task: None,
         };
         // GitHub issue #45 ("Input blink only on focused input or file") / a live follow-up
         // report of missing carets: `graph_state.branches_filter_focus_handle` (added later, in
@@ -384,59 +452,81 @@ impl AdeApp {
         );
         this._caret_blink_subscriptions
             .extend(extra_caret_blink_subscriptions);
-        // Real "add this one repo on startup" (Revision R12 Phase 0): the CLI argument (or a
-        // test's own `repo_path`) becomes the first, focused entry of `Self::repos` rather than a
-        // separate field - `Self::add_repo` is idempotent against whatever `loaded_repo_state`
-        // above already restored, so a repeat launch of the same path never duplicates it. Every
-        // other single-repo-scoped field below (`file_tree_root`/`diff_root`/the initial shell's
-        // cwd/`load_worktrees`) still reads `repo_path` directly rather than
-        // `Self::focused_repo_path()` - they're the same value here by construction, and `Self::
-        // focused_repo_path()` becomes the real accessor once a repo switch is more than "one repo
-        // was ever set".
-        let focused_repo_id = this.add_repo(repo_path.clone(), cx);
-        this.focus_repo(focused_repo_id);
-        // See the `expanded_dirs`/`fold_state_root_key` note in the literal above: resolving the
-        // worktree key here, through the one function that ever resolves it, is what keeps the
-        // startup path and every later worktree switch structurally identical.
-        this.set_file_tree_root(repo_path.clone());
-        this.reload_expanded_dirs_from_fold_state();
+        // Real "add this one repo on startup" (Revision R12 Phase 0, extended by GitHub issue
+        // #90 to a genuinely optional repo): `resolved_repo_path` - the CLI argument, the
+        // remembered last-focused repo, or nothing at all, per `Self::new_with_settings`'s own
+        // decision table above - becomes the first, focused entry of `Self::repos` rather than a
+        // separate field whenever it's `Some`. `Self::add_repo` is idempotent against whatever
+        // `loaded_repo_state` above already restored, so a repeat launch of the same path (or
+        // reopening the same remembered repo) never duplicates it. Every other single-repo-
+        // scoped piece of startup work below (`set_file_tree_root`/the initial shell's cwd/
+        // `load_worktrees`/`load_file_tree`/`load_diff`/the watchers) only runs at all when there
+        // is a real path to run it against - a genuinely empty startup does none of it, and
+        // `Self::focused_repo` simply stays `None`.
+        if let Some(path) = resolved_repo_path.clone() {
+            let focused_repo_id = this.add_repo(path.clone(), cx);
+            this.focus_repo(focused_repo_id, cx);
+            // See the `expanded_dirs`/`fold_state_root_key` note in the literal above: resolving
+            // the worktree key here, through the one function that ever resolves it, is what
+            // keeps the startup path and every later worktree switch structurally identical.
+            this.set_file_tree_root(path.clone());
+            this.reload_expanded_dirs_from_fold_state();
+        }
         // Applies `this.settings.keymap.overrides` on top of `crate::default_key_bindings()` -
         // see `Self::apply_effective_key_bindings`'s own docs. Must run before this constructor
         // returns and the entity's first render, so a persisted rebind is live from the very
         // first frame, not just after the next settings change - real "apply overrides at
-        // startup", not only "apply overrides when later edited".
+        // startup", not only "apply overrides when later edited". Unconditional: a rebound
+        // keymap applies just as much to a genuinely empty window as a focused one.
         this.apply_effective_key_bindings(cx);
         // Applies the real, persisted theme selection at startup (`Self::apply_theme_selection`)
         // - if `follow_system` is also on, the real, current OS appearance takes priority over
         // whatever `theme.name` was last persisted as, matching `Self::sync_theme_to_system_
         // appearance`'s own live behavior (see that method's docs); `apply_theme_selection`'s own
         // call at the end is always run regardless, since `apply_follow_system_appearance` is a
-        // no-op (and doesn't itself apply anything) when the resolved name already matches.
+        // no-op (and doesn't itself apply anything) when the resolved name already matches. Also
+        // unconditional, for the same reason as the keybindings above.
         if this.settings.theme.follow_system {
             let appearance = window.appearance();
             this.apply_follow_system_appearance(appearance, cx);
         }
         this.apply_theme_selection(cx);
-        // A fresh window starts with one shell in the repo root, as a tab like any other.
-        // `focus_active` below moves real keyboard focus onto it - see `Agents::focus_active`'s
-        // docs and this crate's `OverlayFocus`/`restore_focus` docs for why a fresh window must
-        // never start with `Window::focus == None`.
-        this.agents.spawn(
-            AgentKind::Shell,
-            repo_path.clone(),
-            this.settings.appearance.terminal_font_size,
-            window,
-            cx,
-        );
-        this.agents.focus_active(window, cx);
-        this.load_worktrees(cx);
-        this.load_file_tree(repo_path.clone(), cx);
-        this.load_diff(repo_path, cx);
-        this.start_status_polling(cx);
-        this.start_worktree_watch(cx);
+        match resolved_repo_path {
+            Some(path) => {
+                // A fresh window starts with one shell in the repo root, as a tab like any
+                // other. `focus_active` below moves real keyboard focus onto it - see
+                // `Agents::focus_active`'s docs and this crate's `OverlayFocus`/`restore_focus`
+                // docs for why a *focused* window must never start with `Window::focus == None`.
+                this.agents.spawn(
+                    AgentKind::Shell,
+                    path.clone(),
+                    this.settings.appearance.terminal_font_size,
+                    window,
+                    cx,
+                );
+                this.agents.focus_active(window, cx);
+                this.load_worktrees(cx);
+                this.load_file_tree(path.clone(), cx);
+                this.load_diff(path, cx);
+                this.start_status_polling(cx);
+                this.start_worktree_watch(cx);
+            }
+            None => {
+                // A genuinely empty window (GitHub issue #90) has no code surface/rail/tab strip
+                // in its rendered tree at all (`Self::render_empty_state`) - nothing above moved
+                // real keyboard focus anywhere, so this is the same "never leave `Window::focus`
+                // dangling" discipline `Self::select_worktree`'s own fallback branch already
+                // uses when a worktree switch leaves no agent to focus: the rail's own root
+                // container, which - unlike a genuinely empty window's own body - is *not* part
+                // of the rendered tree here, so `Self::render_empty_state`'s own focus handle is
+                // used instead. See that method's docs.
+                window.focus(&this.empty_state_focus_handle, cx);
+            }
+        }
         // GitHub issue #87: a real startup check, plus the periodic loop that keeps re-checking
         // for as long as the app runs - see `crate::updater::flow::AdeApp::
-        // start_update_check_loop`'s own docs.
+        // start_update_check_loop`'s own docs. Unconditional for the same reason the keybindings/
+        // theme setup above is: it has nothing to do with which (if any) repo is focused.
         this.start_update_check_loop(cx);
         this
     }
@@ -667,24 +757,55 @@ impl AdeApp {
         // at all, so the centre pane could keep showing a completely different worktree's
         // terminal after a rail click.
         self.agents.activate_for_worktree(&path, cx);
-        // Browsing to a different worktree disarms a pending prune confirmation - see
-        // `Self::request_prune`'s docs.
+        self.reset_repo_scoped_state(path, window, cx);
+    }
+
+    /// The shared core of "something completely different is now the single-repo-scoped root
+    /// this window revolves around" - every piece of per-worktree/per-repo transient UI state
+    /// this app has, reset, plus the real reload ([`Self::load_file_tree`]/[`Self::load_diff`]/
+    /// [`Self::evict_stale_lsp_clients`]/a graph-tab refresh if open) against `new_root`.
+    ///
+    /// Two real callers, extracted here (an independent audit's own finding) so they can never
+    /// drift apart on which state gets reset: [`Self::select_worktree`] (switching worktrees
+    /// *within* the same repo) and [`Self::open_repo_in_current_window`] (GitHub issue #90's
+    /// "Open Folder", switching to an entirely different repo, or out of a genuinely empty
+    /// window). Both are the same real invariant - "nothing here may still point at whatever was
+    /// open before" - reached through different UI gestures; before this extraction,
+    /// `open_repo_in_current_window` only reset four of these fields
+    /// (`staged_files`/`open_change`/`expanded_dirs`/`selected_tree_path`), leaving every other
+    /// one - `tree_delete_confirm`, `tree_clipboard`, `tree_context_menu`, `tree_inline_edit`,
+    /// `discard_confirm_armed`, `prune_confirm_armed`, `commit_menu_open`, every file/LSP/blame
+    /// cache and in-flight task - armed against whatever repo was open *before* the folder was
+    /// switched. Concretely: arming a delete confirmation on `<old repo>/x`, opening a different
+    /// folder, and confirming the still-rendered modal used to delete inside the *old* repo.
+    ///
+    /// Callers are responsible for whatever is genuinely different between "switching worktrees"
+    /// and "switching repos" themselves: `self.selected`/`self.agents.activate_for_worktree`
+    /// (`select_worktree`) vs. `self.focused_repo`/spawning an initial agent
+    /// (`open_repo_in_current_window`) - this only owns the part identical to both.
+    pub(crate) fn reset_repo_scoped_state(
+        &mut self,
+        new_root: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Browsing away disarms a pending prune confirmation - see `Self::request_prune`'s docs.
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
         // Same reasoning for the commit composer's own split-button popover (Revision R12 §5) -
-        // it targets the *previously* selected worktree's staged set, so it must not stay open
+        // it targets whatever was previously selected's staged set, so it must not stay open
         // pointed at the wrong one.
         self.commit_menu_open = false;
         // Reset per-worktree UI state (see `reset_per_worktree_ui_state`'s docs) so switching
-        // worktrees never leaks a staged checkbox, open diff, or collapsed-dir entry from
-        // the worktree just left. Deliberately runs *before* the focus-fallback block below: both
-        // `focus_newly_spawned_agent` and the `filter_focus_handle` fallback branch on
+        // never leaks a staged checkbox, open diff, or collapsed-dir entry from whatever was open
+        // before. Deliberately runs *before* the focus-fallback block below: both
+        // `focus_newly_spawned_agent` and the fallback branch after it key off
         // `self.open_change`, and until this call runs, `open_change` can still reflect the
-        // worktree just *left* (a file tab open there) rather than the real post-switch state -
-        // evaluating either guard first (a real, live-reproduced bug found in this revision's own
-        // self-audit) made both branches see a stale `Some` and skip moving focus at all, leaving
-        // `Window::focus` dangling on `code_focus_handle` once `open_change` was cleared one
-        // statement later.
+        // worktree/repo just *left* (a file tab open there) rather than the real post-switch
+        // state - evaluating either guard first (a real, live-reproduced bug found in this
+        // revision's own self-audit) made both branches see a stale `Some` and skip moving focus
+        // at all, leaving `Window::focus` dangling on `code_focus_handle` once `open_change` was
+        // cleared one statement later.
         reset_per_worktree_ui_state(
             &mut self.staged_files,
             &mut self.open_change,
@@ -692,33 +813,33 @@ impl AdeApp {
             &mut self.selected_tree_path,
         );
         // The tree's fold state is per-worktree *persisted* state, not merely per-worktree
-        // transient state: the reset above clears the live set, and this re-derives it from the
-        // worktree genuinely being switched *to*. A worktree with no recorded state (a freshly
-        // created one, say) gets an empty set and so opens fully collapsed - the issue's own
-        // suggested answer to "does a fresh worktree inherit anything".
+        // transient state: the reset above clears the live set, and this re-derives it from
+        // whatever is genuinely being switched *to*. A worktree/repo with no recorded state (a
+        // freshly created or freshly opened one) gets an empty set and so opens fully collapsed -
+        // the issue's own suggested answer to "does a fresh worktree inherit anything".
         //
         // `file_tree_root`/`file_tree` move in the *same* step, deliberately: `load_file_tree`
         // below sets the root too, but its walk is asynchronous, so without this the frames
-        // between here and the walk landing would render the worktree just left's rows against
-        // the new worktree's expanded set - and a click on one of those stale rows would reach
-        // `set_dir_expanded` with a path from a different worktree entirely. Clearing
+        // between here and the walk landing would render whatever was left's rows against the
+        // new root's expanded set - and a click on one of those stale rows would reach
+        // `set_dir_expanded` with a path from an entirely different worktree/repo. Clearing
         // `file_tree` makes that window render an honestly empty tree instead.
-        self.set_file_tree_root(path.clone());
+        self.set_file_tree_root(new_root.clone());
         self.file_tree = Vec::new();
         self.reload_expanded_dirs_from_fold_state();
-        // Every one of these holds an absolute path in the worktree being *left* (GitHub issue
-        // #19): an open context menu targeting a row that is about to stop existing, a
-        // half-typed name for a folder in the old tree, a cut/copied entry a paste here would
-        // move across worktrees, and an armed delete for a path in the old tree. Cleared
-        // together, in the same step as `file_tree`/`expanded_dirs` above and for the same
-        // reason - the window between here and the new walk landing must not leave a control
-        // pointing at the old worktree.
+        // Every one of these holds an absolute path in whatever was just left (GitHub issue #19):
+        // an open context menu targeting a row that is about to stop existing, a half-typed name
+        // for a folder in the old tree, a cut/copied entry a paste here would move across
+        // worktrees/repos, and an armed delete for a path in the old tree. Cleared together, in
+        // the same step as `file_tree`/`expanded_dirs` above and for the same reason - the window
+        // between here and the new walk landing must not leave a control pointing at the old
+        // worktree/repo.
         self.tree_context_menu = None;
         self.tree_inline_edit = None;
         self.tree_clipboard = None;
         self.tree_delete_confirm = None;
         self.tree_op_error = None;
-        // "Show me the whole listing" was a decision about the worktree being left.
+        // "Show me the whole listing" was a decision about whatever was left.
         self.file_tree_limit_override = None;
         self.file_tree_truncated = false;
         self.file_tree_complete = false;
@@ -729,32 +850,34 @@ impl AdeApp {
         // filter (`Self::render_tab_strip`) applies, so keyboard focus left pointing at it would
         // silently break every keybinding until the next click - the same "focus left pointing at
         // something no longer rendered" bug class this project's own `OverlayFocus`/
-        // `restore_focus` mechanism exists to prevent, applied here to a plain worktree switch
-        // rather than an overlay open/close. `open_change` above is already this switch's real
-        // post-reset value by the time this runs, so the guard it checks is genuine.
+        // `restore_focus` mechanism exists to prevent, applied here to a plain worktree/repo
+        // switch rather than an overlay open/close. `open_change` above is already this switch's
+        // real post-reset value by the time this runs, so the guard it checks is genuine.
         self.focus_newly_spawned_agent(window, cx);
-        // `focus_newly_spawned_agent` is a real no-op when the newly selected worktree has no
+        // `focus_newly_spawned_agent` is a real no-op when whatever was just switched to has no
         // open agent at all (`Agents::focus_active` has nothing to focus) - so if a
-        // previously-focused agent's pane belonged to the worktree just left, it's now exactly
-        // as dangling as the case the comment above already covers, just with no agent to
-        // redirect *onto*. Fall back to the rail's own root container
-        // (`Self::rail_focus_handle`), which is part of the rendered tree whenever the
-        // workspace body is showing (never while Settings has replaced it - `!self.settings_open`
-        // guards that the same way `focus_newly_spawned_agent` itself does). Deliberately the
-        // rail's root, not its filter field, which this used to target - see
-        // `Self::rail_focus_handle`'s own docs for the real, audit-found keystroke-swallowing bug
-        // that became once the filter field started carrying a `"text-input"` key context. It
-        // keeps the focused `FocusId` genuinely findable in the next rendered frame, which is the
-        // actual invariant this exists to protect: a dangling `FocusId` makes GPUI's action
-        // dispatch fall back to a disconnected root with no real `on_action` handlers at all, not
-        // just this worktree's own missing ones - silently breaking every global keybinding (⌘P
-        // included) until the next click.
+        // previously-focused agent's pane belonged to whatever was left, it's now exactly as
+        // dangling as the case the comment above already covers, just with no agent to redirect
+        // *onto*. Fall back to the rail's own root container (`Self::rail_focus_handle`), which
+        // is part of the rendered tree whenever the workspace body is showing (never while
+        // Settings has replaced it - `!self.settings_open` guards that the same way
+        // `focus_newly_spawned_agent` itself does, and never while a genuinely empty window is
+        // showing `Self::render_empty_state` instead, which has no rail at all - callers switching
+        // *out of* empty state are responsible for their own focus, same as
+        // `Self::open_repo_in_current_window` already is). Deliberately the rail's root, not its
+        // filter field, which this used to target - see `Self::rail_focus_handle`'s own docs for
+        // the real, audit-found keystroke-swallowing bug that became once the filter field
+        // started carrying a `"text-input"` key context. It keeps the focused `FocusId` genuinely
+        // findable in the next rendered frame, which is the actual invariant this exists to
+        // protect: a dangling `FocusId` makes GPUI's action dispatch fall back to a disconnected
+        // root with no real `on_action` handlers at all, not just this worktree's own missing
+        // ones - silently breaking every global keybinding (⌘P included) until the next click.
         if self.agents.active_id().is_none() && self.open_change.is_none() && !self.settings_open {
             window.focus(&self.rail_focus_handle, cx);
         }
         // The File view's own per-worktree state (a cached parse and diff lookup that are about
         // to belong to a different `file_tree_root`) - reset for the same reason as above.
-        // Dropping `_file_load_task` cancels any in-flight load for the worktree just left.
+        // Dropping `_file_load_task` cancels any in-flight load for whatever was left.
         self.code_view = code_view::CodeView::Diff;
         self.file_view_cache = None;
         self.file_load_state = FileLoadState::Idle;
@@ -765,8 +888,7 @@ impl AdeApp {
         // The real text-editing state above (`edit_buffers`) is per-worktree-reset via the shared
         // helper; its own transient/task-shaped siblings - which don't fit that helper's plain
         // free-function signature - are reset directly here for the same reason. Dropping the
-        // task maps cancels every in-flight debounced re-highlight/save for the worktree just
-        // left, matching `_file_load_task`'s own reset above.
+        // task maps cancels every in-flight debounced re-highlight/save for whatever was left.
         self.file_view_row_layout = HashMap::new();
         self.file_view_last_layout = None;
         self.file_view_last_bounds = None;
@@ -774,11 +896,11 @@ impl AdeApp {
         self._rehighlight_tasks = HashMap::new();
         // Real live LSP sync/completions state (Revision R8.5b) is worktree-relative-path-keyed
         // (or entirely path-scoped) the same way `edit_buffers` above is - reset alongside it so
-        // a worktree switch can't leak a stale "already synced this content" record or a dangling
-        // popup from the worktree just left. `lsp_document_versions`/`lsp_uri_cache` are keyed by
-        // *absolute* path (see their own docs), so neither ever actually collides across
-        // worktrees and both are left to `evict_stale_lsp_clients`'s own root-scoped pruning
-        // instead of a blanket reset here.
+        // a switch can't leak a stale "already synced this content" record or a dangling popup
+        // from whatever was left. `lsp_document_versions`/`lsp_uri_cache` are keyed by *absolute*
+        // path (see their own docs), so neither ever actually collides across worktrees/repos and
+        // both are left to `evict_stale_lsp_clients`'s own root-scoped pruning instead of a
+        // blanket reset here.
         self._lsp_sync_tasks = HashMap::new();
         self._completions_request_task = None;
         self.lsp_last_synced_content = HashMap::new();
@@ -790,18 +912,17 @@ impl AdeApp {
         self.file_save_running = HashSet::new();
         self.file_save_error = None;
         self.file_external_conflict = HashSet::new();
-        // The Diff view's syntax-highlight cache is keyed on a whole `DiffFile` from the
-        // worktree just left - reset alongside `open_diff_file_cache` above for the same reason
-        // (and so it can't retain a full file's highlighting from a worktree that's no longer
-        // active).
+        // The Diff view's syntax-highlight cache is keyed on a whole `DiffFile` from whatever was
+        // left - reset alongside `open_diff_file_cache` above for the same reason (and so it
+        // can't retain a full file's highlighting from a worktree/repo that's no longer active).
         self.diff_highlight_cache = None;
         self._file_load_task = None;
         // Editor zoom (`Settings.appearance.editor_zoom_percent`) is a real, globally-persisted
         // Settings field now - see `settings_store`'s "Editor zoom is one global, persisted
         // number now" docs - so it deliberately does *not* get reset here anymore.
         //
-        // The hover cache is per-file - clear it too, or a hover card from the worktree just
-        // left could reappear the instant a same-named file opens in the new one. The real
+        // The hover cache is per-file - clear it too, or a hover card from whatever was left
+        // could reappear the instant a same-named file opens in the new one. The real
         // Completions popup is already dropped above (alongside `_lsp_sync_tasks`/
         // `lsp_last_synced_content`) via `Self::dismiss_completions()` - repeated here,
         // idempotently, right next to `hover`'s own reset for the same reason every other real
@@ -813,30 +934,30 @@ impl AdeApp {
         self.pending_cursor_line = None;
         // Real blame state (GitHub issue #29) is absolute-path-keyed - cleared alongside the
         // hover cache above for the identical reason: without this, a same-named file's blame
-        // from the worktree just left could reappear (wrongly attributed) the instant a
-        // same-named file opens in the new one, and a stale `Loading`/in-flight task from the
-        // old worktree has no reason to keep running once its own worktree is no longer active.
+        // from whatever was left could reappear (wrongly attributed) the instant a same-named
+        // file opens in the new one, and a stale `Loading`/in-flight task from the old worktree/
+        // repo has no reason to keep running once it's no longer active.
         self.blame_cache.clear();
         self.blame_state.clear();
         self._blame_tasks.clear();
         self.blame_last_freshness_check = None;
         // Commit messages are sha-keyed, not path-keyed - a sha means the same real commit
-        // regardless of which worktree it's viewed from, so this cache deliberately survives a
-        // worktree switch (the same "safe to keep, sha is a real global identity" reasoning
+        // regardless of which worktree/repo it's viewed from, so this cache deliberately survives
+        // a switch (the same "safe to keep, sha is a real global identity" reasoning
         // `AdeApp::lsp_uri_cache`'s own root-scoped-only pruning already applies elsewhere).
-        self.load_file_tree(path.clone(), cx);
-        // `load_file_tree` above already set `self.file_tree_root = path` synchronously, so
-        // `path` is the active root by the time eviction runs.
-        self.evict_stale_lsp_clients(&path, cx);
-        self.load_diff(path, cx);
+        self.load_file_tree(new_root.clone(), cx);
+        // `load_file_tree` above already set `self.file_tree_root = new_root` synchronously, so
+        // `new_root` is the active root by the time eviction runs.
+        self.evict_stale_lsp_clients(&new_root, cx);
+        self.load_diff(new_root, cx);
         // The graph tab is repo-scoped, not worktree-scoped (design spec §1: "the graph is
         // repo-scoped"), but the toolbar's `HEAD` chip/upstream counts and the Worktrees scope
         // (`wt_core::graph::GraphScope::Worktrees`, driven by real worktree HEADs) are real facts
-        // about *this* worktree - without this, switching worktrees while the graph tab is open
-        // silently left it showing the previous worktree's data (a real, adversarial-audit-found
-        // gap), and the Commit panel's cached "Files changed" could even fail against the wrong
-        // repo path. `load_diff` above already updated `Self::diff_root` synchronously, so
-        // `load_graph` (which reads it) picks up the new worktree correctly.
+        // about whatever is genuinely current now - without this, switching while the graph tab
+        // is open silently left it showing stale data (a real, adversarial-audit-found gap), and
+        // the Commit panel's cached "Files changed" could even fail against the wrong repo path.
+        // `load_diff` above already updated `Self::diff_root` synchronously, so `load_graph`
+        // (which reads it) picks up the new root correctly.
         if self.graph_tab_open {
             self.load_graph(cx);
         }

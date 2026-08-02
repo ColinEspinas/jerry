@@ -19,6 +19,11 @@ pub mod language;
 pub mod lsp;
 pub mod merge;
 pub mod palette;
+// `pub(crate)`: a single small lock shared by `rail::repo`/`sidebar::fold_state`/
+// `work_surface::tab_order_state`'s own `save_merged_at` methods - see its own module docs for
+// the real intra-process concurrent-writer hazard (GitHub issue #90's "New Window") this exists
+// to close. Nothing outside this crate has any business calling it directly.
+pub(crate) mod persisted_state_lock;
 pub mod rail;
 pub mod root;
 pub mod settings;
@@ -507,10 +512,49 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
     ]
 }
 
+/// The [`WindowOptions`] every ADE window opens with - both the one real window [`run`] itself
+/// opens at process startup, and every window `crate::title_bar::menu`'s "New Window" row opens
+/// later (GitHub issue #90) - one shared literal so the two can never silently drift apart, the
+/// same "no second copy of a decision" reasoning [`default_key_bindings`]'s own docs give.
+/// `Bounds::centered` needs a real `&App` to read the display it's centering against
+/// (`vendor/zed/crates/gpui/src/geometry.rs:740`), which both real call sites have (the launch
+/// callback's own `&mut App`, and a menu row's `Context<AdeApp>`, which derefs to `App` -
+/// `vendor/zed/crates/gpui/src/app/context.rs:25-37`).
+pub(crate) fn default_window_options(cx: &App) -> WindowOptions {
+    let bounds = Bounds::centered(None, size(px(1440.0), px(928.0)), cx);
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        // The design's title-bar band (`crate::title_bar`) draws its own close/minimize/maximize
+        // controls, so the OS/compositor shouldn't also draw a native titlebar - matching
+        // `vendor/zed/crates/zed/src/zed.rs`'s own `titlebar`/`window_decorations` combination.
+        titlebar: Some(TitlebarOptions {
+            title: None,
+            appears_transparent: true,
+            traffic_light_position: None,
+        }),
+        window_decorations: Some(WindowDecorations::Client),
+        window_min_size: Some(Size {
+            width: px(720.0),
+            height: px(480.0),
+        }),
+        ..Default::default()
+    }
+}
+
 /// Opens the ADE window against `repo_path` and runs the GPUI event loop until the window is
 /// closed. Blocks the calling thread for the application's lifetime, mirroring
 /// `gpui::Application::run`'s own contract (`vendor/zed/crates/gpui/examples/hello_world.rs`).
-pub fn run(repo_path: PathBuf) {
+///
+/// GitHub issue #90: `repo_path` is now optional. `Some(path)` behaves exactly as before (the
+/// real CLI-argument case, `crate::main`'s own docs). `None` - a fresh launch with no CLI
+/// argument - is handed straight through to `root::AdeApp::new`/`new_with_settings`, which
+/// resolves it against whatever repo (if any) was last focused and persisted to `repos.toml`:
+/// reopen that one, or - if nothing was ever persisted, or the remembered path no longer exists -
+/// a genuinely empty window with no folder open at all. This is the real fix for "launching the
+/// editor should be in an 'empty' state by default": there is no `env::current_dir()` fallback
+/// anywhere in this path anymore (removed from `crate::main` itself) for `None` to silently
+/// become.
+pub fn run(repo_path: Option<PathBuf>) {
     // `with_assets` registers `fonts::Assets` as the app's `AssetSource`
     // (`vendor/zed/crates/gpui/src/app.rs:198`) before the launch callback runs, since
     // `fonts::load_embedded_fonts` needs `cx.asset_source()` already wired up.
@@ -526,31 +570,19 @@ pub fn run(repo_path: PathBuf) {
 
             cx.bind_keys(default_key_bindings());
 
-            let bounds = Bounds::centered(None, size(px(1440.0), px(928.0)), cx);
-            let opened = cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    // The design's title-bar band (`crate::title_bar`) draws its own
-                    // close/minimize/maximize controls, so the OS/compositor shouldn't also
-                    // draw a native titlebar - matching `vendor/zed/crates/zed/src/zed.rs`'s
-                    // own `titlebar`/`window_decorations` combination.
-                    titlebar: Some(TitlebarOptions {
-                        title: None,
-                        appears_transparent: true,
-                        traffic_light_position: None,
-                    }),
-                    window_decorations: Some(WindowDecorations::Client),
-                    window_min_size: Some(Size {
-                        width: px(720.0),
-                        height: px(480.0),
-                    }),
-                    ..Default::default()
-                },
-                {
-                    let repo_path = repo_path.clone();
-                    move |window, cx| cx.new(|cx| root::AdeApp::new(repo_path.clone(), window, cx))
-                },
-            );
+            let options = default_window_options(cx);
+            let opened = cx.open_window(options, {
+                let repo_path = repo_path.clone();
+                // `true`: the real process-launch path, which is exactly the one case GitHub
+                // issue #90 wants a remembered folder auto-reopened for - unlike a "New Window"
+                // menu row later in the same running process (`crate::title_bar::menu`'s own
+                // handler), which deliberately passes `false` for a genuinely empty window
+                // regardless of what's persisted. See `root::AdeApp::new`'s own docs for exactly
+                // what this flag controls.
+                move |window, cx| {
+                    cx.new(|cx| root::AdeApp::new(repo_path.clone(), true, window, cx))
+                }
+            });
 
             match opened {
                 Ok(_) => cx.activate(true),

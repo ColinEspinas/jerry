@@ -201,10 +201,14 @@ impl AdeApp {
     /// render_windows_title_bar_left`] all stop propagation on their own mouse-down, so pressing
     /// any of those controls can never also arm this drag.
     pub(crate) fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let project_name = self
-            .focused_repo()
-            .map(|repo| repo.name.clone())
-            .unwrap_or_else(|| self.focused_repo_path().display().to_string());
+        // GitHub issue #90: a genuinely empty window (`Self::render_empty_state`) has no real
+        // repo to name - `Self::focused_repo_path`'s own defensive fallback would otherwise
+        // silently show a *different*, merely-known-but-unfocused repo's name here (or an empty
+        // string), which would misleadingly suggest something is open when nothing is.
+        let project_name = match self.focused_repo() {
+            Some(repo) => repo.name.clone(),
+            None => "No Folder Open".to_string(),
+        };
         let branch = self
             .worktrees
             .iter()

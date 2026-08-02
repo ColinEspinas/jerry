@@ -78,7 +78,7 @@ impl AdeApp {
             RightSidebarView::Files => "Changes",
             RightSidebarView::Changes => "Files",
         };
-        let commands = vec![
+        let mut commands = vec![
             palette::CommandCandidate {
                 command: palette::PaletteCommand::NewShell,
                 secondary: format!("spawn a shell in {}", active_cwd.display()),
@@ -127,11 +127,19 @@ impl AdeApp {
                     WindowControlsStyle::WindowsLinuxStyle,
                 ),
             },
-            palette::CommandCandidate {
+        ];
+        // GitHub issue #90: a genuinely empty window has no real repo to graph -
+        // `crate::graph_view::render::AdeApp::open_git_graph`'s own guard now refuses outright
+        // with no focused repo, so this entry is dropped from the results entirely rather than
+        // listed as a real command that would silently do nothing if picked (this app has no
+        // existing "greyed out but still listed" convention for palette rows, unlike the title
+        // bar's dropdown menus - dropping the entry is the simpler, equally honest fix).
+        if self.focused_repo().is_some() {
+            commands.push(palette::CommandCandidate {
                 command: palette::PaletteCommand::OpenGitGraph,
                 secondary: "commit history, branches, lanes".to_string(),
-            },
-        ];
+            });
+        }
 
         palette::build_groups(
             self.palette_scope,

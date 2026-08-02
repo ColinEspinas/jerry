@@ -166,8 +166,9 @@ impl AdeApp {
     }
 
     /// The File menu: open a file (the same real, files-scoped command palette the `+` menu's
-    /// own "Open file…" row opens), save the active file (real, same handler `secondary-s`
-    /// dispatches - a safe no-op with nothing dirty to save, per
+    /// own "Open file…" row opens), open a folder or a brand-new empty window (GitHub issue #90,
+    /// see [`Self::render_title_menu`]'s own row-by-row docs below), save the active file (real,
+    /// same handler `secondary-s` dispatches - a safe no-op with nothing dirty to save, per
     /// [`crate::code_surface::editing::AdeApp::save_active_file`]'s own guard), open Settings, and quit
     /// (the same real [`Window::remove_window`] the title bar's own close control uses).
     fn file_menu_rows(&self, macos: bool, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
@@ -210,8 +211,76 @@ impl AdeApp {
                 cx.notify();
             }))
             .into_any_element(),
-            save_row.into_any_element(),
+            // GitHub issue #90's "Open Folder…" - a real native OS directory picker
+            // ([`AdeApp::start_choose_repo_folder`], the same `gpui::App::prompt_for_paths`
+            // shape `crate::settings::render::AdeApp::start_choose_icon_pack_folder` already
+            // uses), opening the chosen folder as a real, focused repo in *this* window - unlike
+            // the "New Window" row just below, which deliberately opens a brand-new, empty one.
+            // No keybinding (`Vec::new()` combo), matching this menu's own "Open File…" row just
+            // above: this app never binds a keystroke that could also be a plain character a
+            // focused terminal/agent needs, and this row isn't part of `crate::default_key_bindings`
+            // for that same reason.
+            render_dropdown_menu_row(
+                "F",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+                "Open Folder\u{2026}",
+                "open a repository".to_string(),
+                Vec::new(),
+                true,
+            )
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                this.title_menu_open = None;
+                this.start_choose_repo_folder(cx);
+                cx.notify();
+            }))
+            .into_any_element(),
+            // GitHub issue #90's "New Window" - a brand-new ADE window in a genuinely empty
+            // state (`AdeApp::new_with_settings`'s own `use_remembered_repo` docs), not this
+            // window's repo and deliberately not whatever folder was last remembered either - the
+            // issue's own wording is explicit that a new window starts empty. Shares
+            // `crate::default_window_options` with [`crate::run`]'s own real startup window, so
+            // the two can never silently drift apart on bounds/titlebar/decorations.
+            //
+            // Deliberately calls `AdeApp::new_with_settings` with *this* window's own already-
+            // loaded `self.settings`/`self.settings_path` - not `AdeApp::new`, which would re-run
+            // `settings_store::Settings::load_or_init()` from scratch. Two real reasons, not just
+            // one: the new window should show the exact settings/keymap/theme this one already
+            // has loaded rather than risk a second, independent disk read racing a concurrent
+            // edit; and `Settings::load_or_init` really does write a fresh default file to disk
+            // the first time it's ever called (`Settings::load_or_init_at`'s own docs) - firing
+            // that unconditionally from a menu click (including from a test that clicks this real
+            // row, per this codebase's own test rule that a test must never touch the real
+            // settings file - `crate::root::focus::palette_focus_tests::open_test_app`'s own
+            // docs) would be a real, surprising side effect a plain "open another window" click
+            // has no business causing.
+            render_dropdown_menu_row(
+                "N",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+                "New Window",
+                "empty window".to_string(),
+                Vec::new(),
+                true,
+            )
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                this.title_menu_open = None;
+                let options = crate::default_window_options(cx);
+                let settings = this.settings.clone();
+                let settings_path = this.settings_path.clone();
+                let opened = cx.open_window(options, move |window, cx| {
+                    cx.new(|cx| {
+                        AdeApp::new_with_settings(None, false, settings, settings_path, window, cx)
+                    })
+                });
+                if let Err(err) = opened {
+                    log::error!("failed to open a new ADE window: {err}");
+                }
+                cx.notify();
+            }))
+            .into_any_element(),
             Self::render_title_menu_divider(),
+            save_row.into_any_element(),
             render_dropdown_menu_row(
                 "P",
                 theme::text::DIM.into(),
@@ -454,36 +523,49 @@ impl AdeApp {
         // agents open but this one doesn't have a second one of its own.
         let can_cycle = self.current_worktree_agents().count() > 1;
         let active_id = self.agents.active_id();
+        // GitHub issue #90: a genuinely empty window has no real repo root to spawn a new agent
+        // into - see `crate::work_surface::render::AdeApp::new_agent`'s own docs for the real
+        // guard these two rows must agree with, and the concrete bug (a PTY silently spawned
+        // against a different, unopened repo) an independent audit found here.
+        let has_focused_repo = self.focused_repo().is_some();
+
+        let mut new_terminal_row = render_dropdown_menu_row(
+            "\u{276f}",
+            theme::text::DIM.into(),
+            theme::surface::CHIP_NEUTRAL.into(),
+            "New Terminal",
+            "in this worktree".to_string(),
+            keymap::resolve_combo("ctrl+shift+T", macos),
+            has_focused_repo,
+        );
+        if has_focused_repo {
+            new_terminal_row =
+                new_terminal_row.on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.title_menu_open = None;
+                    this.handle_new_terminal_action(&NewTerminal, window, cx);
+                }));
+        }
+        let mut new_agent_pane_row = render_dropdown_menu_row(
+            agent_initial,
+            agent_fg,
+            agent_bg,
+            "New Agent Pane",
+            agent_label.to_string(),
+            keymap::resolve_combo("mod+shift+N", macos),
+            has_focused_repo,
+        );
+        if has_focused_repo {
+            new_agent_pane_row = new_agent_pane_row.on_click(cx.listener(
+                |this, _event: &ClickEvent, window, cx| {
+                    this.title_menu_open = None;
+                    this.handle_new_agent_pane_action(&NewAgentPane, window, cx);
+                },
+            ));
+        }
 
         let mut rows = vec![
-            render_dropdown_menu_row(
-                "\u{276f}",
-                theme::text::DIM.into(),
-                theme::surface::CHIP_NEUTRAL.into(),
-                "New Terminal",
-                "in this worktree".to_string(),
-                keymap::resolve_combo("ctrl+shift+T", macos),
-                true,
-            )
-            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                this.title_menu_open = None;
-                this.handle_new_terminal_action(&NewTerminal, window, cx);
-            }))
-            .into_any_element(),
-            render_dropdown_menu_row(
-                agent_initial,
-                agent_fg,
-                agent_bg,
-                "New Agent Pane",
-                agent_label.to_string(),
-                keymap::resolve_combo("mod+shift+N", macos),
-                true,
-            )
-            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                this.title_menu_open = None;
-                this.handle_new_agent_pane_action(&NewAgentPane, window, cx);
-            }))
-            .into_any_element(),
+            new_terminal_row.into_any_element(),
+            new_agent_pane_row.into_any_element(),
             Self::render_title_menu_divider(),
         ];
 
@@ -779,6 +861,104 @@ mod title_menu_tests {
             assert_eq!(
                 app.title_menu_open, None,
                 "picking a real row should close the title menu"
+            );
+        });
+    }
+
+    /// GitHub issue #90's "Open Folder…" row - the File menu's second row. Drives it through a
+    /// real simulated click plus a real simulated native-picker response
+    /// (`TestAppContext::simulate_path_prompt_response`, the same real `gpui::App::
+    /// prompt_for_paths` seam `AdeApp::start_choose_repo_folder` itself calls), and asserts the
+    /// real effect: the chosen folder becomes this window's own focused repo, not merely that a
+    /// dialog was requested.
+    #[gpui::test]
+    fn file_menu_open_folder_row_focuses_a_real_chosen_folder_in_this_window(
+        cx: &mut TestAppContext,
+    ) {
+        let original_repo = tempfile::tempdir().expect("tempdir");
+        let chosen_repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, original_repo.path().to_path_buf());
+        app.update(cx, |app, cx| {
+            app.set_window_controls_style(WindowControlsStyle::WindowsLinuxStyle, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.title_menu_open = Some(TitleMenu::File);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let bounds = app.read_with(cx, |app, _| {
+            app.title_menu_button_bounds[TitleMenu::File.index()]
+        });
+
+        let chosen = chosen_repo.path().to_path_buf();
+        // "Open Folder…" is the File menu's second row (index 1): Open File, Open Folder, New
+        // Window, [divider], Save, Settings, Quit - see `AdeApp::file_menu_rows`'s own order.
+        cx.simulate_click(nth_row_click_point(bounds, 1, 0), gpui::Modifiers::none());
+        cx.simulate_path_prompt_response(move |_options| Some(vec![chosen]));
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.focused_repo_path(),
+                chosen_repo.path(),
+                "the real chosen folder should now be this window's own focused repo"
+            );
+            assert_eq!(
+                app.title_menu_open, None,
+                "picking a real row should close the title menu"
+            );
+        });
+    }
+
+    /// GitHub issue #90's "New Window" row: opens a genuinely *second*, empty-state window -
+    /// never this window's own repo, and never whatever repo happens to be focused here - even
+    /// though this window under test starts with a real repo focused.
+    #[gpui::test]
+    fn file_menu_new_window_row_opens_a_second_genuinely_empty_window(cx: &mut TestAppContext) {
+        let (app, cx) = open_windows_variant(cx);
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.focused_repo().is_some(),
+                "sanity check: this window starts focused on a real repo"
+            );
+        });
+        let windows_before = cx.windows();
+
+        app.update(cx, |app, cx| {
+            app.title_menu_open = Some(TitleMenu::File);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let bounds = app.read_with(cx, |app, _| {
+            app.title_menu_button_bounds[TitleMenu::File.index()]
+        });
+
+        cx.simulate_click(nth_row_click_point(bounds, 2, 0), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.title_menu_open),
+            None,
+            "picking a real row should close the title menu"
+        );
+
+        let new_window = cx
+            .windows()
+            .into_iter()
+            .find(|window| !windows_before.contains(window))
+            .expect("New Window should have opened a real second window");
+        let new_app = new_window
+            .downcast::<AdeApp>()
+            .expect("the new window's root view should be a real AdeApp")
+            .root(cx)
+            .expect("the new window should have a real root entity");
+        new_app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.focused_repo(),
+                None,
+                "New Window must open a genuinely empty window, even though the window it was \
+                 opened from has a real repo focused"
             );
         });
     }

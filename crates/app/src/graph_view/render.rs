@@ -17,6 +17,22 @@ impl AdeApp {
     /// through this). Idempotent: re-invoking while already open just re-activates it (used by
     /// the tab's own click handler too, so there is exactly one open/activate code path).
     pub(crate) fn open_git_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // GitHub issue #90: a genuinely empty window has no real repo to graph at all - an
+        // independent audit found this reachable two real ways with no focused repo (`mod+shift+G`
+        // is bound with no key context, so it dispatches regardless, and the palette's own "Open
+        // git graph" entry - see `crate::palette::render::AdeApp`'s own gating on this same guard)
+        // and two real consequences: `window.focus(&self.graph_focus_handle, cx)` below would
+        // dangle, since `graph_focus_handle` is only ever tracked inside `Self::render_center_pane`
+        // - part of `Self::render_workspace_body`, never rendered while `Self::render_empty_state`
+        // is showing instead (the same class of bug `Self::open_repo_in_current_window`'s own
+        // `empty_state_focus_handle` forgetting fixes) - and `Self::load_graph` reads
+        // `self.diff_root`, an empty `PathBuf` in this state, which `wt_core::graph::build_graph`
+        // hands to `gix::open`, which resolves an empty path relative to the *process's* real
+        // working directory - silently showing whatever unrelated repo `jerry` happened to be
+        // launched from, a real, confusing (if read-only) wrong-repo display.
+        if self.focused_repo().is_none() {
+            return;
+        }
         // Mirrors `Self::open_settings`'s own defensive top-of-function close: reachable directly
         // (the status bar cluster, the `+` menu, `mod+shift+G`) while the palette also happens to
         // be open, not just via `crate::palette::render::AdeApp::execute_palette_command`'s own
@@ -5084,6 +5100,63 @@ mod graph_focus_tests {
              `AdeApp::wire_caret_blink`, so nothing would have reacted to it losing focus at \
              all, and the caret would have stayed solid/visible until whatever timer the \
              earlier keystroke started eventually fired on its own"
+        );
+    }
+
+    /// GitHub issue #90 (independent audit, second round): a genuinely empty window has no real
+    /// repo to graph at all. `mod+shift+G` is bound with no key context - see
+    /// `crate::default_key_bindings`'s own docs - so it dispatches on the root element regardless
+    /// of whether a repo is focused, reaching `AdeApp::open_git_graph` directly. Before this fix,
+    /// that call would move real keyboard focus onto `graph_focus_handle` - a handle only ever
+    /// tracked inside `Self::render_center_pane` (part of `Self::render_workspace_body`, never
+    /// rendered while `Self::render_empty_state` is showing instead) - dangling it exactly like
+    /// the `empty_state_focus_handle` bug `AdeApp::open_repo_in_current_window`'s own
+    /// `forget_target` calls fix - and would load a real graph from `self.diff_root`, an empty
+    /// `PathBuf` in this state, which `gix::open` silently resolves relative to the process's own
+    /// real working directory.
+    #[gpui::test]
+    fn open_git_graph_is_a_no_op_with_no_focused_repo(cx: &mut TestAppContext) {
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                None,
+                true,
+                crate::settings::store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.focused_repo(), None, "sanity check: starts empty");
+        });
+
+        let empty_state_handle = app.read_with(cx, |app, _| app.empty_state_focus_handle.clone());
+        app.update_in(cx, |app, window, cx| {
+            window.focus(&empty_state_handle, cx);
+            app.handle_new_git_graph_action(&NewGitGraph, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.graph_tab_open,
+                "mod+shift+G with no focused repo must not open the graph tab"
+            );
+            assert!(!app.graph_tab_active);
+            assert!(
+                matches!(app.graph_state.load, GraphLoadState::NotLoaded),
+                "no real graph load may be triggered against an empty/wrong repo path"
+            );
+        });
+        let focused = app.update_in(cx, |_app, window, cx| window.focused(cx));
+        assert_eq!(
+            focused,
+            Some(empty_state_handle),
+            "focus must never move off the still-rendered empty-state handle onto the \
+             unrendered graph view"
         );
     }
 }

@@ -23,12 +23,30 @@ macro_rules! agent_jump_action_handler {
 }
 
 impl AdeApp {
+    /// Spawns a new agent tab into [`Self::active_agent_cwd`] - the single real chokepoint every
+    /// "new terminal"/"new shell" entry point in this app funnels through: `secondary-n`/
+    /// `ctrl-shift-T`'s own `handle_new_agent_action`/`handle_new_terminal_action`, the `+` menu's
+    /// row, the title bar's Agent menu row (`crate::title_bar::menu::AdeApp::agent_menu_rows`),
+    /// and the palette's `PaletteCommand::NewShell`.
+    ///
+    /// GitHub issue #90: a genuinely empty window (no [`Self::focused_repo`]) has no real repo
+    /// root to spawn into at all - a real, live-reproduced bug (independent audit) found that
+    /// without this guard, [`Self::active_agent_cwd`] fell through to [`Self::focused_repo_path`],
+    /// which itself used to fall back to *some other, unopened* known repo's real path (`Self::
+    /// repos.first()`), silently spawning a real PTY - and, from there, reachable real destructive
+    /// git operations (`Keep All Changes`/`Discard Worktree`) - against a repo the user never
+    /// opened and can't even see (the empty-state view renders no tab strip at all, so the tab
+    /// this spawned would have been invisible). A no-op here is the honest fix: there is nothing
+    /// this app can offer to spawn an agent into until a real repo is opened.
     pub(crate) fn new_agent(
         &mut self,
         kind: AgentKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.focused_repo().is_none() {
+            return;
+        }
         let cwd = self.active_agent_cwd();
         self.agents.spawn(
             kind,
@@ -1145,6 +1163,11 @@ impl AdeApp {
     /// process fails to spawn and a non-panicking spawn error shows in the new tab
     /// (`TerminalPane::spawn_error`).
     pub(in crate::work_surface) fn new_agent_pane(&mut self, cx: &mut Context<Self>) {
+        // GitHub issue #90: the same real "nothing to spawn into yet" guard [`Self::new_agent`]'s
+        // own docs explain - see those for the concrete bug this closes.
+        if self.focused_repo().is_none() {
+            return;
+        }
         let cwd = self.active_agent_cwd();
         let task = cx.spawn(async move |this, cx| {
             let installed = cx
@@ -3470,7 +3493,8 @@ mod tab_order_persistence_tests {
     ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
         cx.add_window_view(|window, cx| {
             AdeApp::new_with_settings(
-                repo_path,
+                Some(repo_path),
+                true,
                 settings_store::Settings::default(),
                 Some(settings_path),
                 window,
