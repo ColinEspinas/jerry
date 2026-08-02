@@ -1725,7 +1725,8 @@ mod file_tree_watch_integration_tests {
         std::mem::forget(config_dir);
         cx.add_window_view(|window, cx| {
             AdeApp::new_with_settings(
-                repo_path,
+                Some(repo_path),
+                false,
                 settings_store::Settings::default(),
                 Some(settings_path),
                 window,
