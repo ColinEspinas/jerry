@@ -6,6 +6,9 @@
 //! - [`file_tree`] - the pure `std::fs::read_dir` walk that flattens a directory into the
 //!   indented row list the Files tab shows, plus the pure indent-guide geometry that list
 //!   draws.
+//! - [`file_tree_watch`] - the real `notify`-backed filesystem watcher behind the Files tab's
+//!   live refresh (GitHub issue #13) - the same "OS watch sets a flag, a `gpui` background loop
+//!   polls it" split `crate::rail::worktree_watch` established for the worktree list.
 //! - [`fold_state`] - the real, on-disk (`~/.config/jerry/file-tree-state.toml`) per-worktree
 //!   record of which folders are expanded, and its atomic write path.
 //! - [`changes`] - the pure mapping from `wt_core::diff` data to the Changes tab's row
@@ -41,6 +44,7 @@ pub mod changes;
 pub mod context_menu;
 pub mod file_ops;
 pub mod file_tree;
+pub mod file_tree_watch;
 pub mod fold_state;
 
 pub(crate) mod render;
