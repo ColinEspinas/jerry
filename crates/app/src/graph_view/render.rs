@@ -6,8 +6,11 @@ use super::*;
 use crate::root::widgets::{render_sidebar_message, render_tag_pill};
 use crate::settings::widgets;
 use crate::sidebar::changes;
-use crate::work_surface::render::render_dropdown_menu_row;
-use gpui::{BoxShadow, KeyDownEvent, Pixels};
+use crate::work_surface::render::{
+    render_dropdown_menu_row, render_tab_insertion_caret, tab_settle_animation_id, DraggedTab,
+    TAB_SETTLE_ANIMATION_DURATION,
+};
+use gpui::{Animation, AnimationExt, BoxShadow, DragMoveEvent, KeyDownEvent, Pixels};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use wt_core::graph::{DotKind, ElbowKind, Graph, GraphRow, GraphScope, RefKind};
 
@@ -569,7 +572,7 @@ impl AdeApp {
 /// two-collection shape rather than unifying into one `Tab` enum (see that function's docs, and
 /// this project's own note that a forced unification wasn't the right call here). Rendered only
 /// while `AdeApp::graph_tab_open` is `true`.
-pub(crate) fn render_graph_tab(app: &AdeApp, cx: &mut Context<AdeApp>) -> impl IntoElement {
+pub(crate) fn render_graph_tab(app: &AdeApp, cx: &mut Context<AdeApp>) -> gpui::AnyElement {
     let is_active = app.graph_tab_active;
     let colors = work_surface::tab_colors(is_active);
     let close_color = if is_active {
@@ -577,16 +580,33 @@ pub(crate) fn render_graph_tab(app: &AdeApp, cx: &mut Context<AdeApp>) -> impl I
     } else {
         theme::text::DISABLED
     };
+    let tab_ref = work_surface::TabRef::Graph;
+    let drag_value = DraggedTab::Graph {
+        label: "Git graph".to_string(),
+    };
+    let insertion_caret = match &app.tab_drag_insertion {
+        Some((target, insert_after)) if *target == tab_ref => Some(*insert_after),
+        _ => None,
+    };
+    let is_dragging = app.dragging_tab.as_ref() == Some(&tab_ref);
+    let settle_animation_id = tab_settle_animation_id(&app.dropped_tab_settle, &tab_ref);
+    let this_entity = cx.entity();
+    let tab_ref_for_drag = tab_ref.clone();
 
-    div()
+    let tab_div = div()
         .id("graph-tab")
         .debug_selector(|| "graph-tab".to_string())
+        .relative()
         .flex()
         .flex_none()
         .flex_col()
         .border_r_1()
         .border_color(theme::border::INNER)
         .bg(colors.bg)
+        // Mirrors `AdeApp::render_file_tab`'s own dimmed-original-slot precedent (GitHub issue
+        // #16) - see `AdeApp::dragging_tab`'s own docs for why this can't be derived from GPUI's
+        // `has_active_drag()` alone.
+        .when(is_dragging, |el| el.opacity(0.4))
         // Middle-click closes the graph tab too (GitHub issue #26) - the same real
         // `close_git_graph_tab` teardown the `×` button already uses, matching file/agent tabs.
         .on_mouse_down(
@@ -596,6 +616,29 @@ pub(crate) fn render_graph_tab(app: &AdeApp, cx: &mut Context<AdeApp>) -> impl I
                 this.close_git_graph_tab(window, cx);
             }),
         )
+        // Real drag-to-reorder, unified with agent/file tabs (GitHub issue #93) - see
+        // `AdeApp::render_file_tab`'s own docs for the shared mechanism.
+        .on_drag(drag_value, move |dragged, _position, _window, cx| {
+            this_entity.update(cx, |this, cx| {
+                this.start_dragging_tab(tab_ref_for_drag.clone(), cx);
+            });
+            cx.new(|_| dragged.clone())
+        })
+        .on_drag_move(cx.listener({
+            let tab_ref = tab_ref.clone();
+            move |this, event: &DragMoveEvent<DraggedTab>, _window, cx| {
+                this.update_tab_drag_insertion(&tab_ref, event, cx);
+            }
+        }))
+        .on_drop(cx.listener({
+            let target = tab_ref.clone();
+            move |this, dragged: &DraggedTab, _window, cx| {
+                this.drop_dragged_tab(dragged.tab_ref(), target.clone(), cx);
+            }
+        }))
+        .when_some(insertion_caret, |el, insert_after| {
+            el.child(render_tab_insertion_caret(insert_after))
+        })
         .child(
             div()
                 .id("graph-tab-hit")
@@ -638,7 +681,21 @@ pub(crate) fn render_graph_tab(app: &AdeApp, cx: &mut Context<AdeApp>) -> impl I
                         })),
                 ),
         )
-        .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline))
+        .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline));
+
+    // A real drop's own settle-in fade (GitHub issue #16 §5, extended to the graph tab by
+    // GitHub issue #93) - see `tab_settle_animation_id`'s own docs for why this branches to
+    // `gpui::AnyElement` rather than a plain `.when_some`.
+    match settle_animation_id {
+        Some(id) => tab_div
+            .with_animation(
+                id,
+                Animation::new(TAB_SETTLE_ANIMATION_DURATION),
+                |el, delta| el.opacity(0.55 + 0.45 * delta),
+            )
+            .into_any_element(),
+        None => tab_div.into_any_element(),
+    }
 }
 
 /// The tab's own fork-glyph chip: `#2a2030` bg, `#c98fbf` fork glyph drawn from four rects (two

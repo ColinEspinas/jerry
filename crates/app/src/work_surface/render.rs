@@ -407,7 +407,7 @@ impl AdeApp {
             .iter()
             .any(|agent| agent.kind != AgentKind::Shell);
         let open_files: &[PathBuf] = if is_bare { &[] } else { self.open_files() };
-        work_surface::reconcile_tab_order(stored, &agent_ids, open_files)
+        work_surface::reconcile_tab_order(stored, &agent_ids, open_files, self.graph_tab_open)
     }
 
     /// The unified tab strip's real drag-to-reorder entry point (GitHub issue #16) - moves
@@ -438,7 +438,7 @@ impl AdeApp {
             .iter()
             .filter_map(|tab_ref| match tab_ref {
                 work_surface::TabRef::File(path) => Some(cwd.join(path)),
-                work_surface::TabRef::Agent(_) => None,
+                work_surface::TabRef::Agent(_) | work_surface::TabRef::Graph => None,
             })
             .collect();
         self.tab_order_state.set_file_order(&cwd, &files);
@@ -491,7 +491,7 @@ impl AdeApp {
     /// the two apart. A no-op while the dragged tab is hovering over *itself* - dropping a tab on
     /// its own slot is always a no-op ([`work_surface::state::move_tab_order`]'s own docs), so no
     /// caret should invite it either.
-    pub(in crate::work_surface) fn update_tab_drag_insertion(
+    pub(crate) fn update_tab_drag_insertion(
         &mut self,
         hovered: &work_surface::TabRef,
         event: &DragMoveEvent<DraggedTab>,
@@ -516,7 +516,7 @@ impl AdeApp {
     /// drop lands on a tab [`Self::update_tab_drag_insertion`] never actually recorded for - a
     /// drop can still fire on a tab the cursor technically never entered, e.g. a very fast
     /// release), then delegates to [`Self::reorder_tab`], and clears the now-stale caret state.
-    pub(in crate::work_surface) fn drop_dragged_tab(
+    pub(crate) fn drop_dragged_tab(
         &mut self,
         dragged: work_surface::TabRef,
         target: work_surface::TabRef,
@@ -539,7 +539,7 @@ impl AdeApp {
     /// cursor. A plain method (not inlined into the closure) so it's directly testable without
     /// simulating a real GPUI drag gesture, matching [`Self::update_tab_drag_insertion`]/
     /// [`Self::drop_dragged_tab`]'s own precedent.
-    pub(in crate::work_surface) fn start_dragging_tab(
+    pub(crate) fn start_dragging_tab(
         &mut self,
         tab_ref: work_surface::TabRef,
         cx: &mut Context<Self>,
@@ -571,7 +571,7 @@ impl AdeApp {
         let order = self.combined_tab_order();
         order.into_iter().filter_map(move |tab_ref| match tab_ref {
             work_surface::TabRef::Agent(id) => self.agents.iter().find(|agent| agent.id == id),
-            work_surface::TabRef::File(_) => None,
+            work_surface::TabRef::File(_) | work_surface::TabRef::Graph => None,
         })
     }
 
@@ -665,7 +665,7 @@ impl AdeApp {
             .iter()
             .filter_map(|tab_ref| match tab_ref {
                 work_surface::TabRef::Agent(id) => Some(*id),
-                work_surface::TabRef::File(_) => None,
+                work_surface::TabRef::File(_) | work_surface::TabRef::Graph => None,
             })
             .collect();
         let labels = self.current_worktree_agent_tab_labels(&agent_ids, cx);
@@ -683,15 +683,15 @@ impl AdeApp {
                 work_surface::TabRef::File(path) => {
                     bar = bar.child(self.render_file_tab(&path, cx));
                 }
+                // GitHub issue #93: the git graph tab is now a real member of the same combined
+                // order every agent/file tab already goes through - draggable, and its own
+                // per-worktree position remembered - rather than a fixed, un-reorderable third
+                // slot always rendered after every other tab. See `crate::graph_view::render::
+                // render_graph_tab`'s own docs for the drag wiring this required.
+                work_surface::TabRef::Graph => {
+                    bar = bar.child(crate::graph_view::render::render_graph_tab(self, cx));
+                }
             }
-        }
-
-        // A third, independent parallel slot for the git graph tab (GitHub issue #1, phase (a)) -
-        // at most one, so a plain `if` rather than a loop over a collection like
-        // `combined_tab_order` above. See `crate::graph_view`'s module docs for why this isn't a
-        // forced three-way `Tab` enum.
-        if self.graph_tab_open {
-            bar = bar.child(crate::graph_view::render::render_graph_tab(self, cx));
         }
 
         bar = bar.child(self.render_tab_strip_plus(cx));
@@ -2337,9 +2337,20 @@ pub(in crate::work_surface) fn render_tab_chip(kind: AgentKind, active: bool) ->
 /// by dragging" pattern itself. `Render`ing the dragged value as its own small floating chip -
 /// the same choice Zed's own `DraggedTab` makes - keeps what's being dragged legible.
 #[derive(Clone)]
-pub(in crate::work_surface) enum DraggedTab {
-    Agent { id: AgentId, label: String },
-    File { path: PathBuf, label: String },
+pub(crate) enum DraggedTab {
+    Agent {
+        id: AgentId,
+        label: String,
+    },
+    File {
+        path: PathBuf,
+        label: String,
+    },
+    /// GitHub issue #93 - the git graph tab, dragged the same way. No id/path payload: like
+    /// [`work_surface::TabRef::Graph`], there is only ever at most one real graph tab.
+    Graph {
+        label: String,
+    },
 }
 
 impl DraggedTab {
@@ -2347,15 +2358,17 @@ impl DraggedTab {
         match self {
             DraggedTab::Agent { label, .. } => label,
             DraggedTab::File { label, .. } => label,
+            DraggedTab::Graph { label } => label,
         }
     }
 
     /// This dragged value's own identity as a [`work_surface::TabRef`] - what
     /// [`AdeApp::reorder_tab`] actually moves, regardless of which concrete kind was dragged.
-    pub(in crate::work_surface) fn tab_ref(&self) -> work_surface::TabRef {
+    pub(crate) fn tab_ref(&self) -> work_surface::TabRef {
         match self {
             DraggedTab::Agent { id, .. } => work_surface::TabRef::Agent(*id),
             DraggedTab::File { path, .. } => work_surface::TabRef::File(path.clone()),
+            DraggedTab::Graph { .. } => work_surface::TabRef::Graph,
         }
     }
 }
@@ -2386,7 +2399,7 @@ impl Render for DraggedTab {
 /// edge if `insert_after` is `true` (immediately after) - replacing the old whole-tab `border_l`
 /// highlight, which never distinguished "before" from "after" the hovered tab, with an
 /// unambiguous "it lands exactly here" caret instead.
-fn render_tab_insertion_caret(insert_after: bool) -> impl IntoElement {
+pub(crate) fn render_tab_insertion_caret(insert_after: bool) -> impl IntoElement {
     div()
         .absolute()
         .top(px(0.0))
@@ -2399,7 +2412,7 @@ fn render_tab_insertion_caret(insert_after: bool) -> impl IntoElement {
 
 /// How long a dropped tab's own settle-in fade runs - short and non-blocking, matching the
 /// design handoff's own "animations are short (~120-180ms)" ask (GitHub issue #16 §5).
-const TAB_SETTLE_ANIMATION_DURATION: Duration = Duration::from_millis(150);
+pub(crate) const TAB_SETTLE_ANIMATION_DURATION: Duration = Duration::from_millis(150);
 
 /// A fresh `gpui::AnimationExt::with_animation` id for `tab_ref`, if [`AdeApp::dropped_tab_settle`]
 /// says it's the tab a real drop most recently placed - `None` for every other tab, and for a
@@ -2409,7 +2422,7 @@ const TAB_SETTLE_ANIMATION_DURATION: Duration = Duration::from_millis(150);
 /// (`vendor/zed/crates/gpui/src/elements/animation.rs`'s `AnimationState`) - reusing the same id
 /// across two different drops of the same tab would resume the *first* drop's already-finished
 /// animation instead of starting a fresh one.
-fn tab_settle_animation_id(
+pub(crate) fn tab_settle_animation_id(
     settle: &Option<(work_surface::TabRef, u64)>,
     tab_ref: &work_surface::TabRef,
 ) -> Option<String> {
@@ -2989,6 +3002,109 @@ mod tab_scoping_tests {
             ],
             "the file tab must now sit between the two agent tabs - the real cross-group \
              interleaving this revision exists to unlock"
+        );
+    }
+
+    /// GitHub issue #93: the git graph tab must be a full, kind-agnostic member of the same
+    /// drag-to-reorder system as agent/file tabs, not a fixed trailing entry - dragging it so it
+    /// lands between two agent tabs must actually interleave it into `Self::combined_tab_order`,
+    /// mirroring `dragging_a_file_tab_between_two_agent_tabs_interleaves_them`'s own file-tab
+    /// case exactly.
+    #[gpui::test]
+    fn dragging_the_graph_tab_between_two_agent_tabs_interleaves_it(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
+            let initial_id = app.agents.active_id().expect("initial shell agent");
+            let second_id = app.agents.spawn(
+                AgentKind::Claude,
+                repo.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            app.open_git_graph(window, cx);
+            (initial_id, second_id)
+        });
+
+        let before = app.read_with(cx, |app, _| app.combined_tab_order());
+        assert_eq!(
+            before,
+            vec![
+                work_surface::TabRef::Agent(initial_id),
+                work_surface::TabRef::Agent(second_id),
+                work_surface::TabRef::Graph,
+            ],
+            "with no drag yet, agents come first (creation order), then the freshly opened \
+             graph tab"
+        );
+
+        app.update(cx, |app, cx| {
+            app.reorder_tab(
+                work_surface::TabRef::Graph,
+                work_surface::TabRef::Agent(second_id),
+                false,
+                cx,
+            );
+        });
+
+        let after = app.read_with(cx, |app, _| app.combined_tab_order());
+        assert_eq!(
+            after,
+            vec![
+                work_surface::TabRef::Agent(initial_id),
+                work_surface::TabRef::Graph,
+                work_surface::TabRef::Agent(second_id),
+            ],
+            "the graph tab must now sit between the two agent tabs, the same real \
+             cross-kind interleaving file/agent tabs already get"
+        );
+    }
+
+    /// `Self::start_dragging_tab`/`Self::drop_dragged_tab` must treat `TabRef::Graph` exactly
+    /// like any other tab kind - recording it while dragged, then clearing that record once
+    /// dropped - mirroring `start_dragging_tab_records_exactly_the_tab_that_started_the_drag`'s
+    /// own agent-tab case.
+    #[gpui::test]
+    fn dragging_the_graph_tab_dims_its_own_slot_then_clears_on_drop(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let initial_id = app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+            app.agents.active_id().expect("initial shell agent")
+        });
+
+        app.update(cx, |app, cx| {
+            app.start_dragging_tab(work_surface::TabRef::Graph, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.dragging_tab.clone()),
+            Some(work_surface::TabRef::Graph),
+            "starting a drag on the graph tab must record exactly that tab"
+        );
+
+        app.update(cx, |app, cx| {
+            app.drop_dragged_tab(
+                work_surface::TabRef::Graph,
+                work_surface::TabRef::Agent(initial_id),
+                cx,
+            );
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.dragging_tab.clone()),
+            None,
+            "a handled drop must clear the now-stale dragging-tab state, same as any other kind"
+        );
+        // GitHub issue #93's own extension of the settle-fade (GitHub issue #16 §5): dropping
+        // the graph tab must record it into `Self::dropped_tab_settle` exactly like any other
+        // kind - `Self::drop_dragged_tab` is already kind-agnostic here, so this is really
+        // proving `render_graph_tab` reads the same real field, not a separate code path.
+        assert_eq!(
+            app.read_with(cx, |app, _| app.dropped_tab_settle.clone().map(|(t, _)| t)),
+            Some(work_surface::TabRef::Graph),
+            "a real drop of the graph tab must record it for the settle-in fade too"
         );
     }
 
