@@ -916,6 +916,25 @@ impl AdeApp {
         }
     }
 
+    /// The `Delete` keyboard shortcut's own arming step - mirrors
+    /// [`Self::start_tree_rename_for_selection`]'s "resolve `is_dir` off the live tree, not the
+    /// filesystem" pattern so a stale/renamed selection can't race a real `stat` call.
+    pub(in crate::sidebar) fn request_tree_delete_for_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.selected_tree_path.clone() else {
+            return;
+        };
+        if !path.starts_with(&self.file_tree_root) || path == self.file_tree_root {
+            return;
+        }
+        let is_dir = self
+            .file_tree
+            .iter()
+            .find(|entry| entry.path == path)
+            .map(|entry| entry.is_dir)
+            .unwrap_or_else(|| path.is_dir());
+        self.request_tree_delete(path, is_dir, cx);
+    }
+
     /// Runs the confirmed delete. A trash-backed delete shells out to the resolved command on
     /// the background executor (never the foreground thread); a permanent one runs
     /// [`file_ops::delete_permanently`] there for the same reason.
@@ -1147,6 +1166,26 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         self.paste_into_selection(cx);
+    }
+
+    /// `Delete` while the tree is focused (`crate::root::FileTreeDelete`). Bound with the context
+    /// predicate `"file-tree && !tree-editing"` - deliberately *not* excluding
+    /// `"tree-delete-confirm"` too, unlike Copy/Cut/Paste/Rename, because this single action must
+    /// serve both gestures of the arm/confirm flow: a first press with nothing armed arms the
+    /// confirmation (via [`Self::request_tree_delete_for_selection`]); a second press while the
+    /// panel from that same arming is still up runs the real delete (via
+    /// [`Self::confirm_tree_delete`]), the same as clicking that panel's own confirm button.
+    pub(in crate::sidebar) fn handle_file_tree_delete_action(
+        &mut self,
+        _action: &crate::root::FileTreeDelete,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tree_delete_confirm.is_some() {
+            self.confirm_tree_delete(cx);
+        } else {
+            self.request_tree_delete_for_selection(cx);
+        }
     }
 
     // ---------------------------------------------------------------- misc actions
@@ -2812,6 +2851,97 @@ mod tree_ops_regression_tests {
             Some(PathBuf::from("README.md")),
             "with no menu in the way, a row click must open its file"
         );
+    }
+
+    /// GitHub issue #105: clicking a file used to hand keyboard focus to the editor, silently
+    /// killing every `"file-tree"`-scoped shortcut (`Ctrl+C`/`X`/`V`, `F2`, `Shift+F10`, `Delete`)
+    /// the instant a file was selected. Driven as a real click at the row's own painted bounds -
+    /// not a manual `focus_file_tree` call - because that manual call is exactly what would have
+    /// masked the original bug.
+    #[gpui::test]
+    fn clicking_a_file_row_keeps_the_tree_focused_so_the_next_shortcut_still_fires(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+        cx.run_until_parked();
+
+        let row = cx
+            .debug_bounds("file-tree-row-README.md")
+            .expect("the file row must be painted");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, _cx| {
+            assert_eq!(
+                app.open_change,
+                Some(PathBuf::from("README.md")),
+                "premise: the click really did open the file"
+            );
+            assert!(
+                app.tree_focus_handle.is_focused(window),
+                "a file click must never move keyboard focus off the tree - it is a selection \
+                 gesture, the same as a folder click"
+            );
+        });
+
+        cx.simulate_keystrokes(&secondary("c"));
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.tree_clipboard.is_some(),
+                "with the tree still focused after the click, Ctrl+C must still reach the \
+                 tree's own copy handler"
+            );
+        });
+    }
+
+    /// GitHub issue #105: `Delete` had no keyboard shortcut at all. This drives the real two-press
+    /// flow through the keymap (not by calling `request_tree_delete`/`confirm_tree_delete`
+    /// directly): a first press arms the confirmation, a second removes the file - the same
+    /// outcome as clicking the row's own context-menu "Delete" then the confirmation panel's
+    /// button, but reachable from the keyboard.
+    #[gpui::test]
+    fn the_delete_key_arms_then_confirms_the_selected_files_removal(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+        cx.run_until_parked();
+
+        let victim = repo.path().join("README.md");
+        let row = cx
+            .debug_bounds("file-tree-row-README.md")
+            .expect("the file row must be painted");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("delete");
+        app.read_with(cx, |app, _| {
+            let pending = app
+                .tree_delete_confirm
+                .as_ref()
+                .expect("the first press must arm the confirmation");
+            assert_eq!(pending.path, victim);
+        });
+        assert!(victim.exists(), "arming must not remove anything");
+
+        // Forced the same way `a_confirmed_delete_really_removes_the_file_and_its_tab` does, so
+        // this test doesn't move a real fixture into a developer machine's own trash.
+        app.update(cx, |app, _cx| {
+            app.tree_delete_confirm.as_mut().expect("armed").mechanism = DeleteMechanism::Permanent;
+        });
+
+        cx.simulate_keystrokes("delete");
+        cx.run_until_parked();
+        assert!(
+            !victim.exists(),
+            "the second press, while already armed, must run the real delete"
+        );
+        app.read_with(cx, |app, _| {
+            assert!(app.tree_delete_confirm.is_none());
+        });
     }
 
     /// `Shift+F10` must reach the tree only when the tree is really the focused surface. With the

@@ -190,6 +190,7 @@ actions!(
         FileTreeCopy,
         FileTreeCut,
         FileTreePaste,
+        FileTreeDelete,
     ]
 );
 
