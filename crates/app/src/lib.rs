@@ -31,6 +31,11 @@ pub mod theme;
 // all (both its files are `pub(crate) mod`), and `root::title_bar` was a private module before
 // the split - so making it `pub` would widen this crate's external surface for no reason.
 pub(crate) mod title_bar;
+// GitHub issue #87: real update-available detection + click-to-update. `pub(crate)`, matching
+// `title_bar`'s own precedent just above (see that module's own comment): nothing outside this
+// crate needs `crate::updater` directly, only `crate::root`/`crate::status_bar`/
+// `crate::palette`'s own wiring into it.
+pub(crate) mod updater;
 pub mod work_surface;
 pub mod worktree_history;
 

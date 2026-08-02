@@ -135,10 +135,18 @@ pub enum PaletteCommand {
     /// (design spec §6). Rendered under a dedicated `"Git"` group label rather than the plain
     /// `"Commands"` one - see [`build_groups`]'s own `is_git_command` split.
     OpenGitGraph,
+    /// `crate::updater::flow::AdeApp::check_for_update` (GitHub issue #87) - the real, manual
+    /// trigger alongside the startup check and the periodic background loop
+    /// (`crate::updater::flow::AdeApp::start_update_check_loop`). Deliberately always listed,
+    /// not hidden until an update happens to be available, matching
+    /// [`Self::RestartLanguageServers`]'s own "a discoverable recovery/utility action must be
+    /// findable before the user already knows something's up" reasoning - a user who suspects
+    /// they're on an old build can check right now rather than wait for the next periodic tick.
+    CheckForUpdates,
 }
 
 impl PaletteCommand {
-    pub const ALL: [PaletteCommand; 11] = [
+    pub const ALL: [PaletteCommand; 12] = [
         PaletteCommand::NewShell,
         PaletteCommand::NewClaudeAgent,
         PaletteCommand::NewCodexAgent,
@@ -150,6 +158,7 @@ impl PaletteCommand {
         PaletteCommand::WindowControlsMacos,
         PaletteCommand::WindowControlsWindowsLinux,
         PaletteCommand::OpenGitGraph,
+        PaletteCommand::CheckForUpdates,
     ];
 
     /// Whether this command belongs in the palette's `"Git"` group rather than `"Commands"` -
@@ -171,6 +180,7 @@ impl PaletteCommand {
             PaletteCommand::WindowControlsMacos => "Window Controls: macOS Style",
             PaletteCommand::WindowControlsWindowsLinux => "Window Controls: Windows/Linux Style",
             PaletteCommand::OpenGitGraph => "Open Git Graph",
+            PaletteCommand::CheckForUpdates => "Check for Updates",
         }
     }
 
@@ -198,6 +208,7 @@ impl PaletteCommand {
                 "window controls title bar caption buttons menu keycap platform override windows linux"
             }
             PaletteCommand::OpenGitGraph => "git graph commit history branches log",
+            PaletteCommand::CheckForUpdates => "update version release new github check",
         }
     }
 

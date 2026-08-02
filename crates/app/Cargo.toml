@@ -113,6 +113,30 @@ tree-sitter-javascript = "0.23.1"
 # API wrapper with no GPUI/vendor/zed call site to verify against, the same "just a version pin"
 # treatment `regex`/`unicode-segmentation` already get above.
 notify = "8.2.0"
+# Real GitHub-releases-backed self-update (GitHub issue #87, `crate::updater`) - version
+# check via `backends::github::ReleaseList`, download+extract+atomic self-replace via
+# `backends::github::Update`/`self-replace`. `default-features = false` because this
+# version's real default (`["reqwest", "default-tls"]`, verified against the published
+# `0.44.0` Cargo.toml via `docs.rs/crate/self_update/0.44.0/source/Cargo.toml` and a real
+# `cargo add --dry-run` resolution, not assumed from the crate's own README, which - as of
+# this writing - describes a different, not-yet-released feature set) pulls in `default-tls`
+# (OpenSSL) instead of `rustls`. `reqwest` is re-added explicitly: it is *not* implied by any
+# archive/TLS feature and without it (or `ureq`) there is no HTTP client backend at all and
+# the crate fails to compile - a real gap in the originally-planned feature list this
+# dependency was added with, caught by the same `cargo add --dry-run` resolution above rather
+# than assumed from docs. `archive-tar`/`archive-zip`/`compression-flate2`/
+# `compression-zip-deflate` match `release.yml`'s real asset shapes (`jerry-linux.tar.gz`,
+# `jerry-macos.tar.gz` as gzip-compressed tarballs; `jerry-windows.zip` as a
+# deflate-compressed zip) - `compression-zip-bzip2` is omitted since nothing in this repo
+# ever produces a bzip2-compressed zip.
+self_update = { version = "0.44.0", default-features = false, features = [
+    "rustls",
+    "reqwest",
+    "archive-tar",
+    "archive-zip",
+    "compression-flate2",
+    "compression-zip-deflate",
+] }
 
 # Real per-target `gpui_platform` backend selection (Revision R11, extended in R12 to add
 # real X11 support). `gpui_platform`'s own Cargo.toml

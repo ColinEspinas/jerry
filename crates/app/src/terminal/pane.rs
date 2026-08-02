@@ -277,11 +277,12 @@ pub struct TerminalSpec {
 }
 
 impl TerminalSpec {
-    /// The user's shell (`$SHELL`, falling back to `/bin/bash` if unset), no extra arguments.
+    /// The user's shell (`$SHELL`, falling back to [`default_shell`] if unset), no extra
+    /// arguments.
     pub fn shell(cwd: PathBuf) -> Self {
         let program = std::env::var_os("SHELL")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/bin/bash"));
+            .unwrap_or_else(default_shell);
         Self {
             program,
             args: Vec::new(),
@@ -300,6 +301,33 @@ impl TerminalSpec {
             cwd,
         }
     }
+}
+
+/// The real fallback shell [`TerminalSpec::shell`] spawns when `$SHELL` is unset - genuinely
+/// unset on every real Windows session (`$SHELL` is a Unix convention with no Windows
+/// equivalent), so the naive "just default to `/bin/bash`" this used to do failed every single
+/// spawn on Windows with a real, observed `CreateProcessW` "path not found" error (`/bin/bash`
+/// doesn't exist there) - not a hypothetical gap, this was hit running a real release build.
+///
+/// `#[cfg(windows)]`, not `#[cfg(not(unix))]` - matches `pty-core`'s own established
+/// convention (see that crate's module docs) of gating Windows-specific reasoning narrowly, so
+/// an unsupported non-unix target (e.g. `wasm32-unknown-unknown`) fails to compile loudly
+/// instead of silently picking up logic that makes no sense for it.
+#[cfg(windows)]
+fn default_shell() -> PathBuf {
+    // `%COMSPEC%` is Windows' own real `$SHELL` equivalent - the command interpreter every
+    // `cmd.exe`/PowerShell session sets for child processes to inherit - falling back to the
+    // real `cmd.exe` bare name (resolved via `PATH`/the system directory the same way
+    // `portable_pty::CommandBuilder` already resolves any other bare program name) only in the
+    // genuinely rare case that's also unset.
+    std::env::var_os("COMSPEC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("cmd.exe"))
+}
+
+#[cfg(not(windows))]
+fn default_shell() -> PathBuf {
+    PathBuf::from("/bin/bash")
 }
 
 /// An event [`TerminalPane`] emits (`cx.emit`) for its owner to react to - the same
@@ -763,6 +791,26 @@ impl TerminalPane {
                                         None => this.eof_poll_ticks = 1,
                                     }
                                     break;
+                                }
+                            }
+                        }
+
+                        // Any bytes the VT parser itself generated while processing the chunks
+                        // just appended above - e.g. a cursor position report for `ESC[6n` -
+                        // must be written back to the pty's own stdin, not just left in
+                        // `this.grid`. This is never a no-op-safe skip: real Windows ConPTY
+                        // sends exactly this query as part of its own startup handshake and
+                        // blocks its entire output stream on a real answer (confirmed live -
+                        // see `PtyWriteQueue`'s own docs), so a dropped reply here doesn't just
+                        // misrender a query response, it silently hangs the whole pane forever.
+                        if appended {
+                            let pending_writes = this.grid.take_pending_pty_writes();
+                            if !pending_writes.is_empty() {
+                                if let Err(err) = session.write_input(&pending_writes) {
+                                    log::warn!(
+                                        "failed to answer a terminal query (e.g. cursor \
+                                         position report) back to the pty: {err}"
+                                    );
                                 }
                             }
                         }
