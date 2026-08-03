@@ -469,6 +469,15 @@ pub struct AdeApp {
     /// guaranteeing two deletes of same-named files never collide there, without pulling in a
     /// UUID dependency for something this local.
     pub(crate) tree_undo_backup_counter: u64,
+    /// This `AdeApp` instance's own share of [`Self::tree_undo_backup_root`], assigned once at
+    /// construction from a process-wide atomic counter. `std::process::id()` alone identifies the
+    /// *process*, not the instance - every `#[gpui::test]` in a `cargo test` binary runs in the
+    /// same process, so two tests each starting `tree_undo_backup_counter` back at 0 would
+    /// otherwise write their first delete's backup to the exact same path, and the second test's
+    /// backup would silently fail with `AlreadyExists` (or worse, its cleanup would delete the
+    /// first test's still-referenced backup). This is what actually caused GitHub issue #105's
+    /// undo/redo delete test to fail intermittently in full-suite runs while always passing alone.
+    pub(crate) tree_undo_instance_id: u64,
     /// The most recent file-operation failure (a refused rename, a failed trash command),
     /// surfaced under the tree rather than dropped into the log - the same small, honest error
     /// surface [`Self::file_save_error`] uses for a failed save.
