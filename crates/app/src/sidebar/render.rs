@@ -774,7 +774,6 @@ impl AdeApp {
             .id("file-tree-shell")
             .key_context(key_context)
             .track_focus(&self.tree_focus_handle)
-            .on_action(cx.listener(Self::handle_file_tree_context_menu_action))
             .on_action(cx.listener(Self::handle_file_tree_rename_action))
             .on_action(cx.listener(Self::handle_file_tree_copy_action))
             .on_action(cx.listener(Self::handle_file_tree_cut_action))
@@ -2654,13 +2653,6 @@ pub(in crate::sidebar) fn render_changes_footer(text_size: Pixels) -> impl IntoE
 /// the cursor. (The Changes view's *no-diff* arm still has no footer; that arm renders a single
 /// message rather than a list, so there is nothing for a footer to sit under.)
 ///
-/// This exists to answer a real, reported complaint: `Shift+F10` opens the tree's context menu
-/// (issue #19 §2 required the menu to be reachable from the keyboard, so right-click alone was
-/// never enough) but nothing in the product said so. A user's only encounter with it was a row in
-/// Settings → Keybindings reading "Files tree: context menu", which explains what it does and not
-/// why it exists or that it is the right-click equivalent. Two surfaces now do: that row's own
-/// label (`crate::settings::state::action_label`), and this strip.
-///
 /// The shape is the hint strip the design handoff already specifies for
 /// exactly this job - `design_handoff_jerry_ade/revision/Jerry.dc.html`'s own `diffHints` strip:
 /// `height:28px ... padding:0 12px;background:#111316;border-top:1px solid #1c2023`, hints at
@@ -2669,17 +2661,16 @@ pub(in crate::sidebar) fn render_changes_footer(text_size: Pixels) -> impl IntoE
 /// `theme::band::SURFACE_FOOTER`/`surface::FOOTER`/`border::INNER`/`text::PATH` and the
 /// `KeycapSize::Hint` keycap it already had.
 ///
-/// The keystrokes are resolved through [`keymap::resolve_combo`], the same per-platform
-/// resolution the context menu's own row keycaps use - never a hard-coded keystroke string that
-/// could drift from the real binding, which is also why the tooltip below names no key at all and
-/// points at the keycaps instead. Both hints are for real, registered bindings in
-/// `crate::default_key_bindings`, asserted by
-/// `crate::sidebar::tree_ops`'s own
+/// The keystroke is resolved through [`keymap::resolve_combo`], the same per-platform resolution
+/// the context menu's own row keycaps use - never a hard-coded keystroke string that could drift
+/// from the real binding, which is also why the tooltip below names no key at all and points at
+/// the keycap instead. It names a real, registered binding in `crate::default_key_bindings`,
+/// asserted by `crate::sidebar::tree_ops`'s own
 /// `the_file_tree_footer_only_advertises_real_registered_bindings`.
 ///
-/// `live` is the other half of that honesty: both bindings are scoped
+/// `live` is the other half of that honesty: the binding is scoped
 /// `"file-tree && !tree-editing && !tree-delete-confirm"`, so while an inline name editor or the
-/// delete confirmation is open they genuinely do not fire, and the strip drops its hints rather
+/// delete confirmation is open it genuinely does not fire, and the strip drops its hint rather
 /// than advertising a dead shortcut. The band itself stays, so the tree doesn't jump 28px.
 ///
 /// `text_size` - see [`render_changes_footer`]'s docs for why this takes an already-scaled value.
@@ -2722,18 +2713,11 @@ pub(in crate::sidebar) fn render_file_tree_footer(
             "Right-click a row for file actions. The keycaps here are the keyboard equivalents, \
              for the row currently selected in the tree.",
         ))
-        .when(live, |el| {
-            el.child(hint(FILE_TREE_CONTEXT_MENU_SPEC, "actions"))
-                .child(hint(FILE_TREE_RENAME_SPEC, "rename"))
-        })
+        .when(live, |el| el.child(hint(FILE_TREE_RENAME_SPEC, "rename")))
 }
 
-/// The two `crate::keymap::resolve_combo` specs [`render_file_tree_footer`] advertises, named so
-/// its own test can assert each one really is a registered binding rather than a plausible
-/// string. `shift+F10` has no `mod` in it and so resolves identically on every platform; it still
-/// goes through `resolve_combo` rather than being written out, so the glyphs match every other
-/// keycap in the app.
-pub(in crate::sidebar) const FILE_TREE_CONTEXT_MENU_SPEC: &str = "shift+F10";
+/// The `crate::keymap::resolve_combo` spec [`render_file_tree_footer`] advertises, named so its
+/// own test can assert it really is a registered binding rather than a plausible string.
 pub(in crate::sidebar) const FILE_TREE_RENAME_SPEC: &str = "F2";
 
 /// GitHub issue #148: what a real file-tree row drag carries - every path the gesture moves
