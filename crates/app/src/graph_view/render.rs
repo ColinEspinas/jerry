@@ -1402,55 +1402,106 @@ impl AdeApp {
                         move |this, _event: &ClickEvent, _window, cx| {
                             this.request_graph_revert(sha.clone(), cx);
                         }
-                    })))
-                    .child(render_dropdown_menu_row(
-                        "\u{2191}", theme::button::BLUE_FG.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Rebase onto this commit", String::new(), Vec::new(), true,
-                    ).on_click(cx.listener({
+                    })),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2191}",
+                        theme::button::BLUE_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Rebase onto this commit",
+                        String::new(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
                         let sha = sha.clone();
                         move |this, _event: &ClickEvent, _window, cx| {
                             this.request_graph_rebase_onto(sha.clone(), cx);
                         }
-                    })))
-                    .child(render_dropdown_menu_row(
-                        "\u{2191}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Interactive rebase from here", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
-                    .child(render_graph_row_menu_header("Reset"))
-                    .child(render_dropdown_menu_row(
-                        "\u{21ba}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Soft", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
-                    .child(render_dropdown_menu_row(
-                        "\u{21ba}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Mixed", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
-                    .child(render_dropdown_menu_row(
-                        "\u{21ba}", theme::button::DANGER_FG.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Hard", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
-                    .child(render_graph_row_menu_header("Copy"))
-                    .child(render_dropdown_menu_row(
-                        "#", theme::text::SECONDARY.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Copy SHA", short_sha, Vec::new(), true,
-                    ).on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                        this.copy_graph_text(sha.clone(), cx);
-                    })))
-                    .child(render_dropdown_menu_row(
-                        "\u{ab}", theme::text::SECONDARY.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Copy subject", String::new(), Vec::new(), true,
-                    ).on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                        this.copy_graph_text(subject.clone(), cx);
-                    })))
-                    .child(
-                        div()
-                            .px(px(11.0))
-                            .pt(px(4.0))
-                            .font(font(theme::font::SANS))
-                            .text_size(px(9.5))
-                            .text_color(theme::text::GHOSTER)
-                            .child("rebase and reset run in the focused worktree, never the main checkout"),
-                    ),
+                    })),
+                )
+                .child(render_dropdown_menu_row(
+                    "\u{2191}",
+                    theme::text::GHOST.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
+                    "Interactive rebase from here",
+                    "not implemented yet".to_string(),
+                    Vec::new(),
+                    false,
+                ))
+                .child(render_graph_row_menu_header("Reset"))
+                .child(render_dropdown_menu_row(
+                    "\u{21ba}",
+                    theme::text::GHOST.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
+                    "Soft",
+                    "not implemented yet".to_string(),
+                    Vec::new(),
+                    false,
+                ))
+                .child(render_dropdown_menu_row(
+                    "\u{21ba}",
+                    theme::text::GHOST.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
+                    "Mixed",
+                    "not implemented yet".to_string(),
+                    Vec::new(),
+                    false,
+                ))
+                .child(render_dropdown_menu_row(
+                    "\u{21ba}",
+                    theme::button::DANGER_FG.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
+                    "Hard",
+                    "not implemented yet".to_string(),
+                    Vec::new(),
+                    false,
+                ))
+                .child(render_graph_row_menu_header("Copy"))
+                .child(
+                    render_dropdown_menu_row(
+                        "#",
+                        theme::text::SECONDARY.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Copy SHA",
+                        short_sha,
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener(
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.copy_graph_text(sha.clone(), cx);
+                        },
+                    )),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{ab}",
+                        theme::text::SECONDARY.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Copy subject",
+                        String::new(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener(
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.copy_graph_text(subject.clone(), cx);
+                        },
+                    )),
+                )
+                .child(
+                    div()
+                        .px(px(11.0))
+                        .pt(px(4.0))
+                        .font(font(theme::font::SANS))
+                        .text_size(px(9.5))
+                        .text_color(theme::text::GHOSTER)
+                        .child(
+                            "rebase and reset run in the focused worktree, never the main checkout",
+                        ),
+                ),
             )
             .into_any_element()
     }
