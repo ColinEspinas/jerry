@@ -461,16 +461,12 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         // the tree's own inline name editors has the keystroke. It follows the
         // `"file-editor && !completions"` shape above.
         //
-        // `shift-f10` is the only context-menu keystroke bound. The dedicated Menu/Application
-        // key that some keyboards also carry is deliberately *not* bound: gpui's key names come
-        // from each platform backend at runtime and nothing in the vendored tree names that key
-        // (it isn't in `vendor/zed/crates/gpui/src/platform/keystroke.rs`'s own key vocabulary),
-        // so any spelling guessed here would be a binding that silently never matches.
-        gpui::KeyBinding::new(
-            "shift-f10",
-            root::FileTreeContextMenu,
-            Some("file-tree && !tree-editing"),
-        ),
+        // GitHub issue #155: there is deliberately no bound keystroke that opens the context
+        // menu itself - a menu-opening gesture is what right-click already is, everywhere else in
+        // this app, and a second keyboard path to it (this list previously bound `Shift+F10`) had
+        // no real justification beyond "some other apps do this" - right-click, plus each row's
+        // own already-bound shortcut below (F2/Copy/Cut/Paste/Delete), covers every real action
+        // the menu itself would just be a picker for.
         gpui::KeyBinding::new(
             "f2",
             root::FileTreeRename,
@@ -492,11 +488,11 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
             Some("file-tree && !tree-editing"),
         ),
         // GitHub issue #105: "remove file" had no keyboard shortcut at all - only reachable via
-        // a right-click's own "Delete" menu row (`crate::sidebar::context_menu::MenuAction::
-        // Delete`'s own `keystroke_spec()` deliberately returns `None`, unlike every other
-        // mutating row) or `Shift+F10` opening the menu. Delete runs immediately, with no
-        // confirmation step of its own (undo/redo replaced it - see `crate::sidebar::tree_ops`'s
-        // own module docs), so this needs no different scoping from the bindings just above it.
+        // a right-click's own "Delete" menu row. This binding closed that gap; the menu row's own
+        // `keystroke_spec()` now references it too (GitHub issue #155). Delete runs immediately,
+        // with no confirmation step of its own (undo/redo replaced it - see
+        // `crate::sidebar::tree_ops`'s own module docs), so this needs no different scoping from
+        // the bindings just above it.
         gpui::KeyBinding::new(
             "delete",
             root::FileTreeDelete,
