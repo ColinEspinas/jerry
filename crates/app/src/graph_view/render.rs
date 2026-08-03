@@ -83,6 +83,13 @@ impl AdeApp {
             self.graph_focus.capture(window, &self.agents, cx);
         }
         window.focus(&self.graph_focus_handle, cx);
+        // GitHub issue #127: set alongside the real `window.focus` call, not via a `cx.on_focus`
+        // subscription - `graph_focus_handle` is only ever `track_focus`'d conditionally
+        // (`Self::render_center_pane` renders `Self::render_graph_view` only while
+        // `graph_tab_active` is `true`), and a live-tested subscription registered before that
+        // first render never actually fired for it. See [`AdeApp::graph_view_focused`]'s own
+        // docs for why the row-selection highlight needs this at all.
+        self.graph_view_focused = true;
 
         if matches!(self.graph_state.load, GraphLoadState::NotLoaded) {
             self.load_graph(cx);
@@ -142,6 +149,10 @@ impl AdeApp {
             return;
         }
         self.graph_tab_active = false;
+        // GitHub issue #127: the tab becoming inactive means `graph_focus_handle` stops being
+        // `track_focus`'d at all (see the comment just below), so it definitionally can't be
+        // focused any more, regardless of which handle `restore_focus` below lands on next.
+        self.graph_view_focused = false;
         // Two handles stop being `track_focus`'d here, not one: `graph_focus_handle` itself, and
         // the Branches panel's real filter box (`graph_state.branches_filter_focus_handle`),
         // which is only rendered while this tab is active and can independently hold real
@@ -375,6 +386,8 @@ impl AdeApp {
         // "which overlay owns the next click" property this change is already about.
         self.graph_state.push_menu_open = false;
         window.focus(&self.graph_focus_handle, cx);
+        // GitHub issue #127 - see `Self::open_git_graph`'s own matching comment.
+        self.graph_view_focused = true;
         cx.notify();
     }
 
@@ -1082,7 +1095,14 @@ impl AdeApp {
         now_unix: i64,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let selected = self.graph_state.selected_row == Some(index);
+        // GitHub issue #127: the selected-row highlight (background + left edge) must clear once
+        // real keyboard focus genuinely moves away from the graph view, not stay lit forever
+        // against whatever row was last selected. `graph_view_focused` is a plain bool set
+        // explicitly alongside every real `window.focus(&self.graph_focus_handle, ...)`/
+        // graph-tab-exit call site, rather than a live `FocusHandle::is_focused` check here,
+        // since this render call chain never carries a real `&Window` - see that field's own
+        // docs for why.
+        let selected = self.graph_view_focused && self.graph_state.selected_row == Some(index);
         let is_working_tree = row.commit.id.is_empty();
         let relative = if row.commit.id.is_empty() {
             "now".to_string()
@@ -4684,6 +4704,57 @@ mod graph_selection_render_tests {
             "selecting a row must never resize its own content (unselected: {:?}, selected: \
              {:?})",
             bounds_unselected, bounds_selected
+        );
+    }
+
+    /// GitHub issue #127: `AdeApp::graph_view_focused` - the bool `Self::render_graph_row`'s own
+    /// selected-row highlight reads, since that render call chain never carries a real `&Window`
+    /// to check `FocusHandle::is_focused` against directly - is set explicitly alongside every
+    /// real `window.focus(&self.graph_focus_handle, ...)`/graph-tab-exit call site
+    /// (`Self::open_git_graph`, `Self::open_graph_row_menu_at`, `Self::leave_graph_tab`), not via
+    /// a `cx.on_focus` subscription - one was tried and, live-tested, never fired for
+    /// `graph_focus_handle`, since it's only ever `track_focus`'d conditionally
+    /// (`Self::render_center_pane` renders `Self::render_graph_view` only while `graph_tab_active`
+    /// is `true`). Direct coverage of every site that flips the bool.
+    #[gpui::test]
+    fn graph_view_focused_tracks_real_focus_and_blur_of_the_graph_view(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        assert!(
+            app.read_with(cx, |app, _| app.graph_view_focused),
+            "premise: opening the graph tab genuinely focuses the graph view"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.leave_graph_tab(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.graph_view_focused),
+            "leaving the graph tab must clear it"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.graph_view_focused),
+            "reopening the graph tab must set it again"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.leave_graph_tab(window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.open_graph_row_menu_at(0, px(0.0), px(0.0), window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.graph_view_focused),
+            "opening a row's context menu must also set it, since it explicitly refocuses \
+             graph_focus_handle to fix keyboard focus after a right-click's own stop_propagation"
         );
     }
 }

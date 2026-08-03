@@ -605,6 +605,22 @@ pub struct AdeApp {
     /// The git graph tab's own keyboard-focus target, `track_focus`'d by
     /// `crate::graph_view::render::AdeApp::render_graph_view`'s container.
     pub(crate) graph_focus_handle: FocusHandle,
+    /// Whether [`Self::graph_focus_handle`] is genuinely focused right now (GitHub issue #127) -
+    /// kept as a plain bool, set directly alongside each real `window.focus(&self.
+    /// graph_focus_handle, ...)` call (`crate::graph_view::render::AdeApp::open_git_graph`/
+    /// `Self::toggle_graph_row_menu`) and cleared in `crate::graph_view::render::AdeApp::
+    /// leave_graph_tab`, rather than read live at render time or driven by a `cx.on_focus`
+    /// subscription. Two real reasons, not one: the row list's own render call chain
+    /// (`crate::graph_view::render::AdeApp::render_graph_row`, reached through `Self::
+    /// render_center_pane`) never carries a real `&Window` to check `FocusHandle::is_focused`
+    /// against (`render_center_pane` is also called as a bare "force a redraw" helper from dozens
+    /// of non-rendering call sites with no window at all); and a `cx.on_focus`/`cx.on_blur`
+    /// subscription registered at construction - the shape `Self::wire_caret_blink` uses
+    /// successfully for other handles - was live-tested here and never fired, since
+    /// `graph_focus_handle` is only ever `track_focus`'d conditionally (only while
+    /// `Self::graph_tab_active`) and the very first focus of it can happen before that node has
+    /// ever been part of a rendered frame.
+    pub(crate) graph_view_focused: bool,
     /// Pre-open focus target for [`Self::graph_focus_handle`] - see [`OverlayFocus`]. Captured
     /// only on the closed-to-open transition and moved on only when something else becomes the
     /// active centre-pane content - see `crate::graph_view::render::AdeApp::leave_graph_tab`.

@@ -261,6 +261,7 @@ impl AdeApp {
             graph_tab_open: false,
             graph_tab_active: false,
             graph_focus_handle: cx.focus_handle(),
+            graph_view_focused: false,
             graph_focus: OverlayFocus::default(),
             graph_state: graph_view::state::GraphTabState::new(cx),
             _load_graph_task: None,

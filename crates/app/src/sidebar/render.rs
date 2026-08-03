@@ -583,7 +583,7 @@ impl AdeApp {
         let list = uniform_list(
             "file-tree-list",
             rendered_count,
-            cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
+            cx.processor(move |this: &mut Self, range: Range<usize>, window, cx| {
                 // Both the row range and each index into `file_tree` are clamped/checked rather
                 // than trusted, so a future divergence degrades to "renders fewer rows" instead
                 // of panicking. `start` is clamped to `end`, not just to the length: clamping
@@ -598,7 +598,7 @@ impl AdeApp {
                             .file_tree
                             .get(*index)
                             .cloned()
-                            .map(|entry| this.render_file_tree_row(&entry, &marks, cx)),
+                            .map(|entry| this.render_file_tree_row(&entry, &marks, window, cx)),
                         TreeRow::InlineEditor => {
                             Some(this.render_tree_inline_edit_row(editor_depth, cx))
                         }
@@ -952,15 +952,34 @@ impl AdeApp {
         &self,
         entry: &FileTreeEntry,
         marks: &HashMap<PathBuf, (&'static str, gpui::Rgba)>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let indent = px(file_tree::INDENT_STEP * entry.depth as f32);
         let is_open = entry.is_dir && self.expanded_dirs.contains(&entry.path);
         let mark = marks.get(&entry.path).copied();
-        // The Files tree's row-selection highlight (README's Zone 3 "Selected row bg
-        // `#1a1e21`") - set by `Self::open_file_view` (this row's own click handler, below)
-        // and by `Self::open_palette_file_result` for a palette file result with no diff.
-        let is_selected = self.selected_tree_path.as_deref() == Some(entry.path.as_path());
+        // GitHub issue #127: the row-selection highlight (README's Zone 3 "Selected row bg
+        // `#1a1e21`") and the ancestor-chain indent-guide highlight just below both used to key
+        // purely off `Self::selected_tree_path` - the last-opened path, set by `Self::
+        // open_file_view`/`Self::open_palette_file_result` - with no check against real keyboard
+        // focus at all. That left the row looking selected/focused indefinitely after focus
+        // genuinely moved to the editor, a terminal, or the Changes panel.
+        //
+        // Two genuinely different things were being conflated under one field, though: "this row
+        // is what the centre pane is actually showing" (should stay lit no matter where focus
+        // is, the same way VS Code keeps the open file highlighted in its explorer while you're
+        // typing in the editor) versus "this row is the tree's own keyboard-navigation cursor"
+        // (should go idle the moment focus genuinely leaves the tree - a stale cursor left glowing
+        // over whatever directory you last clicked is exactly the bug this issue was filed for).
+        // `Self::open_change_absolute_path` answers the first question directly from
+        // `Self::open_change` - independent of `selected_tree_path`, which a directory click (or
+        // a tab-strip switch, which never touches it at all) can leave pointing somewhere the
+        // centre pane isn't showing.
+        let tree_focused = self.tree_focus_handle.is_focused(window);
+        let open_change_path = self.open_change_absolute_path();
+        let is_open_file = open_change_path.as_deref() == Some(entry.path.as_path());
+        let is_selected = is_open_file
+            || (tree_focused && self.selected_tree_path.as_deref() == Some(entry.path.as_path()));
 
         // `debug_selector` is a no-op outside test builds; lets a real render test assert on
         // which rows this list genuinely painted, which is the only way to prove the
@@ -1004,11 +1023,16 @@ impl AdeApp {
         // recycle" failure the issue calls out. Each guide spans the row's full 22px height with
         // no gap or inset, so consecutive rows' segments meet exactly and read as one continuous
         // line down the subtree.
-        let active_levels = file_tree::active_guide_levels(
-            &self.file_tree_root,
-            &entry.path,
-            self.selected_tree_path.as_deref(),
-        );
+        // GitHub issue #127: highlights the open file's own ancestor chain regardless of focus
+        // (same reasoning as `is_open_file` above - it helps find the open file in a deep,
+        // collapsed tree), falling back to the focus-gated tree cursor otherwise.
+        let active_chain_target = open_change_path.as_deref().or_else(|| {
+            tree_focused
+                .then_some(self.selected_tree_path.as_deref())
+                .flatten()
+        });
+        let active_levels =
+            file_tree::active_guide_levels(&self.file_tree_root, &entry.path, active_chain_target);
         for level in 0..entry.depth {
             let active = level < active_levels;
             row = row.child(
@@ -3805,6 +3829,95 @@ mod indent_guide_tests {
         (app, cx)
     }
 
+    /// GitHub issue #127: the *open* file's own ancestor-chain highlight must stay lit regardless
+    /// of where keyboard focus is - `Self::open_file_view` moves focus to the editor (not the
+    /// tree), and the highlight must survive that exactly like VS Code keeps its explorer's open-
+    /// file highlight lit while you're typing. A first draft of this fix instead cleared the
+    /// highlight the moment focus left the tree at all, hiding which file was open the instant
+    /// you started editing it - caught by manual review, not a test, since every prior test here
+    /// only ever checked a *mere selection* (a directory click), never a genuinely open file.
+    #[gpui::test]
+    fn the_open_files_ancestor_chain_highlight_survives_focus_leaving_the_tree(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        let (app, cx) = open_deep_tree(cx, &repo);
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(repo.path().join("a/b/c/deep.txt"), window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, _cx| {
+            assert!(
+                !app.tree_focus_handle.is_focused(window),
+                "premise: opening a file via the normal path focuses the editor, not the tree"
+            );
+        });
+        assert!(
+            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
+                .is_some(),
+            "the open file's own chain must stay lit even with the editor (not the tree) focused"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-guide-idle-deep.txt-0").is_none(),
+            "and must not also render idle"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.focus_file_tree(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
+                .is_some(),
+            "and must stay lit once the tree regains focus too"
+        );
+    }
+
+    /// The counterpart to the test above: a row that was merely *selected* in the tree (a
+    /// directory click, which never opens anything - `Self::open_change` stays `None`) is a real,
+    /// live keyboard-navigation cursor, not a standing "this is open" marker, so *its* chain must
+    /// go idle the instant real focus leaves the tree - the original GitHub issue #127 report: a
+    /// stale highlight glowing over whatever was last clicked long after focus moved away.
+    #[gpui::test]
+    fn a_merely_selected_directorys_ancestor_chain_highlight_clears_once_focus_leaves_the_tree(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        let (app, cx) = open_deep_tree(cx, &repo);
+
+        app.update_in(cx, |app, window, cx| {
+            app.selected_tree_path = Some(repo.path().join("a/b/c"));
+            app.focus_file_tree(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
+                .is_some(),
+            "premise: with the tree focused, the selected directory's own chain renders active \
+             (deep.txt sits inside it, at the deepest level the chain reaches)"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.agents.focus_active(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.open_change.is_none()),
+            "premise: focusing a terminal agent never opens a file tab"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-guide-idle-deep.txt-0").is_some(),
+            "a mere selection - nothing was ever opened - must go idle once focus genuinely \
+             leaves the tree"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
+                .is_none(),
+            "and must not also render active"
+        );
+    }
+
     /// One guide per nesting level, each at exactly its level's chevron offset from the row's
     /// own left edge, and none at all for a root-level row.
     #[gpui::test]
@@ -4001,6 +4114,10 @@ mod indent_guide_tests {
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(repo.path().join("a/b/c/deep.txt"), window, cx);
+            // GitHub issue #127: the ancestor-chain highlight now also requires the tree to be
+            // genuinely focused, not just a real selected path - `open_file_view` moves focus to
+            // the editor, so this test's premise needs a real tree focus afterward too.
+            app.focus_file_tree(window, cx);
         });
         cx.run_until_parked();
 
