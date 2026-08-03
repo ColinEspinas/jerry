@@ -583,7 +583,7 @@ impl AdeApp {
         let list = uniform_list(
             "file-tree-list",
             rendered_count,
-            cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
+            cx.processor(move |this: &mut Self, range: Range<usize>, window, cx| {
                 // Both the row range and each index into `file_tree` are clamped/checked rather
                 // than trusted, so a future divergence degrades to "renders fewer rows" instead
                 // of panicking. `start` is clamped to `end`, not just to the length: clamping
@@ -598,7 +598,7 @@ impl AdeApp {
                             .file_tree
                             .get(*index)
                             .cloned()
-                            .map(|entry| this.render_file_tree_row(&entry, &marks, cx)),
+                            .map(|entry| this.render_file_tree_row(&entry, &marks, window, cx)),
                         TreeRow::InlineEditor => {
                             Some(this.render_tree_inline_edit_row(editor_depth, cx))
                         }
@@ -952,15 +952,22 @@ impl AdeApp {
         &self,
         entry: &FileTreeEntry,
         marks: &HashMap<PathBuf, (&'static str, gpui::Rgba)>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let indent = px(file_tree::INDENT_STEP * entry.depth as f32);
         let is_open = entry.is_dir && self.expanded_dirs.contains(&entry.path);
         let mark = marks.get(&entry.path).copied();
-        // The Files tree's row-selection highlight (README's Zone 3 "Selected row bg
-        // `#1a1e21`") - set by `Self::open_file_view` (this row's own click handler, below)
-        // and by `Self::open_palette_file_result` for a palette file result with no diff.
-        let is_selected = self.selected_tree_path.as_deref() == Some(entry.path.as_path());
+        // GitHub issue #127: the row-selection highlight (README's Zone 3 "Selected row bg
+        // `#1a1e21`") and the ancestor-chain indent-guide highlight just below both used to key
+        // purely off `Self::selected_tree_path` - the last-opened path, set by `Self::
+        // open_file_view`/`Self::open_palette_file_result` - with no check against real keyboard
+        // focus at all. That left the row looking selected/focused indefinitely after focus
+        // genuinely moved to the editor, a terminal, or the Changes panel. Both now also require
+        // `Self::tree_focus_handle` to really be focused.
+        let tree_focused = self.tree_focus_handle.is_focused(window);
+        let is_selected =
+            tree_focused && self.selected_tree_path.as_deref() == Some(entry.path.as_path());
 
         // `debug_selector` is a no-op outside test builds; lets a real render test assert on
         // which rows this list genuinely painted, which is the only way to prove the
@@ -1007,7 +1014,11 @@ impl AdeApp {
         let active_levels = file_tree::active_guide_levels(
             &self.file_tree_root,
             &entry.path,
-            self.selected_tree_path.as_deref(),
+            // GitHub issue #127: no ancestor-chain highlight at all once the tree genuinely
+            // isn't focused, same reasoning as `is_selected` above.
+            tree_focused
+                .then_some(self.selected_tree_path.as_deref())
+                .flatten(),
         );
         for level in 0..entry.depth {
             let active = level < active_levels;
@@ -3805,6 +3816,48 @@ mod indent_guide_tests {
         (app, cx)
     }
 
+    /// GitHub issue #127: the selected file's own ancestor-chain highlight must clear the moment
+    /// real keyboard focus moves off the tree - not stay lit indefinitely just because
+    /// `Self::selected_tree_path` still names that file. `Self::open_file_view` moves focus to
+    /// the editor (not the tree), which is the exact reported scenario: click a file, then work
+    /// in the editor, and the tree still looked focused.
+    #[gpui::test]
+    fn the_ancestor_chain_highlight_clears_once_focus_leaves_the_tree(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let (app, cx) = open_deep_tree(cx, &repo);
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(repo.path().join("a/b/c/deep.txt"), window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, _cx| {
+            assert!(
+                !app.tree_focus_handle.is_focused(window),
+                "premise: opening a file via the normal path focuses the editor, not the tree"
+            );
+        });
+        assert!(
+            cx.debug_bounds("file-tree-guide-idle-deep.txt-0").is_some(),
+            "with the editor (not the tree) focused, the selected file's own chain must render \
+             idle, even though it's still the real selected path"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
+                .is_none(),
+            "and must not also render active"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.focus_file_tree(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
+                .is_some(),
+            "focusing the tree for the same still-selected file must light the chain back up"
+        );
+    }
+
     /// One guide per nesting level, each at exactly its level's chevron offset from the row's
     /// own left edge, and none at all for a root-level row.
     #[gpui::test]
@@ -4001,6 +4054,10 @@ mod indent_guide_tests {
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(repo.path().join("a/b/c/deep.txt"), window, cx);
+            // GitHub issue #127: the ancestor-chain highlight now also requires the tree to be
+            // genuinely focused, not just a real selected path - `open_file_view` moves focus to
+            // the editor, so this test's premise needs a real tree focus afterward too.
+            app.focus_file_tree(window, cx);
         });
         cx.run_until_parked();
 
