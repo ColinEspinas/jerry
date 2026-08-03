@@ -186,7 +186,6 @@ actions!(
         TextUndo,
         TextRedo,
         CloseFocusedTab,
-        FileTreeContextMenu,
         FileTreeRename,
         FileTreeCopy,
         FileTreeCut,

@@ -368,8 +368,8 @@ impl AdeApp {
     /// Opens the context menu for `target` at a real click position, clamped so the whole
     /// popover stays inside the window (`context_menu::clamp_menu_origin`).
     ///
-    /// Also focuses the tree and selects the targeted row: a right-click is a real selection
-    /// gesture, and `Shift+F10` afterwards has to have something to target.
+    /// Also focuses the tree and selects the targeted row - a right-click is a real selection
+    /// gesture in its own right, independent of the menu it also opens.
     pub(in crate::sidebar) fn open_tree_context_menu(
         &mut self,
         target: ContextTarget,
@@ -420,40 +420,6 @@ impl AdeApp {
         self.tree_op_error = None;
         self.focus_file_tree(window, cx);
         cx.notify();
-    }
-
-    /// `Shift+F10`'s handler: opens the menu for the currently selected row, or for the empty
-    /// area when nothing in this tree is selected.
-    ///
-    /// The origin is the top-left of the sidebar's own painted bounds plus a small offset rather
-    /// than a mouse position - there is no cursor involved in a keyboard-opened menu, and
-    /// pinning it to the last mouse position would put it somewhere the keyboard user never
-    /// looked. Still routed through the same clamp, so it can't escape the window either.
-    pub(in crate::sidebar) fn open_tree_context_menu_from_keyboard(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let target = match self.selected_tree_path.clone() {
-            Some(path) if path.starts_with(&self.file_tree_root) => {
-                let is_dir = self
-                    .file_tree
-                    .iter()
-                    .find(|entry| entry.path == path)
-                    .map(|entry| entry.is_dir)
-                    .unwrap_or_else(|| path.is_dir());
-                if is_dir {
-                    ContextTarget::Folder(path)
-                } else {
-                    ContextTarget::File(path)
-                }
-            }
-            _ => ContextTarget::Empty,
-        };
-        let bounds = self.file_tree_bounds;
-        let x = f32::from(bounds.origin.x) + 12.0;
-        let y = f32::from(bounds.origin.y) + 12.0;
-        self.open_tree_context_menu(target, x, y, window, cx);
     }
 
     pub(in crate::sidebar) fn close_tree_context_menu(&mut self, cx: &mut Context<Self>) {
@@ -1584,16 +1550,6 @@ impl AdeApp {
 
     // ---------------------------------------------------------------- bound actions
 
-    /// `Shift+F10` (`crate::root::FileTreeContextMenu`).
-    pub(in crate::sidebar) fn handle_file_tree_context_menu_action(
-        &mut self,
-        _action: &crate::root::FileTreeContextMenu,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_tree_context_menu_from_keyboard(window, cx);
-    }
-
     /// `F2` (`crate::root::FileTreeRename`).
     pub(in crate::sidebar) fn handle_file_tree_rename_action(
         &mut self,
@@ -2500,76 +2456,6 @@ mod tree_ops_regression_tests {
         );
     }
 
-    /// The positive half of the keyboard-access requirement (§1) - without this, the negative
-    /// tests below could pass simply because the binding never works at all.
-    #[gpui::test]
-    fn shift_f10_with_the_tree_focused_opens_the_menu_for_the_selected_row(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = TempDir::new().expect("tempdir");
-        seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
-        cx.run_until_parked();
-
-        app.update_in(cx, |app, window, cx| {
-            app.selected_tree_path = Some(repo.path().join("README.md"));
-            app.focus_file_tree(window, cx);
-        });
-        cx.run_until_parked();
-
-        cx.simulate_keystrokes("shift-f10");
-        app.read_with(cx, |app, _| {
-            let menu = app
-                .tree_context_menu
-                .as_ref()
-                .expect("shift-f10 with the tree focused must open the menu");
-            assert_eq!(
-                menu.target,
-                ContextTarget::File(repo.path().join("README.md"))
-            );
-        });
-    }
-
-    /// §1 + the keystroke-scoping discipline: `Shift+F10` must not reach the tree while one of
-    /// its own inline name editors has the keyboard - it would open a menu on top of the field
-    /// the user is typing into.
-    #[gpui::test]
-    fn shift_f10_while_an_inline_editor_is_open_neither_opens_a_menu_nor_disturbs_the_name(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = TempDir::new().expect("tempdir");
-        seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
-        cx.run_until_parked();
-
-        app.update_in(cx, |app, window, cx| {
-            app.selected_tree_path = Some(repo.path().join("README.md"));
-            app.start_tree_rename(repo.path().join("README.md"), false, window, cx);
-            app.tree_inline_edit.as_mut().expect("editor").name =
-                text_history::TextField::seeded("in-progress");
-        });
-        cx.run_until_parked();
-
-        cx.simulate_keystrokes("shift-f10");
-        app.read_with(cx, |app, _| {
-            assert!(
-                app.tree_context_menu.is_none(),
-                "the `!tree-editing` half of the binding's context predicate is what stops this"
-            );
-            assert_eq!(
-                app.tree_inline_edit
-                    .as_ref()
-                    .expect("still open")
-                    .name
-                    .as_str(),
-                "in-progress",
-                "and the editor must be untouched"
-            );
-        });
-    }
-
     /// **The merge regression this whole group exists for.** GitHub issue #19 (this file tree)
     /// and issue #17 (per-widget text undo) were built on two branches in parallel and only met
     /// at a merge. Nothing about that merge conflicted textually here, and the merged tree
@@ -2843,7 +2729,6 @@ mod tree_ops_regression_tests {
     fn every_file_tree_binding_is_scoped_away_from_the_inline_editor() {
         let expected = "file-tree && !tree-editing";
         let tree_actions = [
-            "app::FileTreeContextMenu",
             "app::FileTreeRename",
             "app::FileTreeCopy",
             "app::FileTreeCut",
@@ -3545,48 +3430,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// `Shift+F10` must reach the tree only when the tree is really the focused surface. With the
-    /// command palette open - a real, focused text-input surface - it must do nothing at all, and
-    /// the palette must keep taking the keystrokes that follow.
-    ///
-    /// Honest framing: this covers *pre-existing* scoping (`"file-tree && ..."`), not anything
-    /// this branch changed - it passes against the untouched base too. It is here because the
-    /// same branch makes `Shift+F10` more discoverable (the Files-tree footer hint strip and the
-    /// Keybindings-page relabel), and "more people will now press it" is exactly the moment to
-    /// pin down that pressing it in the wrong place costs nothing.
-    #[gpui::test]
-    fn shift_f10_with_the_palette_focused_neither_opens_the_menu_nor_eats_the_next_keystroke(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = TempDir::new().expect("tempdir");
-        seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
-        cx.run_until_parked();
-
-        app.update_in(cx, |app, window, cx| app.open_palette(window, cx));
-        cx.run_until_parked();
-
-        cx.simulate_keystrokes("shift-f10");
-        cx.run_until_parked();
-        app.read_with(cx, |app, _| {
-            assert!(
-                app.tree_context_menu.is_none(),
-                "the binding is scoped to the `file-tree` context precisely so a focused text \
-                 input keeps its own keystrokes"
-            );
-            assert!(app.palette_open, "and the palette must still be open");
-        });
-
-        cx.simulate_input("ab");
-        cx.run_until_parked();
-        assert_eq!(
-            app.read_with(cx, |app, _| app.palette_query.as_str().to_string()),
-            "ab",
-            "and the keystrokes after it must still land in the palette's own query"
-        );
-    }
-
     /// `menu_height` is what the window-edge flip is computed from, so it has to equal what the
     /// popover *actually paints* - not just what its own formula restates. Asserted against real
     /// painted bounds for all three targets, which is the only form of this assertion that can
@@ -3630,57 +3473,53 @@ mod tree_ops_regression_tests {
     /// that named a keystroke nothing dispatches would be worse than no hint.
     #[test]
     fn the_file_tree_footer_only_advertises_real_registered_bindings() {
-        use crate::sidebar::render::{FILE_TREE_CONTEXT_MENU_SPEC, FILE_TREE_RENAME_SPEC};
+        use crate::sidebar::render::FILE_TREE_RENAME_SPEC;
 
         let bindings = crate::default_key_bindings();
-        for (spec, action) in [
-            (FILE_TREE_CONTEXT_MENU_SPEC, "app::FileTreeContextMenu"),
-            (FILE_TREE_RENAME_SPEC, "app::FileTreeRename"),
-        ] {
-            let binding = bindings
-                .iter()
-                .find(|binding| binding.action().name() == action)
-                .unwrap_or_else(|| panic!("{action} must have a real registered binding"));
-            let printed = crate::keymap::resolve_combo(spec, false);
-            let real: Vec<String> = binding
-                .keystrokes()
-                .iter()
-                .flat_map(|keystroke| {
-                    // Every modifier, not just `shift` - a binding that silently gained a Ctrl or
-                    // Alt would otherwise still match, and the footer would keep printing a
-                    // keycap nobody can trigger.
-                    let modifiers = keystroke.modifiers();
-                    let mut parts: Vec<String> = Vec::new();
-                    if modifiers.control {
-                        parts.push("ctrl".to_string());
-                    }
-                    if modifiers.alt {
-                        parts.push("alt".to_string());
-                    }
-                    if modifiers.platform {
-                        parts.push("cmd".to_string());
-                    }
-                    if modifiers.shift {
-                        parts.push("shift".to_string());
-                    }
-                    parts.push(keystroke.key().to_string());
-                    parts
-                })
-                .map(|part| crate::keymap::resolve_combo(&part, false).join(""))
-                .collect();
-            // Case-insensitively: `gpui::Keystroke` normalises `key` to lowercase (`"f10"`),
-            // while the spec - and so the keycap the user reads - carries the conventional
-            // uppercase `"F10"`. The glyph, not its case, is what has to match.
-            let lower = |parts: &[String]| -> Vec<String> {
-                parts.iter().map(|part| part.to_lowercase()).collect()
-            };
-            assert_eq!(
-                lower(&printed),
-                lower(&real),
-                "the footer prints {spec:?} for {action}, which is not what that action is \
-                 actually bound to"
-            );
-        }
+        let (spec, action) = (FILE_TREE_RENAME_SPEC, "app::FileTreeRename");
+        let binding = bindings
+            .iter()
+            .find(|binding| binding.action().name() == action)
+            .unwrap_or_else(|| panic!("{action} must have a real registered binding"));
+        let printed = crate::keymap::resolve_combo(spec, false);
+        let real: Vec<String> = binding
+            .keystrokes()
+            .iter()
+            .flat_map(|keystroke| {
+                // Every modifier, not just `shift` - a binding that silently gained a Ctrl or
+                // Alt would otherwise still match, and the footer would keep printing a
+                // keycap nobody can trigger.
+                let modifiers = keystroke.modifiers();
+                let mut parts: Vec<String> = Vec::new();
+                if modifiers.control {
+                    parts.push("ctrl".to_string());
+                }
+                if modifiers.alt {
+                    parts.push("alt".to_string());
+                }
+                if modifiers.platform {
+                    parts.push("cmd".to_string());
+                }
+                if modifiers.shift {
+                    parts.push("shift".to_string());
+                }
+                parts.push(keystroke.key().to_string());
+                parts
+            })
+            .map(|part| crate::keymap::resolve_combo(&part, false).join(""))
+            .collect();
+        // Case-insensitively: `gpui::Keystroke` normalises `key` to lowercase (`"f10"`),
+        // while the spec - and so the keycap the user reads - carries the conventional
+        // uppercase `"F10"`. The glyph, not its case, is what has to match.
+        let lower = |parts: &[String]| -> Vec<String> {
+            parts.iter().map(|part| part.to_lowercase()).collect()
+        };
+        assert_eq!(
+            lower(&printed),
+            lower(&real),
+            "the footer prints {spec:?} for {action}, which is not what that action is actually \
+             bound to"
+        );
     }
 }
 

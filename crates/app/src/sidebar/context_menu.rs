@@ -114,6 +114,12 @@ impl MenuAction {
             MenuAction::Cut => Some("mod+X"),
             MenuAction::Copy => Some("mod+C"),
             MenuAction::Paste => Some("mod+V"),
+            // GitHub issue #155: every mutating row with a real registered binding should
+            // reference it - `Delete` runs immediately (no confirmation, see
+            // `crate::sidebar::tree_ops`'s own module docs) via the same real `"delete"`
+            // keybinding this row's own click already does, so leaving its hint blank while
+            // Rename/Cut/Copy/Paste all show theirs was the one real inconsistency here.
+            MenuAction::Delete => Some("Delete"),
             _ => None,
         }
     }
