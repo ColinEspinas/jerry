@@ -61,6 +61,7 @@ use wt_core::merge::ConflictHunk;
 
 use crate::code_surface::code_view;
 use crate::code_surface::edit_buffer;
+use crate::code_surface::markdown_preview;
 use crate::env_info;
 use crate::graph_view;
 use crate::keymap::WindowControlsStyle;
@@ -589,6 +590,13 @@ pub struct AdeApp {
     /// [`Self::render_code_surface`] alongside a "does this file even have a diff" check (a
     /// diff-less file always renders as `File` regardless of this field).
     pub(crate) code_view: code_view::CodeView,
+    /// GitHub issue #115: a `.md` file's `Source | Preview` toggle - reset the same way
+    /// [`Self::code_view`] is (see that field's own docs), not persisted per tab.
+    pub(crate) markdown_view: markdown_preview::MarkdownView,
+    /// Scroll position for [`Self::render_markdown_preview`] - plain [`gpui::ScrollHandle`]
+    /// rather than [`Self::file_view_scroll_handle`]'s `UniformListScrollHandle`, since the
+    /// preview is a real nested block tree, not a virtualized flat line list.
+    pub(crate) markdown_preview_scroll_handle: gpui::ScrollHandle,
     /// Surface C's Diff/File focus target, `track_focus`'d by
     /// [`Self::render_code_surface`]'s outer container - see [`OverlayFocus`]/[`restore_focus`]
     /// for the dangling-focus invariant this and [`Self::code_focus`] exist to satisfy.

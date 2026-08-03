@@ -60,6 +60,14 @@ impl AdeApp {
         } else {
             code_view::CodeView::File
         };
+        // GitHub issue #115: the `Source | Preview` toggle only makes sense for a real `.md` file
+        // actually showing the File view - a diff hunk of a markdown file still shows its own
+        // real diff, never a preview of one side of it.
+        let is_markdown_file = effective_view == code_view::CodeView::File
+            && relative_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
 
         let toolbar = div()
             .flex_none()
@@ -117,6 +125,9 @@ impl AdeApp {
                 )
             })
             .child(div().flex_1())
+            .when(is_markdown_file, |el| {
+                el.child(self.render_markdown_view_toggle(cx))
+            })
             .child(self.render_diff_file_toggle(has_diff, effective_view, cx))
             .child(self.render_zoom_control(cx))
             .child(
@@ -145,6 +156,20 @@ impl AdeApp {
 
         let body = match (effective_view, diff_file) {
             (code_view::CodeView::Diff, Some(file)) => self.render_diff_file_detail(file, cx),
+            _ if is_markdown_file
+                && self.markdown_view == markdown_preview::MarkdownView::Preview =>
+            {
+                // `render_file_view` still runs first, purely for its real loading side effect
+                // (`Self::spawn_file_load` on a stale/missing cache) - the same freshness dance
+                // Source mode always does. Its returned element is only used as the fallback for
+                // whichever frame the content genuinely isn't loaded/cached yet (a real "loading…"
+                // or error message), never shown alongside a real preview.
+                let fallback = self.render_file_view(relative_path, cx);
+                match self.markdown_preview_source(relative_path) {
+                    Some(source) => self.render_markdown_preview(&source, cx),
+                    None => fallback,
+                }
+            }
             _ => self.render_file_view(relative_path, cx),
         };
 
@@ -300,6 +325,58 @@ impl AdeApp {
             },
         )
     }
+
+    /// GitHub issue #115's `Source | Preview` toggle for a `.md` file's File view - only rendered
+    /// by [`Self::render_code_surface`] when [`code_view::CodeView::File`] is showing a real
+    /// `.md` path. Shares [`Self::render_choice_control`] exactly like
+    /// [`Self::render_diff_file_toggle`] does.
+    pub(in crate::code_surface) fn render_markdown_view_toggle(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = match self.markdown_view {
+            markdown_preview::MarkdownView::Source => "Source",
+            markdown_preview::MarkdownView::Preview => "Preview",
+        };
+        self.render_choice_control(
+            "markdown-view-toggle",
+            &[ChoiceOption::new("Source"), ChoiceOption::new("Preview")],
+            selected.to_string(),
+            cx,
+            |this, index, _window, cx| {
+                // Index 0 is `Source`, index 1 is `Preview`, per the options array above.
+                this.markdown_view = match index {
+                    0 => markdown_preview::MarkdownView::Source,
+                    _ => markdown_preview::MarkdownView::Preview,
+                };
+                cx.notify();
+            },
+        )
+    }
+
+    /// The real, already-loaded raw text `Self::render_markdown_preview` parses - preferring a
+    /// live [`Self::edit_buffer`] (so a preview reflects unsaved edits, not just what's on disk)
+    /// and falling back to the read-only [`Self::file_view_cache`] the same way
+    /// [`Self::render_file_view`]'s own diagnostics indexing already does (see that call site's
+    /// own docs) for a file with no edit buffer yet - truncated, non-UTF-8, or simply not loaded
+    /// on this exact frame. `None` means "not ready yet", the caller's cue to show
+    /// [`Self::render_file_view`]'s own loading/error state instead.
+    fn markdown_preview_source(&self, relative_path: &Path) -> Option<String> {
+        if let Some(buffer) = self.edit_buffer(relative_path) {
+            return Some(buffer.content.clone());
+        }
+        let absolute_path = self.file_tree_root.join(relative_path);
+        self.file_view_cache.as_ref().and_then(|parsed| {
+            (parsed.path == absolute_path).then(|| {
+                parsed
+                    .lines
+                    .iter()
+                    .map(|line| line.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        })
+    }
 }
 
 /// Proves the segmented `Diff | File` toggle's dispatch (`render_diff_file_toggle`, via the
@@ -380,6 +457,130 @@ mod choice_control_dispatch_tests {
             app.read_with(cx, |app, _| app.code_view),
             code_view::CodeView::Diff,
             "clicking the segment at structural index 0 must select Diff"
+        );
+    }
+}
+
+/// GitHub issue #115: the `Source | Preview` toggle only appears for a real `.md` file, and
+/// switching to `Preview` renders the real parsed markdown tree (`markdown_preview`) with no
+/// panic - end-to-end coverage on top of `markdown_preview::parse_tests`' own pure parser
+/// coverage, matching `choice_control_dispatch_tests`' own real-window dispatch discipline.
+#[cfg(test)]
+mod markdown_preview_toggle_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn the_toggle_only_appears_for_a_real_md_file(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo.path().join("readme.md"), "# hi\n").expect("write readme.md");
+        std::fs::write(repo.path().join("main.rs"), "fn main() {}\n").expect("write main.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(repo.path().join("main.rs"), window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("choice-markdown-view-toggle-0").is_none(),
+            "a non-markdown file must never show the Source/Preview toggle"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(repo.path().join("readme.md"), window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("choice-markdown-view-toggle-0").is_some(),
+            "a real .md file's File view must show the Source/Preview toggle"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_preview_renders_the_real_parsed_document_with_no_panic(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            repo.path().join("readme.md"),
+            "# Title\n\nSome **bold** text, a [link](https://example.com), and:\n\n- one\n- two\n\n\
+             ```rust\nfn main() {}\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n",
+        )
+        .expect("write readme.md");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(repo.path().join("readme.md"), window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.markdown_view),
+            markdown_preview::MarkdownView::Source,
+            "sanity: a freshly opened file starts in Source view"
+        );
+
+        let preview_bounds = cx
+            .debug_bounds("choice-markdown-view-toggle-1")
+            .expect("the Preview segment must have painted");
+        cx.simulate_click(preview_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.markdown_view),
+            markdown_preview::MarkdownView::Preview
+        );
+        assert!(
+            cx.debug_bounds("markdown-preview-content").is_some(),
+            "switching to Preview must really mount the preview's own content container"
+        );
+
+        // Back to Source - the real editable line-numbered view must reappear, not a frozen
+        // preview.
+        let source_bounds = cx
+            .debug_bounds("choice-markdown-view-toggle-0")
+            .expect("the Source segment must have painted");
+        cx.simulate_click(source_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.markdown_view),
+            markdown_preview::MarkdownView::Source
+        );
+    }
+
+    /// GitHub issue #145/#127-adjacent regression class: opening a *different* file must not
+    /// leave a previous file's `Preview` selection stuck on screen for a file that never asked
+    /// for it - `markdown_view` is one shared field, not per-tab state (see
+    /// `root::AdeApp::markdown_view`'s own docs), so every file-open path must reset it exactly
+    /// like `code_view` already resets.
+    #[gpui::test]
+    fn opening_a_different_markdown_file_resets_the_toggle_back_to_source(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo.path().join("a.md"), "# a\n").expect("write a.md");
+        std::fs::write(repo.path().join("b.md"), "# b\n").expect("write b.md");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(repo.path().join("a.md"), window, cx);
+        });
+        cx.run_until_parked();
+        let preview_bounds = cx
+            .debug_bounds("choice-markdown-view-toggle-1")
+            .expect("the Preview segment must have painted");
+        cx.simulate_click(preview_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.markdown_view),
+            markdown_preview::MarkdownView::Preview
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(repo.path().join("b.md"), window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.markdown_view),
+            markdown_preview::MarkdownView::Source,
+            "a newly opened file must never inherit a different file's stray Preview selection"
         );
     }
 }
