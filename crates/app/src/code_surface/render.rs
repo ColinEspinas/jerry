@@ -1,6 +1,6 @@
 //! Surface C's shell: which of the two views (Diff or File) an active tab actually shows,
 //! the key context that decides which keybindings are live over it, and the segmented
-//! Diff/File toggle that switches between them.
+//! File/Diff toggle that switches between them.
 
 use super::diff_view::render_accept_file_button;
 use super::*;
@@ -38,7 +38,7 @@ impl AdeApp {
 
     /// The centre's single-file Surface C, opened by a Changes-row click (`diff_file` always
     /// `Some`) or a Files-tree row click (`diff_file` may be `None`): a toolbar (dir/name, tag
-    /// pill, +n/-n stats, the `Diff | File` toggle, the zoom group, `Accept file`, close) over
+    /// pill, +n/-n stats, the `File | Diff` toggle, the zoom group, `Accept file`, close) over
     /// either [`Self::render_diff_file_detail`]'s folded hunk content or [`Self::render_file_view`]'s
     /// syntax-highlighted content, both zoom-scoped through [`zoom_scoped`].
     ///
@@ -294,7 +294,7 @@ impl AdeApp {
             .into_any_element()
     }
 
-    /// The toolbar's segmented `Diff | File` toggle. `Diff` is only clickable when `has_diff` is
+    /// The toolbar's segmented `File | Diff` toggle. `Diff` is only clickable when `has_diff` is
     /// true ([`ChoiceOption::enabled_if`] disables it otherwise); `File` is always clickable.
     /// Shares [`Self::render_choice_control`] with the other segmented toggles in this file.
     pub(in crate::code_surface) fn render_diff_file_toggle(
@@ -310,16 +310,18 @@ impl AdeApp {
         self.render_choice_control(
             "diff-file-toggle",
             &[
-                ChoiceOption::enabled_if("Diff", has_diff),
+                // GitHub issue #153: `File` first, `Diff` second - the order the segments
+                // themselves paint in, matching the issue's own reference screenshot.
                 ChoiceOption::new("File"),
+                ChoiceOption::enabled_if("Diff", has_diff),
             ],
             selected.to_string(),
             cx,
             |this, index, _window, cx| {
-                // Index 0 is `Diff`, index 1 is `File`, per the options array above.
+                // Index 0 is `File`, index 1 is `Diff`, per the options array above.
                 this.code_view = match index {
-                    0 => code_view::CodeView::Diff,
-                    _ => code_view::CodeView::File,
+                    0 => code_view::CodeView::File,
+                    _ => code_view::CodeView::Diff,
                 };
                 cx.notify();
             },
@@ -379,7 +381,7 @@ impl AdeApp {
     }
 }
 
-/// Proves the segmented `Diff | File` toggle's dispatch (`render_diff_file_toggle`, via the
+/// Proves the segmented `File | Diff` toggle's dispatch (`render_diff_file_toggle`, via the
 /// shared `render_choice_control`) is driven by each segment's structural position, not its
 /// display label - the R5.5 audit found the prior label-string dispatch could silently select
 /// the wrong value if a label was renamed without updating `on_select`, with no compile error or
@@ -433,30 +435,30 @@ mod choice_control_dispatch_tests {
             "sanity: opening a changed file's diff lands in Diff view by default"
         );
 
-        // Segment at structural index 1 ("File") - clicked by its position-based selector,
+        // Segment at structural index 0 ("File") - clicked by its position-based selector,
         // never by searching for its label text.
         let file_bounds = cx
-            .debug_bounds("choice-diff-file-toggle-1")
+            .debug_bounds("choice-diff-file-toggle-0")
             .expect("the File segment must have painted at least once");
         cx.simulate_click(file_bounds.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert_eq!(
             app.read_with(cx, |app, _| app.code_view),
             code_view::CodeView::File,
-            "clicking the segment at structural index 1 must select File - position-based \
+            "clicking the segment at structural index 0 must select File - position-based \
              dispatch, not a re-match on whatever that segment's label currently says"
         );
 
-        // Segment at structural index 0 ("Diff") - back the other way, same mechanism.
+        // Segment at structural index 1 ("Diff") - back the other way, same mechanism.
         let diff_bounds = cx
-            .debug_bounds("choice-diff-file-toggle-0")
+            .debug_bounds("choice-diff-file-toggle-1")
             .expect("the Diff segment must have painted at least once");
         cx.simulate_click(diff_bounds.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert_eq!(
             app.read_with(cx, |app, _| app.code_view),
             code_view::CodeView::Diff,
-            "clicking the segment at structural index 0 must select Diff"
+            "clicking the segment at structural index 1 must select Diff"
         );
     }
 }

@@ -584,7 +584,7 @@ pub struct AdeApp {
     /// read on every visible row every frame) is the only real query this needs - row order comes
     /// from the tree itself, not from this field, whenever an operation needs an ordered list.
     pub(crate) additional_tree_selection: HashSet<PathBuf>,
-    /// Surface C's `Diff | File` toggle for whichever file [`Self::open_change`] names - set to
+    /// Surface C's `File | Diff` toggle for whichever file [`Self::open_change`] names - set to
     /// `Diff` by [`Self::open_change_diff`] and `File` by [`Self::open_file_view`], read by
     /// [`Self::render_code_surface`] alongside a "does this file even have a diff" check (a
     /// diff-less file always renders as `File` regardless of this field).
