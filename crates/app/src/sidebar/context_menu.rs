@@ -21,30 +21,41 @@ use std::path::{Path, PathBuf};
 
 /// What a right-click landed on. `Empty` is a real target, not a fallback: the area below the
 /// last row offers its own menu (New File / New Folder / Paste / Collapse All), scoped to the
-/// worktree root.
+/// worktree root. `Multiple` (GitHub issue #145) is a real, distinct target too, not `File`/
+/// `Folder` with an extra field bolted on: a multi-selection has no single "new file goes here"
+/// destination and no single name to rename, so it deliberately offers a smaller, honest menu
+/// (see [`menu_groups`]) rather than a `File`/`Folder` row set that would silently only ever
+/// apply to one of the selected paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextTarget {
     File(PathBuf),
     Folder(PathBuf),
+    Multiple(Vec<PathBuf>),
     Empty,
 }
 
 impl ContextTarget {
-    /// The path this target's actions operate *on*, or `None` for the empty area.
+    /// The path this target's actions operate *on* - `None` for the empty area and, honestly,
+    /// for `Multiple` too: there is no single path a multi-selection's actions operate on, and a
+    /// caller that needs the *whole* selection should read [`AdeApp::tree_selected_paths`]
+    /// (`crate::sidebar::tree_ops`) instead of asking this method to pick one arbitrarily.
     pub fn path(&self) -> Option<&Path> {
         match self {
             ContextTarget::File(path) | ContextTarget::Folder(path) => Some(path),
-            ContextTarget::Empty => None,
+            ContextTarget::Multiple(_) | ContextTarget::Empty => None,
         }
     }
 
     /// The directory a "New File"/"New Folder"/"Paste" from this target should land in: the
-    /// folder itself, a file's parent, or the tree root for the empty area.
+    /// folder itself, a file's parent, or the tree root for the empty area. `Multiple` never
+    /// offers those rows (see [`menu_groups`]), so this is never actually read for it - the root
+    /// is returned anyway rather than panicking, matching every other "not really applicable"
+    /// case here.
     pub fn destination_dir<'a>(&'a self, root: &'a Path) -> &'a Path {
         match self {
             ContextTarget::Folder(path) => path,
             ContextTarget::File(path) => path.parent().unwrap_or(root),
-            ContextTarget::Empty => root,
+            ContextTarget::Multiple(_) | ContextTarget::Empty => root,
         }
     }
 }
@@ -195,6 +206,14 @@ pub fn menu_groups(target: &ContextTarget, clipboard_has_entry: bool) -> Vec<Vec
                 MenuItem::enabled(MenuAction::Reveal),
             ],
         ],
+        // GitHub issue #145: deliberately just Delete. Rename has no single name to edit; New
+        // File/New Folder/Paste have no single destination; Cut/Copy/Duplicate/CollapseSubtree/
+        // CopyPath all name a *single* real path each - offering them here would either silently
+        // act on only one of the selected paths or need a second, parallel bulk implementation of
+        // each. Bulk delete alone is real and safe today because `Self::request_tree_delete` was
+        // already immediate and per-path, undo-backed (GitHub issue #105) - looping it over every
+        // selected path needed no new machinery. A real follow-up, not a permanent gap.
+        ContextTarget::Multiple(_) => vec![vec![MenuItem::enabled(MenuAction::Delete)]],
         ContextTarget::Empty => vec![
             vec![
                 MenuItem::enabled(MenuAction::NewFile),

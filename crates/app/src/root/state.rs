@@ -236,7 +236,7 @@ impl AdeApp {
             tree_op_error: None,
             tree_focus_handle,
             file_tree_bounds: gpui::Bounds::default(),
-            _tree_delete_task: None,
+            _tree_delete_tasks: Vec::new(),
             _tree_copy_task: None,
             staged_files: HashSet::new(),
             staging_error: None,
@@ -247,6 +247,7 @@ impl AdeApp {
             close_tab_confirm_armed: None,
             open_diff_file_cache: None,
             selected_tree_path: None,
+            additional_tree_selection: HashSet::new(),
             code_view: code_view::CodeView::Diff,
             code_focus_handle,
             code_focus: OverlayFocus::default(),
@@ -904,6 +905,7 @@ impl AdeApp {
             &mut self.open_change,
             &mut self.expanded_dirs,
             &mut self.selected_tree_path,
+            &mut self.additional_tree_selection,
         );
         // The tree's fold state is per-worktree *persisted* state, not merely per-worktree
         // transient state: the reset above clears the live set, and this re-derives it from
@@ -1227,11 +1229,13 @@ pub(super) fn reset_per_worktree_ui_state(
     open_change: &mut Option<PathBuf>,
     expanded_dirs: &mut HashSet<PathBuf>,
     selected_tree_path: &mut Option<PathBuf>,
+    additional_tree_selection: &mut HashSet<PathBuf>,
 ) {
     staged_files.clear();
     *open_change = None;
     expanded_dirs.clear();
     *selected_tree_path = None;
+    additional_tree_selection.clear();
 }
 
 #[cfg(test)]
@@ -1246,12 +1250,14 @@ mod tests {
         let mut open_change = Some(PathBuf::from("src/main.rs"));
         let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
+        let mut additional_tree_selection = HashSet::new();
 
         reset_per_worktree_ui_state(
             &mut staged_files,
             &mut open_change,
             &mut expanded_dirs,
             &mut selected_tree_path,
+            &mut additional_tree_selection,
         );
 
         assert!(staged_files.is_empty());
@@ -1264,12 +1270,14 @@ mod tests {
         let mut open_change = None;
         let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
+        let mut additional_tree_selection = HashSet::new();
 
         reset_per_worktree_ui_state(
             &mut staged_files,
             &mut open_change,
             &mut expanded_dirs,
             &mut selected_tree_path,
+            &mut additional_tree_selection,
         );
 
         assert!(staged_files.is_empty());
@@ -1283,6 +1291,7 @@ mod tests {
         let mut open_change = None;
         let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
+        let mut additional_tree_selection = HashSet::new();
         expanded_dirs.insert(PathBuf::from("/repo/worktree-a/src"));
         expanded_dirs.insert(PathBuf::from("/repo/worktree-a/tests"));
 
@@ -1291,6 +1300,7 @@ mod tests {
             &mut open_change,
             &mut expanded_dirs,
             &mut selected_tree_path,
+            &mut additional_tree_selection,
         );
 
         assert!(expanded_dirs.is_empty());
@@ -1302,15 +1312,19 @@ mod tests {
         let mut open_change = None;
         let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = Some(PathBuf::from("/repo/worktree-a/src/main.rs"));
+        let mut additional_tree_selection = HashSet::new();
+        additional_tree_selection.insert(PathBuf::from("/repo/worktree-a/src/lib.rs"));
 
         reset_per_worktree_ui_state(
             &mut staged_files,
             &mut open_change,
             &mut expanded_dirs,
             &mut selected_tree_path,
+            &mut additional_tree_selection,
         );
 
         assert_eq!(selected_tree_path, None);
+        assert!(additional_tree_selection.is_empty());
     }
 
     /// [`AdeApp::open_files`]/[`AdeApp::open_files_mut`] resolve through

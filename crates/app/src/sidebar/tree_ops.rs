@@ -234,6 +234,137 @@ impl AdeApp {
         window.focus(&self.tree_focus_handle, cx);
     }
 
+    // ---------------------------------------------------------------- multi-selection (issue #145)
+
+    /// Whether `path` is part of the tree's real current selection - the anchor
+    /// ([`Self::selected_tree_path`]) or [`Self::additional_tree_selection`], either one.
+    pub(in crate::sidebar) fn is_tree_path_selected(&self, path: &Path) -> bool {
+        self.selected_tree_path.as_deref() == Some(path)
+            || self.additional_tree_selection.contains(path)
+    }
+
+    /// How many rows the tree's real current selection spans - `0` with nothing selected, `1`
+    /// for an ordinary single selection, more once Ctrl/Cmd- or Shift-click has grown it.
+    pub(in crate::sidebar) fn tree_selection_len(&self) -> usize {
+        self.selected_tree_path.iter().count() + self.additional_tree_selection.len()
+    }
+
+    /// The tree's whole real selection - the anchor plus every additionally-selected path -
+    /// ordered the way the tree itself displays them (via [`file_tree::visible_indices`]) rather
+    /// than insertion order, so a bulk action's own visible order (a "delete these 3 files" log,
+    /// say) reads the same way the rows did. A selected path currently hidden inside a collapsed
+    /// ancestor (reachable via Shift+click through an ancestor that was later re-collapsed) sorts
+    /// after every visible one, in whatever order the underlying `HashSet` happens to hold it -
+    /// a real but rare edge case, and still processed, just not in a meaningful order.
+    pub(in crate::sidebar) fn tree_selected_paths(&self) -> Vec<PathBuf> {
+        if self.additional_tree_selection.is_empty() {
+            return self.selected_tree_path.iter().cloned().collect();
+        }
+        let visible = file_tree::visible_indices(&self.file_tree, &self.expanded_dirs);
+        let mut ordered: Vec<PathBuf> = Vec::with_capacity(self.tree_selection_len());
+        let mut remaining = self.additional_tree_selection.clone();
+        if let Some(anchor) = &self.selected_tree_path {
+            remaining.remove(anchor);
+        }
+        for &index in &visible {
+            let path = &self.file_tree[index].path;
+            if remaining.remove(path) || self.selected_tree_path.as_deref() == Some(path.as_path())
+            {
+                ordered.push(path.clone());
+            }
+        }
+        // Whatever's left never appeared in `visible` at all (hidden behind a collapsed
+        // ancestor) - still real selection, appended so nothing silently drops out of a bulk
+        // action just because its parent folder happens to be collapsed right now.
+        ordered.extend(remaining);
+        ordered
+    }
+
+    /// One tree row's real click - the single place `Self::render_file_tree_row`'s file and
+    /// folder click handlers both funnel through, so Ctrl/Cmd-click and Shift-click can never
+    /// mean something different depending on which kind of row was clicked.
+    ///
+    /// - A plain click collapses the selection to just `path` (the existing, pre-#145 behavior).
+    /// - Ctrl/Cmd-click (`Modifiers::secondary`) toggles `path`'s own membership, leaving every
+    ///   other selected row alone. Toggling the anchor itself off promotes an arbitrary remaining
+    ///   member to anchor (there is no real "next" ordering to prefer one over another once the
+    ///   anchor is gone) rather than collapsing the whole selection just because its first member
+    ///   happened to be clicked again.
+    /// - Shift-click range-selects from the anchor to `path`, using the tree's own real display
+    ///   order (`file_tree::visible_indices`) - not insertion order, not a path comparison, since
+    ///   neither would match what the user actually sees between the two rows. Replaces whatever
+    ///   [`Self::additional_tree_selection`] held before (matching every mainstream file
+    ///   manager's own "Shift-click" - a second Shift-click resizes the range, it doesn't extend
+    ///   it further from wherever the first one left off). Falls back to a plain single-select
+    ///   when there is no anchor yet to range from.
+    pub(in crate::sidebar) fn tree_click_select(
+        &mut self,
+        path: PathBuf,
+        modifiers: gpui::Modifiers,
+    ) {
+        if modifiers.shift && self.selected_tree_path.is_some() {
+            self.tree_select_range_to(&path);
+            return;
+        }
+        if modifiers.secondary() {
+            if self.selected_tree_path.as_deref() == Some(path.as_path()) {
+                // Toggling the anchor off - promote another member, if any, so the selection
+                // shrinks rather than silently losing its anchor while other rows stay lit.
+                let promoted = self.additional_tree_selection.iter().next().cloned();
+                if let Some(promoted) = promoted {
+                    self.additional_tree_selection.remove(&promoted);
+                    self.selected_tree_path = Some(promoted);
+                } else {
+                    self.selected_tree_path = None;
+                }
+            } else if !self.additional_tree_selection.remove(&path) {
+                if self.selected_tree_path.is_none() {
+                    self.selected_tree_path = Some(path);
+                } else {
+                    self.additional_tree_selection.insert(path);
+                }
+            }
+            return;
+        }
+        self.selected_tree_path = Some(path);
+        self.additional_tree_selection.clear();
+    }
+
+    /// The Shift-click half of [`Self::tree_click_select`] - see that method's own docs.
+    fn tree_select_range_to(&mut self, path: &Path) {
+        let Some(anchor) = self.selected_tree_path.clone() else {
+            self.selected_tree_path = Some(path.to_path_buf());
+            self.additional_tree_selection.clear();
+            return;
+        };
+        let visible = file_tree::visible_indices(&self.file_tree, &self.expanded_dirs);
+        let anchor_index = visible
+            .iter()
+            .position(|&index| self.file_tree[index].path == anchor);
+        let click_index = visible
+            .iter()
+            .position(|&index| self.file_tree[index].path == *path);
+        let (Some(anchor_index), Some(click_index)) = (anchor_index, click_index) else {
+            // Either endpoint isn't currently visible (a stale anchor from a row that's since
+            // been hidden behind a collapsed ancestor) - a range through rows the user can't see
+            // would be confusing to have selected sight unseen, so fall back to a plain
+            // single-select of the row that was actually clicked.
+            self.selected_tree_path = Some(path.to_path_buf());
+            self.additional_tree_selection.clear();
+            return;
+        };
+        let (start, end) = if anchor_index <= click_index {
+            (anchor_index, click_index)
+        } else {
+            (click_index, anchor_index)
+        };
+        self.additional_tree_selection = visible[start..=end]
+            .iter()
+            .map(|&index| self.file_tree[index].path.clone())
+            .filter(|entry_path| entry_path != &anchor)
+            .collect();
+    }
+
     /// Opens the context menu for `target` at a real click position, clamped so the whole
     /// popover stays inside the window (`context_menu::clamp_menu_origin`).
     ///
@@ -252,6 +383,21 @@ impl AdeApp {
         if self.tree_inline_edit.is_some() {
             self.cancel_tree_inline_edit(window, cx);
         }
+        // GitHub issue #145: a right-click on a row that's already part of a real multi-selection
+        // (more than just the anchor) must act on the *whole* selection, not collapse it down to
+        // just the row under the cursor - the same "right-click within a selection" convention
+        // every mainstream file manager follows. A right-click anywhere else (a fresh row, or the
+        // empty area) still collapses to that one target, exactly like before this issue.
+        let target = match target.path() {
+            Some(path) if self.tree_selection_len() > 1 && self.is_tree_path_selected(path) => {
+                ContextTarget::Multiple(self.tree_selected_paths())
+            }
+            _ => {
+                self.selected_tree_path = target.path().map(Path::to_path_buf);
+                self.additional_tree_selection.clear();
+                target
+            }
+        };
         // The exact rows `crate::sidebar::render::AdeApp::render_tree_context_menu` will paint,
         // group dividers included - measuring the action rows alone would leave the popover 9px
         // per group boundary taller than the clamp believed, so a menu opened near the bottom
@@ -266,7 +412,6 @@ impl AdeApp {
             f32::from(viewport.width),
             f32::from(viewport.height),
         );
-        self.selected_tree_path = target.path().map(Path::to_path_buf);
         self.tree_context_menu = Some(TreeContextMenu {
             target,
             origin_x,
@@ -382,8 +527,21 @@ impl AdeApp {
             // all" button calls - the live set, this worktree's persisted entry, and the queued
             // write all reset in one step. Not a second, parallel mechanism.
             MenuAction::CollapseAll => self.collapse_all_dirs(cx),
+            // GitHub issue #145: `Multiple`'s only real row. Each path gets its own real,
+            // undo-backed delete (`Self::request_tree_delete`, already immediate and per-path
+            // since GitHub issue #105) - a loop, not a second bulk-delete implementation.
             MenuAction::Delete => {
-                if let Some(path) = target_path {
+                if let ContextTarget::Multiple(paths) = &menu.target {
+                    for path in paths.clone() {
+                        let is_dir = self
+                            .file_tree
+                            .iter()
+                            .find(|entry| entry.path == path)
+                            .map(|entry| entry.is_dir)
+                            .unwrap_or_else(|| path.is_dir());
+                        self.request_tree_delete(path, is_dir, cx);
+                    }
+                } else if let Some(path) = target_path {
                     let is_dir = matches!(menu.target, ContextTarget::Folder(_));
                     self.request_tree_delete(path, is_dir, cx);
                 }
@@ -453,12 +611,19 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// `F2`'s handler - renames whatever row is selected.
+    /// `F2`'s handler - renames whatever row is selected. GitHub issue #145: a real no-op with
+    /// more than one row selected - there is no single name to rename a multi-selection to, and
+    /// silently renaming just the anchor while the rest of the selection sat there unrenamed
+    /// would be exactly the "looks like it applies to the whole selection but doesn't" bug this
+    /// codebase's own discipline forbids.
     pub(in crate::sidebar) fn start_tree_rename_for_selection(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.additional_tree_selection.is_empty() {
+            return;
+        }
         let Some(path) = self.selected_tree_path.clone() else {
             return;
         };
@@ -927,21 +1092,22 @@ impl AdeApp {
 
     /// The `Delete` keyboard shortcut's own handler - mirrors [`Self::start_tree_rename_for_selection`]'s
     /// "resolve `is_dir` off the live tree, not the filesystem" pattern so a stale/renamed
-    /// selection can't race a real `stat` call.
+    /// selection can't race a real `stat` call. GitHub issue #145: deletes the whole real
+    /// selection (`Self::tree_selected_paths`), not just the anchor - each path still gets its
+    /// own real, undo-backed delete (`Self::request_tree_delete`).
     pub(in crate::sidebar) fn request_tree_delete_for_selection(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.selected_tree_path.clone() else {
-            return;
-        };
-        if !path.starts_with(&self.file_tree_root) || path == self.file_tree_root {
-            return;
+        for path in self.tree_selected_paths() {
+            if !path.starts_with(&self.file_tree_root) || path == self.file_tree_root {
+                continue;
+            }
+            let is_dir = self
+                .file_tree
+                .iter()
+                .find(|entry| entry.path == path)
+                .map(|entry| entry.is_dir)
+                .unwrap_or_else(|| path.is_dir());
+            self.request_tree_delete(path, is_dir, cx);
         }
-        let is_dir = self
-            .file_tree
-            .iter()
-            .find(|entry| entry.path == path)
-            .map(|entry| entry.is_dir)
-            .unwrap_or_else(|| path.is_dir());
-        self.request_tree_delete(path, is_dir, cx);
     }
 
     /// [`Self::delete_path_with_real_undo`], resolving a real [`DeleteMechanism`] against this
@@ -1060,7 +1226,7 @@ impl AdeApp {
                 cx.notify();
             });
         });
-        self._tree_delete_task = Some(task);
+        self._tree_delete_tasks.push(task);
         cx.notify();
     }
 
@@ -3282,7 +3448,7 @@ mod tree_ops_regression_tests {
     /// run would move a real test fixture into the developer's own trash - the same hygiene
     /// concern `Self::request_tree_delete_with_mechanism_for_test` exists for elsewhere. Mechanism
     /// resolution and spawning the delete task both happen synchronously, before anything
-    /// destructive runs, so checking `_tree_delete_task` right after dispatch - without ever
+    /// destructive runs, so checking `_tree_delete_tasks` right after dispatch - without ever
     /// draining the executor - proves the keystroke reached the real delete path without letting
     /// the real removal command run. `deleting_a_file_removes_it_immediately_and_records_a_real_undo_entry`
     /// covers the real end-to-end removal, with a mechanism it fully controls.
@@ -3303,7 +3469,7 @@ mod tree_ops_regression_tests {
         cx.simulate_keystrokes("delete");
         app.read_with(cx, |app, _| {
             assert!(
-                app._tree_delete_task.is_some(),
+                !app._tree_delete_tasks.is_empty(),
                 "the Delete keystroke must reach AdeApp::request_tree_delete_for_selection and \
                  spawn a real delete task"
             );
@@ -3446,6 +3612,338 @@ mod tree_ops_regression_tests {
                  actually bound to"
             );
         }
+    }
+}
+
+/// GitHub issue #145: Ctrl/Cmd+click toggle, Shift+click range-select, bulk delete, rename
+/// gating, and right-click-within-a-selection all in one place - real coverage for the tree's
+/// own multi-selection, not just the single-target behavior `tree_ops_regression_tests` already
+/// covers.
+#[cfg(test)]
+mod tree_multiselect_tests {
+    use crate::root::focus::palette_focus_tests;
+    use crate::sidebar::context_menu::ContextTarget;
+    use gpui::{Modifiers, TestAppContext};
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Four plain root-level files, alphabetical - `visible_indices`' own display order for a
+    /// worktree with no directories to expand, so a range-select test can reason about exactly
+    /// which paths a Shift+click between two of them should span.
+    fn seed_flat(repo: &TempDir) {
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            fs::write(repo.path().join(name), "x\n").expect("write");
+        }
+    }
+
+    fn secondary_modifiers() -> Modifiers {
+        if cfg!(target_os = "macos") {
+            Modifiers {
+                platform: true,
+                ..Modifiers::none()
+            }
+        } else {
+            Modifiers {
+                control: true,
+                ..Modifiers::none()
+            }
+        }
+    }
+
+    fn shift_modifiers() -> Modifiers {
+        Modifiers {
+            shift: true,
+            ..Modifiers::none()
+        }
+    }
+
+    #[gpui::test]
+    fn secondary_click_toggles_a_row_into_and_back_out_of_the_selection(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed_flat(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let a = repo.path().join("a.txt");
+        let b = repo.path().join("b.txt");
+        app.update(cx, |app, _cx| {
+            app.selected_tree_path = Some(a.clone());
+        });
+
+        app.update(cx, |app, _cx| {
+            app.tree_click_select(b.clone(), secondary_modifiers());
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.selected_tree_path.as_deref(), Some(a.as_path()));
+            assert!(app.additional_tree_selection.contains(&b));
+            assert_eq!(app.tree_selection_len(), 2);
+        });
+
+        // A second Ctrl/Cmd+click on the same row toggles it back off.
+        app.update(cx, |app, _cx| {
+            app.tree_click_select(b.clone(), secondary_modifiers());
+        });
+        app.read_with(cx, |app, _| {
+            assert!(!app.additional_tree_selection.contains(&b));
+            assert_eq!(app.tree_selection_len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn secondary_click_toggling_the_anchor_off_promotes_another_selected_row(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        seed_flat(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let a = repo.path().join("a.txt");
+        let b = repo.path().join("b.txt");
+        app.update(cx, |app, _cx| {
+            app.selected_tree_path = Some(a.clone());
+            app.tree_click_select(b.clone(), secondary_modifiers());
+            // Ctrl/Cmd+click the anchor itself off.
+            app.tree_click_select(a.clone(), secondary_modifiers());
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.selected_tree_path.as_deref(),
+                Some(b.as_path()),
+                "the remaining selected row must become the new anchor rather than the whole \
+                 selection collapsing to nothing"
+            );
+            assert!(app.additional_tree_selection.is_empty());
+            assert_eq!(app.tree_selection_len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn shift_click_range_selects_between_the_anchor_and_the_clicked_row(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed_flat(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let a = repo.path().join("a.txt");
+        let c = repo.path().join("c.txt");
+        app.update(cx, |app, _cx| {
+            app.selected_tree_path = Some(a.clone());
+            app.tree_click_select(c.clone(), shift_modifiers());
+        });
+        app.read_with(cx, |app, _| {
+            let mut selected = app.tree_selected_paths();
+            selected.sort();
+            let mut expected = vec![a.clone(), repo.path().join("b.txt"), c.clone()];
+            expected.sort();
+            assert_eq!(
+                selected, expected,
+                "a-through-c must select exactly a.txt, b.txt, c.txt - not d.txt"
+            );
+            assert_eq!(
+                app.selected_tree_path.as_deref(),
+                Some(a.as_path()),
+                "the anchor itself must not move on a Shift+click"
+            );
+        });
+
+        // A second Shift+click resizes the range from the same anchor - it does not extend from
+        // wherever the first range left off.
+        let b = repo.path().join("b.txt");
+        app.update(cx, |app, _cx| {
+            app.tree_click_select(b.clone(), shift_modifiers());
+        });
+        app.read_with(cx, |app, _| {
+            let mut selected = app.tree_selected_paths();
+            selected.sort();
+            let mut expected = vec![a.clone(), b.clone()];
+            expected.sort();
+            assert_eq!(selected, expected);
+        });
+    }
+
+    #[gpui::test]
+    fn a_plain_click_collapses_the_selection_to_just_that_row(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed_flat(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let a = repo.path().join("a.txt");
+        let b = repo.path().join("b.txt");
+        let c = repo.path().join("c.txt");
+        app.update(cx, |app, _cx| {
+            app.selected_tree_path = Some(a.clone());
+            app.tree_click_select(b.clone(), secondary_modifiers());
+            assert_eq!(
+                app.tree_selection_len(),
+                2,
+                "premise: a real 2-row selection exists"
+            );
+            app.tree_click_select(c.clone(), Modifiers::none());
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.selected_tree_path.as_deref(), Some(c.as_path()));
+            assert!(app.additional_tree_selection.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn the_delete_key_removes_every_selected_file_not_just_the_anchor(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed_flat(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let a = repo.path().join("a.txt");
+        let b = repo.path().join("b.txt");
+        let c = repo.path().join("c.txt");
+        app.update(cx, |app, _cx| {
+            app.selected_tree_path = Some(a.clone());
+            app.tree_click_select(b.clone(), secondary_modifiers());
+        });
+        app.update(cx, |app, cx| {
+            app.request_tree_delete_for_selection(cx);
+        });
+        cx.run_until_parked();
+
+        assert!(!a.exists(), "the anchor must be deleted");
+        assert!(!b.exists(), "the Ctrl/Cmd-selected row must be deleted too");
+        assert!(c.exists(), "an unselected row must be left alone");
+    }
+
+    #[gpui::test]
+    fn rename_is_a_no_op_with_more_than_one_row_selected(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed_flat(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let a = repo.path().join("a.txt");
+        let b = repo.path().join("b.txt");
+        app.update_in(cx, |app, window, cx| {
+            app.selected_tree_path = Some(a.clone());
+            app.tree_click_select(b.clone(), secondary_modifiers());
+            app.start_tree_rename_for_selection(window, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.tree_inline_edit.is_none(),
+                "F2 with a real multi-selection must not open a rename editor at all - there \
+                 is no single name to rename it to"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn rename_still_works_normally_with_exactly_one_row_selected(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed_flat(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let a = repo.path().join("a.txt");
+        app.update_in(cx, |app, window, cx| {
+            app.selected_tree_path = Some(a.clone());
+            app.start_tree_rename_for_selection(window, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.tree_inline_edit.is_some(),
+                "a real single selection must still open the rename editor exactly as before \
+                 GitHub issue #145"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn right_clicking_a_row_already_inside_a_multi_selection_preserves_the_whole_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        seed_flat(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let a = repo.path().join("a.txt");
+        let b = repo.path().join("b.txt");
+        app.update_in(cx, |app, window, cx| {
+            app.selected_tree_path = Some(a.clone());
+            app.tree_click_select(b.clone(), secondary_modifiers());
+            // Right-clicking `b` - itself already part of the 2-row selection - must not
+            // collapse it down to just `b`.
+            app.open_tree_context_menu(ContextTarget::File(b.clone()), 10.0, 10.0, window, cx);
+        });
+        app.read_with(cx, |app, _| {
+            let menu = app.tree_context_menu.as_ref().expect("menu must be open");
+            match &menu.target {
+                ContextTarget::Multiple(paths) => {
+                    let mut sorted = paths.clone();
+                    sorted.sort();
+                    let mut expected = vec![a.clone(), b.clone()];
+                    expected.sort();
+                    assert_eq!(sorted, expected);
+                }
+                other => panic!("expected ContextTarget::Multiple, got {other:?}"),
+            }
+            assert_eq!(
+                app.selected_tree_path.as_deref(),
+                Some(a.as_path()),
+                "the anchor must survive a right-click within its own selection"
+            );
+            assert!(app.additional_tree_selection.contains(&b));
+        });
+    }
+
+    #[gpui::test]
+    fn right_clicking_a_row_outside_the_selection_collapses_to_just_that_row(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        seed_flat(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let a = repo.path().join("a.txt");
+        let b = repo.path().join("b.txt");
+        let c = repo.path().join("c.txt");
+        app.update_in(cx, |app, window, cx| {
+            app.selected_tree_path = Some(a.clone());
+            app.tree_click_select(b.clone(), secondary_modifiers());
+            // Right-clicking `c` - outside the {a, b} selection - must collapse to just `c`.
+            app.open_tree_context_menu(ContextTarget::File(c.clone()), 10.0, 10.0, window, cx);
+        });
+        app.read_with(cx, |app, _| {
+            let menu = app.tree_context_menu.as_ref().expect("menu must be open");
+            assert_eq!(menu.target, ContextTarget::File(c.clone()));
+            assert_eq!(app.selected_tree_path.as_deref(), Some(c.as_path()));
+            assert!(app.additional_tree_selection.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn opening_a_file_from_the_tree_collapses_a_stray_multi_selection(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed_flat(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let a = repo.path().join("a.txt");
+        let b = repo.path().join("b.txt");
+        app.update(cx, |app, _cx| {
+            app.selected_tree_path = Some(a.clone());
+            app.additional_tree_selection.insert(b.clone());
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(b.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.additional_tree_selection.is_empty(),
+                "opening a real file must collapse whatever stray multi-selection preceded it"
+            );
+        });
     }
 }
 

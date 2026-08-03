@@ -477,10 +477,14 @@ pub struct AdeApp {
     /// render (the same pattern [`Self::plus_button_bounds`] uses) - where a *keyboard*-opened
     /// context menu (`Shift+F10`) anchors, since there is no cursor position to use.
     pub(crate) file_tree_bounds: gpui::Bounds<Pixels>,
-    /// The in-flight confirmed delete (a real `gio trash` child process, or a real
-    /// `remove_dir_all`), one slot: a second delete can't be requested until the confirmation
-    /// panel is open again, so there is never more than one.
-    pub(crate) _tree_delete_task: Option<Task<()>>,
+    /// Every in-flight confirmed delete (a real `gio trash` child process, or a real
+    /// `remove_dir_all`) - a real `Vec`, not one slot, since GitHub issue #145's bulk delete
+    /// starts one real task per selected path in the same call: a single `Option` overwritten in
+    /// a loop would drop (and, being a `Task`, therefore cancel) every delete but the last one.
+    /// Finished tasks are never removed - `Task<()>` completing is a no-op to poll again, and
+    /// this only ever grows by a handful of entries per bulk delete, not worth the bookkeeping to
+    /// prune.
+    pub(crate) _tree_delete_tasks: Vec<Task<()>>,
     /// The in-flight Duplicate / paste-a-copy - a real, recursive `std::fs` tree copy, run on the
     /// background executor rather than in the click listener that started it (see
     /// `crate::sidebar::tree_ops::AdeApp::spawn_tree_copy`). One slot, superseding: a second copy
@@ -561,8 +565,19 @@ pub struct AdeApp {
     pub(crate) open_diff_file_cache: Option<DiffFile>,
     /// File-tree path last resolved from a palette file result with no diff to open
     /// (`Self::open_palette_file_result`) - highlighted in `Self::render_file_tree_row` like a
-    /// Changes row's own selection highlight.
+    /// Changes row's own selection highlight. GitHub issue #145: also the multi-selection's
+    /// *anchor* - the row a plain click lands on, a Shift+click range starts from, and the only
+    /// row F2/rename ever targets. See [`Self::additional_tree_selection`]'s own docs for the
+    /// rest of a real multi-selection.
     pub(crate) selected_tree_path: Option<PathBuf>,
+    /// GitHub issue #145: every multi-selected file-tree row *besides* the anchor
+    /// ([`Self::selected_tree_path`]) - Ctrl/Cmd+click toggles membership, Shift+click replaces
+    /// this with the range between the anchor and the clicked row. The tree's real selection is
+    /// always this set plus the anchor together (`Self::tree_selected_paths`), never either alone,
+    /// and it's a `HashSet` rather than a `Vec` since membership (`Self::is_tree_path_selected`,
+    /// read on every visible row every frame) is the only real query this needs - row order comes
+    /// from the tree itself, not from this field, whenever an operation needs an ordered list.
+    pub(crate) additional_tree_selection: HashSet<PathBuf>,
     /// Surface C's `Diff | File` toggle for whichever file [`Self::open_change`] names - set to
     /// `Diff` by [`Self::open_change_diff`] and `File` by [`Self::open_file_view`], read by
     /// [`Self::render_code_surface`] alongside a "does this file even have a diff" check (a
