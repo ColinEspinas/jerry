@@ -248,8 +248,35 @@ impl AdeApp {
         self.load_graph(cx);
     }
 
-    pub(crate) fn select_graph_row(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub(crate) fn select_graph_row(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.graph_state.selected_row = Some(index);
+        // GitHub issue #139: this can switch `right_panel` away from `Branches`, unrendering
+        // `graph_state.branches_filter_focus_handle` - the same real
+        // dangling-focus bug class `Self::leave_graph_tab` already guards against (see its own
+        // docs), reached through a different door. Without this, `Window::focus` stayed pinned to
+        // a handle no longer in the rendered frame, and GPUI's `dispatch_key_event` silently falls
+        // back to its own synthetic root node for *every* keystroke from then on - not just ones
+        // this app binds - since that fallback path carries no registered `key_context`/action
+        // listeners at all (confirmed by reading `vendor/zed/crates/gpui/src/window.rs`'s
+        // `focus_node_id_in_rendered_frame`/`dispatch_key_event`), which is what made even a
+        // genuinely global, unscoped binding like `TogglePalette`'s `secondary-p`
+        // (`crate::default_key_bindings`) stop firing entirely. Redirects onto
+        // `Self::graph_focus_handle` rather than `restore_focus`- unlike leaving the tab
+        // outright, this stays inside it, and that handle is still rendered across a right-panel
+        // switch.
+        if self
+            .graph_state
+            .branches_filter_focus_handle
+            .is_focused(window)
+        {
+            window.focus(&self.graph_focus_handle, cx);
+            self.graph_view_focused = true;
+        }
         self.graph_state.right_panel = GraphRightPanel::Commit;
         if let Some(row) = self.current_graph_row(index) {
             if !row.commit.id.is_empty() {
@@ -295,7 +322,23 @@ impl AdeApp {
         self._load_commit_files_task = Some(task);
     }
 
-    pub(crate) fn set_graph_right_panel(&mut self, panel: GraphRightPanel, cx: &mut Context<Self>) {
+    pub(crate) fn set_graph_right_panel(
+        &mut self,
+        panel: GraphRightPanel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // GitHub issue #139 - see `Self::select_graph_row`'s own matching guard for the real bug
+        // this closes.
+        if panel != GraphRightPanel::Branches
+            && self
+                .graph_state
+                .branches_filter_focus_handle
+                .is_focused(window)
+        {
+            window.focus(&self.graph_focus_handle, cx);
+            self.graph_view_focused = true;
+        }
         self.graph_state.right_panel = panel;
         cx.notify();
     }
@@ -1157,8 +1200,8 @@ impl AdeApp {
                     }),
                 )
             })
-            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                this.select_graph_row(index, cx);
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.select_graph_row(index, window, cx);
             }))
             .child(render_graph_lane_canvas(index, row, lane_count))
             .child(render_graph_ref_chips(row))
@@ -1450,13 +1493,13 @@ impl AdeApp {
                 &options,
                 selected.to_string(),
                 cx,
-                |this, index, _window, cx| {
+                |this, index, window, cx| {
                     let panel = if index == 0 {
                         GraphRightPanel::Commit
                     } else {
                         GraphRightPanel::Branches
                     };
-                    this.set_graph_right_panel(panel, cx);
+                    this.set_graph_right_panel(panel, window, cx);
                 },
             ));
 
@@ -2823,8 +2866,8 @@ mod graph_row_menu_tests {
         // Branches filter box, the same real, independently-focusable surface
         // `leaving_the_graph_tab_from_the_branches_filter_lands_on_the_real_agent_pane` (in
         // `graph_focus_tests` below) uses for the identical reason.
-        app.update_in(cx, |app, _window, cx| {
-            app.set_graph_right_panel(GraphRightPanel::Branches, cx);
+        app.update_in(cx, |app, window, cx| {
+            app.set_graph_right_panel(GraphRightPanel::Branches, window, cx);
         });
         let (focused_before, graph_handle, filter_handle) = app.update_in(cx, |app, window, cx| {
             window.focus(&app.graph_state.branches_filter_focus_handle, cx);
@@ -4678,8 +4721,8 @@ mod graph_selection_render_tests {
             .debug_bounds("graph-row-1-lane-canvas")
             .expect("row 1's lane canvas must be painted while unselected");
 
-        app.update(cx, |app, cx| {
-            app.select_graph_row(1, cx);
+        app.update_in(cx, |app, window, cx| {
+            app.select_graph_row(1, window, cx);
         });
         cx.run_until_parked();
         assert_eq!(
@@ -4934,8 +4977,8 @@ mod graph_focus_tests {
             app.open_git_graph(window, cx);
         });
         cx.run_until_parked();
-        app.update_in(cx, |app, _window, cx| {
-            app.set_graph_right_panel(GraphRightPanel::Branches, cx);
+        app.update_in(cx, |app, window, cx| {
+            app.set_graph_right_panel(GraphRightPanel::Branches, window, cx);
         });
         cx.run_until_parked();
         app.update_in(cx, |app, window, cx| {
@@ -4972,6 +5015,80 @@ mod graph_focus_tests {
         assert!(
             !app.read_with(cx, |app, _| app.graph_tab_active),
             "the graph tab must have been genuinely left, not merely re-focused"
+        );
+    }
+
+    /// GitHub issue #139 ("sometimes we can't open the command palette with the keyboard
+    /// shortcut, it seems to depend of what we focus"). `Self::select_graph_row` and
+    /// `Self::set_graph_right_panel` used to switch `graph_state.right_panel` away from
+    /// `Branches` with no check at all against `graph_state.branches_filter_focus_handle` -
+    /// exactly the gap `leaving_the_graph_tab_from_the_branches_filter_lands_on_the_real_agent_pane`
+    /// above already closed for *leaving the tab entirely*, just reached through a different
+    /// door: staying inside the tab and switching the right panel back to Commit.
+    ///
+    /// Left unguarded, `Window::focus` stayed pinned to a `FocusId` no longer in the rendered
+    /// frame. That is not a narrow, palette-specific bug: GPUI's own `dispatch_key_event`
+    /// (`vendor/zed/crates/gpui/src/window.rs`) can't find that `FocusId` in the last rendered
+    /// frame and falls back to its synthetic root dispatch node, which carries no registered
+    /// `key_context`/action listeners at all - so *every* global, unscoped keybinding
+    /// (`crate::default_key_bindings`' `secondary-p`/`TogglePalette` included) silently stopped
+    /// firing, with no panic or log. This test drives the exact real user sequence the bug
+    /// report described and asserts on the one symptom the user could actually see: a real,
+    /// simulated `secondary-p` keystroke failing to open the palette.
+    #[gpui::test]
+    fn selecting_a_row_after_the_branches_filter_was_focused_leaves_the_palette_shortcut_working(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded(cx);
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.set_graph_right_panel(GraphRightPanel::Branches, window, cx);
+            window.focus(&app.graph_state.branches_filter_focus_handle, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.update_in(cx, |app, window, _cx| app
+                .graph_state
+                .branches_filter_focus_handle
+                .is_focused(window)),
+            "premise: the Branches filter box really is focused"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.select_graph_row(0, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.right_panel),
+            GraphRightPanel::Commit,
+            "premise: selecting a row really did switch the right panel away from Branches, \
+             unrendering the filter box"
+        );
+        assert!(
+            !app.update_in(cx, |app, window, _cx| app
+                .graph_state
+                .branches_filter_focus_handle
+                .is_focused(window)),
+            "selecting a row must move real focus off the now-unrendered filter box, not leave \
+             it dangling there"
+        );
+
+        let secondary_p = if cfg!(target_os = "macos") {
+            "cmd-p"
+        } else {
+            "ctrl-p"
+        };
+        cx.simulate_keystrokes(secondary_p);
+        assert!(
+            app.read_with(cx, |app, _| app.palette_open),
+            "a real, simulated {secondary_p} keystroke must still open the palette after this \
+             sequence - before the fix, Window::focus was left dangling on the unrendered \
+             filter box and every global keybinding, not just this one, silently stopped firing"
         );
     }
 
@@ -5060,7 +5177,7 @@ mod graph_focus_tests {
 
         app.update_in(cx, |app, window, cx| {
             app.open_git_graph(window, cx);
-            app.set_graph_right_panel(GraphRightPanel::Branches, cx);
+            app.set_graph_right_panel(GraphRightPanel::Branches, window, cx);
             window.focus(&app.graph_state.branches_filter_focus_handle, cx);
         });
         cx.run_until_parked();
@@ -5139,7 +5256,7 @@ mod graph_focus_tests {
 
         app.update_in(cx, |app, window, cx| {
             app.open_git_graph(window, cx);
-            app.set_graph_right_panel(GraphRightPanel::Branches, cx);
+            app.set_graph_right_panel(GraphRightPanel::Branches, window, cx);
             window.focus(&app.graph_state.branches_filter_focus_handle, cx);
         });
         // `open_git_graph` kicks off a real, async `load_graph` (a background `gix` commit
