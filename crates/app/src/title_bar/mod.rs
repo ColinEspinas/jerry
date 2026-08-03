@@ -35,8 +35,7 @@ use crate::worktree_history::flow as worktree_history;
 #[cfg(test)]
 use gpui::Pixels;
 use gpui::{
-    div, font, prelude::*, px, App, BoxShadow, ClickEvent, Context, MouseButton, Window,
-    WindowControlArea,
+    div, font, prelude::*, px, App, ClickEvent, Context, MouseButton, Window, WindowControlArea,
 };
 #[cfg(test)]
 use std::path::PathBuf;

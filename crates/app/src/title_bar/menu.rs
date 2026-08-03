@@ -7,7 +7,7 @@
 use super::*;
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
-use crate::root::widgets::render_menu_group_divider;
+use crate::root::widgets::{menu_popover_chrome, render_menu_group_divider};
 use crate::work_surface::render::render_dropdown_menu_row;
 
 /// The Windows/Linux title bar's five real menu dropdowns (`File Edit View Agent Help`) - see
@@ -107,7 +107,6 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let bounds = self.title_menu_button_bounds[menu.index()];
-        let (shadow_x, shadow_y, shadow_blur) = theme::shadow::PLUS_MENU;
         let macos = self.window_controls_style().is_macos();
         let rows = match menu {
             TitleMenu::File => self.file_menu_rows(macos, cx),
@@ -130,27 +129,20 @@ impl AdeApp {
                 cx.notify();
             }))
             .child(
-                div()
-                    .id("title-menu-popover")
-                    .absolute()
-                    .left(bounds.origin.x)
-                    .top(bounds.origin.y + bounds.size.height)
-                    .w(theme::zone::PLUS_MENU_WIDTH)
-                    .py(px(4.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::CARD)
-                    .shadow(vec![BoxShadow::new(
-                        shadow_x,
-                        shadow_y,
-                        gpui::black().opacity(0.55),
-                    )
-                    .blur_radius(shadow_blur)])
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }))
-                    .children(rows),
+                menu_popover_chrome(
+                    div()
+                        .id("title-menu-popover")
+                        .absolute()
+                        .left(bounds.origin.x)
+                        .top(bounds.origin.y + bounds.size.height)
+                        .w(theme::zone::PLUS_MENU_WIDTH)
+                        .py(px(4.0)),
+                    theme::shadow::MENU,
+                )
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .children(rows),
             )
             .into_any_element()
     }

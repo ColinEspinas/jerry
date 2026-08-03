@@ -17,6 +17,20 @@
 //! AdeApp::render_plus_menu` already establishes for this app's other floating popover, off
 //! `AdeApp::plus_button_bounds`), not nested inside the File view's own `uniform_list` - a popup
 //! anchored to one row must not be clipped by that row's own virtualized scroll container.
+//!
+//! ## Deliberately not on the shared menu chrome (GitHub issue #129)
+//!
+//! An audit for that issue flagged this popover's `theme::surface::POPOVER` background,
+//! `theme::radius::CARD_SM` (5px) corner radius, and `theme::shadow::POPOVER` shadow as
+//! inconsistent with the `theme::surface::PALETTE`/`theme::radius::CARD`/`theme::shadow::MENU`
+//! recipe every dropdown/context-menu in the app now shares. They're not drift: each value is
+//! pinned to `design_handoff_jerry_ade/Jerry.dc.html`'s own completions-popup markup (line ~406 -
+//! `border-radius:5px;background:#181c20;box-shadow:0 8px 20px rgba(0,0,0,.5)`), which specifies
+//! a genuinely different recipe from the app-level menus for this specific surface. Left
+//! unchanged, along with `crate::code_surface::lsp_ui`'s hover card, which intentionally matches
+//! it (same `theme::surface::POPOVER`/`theme::border::POPOVER` pair, plus every plain tooltip via
+//! `crate::root::widgets::TextTooltip`) - all three are the "info popover" family, not the "menu"
+//! family, and have no per-row hover at all (keyboard/passive, not mouse-driven).
 
 use super::*;
 use crate::code_surface::edit_buffer::EditBuffer;

@@ -3,11 +3,11 @@
 //! AdeApp` glue that opens/closes/loads it. See `super`'s module docs for scope.
 
 use super::*;
-use crate::root::widgets::{render_sidebar_message, render_tag_pill};
+use crate::root::widgets::{menu_popover_chrome, render_sidebar_message, render_tag_pill};
 use crate::settings::widgets;
 use crate::sidebar::changes;
 use crate::work_surface::render::{render_dropdown_menu_row, DraggedTab, TabChromeArgs};
-use gpui::{BoxShadow, KeyDownEvent, Pixels};
+use gpui::{KeyDownEvent, Pixels};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use wt_core::graph::{DotKind, ElbowKind, Graph, GraphRow, GraphScope, RefKind};
 
@@ -930,7 +930,6 @@ impl AdeApp {
 
     pub(crate) fn render_graph_push_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let bounds = self.graph_state.push_button_bounds;
-        let (shadow_x, shadow_y, shadow_blur) = theme::shadow::PLUS_MENU;
         div()
             .id("graph-push-menu-scrim")
             .absolute()
@@ -943,89 +942,82 @@ impl AdeApp {
                 cx.notify();
             }))
             .child(
-                div()
-                    .id("graph-push-menu-popover")
-                    .absolute()
-                    .left(bounds.origin.x)
-                    .top(bounds.origin.y + bounds.size.height + px(2.0))
-                    .w(theme::graph::PUSH_MENU_WIDTH)
-                    .py(px(4.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::CARD)
-                    .shadow(vec![BoxShadow::new(
-                        shadow_x,
-                        shadow_y,
-                        gpui::black().opacity(0.55),
+                menu_popover_chrome(
+                    div()
+                        .id("graph-push-menu-popover")
+                        .absolute()
+                        .left(bounds.origin.x)
+                        .top(bounds.origin.y + bounds.size.height + px(2.0))
+                        .w(theme::graph::PUSH_MENU_WIDTH)
+                        .py(px(4.0)),
+                    theme::shadow::MENU,
+                )
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2191}",
+                        theme::button::BLUE_FG.into(),
+                        theme::button::BLUE_BG.into(),
+                        "Push",
+                        "fast-forwards the remote branch".to_string(),
+                        Vec::new(),
+                        true,
                     )
-                    .blur_radius(shadow_blur)])
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }))
-                    .child(
-                        render_dropdown_menu_row(
-                            "\u{2191}",
-                            theme::button::BLUE_FG.into(),
-                            theme::button::BLUE_BG.into(),
-                            "Push",
-                            "fast-forwards the remote branch".to_string(),
-                            Vec::new(),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                this.request_graph_push(wt_core::remote::PushForce::None, cx);
-                            },
-                        )),
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            this.request_graph_push(wt_core::remote::PushForce::None, cx);
+                        },
+                    )),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2191}",
+                        theme::button::DANGER_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Force with lease",
+                        if self.graph_state.push_force_confirm_armed
+                            == Some(wt_core::remote::PushForce::WithLease)
+                        {
+                            "click again to really push".to_string()
+                        } else {
+                            "aborts if the remote moved".to_string()
+                        },
+                        Vec::new(),
+                        true,
                     )
-                    .child(
-                        render_dropdown_menu_row(
-                            "\u{2191}",
-                            theme::button::DANGER_FG.into(),
-                            theme::surface::CHIP_NEUTRAL.into(),
-                            "Force with lease",
-                            if self.graph_state.push_force_confirm_armed
-                                == Some(wt_core::remote::PushForce::WithLease)
-                            {
-                                "click again to really push".to_string()
-                            } else {
-                                "aborts if the remote moved".to_string()
-                            },
-                            Vec::new(),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                this.request_graph_push(wt_core::remote::PushForce::WithLease, cx);
-                            },
-                        )),
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            this.request_graph_push(wt_core::remote::PushForce::WithLease, cx);
+                        },
+                    )),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2191}",
+                        theme::button::DANGER_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Force",
+                        if self.graph_state.push_force_confirm_armed
+                            == Some(wt_core::remote::PushForce::Force)
+                        {
+                            "click again to really push".to_string()
+                        } else {
+                            "overwrites the remote unconditionally".to_string()
+                        },
+                        Vec::new(),
+                        true,
                     )
-                    .child(
-                        render_dropdown_menu_row(
-                            "\u{2191}",
-                            theme::button::DANGER_FG.into(),
-                            theme::surface::CHIP_NEUTRAL.into(),
-                            "Force",
-                            if self.graph_state.push_force_confirm_armed
-                                == Some(wt_core::remote::PushForce::Force)
-                            {
-                                "click again to really push".to_string()
-                            } else {
-                                "overwrites the remote unconditionally".to_string()
-                            },
-                            Vec::new(),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                this.request_graph_push(wt_core::remote::PushForce::Force, cx);
-                            },
-                        )),
-                    ),
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            this.request_graph_push(wt_core::remote::PushForce::Force, cx);
+                        },
+                    )),
+                ),
             )
     }
 
@@ -1285,7 +1277,6 @@ impl AdeApp {
         let Some(row) = self.current_graph_row(index) else {
             return gpui::Empty.into_any_element();
         };
-        let (shadow_x, shadow_y, shadow_blur) = theme::shadow::PLUS_MENU;
         let sha = row.commit.id.clone();
         let short_sha = row.commit.short_id.clone();
         let subject = row.commit.subject.clone();
@@ -1325,61 +1316,88 @@ impl AdeApp {
                 }),
             )
             .child(
-                div()
-                    .id("graph-row-menu-popover")
-                    .debug_selector(|| "graph-row-menu-popover".to_string())
-                    .absolute()
-                    .left(menu.origin_x)
-                    .top(menu.origin_y)
-                    .w(theme::graph::ROW_MENU_WIDTH)
-                    .py(px(4.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::CARD)
-                    .shadow(vec![BoxShadow::new(shadow_x, shadow_y, gpui::black().opacity(0.55))
-                        .blur_radius(shadow_blur)])
-                    // Occludes so a right-click *inside* the popover's own bounds can never fall
-                    // through to whatever row it happens to be painted on top of (a real,
-                    // adversarial-audit-found bug: the popover opens *over* the row list, and
-                    // without this a right-click on the panel itself retargeted the menu to
-                    // whichever row was underneath it). Scoped to the panel alone, not the whole
-                    // scrim above - the panel is a small, content-sized rectangle that never
-                    // reaches the title bar, so (unlike `render_tree_context_menu`'s own
-                    // full-window occluding scrim, which had to start below the title bar for
-                    // exactly this reason - see that method's docs) no caption-button interaction
-                    // is possible here.
-                    .occlude()
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }))
-                    .child(render_graph_row_menu_header("Branch"))
-                    .child(render_dropdown_menu_row(
-                        "\u{2713}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Check out", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
-                    .child(render_dropdown_menu_row(
-                        "+", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Create branch here", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
-                    .child(render_dropdown_menu_row(
-                        "\u{25b8}", theme::button::BLUE_FG.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Start agent from this commit", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
-                    .child(render_graph_row_menu_header("Apply"))
-                    .child(render_dropdown_menu_row(
-                        "\u{2398}", theme::button::BLUE_FG.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Cherry-pick", String::new(), Vec::new(), true,
-                    ).on_click(cx.listener({
+                menu_popover_chrome(
+                    div()
+                        .id("graph-row-menu-popover")
+                        .debug_selector(|| "graph-row-menu-popover".to_string())
+                        .absolute()
+                        .left(menu.origin_x)
+                        .top(menu.origin_y)
+                        .w(theme::graph::ROW_MENU_WIDTH)
+                        .py(px(4.0)),
+                    theme::shadow::MENU,
+                )
+                // Occludes so a right-click *inside* the popover's own bounds can never fall
+                // through to whatever row it happens to be painted on top of (a real,
+                // adversarial-audit-found bug: the popover opens *over* the row list, and
+                // without this a right-click on the panel itself retargeted the menu to
+                // whichever row was underneath it). Scoped to the panel alone, not the whole
+                // scrim above - the panel is a small, content-sized rectangle that never
+                // reaches the title bar, so (unlike `render_tree_context_menu`'s own
+                // full-window occluding scrim, which had to start below the title bar for
+                // exactly this reason - see that method's docs) no caption-button interaction
+                // is possible here.
+                .occlude()
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .child(render_graph_row_menu_header("Branch"))
+                .child(render_dropdown_menu_row(
+                    "\u{2713}",
+                    theme::text::GHOST.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
+                    "Check out",
+                    "not implemented yet".to_string(),
+                    Vec::new(),
+                    false,
+                ))
+                .child(render_dropdown_menu_row(
+                    "+",
+                    theme::text::GHOST.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
+                    "Create branch here",
+                    "not implemented yet".to_string(),
+                    Vec::new(),
+                    false,
+                ))
+                .child(render_dropdown_menu_row(
+                    "\u{25b8}",
+                    theme::button::BLUE_FG.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
+                    "Start agent from this commit",
+                    "not implemented yet".to_string(),
+                    Vec::new(),
+                    false,
+                ))
+                .child(render_graph_row_menu_header("Apply"))
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2398}",
+                        theme::button::BLUE_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Cherry-pick",
+                        String::new(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
                         let sha = sha.clone();
                         move |this, _event: &ClickEvent, _window, cx| {
                             this.request_graph_cherry_pick(sha.clone(), cx);
                         }
-                    })))
-                    .child(render_dropdown_menu_row(
-                        "\u{21b6}", theme::button::AMBER_FG.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Revert", String::new(), Vec::new(), true,
-                    ).on_click(cx.listener({
+                    })),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{21b6}",
+                        theme::button::AMBER_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Revert",
+                        String::new(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
                         let sha = sha.clone();
                         move |this, _event: &ClickEvent, _window, cx| {
                             this.request_graph_revert(sha.clone(), cx);
