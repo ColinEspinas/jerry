@@ -152,7 +152,7 @@ impl AdeApp {
             .child(
                 div()
                     .flex_none()
-                    .h(theme::band::RAIL_HEADER)
+                    .h(theme::band::CHROME_HEADER)
                     .flex()
                     .items_center()
                     .justify_between()

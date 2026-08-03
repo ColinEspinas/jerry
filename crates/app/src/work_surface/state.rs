@@ -376,9 +376,6 @@ pub enum ActionKind {
     /// stand-in for `Retry`/`Resume` (this app has no saved-agent resumability to actually
     /// resume *from* - see [`pty_state_label`] on the same gap).
     Respawn,
-    /// Closes this tab (`Agents::close`) - the same action as the context bar's own `Archive`
-    /// button.
-    Archive,
     /// `crate::worktree_history::flow::AdeApp::keep_all_changes` (Revision R10): a real,
     /// undoable `wt_core::undo::commit_all_changes` on this agent's worktree.
     KeepAllChanges,
@@ -413,7 +410,10 @@ pub struct FooterAction {
 /// R10) · `Review diff` (still unimplemented) · `Open in editor` (still unimplemented) ·
 /// `Discard worktree` (real - Revision R10); ask gets `Open terminal` · `Interrupt ⌃C`; fail gets
 /// `Retry ⌘R` · `Open terminal` · `Discard worktree` (real - Revision R10); run gets
-/// `Interrupt ⌃C` · `Open terminal`; idle gets `Resume ⌘⏎` (blue) · `Archive`.
+/// `Interrupt ⌃C` · `Open terminal`; idle gets `Resume ⌘⏎` (blue) alone - `Archive` is
+/// deliberately not repeated here (GitHub issue #20): the context bar's own
+/// `Self::render_archive_button` already renders it unconditionally for every non-bare agent, so
+/// an idle agent used to show it twice.
 pub fn footer_actions(status: Status) -> Vec<FooterAction> {
     match status {
         Status::Review => vec![
@@ -513,22 +513,13 @@ pub fn footer_actions(status: Status) -> Vec<FooterAction> {
                 implemented: true,
             },
         ],
-        Status::Idle => vec![
-            FooterAction {
-                kind: ActionKind::Respawn,
-                label: "Resume",
-                keycap: Some("mod+enter"),
-                style: ActionStyle::PrimaryBlue,
-                implemented: true,
-            },
-            FooterAction {
-                kind: ActionKind::Archive,
-                label: "Archive",
-                keycap: None,
-                style: ActionStyle::Ghost,
-                implemented: true,
-            },
-        ],
+        Status::Idle => vec![FooterAction {
+            kind: ActionKind::Respawn,
+            label: "Resume",
+            keycap: Some("mod+enter"),
+            style: ActionStyle::PrimaryBlue,
+            implemented: true,
+        }],
     }
 }
 
@@ -683,13 +674,14 @@ mod tests {
         assert!(actions.last().unwrap().implemented);
     }
 
+    /// GitHub issue #20: idle no longer repeats `Archive` in the footer - the context bar already
+    /// renders it unconditionally for every non-bare agent (`Self::render_archive_button`).
     #[test]
-    fn idle_actions_are_resume_then_archive_both_real() {
+    fn idle_actions_are_just_a_real_resume_not_a_second_archive() {
         let actions = footer_actions(Status::Idle);
-        assert_eq!(actions.len(), 2);
+        assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].kind, ActionKind::Respawn);
-        assert_eq!(actions[1].kind, ActionKind::Archive);
-        assert!(actions.iter().all(|a| a.implemented));
+        assert!(actions[0].implemented);
     }
 
     #[test]
