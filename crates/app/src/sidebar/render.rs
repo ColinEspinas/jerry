@@ -985,8 +985,14 @@ impl AdeApp {
         let tree_focused = self.tree_focus_handle.is_focused(window);
         let open_change_path = self.open_change_absolute_path();
         let is_open_file = open_change_path.as_deref() == Some(entry.path.as_path());
+        // GitHub issue #145: a Ctrl/Cmd- or Shift-selected row (beyond the anchor) highlights
+        // exactly like the anchor itself does - same focus gating, since it's a keyboard-
+        // navigation-style selection, not a standing "this is open" marker the way `is_open_file`
+        // is.
         let is_selected = is_open_file
-            || (tree_focused && self.selected_tree_path.as_deref() == Some(entry.path.as_path()));
+            || (tree_focused
+                && (self.selected_tree_path.as_deref() == Some(entry.path.as_path())
+                    || self.additional_tree_selection.contains(&entry.path)));
 
         // `debug_selector` is a no-op outside test builds; lets a real render test assert on
         // which rows this list genuinely painted, which is the only way to prove the
@@ -1104,16 +1110,27 @@ impl AdeApp {
             row = row
                 .cursor_pointer()
                 .hover(|el| el.bg(theme::surface::ROW_HOVER))
-                .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     // Selecting *and* focusing, both real: a folder click is what gives the tree
                     // keyboard focus (so its `Ctrl+C`/`F2`/`Shift+F10` bindings can match at
                     // all) and what gives those bindings a target. Deliberately here, in the
                     // click handler, and not inside `toggle_dir_expanded` - that method is also
                     // called programmatically (`start_tree_new_entry`, the reveal paths), where
                     // moving the selection would be a side effect nobody asked for.
-                    this.selected_tree_path = Some(path.clone());
                     this.focus_file_tree(window, cx);
-                    this.toggle_dir_expanded(path.clone(), cx);
+                    let modifiers = event.modifiers();
+                    // GitHub issue #145: Ctrl/Cmd- or Shift-click only ever adjusts the
+                    // selection, never the expand/collapse state - a modifier-click that also
+                    // toggled the folder open would be a second, unrelated effect nobody asked
+                    // for from what's meant to be a pure selection gesture.
+                    if modifiers.secondary() || modifiers.shift {
+                        this.tree_click_select(path.clone(), modifiers);
+                    } else {
+                        this.selected_tree_path = Some(path.clone());
+                        this.additional_tree_selection.clear();
+                        this.toggle_dir_expanded(path.clone(), cx);
+                    }
+                    cx.notify();
                 }));
         } else {
             // GitHub issue #105: uses `Self::open_file_view_from_tree_click`, not
@@ -1128,9 +1145,20 @@ impl AdeApp {
             row = row
                 .cursor_pointer()
                 .hover(|el| el.bg(theme::surface::ROW_HOVER))
-                .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                    this.open_file_view_from_tree_click(path.clone(), window, cx);
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     this.focus_file_tree(window, cx);
+                    let modifiers = event.modifiers();
+                    // GitHub issue #145: a modifier-click only ever adjusts the selection, never
+                    // opens the file - opening every Ctrl/Cmd- or Shift-selected file at once
+                    // would be a real, surprising side effect of what's meant to be a pure
+                    // selection gesture (and would fight the very "build up a selection" the
+                    // modifier is for).
+                    if modifiers.secondary() || modifiers.shift {
+                        this.tree_click_select(path.clone(), modifiers);
+                        cx.notify();
+                    } else {
+                        this.open_file_view_from_tree_click(path.clone(), window, cx);
+                    }
                 }));
         }
 

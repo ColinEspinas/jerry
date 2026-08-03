@@ -191,6 +191,11 @@ impl AdeApp {
         if absolute.starts_with(&self.file_tree_root) {
             self.reveal_in_tree(&absolute, cx);
             self.selected_tree_path = Some(absolute);
+            // GitHub issue #145: opening any single file - from the tree itself, the palette, a
+            // terminal link, go-to-definition, wherever - collapses a stray multi-selection down
+            // to just that file, the same way a plain click on a tree row already did before
+            // multi-selection existed.
+            self.additional_tree_selection.clear();
         }
         self.refresh_open_diff_file_cache();
         // A hover card is only valid for the file it was requested against - and so is a real
