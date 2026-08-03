@@ -982,6 +982,75 @@ impl AdeApp {
         }
     }
 
+    /// GitHub issue #148: drag-and-drop's own "move these into that folder" - the same real,
+    /// synchronous `file_ops::move_path` + `Self::rename_open_paths` +
+    /// `TreeUndoEntry::Relocate` [`Self::paste_into_dir`]'s own `Cut` branch already uses, just
+    /// generalized to a whole list of sources (a dragged multi-selection) instead of the
+    /// clipboard's single entry - a real second real caller of the same move primitive, not a
+    /// second, parallel move implementation.
+    ///
+    /// Each source is handled independently: one real name collision or one attempt to drop a
+    /// folder into its own subtree reports a real error for *that* source and moves on to the
+    /// rest, rather than a single bad source aborting an otherwise-valid bulk move partway
+    /// through. `sources` already inside `dir` are silently skipped (dropping a selection back
+    /// onto its own current parent is a real no-op, not an error, matching `paste_into_dir`'s
+    /// identical "already exactly where it was asked to go" rule).
+    pub(in crate::sidebar) fn move_paths_into_dir(
+        &mut self,
+        sources: &[PathBuf],
+        dir: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        let mut last_destination = None;
+        for source in sources {
+            let Some(name) = source
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            if dir.join(&name) == *source {
+                continue;
+            }
+            // A folder can never be dropped into itself or one of its own descendants - the
+            // filesystem's own `rename` would either fail outright or (worse, on some platforms)
+            // silently do something no drag gesture ever meant to ask for.
+            if dir == source.as_path() || dir.starts_with(source) {
+                self.report_tree_op_error(
+                    format!("can't move {} into its own subtree", source.display()),
+                    cx,
+                );
+                continue;
+            }
+            let destination = match file_ops::unique_destination(dir, &name) {
+                Ok(destination) => destination,
+                Err(err) => {
+                    self.report_tree_op_error(err.to_string(), cx);
+                    continue;
+                }
+            };
+            if let Err(err) = file_ops::move_path(source, &destination) {
+                self.report_tree_op_error(err.to_string(), cx);
+                continue;
+            }
+            self.rename_open_paths(source, &destination, cx);
+            self.push_tree_undo_entry(
+                TreeUndoEntry::Relocate {
+                    old_path: source.clone(),
+                    new_path: destination.clone(),
+                },
+                cx,
+            );
+            last_destination = Some(destination);
+        }
+        if let Some(destination) = last_destination {
+            self.reveal_in_tree(&destination, cx);
+            self.selected_tree_path = Some(destination);
+            self.additional_tree_selection.clear();
+            self.refresh_after_file_op(cx);
+        }
+    }
+
     /// "Duplicate" - a copy next to the original, named by the same
     /// [`file_ops::unique_destination`] rule a paste-into-the-source-folder uses, so the two can
     /// never disagree about what a duplicate is called.
@@ -3942,6 +4011,137 @@ mod tree_multiselect_tests {
             assert!(
                 app.additional_tree_selection.is_empty(),
                 "opening a real file must collapse whatever stray multi-selection preceded it"
+            );
+        });
+    }
+}
+
+/// GitHub issue #148: `AdeApp::move_paths_into_dir` - the real move `Self::render_file_tree_row`'s
+/// own `.on_drop`/`Self::file_tree_shell`'s root drop both call. Drives the method directly rather
+/// than simulating a real GPUI drag gesture (this app's own test harness has no drag/drop
+/// simulator - `crate::work_surface::render`'s own tab-reorder tests call `AdeApp::reorder_tab`/
+/// `AdeApp::drop_dragged_tab` directly for the identical reason), so this is real coverage of the
+/// move primitive itself, not of the mouse plumbing on top of it (which is the same real
+/// `on_drag`/`on_drag_move`/`on_drop` triple already exercised for tabs).
+#[cfg(test)]
+mod tree_drag_move_tests {
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn seed(repo: &TempDir) {
+        fs::create_dir_all(repo.path().join("dest")).expect("mkdir");
+        fs::write(repo.path().join("a.txt"), "a\n").expect("write");
+        fs::write(repo.path().join("b.txt"), "b\n").expect("write");
+    }
+
+    #[gpui::test]
+    fn dropping_a_file_onto_a_folder_moves_it_there_with_a_real_undo_entry(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let a = repo.path().join("a.txt");
+        let dest = repo.path().join("dest");
+        let undo_len_before = app.read_with(cx, |app, _| app.tree_undo_stack.len());
+        app.update(cx, |app, cx| {
+            app.move_paths_into_dir(std::slice::from_ref(&a), &dest, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(!a.exists(), "the old path must be gone");
+        assert!(
+            dest.join("a.txt").exists(),
+            "the file must really be in dest/ now"
+        );
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.tree_undo_stack.len(),
+                undo_len_before + 1,
+                "a drag-move must record a real, undoable Relocate entry - the same as a cut/paste \
+                 move or a rename"
+            );
+            assert_eq!(
+                app.selected_tree_path.as_deref(),
+                Some(dest.join("a.txt").as_path())
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn dropping_a_multi_selection_moves_every_selected_path(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let a = repo.path().join("a.txt");
+        let b = repo.path().join("b.txt");
+        let dest = repo.path().join("dest");
+        app.update(cx, |app, cx| {
+            app.move_paths_into_dir(&[a.clone(), b.clone()], &dest, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(!a.exists());
+        assert!(!b.exists());
+        assert!(dest.join("a.txt").exists());
+        assert!(dest.join("b.txt").exists());
+    }
+
+    #[gpui::test]
+    fn dropping_a_folder_onto_its_own_descendant_is_refused_with_a_real_error(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        fs::create_dir_all(repo.path().join("dest/inner")).expect("mkdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let dest = repo.path().join("dest");
+        let inner = repo.path().join("dest/inner");
+        app.update(cx, |app, cx| {
+            app.move_paths_into_dir(std::slice::from_ref(&dest), &inner, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(dest.exists(), "the folder must not have moved at all");
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.tree_op_error.is_some(),
+                "dropping a folder into its own subtree must report a real error, not silently \
+                 no-op or corrupt the tree"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn dropping_onto_its_own_current_parent_is_a_real_no_op(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let a = repo.path().join("a.txt");
+        let root = repo.path().to_path_buf();
+        let undo_len_before = app.read_with(cx, |app, _| app.tree_undo_stack.len());
+        app.update(cx, |app, cx| {
+            app.move_paths_into_dir(std::slice::from_ref(&a), &root, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(a.exists(), "the file must still be exactly where it was");
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.tree_undo_stack.len(),
+                undo_len_before,
+                "dropping a file back onto its own current folder must not record a real move - \
+                 there is nothing to undo"
             );
         });
     }
