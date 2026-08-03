@@ -7194,3 +7194,50 @@ would have made it vacuous (the row it checks would itself become exempt).
 **Verification**: `cargo test --workspace -p app rail::render::rail_row_tests` - 6 passed, 0
 failed. `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all -- --check` -
 both clean.
+
+## A settings toggle for the code editor's own indent guides (GitHub issue #122)
+
+The file tree already had real indent guides; the code editor itself (the File view) had none,
+and `theme::editor::INDENT_GUIDE`/`INDENT_GUIDE_ACTIVE` were already sitting in the theme as
+explicitly-documented "not yet painted by any real renderer" tokens.
+
+Added `AppearanceSettings::show_indent_guides` (default `true`, mirroring `caret_blink`'s own
+field/toggle pattern exactly, settings UI row included) and real painted guides in
+`render_editable_file_view_line`: one absolutely-positioned 1px line per real indent level a
+line's own leading whitespace covers, added before the line's code-run children so they paint
+underneath the actual glyphs. Guide x-positions are resolved once per visible range in
+`render_file_view`'s row-building closure from a real, measured monospace character width
+(`Window::text_system().advance`, the same real API `terminal::pane::AdeApp::cell_size` already
+uses) at the code text's real font size - never a hardcoded pixel constant - and the real indent
+width used to count levels (`indent::leading_indent_levels`, tab-stop-aware) comes from
+`resolved_indent_settings_for_target()`, the exact same resolution `Tab`/`Enter`'s own auto-indent
+(issue #121, above) already use, so a `.editorconfig` override changes all three consistently.
+`indent_guide_xs` is empty whenever the setting is off or a line has no leading indentation, so an
+unaffected row's element tree is unchanged either way.
+
+Two real gaps found and fixed during this session's own verification pass, before this shipped:
+
+1. The new settings-persistence test (`settings::render::indent_guide_settings_tests::
+   toggle_indent_guides_flips_the_real_persisted_setting_and_persists_across_reload`) failed on
+   first run - its `open_app_with_state_dir` helper always constructed the "reloaded" app with
+   `Settings::default()` instead of actually loading `settings_path` first
+   (`Settings::load_or_init_at`, the same real load `keybinding_rebind_tests`' own established
+   sibling pattern in this same file already uses), so the "reload" never re-read its own file and
+   the test could never have failed no matter what persistence bug it was meant to catch. Fixed by
+   loading real settings from disk before constructing, and by adding the missing
+   `cx.run_until_parked()` between the toggle and the reload (the real serial settings-save writer
+   task is asynchronous).
+2. `settings::render::indent_guide_settings_tests`' own module docs claimed the guides' real
+   *painted* effect was covered separately by `code_surface::editing::indent_guide_tests` - that
+   module didn't exist. Added the real coverage directly instead: two `#[gpui::test]`s
+   (`an_indented_lines_indent_guide_paints_when_the_setting_is_on`/
+   `no_indent_guide_paints_when_the_setting_is_off`) that open a real indented file and assert on
+   `debug_bounds("file-view-indent-guide-2-0")` - proving a guide genuinely paints (or doesn't),
+   not merely that the boolean setting flips.
+
+**Verification**: `cargo build --workspace`, `cargo clippy --workspace --all-targets -- -D
+warnings`, `cargo fmt --all -- --check` - all clean. `cargo test --workspace -p app settings::`:
+132 passed, 0 failed. `cargo test --workspace -p app code_surface::`: 340 passed, 5 failed - all 5
+pre-existing and environment-specific (LSP wiring/GPU-paint tests, already documented elsewhere in
+this log), none touching indent guides; both new indent-guide-paint tests and the persistence test
+pass.

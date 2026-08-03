@@ -754,14 +754,20 @@ pub mod editor {
     /// - bracket-matching isn't implemented in the File view yet.
     pub const MATCHING_BRACKET: ColorToken = hex(0x2c4a63);
 
-    /// A resting indent guide inside the code surface. **Not yet painted by any real renderer** -
-    /// distinct from [`tree::INDENT_GUIDE`], the file-*tree* sidebar's own real, already-painted
-    /// indent guide. Aliases [`super::border::DIVIDER`], matching [`tree::INDENT_GUIDE`]'s own
-    /// choice, so the two would read as the same visual language if the code-surface version is
-    /// ever built.
+    /// A resting indent guide inside the code surface (GitHub issue #122: "Add settings to
+    /// display indents in code editor") - distinct from [`tree::INDENT_GUIDE`], the file-*tree*
+    /// sidebar's own real, already-painted indent guide. Now really painted too:
+    /// `crate::code_surface::editing::render_editable_file_view_line` draws one guide per real
+    /// indent level, gated by `crate::settings::store::AppearanceSettings::show_indent_guides`.
+    /// Aliases [`super::border::DIVIDER`], matching [`tree::INDENT_GUIDE`]'s own choice, so the
+    /// two read as the same visual language.
     pub const INDENT_GUIDE: ColorToken = super::border::DIVIDER;
     /// The indent guide for the level the caret currently sits in. **Not yet painted by any real
-    /// renderer.** Aliases [`super::border::SELECTED_EDGE`], matching [`tree::INDENT_GUIDE_ACTIVE`].
+    /// renderer** - GitHub issue #122's own real indent guides (above) don't distinguish an
+    /// "active" level, since that would need real scope/bracket-matching data this codebase
+    /// doesn't have yet (see [`MATCHING_BRACKET`]'s own docs). Aliases
+    /// [`super::border::SELECTED_EDGE`], matching [`tree::INDENT_GUIDE_ACTIVE`], so a real
+    /// active-level highlight has a token to plug into if bracket-matching is ever built.
     pub const INDENT_GUIDE_ACTIVE: ColorToken = super::border::SELECTED_EDGE;
 
     /// A rendered whitespace mark (a middle-dot for a space, an arrow for a tab). **Not yet
