@@ -594,7 +594,7 @@ impl AdeApp {
             .items_center()
             .justify_end()
             .px(px(10.0))
-            .h(theme::band::RAIL_HEADER)
+            .h(theme::band::CHROME_HEADER)
             .border_b_1()
             .border_color(theme::border::RAIL_INNER)
             .child(self.render_new_agent_button(cx))

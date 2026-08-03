@@ -1354,7 +1354,7 @@ impl AdeApp {
 
         div()
             .flex_none()
-            .h(theme::band::PANEL_HEADER)
+            .h(theme::band::CHROME_HEADER)
             .flex()
             .items_center()
             .px(px(10.0))

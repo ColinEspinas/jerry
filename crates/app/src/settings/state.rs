@@ -587,6 +587,7 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::FileTreeDelete" => Some("Files tree: delete"),
         "app::FileTreeUndo" => Some("Files tree: undo"),
         "app::FileTreeRedo" => Some("Files tree: redo"),
+        "app::TerminalClear" => Some("Terminal: clear"),
         _ => None,
     }
 }
@@ -1291,6 +1292,8 @@ mod tests {
                 "Files tree: redo",
                 // GitHub issue #26's `Ctrl+W` - closes the focused tab, scoped `Some("!terminal")`.
                 "Close focused tab",
+                // GitHub issue #20's terminal footer `clear`, scoped `Some("terminal")`.
+                "Terminal: clear",
             ]
         );
     }
@@ -1354,6 +1357,8 @@ mod tests {
         // immediately - no confirmation step, so no different scoping from Copy/Cut/Paste/Rename
         // above it) and its own `FileTreeUndo`/`FileTreeRedo` (`Ctrl+Z`/`Ctrl+Shift+Z`) - distinct
         // actions from `TextUndo`/`TextRedo`, all three `Some("file-tree && !tree-editing")`.
+        // GitHub issue #20 added 1 more real scoped binding: `TerminalClear`
+        // (`cmd-k`/`ctrl-shift-l`), `Some("terminal")`.
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings, &[]);
         assert!(!rows.is_empty());
@@ -1361,15 +1366,15 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            73,
+            74,
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
              every real Completions* binding (5) plus every real merge-editor binding (18) plus \
              TextUndo/TextRedo (3, GitHub issue #17) plus every real \
              file-tree binding (8, GitHub issues #19 and #105) plus every real word-wise Editor* \
              binding (8, GitHub issue #27) plus every real multi-cursor Editor* binding (4, \
              GitHub issue #28) plus every real GitHub issue #26 binding (7, not counting \
-             EditorCollapseCursors above, which is issue #28's own action) to be scoped, not \
-             global"
+             EditorCollapseCursors above, which is issue #28's own action) plus TerminalClear \
+             (1, GitHub issue #20) to be scoped, not global"
         );
         assert!(
             scoped

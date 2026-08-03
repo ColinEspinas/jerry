@@ -1156,9 +1156,11 @@ pub mod band {
     use super::{px, Pixels};
 
     pub const TITLE_BAR: Pixels = px(38.0);
-    pub const TAB_STRIP: Pixels = px(34.0);
-    pub const RAIL_HEADER: Pixels = px(36.0);
-    pub const PANEL_HEADER: Pixels = px(36.0);
+    /// Shared height for the work-surface tab strip, the session-rail header, and the
+    /// files/changes panel header - the three sit side by side under the title bar and must
+    /// line up pixel-perfect, so they read off one constant instead of three values that could
+    /// drift independently.
+    pub const CHROME_HEADER: Pixels = px(36.0);
     pub const CONTEXT_BAR: Pixels = px(32.0);
     pub const DIFF_TOOLBAR: Pixels = px(31.0);
     pub const FILTER_ROW: Pixels = px(30.0);

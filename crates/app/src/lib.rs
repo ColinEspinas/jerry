@@ -532,6 +532,28 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         // terminal/agent tab is still always closeable via the tab strip's own `×` or
         // middle-click regardless.
         gpui::KeyBinding::new("ctrl-w", root::CloseFocusedTab, Some("!terminal")),
+        // GitHub issue #20's "stays rebindable" requirement for the terminal footer's `clear`
+        // action (`crate::work_surface::render::AdeApp::handle_terminal_clear_action`). Scoped
+        // `Some("terminal")` (the opposite direction from `"ctrl-w"` above - this one only fires
+        // *while* a terminal is focused) with a keystroke chosen the same way `"ctrl-w"` and
+        // `"ctrl-shift-t"` already reason about the "app-level shortcut steals terminal input"
+        // conflict class: on macOS, `cmd-k` never reaches the pty in the first place
+        // (`keystroke_to_bytes` returns `None` for any `modifiers.platform` keystroke, checked
+        // first, before the plain-Ctrl control-byte branch below it); on Linux/Windows,
+        // `keystroke_to_bytes`'s own control-byte formula ignores the shift modifier entirely, so
+        // `ctrl-shift-l` is a real, distinct `KeyBinding` match (GPUI matches the exact modifier
+        // set) that never collides with plain `Ctrl-L`'s own `0x0c` byte reaching a focused shell -
+        // the same real precedent Zed's own keymap uses for `terminal::Clear` (see that action
+        // handler's own docs).
+        gpui::KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-k"
+            } else {
+                "ctrl-shift-l"
+            },
+            root::TerminalClear,
+            Some("terminal"),
+        ),
     ]
 }
 
