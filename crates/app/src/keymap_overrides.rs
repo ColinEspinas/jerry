@@ -709,18 +709,20 @@ mod tests {
 
     /// Drift guard for [`real_context_stacks`], which the collision checker's exactness depends
     /// on entirely: that list is hand-derived from this crate's `.key_context(..)` call sites, so
-    /// a tenth call site appearing without a matching entry would silently make every
-    /// disjointness answer unsound. Reads the real source rather than trusting a comment.
+    /// a new call site appearing without a matching entry would silently make every disjointness
+    /// answer unsound. Reads the real source rather than trusting a comment.
     #[test]
     fn every_real_key_context_call_site_is_covered() {
         let sites = key_context_call_sites();
         let call_sites: usize = sites.iter().map(|(_, count)| count).sum();
         assert_eq!(
-            call_sites, 10,
-            "real_context_stacks() is hand-derived from exactly ten .key_context(..) call sites \
-             (five of which emit the same bare \"text-input\", `graph_view/render.rs`'s Branches \
-             filter box being the newest) - a new one means that list, and every disjointness \
-             answer built on it, needs updating. Real sites found: {sites:?}"
+            call_sites, 11,
+            "real_context_stacks() is hand-derived from exactly eleven .key_context(..) call \
+             sites (six of which emit the same bare \"text-input\": the palette, the rail filter, \
+             the new-file prompt, the Branches filter, the Keybindings filter and - newest, \
+             GitHub issue #141 - the Themes page's \"Generate from colour\" seed input) - a new \
+             one means that list, and every disjointness answer built on it, needs updating. Real \
+             sites found: {sites:?}"
         );
 
         // The file tree's own site is named explicitly: it is the one a merge added while this

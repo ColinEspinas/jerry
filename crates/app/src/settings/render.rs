@@ -1226,7 +1226,13 @@ impl AdeApp {
                 .flex_wrap()
                 .gap(px(8.0))
                 .children(settings::THEME_DEFS.iter().map(|def| {
-                    self.render_theme_card(def.name, def.subtitle, def.swatches, false, cx)
+                    self.render_theme_card(
+                        def.name,
+                        def.subtitle,
+                        def.theme.preview_swatches(),
+                        false,
+                        cx,
+                    )
                 }));
 
         let follow_system_row = self.render_settings_row(
@@ -1347,7 +1353,13 @@ impl AdeApp {
             .flex_wrap()
             .gap(px(8.0))
             .children(self.custom_themes.iter().map(|theme| {
-                self.render_theme_card(&theme.name, &theme.subtitle, theme.swatches, true, cx)
+                self.render_theme_card(
+                    &theme.name,
+                    &theme.subtitle,
+                    theme.preview_swatches(),
+                    true,
+                    cx,
+                )
             }));
 
         let empty_state = (!has_custom).then(|| {
@@ -1408,8 +1420,209 @@ impl AdeApp {
             .child(header_row)
             .children(empty_state)
             .child(cards)
+            .child(self.render_theme_seed_row(cx))
             .children(load_errors)
             .children(status)
+    }
+
+    /// GitHub issue #141's "Generate from colour" row: a real, focusable `#rrggbb` input plus the
+    /// button that turns it into a whole theme file.
+    ///
+    /// This is where `crate::theme::derive_shift`'s HSL machinery ended up after the theme
+    /// system's rewrite took it out of the live resolution path: one seed colour becomes a real,
+    /// complete, literal, hand-editable theme file on disk (`Self::generate_theme_from_seed`),
+    /// derived by exactly the same code that generated the five bundled themes' own files
+    /// (`custom_theme`/`builtin_themes`). It is a starting point, not a black box - the whole
+    /// point of writing it out as ~270 explicit lines is that the user can then retune any one of
+    /// them by hand.
+    ///
+    /// The input is the same minimal hand-rolled field shape as the Keybindings filter
+    /// ([`Self::render_settings_keymap_filter_row`]) - a real `FocusHandle`, a real caret
+    /// ([`Self::render_simple_input_caret`]), append/backspace/`Esc`-clears - deliberately reusing
+    /// that established pattern rather than introducing a second, richer text-input mechanism this
+    /// app doesn't otherwise have.
+    fn render_theme_seed_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let seed = self.theme_seed_input.as_str().to_string();
+        let has_seed = !seed.is_empty();
+
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .pt(px(10.0))
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .text_size(px(10.5))
+                    .text_color(theme::text::MUTED)
+                    .child("Generate from colour"),
+            )
+            .child(
+                div()
+                    .id("settings-theme-seed-input")
+                    .debug_selector(|| "settings-theme-seed-input".to_string())
+                    .track_focus(&self.theme_seed_focus_handle)
+                    // See `crate::default_key_bindings`' `TextUndo`/`TextRedo` docs for why the
+                    // tag and the listeners both live on this exact node.
+                    .key_context("text-input")
+                    .on_action(cx.listener(Self::handle_theme_seed_text_undo))
+                    .on_action(cx.listener(Self::handle_theme_seed_text_redo))
+                    .on_key_down(cx.listener(Self::handle_theme_seed_key_down))
+                    .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                        window.focus(&this.theme_seed_focus_handle, cx);
+                    }))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .h(px(20.0))
+                    .w(px(96.0))
+                    .px(px(7.0))
+                    .rounded(theme::radius::BUTTON)
+                    .border_1()
+                    .border_color(theme::border::CARD_FIELD)
+                    .bg(theme::surface::CARD_SUNK)
+                    .when(!has_seed, |el| {
+                        el.child(self.render_simple_input_caret(
+                            "settings-theme-seed-caret",
+                            &self.theme_seed_focus_handle,
+                        ))
+                    })
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(10.5))
+                            .text_color(if has_seed {
+                                theme::text::BODY
+                            } else {
+                                theme::text::GHOST
+                            })
+                            .child(if has_seed {
+                                seed.clone()
+                            } else {
+                                "#rrggbb".to_string()
+                            })
+                            .debug_selector(|| "settings-theme-seed-text".to_string()),
+                    )
+                    .when(has_seed, |el| {
+                        el.child(self.render_simple_input_caret(
+                            "settings-theme-seed-caret",
+                            &self.theme_seed_focus_handle,
+                        ))
+                    }),
+            )
+            // A real, live preview of the seed itself, so a typo is visible before clicking.
+            .when(parse_seed_hex(&seed).is_some(), |el| {
+                let value = parse_seed_hex(&seed).unwrap_or(0);
+                el.child(
+                    div()
+                        .w(px(20.0))
+                        .h(px(14.0))
+                        .rounded(theme::radius::MARK)
+                        .border_1()
+                        .border_color(theme::border::CARD)
+                        .bg(gpui::rgb(value)),
+                )
+            })
+            .child(self.render_theme_action_button(
+                "settings-theme-generate",
+                "Generate\u{2026}",
+                cx,
+                |this, cx| this.start_generate_theme_from_seed(cx),
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::DISABLED)
+                    .child(
+                        "one colour becomes a whole editable theme file, tuned around it"
+                            .to_string(),
+                    ),
+            )
+    }
+
+    /// Same minimal append/backspace/escape-clears shape as
+    /// [`Self::handle_settings_keymap_filter_key_down`] - see that method's docs for the
+    /// deliberate scope cut (no cursor positioning, no selection, no IME).
+    pub(in crate::settings) fn handle_theme_seed_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+            return;
+        }
+        self.reset_caret_blink(cx);
+        let changed = match keystroke.key.as_str() {
+            "backspace" => self.theme_seed_input.pop(Instant::now()),
+            "escape" => self.theme_seed_input.clear(Instant::now()),
+            "enter" => {
+                self.start_generate_theme_from_seed(cx);
+                return;
+            }
+            _ => match keystroke.key_char.as_deref() {
+                Some(text) if !text.is_empty() => {
+                    self.theme_seed_input.push_str(text, Instant::now())
+                }
+                _ => false,
+            },
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// GitHub issue #141's real "Generate from colour" action: parses the seed, derives a whole
+    /// palette from it (`crate::theme::shift_from_seed` + `derived_palette` - the exact same
+    /// generator the five bundled theme files were produced with), and writes it into this
+    /// instance's own themes directory through the same validate-then-write-then-reload-from-disk
+    /// path every other theme-creating action uses, on the background executor.
+    ///
+    /// A malformed or empty seed is a real, specific status-line error rather than a silent no-op
+    /// or a guessed default - there is no honest colour to fall back to when the whole action is
+    /// "build a theme around *this* colour".
+    pub(in crate::settings) fn start_generate_theme_from_seed(&mut self, cx: &mut Context<Self>) {
+        let Some(seed) = parse_seed_hex(self.theme_seed_input.as_str()) else {
+            self.custom_theme_status = Some(Err(format!(
+                "\"{}\" isn't a colour - type a hex value like #7f9ad4 to generate a theme from",
+                self.theme_seed_input.as_str()
+            )));
+            cx.notify();
+            return;
+        };
+        let Some(settings_path) = self.settings_path.clone() else {
+            self.custom_theme_status = Some(Err(
+                "can't create a theme: no settings file location is known".to_string(),
+            ));
+            cx.notify();
+            return;
+        };
+        let file = generated_theme_file_for_seed(seed);
+        let task = cx.spawn(async move |this, cx| {
+            let dest_dir = custom_theme::custom_themes_dir_for(&settings_path);
+            let result: Result<_, custom_theme::ThemeFileError> = cx
+                .background_executor()
+                .spawn(async move {
+                    let created = custom_theme::validate_and_write(file, &dest_dir)?;
+                    let (themes, errors) = custom_theme::load_custom_themes_from_dir(&dest_dir);
+                    Ok((created, themes, errors))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_custom_theme_load_result(
+                    result,
+                    |name| format!("Generated \"{name}\" - edit its file to tune it further."),
+                    cx,
+                );
+            });
+        });
+        self._theme_generate_task = Some(task);
     }
 
     /// GitHub issue #5's "custom icon packs": a real, user-chosen directory of `<name>.svg`
@@ -1913,6 +2126,28 @@ impl AdeApp {
 
     /// `TextUndo`/`TextRedo` for the Keybindings page's filter field (GitHub issue #17) - see
     /// `crate::default_key_bindings`' own docs for the scoping.
+    pub(in crate::settings) fn handle_theme_seed_text_undo(
+        &mut self,
+        _: &TextUndo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.theme_seed_input.undo() {
+            cx.notify();
+        }
+    }
+
+    pub(in crate::settings) fn handle_theme_seed_text_redo(
+        &mut self,
+        _: &TextRedo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.theme_seed_input.redo() {
+            cx.notify();
+        }
+    }
+
     pub(in crate::settings) fn handle_settings_keymap_filter_text_undo(
         &mut self,
         _: &TextUndo,
@@ -2563,7 +2798,7 @@ impl AdeApp {
     /// `follow_system`.
     fn set_theme_name(&mut self, name: String, cx: &mut Context<Self>) {
         let is_light = self
-            .theme_swatches_for(&name)
+            .theme_window_background_for(&name)
             .map(theme::theme_is_light)
             .unwrap_or(false);
         if !is_light {
@@ -2575,22 +2810,25 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// Real, single lookup used by both [`Self::apply_theme_selection`] (which colour palette is
-    /// live) and [`Self::set_theme_name`] (is the newly selected theme light, for
-    /// `last_dark_theme` bookkeeping) - looks up `name` first against the six built-in
-    /// `settings::THEME_DEFS`, then against [`Self::custom_themes`], so the two callers can never
-    /// resolve a name differently.
-    fn theme_swatches_for(&self, name: &str) -> Option<[u32; 5]> {
+    /// Real, single by-name lookup over every theme this app knows about - the six built-in
+    /// `settings::THEME_DEFS` first, then [`Self::custom_themes`] - so every caller that has to
+    /// resolve a theme name (which palette is live, is it light, what does its card preview
+    /// paint, what should exporting it write) can never resolve one differently from another.
+    fn theme_by_name(&self, name: &str) -> Option<&custom_theme::CustomTheme> {
         settings::THEME_DEFS
             .iter()
             .find(|def| def.name == name)
-            .map(|def| def.swatches)
-            .or_else(|| {
-                self.custom_themes
-                    .iter()
-                    .find(|theme| theme.name == name)
-                    .map(|theme| theme.swatches)
-            })
+            .map(|def| def.theme)
+            .or_else(|| self.custom_themes.iter().find(|theme| theme.name == name))
+    }
+
+    /// The real window background `name` renders with - [`Self::set_theme_name`]'s
+    /// "is this a light theme, for `Settings.theme.last_dark_theme` bookkeeping" question. See
+    /// `custom_theme::CustomTheme::window_background` for the one honest approximation involved
+    /// (a partial theme inheriting that key from a non-Jerry-Dark base).
+    fn theme_window_background_for(&self, name: &str) -> Option<gpui::Rgba> {
+        self.theme_by_name(name)
+            .map(|theme| theme.window_background())
     }
 
     /// Turning this on immediately syncs to the real, current OS appearance
@@ -2619,38 +2857,36 @@ impl AdeApp {
     /// already-rendered surface - not just ones that happen to re-render for some other reason -
     /// picks up the new colours on the very next frame.
     ///
-    /// Checks the six built-in `settings::THEME_DEFS` first, then [`Self::custom_themes`]
-    /// (GitHub issue #5) - a built-in name always wins if both somehow matched, though
-    /// `crate::settings::custom_theme::CustomThemeFile::validate` already rejects a custom theme
-    /// whose name collides with a built-in one, so that's not actually reachable outside a
-    /// theoretical race with a hand-edited file. A name matching neither (only reachable via a
-    /// hand-edited `settings.toml`, or a custom theme file that's since been deleted) falls back
-    /// to index `0` (Jerry Dark) rather than leaving the previous theme's index in place
-    /// unnoticed. [`crate::theme::set_current_theme_index`]/[`crate::theme::
-    /// set_current_custom_theme`] are always written together here - see the latter's own docs
-    /// for why `crate::theme::ColorToken::resolve` depends on that.
+    /// The selection is *compiled* here, once - `custom_theme::compile_palette_by_name` resolves
+    /// the name against the six built-in `settings::THEME_DEFS` first, then
+    /// [`Self::custom_themes`], walks its whole `base` chain and flattens it into one real
+    /// `crate::theme::Palette` that live token resolution then reads with a single hash lookup per
+    /// colour. A name matching nothing (only reachable via a hand-edited `settings.toml`, or a
+    /// custom theme file that's since been deleted) compiles to `None`, i.e. Jerry Dark, rather
+    /// than leaving the previous theme's palette installed unnoticed.
+    ///
+    /// A real compile *error* (a `base` chain that loops, or names a theme that isn't loaded) is
+    /// logged and falls back to Jerry Dark rather than being silently ignored or panicking. That
+    /// path is a backstop, not the primary reporting surface:
+    /// `custom_theme::load_custom_themes_from_dir` already checks every theme's chain when it
+    /// loads the directory and surfaces a real, per-file error on the Themes page, so a broken
+    /// chain is normally rejected before it can ever be selected.
     pub(crate) fn apply_theme_selection(&self, cx: &mut Context<Self>) {
-        let name = self.settings.theme.name.as_str();
-        if let Some(index) = settings::THEME_DEFS.iter().position(|def| def.name == name) {
-            theme::set_current_theme_index(index);
-            theme::set_current_custom_theme(None);
-            theme::set_current_syntax_overrides(None);
-        } else if let Some(active) = self.custom_themes.iter().find(|theme| theme.name == name) {
-            theme::set_current_theme_index(0);
-            theme::set_current_custom_theme(Some(active.swatches));
-            // GitHub issue #141: `None` (not an empty map) for a custom theme with no real
-            // `[syntax]` table of its own - `crate::theme::syntax_override_for_kind` treats the
-            // two identically today, but `None` is the honest "this theme names no per-scope
-            // overrides at all" signal, matching `Option`'s own meaning everywhere else in this
-            // module rather than an always-`Some` map that's merely often empty.
-            theme::set_current_syntax_overrides(
-                (!active.syntax_overrides.is_empty()).then(|| active.syntax_overrides.clone()),
-            );
-        } else {
-            theme::set_current_theme_index(0);
-            theme::set_current_custom_theme(None);
-            theme::set_current_syntax_overrides(None);
-        }
+        let palette = match custom_theme::compile_palette_by_name(
+            &self.settings.theme.name,
+            &self.custom_themes,
+        ) {
+            Ok(palette) => palette,
+            Err(err) => {
+                log::warn!(
+                    "couldn't compile the selected theme \"{}\" ({err}) - falling back to \
+                         Jerry Dark",
+                    self.settings.theme.name
+                );
+                None
+            }
+        };
+        theme::set_current_theme(palette.map(std::rc::Rc::new));
         cx.refresh_windows();
     }
 
@@ -2986,7 +3222,7 @@ impl AdeApp {
     /// unmodified export is a real no-op "update" rather than spawning a `(copy)` duplicate.
     pub(in crate::settings) fn start_export_custom_theme(&mut self, cx: &mut Context<Self>) {
         let active_name = self.settings.theme.name.clone();
-        let Some(swatches) = self.theme_swatches_for(&active_name) else {
+        let Some(active) = self.theme_by_name(&active_name).cloned() else {
             self.custom_theme_status = Some(Err(format!(
                 "can't export: no theme named \"{active_name}\" is currently loaded"
             )));
@@ -2994,34 +3230,14 @@ impl AdeApp {
             return;
         };
         let export_name = export_theme_name_for(active_name.as_str());
-        let subtitle = self
-            .custom_themes
-            .iter()
-            .find(|theme| theme.name == active_name)
-            .map(|theme| theme.subtitle.clone())
-            .or_else(|| {
-                settings::THEME_DEFS
-                    .iter()
-                    .find(|def| def.name == active_name)
-                    .map(|def| def.subtitle.to_string())
-            })
-            .unwrap_or_default();
-        // GitHub issue #141: a built-in theme has no real per-scope syntax overrides at all -
-        // `.unwrap_or_default()` reports that honestly (an empty map) rather than only ever
-        // resolving for a custom theme and silently dropping this half of an imported VSCode
-        // theme's own real palette on export.
-        let syntax_overrides = self
-            .custom_themes
-            .iter()
-            .find(|theme| theme.name == active_name)
-            .map(|theme| theme.syntax_overrides.clone())
-            .unwrap_or_default();
+        // Exports the theme's own real file contents - its `base`, its explicit preview swatches
+        // and every token it actually names - not a lossy summary of them, so a re-import is a
+        // genuine round trip. Jerry Dark is the one theme this produces a nearly-empty file for,
+        // and honestly so: it overrides nothing, because it *is* the compiled default palette.
         let export_theme = custom_theme::CustomTheme {
             name: export_name.clone(),
-            subtitle,
-            swatches,
-            syntax_overrides,
             source_path: None,
+            ..active
         };
         let default_dir = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
@@ -3204,6 +3420,56 @@ impl AdeApp {
     }
 }
 
+/// Parses the "Generate from colour" seed input's own text into a real `0xrrggbb` value -
+/// tolerant of a missing leading `#` and of surrounding whitespace (both are things a user
+/// genuinely types or pastes), but of nothing else: a three-digit shorthand, an alpha channel or
+/// a colour *name* would each be a guess about what was meant, and this action's whole output is
+/// built around getting that one colour right. A pure function so the parsing rule is directly
+/// unit-testable without a window.
+fn parse_seed_hex(input: &str) -> Option<u32> {
+    let trimmed = input.trim();
+    let hex = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
+}
+
+/// The real, complete theme file [`AdeApp::start_generate_theme_from_seed`] writes for `seed` -
+/// a pure function, so what "generate from colour" actually produces is directly testable without
+/// a window, a file dialog or a disk.
+///
+/// Named `"Custom #rrggbb"` after the seed itself: unique per seed (so generating from two
+/// different colours produces two themes rather than silently overwriting one), never colliding
+/// with a built-in name, and immediately obvious on the Themes page. Its five card preview
+/// swatches are read straight out of the derived palette's own
+/// `surface.window`/`surface.rail`/`status.review`/`status.ask`/`status.run`, so the card really
+/// shows what the theme looks like.
+fn generated_theme_file_for_seed(seed: u32) -> custom_theme::CustomThemeFile {
+    let shift = theme::shift_from_seed(theme::hex_rgba(seed));
+    let palette = theme::derived_palette(shift);
+    let swatch = |key: &str| -> u32 {
+        palette
+            .iter()
+            .find(|(entry_key, _)| *entry_key == key)
+            .map(|(_, color)| custom_theme::rgba_to_hex(*color))
+            .unwrap_or(seed)
+    };
+    let preview = [
+        swatch("surface.window"),
+        swatch("surface.rail"),
+        swatch("status.review"),
+        swatch("status.ask"),
+        swatch("status.run"),
+    ];
+    crate::settings::builtin_themes::generated_theme_file(
+        &format!("Custom #{seed:06x}"),
+        "generated from a single colour",
+        preview,
+        palette,
+    )
+}
+
 /// The real name [`AdeApp::start_export_custom_theme`] exports `active_name` under - a pure,
 /// directly-`#[test]`-able decision (not a `gpui`-window-touching method) so this can be checked
 /// without a real save dialog. A built-in theme (`settings::THEME_DEFS`) is renamed to `"<name>
@@ -3220,6 +3486,75 @@ fn export_theme_name_for(active_name: &str) -> String {
         format!("{active_name} (copy)")
     } else {
         active_name.to_string()
+    }
+}
+
+#[cfg(test)]
+mod theme_seed_tests {
+    use super::*;
+
+    #[test]
+    fn parse_seed_hex_accepts_the_real_shapes_a_user_types_and_rejects_guesses() {
+        assert_eq!(parse_seed_hex("#e07a5f"), Some(0xe07a5f));
+        assert_eq!(
+            parse_seed_hex("e07a5f"),
+            Some(0xe07a5f),
+            "a missing # is real input"
+        );
+        assert_eq!(parse_seed_hex("  #E07A5F  "), Some(0xe07a5f));
+        for bad in ["", "#abc", "#e07a5fff", "coral", "#gggggg", "#e07a5"] {
+            assert_eq!(parse_seed_hex(bad), None, "{bad:?} should not parse");
+        }
+    }
+
+    /// The generated file is a real, complete, valid theme - every registered token named, a real
+    /// base, real preview swatches - not a stub.
+    #[test]
+    fn a_generated_seed_theme_is_a_real_complete_valid_palette() {
+        let file = generated_theme_file_for_seed(0xe07a5f);
+        assert_eq!(file.name, "Custom #e07a5f");
+        assert_eq!(file.base.as_deref(), Some("Jerry Dark"));
+        assert_eq!(file.overrides.len(), theme::all_tokens().count());
+        let validated = file.validate().expect("a generated theme must validate");
+        assert_eq!(validated.overrides.len(), theme::all_tokens().count());
+        let reparsed = custom_theme::parse_theme_file_str(&validated.to_toml_string())
+            .expect("a generated theme must round-trip through its own file format");
+        assert_eq!(reparsed.overrides, validated.overrides);
+    }
+
+    /// Two different seeds really produce two different palettes and two different names - the
+    /// real proof the seed is doing something, and that generating twice doesn't overwrite.
+    #[test]
+    fn two_different_seeds_produce_two_genuinely_different_themes() {
+        let warm = generated_theme_file_for_seed(0xe07a5f)
+            .validate()
+            .expect("valid");
+        let cool = generated_theme_file_for_seed(0x3f7a52)
+            .validate()
+            .expect("valid");
+        assert_ne!(warm.name, cool.name);
+        assert_ne!(
+            warm.overrides["status.run"], cool.overrides["status.run"],
+            "two seeds must really move the palette differently"
+        );
+    }
+
+    /// The seed's own hue really is where the app's accent lands - the documented contract of
+    /// `crate::theme::shift_from_seed`, checked here through the whole file-building path rather
+    /// than only at the maths layer.
+    #[test]
+    fn the_generated_theme_puts_the_apps_accent_on_the_seeds_own_hue() {
+        let generated = generated_theme_file_for_seed(0xe07a5f)
+            .validate()
+            .expect("valid");
+        let accent: gpui::Hsla = generated.overrides["syntax.function"].into();
+        let seed: gpui::Hsla = theme::hex_rgba(0xe07a5f).into();
+        assert!(
+            (accent.h - seed.h).abs() < 0.01,
+            "the accent hue ({}) should be the seed's own ({})",
+            accent.h,
+            seed.h
+        );
     }
 }
 
@@ -3248,12 +3583,9 @@ mod export_theme_name_tests {
         let bare = custom_theme::CustomThemeFile {
             name: "Slate".to_string(),
             subtitle: String::new(),
-            background: "#0d1117".to_string(),
-            panel: "#161b22".to_string(),
-            accent_green: "#57a773".to_string(),
-            accent_amber: "#c9a227".to_string(),
-            accent_blue: "#6b9bd1".to_string(),
-            syntax: std::collections::HashMap::new(),
+            base: Some("Jerry Dark".to_string()),
+            preview: None,
+            overrides: vec![("surface.window".to_string(), "#0d1117".to_string())],
         };
         assert!(
             bare.validate().is_err(),
@@ -3913,49 +4245,43 @@ mod keybinding_rebind_tests {
 /// End-to-end regression coverage for the real theme-swap mechanism, driven through the same
 /// `AdeApp` methods a real theme-card click invokes (`Self::set_theme_name`), not a direct call
 /// into `crate::theme`'s own already-tested pure mechanism (`theme::theme_runtime_tests`) - this
-/// module proves the *wiring* (persistence, the live `crate::theme::current_theme_index` write,
-/// and that a representative real render call genuinely reads the new value), which a pure unit
-/// test of `crate::theme` alone can't catch (e.g. forgetting to call `apply_theme_selection` from
-/// `Self::set_theme_name` would still pass every `crate::theme` test).
+/// module proves the *wiring* (persistence, the live `crate::theme::CURRENT_THEME` palette
+/// install, and that a representative real render call genuinely reads the new value), which a
+/// pure unit test of `crate::theme` alone can't catch (e.g. forgetting to call
+/// `apply_theme_selection` from `Self::set_theme_name` would still pass every `crate::theme`
+/// test).
 #[cfg(test)]
 mod theme_swap_tests {
     use super::*;
     use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
 
-    /// `crate::theme::CURRENT_THEME_INDEX` is real, process-global, mutable state - reset it
-    /// after this test regardless of outcome, matching `crate::theme::theme_runtime_tests`'s own
-    /// discipline (see that module's docs for why a leaked non-default index would corrupt other
-    /// tests in this binary). In practice any *other* test that goes on to construct a fresh
-    /// `AdeApp` already self-heals this via `Self::apply_theme_selection` running in `Self::
-    /// new_with_settings`, but this test doesn't rely on that - it cleans up its own real global
-    /// write directly.
+    /// `crate::theme::CURRENT_THEME` is real, thread-local, mutable state - reset it after this
+    /// test regardless of outcome, matching `crate::theme::theme_runtime_tests`'s own discipline
+    /// (see that module's docs for why a leaked palette would corrupt other tests on the same
+    /// thread). In practice any *other* test that goes on to construct a fresh `AdeApp` already
+    /// self-heals this via `Self::apply_theme_selection` running in `Self::new_with_settings`,
+    /// but this test doesn't rely on that - it cleans up its own real write directly.
     struct ResetThemeIndexOnDrop;
     impl Drop for ResetThemeIndexOnDrop {
         fn drop(&mut self) {
-            theme::set_current_theme_index(0);
+            theme::set_current_theme(None);
         }
     }
 
     #[gpui::test]
-    fn selecting_a_real_theme_card_changes_the_live_selected_index_and_a_representative_color(
+    fn selecting_a_real_theme_card_installs_the_live_palette_and_changes_a_representative_color(
         cx: &mut TestAppContext,
     ) {
         let _guard = ResetThemeIndexOnDrop;
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
-        assert_eq!(
-            theme::current_theme_index(),
-            0,
-            "a fresh app defaults to Jerry Dark (index 0)"
+        assert!(
+            theme::current_theme_palette().is_none(),
+            "a fresh app defaults to Jerry Dark, the real no-palette identity case"
         );
         let jerry_dark_window_bg = theme::surface::WINDOW.resolve();
-
-        let slate_index = settings::THEME_DEFS
-            .iter()
-            .position(|def| def.name == "Slate")
-            .expect("Slate should be a real theme");
 
         app.update(cx, |app, cx| {
             app.set_theme_name("Slate".to_string(), cx);
@@ -3967,11 +4293,12 @@ mod theme_swap_tests {
             "Slate",
             "the selection must really persist in Settings"
         );
+        let palette = theme::current_theme_palette()
+            .expect("selecting a real bundled theme must install a real compiled palette");
         assert_eq!(
-            theme::current_theme_index(),
-            slate_index,
-            "selecting a theme card must really update the live-selected index, not just the \
-             persisted setting"
+            palette.len(),
+            theme::all_tokens().count(),
+            "Slate is a complete generated palette - every real token should be in it"
         );
         assert!(
             theme::surface::WINDOW.resolve() != jerry_dark_window_bg,
@@ -3985,7 +4312,7 @@ mod theme_swap_tests {
             app.set_theme_name("Jerry Dark".to_string(), cx);
         });
         cx.run_until_parked();
-        assert_eq!(theme::current_theme_index(), 0);
+        assert!(theme::current_theme_palette().is_none());
         assert_eq!(theme::surface::WINDOW.resolve(), jerry_dark_window_bg);
     }
 
@@ -4007,11 +4334,10 @@ mod theme_swap_tests {
             "Paper",
             "a real OS-light signal must select the one real light theme"
         );
-        let paper_index = settings::THEME_DEFS
-            .iter()
-            .position(|def| def.name == "Paper")
-            .expect("Paper should be a real theme");
-        assert_eq!(theme::current_theme_index(), paper_index);
+        assert!(
+            theme::theme_is_light(theme::surface::WINDOW.resolve()),
+            "selecting Paper must really make the live window background a light colour"
+        );
 
         app.update(cx, |app, cx| {
             app.apply_follow_system_appearance(gpui::WindowAppearance::Dark, cx);
@@ -4022,7 +4348,7 @@ mod theme_swap_tests {
             "a real OS-dark signal must switch back to the real last-chosen dark theme, which \
              for a fresh install is the documented default"
         );
-        assert_eq!(theme::current_theme_index(), 0);
+        assert!(theme::current_theme_palette().is_none());
     }
 
     /// Regression for a real data-loss bug an audit caught: before `Settings.theme.
@@ -4112,15 +4438,12 @@ mod custom_theme_settings_tests {
     use super::*;
     use gpui::TestAppContext;
 
-    /// Same real-global-leak discipline `theme_swap_tests::ResetThemeIndexOnDrop` documents, for
-    /// both `CURRENT_THEME_INDEX` and `CURRENT_CUSTOM_SHIFT` together - a custom-theme test can
-    /// leave either non-default.
+    /// Same real-leak discipline `theme_swap_tests::ResetThemeIndexOnDrop` documents, for
+    /// `crate::theme::CURRENT_THEME` - a custom-theme test can leave a palette installed.
     struct ResetThemeStateOnDrop;
     impl Drop for ResetThemeStateOnDrop {
         fn drop(&mut self) {
-            theme::set_current_theme_index(0);
-            theme::set_current_custom_theme(None);
-            theme::set_current_syntax_overrides(None);
+            theme::set_current_theme(None);
         }
     }
 
@@ -4147,13 +4470,25 @@ mod custom_theme_settings_tests {
         std::fs::write(themes_dir.join(file_name), contents).expect("write theme file");
     }
 
+    /// A real, minimal theme file in the current format - a name, a base, and a handful of real
+    /// token keys. Deliberately partial (it names six of the app's ~270 tokens), so these tests
+    /// exercise the same "override a little, inherit the rest" shape a hand-authored theme
+    /// actually has.
     const MIDNIGHT_CORAL_TOML: &str = "name = \"Midnight Coral\"\n\
          subtitle = \"warm accent\"\n\
-         background = \"#0c0d10\"\n\
-         panel = \"#181a1e\"\n\
-         accent_green = \"#5cb87f\"\n\
-         accent_amber = \"#e2a336\"\n\
-         accent_blue = \"#e07a5f\"\n";
+         base = \"Jerry Dark\"\n\
+         \n\
+         [surface]\n\
+         window = \"#0c0d10\"\n\
+         card = \"#181a1e\"\n\
+         rail = \"#101216\"\n\
+         \n\
+         [status]\n\
+         review = \"#5cb87f\"\n\
+         ask = \"#e2a336\"\n\
+         \n\
+         [syntax]\n\
+         keyword = \"#e07a5f\"\n";
 
     /// A real theme file, sitting in the settings-sibling `themes/` directory before the app is
     /// ever constructed, is loaded at startup (`crate::root::AdeApp::new_with_settings`) and
@@ -4422,6 +4757,119 @@ mod custom_theme_settings_tests {
         assert!(
             matches!(status, Some(Err(_))),
             "a malformed VSCode import should report a real, honest error, got {status:?}"
+        );
+    }
+
+    /// GitHub issue #141's "Generate from colour": typing a real hex seed into the Themes page's
+    /// own input and clicking Generate must write a real, complete theme file into this instance's
+    /// themes directory, load it as a real card, and report a real success - the whole action
+    /// end-to-end, driven the way a user drives it (a real focused input receiving real
+    /// keystrokes, then a real click on the real painted button), not by calling the pure helper.
+    #[gpui::test]
+    fn typing_a_seed_colour_and_clicking_generate_really_writes_a_whole_theme_file(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path,
+        );
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Theme, window, cx);
+        });
+        cx.run_until_parked();
+
+        let input_bounds = cx
+            .debug_bounds("settings-theme-seed-input")
+            .expect("the seed input must have painted");
+        cx.simulate_click(input_bounds.center(), gpui::Modifiers::none());
+        cx.simulate_keystrokes("# e 0 7 a 5 f");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.theme_seed_input.as_str().to_string()),
+            "#e07a5f",
+            "real keystrokes must reach the real seed field"
+        );
+
+        let button_bounds = cx
+            .debug_bounds("settings-theme-generate")
+            .expect("the Generate button must have painted");
+        cx.simulate_click(button_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let status = app.read_with(cx, |app, _| app.custom_theme_status.clone());
+        assert!(
+            matches!(status, Some(Ok(_))),
+            "generating from a real seed colour must report a real success, got {status:?}"
+        );
+        let themes = app.read_with(cx, |app, _| app.custom_themes.clone());
+        assert_eq!(themes.len(), 1, "the generated theme must really be loaded");
+        assert_eq!(themes[0].name, "Custom #e07a5f");
+        assert_eq!(
+            themes[0].overrides.len(),
+            theme::all_tokens().count(),
+            "a generated theme must be a real, complete palette the user can hand-tune"
+        );
+        let file = themes[0]
+            .source_path
+            .clone()
+            .expect("the generated theme must have a real backing file");
+        assert!(file.exists());
+        assert!(
+            std::fs::read_to_string(&file)
+                .expect("readable")
+                .contains("[syntax]"),
+            "the written file must really be the grouped, editable format, not an opaque blob"
+        );
+
+        // And it is genuinely selectable: picking it really re-skins the app.
+        let jerry_dark_window = theme::surface::WINDOW.resolve();
+        app.update(cx, |app, cx| {
+            app.set_theme_name("Custom #e07a5f".to_string(), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            theme::syntax::KEYWORD.resolve() != jerry_dark_window
+                && theme::syntax::KEYWORD.resolve() != theme::syntax::KEYWORD.default,
+            "selecting the generated theme must really change what the app resolves"
+        );
+    }
+
+    /// A malformed seed is a real, specific error - not a silent no-op, and not a guessed default
+    /// colour.
+    #[gpui::test]
+    fn generating_from_a_malformed_seed_is_a_real_reported_error(cx: &mut TestAppContext) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path,
+        );
+
+        app.update(cx, |app, cx| {
+            app.theme_seed_input.set("nope", std::time::Instant::now());
+            app.start_generate_theme_from_seed(cx);
+        });
+        cx.run_until_parked();
+
+        let status = app.read_with(cx, |app, _| app.custom_theme_status.clone());
+        assert!(
+            matches!(status, Some(Err(_))),
+            "a malformed seed must report a real error, got {status:?}"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.custom_themes.is_empty()),
+            "nothing should have been created"
         );
     }
 

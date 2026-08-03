@@ -1405,6 +1405,15 @@ pub struct AdeApp {
     /// [`Self::filter_query`], and the same real per-widget undo history (GitHub issue #17).
     pub(crate) settings_keymap_filter: text_history::TextField,
     pub(crate) settings_keymap_filter_focus_handle: FocusHandle,
+    /// GitHub issue #141: the Themes page's "Generate from colour" seed - a real, focusable hex
+    /// input (`#rrggbb`), same minimal append/backspace/`Esc`-clears shape as
+    /// [`Self::settings_keymap_filter`] and the same real per-widget undo history (GitHub issue
+    /// #17). Its value is what `crate::theme::shift_from_seed` derives a whole theme from.
+    pub(crate) theme_seed_input: text_history::TextField,
+    pub(crate) theme_seed_focus_handle: FocusHandle,
+    /// The real background-executor task behind "Generate from colour" - same one-at-a-time
+    /// shape as [`Self::_custom_theme_import_task`].
+    pub(crate) _theme_generate_task: Option<Task<()>>,
     /// The identity of the Keybindings row currently capturing a new chord, if any - see
     /// [`Self::start_recording_keybinding`]'s own docs for the real `App::intercept_keystrokes`
     /// mechanism this drives.

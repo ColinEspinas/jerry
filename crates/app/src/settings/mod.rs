@@ -39,6 +39,7 @@ use crate::theme;
 use crate::work_surface::agents::AgentKind;
 use crate::work_surface::state as work_surface;
 
+pub mod builtin_themes;
 pub mod custom_theme;
 pub mod state;
 pub mod store;

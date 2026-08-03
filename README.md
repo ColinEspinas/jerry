@@ -77,96 +77,116 @@ design_handoff_jerry_ade/
               something to port markup from, and not itself part of the app.
 ```
 
-## Custom themes
+## Themes
 
-Besides the six built-in themes (Jerry Dark, Jerry Dim, Slate, Ember, Moss, Paper), the Themes
-settings page (Settings → Themes) supports user-authored ones too (GitHub issue #5) — built-in
-and custom themes are shown as the same kind of card, not a first-class set and a second-tier
-list. In fact, the six built-ins are themselves just files: `assets/themes/*.toml` in this
-repository, embedded into the binary and parsed through the exact same code path a custom
-theme's own file goes through, not a separate hardcoded palette.
+Jerry's entire interface is painted from about 270 named colour tokens (`crates/app/src/theme.rs`),
+grouped into modules — `surface`, `border`, `text`, `status`, `syntax`, `term`, `diff`, `editor`,
+`graph`, and so on. A **theme** is a file that names any subset of those tokens; everything it
+doesn't name is inherited from the theme it declares as its `base`, and ultimately from Jerry
+Dark's own compiled-in defaults.
 
-**File format.** One `.toml` file per theme, five hex colours plus a name/subtitle:
+There are six built-in themes (Jerry Dark, Jerry Dim, Slate, Ember, Moss, Paper) and any number of
+user-authored ones (GitHub issue #5). Both kinds are shown as the same kind of card on Settings →
+Themes, and both are literally the same kind of file: the built-ins live at `assets/themes/*.toml`
+in this repository, embedded into the binary and parsed through the exact same code a custom
+theme's own file goes through. Jerry Dark's own file names no colours at all — it *is* the
+compiled default palette; the other five are complete, literal, hand-editable palettes.
+
+**File format.** One `.toml` file per theme:
 
 ```toml
 name = "Midnight Coral"
 subtitle = "warm accent, dark base"
-background   = "#0c0d10"
-panel        = "#181a1e"
-accent_green = "#5cb87f"
-accent_amber = "#e2a336"
-accent_blue  = "#e07a5f"
-```
+base = "Jerry Dark"
 
-Colours are `#rrggbb` — a `#` plus exactly six hex digits; no `#rgb` shorthand, alpha channel, or
-named CSS colours. `name` must be unique (it can't reuse a built-in theme's own name); `subtitle`
-is optional. Those five swatches are the same five every built-in theme is defined by — the rest
-of the app's roughly 200 chrome colour tokens (surfaces, borders, chips, ...) are derived from how
-they differ from Jerry Dark's own five (see `derive_shift` in `crates/app/src/theme.rs` for the
-actual HSL transform — it's a private function, so this means reading the source, not generated
-rustdoc), so authoring five colours re-skins the whole app's chrome, not just a preview card.
-`panel` also has to actually read as a different shade from `background`: a real
-perceptual-brightness check rejects a `panel` that's the same colour as (or only a couple of hex
-digits off from) `background`.
+[surface]
+window = "#0c0d10"
+card = "#181a1e"
+rail = "#101216"
 
-**Real per-scope syntax colours (GitHub issue #141, optional).** An additional `[syntax]` table
-can name individual, literal colours for specific syntax buckets — unlike the five swatches
-above, these are not re-derived; a `[syntax]` entry is the exact colour that bucket renders:
+[text]
+body = "#b9bfc7"
+muted = "#98a0a9"
 
-```toml
 [syntax]
 keyword = "#ff79c6"
-string  = "#f1fa8c"
+string = "#f1fa8c"
 comment = "#6272a4"
 ```
 
-Every real key is one of `crate::code_surface::code_view::HighlightKind`'s own names (`keyword`,
-`function`, `function_method`, `type`, `type_builtin`, `constant`, `constant_builtin`, `string`,
-`string_escape`, `number`, `comment`, `comment_doc`, `variable`, `variable_parameter`,
-`variable_builtin`, `property`, `operator`, `punctuation_bracket`, `punctuation_delimiter`, `tag`,
-`attribute`, `embedded`, `text`, `heading`, `link`, `strong`, `emphasis`) — an unrecognized key is
-a real, rejected error, not a silently ignored typo. The table is entirely optional and additive:
-a theme with no `[syntax]` table (every theme predating this feature) keeps getting its syntax
-colours from the same five-swatch derivation as before — real per-scope colours only ever *add*
-fidelity on top, never replace the fallback.
+- **`name`** — required, non-empty, and must not reuse a built-in theme's name.
+- **`subtitle`** — optional one-line description shown on the card.
+- **`base`** — optional; the theme every unnamed key is inherited from. `"Jerry Dark"` is the
+  usual choice, and omitting it is equivalent (Jerry Dark's values are the compiled defaults). A
+  `base` chain that loops back on itself is rejected with a real error naming the whole chain.
+- **`preview`** — optional array of five `#rrggbb` colours for the card's swatch strip. Omitted, it
+  is read from the theme's own `surface.window`/`surface.rail`/`status.review`/`status.ask`/
+  `status.run`.
+- **every other table** is a `crate::theme` module, and every key in it is one of that module's
+  tokens with its Rust constant name lowercased: `theme::surface::WINDOW` is `[surface] window`,
+  `theme::syntax::FUNCTION_METHOD` is `[syntax] function_method`. Pair and array tokens use a
+  quoted dotted key inside their table (`"sonnet.fg"`, `"lanes.0"`).
+
+Colours are `#rrggbb` — a `#` plus exactly six hex digits; no `#rgb` shorthand, alpha channel, or
+named CSS colours. An unknown table or key is a real, specific rejection naming what it didn't
+recognise, never a silently ignored typo. `surface.card` also has to read as a genuinely different
+shade from `surface.window`: a real perceptual-brightness (ITU-R BT.709 luma) check rejects a card
+surface that's the same colour as — or a couple of hex digits off from — the window behind it.
+
+A theme naming three keys is a complete, valid theme. For the full list of real keys, copy one of
+the generated bundled palettes ([`assets/themes/slate.toml`](assets/themes/slate.toml) and its
+siblings each list every single key with a real value) or read `crates/app/src/theme.rs`, where
+most tokens carry a doc comment saying exactly what paints with them.
+[`assets/themes/template.toml`](assets/themes/template.toml) is a commented starting point.
 
 **Where files live.** `~/.config/jerry/themes/*.toml` — a `themes` directory sitting next to
 `~/.config/jerry/settings.toml`. Every `.toml` file directly inside it is loaded as a theme at
-startup; a file that fails to parse or validate is skipped with a real, specific error shown on
-the Themes page (the rest of the directory still loads normally).
+startup; a file that fails to parse, validate, or resolve its `base` is skipped with a real,
+specific error shown on the Themes page (the rest of the directory still loads normally).
 
-**Getting started without leaving the app.** The Themes page's "Custom themes" section has four
-real actions: **New from template…** writes a real, well-commented starting-point file straight
-into that directory (the same file checked into this repository at
-[`assets/themes/template.toml`](assets/themes/template.toml) — copying it by hand works exactly
-as well as clicking the button); **Import theme…** validates and copies in any `.toml` file you
-already have, via a native file picker; **Import VSCode theme…** converts a downloaded VSCode
-theme `.json` file (see below) the same way; **Export current theme…** saves whichever theme is
-currently active to a file you can hand to someone else. Every custom theme card also has a
-two-click **Remove** action that deletes its backing file.
+**Getting started without leaving the app.** The Themes page's "Custom themes" section has five
+real actions: **New from template…** writes the commented starting-point file above straight into
+that directory; **Import theme…** validates and copies in any `.toml` file you already have, via a
+native file picker; **Import VSCode theme…** converts a downloaded VSCode theme `.json` file (see
+below) the same way; **Generate from colour…** takes one hex colour and derives a whole theme from
+it (see below); **Export current theme…** saves whichever theme is currently active to a file you
+can hand to someone else. Every custom theme card also has a two-click **Remove** action that
+deletes its backing file.
 
-**Importing a VSCode theme (GitHub issue #141).** "Import VSCode theme…" picks a real VSCode
-theme JSON file (JSONC — `//`/`/* */` comments and trailing commas are tolerated, since that's how
-most real downloaded theme files are actually written) and converts it into this app's own format
-— both halves of it:
+**Generate from colour.** Type a `#rrggbb` seed into the Themes page's own input and click
+Generate: Jerry rotates its whole palette so its accent blue lands on that hue, scales saturation
+to match, leaves lightness alone (so the theme's light/dark structure survives), and writes the
+result out as a real, complete, literal theme file — all ~270 keys, ready to hand-tune line by
+line. This is the same HSL derivation (`derive_shift`/`apply_shift` in `crates/app/src/theme.rs`)
+that used to compute every non-Jerry-Dark colour live on every render; it is now strictly an
+authoring tool that produces files, never part of live rendering.
 
-- The five whole-app swatches: `background`/`panel` come from `colors["editor.background"]`/
-  `colors["sideBar.background"]` (or a nearby fallback key), and the three accents come from a
-  handful of real VSCode colour keys (`terminal.ansiGreen`/`terminal.ansiYellow`/
-  `button.background`, among others), falling back to a `tokenColors` scope search and then to
-  Jerry Dark's own accents if none of those are present.
-- Real per-scope syntax colours: the converter walks every `HighlightKind` bucket and searches the
-  theme's own `tokenColors` for a real matching textmate scope (`entity.name.function` for
-  `function`, `keyword.control` for `keyword`, `string.quoted` for `string`, and so on for every
-  bucket the `[syntax]` table above accepts), writing a real `[syntax]` table — not a re-derived
-  guess. A bucket with no direct scope match inherits its real parent bucket's own resolved colour
-  (the same dependency chain this app's own default palette already uses, e.g. a method call
-  falling back to a plain function call's colour) rather than being left unset, so a theme that
-  only styles the common cases still produces consistent results throughout.
+**Importing a VSCode theme (GitHub issue #141).** "Import VSCode theme…" picks a real VSCode theme
+JSON file (JSONC — `//`/`/* */` comments and trailing commas are tolerated, since that's how most
+real downloaded theme files are actually written) and converts it into a real Jerry theme file, in
+two layers:
 
-`editor.foreground` becomes the `text` override; a VSCode theme with no `tokenColors` at all (rare
-in practice) still converts, just with an empty `[syntax]` table — every bucket then keeps this
-app's own considered default, re-tinted by the five swatches above like any other custom theme.
+- **A complete derived base.** Five representative colours (`editor.background`, a sidebar/panel
+  background, and three accents from keys like `terminal.ansiGreen`/`terminal.ansiYellow`/
+  `button.background`) are run through the same derivation "Generate from colour" uses, giving
+  every one of Jerry's ~270 tokens a real value in the theme's own family. This is what stops an
+  imported light theme from leaving half the chrome dark.
+- **Every directly-mapped key on top.** Jerry's tokens are mapped onto the VSCode `colors` keys
+  that genuinely mean the same thing — the editor surface, gutter, selection and line highlight;
+  sidebar/activity bar/panel/status bar/title bar; list hover and selection rows; input and widget
+  surfaces; buttons and badges; the terminal ANSI palette; diff and git decoration colours; error
+  and warning foregrounds; scrollbar slider states; and the `foreground`/`descriptionForeground`/
+  `disabledForeground` text levels. Syntax comes from the theme's own `tokenColors`: every
+  highlight bucket searches for its real textmate scope (`entity.name.function` for `function`,
+  `keyword.control` for `keyword`, and so on), with proper scope matching — a rule for
+  `variable.parameter` colours parameters without also recolouring plain variables — and a bucket
+  with no rule of its own inherits its parent bucket's resolved colour.
+
+VSCode colour families with no counterpart in this app (peek view, notebooks, testing,
+merge-conflict decorations, debug toolbar, charts, bracket-pair colourisation) are deliberately not
+mapped; those tokens keep their derived value, which is still a real colour in the imported theme's
+own family. The result is an ordinary Jerry theme file — every value literal, every line editable
+afterwards.
 
 ## Building and running it
 

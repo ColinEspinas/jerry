@@ -379,7 +379,7 @@ pub(in crate::code_surface) fn render_diff_line(
             // git-gutter marker so consecutive added/removed rows read as one continuous strip
             // rather than leaving gaps at higher zoom.
             .self_stretch()
-            .bg(accent.unwrap_or(theme::ColorToken(work_surface::TRANSPARENT))),
+            .bg(accent.unwrap_or(theme::ColorToken::literal(work_surface::TRANSPARENT))),
     );
 
     let mut text_row = div().flex().flex_1().min_w_0();

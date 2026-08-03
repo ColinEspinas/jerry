@@ -299,15 +299,17 @@ pub fn worktree_row_action(is_main: bool, note: &WorktreeNote) -> WorktreeRowAct
     WorktreeRowAction::Open
 }
 
-/// One Themes-page card - `Jerry.dc.html`'s own `themeDefs` fixture, transcribed verbatim (name,
-/// subtitle, five swatch hex colours). Kept as plain `u32` (converted to `gpui::Rgba` at the
-/// render call site, like `crate::terminal::pane`'s own one-off literal colours) so this module
-/// stays free of a `gpui` dependency.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One built-in theme, as loaded from its real `assets/themes/*.toml` file. `name`/`subtitle` are
+/// carried directly (leaked into `&'static str`s - see [`THEME_DEFS`]) so this stays a plain
+/// `Copy` handle every call site can pass around, and `theme` is the real, fully-parsed
+/// `crate::settings::custom_theme::CustomTheme` behind it: its own explicit token overrides, its
+/// `base`, and its card preview swatches. There is deliberately no second, built-in-only shape -
+/// a bundled theme is exactly the same kind of value a user's own theme file produces.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ThemeDef {
     pub name: &'static str,
     pub subtitle: &'static str,
-    pub swatches: [u32; 5],
+    pub theme: &'static crate::settings::custom_theme::CustomTheme,
 }
 
 /// The Themes page's six cards - real `assets/themes/*.toml` files (repo root, alongside
@@ -347,9 +349,9 @@ pub static THEME_DEFS: std::sync::LazyLock<[ThemeDef; 6]> = std::sync::LazyLock:
     FILES.map(|contents| {
         let theme = crate::settings::custom_theme::parse_builtin_theme_file_str(contents);
         ThemeDef {
-            name: Box::leak(theme.name.into_boxed_str()),
-            subtitle: Box::leak(theme.subtitle.into_boxed_str()),
-            swatches: theme.swatches,
+            name: Box::leak(theme.name.clone().into_boxed_str()),
+            subtitle: Box::leak(theme.subtitle.clone().into_boxed_str()),
+            theme: Box::leak(Box::new(theme)),
         }
     })
 });
@@ -930,18 +932,15 @@ mod tests {
         assert_eq!(THEME_DEFS[0].name, "Jerry Dark");
     }
 
-    /// The real regression guard for the built-in-themes-as-files refactor (GitHub issue #5
-    /// follow-up): `THEME_DEFS` is now built at runtime from `assets/themes/*.toml` rather than a
-    /// hardcoded `const` array, so this pins the exact same names/subtitles/hex swatches the old
-    /// array held, transcribed verbatim - a single-digit typo made while writing one of those
-    /// `.toml` files would silently change the app's real default appearance, and this is what
-    /// would catch it. `custom_theme::tests::
-    /// parse_builtin_theme_file_str_parses_every_embedded_built_in_theme_file_into_the_exact_documented_swatches`
-    /// pins the same values one layer lower, straight off each file's own `include_str!`; this
-    /// test instead goes through the real, public `THEME_DEFS` every other call site in this
-    /// crate actually reads.
+    /// The real regression guard for the built-in themes' own identity: `THEME_DEFS` is built at
+    /// runtime from `assets/themes/*.toml`, so this pins the exact names, subtitles and card
+    /// preview swatches those files must produce. The swatch values are the same five each theme
+    /// was originally defined by, before the theme system's rewrite turned them into full literal
+    /// palettes - each generated file carries them forward as its explicit `preview`, so the
+    /// Themes page's cards look exactly as they always have. A single-digit typo in one of those
+    /// files would silently change the app's real appearance, and this is what would catch it.
     #[test]
-    fn theme_defs_match_the_documented_exact_names_subtitles_and_hex_swatches() {
+    fn theme_defs_match_the_documented_exact_names_subtitles_and_preview_swatches() {
         let expected: [(&str, &str, [u32; 5]); 6] = [
             (
                 "Jerry Dark",
@@ -978,7 +977,40 @@ mod tests {
         for (def, (name, subtitle, swatches)) in THEME_DEFS.iter().zip(expected.iter()) {
             assert_eq!(def.name, *name, "name mismatch");
             assert_eq!(def.subtitle, *subtitle, "subtitle mismatch for {name}");
-            assert_eq!(def.swatches, *swatches, "swatch mismatch for {name}");
+            assert_eq!(
+                def.theme.preview_swatches(),
+                *swatches,
+                "preview swatch mismatch for {name}"
+            );
+        }
+    }
+
+    /// Jerry Dark is the real identity theme: its file names no colour overrides at all, because
+    /// every `crate::theme::ColorToken`'s own compiled default *is* Jerry Dark. Every other
+    /// built-in is a full, literal palette that inherits from it.
+    #[test]
+    fn jerry_dark_overrides_nothing_and_every_other_builtin_is_a_full_palette_based_on_it() {
+        let jerry_dark = THEME_DEFS[0].theme;
+        assert!(
+            jerry_dark.overrides.is_empty(),
+            "Jerry Dark must not override any token - it is the compiled default palette itself"
+        );
+        assert_eq!(jerry_dark.base, None);
+
+        let token_count = crate::theme::all_tokens().count();
+        for def in THEME_DEFS.iter().skip(1) {
+            assert_eq!(
+                def.theme.base.as_deref(),
+                Some("Jerry Dark"),
+                "{} should name Jerry Dark as its base",
+                def.name
+            );
+            assert_eq!(
+                def.theme.overrides.len(),
+                token_count,
+                "{} should be a complete generated palette naming every real token",
+                def.name
+            );
         }
     }
 

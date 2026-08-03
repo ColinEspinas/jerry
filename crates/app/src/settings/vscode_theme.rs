@@ -1,42 +1,46 @@
-//! GitHub issue #141: importing a real VSCode theme JSON file and converting it into this app's
-//! own [`crate::settings::custom_theme::CustomThemeFile`] format - five whole-app swatches, plus
-//! (see "Per-scope syntax fidelity" below) real, individually-picked colours for every syntax
-//! bucket this app's own highlighter recognizes.
+//! GitHub issue #141: importing a real VSCode theme JSON file and converting it into one of this
+//! app's own theme files (`crate::settings::custom_theme`) - a real, per-token palette, not a
+//! handful of swatches.
 //!
-//! ## The five whole-app swatches: a real, honest palette conversion
+//! ## What a converted theme actually contains
 //!
-//! `custom_theme`'s own module docs describe this app's base mechanism: the whole app's ~200
-//! chrome tokens (backgrounds, borders, chips, ...) re-skin from exactly five swatches
-//! (`background`/`panel`/three accents) via `crate::theme::derive_shift` - there is no real
-//! per-chrome-token override file, and building one is a genuine, separate architectural change
-//! this issue's own "without affecting UI visuals" constraint argues against attempting for
-//! *chrome*. This module picks five real, representative colours out of a VSCode theme's own
-//! `colors` map (falling back to a `tokenColors` scope search, then a Jerry Dark default, for the
-//! three accents only - `background` has no default, see
-//! [`VscodeThemeError::MissingBackground`]) and runs them through the *exact same*
-//! [`crate::settings::custom_theme::CustomThemeFile::validate`] pipeline every hand-authored or
-//! plain-TOML-imported theme already goes through - so an imported VSCode theme is genuinely
-//! held to the same readability floor, the same built-in-name-collision check, real errors
-//! reported the same way.
+//! Two layers, in this order, both written literally into the resulting `.toml`:
 //!
-//! ## Per-scope syntax fidelity: real, not derived
+//! 1. **A full derived base.** Five representative colours are picked out of the VSCode theme
+//!    (`editor.background`, a sidebar/panel background, and three accents - see
+//!    [`swatches_from_vscode`]) and run through `crate::theme::derive_shift`/`derived_palette`,
+//!    producing a real value for every one of this app's ~270 tokens. This is what stops an
+//!    imported theme from being a patchwork: a light VSCode theme re-tints *all* of Jerry's
+//!    chrome, including the many tokens (border levels, the twelve `text::*` steps, rail and graph
+//!    chrome, ...) no VSCode colour key has any equivalent for.
+//! 2. **Every real, directly-mapped key on top.** [`COLOR_KEY_MAP`] maps this app's tokens onto
+//!    the VSCode `colors` keys that genuinely mean the same thing, and [`build_syntax_overrides`]
+//!    maps every syntax bucket onto the theme's own `tokenColors` textmate scopes. Wherever the
+//!    theme really says something, its own literal colour wins over the derived one.
 //!
-//! Unlike chrome, this app's *syntax* colours have a real per-bucket override mechanism
-//! (`crate::theme::syntax_override_for_kind`, checked by
-//! `crate::code_surface::code_view::color_for_kind` before its own hardcoded default) - see that
-//! function's own docs for why syntax specifically got this and chrome didn't (the short version:
-//! this app already had ~27 independently-named syntax buckets to hang real, distinct colours
-//! off; chrome's ~200 tokens have no equivalent semantic seam to add one to without a much larger
-//! change). [`build_syntax_overrides`] is the real converter: it walks
-//! [`crate::code_surface::code_view::HighlightKind::ALL`] and, for each, searches the VSCode
-//! theme's own `tokenColors` for a real matching textmate scope (see [`syntax_scope_rule`]'s own
-//! per-bucket scope list and parent-inheritance chain - the same dependency order
-//! `crate::theme::syntax`'s own module already documents for its *default* palette, e.g.
-//! `FUNCTION_METHOD` falling back to `FUNCTION`), so a theme that only styles
-//! `entity.name.function` still gets a real, consistent colour for a method call too. A bucket
-//! neither the theme nor its inheritance chain resolves simply keeps this app's own considered
-//! default (still re-tinted through the five-swatch derivation above) - never a jarring mix of
-//! "some tokens follow the theme, some silently don't".
+//! Before the theme system's rewrite only the first layer existed for chrome (there was no
+//! per-token override mechanism at all) and the second existed only for syntax. Both layers now
+//! land in the same flat, hand-editable file, so an imported theme is exactly as adjustable
+//! afterwards as a hand-written one.
+//!
+//! ## Which VSCode keys are mapped, and which deliberately aren't
+//!
+//! [`COLOR_KEY_MAP`] covers the parts of VSCode's colour surface that have a real counterpart
+//! here: the editor and its gutter/selection/line highlight, the sidebar/activity bar/panel/status
+//! bar/title bar backgrounds Jerry's own rail, panels, header and footer correspond to, list
+//! rows (hover/active/inactive selection), input and dropdown surfaces, buttons, badges, the
+//! sixteen-colour terminal ANSI palette, diff/git decoration colours, editor error/warning
+//! squigglies, scrollbar slider states, and the four `foreground` text levels
+//! (`foreground`/`descriptionForeground`/`disabledForeground`).
+//!
+//! Deliberately **not** mapped, and why: VSCode's peek view, notebook, testing, merge-conflict,
+//! debug-toolbar, chart, and extension-button colour families have no counterpart in this app at
+//! all (there is no such surface to paint); its `*.border` keys are mostly per-widget and would
+//! flatten onto Jerry's four structural border levels in a way that reads worse than the derived
+//! values; and its `editorBracketHighlight.foreground1..6` family maps onto nothing here because
+//! this app has no bracket-pair colouring yet (`theme::editor::MATCHING_BRACKET` is a real token
+//! but nothing paints it - see its own docs). Every one of those keeps its derived value, which is
+//! a real colour in the theme's own family, not a Jerry Dark leftover.
 //!
 //! ## JSONC tolerance
 //!
@@ -51,13 +55,14 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::code_surface::code_view::HighlightKind;
+use crate::theme;
 
 use super::custom_theme::CustomThemeFile;
 
-/// Jerry Dark's own three accent swatches (`assets/themes/jerry-dark.toml`) - the last-resort
-/// default for an accent this VSCode theme's own `colors`/`tokenColors` never name at all. Never
-/// used for `background`/`panel` - see [`VscodeThemeError::MissingBackground`]'s own docs for why
-/// those two are load-bearing enough to be real errors instead.
+/// Jerry Dark's own three accent swatches - the last-resort default for an accent this VSCode
+/// theme's own `colors`/`tokenColors` never name at all. Never used for `background`/`panel` - see
+/// [`VscodeThemeError::MissingBackground`]'s own docs for why those two are load-bearing enough to
+/// be real errors instead.
 const DEFAULT_ACCENT_GREEN: &str = "#5cb87f";
 const DEFAULT_ACCENT_AMBER: &str = "#e2a336";
 const DEFAULT_ACCENT_BLUE: &str = "#74ade8";
@@ -118,17 +123,361 @@ enum ScopeField {
 }
 
 impl ScopeField {
-    fn starts_with_any(&self, prefixes: &[&str]) -> bool {
-        let matches_one = |scope: &str| {
-            let scope = scope.trim();
-            prefixes.iter().any(|prefix| scope.starts_with(prefix))
-        };
+    /// Every individual selector this rule declares - a VSCode `scope` is either one string
+    /// (possibly comma-separated) or an array of them.
+    fn selectors(&self) -> Vec<&str> {
         match self {
-            ScopeField::One(scope) => scope.split(',').any(matches_one),
-            ScopeField::Many(scopes) => scopes.iter().any(|scope| matches_one(scope)),
+            ScopeField::One(scope) => scope.split(',').map(|part| part.trim()).collect(),
+            ScopeField::Many(scopes) => scopes.iter().map(|scope| scope.trim()).collect(),
         }
     }
+
+    /// How specifically this rule applies to the textmate scope `query`, or `None` if it doesn't
+    /// apply at all - the length of the longest selector that is a real scope-prefix of `query`.
+    ///
+    /// The *direction* here is the whole correctness of this module's syntax mapping, and it is
+    /// the opposite of what an earlier version did. A theme rule applies to a token when the
+    /// rule's selector is a prefix of the token's scope, not the other way round: asking "what
+    /// colour is a plain `variable`?" must **not** be answered by a rule for
+    /// `variable.parameter` (that rule is about something more specific), while asking "what
+    /// colour is `variable.parameter`?" *is* legitimately answered by a rule for `variable` when
+    /// the theme has nothing more specific. Matching the loose way round silently gave
+    /// `syntax.variable` a parameter's colour for any theme that styled parameters - a real bug
+    /// this module's own `a_child_scope_the_theme_styles_diverges_from_the_parent_it_used_to_alias`
+    /// test now pins.
+    ///
+    /// Prefixes are compared at `.`-segment boundaries, so `variable` matches
+    /// `variable.parameter` but `var` does not match `variable`.
+    fn specificity_for(&self, query: &str) -> Option<usize> {
+        self.selectors()
+            .into_iter()
+            .filter(|selector| {
+                !selector.is_empty()
+                    && (query == *selector || query.starts_with(&format!("{selector}.")))
+            })
+            .map(|selector| selector.len())
+            .max()
+    }
 }
+
+/// The real mapping from this app's own token keys to the VSCode `colors` keys that genuinely
+/// mean the same thing, most-specific first - the first key a given theme actually defines wins,
+/// and a token whose whole list is absent simply keeps its derived value (see the module docs).
+///
+/// Every VSCode key here is a real one from VSCode's own published theme-colour reference, not a
+/// guess. The mapping choices worth stating explicitly:
+///
+/// - Jerry's three background levels (`surface.window`/`surface.center`/`surface.pty`) all come
+///   from `editor.background`, with the terminal surface preferring `terminal.background` and
+///   `panel.background` when a theme defines them - those are genuinely the same surfaces.
+/// - Jerry's rail, panel headers and footers correspond to VSCode's sidebar/activity bar/status
+///   bar chrome, so they read from `sideBar.background` first and fall back through
+///   `activityBar.background`/`panel.background`/`editorGroupHeader.tabsBackground`.
+/// - `surface.row_hover`/`row_selected` map to VSCode's own list row states
+///   (`list.hoverBackground`, `list.activeSelectionBackground` with the inactive variant as a
+///   fallback), which is exactly what Jerry's file-tree and change rows are.
+/// - The `status::*` family is agent urgency, not VSCode's status *bar*: green/amber/red/blue come
+///   from the terminal ANSI palette (`terminal.ansiGreen`/`ansiYellow`/`ansiRed`/`ansiBlue`), the
+///   most reliably-defined semantic colour set in a VSCode theme, with the editor's own
+///   error/warning foregrounds as fallbacks.
+/// - `term.*`'s sixteen-colour block maps one-to-one onto `terminal.ansi*`, the one place this
+///   app and VSCode agree exactly.
+/// - `diff.*` maps onto VSCode's own diff editor and git decoration colours; the `*_bg` tokens
+///   prefer `diffEditor.insertedTextBackground`/`removedTextBackground` (which are often
+///   translucent in VSCode - the alpha channel is dropped, see [`normalize_vscode_hex`], leaving
+///   the intended hue) and fall back to the git decoration foregrounds.
+const COLOR_KEY_MAP: &[(&str, &[&str])] = &[
+    // ---- surfaces -------------------------------------------------------------------------
+    ("surface.window", &["editor.background", "background"]),
+    ("surface.center", &["editor.background"]),
+    (
+        "surface.card",
+        &["editorWidget.background", "menu.background"],
+    ),
+    ("surface.card_sunk", &["input.background"]),
+    (
+        "surface.popover",
+        &["editorWidget.background", "editorSuggestWidget.background"],
+    ),
+    (
+        "surface.palette",
+        &["quickInput.background", "editorWidget.background"],
+    ),
+    (
+        "surface.pty",
+        &[
+            "terminal.background",
+            "panel.background",
+            "editor.background",
+        ],
+    ),
+    (
+        "surface.rail",
+        &["sideBar.background", "activityBar.background"],
+    ),
+    (
+        "surface.header",
+        &["editorGroupHeader.tabsBackground", "tab.inactiveBackground"],
+    ),
+    ("surface.title_bar", &["titleBar.activeBackground"]),
+    ("surface.footer", &["statusBar.background"]),
+    ("surface.row_hover", &["list.hoverBackground"]),
+    (
+        "surface.row_hover_alt",
+        &["toolbar.hoverBackground", "list.hoverBackground"],
+    ),
+    (
+        "surface.row_selected",
+        &[
+            "list.activeSelectionBackground",
+            "list.inactiveSelectionBackground",
+        ],
+    ),
+    (
+        "surface.menu_row_hover",
+        &["menu.selectionBackground", "list.hoverBackground"],
+    ),
+    ("surface.current_line", &["editor.lineHighlightBackground"]),
+    ("surface.chip_neutral", &["badge.background"]),
+    ("surface.segment_track", &["input.background"]),
+    (
+        "surface.segment_active",
+        &["inputOption.activeBackground", "button.secondaryBackground"],
+    ),
+    ("surface.scrim", &["editor.background"]),
+    // ---- borders --------------------------------------------------------------------------
+    ("border.zone", &["editorGroup.border", "panel.border"]),
+    ("border.inner", &["panel.border", "editorGroup.border"]),
+    ("border.divider", &["editorGroup.border", "panel.border"]),
+    ("border.card", &["editorWidget.border", "menu.border"]),
+    (
+        "border.card_field",
+        &["input.border", "editorWidget.border"],
+    ),
+    ("border.composer", &["input.border"]),
+    (
+        "border.popover",
+        &["editorSuggestWidget.border", "editorWidget.border"],
+    ),
+    ("border.button", &["button.border", "contrastBorder"]),
+    ("border.selected_edge", &["focusBorder"]),
+    // ---- text -----------------------------------------------------------------------------
+    (
+        "text.selected",
+        &["list.activeSelectionForeground", "editor.foreground"],
+    ),
+    ("text.primary", &["editor.foreground", "foreground"]),
+    ("text.body", &["foreground", "editor.foreground"]),
+    ("text.secondary", &["sideBar.foreground", "foreground"]),
+    ("text.muted", &["descriptionForeground"]),
+    ("text.dim", &["descriptionForeground"]),
+    (
+        "text.faint",
+        &["disabledForeground", "descriptionForeground"],
+    ),
+    ("text.disabled", &["disabledForeground"]),
+    ("text.gutter", &["editorLineNumber.foreground"]),
+    (
+        "text.dimmer",
+        &["editorLineNumber.activeForeground", "descriptionForeground"],
+    ),
+    // ---- status (agent urgency - see this constant's own docs) -----------------------------
+    (
+        "status.review",
+        &[
+            "terminal.ansiGreen",
+            "gitDecoration.addedResourceForeground",
+        ],
+    ),
+    (
+        "status.ask",
+        &["terminal.ansiYellow", "editorWarning.foreground"],
+    ),
+    (
+        "status.fail",
+        &["terminal.ansiRed", "editorError.foreground"],
+    ),
+    ("status.run", &["terminal.ansiBlue", "textLink.foreground"]),
+    (
+        "status.idle",
+        &["disabledForeground", "descriptionForeground"],
+    ),
+    // ---- editor chrome --------------------------------------------------------------------
+    ("editor.selection", &["editor.selectionBackground"]),
+    (
+        "editor.selection_inactive",
+        &["editor.inactiveSelectionBackground"],
+    ),
+    ("editor.current_line", &["editor.lineHighlightBackground"]),
+    ("editor.caret", &["editorCursor.foreground"]),
+    ("editor.gutter_text", &["editorLineNumber.foreground"]),
+    (
+        "editor.gutter_text_active",
+        &["editorLineNumber.activeForeground"],
+    ),
+    (
+        "editor.indent_guide",
+        &[
+            "editorIndentGuide.background1",
+            "editorIndentGuide.background",
+        ],
+    ),
+    (
+        "editor.indent_guide_active",
+        &[
+            "editorIndentGuide.activeBackground1",
+            "editorIndentGuide.activeBackground",
+        ],
+    ),
+    (
+        "editor.matching_bracket",
+        &["editorBracketMatch.background"],
+    ),
+    ("editor.whitespace", &["editorWhitespace.foreground"]),
+    ("editor.diff_added", &["editorGutter.addedBackground"]),
+    ("editor.diff_removed", &["editorGutter.deletedBackground"]),
+    ("editor.blame_text", &["descriptionForeground"]),
+    // ---- syntax chrome that lives outside the tokenColors world -----------------------------
+    ("syntax.caret", &["editorCursor.foreground"]),
+    ("syntax.error_underline", &["editorError.foreground"]),
+    (
+        "syntax.hover_underline",
+        &["textLink.foreground", "editorLink.activeForeground"],
+    ),
+    (
+        "syntax.diagnostic_card_message",
+        &["editorError.foreground"],
+    ),
+    // ---- terminal: the one exact one-to-one block -------------------------------------------
+    ("term.text", &["terminal.foreground", "editor.foreground"]),
+    ("term.dim", &["terminal.ansiBrightBlack"]),
+    ("term.ok", &["terminal.ansiGreen"]),
+    ("term.err", &["terminal.ansiRed"]),
+    ("term.warn", &["terminal.ansiYellow"]),
+    (
+        "term.prompt",
+        &["terminal.ansiBrightBlue", "terminal.ansiBlue"],
+    ),
+    ("term.activity", &["terminal.ansiBlue"]),
+    (
+        "term.heading",
+        &["terminal.ansiBrightWhite", "terminal.foreground"],
+    ),
+    (
+        "term.cursor",
+        &["terminalCursor.foreground", "editorCursor.foreground"],
+    ),
+    ("term.link", &["textLink.foreground"]),
+    (
+        "term.link_hover",
+        &["textLink.activeForeground", "textLink.foreground"],
+    ),
+    (
+        "term.menu_sel_fg",
+        &["terminal.ansiBrightYellow", "terminal.ansiYellow"],
+    ),
+    // ---- diff -------------------------------------------------------------------------------
+    (
+        "diff.add_bg",
+        &[
+            "diffEditor.insertedTextBackground",
+            "diffEditor.insertedLineBackground",
+        ],
+    ),
+    (
+        "diff.del_bg",
+        &[
+            "diffEditor.removedTextBackground",
+            "diffEditor.removedLineBackground",
+        ],
+    ),
+    (
+        "diff.add_fg",
+        &[
+            "gitDecoration.addedResourceForeground",
+            "terminal.ansiGreen",
+        ],
+    ),
+    (
+        "diff.del_fg",
+        &[
+            "gitDecoration.deletedResourceForeground",
+            "terminal.ansiRed",
+        ],
+    ),
+    (
+        "diff.add_sign",
+        &["editorGutter.addedBackground", "terminal.ansiGreen"],
+    ),
+    (
+        "diff.del_sign",
+        &["editorGutter.deletedBackground", "terminal.ansiRed"],
+    ),
+    (
+        "diff.stat_add",
+        &[
+            "gitDecoration.addedResourceForeground",
+            "terminal.ansiGreen",
+        ],
+    ),
+    (
+        "diff.stat_del",
+        &[
+            "gitDecoration.deletedResourceForeground",
+            "terminal.ansiRed",
+        ],
+    ),
+    ("diff.git_gutter", &["editorGutter.modifiedBackground"]),
+    ("diff.ctx_fg", &["descriptionForeground"]),
+    // ---- buttons, toggles, badges -----------------------------------------------------------
+    ("button.blue_bg", &["button.background"]),
+    (
+        "button.blue_bg_hover",
+        &["button.hoverBackground", "button.background"],
+    ),
+    ("button.blue_fg", &["button.foreground"]),
+    ("button.green_bg", &["terminal.ansiGreen"]),
+    ("button.green_fg", &["button.foreground"]),
+    ("button.amber_bg", &["terminal.ansiYellow"]),
+    (
+        "button.danger_fg",
+        &["errorForeground", "editorError.foreground"],
+    ),
+    (
+        "button.danger_fg_hover",
+        &["editorError.foreground", "errorForeground"],
+    ),
+    ("toggle.track_on", &["button.background", "focusBorder"]),
+    (
+        "toggle.track_off",
+        &["input.background", "badge.background"],
+    ),
+    // ---- scrollbar --------------------------------------------------------------------------
+    ("scrollbar.thumb", &["scrollbarSlider.background"]),
+    (
+        "scrollbar.thumb_hover",
+        &["scrollbarSlider.hoverBackground"],
+    ),
+    // ---- completions popup ------------------------------------------------------------------
+    (
+        "completions_popup.item_selected_bg",
+        &[
+            "editorSuggestWidget.selectedBackground",
+            "list.activeSelectionBackground",
+        ],
+    ),
+    (
+        "completions_popup.item_selected_fg",
+        &[
+            "editorSuggestWidget.selectedForeground",
+            "list.activeSelectionForeground",
+        ],
+    ),
+    (
+        "completions_popup.item_fg",
+        &["editorSuggestWidget.foreground", "foreground"],
+    ),
+];
 
 /// Strips `//` line comments, `/* */` block comments, and trailing commas before `}`/`]` from
 /// `input` - real JSONC noise `serde_json` itself rejects, but genuinely present in real
@@ -219,11 +568,13 @@ fn strip_jsonc_noise(input: &str) -> String {
 
 /// Normalizes a real VSCode colour string into this app's own `#rrggbb` shape:
 /// `#rgb`/`#rgba` shorthand doubled, `#rrggbb` passed through, `#rrggbbaa`'s alpha channel
-/// dropped (this app's own five swatches carry no alpha - see `custom_theme`'s own module docs
-/// on why `#rrggbb` is the one real shape it accepts). `None` for anything else (a named CSS
-/// colour, a malformed string) - VSCode themes overwhelmingly use hex, and guessing at named
-/// colours is exactly the kind of "vibe match wearing a precise-looking answer" this module's own
-/// docs already reject for the load-bearing background field.
+/// dropped (this app's own theme files carry no alpha - see `custom_theme`'s own module docs on
+/// why `#rrggbb` is the one real shape it accepts; VSCode uses translucent colours heavily for
+/// selection/diff backgrounds, and taking their hue at full opacity is the honest approximation
+/// available). `None` for anything else (a named CSS colour, a malformed string) - VSCode themes
+/// overwhelmingly use hex, and guessing at named colours is exactly the kind of "vibe match
+/// wearing a precise-looking answer" this module's own docs reject for the load-bearing background
+/// field.
 fn normalize_vscode_hex(value: &str) -> Option<String> {
     let hex = value.trim().strip_prefix('#')?;
     if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -250,26 +601,43 @@ fn first_valid_color<'a>(
     })
 }
 
+/// The real colour this theme gives the first of `queries` it says anything about at all.
+///
+/// `queries` is one bucket's own preference order (most specific textmate scope first - see
+/// [`syntax_scope_rule`]), and within a single query the *best* rule wins, not merely the first:
+/// the most specific matching selector ([`ScopeField::specificity_for`]), with a later rule
+/// beating an earlier one of equal specificity - which is VSCode's own "later `tokenColors`
+/// entries override earlier ones" precedence, not a guess.
 fn first_scope_foreground(
     token_colors: &[VscodeTokenColorRule],
-    prefixes: &[&str],
+    queries: &[&str],
 ) -> Option<String> {
-    token_colors
-        .iter()
-        .find(|rule| {
-            rule.scope
-                .as_ref()
-                .is_some_and(|scope| scope.starts_with_any(prefixes))
-        })
-        .and_then(|rule| rule.settings.foreground.as_deref())
-        .and_then(normalize_vscode_hex)
+    for query in queries {
+        let mut best: Option<(usize, &str)> = None;
+        for rule in token_colors {
+            let (Some(scope), Some(foreground)) =
+                (&rule.scope, rule.settings.foreground.as_deref())
+            else {
+                continue;
+            };
+            let Some(specificity) = scope.specificity_for(query) else {
+                continue;
+            };
+            if best.is_none_or(|(best_specificity, _)| specificity >= best_specificity) {
+                best = Some((specificity, foreground));
+            }
+        }
+        if let Some(color) = best.and_then(|(_, foreground)| normalize_vscode_hex(foreground)) {
+            return Some(color);
+        }
+    }
+    None
 }
 
 /// A plausible second swatch when nothing in `colors` names a real sidebar/panel-shaped colour -
 /// nudges `background`'s own luma a fixed step in whichever direction gives more room (lighter
 /// for a dark theme, darker for a light one), so `panel` is never simply identical to
-/// `background` (which would fail the shared readability floor `validate()` already enforces
-/// regardless of where a swatch came from).
+/// `background` (which would make the derived lightness fit degenerate).
 fn derive_panel_fallback(background_hex: &str) -> String {
     let value = u32::from_str_radix(background_hex.trim_start_matches('#'), 16).unwrap_or(0);
     let (r, g, b) = ((value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff);
@@ -277,6 +645,43 @@ fn derive_panel_fallback(background_hex: &str) -> String {
     let shift: i32 = if luma < 128 { 14 } else { -14 };
     let nudge = |channel: u32| (channel as i32 + shift).clamp(0, 255) as u32;
     format!("#{:06x}", (nudge(r) << 16) | (nudge(g) << 8) | nudge(b))
+}
+
+/// Whether this theme's own panel colour can be used as the second swatch of the derived base
+/// layer's lightness fit (`crate::theme::derive_shift`), or whether a synthesized one
+/// ([`derive_panel_fallback`]) has to stand in for it.
+///
+/// The fit solves a line through `(jerry_bg, theme_bg)` and `(jerry_panel, theme_panel)`, and
+/// Jerry Dark's own panel is *lighter* than its window. So:
+///
+/// - A theme whose window background is dark, like Jerry's, must have its panel lighter than its
+///   window for the fit to keep Jerry's own light/dark structure. Plenty of real dark themes
+///   (Dracula among them) make their sidebar *darker* than the editor instead - a perfectly good
+///   choice for VSCode, but feeding it into the fit solves a **negative** slope, which inverts
+///   every token: Jerry's light text would map below zero lightness and clamp to black on a dark
+///   background. That is not a subtle quality loss, it is an unusable palette.
+/// - A theme whose window background is light *should* invert (that is exactly how the bundled
+///   "Paper" theme is derived from Jerry Dark), so there the negative slope is correct and a panel
+///   darker than the window is what we want.
+///
+/// So the usable direction is simply "does this theme's panel sit on the same side of its window
+/// as the derivation needs" - lighter for a dark theme, darker for a light one. When it doesn't,
+/// [`derive_panel_fallback`] synthesizes one that does, nudging in exactly that direction. The
+/// theme's real sidebar colour is not lost by this: it is still mapped directly onto
+/// `surface.rail` by [`COLOR_KEY_MAP`], which is the token that actually paints it.
+fn panel_direction_is_usable(background_hex: &str, panel_hex: &str) -> bool {
+    let luma = |hex: &str| -> i32 {
+        let value = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0);
+        let (r, g, b) = ((value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff);
+        ((r * 299 + g * 587 + b * 114) / 1000) as i32
+    };
+    let background = luma(background_hex);
+    let panel = luma(panel_hex);
+    if background < 128 {
+        panel > background
+    } else {
+        panel < background
+    }
 }
 
 /// Filename stem, e.g. `dracula-pro.json` -> `"Dracula Pro"` - the real fallback display name
@@ -297,23 +702,11 @@ fn title_case_from_stem(stem: &str) -> String {
         .join(" ")
 }
 
-/// Converts real VSCode theme JSON `contents` into this app's own [`CustomThemeFile`] shape -
-/// **not yet validated**; the caller runs it through [`CustomThemeFile::validate`] (or
-/// [`super::custom_theme::import_theme_file`]'s own validate-then-write path) the same as any
-/// other theme file, so a converted-but-unreadable result (e.g. `editor.background` and
-/// `sideBar.background` too close in luma) is rejected the same honest way a hand-authored one
-/// would be.
-///
-/// `source_stem` is the source file's own name without extension (e.g. `"dracula"` for
-/// `dracula.json`) - the real fallback display name, see [`title_case_from_stem`].
-pub fn convert_vscode_theme_str(
-    contents: &str,
-    source_stem: &str,
-) -> Result<CustomThemeFile, VscodeThemeError> {
-    let stripped = strip_jsonc_noise(contents);
-    let file: VscodeThemeFile =
-        serde_json::from_str(&stripped).map_err(|err| VscodeThemeError::Parse(err.to_string()))?;
-
+/// Picks the five representative `[background, panel, green-ish, amber-ish, blue-ish]` colours the
+/// whole-app derived base layer is computed from (see the module docs' layer 1). `background` has
+/// no default - a theme that names none is a real [`VscodeThemeError::MissingBackground`]; the
+/// three accents fall back through the theme's own `tokenColors` and finally to Jerry Dark's own.
+fn swatches_from_vscode(file: &VscodeThemeFile) -> Result<[u32; 5], VscodeThemeError> {
     let background = first_valid_color(&file.colors, ["editor.background", "background"])
         .ok_or(VscodeThemeError::MissingBackground)?;
     let panel = first_valid_color(
@@ -325,6 +718,7 @@ pub fn convert_vscode_theme_str(
             "editorGroupHeader.tabsBackground",
         ],
     )
+    .filter(|panel| panel_direction_is_usable(&background, panel))
     .unwrap_or_else(|| derive_panel_fallback(&background));
     let accent_green = first_valid_color(
         &file.colors,
@@ -363,37 +757,95 @@ pub fn convert_vscode_theme_str(
     })
     .unwrap_or_else(|| DEFAULT_ACCENT_BLUE.to_string());
 
+    let parse = |value: &str| u32::from_str_radix(value.trim_start_matches('#'), 16).unwrap_or(0);
+    Ok([
+        parse(&background),
+        parse(&panel),
+        parse(&accent_green),
+        parse(&accent_amber),
+        parse(&accent_blue),
+    ])
+}
+
+/// Converts real VSCode theme JSON `contents` into this app's own [`CustomThemeFile`] shape -
+/// **not yet validated**; the caller runs it through `CustomThemeFile::validate` (or
+/// [`super::custom_theme::validate_and_write`]'s own validate-then-write path) the same as any
+/// other theme file, so a converted-but-unreadable result is rejected the same honest way a
+/// hand-authored one would be.
+///
+/// `source_stem` is the source file's own name without extension (e.g. `"dracula"` for
+/// `dracula.json`) - the real fallback display name, see [`title_case_from_stem`].
+pub fn convert_vscode_theme_str(
+    contents: &str,
+    source_stem: &str,
+) -> Result<CustomThemeFile, VscodeThemeError> {
+    let stripped = strip_jsonc_noise(contents);
+    let file: VscodeThemeFile =
+        serde_json::from_str(&stripped).map_err(|err| VscodeThemeError::Parse(err.to_string()))?;
+
+    let swatches = swatches_from_vscode(&file)?;
+
+    // Layer 1: a real, complete derived base for every token in the app.
+    let shift = theme::derive_shift(super::builtin_themes::jerry_dark_swatches(), swatches);
+    let mut palette: HashMap<&'static str, gpui::Rgba> =
+        theme::derived_palette(shift).into_iter().collect();
+
+    // Layer 2: every key this theme really names, on top.
+    for (token_key, vscode_keys) in COLOR_KEY_MAP {
+        let Some(color) = first_valid_color(&file.colors, vscode_keys.iter().copied()) else {
+            continue;
+        };
+        let Some(token) = theme::token_for_key(token_key) else {
+            debug_assert!(false, "{token_key} is not a real registered theme token");
+            continue;
+        };
+        if let Some(hex) = parse_normalized_hex(&color) {
+            palette.insert(token.key, theme::hex_rgba(hex));
+        }
+    }
+    for (token_key, color) in build_syntax_overrides(&file.colors, &file.token_colors) {
+        if let (Some(token), Some(hex)) = (
+            theme::token_for_key(&token_key),
+            parse_normalized_hex(&color),
+        ) {
+            palette.insert(token.key, theme::hex_rgba(hex));
+        }
+    }
+
     let name = file
         .name
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| title_case_from_stem(source_stem));
 
-    Ok(CustomThemeFile {
-        name,
-        subtitle: "imported from a VSCode theme".to_string(),
-        background,
-        panel,
-        accent_green,
-        accent_amber,
-        accent_blue,
-        syntax: build_syntax_overrides(&file.colors, &file.token_colors),
-    })
+    Ok(super::builtin_themes::generated_theme_file(
+        &name,
+        "imported from a VSCode theme",
+        swatches,
+        theme::all_tokens()
+            .filter_map(|token| palette.get(token.key).map(|color| (token.key, *color)))
+            .collect(),
+    ))
+}
+
+/// A `#rrggbb` string [`normalize_vscode_hex`] already produced -> its `0xrrggbb` value.
+fn parse_normalized_hex(value: &str) -> Option<u32> {
+    u32::from_str_radix(value.strip_prefix('#')?, 16).ok()
 }
 
 /// One [`HighlightKind`]'s real, ordered list of textmate scope prefixes to search
 /// [`file.token_colors`](VscodeThemeFile::token_colors) for, plus the kind to inherit its colour
-/// from when no rule matches - the real bucket dependency order
-/// [`crate::theme::syntax`]'s own module docs already establish for this app's *default* palette
-/// (`FUNCTION_METHOD` falls back to `FUNCTION`, `TYPE_BUILTIN` to `TYPE`, `VARIABLE` to `TEXT`,
-/// ...), computed once here at import time instead of at `const`-definition time, so a VSCode
-/// theme that only styles `entity.name.function` still gets a real, consistent colour for a
-/// method call too - not a jarring mix of "some tokens follow the theme, some silently don't".
+/// from when no rule matches - the real bucket dependency order [`crate::theme::syntax`]'s own
+/// module docs already establish as this app's *default* fallback chain (`FUNCTION_METHOD` after
+/// `FUNCTION`, `TYPE_BUILTIN` after `TYPE`, `VARIABLE` after `TEXT`, ...), applied here at import
+/// time, so a VSCode theme that only styles `entity.name.function` still gets a real, consistent
+/// colour for a method call too - not a jarring mix of "some tokens follow the theme, some
+/// silently don't".
 ///
-/// A `None` parent means "this bucket's default is this crate's own hardcoded colour, not
-/// another bucket's" - the same real roots `theme::syntax` itself uses (`KEYWORD`/`FUNCTION`/
-/// `TYPE`/`CONSTANT`/`STRING`/`COMMENT`/`ATTRIBUTE`/`STRONG`/`EMPHASIS` are independently
-/// authored hues, not aliases).
+/// A `None` parent means "this bucket has no ancestor to inherit from" - the same real roots
+/// `theme::syntax` itself uses (`KEYWORD`/`FUNCTION`/`TYPE`/`CONSTANT`/`STRING`/`COMMENT`/
+/// `ATTRIBUTE`/`STRONG`/`EMPHASIS` are independently authored hues, not defaults borrowed from
+/// another bucket).
 fn syntax_scope_rule(kind: HighlightKind) -> (&'static [&'static str], Option<HighlightKind>) {
     use HighlightKind::*;
     match kind {
@@ -482,20 +934,23 @@ fn syntax_scope_rule(kind: HighlightKind) -> (&'static [&'static str], Option<Hi
     }
 }
 
-/// Builds the real `[syntax]` table [`convert_vscode_theme_str`] hands `CustomThemeFile::syntax`,
-/// naming every [`HighlightKind`] this VSCode theme's own `colors`/`tokenColors` give a real,
-/// resolved colour for. Processed in [`HighlightKind::ALL`]'s own declaration order (parents
-/// before every child that can inherit from them - see [`syntax_scope_rule`]'s own docs) so a
-/// child's fallback inheritance always reads an already-resolved parent, never one that hasn't
-/// been visited yet.
+/// Builds the real `syntax.*` half of a converted palette: every [`HighlightKind`] this VSCode
+/// theme's own `colors`/`tokenColors` give a real, resolved colour for, keyed by the matching
+/// `crate::theme::syntax` token key (`HighlightKind::name` and that token's key are the same
+/// snake_case string by construction - see [`tests::every_highlight_kind_maps_onto_a_real_syntax_token`],
+/// which proves it rather than assuming it).
+///
+/// Processed in [`HighlightKind::ALL`]'s own declaration order (parents before every child that
+/// can inherit from them - see [`syntax_scope_rule`]) so a child's fallback always reads an
+/// already-resolved parent, never one that hasn't been visited yet.
 ///
 /// [`HighlightKind::Text`] is the one real special case: it comes from `colors["editor.foreground"]`
 /// (a real VSCode UI colour, not a `tokenColors` scope - there is no textmate scope for "plain
-/// text with no other rule matching") rather than [`syntax_scope_rule`]'s own scope search.
+/// text with no other rule matching") rather than a scope search.
 fn build_syntax_overrides(
     colors: &HashMap<String, String>,
     token_colors: &[VscodeTokenColorRule],
-) -> HashMap<String, String> {
+) -> Vec<(String, String)> {
     let mut resolved: HashMap<HighlightKind, String> = HashMap::new();
     if let Some(foreground) = first_valid_color(colors, ["editor.foreground", "foreground"]) {
         resolved.insert(HighlightKind::Text, foreground);
@@ -511,16 +966,21 @@ fn build_syntax_overrides(
             resolved.insert(kind, color);
         }
     }
-    resolved
+    // Registry order, not `HashMap` order, so a converted file's `[syntax]` table comes out
+    // deterministic rather than differing between two imports of the same source file.
+    HighlightKind::ALL
         .into_iter()
-        .map(|(kind, color)| (kind.name().to_string(), color))
+        .filter_map(|kind| {
+            resolved
+                .get(&kind)
+                .map(|color| (format!("syntax.{}", kind.name()), color.clone()))
+        })
         .collect()
 }
 
-/// The real file-path entry point [`super::render::AdeApp::start_import_vscode_theme`] uses:
-/// reads `source_path`, converts, and hands back an *unvalidated* [`CustomThemeFile`] plus the
-/// stem [`convert_vscode_theme_str`] used - the caller still runs the shared validate-then-write
-/// path, same as [`super::custom_theme::import_theme_file`].
+/// Reads and converts `source_path` - the real file-path entry point behind
+/// [`import_vscode_theme_file`]. Hands back an *unvalidated* [`CustomThemeFile`]; the caller still
+/// runs the shared validate-then-write path.
 pub fn convert_vscode_theme_file(source_path: &Path) -> Result<CustomThemeFile, VscodeThemeError> {
     let contents = std::fs::read_to_string(source_path)
         .map_err(|err| VscodeThemeError::Parse(err.to_string()))?;
@@ -533,10 +993,8 @@ pub fn convert_vscode_theme_file(source_path: &Path) -> Result<CustomThemeFile, 
 
 /// Every real, specific way importing a VSCode theme *file* (as opposed to just converting
 /// already-read text, [`convert_vscode_theme_str`]'s own concern) can fail - a real conversion
-/// error, or the *converted* result failing the shared
-/// [`super::custom_theme::CustomThemeFile::validate`]/write pipeline every other theme import
-/// goes through (a genuine readability-floor rejection, or an I/O failure writing the canonical
-/// copy).
+/// error, or the *converted* result failing the shared validate/write pipeline every other theme
+/// import goes through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VscodeImportError {
     Convert(VscodeThemeError),
@@ -557,7 +1015,7 @@ impl std::fmt::Display for VscodeImportError {
 /// validate-then-write-a-canonical-copy path [`super::custom_theme::import_theme_file`] uses for
 /// a plain TOML theme, so an imported VSCode theme is a real, indistinguishable
 /// [`super::custom_theme::CustomTheme`] afterward - same readability floor, same collision-safe
-/// destination naming, same re-import-updates-in-place behaviour.
+/// destination naming, same re-import-updates-in-place behaviour, and a real, hand-editable file.
 pub fn import_vscode_theme_file(
     source_path: &Path,
     dest_dir: &Path,
@@ -569,6 +1027,14 @@ pub fn import_vscode_theme_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The converted file's real entry for `key`, as a `#rrggbb` string.
+    fn entry(file: &CustomThemeFile, key: &str) -> Option<String> {
+        file.overrides
+            .iter()
+            .find(|(entry_key, _)| entry_key == key)
+            .map(|(_, value)| value.clone())
+    }
 
     #[test]
     fn strip_jsonc_noise_removes_line_and_block_comments_and_trailing_commas() {
@@ -619,49 +1085,205 @@ mod tests {
         );
     }
 
-    fn sample_theme_json(background: &str, extra: &str) -> String {
-        format!(
-            r#"{{
-                "name": "Sample Theme",
-                "colors": {{
-                    "editor.background": "{background}"
-                    {extra}
-                }},
-                "tokenColors": []
-            }}"#
-        )
+    /// Every VSCode key this module claims to map must target a *real* registered token - a typo
+    /// here would silently drop that mapping, and `debug_assert!` alone wouldn't be checked in a
+    /// release build.
+    #[test]
+    fn every_mapped_token_key_is_a_real_registered_theme_token() {
+        for (token_key, vscode_keys) in COLOR_KEY_MAP {
+            assert!(
+                theme::token_for_key(token_key).is_some(),
+                "{token_key} is not a real registered theme token"
+            );
+            assert!(
+                !vscode_keys.is_empty(),
+                "{token_key} maps to no VSCode key at all"
+            );
+        }
+    }
+
+    /// The `syntax.*` half depends on `HighlightKind::name()` and the matching token key being the
+    /// same string - proven here rather than assumed.
+    #[test]
+    fn every_highlight_kind_maps_onto_a_real_syntax_token() {
+        for kind in HighlightKind::ALL {
+            let key = format!("syntax.{}", kind.name());
+            assert!(
+                theme::token_for_key(&key).is_some(),
+                "{key} (from HighlightKind::{kind:?}) is not a real registered token"
+            );
+        }
     }
 
     #[test]
-    fn a_real_minimal_theme_converts_with_jerry_dark_accent_defaults() {
-        let json = sample_theme_json("#101214", "");
-        let file = convert_vscode_theme_str(&json, "sample").expect("convert");
+    fn a_real_minimal_theme_converts_into_a_complete_derived_palette() {
+        let json = r##"{
+            "name": "Sample Theme",
+            "colors": { "editor.background": "#101214" }
+        }"##;
+        let file = convert_vscode_theme_str(json, "sample").expect("convert");
         assert_eq!(file.name, "Sample Theme");
-        assert_eq!(file.background, "#101214");
-        assert_eq!(file.accent_green, DEFAULT_ACCENT_GREEN);
-        assert_eq!(file.accent_amber, DEFAULT_ACCENT_AMBER);
-        assert_eq!(file.accent_blue, DEFAULT_ACCENT_BLUE);
-        // No real sideBar/panel colour supplied - a derived fallback, not identical to
-        // `background` (which would fail the shared readability floor).
-        assert_ne!(file.panel, file.background);
+        assert_eq!(file.base.as_deref(), Some("Jerry Dark"));
+        assert_eq!(
+            file.overrides.len(),
+            theme::all_tokens().count(),
+            "an imported theme must be a complete palette, not a handful of keys - every token \
+             the theme itself doesn't name still gets a real derived colour in its own family"
+        );
+        assert_eq!(entry(&file, "surface.window").as_deref(), Some("#101214"));
     }
 
     #[test]
-    fn real_colors_and_terminal_ansi_swatches_are_preferred_over_defaults() {
+    fn real_colors_keys_win_over_the_derived_base_layer() {
         let json = r##"{
             "colors": {
                 "editor.background": "#101214",
                 "sideBar.background": "#1a1e21",
-                "terminal.ansiGreen": "#5cb87f",
-                "terminal.ansiYellow": "#e2a336",
-                "button.background": "#74ade8"
+                "statusBar.background": "#2b2d3a",
+                "terminal.ansiGreen": "#50fa7b",
+                "terminal.ansiRed": "#ff5555",
+                "editorCursor.foreground": "#f8f8f0",
+                "list.hoverBackground": "#313442"
             }
         }"##;
         let file = convert_vscode_theme_str(json, "sample").expect("convert");
-        assert_eq!(file.panel, "#1a1e21");
-        assert_eq!(file.accent_green, "#5cb87f");
-        assert_eq!(file.accent_amber, "#e2a336");
-        assert_eq!(file.accent_blue, "#74ade8");
+        assert_eq!(entry(&file, "surface.rail").as_deref(), Some("#1a1e21"));
+        assert_eq!(entry(&file, "surface.footer").as_deref(), Some("#2b2d3a"));
+        assert_eq!(entry(&file, "status.review").as_deref(), Some("#50fa7b"));
+        assert_eq!(entry(&file, "term.ok").as_deref(), Some("#50fa7b"));
+        assert_eq!(entry(&file, "status.fail").as_deref(), Some("#ff5555"));
+        assert_eq!(entry(&file, "editor.caret").as_deref(), Some("#f8f8f0"));
+        assert_eq!(
+            entry(&file, "surface.row_hover").as_deref(),
+            Some("#313442")
+        );
+    }
+
+    /// The real breadth claim: a theme with a normal VSCode colour set moves genuinely many
+    /// distinct Jerry tokens to its *own literal* values, across unrelated modules - not just the
+    /// three or four the old five-swatch conversion could.
+    #[test]
+    fn a_realistic_theme_maps_many_real_keys_across_unrelated_modules() {
+        let json = r##"{
+            "name": "Broad",
+            "colors": {
+                "editor.background": "#282a36",
+                "editor.foreground": "#f8f8f2",
+                "sideBar.background": "#21222c",
+                "activityBar.background": "#343746",
+                "statusBar.background": "#191a21",
+                "titleBar.activeBackground": "#21222c",
+                "editorWidget.background": "#21222c",
+                "input.background": "#282a36",
+                "list.hoverBackground": "#44475a",
+                "list.activeSelectionBackground": "#44475a",
+                "editor.lineHighlightBackground": "#44475a",
+                "editor.selectionBackground": "#44475a",
+                "editorCursor.foreground": "#f8f8f0",
+                "editorLineNumber.foreground": "#6272a4",
+                "editorLineNumber.activeForeground": "#f8f8f2",
+                "editorIndentGuide.background1": "#424450",
+                "editorWhitespace.foreground": "#424450",
+                "editorError.foreground": "#ff5555",
+                "editorWarning.foreground": "#ffb86c",
+                "editorGutter.addedBackground": "#50fa7b",
+                "editorGutter.deletedBackground": "#ff5555",
+                "editorGutter.modifiedBackground": "#8be9fd",
+                "gitDecoration.addedResourceForeground": "#50fa7b",
+                "gitDecoration.deletedResourceForeground": "#ff5555",
+                "diffEditor.insertedTextBackground": "#50fa7b33",
+                "diffEditor.removedTextBackground": "#ff555533",
+                "terminal.foreground": "#f8f8f2",
+                "terminal.ansiGreen": "#50fa7b",
+                "terminal.ansiRed": "#ff5555",
+                "terminal.ansiYellow": "#f1fa8c",
+                "terminal.ansiBlue": "#bd93f9",
+                "terminal.ansiBrightBlack": "#6272a4",
+                "terminal.ansiBrightWhite": "#ffffff",
+                "button.background": "#44475a",
+                "button.foreground": "#f8f8f2",
+                "badge.background": "#44475a",
+                "focusBorder": "#6272a4",
+                "foreground": "#f8f8f2",
+                "descriptionForeground": "#6272a4",
+                "scrollbarSlider.background": "#44475a",
+                "textLink.foreground": "#8be9fd"
+            },
+            "tokenColors": [
+                { "scope": "keyword", "settings": { "foreground": "#ff79c6" } },
+                { "scope": "string", "settings": { "foreground": "#f1fa8c" } },
+                { "scope": "comment", "settings": { "foreground": "#6272a4" } },
+                { "scope": "entity.name.function", "settings": { "foreground": "#50fa7b" } },
+                { "scope": "entity.name.type", "settings": { "foreground": "#8be9fd" } },
+                { "scope": "variable.parameter", "settings": { "foreground": "#ffb86c" } }
+            ]
+        }"##;
+        let file = convert_vscode_theme_str(json, "broad").expect("convert");
+
+        // Every value the theme literally names is present verbatim, spread across modules that
+        // have nothing to do with each other.
+        for (key, expected) in [
+            ("surface.window", "#282a36"),
+            ("surface.rail", "#21222c"),
+            ("surface.footer", "#191a21"),
+            ("surface.title_bar", "#21222c"),
+            ("text.body", "#f8f8f2"),
+            ("text.muted", "#6272a4"),
+            ("status.fail", "#ff5555"),
+            ("status.ask", "#f1fa8c"),
+            ("editor.gutter_text", "#6272a4"),
+            ("editor.whitespace", "#424450"),
+            ("term.dim", "#6272a4"),
+            ("term.heading", "#ffffff"),
+            ("diff.git_gutter", "#8be9fd"),
+            ("scrollbar.thumb", "#44475a"),
+            ("button.blue_bg", "#44475a"),
+            ("syntax.keyword", "#ff79c6"),
+            ("syntax.string", "#f1fa8c"),
+            ("syntax.comment", "#6272a4"),
+            ("syntax.function", "#50fa7b"),
+            ("syntax.type", "#8be9fd"),
+            ("syntax.variable_parameter", "#ffb86c"),
+        ] {
+            assert_eq!(
+                entry(&file, key).as_deref(),
+                Some(expected),
+                "{key} should have come straight from the VSCode theme"
+            );
+        }
+
+        // A translucent VSCode colour keeps its hue at full opacity.
+        assert_eq!(entry(&file, "diff.add_bg").as_deref(), Some("#50fa7b"));
+
+        // And the whole thing is still a real, valid, selectable theme.
+        let validated = file
+            .validate()
+            .expect("must pass the shared validate pipeline");
+        assert_eq!(validated.name, "Broad");
+    }
+
+    /// A former Rust-level alias pair really can diverge now: `variable.parameter` is styled by
+    /// this theme, `variable` isn't, and the two must land on genuinely different colours - the
+    /// concrete fidelity win the token rewrite bought for VSCode import.
+    #[test]
+    fn a_child_scope_the_theme_styles_diverges_from_the_parent_it_used_to_alias() {
+        let json = r##"{
+            "colors": { "editor.background": "#101214", "editor.foreground": "#eeeeee" },
+            "tokenColors": [
+                { "scope": "variable.parameter", "settings": { "foreground": "#ffb86c" } }
+            ]
+        }"##;
+        let file = convert_vscode_theme_str(json, "sample").expect("convert");
+        assert_eq!(
+            entry(&file, "syntax.variable_parameter").as_deref(),
+            Some("#ffb86c")
+        );
+        assert_eq!(entry(&file, "syntax.variable").as_deref(), Some("#eeeeee"));
+        assert_ne!(
+            entry(&file, "syntax.variable_parameter"),
+            entry(&file, "syntax.variable"),
+            "before the token rewrite these were the same const and could not differ at all"
+        );
     }
 
     #[test]
@@ -674,8 +1296,8 @@ mod tests {
             ]
         }"##;
         let file = convert_vscode_theme_str(json, "sample").expect("convert");
-        assert_eq!(file.accent_green, "#7fd88f");
-        assert_eq!(file.accent_amber, "#e9c46a");
+        assert_eq!(entry(&file, "syntax.string").as_deref(), Some("#7fd88f"));
+        assert_eq!(entry(&file, "syntax.keyword").as_deref(), Some("#e9c46a"));
     }
 
     #[test]
@@ -691,7 +1313,7 @@ mod tests {
     fn a_top_level_background_key_is_a_real_fallback_for_editor_background() {
         let json = r##"{ "colors": { "background": "#0a0b0c" } }"##;
         let file = convert_vscode_theme_str(json, "sample").expect("convert");
-        assert_eq!(file.background, "#0a0b0c");
+        assert_eq!(entry(&file, "surface.window").as_deref(), Some("#0a0b0c"));
     }
 
     #[test]
@@ -718,7 +1340,7 @@ mod tests {
         }"##;
         let file = convert_vscode_theme_str(json, "sample").expect("convert");
         assert_eq!(file.name, "Commented");
-        assert_eq!(file.background, "#101214");
+        assert_eq!(entry(&file, "surface.window").as_deref(), Some("#101214"));
     }
 
     #[test]
@@ -741,28 +1363,10 @@ mod tests {
     }
 
     #[test]
-    fn a_real_token_color_rule_produces_a_real_syntax_override() {
-        let json = r##"{
-            "colors": { "editor.background": "#101214" },
-            "tokenColors": [
-                { "scope": "keyword.control", "settings": { "foreground": "#ff79c6" } },
-                { "scope": "string.quoted", "settings": { "foreground": "#f1fa8c" } }
-            ]
-        }"##;
-        let file = convert_vscode_theme_str(json, "sample").expect("convert");
-        assert_eq!(file.syntax.get("keyword"), Some(&"#ff79c6".to_string()));
-        assert_eq!(file.syntax.get("string"), Some(&"#f1fa8c".to_string()));
-        let validated = file
-            .validate()
-            .expect("must pass the shared validate() pipeline");
-        assert_eq!(validated.syntax_overrides.len(), file.syntax.len());
-    }
-
-    #[test]
     fn a_child_bucket_with_no_direct_scope_match_inherits_its_real_parents_resolved_colour() {
         // No "entity.name.function.method"/"support.function.method" rule at all - only the
         // parent "entity.name.function" is styled. FunctionMethod must still resolve, to the
-        // same colour, rather than being left unset.
+        // same colour, rather than being left on the derived value.
         let json = r##"{
             "colors": { "editor.background": "#101214" },
             "tokenColors": [
@@ -770,12 +1374,12 @@ mod tests {
             ]
         }"##;
         let file = convert_vscode_theme_str(json, "sample").expect("convert");
-        assert_eq!(file.syntax.get("function"), Some(&"#8be9fd".to_string()));
+        assert_eq!(entry(&file, "syntax.function").as_deref(), Some("#8be9fd"));
         assert_eq!(
-            file.syntax.get("function_method"),
-            Some(&"#8be9fd".to_string()),
+            entry(&file, "syntax.function_method").as_deref(),
+            Some("#8be9fd"),
             "FunctionMethod has no direct scope match here, so it must inherit Function's own \
-             real resolved colour rather than being left unset"
+             real resolved colour"
         );
     }
 
@@ -790,26 +1394,14 @@ mod tests {
         }"##;
         let file = convert_vscode_theme_str(json, "sample").expect("convert");
         assert_eq!(
-            file.syntax.get("function_method"),
-            Some(&"#50fa7b".to_string()),
-            "a real, direct scope match for the child bucket must win over inheriting its \
-             parent's colour"
+            entry(&file, "syntax.function_method").as_deref(),
+            Some("#50fa7b"),
+            "a real, direct scope match for the child bucket must win over inheriting its parent"
         );
     }
 
     #[test]
-    fn a_theme_with_no_real_token_colors_at_all_produces_no_syntax_overrides() {
-        let json = r##"{ "colors": { "editor.background": "#101214" } }"##;
-        let file = convert_vscode_theme_str(json, "sample").expect("convert");
-        assert!(
-            file.syntax.is_empty(),
-            "no tokenColors and no editor.foreground means nothing this app can resolve a real \
-             override from - an empty table, not a guess"
-        );
-    }
-
-    #[test]
-    fn editor_foreground_becomes_the_real_text_override() {
+    fn editor_foreground_becomes_the_real_text_syntax_colour() {
         let json = r##"{
             "colors": {
                 "editor.background": "#101214",
@@ -817,6 +1409,26 @@ mod tests {
             }
         }"##;
         let file = convert_vscode_theme_str(json, "sample").expect("convert");
-        assert_eq!(file.syntax.get("text"), Some(&"#f8f8f2".to_string()));
+        assert_eq!(entry(&file, "syntax.text").as_deref(), Some("#f8f8f2"));
+    }
+
+    /// A converted theme really round-trips through this app's own file format - the property
+    /// `import_vscode_theme_file`'s write-then-reload depends on.
+    #[test]
+    fn a_converted_theme_round_trips_through_the_real_toml_writer_and_parser() {
+        let json = r##"{
+            "name": "Round Trip",
+            "colors": { "editor.background": "#282a36", "sideBar.background": "#21222c" },
+            "tokenColors": [
+                { "scope": "keyword", "settings": { "foreground": "#ff79c6" } }
+            ]
+        }"##;
+        let file = convert_vscode_theme_str(json, "sample").expect("convert");
+        let validated = file.validate().expect("must validate");
+        let reparsed =
+            super::super::custom_theme::parse_theme_file_str(&validated.to_toml_string())
+                .expect("the written file must re-parse");
+        assert_eq!(reparsed.overrides, validated.overrides);
+        assert_eq!(reparsed.preview, validated.preview);
     }
 }

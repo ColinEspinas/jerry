@@ -332,12 +332,15 @@ impl HighlightKind {
 /// Maps a [`HighlightKind`] to its real `theme::syntax::*` colour - see that module's own docs
 /// for the fallback-chain design behind each mapping.
 pub fn color_for_kind(kind: HighlightKind) -> Rgba {
-    // GitHub issue #141: a live-selected custom theme's own real, individually-picked colour for
-    // `kind` (from an imported VSCode theme's `tokenColors`) always wins over this crate's own
-    // hardcoded default below - see `theme::syntax_override_for_kind`'s own docs.
-    if let Some(overridden) = theme::syntax_override_for_kind(kind) {
-        return overridden;
-    }
+    // Each arm is an ordinary `theme::syntax::*` token, so a theme file that names e.g.
+    // `[syntax] keyword = "#ff79c6"` (very much including an imported VSCode theme, whose own
+    // `tokenColors` array is converted straight into those keys - see
+    // `crate::settings::vscode_theme`) changes what this returns through the exact same
+    // `ColorToken::resolve` path every other colour in the app goes through. Before the theme
+    // system's rewrite this function needed its own separate per-scope override map checked ahead
+    // of the tokens, because several of these buckets were literal Rust-level aliases of one
+    // another and could not be told apart; every one of them is now independently keyed, so that
+    // second mechanism is gone.
     match kind {
         HighlightKind::Keyword => theme::syntax::KEYWORD.into(),
         HighlightKind::Function => theme::syntax::FUNCTION.into(),
@@ -1579,23 +1582,21 @@ mod tests {
     use std::path::PathBuf;
     use wt_core::diff::{DiffHunk, DiffLine, FileChangeStatus};
 
-    /// GitHub issue #141: `color_for_kind` must check a live custom theme's own per-scope
-    /// override before falling through to this crate's hardcoded default - and must leave
-    /// `HighlightKind`s the theme names no override for completely alone. `Drop`-guarded: Rust's
+    /// GitHub issue #141: a live theme palette really changes `color_for_kind`'s output for the
+    /// buckets it names, and leaves every other bucket completely alone. `Drop`-guarded: Rust's
     /// default test harness reuses worker threads across different tests, so a `thread_local!`
     /// left non-default here could leak into a completely unrelated test scheduled on the same
-    /// worker later - the same real concern `crate::theme::CURRENT_THEME_INDEX`'s own docs
-    /// already document for exactly this reason.
-    struct ResetSyntaxOverridesOnDrop;
-    impl Drop for ResetSyntaxOverridesOnDrop {
+    /// worker later - the same real concern `crate::theme::CURRENT_THEME`'s own docs document.
+    struct ResetThemeOnDrop;
+    impl Drop for ResetThemeOnDrop {
         fn drop(&mut self) {
-            theme::set_current_syntax_overrides(None);
+            theme::set_current_theme(None);
         }
     }
 
     #[test]
-    fn color_for_kind_prefers_a_live_custom_themes_override_over_the_hardcoded_default() {
-        let _guard = ResetSyntaxOverridesOnDrop;
+    fn color_for_kind_follows_a_live_theme_palette_for_exactly_the_scopes_it_names() {
+        let _guard = ResetThemeOnDrop;
         let default_keyword = color_for_kind(HighlightKind::Keyword);
         let default_string = color_for_kind(HighlightKind::String);
 
@@ -1605,26 +1606,27 @@ mod tests {
             b: 0.5,
             a: 1.0,
         };
-        let mut overrides = std::collections::HashMap::new();
-        overrides.insert(HighlightKind::Keyword, overridden);
-        theme::set_current_syntax_overrides(Some(overrides));
+        let mut palette = theme::Palette::new();
+        palette.insert("syntax.keyword", overridden);
+        theme::set_current_theme(Some(std::rc::Rc::new(palette)));
 
         assert_eq!(
             color_for_kind(HighlightKind::Keyword),
             overridden,
-            "an overridden kind must return the theme's own real colour, not the hardcoded one"
+            "a bucket the live theme names must return the theme's own real colour, not the \
+             compiled default"
         );
         assert_eq!(
             color_for_kind(HighlightKind::String),
             default_string,
-            "a kind the theme names no override for must be completely unaffected"
+            "a bucket the theme names nothing for must be completely unaffected"
         );
 
-        theme::set_current_syntax_overrides(None);
+        theme::set_current_theme(None);
         assert_eq!(
             color_for_kind(HighlightKind::Keyword),
             default_keyword,
-            "clearing the override must really restore the hardcoded default, not leave the \
+            "clearing the theme must really restore the compiled default, not leave the \
              last-set colour stuck"
         );
     }

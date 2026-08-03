@@ -1946,7 +1946,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 .bg(if is_changed {
                     theme::editor::DIFF_ADDED
                 } else {
-                    theme::ColorToken(crate::work_surface::state::TRANSPARENT)
+                    theme::ColorToken::literal(crate::work_surface::state::TRANSPARENT)
                 }),
         )
         .child(
