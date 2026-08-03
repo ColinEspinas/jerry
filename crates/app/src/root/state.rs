@@ -250,6 +250,8 @@ impl AdeApp {
             selected_tree_path: None,
             additional_tree_selection: HashSet::new(),
             code_view: code_view::CodeView::Diff,
+            markdown_view: markdown_preview::MarkdownView::Source,
+            markdown_preview_scroll_handle: gpui::ScrollHandle::new(),
             code_focus_handle,
             code_focus: OverlayFocus::default(),
             // `true`/`Task::ready(())`: no blink loop is running yet (nothing is focused at
@@ -979,6 +981,7 @@ impl AdeApp {
         // to belong to a different `file_tree_root`) - reset for the same reason as above.
         // Dropping `_file_load_task` cancels any in-flight load for whatever was left.
         self.code_view = code_view::CodeView::Diff;
+        self.markdown_view = markdown_preview::MarkdownView::Source;
         self.file_view_cache = None;
         self.file_load_state = FileLoadState::Idle;
         self.file_view_changed_lines = HashSet::new();

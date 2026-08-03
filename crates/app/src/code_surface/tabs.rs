@@ -173,6 +173,7 @@ impl AdeApp {
         self.push_open_file(&relative);
         self.open_change = Some(relative);
         self.code_view = view;
+        self.markdown_view = markdown_preview::MarkdownView::Source;
         // Every "this file is now the selected tree row" path reveals it (GitHub issue #18 §5).
         // A click in the tree has its ancestors expanded already, so this is a no-op there - but
         // go-to-definition (`Self::navigate_to_definition`), a palette result and a terminal link
@@ -316,6 +317,7 @@ impl AdeApp {
 
         if self.open_change.as_deref() == Some(path.as_path()) {
             self.code_view = code_view::CodeView::File;
+            self.markdown_view = markdown_preview::MarkdownView::Source;
             cx.notify();
             return;
         }
@@ -333,6 +335,7 @@ impl AdeApp {
         } else {
             code_view::CodeView::File
         };
+        self.markdown_view = markdown_preview::MarkdownView::Source;
         self.refresh_open_diff_file_cache();
         self.hover = None;
         // See `Self::open_and_focus_file`'s identical `dismiss_completions()` call for why
