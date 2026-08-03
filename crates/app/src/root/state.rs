@@ -1,6 +1,11 @@
 use super::*;
 use crate::code_surface::state::{DiffLoadState, FileLoadState};
 use crate::sidebar::render::RightSidebarView;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Backs [`AdeApp::tree_undo_instance_id`] - see that field's own docs for why per-process
+/// uniqueness isn't enough.
+static NEXT_TREE_UNDO_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 
 impl AdeApp {
     /// Production entry point - loads `~/.config/jerry/settings.toml` (`Settings::load_or_init`)
@@ -234,6 +239,7 @@ impl AdeApp {
             tree_undo_stack: Vec::new(),
             tree_redo_stack: Vec::new(),
             tree_undo_backup_counter: 0,
+            tree_undo_instance_id: NEXT_TREE_UNDO_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             tree_op_error: None,
             tree_focus_handle,
             file_tree_bounds: gpui::Bounds::default(),

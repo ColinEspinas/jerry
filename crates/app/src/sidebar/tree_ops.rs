@@ -1273,9 +1273,14 @@ impl AdeApp {
     /// OS temp directory, not anywhere under the worktree itself: a delete's own undo must
     /// survive the delete succeeding, so it can never live inside what was just removed, and it
     /// must never show up in the tree's own walk or `git status` as a stray file. Scoped by this
-    /// process's own pid so two running instances never collide.
+    /// process's own pid *and* this `AdeApp`'s own [`Self::tree_undo_instance_id`] - see that
+    /// field's own docs for why the pid alone isn't enough to keep two instances from colliding.
     fn tree_undo_backup_root(&self) -> PathBuf {
-        std::env::temp_dir().join(format!("jerry-tree-undo-{}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "jerry-tree-undo-{}-{}",
+            std::process::id(),
+            self.tree_undo_instance_id
+        ))
     }
 
     /// A fresh, real path under [`Self::tree_undo_backup_root`] to back a about-to-be-deleted
@@ -2115,6 +2120,64 @@ mod tree_ops_regression_tests {
             assert!(app.tree_redo_stack.is_empty());
             assert_eq!(app.tree_undo_stack.len(), 1);
         });
+    }
+
+    /// Two separate `AdeApp` instances (as any two `#[gpui::test]`s in the same `cargo test`
+    /// binary really are - one process, one pid) each delete a same-named file. Before
+    /// [`AdeApp::tree_undo_instance_id`] existed, [`AdeApp::tree_undo_backup_root`] was keyed by
+    /// `std::process::id()` alone and [`AdeApp::tree_undo_backup_counter`] always restarted at 0,
+    /// so both deletes' first backup landed at the exact same path - the second app's backup copy
+    /// failed with `AlreadyExists`, silently leaving its "deleted" file still on disk. This is
+    /// what actually made `undoing_then_redoing_a_delete_restores_then_removes_the_file_again`
+    /// fail intermittently in full-suite runs while always passing alone.
+    #[gpui::test]
+    fn two_app_instances_deleting_a_same_named_file_never_collide_on_their_backup_paths(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = TempDir::new().expect("tempdir a");
+        seed(&repo_a);
+        let repo_b = TempDir::new().expect("tempdir b");
+        seed(&repo_b);
+
+        let (app_a, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+        let (app_b, cx) = palette_focus_tests::open_test_app(cx, repo_b.path().to_path_buf());
+        cx.run_until_parked();
+
+        app_a.read_with(cx, |a, _| {
+            app_b.read_with(cx, |b, _| {
+                assert_ne!(
+                    a.tree_undo_instance_id, b.tree_undo_instance_id,
+                    "two AdeApp instances in the same process must never share an instance id"
+                );
+            })
+        });
+
+        let victim_a = repo_a.path().join("src/util.rs");
+        let victim_b = repo_b.path().join("src/util.rs");
+        app_a.update(cx, |a, cx| {
+            a.request_tree_delete_with_mechanism_for_test(
+                victim_a.clone(),
+                false,
+                DeleteMechanism::Permanent,
+                cx,
+            );
+        });
+        app_b.update(cx, |b, cx| {
+            b.request_tree_delete_with_mechanism_for_test(
+                victim_b.clone(),
+                false,
+                DeleteMechanism::Permanent,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(!victim_a.exists(), "app a's own delete must really happen");
+        assert!(
+            !victim_b.exists(),
+            "app b's own delete must really happen too, unblocked by a's"
+        );
     }
 
     /// The same real undo/redo, for a rename - the other half of GitHub issue #105's scope
