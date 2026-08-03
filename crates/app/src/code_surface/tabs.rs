@@ -748,6 +748,27 @@ impl AdeApp {
             _ => None,
         }
     }
+
+    /// The absolute, on-disk path [`Self::open_change`] really names, resolved against whichever
+    /// root it's actually relative to - [`Self::diff_root`] while [`Self::code_view`] is `Diff`,
+    /// [`Self::file_tree_root`] otherwise (`Self::open_and_focus_file`'s own two callers,
+    /// [`Self::open_change_diff`]/[`Self::open_file_view`], resolve exactly this way). `None` iff
+    /// no file tab is showing at all.
+    ///
+    /// GitHub issue #127: this - not [`Self::selected_tree_path`] - is the Files tree's real
+    /// "which row is the open file" signal, since it stays correct regardless of tree focus and
+    /// survives every way `selected_tree_path` can drift from the centre pane's actual content: a
+    /// directory click (which updates `selected_tree_path` to a path that was never opened at
+    /// all) and switching tabs via the tab strip ([`Self::activate_file_tab`] never touches
+    /// `selected_tree_path`).
+    pub(crate) fn open_change_absolute_path(&self) -> Option<PathBuf> {
+        let relative = self.open_change.as_ref()?;
+        let root = match self.code_view {
+            code_view::CodeView::Diff => &self.diff_root,
+            code_view::CodeView::File => &self.file_tree_root,
+        };
+        Some(root.join(relative))
+    }
 }
 
 /// Regression coverage for `AdeApp::render_file_view`'s cache: re-running an expensive parse on
