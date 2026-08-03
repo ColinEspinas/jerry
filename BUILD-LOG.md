@@ -7501,3 +7501,41 @@ original #113 fix) touches. Every new/modified test this follow-up added ran gre
 (`cargo test -p app --lib rail:: -- --test-threads=4`: 98 passed; `cargo test -p app --lib root::
 -- --test-threads=4`: 110 passed; `cargo test -p app --lib work_surface:: -- --test-threads=4`: 75
 passed) and by exact name in isolation.
+
+## File tree row/header icons collided with the real overlay scrollbar (GitHub issue #123)
+
+Reported with a screenshot: the file tree's right-side icons/buttons sit too close to the
+scrollbar and visually collide with it.
+
+Root cause: `crate::root::scrollbar::SCROLLBAR_SIZE` (the real overlay scrollbar track's width)
+is `8.0`, and every place in `crates/app/src/sidebar/render.rs` giving file-tree/header content
+its own right padding used exactly `pr(px(8.0))` (`render_file_tree_row`,
+`render_tree_inline_edit_row`) or `pr(px(10.0))` (the right-sidebar header's action cluster,
+`render_change_row`) - in every case, at most 2px of real clearance past where the scrollbar's
+own track begins, which reads as flush contact once anti-aliasing and hover states are on
+screen. The scrollbar is painted as an `.absolute()` sibling overlay, not reserved flex space
+(see this module's own docs for why), so content padded only to `SCROLLBAR_SIZE` sits exactly
+where the track starts.
+
+Fixed by adding one shared constant, `crate::root::scrollbar::CONTENT_CLEARANCE =
+SCROLLBAR_SIZE + 6.0`, and using it as the right padding everywhere content sits next to this
+scrollbar (`render_file_tree_row`, `render_tree_inline_edit_row`, `render_change_row`, and the
+right-sidebar header's action cluster in `render_right_sidebar_toggle`) - one real value instead
+of every call site repeating its own guess at "close enough".
+
+New regression test `file_tree_row_and_header_actions_clear_the_real_scrollbar`
+(`sidebar::render::virtualization_tests`) seeds enough files that the tree genuinely overflows
+and the real scrollbar actually paints, then asserts real painted clearance (via `debug_bounds`)
+between both the directory row's own "+" control and the header's "New file" button and the
+scrollbar's own left edge - a genuine geometric assertion (a real, independent minimum-gap
+threshold, not derived from `CONTENT_CLEARANCE` itself) rather than only proving a padding
+*number* changed. This required adding a `debug_selector` to both the scrollbar track itself and
+the per-row "+" button (keyed by the row's real path, matching its own `.id()`), neither of
+which had one before - `.id()` alone doesn't register a `debug_bounds`-queryable selector.
+
+**Verification**: `cargo build --workspace`, `cargo clippy --workspace --all-targets -- -D
+warnings`, `cargo fmt --all -- --check` - all clean. `cargo test --workspace`: **1388 passed, 10
+failed** - all 10 failures are the same pre-existing, environment-specific set already documented
+elsewhere in this log (LSP wiring tests needing network/language-server readiness, one
+syntax-highlight-cache flake), none in `sidebar::render` or touching this change; all 36
+`sidebar::render` tests, including the new one, pass.

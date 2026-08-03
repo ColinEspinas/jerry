@@ -100,6 +100,22 @@ use crate::root::scrollbar_geometry as geometry;
 /// is 22px; a 12px `list_example.rs`-style scrollbar would visually dominate a row that short).
 const SCROLLBAR_SIZE: f32 = 8.0;
 
+/// How much real right-side clearance row/header content next to this scrollbar needs, in
+/// addition to `SCROLLBAR_SIZE` itself - GitHub issue #123 ("Add padding to the file tree right
+/// side icons/buttons"). The scrollbar track is painted as an `.absolute()` sibling overlay
+/// (this module's own top docs explain why), not reserved flex space, so any row/header content
+/// whose own right padding is `<= SCROLLBAR_SIZE` sits exactly where the track begins - flush
+/// contact, not a real gap - whenever the list is scrollable. Before this fix
+/// `crate::sidebar::render::render_change_row` was the one place in the codebase that already
+/// padded further than the bare `SCROLLBAR_SIZE` (`pr(px(10.0))`, i.e. `SCROLLBAR_SIZE + 2.0`),
+/// but 2px of real clearance still reads as "touching" once anti-aliasing and hover states are
+/// on screen (the collision the issue's screenshot shows). `+ 6.0` triples that margin to a
+/// value that's genuinely, unambiguously distinct from the track - still compact enough to match
+/// this UI's generally tight chrome (`theme::band::TREE_ROW` is 22px) - and is reused as the one
+/// shared constant everywhere right-aligned content sits next to this scrollbar, instead of every
+/// call site repeating its own guess at "close enough".
+pub(crate) const CONTENT_CLEARANCE: f32 = SCROLLBAR_SIZE + 6.0;
+
 /// One decoration mark on a vertical scrollbar's track (see this module's own docs) - a coloured
 /// tick at `fraction` (`0.0` = the very top of the full document, `1.0` = the very bottom),
 /// painted over the track underneath the thumb so it stays visible even while scrolled away from
@@ -183,6 +199,12 @@ impl AdeApp {
         Some(
             div()
                 .id(id)
+                // Test-only (a no-op outside test builds, like every other `debug_selector` in
+                // this codebase) - lets a real render test read the track's own painted bounds
+                // back with `VisualTestContext::debug_bounds` to assert genuine geometric
+                // clearance (see `crate::sidebar::render`'s tests), rather than trusting a
+                // padding value's *number* changed without proving what it actually clears.
+                .debug_selector(move || id.to_string())
                 .absolute()
                 .top_0()
                 .right_0()
