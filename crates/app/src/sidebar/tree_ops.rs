@@ -1313,31 +1313,16 @@ impl AdeApp {
     }
 
     /// A fresh, real path under [`Self::tree_undo_backup_root`] to back a about-to-be-deleted
-    /// path up to - named with a monotonic counter, not the deleted name alone, so two deletes of
-    /// same-named entries (different folders, or the same folder across an undo/redo cycle) never
-    /// collide.
-    ///
-    /// The counter is **process-global**, not per-`AdeApp`, and that is a real bug fix rather than
-    /// a style choice. [`Self::tree_undo_backup_root`] is keyed by pid alone, so two `AdeApp`s
-    /// alive in one process (two real windows - GitHub issue #90 - or, far more often, two
-    /// `#[gpui::test]`s in the same test binary) share that directory; with a per-instance counter
-    /// they both start at `0`, so window B deleting a `util.rs` computes the exact path window A
-    /// already backed *its* `util.rs` up to. `file_ops::copy_path` refuses to overwrite an
-    /// existing destination, so the second delete fails its backup step and - correctly, per
-    /// [`Self::delete_path_with_mechanism`]'s own "no backup, no delete" rule - doesn't delete
-    /// anything at all, surfacing as a mysterious "already exists" error on a perfectly ordinary
-    /// delete. A real, reproduced failure: `tree_ops_regression_tests::
-    /// undoing_then_redoing_a_delete_restores_then_removes_the_file_again` failed on exactly this
-    /// in a full-suite run (three of these tests delete a `src/util.rs`, and undo restores from a
-    /// backup without removing it) while passing in isolation. One shared counter makes the
-    /// collision structurally impossible instead.
+    /// path up to - named with a monotonic counter ([`AdeApp::tree_undo_backup_counter`]), not
+    /// the deleted name alone, so two deletes of same-named entries (different folders, or the
+    /// same folder across an undo/redo cycle) never collide.
     fn next_tree_undo_backup_path(&mut self, original: &Path) -> PathBuf {
-        static NEXT_BACKUP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let name = original
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "entry".to_string());
-        let counter = NEXT_BACKUP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let counter = self.tree_undo_backup_counter;
+        self.tree_undo_backup_counter += 1;
         self.tree_undo_backup_root()
             .join(format!("{counter}-{name}"))
     }
