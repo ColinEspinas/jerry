@@ -357,6 +357,36 @@ pub fn leading_dedent_len(line_text: &str, width: u8) -> usize {
     count
 }
 
+/// The real leading whitespace (spaces and/or tabs) at the very start of `text` - GitHub issue
+/// #121's own real "predict the next line's indentation" baseline reads this from `crate::
+/// code_surface::edit_buffer::EditBuffer::insert_newline_with_auto_indent`'s own real buffer
+/// content (never a hardcoded assumption) to carry a line's indentation over to the new line
+/// `Enter` creates below it. Stops at the first character that isn't a space or a tab (or the end
+/// of `text`), so a line with no real leading whitespace at all returns `""` - a genuine no-op
+/// carry-over, not a fabricated one.
+pub fn leading_whitespace(text: &str) -> &str {
+    let end = text
+        .find(|ch: char| ch != ' ' && ch != '\t')
+        .unwrap_or(text.len());
+    &text[..end]
+}
+
+/// Whether `text_before_cursor` (a line's own real text up to, but not including, the caret),
+/// after trimming real trailing whitespace, ends with one of the three real opening brackets
+/// (`{`, `(`, `[`). [`crate::code_surface::edit_buffer::EditBuffer::insert_newline_with_auto_indent`]'s
+/// own real, single-line "does the line I'm leaving open a block" heuristic (GitHub issue #121's
+/// stretch goal): a genuinely common shape across every language this app highlights via
+/// tree-sitter. Deliberately does not attempt real bracket matching across multiple lines, does
+/// not track whether the bracket is itself inside a string/comment, and does not look past the
+/// caret: a narrow, single-line heuristic real editors use for this exact gesture, not full
+/// re-indentation.
+pub fn ends_with_opener(text_before_cursor: &str) -> bool {
+    matches!(
+        text_before_cursor.trim_end().chars().next_back(),
+        Some('{') | Some('(') | Some('[')
+    )
+}
+
 /// `crate::code_surface::edit_buffer::EditBuffer::indent_lines`'s own real "which lines does a
 /// selection touch" rule, factored out here so it's directly unit-testable without a live
 /// `EditBuffer`: every line the selection's `start` through `end` byte range overlaps, except a
@@ -703,6 +733,33 @@ mod tests {
     #[test]
     fn leading_dedent_len_is_zero_for_a_line_with_no_leading_whitespace() {
         assert_eq!(leading_dedent_len("foo", 4), 0);
+    }
+
+    #[test]
+    fn leading_whitespace_returns_the_real_leading_spaces_or_tabs() {
+        assert_eq!(leading_whitespace("    foo"), "    ");
+        assert_eq!(leading_whitespace("\tfoo"), "\t");
+        assert_eq!(leading_whitespace("\t  foo"), "\t  ");
+        assert_eq!(leading_whitespace("foo"), "");
+        assert_eq!(leading_whitespace(""), "");
+        assert_eq!(leading_whitespace("    "), "    ");
+    }
+
+    #[test]
+    fn ends_with_opener_detects_the_three_real_opening_brackets() {
+        assert!(ends_with_opener("fn foo() {"));
+        assert!(ends_with_opener("let xs = ["));
+        assert!(ends_with_opener("foo("));
+        // Real trailing whitespace after the opener must not defeat the check.
+        assert!(ends_with_opener("fn foo() {   "));
+    }
+
+    #[test]
+    fn ends_with_opener_is_false_for_a_closer_or_plain_text() {
+        assert!(!ends_with_opener("fn foo() {}"));
+        assert!(!ends_with_opener("let x = 1;"));
+        assert!(!ends_with_opener(""));
+        assert!(!ends_with_opener("   "));
     }
 
     #[test]

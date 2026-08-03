@@ -1451,6 +1451,68 @@ impl EditBuffer {
         self.replace_range_recording(Some(self.selected_range.clone()), "", Some(before), None);
     }
 
+    /// `Enter` (GitHub issue #121): inserts a real newline plus the leading whitespace of the
+    /// real line each cursor sits on, so the new line starts already-indented instead of at
+    /// column 0 - the "predict the next line's indentation" behavior every mainstream editor
+    /// performs on this exact gesture. Reads that whitespace from the real buffer content (via
+    /// [`Self::auto_indent_insertion`]) rather than assuming any fixed width, so it respects
+    /// whatever the line actually contains (tabs, spaces, or a mix).
+    ///
+    /// `extra_indent` (already resolved by the caller - `crate::code_surface::editing::
+    /// AdeApp::handle_editor_enter_action`'s own docs for the real tabs-vs-spaces/width/
+    /// `.editorconfig` resolution, the same one [`Self::indent_lines`] uses) is appended once more
+    /// on top of the carried-over whitespace whenever the line up to the cursor ends, after
+    /// trimming real trailing whitespace, with an opening bracket (`{`, `(`, `[`) - see
+    /// [`crate::code_surface::indent::ends_with_opener`]'s own docs for that narrow, single-line
+    /// heuristic's real scope.
+    ///
+    /// Multi-cursor (issue #28): each real cursor - primary and every secondary - gets its own
+    /// real indentation, computed from *its own* line, not copied from the primary's - the same
+    /// per-cursor-computed-text shape [`Self::apply_at_every_cursor`] was already built to support
+    /// (its `compute` closure returns real text per cursor, not one fixed string), so a multi-
+    /// cursor `Enter` press across lines with different real indentation gets each one right.
+    pub fn insert_newline_with_auto_indent(&mut self, extra_indent: &str) {
+        if !self.secondary_cursors.is_empty() {
+            self.apply_at_every_cursor(EditKind::Type, |buffer, cursor_range| {
+                let cursor_range = buffer.clamp_range(cursor_range);
+                let text = buffer.auto_indent_insertion(cursor_range.start, extra_indent);
+                (cursor_range, text)
+            });
+            return;
+        }
+        let text = self.auto_indent_insertion(self.selected_range.start, extra_indent);
+        self.replace_range(None, &text);
+    }
+
+    /// The real `"\n"` plus carried-over indentation [`Self::insert_newline_with_auto_indent`]
+    /// inserts for one cursor sitting at real byte `offset` - see that method's own docs. Reads
+    /// `offset`'s own line's real leading whitespace straight from [`Self::content`]/
+    /// [`Self::line_ranges`] (never a hardcoded guess), and appends `extra_indent` once more when
+    /// the real text from that line's start up to `offset` ends, after trimming trailing
+    /// whitespace, with an opening bracket. Falls back to a bare `"\n"` for the defensive case of
+    /// an `offset` with no real line entry at all (an empty buffer's `line_ranges` is empty) -
+    /// matches this app's own "an edit case with no real state to act on is a safe no-op, never a
+    /// fabricated result" discipline.
+    fn auto_indent_insertion(&self, offset: usize, extra_indent: &str) -> String {
+        let (line, col) = self.line_col_for_offset(offset);
+        let Some(range) = self.line_ranges.get(line) else {
+            return "\n".to_string();
+        };
+        let line_start = range.start;
+        let before_cursor_end = (line_start + col).min(range.end);
+        let Some(before_cursor) = self.content.get(line_start..before_cursor_end) else {
+            return "\n".to_string();
+        };
+        let leading = indent::leading_whitespace(before_cursor);
+        let mut result = String::with_capacity(1 + leading.len() + extra_indent.len());
+        result.push('\n');
+        result.push_str(leading);
+        if !extra_indent.is_empty() && indent::ends_with_opener(before_cursor) {
+            result.push_str(extra_indent);
+        }
+        result
+    }
+
     /// `Left`: collapses a real selection to its start, or moves the caret one real grapheme
     /// left. Clears [`Self::goal_column`] (a horizontal move). Moves every real cursor together
     /// when more than one is active - see [`Self::move_every_cursor`]'s own docs.
@@ -2625,6 +2687,77 @@ mod tests {
         assert_eq!(buf.lines[0].text, "a");
         assert_eq!(buf.lines[1].text, "X");
         assert_eq!(buf.lines[2].text, "b");
+    }
+
+    /// GitHub issue #121, test (a): pressing Enter after an indented line carries the exact same
+    /// real leading whitespace over to the new line.
+    #[test]
+    fn insert_newline_with_auto_indent_carries_the_real_leading_whitespace_over() {
+        let mut buf = buffer("fn main() {\n    let x = 1;\n}\n");
+        // Right after the `;`, before the line's own trailing newline.
+        buf.move_to("fn main() {\n    let x = 1;".len());
+        buf.insert_newline_with_auto_indent("    ");
+        assert_eq!(buf.content, "fn main() {\n    let x = 1;\n    \n}\n");
+        assert_eq!(
+            buf.cursor_offset(),
+            "fn main() {\n    let x = 1;\n    ".len(),
+            "the real caret must land right after the carried-over whitespace"
+        );
+    }
+
+    /// GitHub issue #121, test (b): pressing Enter on a column-0 (no leading whitespace) line
+    /// inserts a bare newline - no extra whitespace fabricated out of nowhere.
+    #[test]
+    fn insert_newline_with_auto_indent_adds_no_whitespace_for_a_column_zero_line() {
+        let mut buf = buffer("foo\nbar\n");
+        buf.move_to(3); // right after "foo", before its own trailing newline
+        buf.insert_newline_with_auto_indent("    ");
+        assert_eq!(buf.content, "foo\n\nbar\n");
+    }
+
+    /// GitHub issue #121, test (c) - stretch goal: a line that ends with a real opening bracket
+    /// gets one extra real indent unit on top of whatever it already carried over.
+    #[test]
+    fn insert_newline_with_auto_indent_adds_one_extra_level_after_an_opening_bracket() {
+        let mut buf = buffer("fn main() {\n");
+        buf.move_to("fn main() {".len());
+        buf.insert_newline_with_auto_indent("    ");
+        assert_eq!(buf.content, "fn main() {\n    \n");
+
+        // The same real opener check must also work on an already-indented line - the extra
+        // indent unit stacks on top of the real carried-over whitespace, not instead of it.
+        let mut nested = buffer("fn main() {\n    if true {\n    }\n}\n");
+        nested.move_to("fn main() {\n    if true {".len());
+        nested.insert_newline_with_auto_indent("    ");
+        assert_eq!(
+            nested.content,
+            "fn main() {\n    if true {\n        \n    }\n}\n"
+        );
+    }
+
+    /// A real closing bracket (or any other real, non-opener text) must not trigger the stretch
+    /// goal's extra indent - only a genuine opener does.
+    #[test]
+    fn insert_newline_with_auto_indent_does_not_add_extra_indent_after_a_closer() {
+        let mut buf = buffer("fn main() {\n}\n");
+        buf.move_to("fn main() {\n}".len());
+        buf.insert_newline_with_auto_indent("    ");
+        assert_eq!(buf.content, "fn main() {\n}\n\n");
+    }
+
+    /// Multi-cursor (issue #28 infrastructure, reused here): each real cursor gets its own real
+    /// indentation, computed from its own line - not copied from the primary cursor's.
+    #[test]
+    fn insert_newline_with_auto_indent_computes_each_multi_cursor_independently() {
+        let mut buf = buffer("    a;\nb;\n");
+        // Primary cursor after "    a;" (indented line); secondary cursor after "b;" (column-0
+        // line), added the same real way `Ctrl+D`/`add_cursor_at` do.
+        buf.move_to("    a;".len());
+        buf.add_cursor_at("    a;\nb;".len());
+        assert_eq!(buf.cursor_count(), 2);
+
+        buf.insert_newline_with_auto_indent("    ");
+        assert_eq!(buf.content, "    a;\n    \nb;\n\n");
     }
 
     #[test]

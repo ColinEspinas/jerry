@@ -307,7 +307,7 @@ impl AdeApp {
     pub(crate) fn handle_editor_enter_action(
         &mut self,
         _: &EditorEnter,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Defense in depth, not the only guard: `crate::default_key_bindings` already scopes
@@ -329,9 +329,42 @@ impl AdeApp {
         if self.completions_open_for_active_path() {
             return;
         }
-        self.replace_text_in_range(None, "\n", window, cx);
+        // GitHub issue #121: predicts the new line's own indentation rather than a bare `"\n"` -
+        // `EditBuffer::insert_newline_with_auto_indent` reads the real leading whitespace off the
+        // line each cursor is leaving (never a hardcoded assumption) and, on top of that, adds one
+        // real indent unit when that line ends with an opening bracket. The indent unit itself
+        // uses the exact same real tabs-vs-spaces/width/`.editorconfig` resolution
+        // `Self::handle_editor_indent_action`'s own `Tab` already uses, so this respects the same
+        // settings Tab does rather than a hardcoded `"    "`.
+        //
+        // Dispatches per real edit target directly (rather than through the generic
+        // `EntityInputHandler::replace_text_in_range`, which only ever inserts one fixed literal
+        // string) since the text to insert here depends on the real buffer content at the insertion
+        // point - both real targets ([`EditTarget::File`]/[`EditTarget::Merge`]) share this same
+        // buffer-editing machinery, matching every other real text-changing `Editor*` handler in
+        // this file.
+        let settings = self.resolved_indent_settings_for_target();
+        let extra_indent = indent::indent_unit(settings);
+        match self.active_edit_target() {
+            Some(EditTarget::File(path)) => {
+                let Some(buffer) = self.edit_buffer_mut(&path) else {
+                    return;
+                };
+                buffer.insert_newline_with_auto_indent(&extra_indent);
+                self.schedule_rehighlight(path.clone(), cx);
+                self.schedule_lsp_sync(self.file_tree_root.clone(), path, cx);
+            }
+            Some(EditTarget::Merge) => {
+                let Some(edit) = self.merge_edit.as_mut() else {
+                    return;
+                };
+                edit.buffer.insert_newline_with_auto_indent(&extra_indent);
+            }
+            None => return,
+        }
         self.sync_cursor_and_scroll();
         self.reset_caret_blink(cx);
+        cx.notify();
     }
 
     pub(crate) fn handle_editor_left_action(
@@ -4008,6 +4041,128 @@ mod editing_tests {
                 .clone()),
             content_before_escape,
             "dismissing via Escape must not touch the real buffer content"
+        );
+    }
+
+    /// GitHub issue #121, test (a): pressing a real `Enter` keystroke after an indented line
+    /// carries that exact same real leading whitespace over to the new line, through the real,
+    /// bound `EditorEnter` keystroke (not a direct handler call) - matching this file's own
+    /// established "simulate the real keystroke" precedent for `Enter` regression coverage (see
+    /// `completions_keybindings_are_correctly_scoped_in_both_the_open_and_closed_state` just
+    /// above).
+    #[gpui::test]
+    fn enter_carries_the_real_leading_whitespace_of_the_previous_line_over(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "fn main() {\n    let x = 1;\n}\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        app.update(cx, |app, cx| {
+            // Right after the `;`, before that line's own trailing newline.
+            app.edit_buffer_mut(&relative)
+                .unwrap()
+                .move_to("fn main() {\n    let x = 1;".len());
+            cx.notify();
+        });
+
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffer(&relative)
+                .unwrap()
+                .content
+                .clone()),
+            "fn main() {\n    let x = 1;\n    \n}\n",
+            "the new line must start with the exact same real 4-space indentation the line \
+             above it had, read from the real buffer content"
+        );
+    }
+
+    /// GitHub issue #121, test (b): pressing `Enter` on a real column-0 line (no leading
+    /// whitespace at all) inserts a bare newline - no whitespace fabricated out of nowhere.
+    #[gpui::test]
+    fn enter_adds_no_whitespace_after_a_column_zero_line(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "foo();\nbar();\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        app.update(cx, |app, cx| {
+            app.edit_buffer_mut(&relative).unwrap().move_to(6); // end of "foo();"
+            cx.notify();
+        });
+
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffer(&relative)
+                .unwrap()
+                .content
+                .clone()),
+            "foo();\n\nbar();\n",
+            "a column-0 line must not gain any real indentation it never had"
+        );
+    }
+
+    /// GitHub issue #121, test (c) - stretch goal: `Enter` right after a real opening bracket
+    /// adds one more real indent unit on top of the carried-over whitespace, using the exact same
+    /// real indent-unit resolution (tabs/spaces/width) `Self::handle_editor_indent_action`'s own
+    /// `Tab` uses - proven here by checking the inserted whitespace is real 4 literal spaces (the
+    /// default `EditorSettings::tab_width`/`insert_spaces`, not a hardcoded `"    "` this test
+    /// would pass even if the production code had a different, wrong hardcoded width).
+    #[gpui::test]
+    fn enter_adds_one_extra_real_indent_level_after_an_opening_bracket(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "fn main() {\n}\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        app.update(cx, |app, cx| {
+            app.edit_buffer_mut(&relative).unwrap().move_to(11); // end of "fn main() {"
+            cx.notify();
+        });
+
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffer(&relative)
+                .unwrap()
+                .content
+                .clone()),
+            "fn main() {\n    \n}\n",
+            "a line ending in an opening bracket must add one real indent unit on top of \
+             whatever it already carried over"
+        );
+
+        // Same real settings-driven indent unit as `Tab` - a hand-edited `tab_width` must change
+        // this insertion's own width too, not just `EditorIndent`'s.
+        app.update(cx, |app, cx| {
+            app.settings.editor.tab_width = 2;
+            app.edit_buffer_mut(&relative).unwrap().undo();
+            app.edit_buffer_mut(&relative).unwrap().move_to(11);
+            cx.notify();
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffer(&relative)
+                .unwrap()
+                .content
+                .clone()),
+            "fn main() {\n  \n}\n",
+            "the extra indent level must use the real, current tab_width setting, not a \
+             hardcoded 4-space guess"
         );
     }
 

@@ -7539,3 +7539,38 @@ failed** - all 10 failures are the same pre-existing, environment-specific set a
 elsewhere in this log (LSP wiring tests needing network/language-server readiness, one
 syntax-highlight-cache flake), none in `sidebar::render` or touching this change; all 36
 `sidebar::render` tests, including the new one, pass.
+
+## The editor should predict the next line's indentation (GitHub issue #121)
+
+`AdeApp::handle_editor_enter_action` (`crates/app/src/code_surface/editing.rs`) previously
+inserted a bare `"\n"` on `Enter` via the generic `replace_text_in_range`, with zero auto-indent -
+every mainstream editor instead carries the previous line's leading whitespace over so the cursor
+lands already-indented.
+
+Added `EditBuffer::insert_newline_with_auto_indent` (`crates/app/src/code_surface/edit_buffer.rs`):
+reads the real leading whitespace of the line each cursor sits on straight from the buffer's own
+content (via `indent::leading_whitespace`, never a hardcoded guess), and appends one more real
+indent unit on top when that line, after trimming real trailing whitespace, ends with an opening
+bracket (`indent::ends_with_opener` - a narrow, single-line heuristic, deliberately not real
+multi-line bracket matching or string/comment awareness). The indent unit itself comes from
+`Self::resolved_indent_settings_for_target()`/`indent::indent_unit`, the exact same real
+tabs-vs-spaces/width/`.editorconfig` resolution `Tab` already uses, so `Enter` never disagrees
+with `Tab` about what "one indent level" means. Multi-cursor-aware: each cursor computes its own
+indentation from its own line via `EditBuffer::apply_at_every_cursor`, not copied from the
+primary cursor.
+
+`handle_editor_enter_action` now dispatches per real edit target (`EditTarget::File`/`::Merge`)
+directly, matching how this file's other real buffer-mutating handlers already work, rather than
+through the generic single-fixed-string `replace_text_in_range`.
+
+Eight new tests: three end-to-end (`code_surface::editing::editing_tests`, driven through the
+real bound `EditorEnter` keystroke via `cx.simulate_keystrokes("enter")`, not a direct handler
+call) covering carry-over, a column-0 no-op, and the opening-bracket stretch goal; five at the
+`EditBuffer` level (`code_surface::edit_buffer::tests`) covering the same three cases plus
+multi-cursor independence and confirming a *closing* bracket does not spuriously add extra
+indent.
+
+**Verification**: `cargo build --workspace`, `cargo clippy --workspace --all-targets -- -D
+warnings`, `cargo fmt --all -- --check` - all clean. `cargo test --workspace -p app
+code_surface::`: 348 passed, 5 failed - all 5 pre-existing and environment-specific (LSP/GPU-paint
+tests unrelated to this change, already documented elsewhere in this log); all 8 new tests pass.
