@@ -188,6 +188,61 @@ pub fn set_current_custom_theme(swatches: Option<[u32; 5]>) {
     });
 }
 
+thread_local! {
+    /// GitHub issue #141: a live-selected custom theme's real, individually-picked per-scope
+    /// syntax colours, if it has any (`crate::settings::custom_theme::CustomTheme::
+    /// syntax_overrides`) - independent of, and layered *underneath*,
+    /// [`CURRENT_CUSTOM_SHIFT`]'s own whole-app HSL derivation.
+    ///
+    /// This exists because [`CURRENT_CUSTOM_SHIFT`]'s five-swatch derivation is a real, deliberate
+    /// scope limit (see `crate::settings::custom_theme`'s own module docs): it can re-tint every
+    /// token, but it cannot make two tokens that already share one `ColorToken` (e.g.
+    /// `syntax::VARIABLE`/`syntax::OPERATOR` both aliasing `syntax::TEXT`) diverge from each
+    /// other - only a real, per-token colour can do that, which is exactly what an imported
+    /// VSCode theme's own `tokenColors` array supplies. Checked by
+    /// `crate::code_surface::code_view::color_for_kind` *before* it falls through to this
+    /// crate's own hardcoded palette (which itself still runs through
+    /// [`CURRENT_CUSTOM_SHIFT`]'s derivation for every kind this map has no entry for), so a
+    /// theme with a partial `[syntax]` table gets real, distinct colours for exactly the scopes
+    /// it named and this app's own considered defaults (re-tinted, not literal) for the rest -
+    /// never a jarring mix of "some tokens ignore the theme entirely".
+    ///
+    /// `RefCell`, not `Cell` like [`CURRENT_CUSTOM_SHIFT`]: a `HashMap` isn't `Copy`. Same
+    /// `thread_local!`-not-global reasoning as every other piece of live theme state in this
+    /// module - see [`CURRENT_THEME_INDEX`]'s own docs.
+    static CURRENT_SYNTAX_OVERRIDES: std::cell::RefCell<
+        Option<std::collections::HashMap<crate::code_surface::code_view::HighlightKind, Rgba>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Selects (`Some`) or clears (`None`) the live custom-theme's real per-scope syntax overrides -
+/// see [`CURRENT_SYNTAX_OVERRIDES`]'s own docs. Always written alongside
+/// [`set_current_custom_theme`] by the one real caller
+/// (`crate::settings::render::AdeApp::apply_theme_selection`), for the identical
+/// "these two pieces of live theme state can never point at two different themes" reason that
+/// function's own docs already give for `set_current_theme_index`/`set_current_custom_theme`.
+pub fn set_current_syntax_overrides(
+    overrides: Option<
+        std::collections::HashMap<crate::code_surface::code_view::HighlightKind, Rgba>,
+    >,
+) {
+    CURRENT_SYNTAX_OVERRIDES.with(|cell| *cell.borrow_mut() = overrides);
+}
+
+/// The real, individually-picked colour for `kind`, if the live-selected custom theme named one -
+/// [`crate::code_surface::code_view::color_for_kind`]'s own real first check, before it falls
+/// through to this crate's hardcoded (but still [`CURRENT_CUSTOM_SHIFT`]-derived) default for
+/// `kind`. See [`CURRENT_SYNTAX_OVERRIDES`]'s own docs.
+pub fn syntax_override_for_kind(
+    kind: crate::code_surface::code_view::HighlightKind,
+) -> Option<Rgba> {
+    CURRENT_SYNTAX_OVERRIDES.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|map| map.get(&kind).copied())
+    })
+}
+
 /// Real, general "is this swatch set a light theme" check - the background swatch (index 0)'s
 /// HSL lightness alone, `> 0.5`. Generalizes the old hardcoded `name == "Paper"` special case
 /// (`crate::settings::render::AdeApp::set_theme_name`'s `last_dark_theme` bookkeeping used to

@@ -2634,17 +2634,22 @@ impl AdeApp {
         if let Some(index) = settings::THEME_DEFS.iter().position(|def| def.name == name) {
             theme::set_current_theme_index(index);
             theme::set_current_custom_theme(None);
-        } else if let Some(swatches) = self
-            .custom_themes
-            .iter()
-            .find(|theme| theme.name == name)
-            .map(|theme| theme.swatches)
-        {
+            theme::set_current_syntax_overrides(None);
+        } else if let Some(active) = self.custom_themes.iter().find(|theme| theme.name == name) {
             theme::set_current_theme_index(0);
-            theme::set_current_custom_theme(Some(swatches));
+            theme::set_current_custom_theme(Some(active.swatches));
+            // GitHub issue #141: `None` (not an empty map) for a custom theme with no real
+            // `[syntax]` table of its own - `crate::theme::syntax_override_for_kind` treats the
+            // two identically today, but `None` is the honest "this theme names no per-scope
+            // overrides at all" signal, matching `Option`'s own meaning everywhere else in this
+            // module rather than an always-`Some` map that's merely often empty.
+            theme::set_current_syntax_overrides(
+                (!active.syntax_overrides.is_empty()).then(|| active.syntax_overrides.clone()),
+            );
         } else {
             theme::set_current_theme_index(0);
             theme::set_current_custom_theme(None);
+            theme::set_current_syntax_overrides(None);
         }
         cx.refresh_windows();
     }
@@ -3001,10 +3006,21 @@ impl AdeApp {
                     .map(|def| def.subtitle.to_string())
             })
             .unwrap_or_default();
+        // GitHub issue #141: a built-in theme has no real per-scope syntax overrides at all -
+        // `.unwrap_or_default()` reports that honestly (an empty map) rather than only ever
+        // resolving for a custom theme and silently dropping this half of an imported VSCode
+        // theme's own real palette on export.
+        let syntax_overrides = self
+            .custom_themes
+            .iter()
+            .find(|theme| theme.name == active_name)
+            .map(|theme| theme.syntax_overrides.clone())
+            .unwrap_or_default();
         let export_theme = custom_theme::CustomTheme {
             name: export_name.clone(),
             subtitle,
             swatches,
+            syntax_overrides,
             source_path: None,
         };
         let default_dir = std::env::var_os("HOME")
@@ -3237,6 +3253,7 @@ mod export_theme_name_tests {
             accent_green: "#57a773".to_string(),
             accent_amber: "#c9a227".to_string(),
             accent_blue: "#6b9bd1".to_string(),
+            syntax: std::collections::HashMap::new(),
         };
         assert!(
             bare.validate().is_err(),
@@ -4103,6 +4120,7 @@ mod custom_theme_settings_tests {
         fn drop(&mut self) {
             theme::set_current_theme_index(0);
             theme::set_current_custom_theme(None);
+            theme::set_current_syntax_overrides(None);
         }
     }
 
@@ -4440,6 +4458,66 @@ mod custom_theme_settings_tests {
             app.read_with(cx, |app, _| app._vscode_theme_import_task.is_some()),
             "a real click on the button must actually invoke Self::start_import_vscode_theme, \
              not silently do nothing"
+        );
+    }
+
+    /// GitHub issue #141: selecting a real, imported VSCode theme with a `[syntax]` table must
+    /// really change `code_surface::code_view::color_for_kind`'s *live* output for the buckets
+    /// it named - not just update `Self::custom_themes`' own in-memory record. This is the one
+    /// real end-to-end proof connecting `Self::apply_theme_selection` to
+    /// `crate::theme::set_current_syntax_overrides`, on top of `vscode_theme`'s own pure
+    /// conversion tests and `code_view`'s own pure override-precedence test.
+    #[gpui::test]
+    fn selecting_an_imported_vscode_theme_really_changes_the_live_syntax_colour(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let dest_dir = settings_dir.path().join("themes");
+        let source_dir = tempfile::tempdir().expect("tempdir");
+        let source_path = source_dir.path().join("dracula.json");
+        std::fs::write(
+            &source_path,
+            r##"{
+                "name": "Dracula Live",
+                "colors": { "editor.background": "#282a36", "sideBar.background": "#21222c" },
+                "tokenColors": [
+                    { "scope": "keyword.control", "settings": { "foreground": "#ff79c6" } }
+                ]
+            }"##,
+        )
+        .expect("write source file");
+        let imported = vscode_theme::import_vscode_theme_file(&source_path, &dest_dir)
+            .expect("import must succeed");
+
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path,
+        );
+        app.update(cx, |app, cx| {
+            app.custom_themes = vec![imported];
+            app.settings.theme.name = "Dracula Live".to_string();
+            app.apply_theme_selection(cx);
+        });
+        cx.run_until_parked();
+
+        let live_color = crate::code_surface::code_view::color_for_kind(
+            crate::code_surface::code_view::HighlightKind::Keyword,
+        );
+        assert_eq!(
+            live_color,
+            gpui::Rgba {
+                r: 0xff as f32 / 255.0,
+                g: 0x79 as f32 / 255.0,
+                b: 0xc6 as f32 / 255.0,
+                a: 1.0,
+            },
+            "selecting the imported theme must really change color_for_kind's live output for \
+             Keyword to the real colour the VSCode theme's own tokenColors named"
         );
     }
 

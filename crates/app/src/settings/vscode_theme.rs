@@ -1,28 +1,42 @@
 //! GitHub issue #141: importing a real VSCode theme JSON file and converting it into this app's
-//! own five-swatch [`crate::settings::custom_theme::CustomThemeFile`] format.
+//! own [`crate::settings::custom_theme::CustomThemeFile`] format - five whole-app swatches, plus
+//! (see "Per-scope syntax fidelity" below) real, individually-picked colours for every syntax
+//! bucket this app's own highlighter recognizes.
 //!
-//! ## Scope: a real, honest palette conversion - not a rearchitecture
+//! ## The five whole-app swatches: a real, honest palette conversion
 //!
-//! `custom_theme`'s own module docs already made and documented a deliberate choice: this app's
-//! whole custom-theme system re-skins ~200 tokens from exactly five swatches
-//! (`background`/`panel`/three accents) via `crate::theme::derive_shift`, not a per-token
-//! override file. A VSCode theme's real `tokenColors` array carries dozens of independent
-//! textmate-scope colours that format cannot represent one-for-one - faithfully reproducing every
-//! one of them would mean giving `crate::theme::ColorToken` a real identity so a theme file could
-//! override individual tokens, a genuine architectural change to the theme system this issue's
-//! own "without affecting UI visuals" constraint argues against attempting casually. This module
-//! instead does the honest, bounded version: picks five real, representative colours out of a
-//! VSCode theme's own `colors` map (falling back to a `tokenColors` scope search, then a Jerry
-//! Dark default, for the three accents only - `background` has no default, see
+//! `custom_theme`'s own module docs describe this app's base mechanism: the whole app's ~200
+//! chrome tokens (backgrounds, borders, chips, ...) re-skin from exactly five swatches
+//! (`background`/`panel`/three accents) via `crate::theme::derive_shift` - there is no real
+//! per-chrome-token override file, and building one is a genuine, separate architectural change
+//! this issue's own "without affecting UI visuals" constraint argues against attempting for
+//! *chrome*. This module picks five real, representative colours out of a VSCode theme's own
+//! `colors` map (falling back to a `tokenColors` scope search, then a Jerry Dark default, for the
+//! three accents only - `background` has no default, see
 //! [`VscodeThemeError::MissingBackground`]) and runs them through the *exact same*
 //! [`crate::settings::custom_theme::CustomThemeFile::validate`] pipeline every hand-authored or
 //! plain-TOML-imported theme already goes through - so an imported VSCode theme is genuinely
 //! held to the same readability floor, the same built-in-name-collision check, real errors
 //! reported the same way.
 //!
-//! True per-scope syntax-highlight fidelity (the issue's own "bring syntax highlighting to the
-//! same level as VSCode" half) is a real, larger follow-up - flagged here rather than silently
-//! dropped - and out of scope for this pass.
+//! ## Per-scope syntax fidelity: real, not derived
+//!
+//! Unlike chrome, this app's *syntax* colours have a real per-bucket override mechanism
+//! (`crate::theme::syntax_override_for_kind`, checked by
+//! `crate::code_surface::code_view::color_for_kind` before its own hardcoded default) - see that
+//! function's own docs for why syntax specifically got this and chrome didn't (the short version:
+//! this app already had ~27 independently-named syntax buckets to hang real, distinct colours
+//! off; chrome's ~200 tokens have no equivalent semantic seam to add one to without a much larger
+//! change). [`build_syntax_overrides`] is the real converter: it walks
+//! [`crate::code_surface::code_view::HighlightKind::ALL`] and, for each, searches the VSCode
+//! theme's own `tokenColors` for a real matching textmate scope (see [`syntax_scope_rule`]'s own
+//! per-bucket scope list and parent-inheritance chain - the same dependency order
+//! `crate::theme::syntax`'s own module already documents for its *default* palette, e.g.
+//! `FUNCTION_METHOD` falling back to `FUNCTION`), so a theme that only styles
+//! `entity.name.function` still gets a real, consistent colour for a method call too. A bucket
+//! neither the theme nor its inheritance chain resolves simply keeps this app's own considered
+//! default (still re-tinted through the five-swatch derivation above) - never a jarring mix of
+//! "some tokens follow the theme, some silently don't".
 //!
 //! ## JSONC tolerance
 //!
@@ -35,6 +49,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use serde::Deserialize;
+
+use crate::code_surface::code_view::HighlightKind;
 
 use super::custom_theme::CustomThemeFile;
 
@@ -361,7 +377,144 @@ pub fn convert_vscode_theme_str(
         accent_green,
         accent_amber,
         accent_blue,
+        syntax: build_syntax_overrides(&file.colors, &file.token_colors),
     })
+}
+
+/// One [`HighlightKind`]'s real, ordered list of textmate scope prefixes to search
+/// [`file.token_colors`](VscodeThemeFile::token_colors) for, plus the kind to inherit its colour
+/// from when no rule matches - the real bucket dependency order
+/// [`crate::theme::syntax`]'s own module docs already establish for this app's *default* palette
+/// (`FUNCTION_METHOD` falls back to `FUNCTION`, `TYPE_BUILTIN` to `TYPE`, `VARIABLE` to `TEXT`,
+/// ...), computed once here at import time instead of at `const`-definition time, so a VSCode
+/// theme that only styles `entity.name.function` still gets a real, consistent colour for a
+/// method call too - not a jarring mix of "some tokens follow the theme, some silently don't".
+///
+/// A `None` parent means "this bucket's default is this crate's own hardcoded colour, not
+/// another bucket's" - the same real roots `theme::syntax` itself uses (`KEYWORD`/`FUNCTION`/
+/// `TYPE`/`CONSTANT`/`STRING`/`COMMENT`/`ATTRIBUTE`/`STRONG`/`EMPHASIS` are independently
+/// authored hues, not aliases).
+fn syntax_scope_rule(kind: HighlightKind) -> (&'static [&'static str], Option<HighlightKind>) {
+    use HighlightKind::*;
+    match kind {
+        Keyword => (
+            &[
+                "keyword.control",
+                "keyword.other",
+                "storage.modifier",
+                "keyword",
+            ],
+            None,
+        ),
+        Function => (&["entity.name.function", "support.function"], None),
+        FunctionMethod => (
+            &[
+                "entity.name.function.method",
+                "support.function.method",
+                "meta.function-call entity.name.function",
+            ],
+            Some(Function),
+        ),
+        Type => (
+            &["entity.name.type", "entity.name.class", "support.class"],
+            None,
+        ),
+        TypeBuiltin => (
+            &["support.type", "storage.type.primitive", "keyword.type"],
+            Some(Type),
+        ),
+        Constant => (&["constant.other", "constant"], None),
+        ConstantBuiltin => (&["constant.language", "keyword.constant"], Some(Constant)),
+        String => (&["string.quoted", "string"], None),
+        StringEscape => (&["constant.character.escape"], Some(String)),
+        Number => (&["constant.numeric"], Some(Constant)),
+        Comment => (&["comment.line", "comment.block", "comment"], None),
+        CommentDoc => (
+            &["comment.block.documentation", "comment.documentation"],
+            Some(Comment),
+        ),
+        Variable => (&["variable.other.readwrite", "variable"], Some(Text)),
+        VariableParameter => (&["variable.parameter"], Some(Variable)),
+        VariableBuiltin => (
+            &[
+                "variable.language",
+                "variable.language.this",
+                "keyword.other.this",
+            ],
+            Some(Constant),
+        ),
+        Property => (
+            &[
+                "variable.other.property",
+                "variable.other.object.property",
+                "meta.object-literal.key",
+            ],
+            Some(Variable),
+        ),
+        Operator => (&["keyword.operator"], Some(Text)),
+        PunctuationBracket => (
+            &[
+                "punctuation.section.brackets",
+                "punctuation.definition.brace",
+                "punctuation.section.parens",
+            ],
+            Some(Text),
+        ),
+        PunctuationDelimiter => (
+            &[
+                "punctuation.separator",
+                "punctuation.terminator",
+                "punctuation.delimiter",
+            ],
+            Some(Text),
+        ),
+        Tag => (&["entity.name.tag"], Some(Type)),
+        Attribute => (&["entity.other.attribute-name", "storage.modifier"], None),
+        Embedded => (&[], Some(Text)),
+        Text => (&[], None),
+        Heading => (&["markup.heading", "entity.name.section"], Some(Type)),
+        Link => (
+            &["markup.underline.link", "string.other.link"],
+            Some(Function),
+        ),
+        Strong => (&["markup.bold"], None),
+        Emphasis => (&["markup.italic"], None),
+    }
+}
+
+/// Builds the real `[syntax]` table [`convert_vscode_theme_str`] hands `CustomThemeFile::syntax`,
+/// naming every [`HighlightKind`] this VSCode theme's own `colors`/`tokenColors` give a real,
+/// resolved colour for. Processed in [`HighlightKind::ALL`]'s own declaration order (parents
+/// before every child that can inherit from them - see [`syntax_scope_rule`]'s own docs) so a
+/// child's fallback inheritance always reads an already-resolved parent, never one that hasn't
+/// been visited yet.
+///
+/// [`HighlightKind::Text`] is the one real special case: it comes from `colors["editor.foreground"]`
+/// (a real VSCode UI colour, not a `tokenColors` scope - there is no textmate scope for "plain
+/// text with no other rule matching") rather than [`syntax_scope_rule`]'s own scope search.
+fn build_syntax_overrides(
+    colors: &HashMap<String, String>,
+    token_colors: &[VscodeTokenColorRule],
+) -> HashMap<String, String> {
+    let mut resolved: HashMap<HighlightKind, String> = HashMap::new();
+    if let Some(foreground) = first_valid_color(colors, ["editor.foreground", "foreground"]) {
+        resolved.insert(HighlightKind::Text, foreground);
+    }
+    for kind in HighlightKind::ALL {
+        if kind == HighlightKind::Text {
+            continue;
+        }
+        let (scopes, parent) = syntax_scope_rule(kind);
+        let color = first_scope_foreground(token_colors, scopes)
+            .or_else(|| parent.and_then(|parent| resolved.get(&parent).cloned()));
+        if let Some(color) = color {
+            resolved.insert(kind, color);
+        }
+    }
+    resolved
+        .into_iter()
+        .map(|(kind, color)| (kind.name().to_string(), color))
+        .collect()
 }
 
 /// The real file-path entry point [`super::render::AdeApp::start_import_vscode_theme`] uses:
@@ -585,5 +738,85 @@ mod tests {
             .validate()
             .expect("must pass the shared validate() pipeline");
         assert_eq!(validated.name, "Round Trip Theme");
+    }
+
+    #[test]
+    fn a_real_token_color_rule_produces_a_real_syntax_override() {
+        let json = r##"{
+            "colors": { "editor.background": "#101214" },
+            "tokenColors": [
+                { "scope": "keyword.control", "settings": { "foreground": "#ff79c6" } },
+                { "scope": "string.quoted", "settings": { "foreground": "#f1fa8c" } }
+            ]
+        }"##;
+        let file = convert_vscode_theme_str(json, "sample").expect("convert");
+        assert_eq!(file.syntax.get("keyword"), Some(&"#ff79c6".to_string()));
+        assert_eq!(file.syntax.get("string"), Some(&"#f1fa8c".to_string()));
+        let validated = file
+            .validate()
+            .expect("must pass the shared validate() pipeline");
+        assert_eq!(validated.syntax_overrides.len(), file.syntax.len());
+    }
+
+    #[test]
+    fn a_child_bucket_with_no_direct_scope_match_inherits_its_real_parents_resolved_colour() {
+        // No "entity.name.function.method"/"support.function.method" rule at all - only the
+        // parent "entity.name.function" is styled. FunctionMethod must still resolve, to the
+        // same colour, rather than being left unset.
+        let json = r##"{
+            "colors": { "editor.background": "#101214" },
+            "tokenColors": [
+                { "scope": "entity.name.function", "settings": { "foreground": "#8be9fd" } }
+            ]
+        }"##;
+        let file = convert_vscode_theme_str(json, "sample").expect("convert");
+        assert_eq!(file.syntax.get("function"), Some(&"#8be9fd".to_string()));
+        assert_eq!(
+            file.syntax.get("function_method"),
+            Some(&"#8be9fd".to_string()),
+            "FunctionMethod has no direct scope match here, so it must inherit Function's own \
+             real resolved colour rather than being left unset"
+        );
+    }
+
+    #[test]
+    fn a_direct_child_scope_match_wins_over_inheriting_the_parent() {
+        let json = r##"{
+            "colors": { "editor.background": "#101214" },
+            "tokenColors": [
+                { "scope": "entity.name.function", "settings": { "foreground": "#8be9fd" } },
+                { "scope": "entity.name.function.method", "settings": { "foreground": "#50fa7b" } }
+            ]
+        }"##;
+        let file = convert_vscode_theme_str(json, "sample").expect("convert");
+        assert_eq!(
+            file.syntax.get("function_method"),
+            Some(&"#50fa7b".to_string()),
+            "a real, direct scope match for the child bucket must win over inheriting its \
+             parent's colour"
+        );
+    }
+
+    #[test]
+    fn a_theme_with_no_real_token_colors_at_all_produces_no_syntax_overrides() {
+        let json = r##"{ "colors": { "editor.background": "#101214" } }"##;
+        let file = convert_vscode_theme_str(json, "sample").expect("convert");
+        assert!(
+            file.syntax.is_empty(),
+            "no tokenColors and no editor.foreground means nothing this app can resolve a real \
+             override from - an empty table, not a guess"
+        );
+    }
+
+    #[test]
+    fn editor_foreground_becomes_the_real_text_override() {
+        let json = r##"{
+            "colors": {
+                "editor.background": "#101214",
+                "editor.foreground": "#f8f8f2"
+            }
+        }"##;
+        let file = convert_vscode_theme_str(json, "sample").expect("convert");
+        assert_eq!(file.syntax.get("text"), Some(&"#f8f8f2".to_string()));
     }
 }

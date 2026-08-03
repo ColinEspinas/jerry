@@ -136,17 +136,44 @@ pub struct CustomThemeFile {
     pub accent_green: String,
     pub accent_amber: String,
     pub accent_blue: String,
+    /// GitHub issue #141's real, optional per-scope syntax overrides - a `[syntax]` TOML table
+    /// keyed by `crate::code_surface::code_view::HighlightKind::name`, e.g.:
+    ///
+    /// ```toml
+    /// [syntax]
+    /// keyword = "#ff79c6"
+    /// string = "#f1fa8c"
+    /// comment = "#6272a4"
+    /// ```
+    ///
+    /// Deliberately additive, not a replacement for the five swatches above: every existing
+    /// hand-authored or plain-TOML-imported theme file simply has no `[syntax]` table at all
+    /// (`#[serde(default)]` makes that a real, empty map, not a parse failure), so its syntax
+    /// colours keep coming from the same whole-app HSL derivation they always have - this table
+    /// only ever *adds* real, individually-picked colours on top, never subtracts the fallback.
+    /// Omitted entirely from a written file when empty (`skip_serializing_if`), so re-exporting
+    /// an old-format theme produces byte-for-byte the same shape it always did.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub syntax: std::collections::HashMap<String, String>,
 }
 
 /// A [`CustomThemeFile`] that has already been validated - real hex colours, a non-empty name
 /// that doesn't collide with a built-in theme - and is safe to hand straight to
-/// `crate::theme::set_current_custom_theme` or render as a Themes-page card.
+/// `crate::theme::set_current_custom_theme`/[`crate::theme::set_current_syntax_overrides`] or
+/// render as a Themes-page card.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CustomTheme {
     pub name: String,
     pub subtitle: String,
     /// `[background, panel, green-ish, amber-ish, blue-ish]` - see the module docs.
     pub swatches: [u32; 5],
+    /// GitHub issue #141: this theme's own real, validated per-scope syntax colours - every
+    /// `CustomThemeFile::syntax` entry, parsed into a real
+    /// `crate::code_surface::code_view::HighlightKind` key and `Rgba` value. Empty for every
+    /// theme with no `[syntax]` table (which is every theme predating this issue) - see
+    /// [`CustomThemeFile::syntax`]'s own docs.
+    pub syntax_overrides:
+        std::collections::HashMap<crate::code_surface::code_view::HighlightKind, gpui::Rgba>,
     /// The real file this theme was loaded from/written to. `None` only for a value built
     /// in-memory without ever touching disk (no real production path constructs one that way,
     /// but keeps this struct honestly total rather than assuming every caller has a path).
@@ -178,6 +205,18 @@ pub enum ThemeFileError {
         bytes: u64,
         max_bytes: u64,
     },
+    /// GitHub issue #141: a `[syntax]` table key that isn't a real
+    /// `crate::code_surface::code_view::HighlightKind::name` - a real, specific rejection rather
+    /// than silently ignoring what's most likely a typo in a hand-authored file.
+    UnknownSyntaxKey(String),
+    /// GitHub issue #141: a `[syntax]` table value that isn't a real `#rrggbb` colour - the same
+    /// shape [`InvalidColor`](Self::InvalidColor) enforces for the five base swatches, just with
+    /// an owned `key` (a `[syntax]` table key is user-authored text, not one of this struct's own
+    /// fixed `&'static str` field names).
+    InvalidSyntaxColor {
+        key: String,
+        value: String,
+    },
 }
 
 impl std::fmt::Display for ThemeFileError {
@@ -206,6 +245,15 @@ impl std::fmt::Display for ThemeFileError {
                 f,
                 "theme file is {bytes} bytes, over the {max_bytes}-byte limit for a theme file"
             ),
+            ThemeFileError::UnknownSyntaxKey(key) => write!(
+                f,
+                "`[syntax]` names \"{key}\", which isn't a real syntax colour this app knows \
+                 about - see the docs for the full list of real names"
+            ),
+            ThemeFileError::InvalidSyntaxColor { key, value } => write!(
+                f,
+                "`[syntax].{key}` is not a real colour (\"{value}\") - expected `#rrggbb`"
+            ),
         }
     }
 }
@@ -224,6 +272,27 @@ fn parse_hex_color(value: &str) -> Option<u32> {
 
 fn format_hex_color(value: u32) -> String {
     format!("#{:06x}", value & 0x00ff_ffff)
+}
+
+/// `0xrrggbb` -> a real, opaque `gpui::Rgba` - the same byte-extraction shape
+/// `crate::theme::hex` uses for its own `ColorToken` constants, reimplemented here rather than
+/// exposed from that module (whose own `hex` is a private `const fn`, and this module has no
+/// real need for the rest of `ColorToken`'s machinery - a syntax override is already a real,
+/// final colour, not a token to be re-derived).
+fn hex_to_rgba(value: u32) -> gpui::Rgba {
+    gpui::Rgba {
+        r: ((value >> 16) & 0xff) as f32 / 255.0,
+        g: ((value >> 8) & 0xff) as f32 / 255.0,
+        b: (value & 0xff) as f32 / 255.0,
+        a: 1.0,
+    }
+}
+
+/// The inverse of [`hex_to_rgba`] - used by [`CustomTheme::to_file`] to write a syntax
+/// override's real `Rgba` back out as `0xrrggbb`.
+fn rgba_to_hex(color: gpui::Rgba) -> u32 {
+    let channel = |value: f32| ((value.clamp(0.0, 1.0) * 255.0).round() as u32) & 0xff;
+    (channel(color.r) << 16) | (channel(color.g) << 8) | channel(color.b)
 }
 
 /// Filesystem-safe, lowercase, hyphenated identifier for `name` - used for the `<slug>.toml`
@@ -317,10 +386,21 @@ impl CustomThemeFile {
                 floor_per_mille: floor,
             });
         }
+        let mut syntax_overrides = std::collections::HashMap::with_capacity(self.syntax.len());
+        for (key, value) in &self.syntax {
+            let kind = crate::code_surface::code_view::HighlightKind::from_name(key)
+                .ok_or_else(|| ThemeFileError::UnknownSyntaxKey(key.clone()))?;
+            let hex = parse_hex_color(value).ok_or_else(|| ThemeFileError::InvalidSyntaxColor {
+                key: key.clone(),
+                value: value.clone(),
+            })?;
+            syntax_overrides.insert(kind, hex_to_rgba(hex));
+        }
         Ok(CustomTheme {
             name: name.to_string(),
             subtitle: self.subtitle.trim().to_string(),
             swatches,
+            syntax_overrides,
             source_path: None,
         })
     }
@@ -359,6 +439,16 @@ impl CustomTheme {
             accent_green: format_hex_color(self.swatches[2]),
             accent_amber: format_hex_color(self.swatches[3]),
             accent_blue: format_hex_color(self.swatches[4]),
+            syntax: self
+                .syntax_overrides
+                .iter()
+                .map(|(kind, color)| {
+                    (
+                        kind.name().to_string(),
+                        format_hex_color(rgba_to_hex(*color)),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -678,6 +768,7 @@ mod tests {
             accent_green: "#5cb87f".to_string(),
             accent_amber: "#e2a336".to_string(),
             accent_blue: "#e07a5f".to_string(),
+            syntax: std::collections::HashMap::new(),
         }
     }
 
@@ -691,6 +782,81 @@ mod tests {
             [0x0c0d10, 0x181a1e, 0x5cb87f, 0xe2a336, 0xe07a5f]
         );
         assert_eq!(theme.source_path, None);
+        assert!(
+            theme.syntax_overrides.is_empty(),
+            "a file with no [syntax] table must validate with a real, empty override map"
+        );
+    }
+
+    #[test]
+    fn a_real_syntax_table_validates_into_the_real_highlight_kind_keyed_overrides() {
+        let mut file = valid_file();
+        file.syntax
+            .insert("keyword".to_string(), "#ff79c6".to_string());
+        file.syntax
+            .insert("string".to_string(), "#f1fa8c".to_string());
+        let theme = file.validate().expect("should validate");
+        assert_eq!(theme.syntax_overrides.len(), 2);
+        assert_eq!(
+            theme.syntax_overrides[&crate::code_surface::code_view::HighlightKind::Keyword],
+            hex_to_rgba(0xff79c6)
+        );
+        assert_eq!(
+            theme.syntax_overrides[&crate::code_surface::code_view::HighlightKind::String],
+            hex_to_rgba(0xf1fa8c)
+        );
+    }
+
+    #[test]
+    fn an_unknown_syntax_key_is_a_real_rejection_not_a_silently_ignored_typo() {
+        let mut file = valid_file();
+        file.syntax
+            .insert("keywrod".to_string(), "#ff79c6".to_string());
+        assert_eq!(
+            file.validate(),
+            Err(ThemeFileError::UnknownSyntaxKey("keywrod".to_string()))
+        );
+    }
+
+    #[test]
+    fn an_invalid_syntax_colour_is_a_real_rejection() {
+        let mut file = valid_file();
+        file.syntax
+            .insert("keyword".to_string(), "not-a-color".to_string());
+        assert_eq!(
+            file.validate(),
+            Err(ThemeFileError::InvalidSyntaxColor {
+                key: "keyword".to_string(),
+                value: "not-a-color".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_theme_with_syntax_overrides_round_trips_through_to_file_and_back() {
+        let mut file = valid_file();
+        file.syntax
+            .insert("keyword".to_string(), "#ff79c6".to_string());
+        file.syntax
+            .insert("comment".to_string(), "#6272a4".to_string());
+        let theme = file.validate().expect("should validate");
+        let round_tripped = theme.to_file().validate().expect("should re-validate");
+        assert_eq!(round_tripped.syntax_overrides, theme.syntax_overrides);
+    }
+
+    #[test]
+    fn every_highlight_kind_name_round_trips_through_from_name() {
+        for kind in crate::code_surface::code_view::HighlightKind::ALL {
+            assert_eq!(
+                crate::code_surface::code_view::HighlightKind::from_name(kind.name()),
+                Some(kind),
+                "HighlightKind::{kind:?}'s own name() must round-trip through from_name()"
+            );
+        }
+        assert_eq!(
+            crate::code_surface::code_view::HighlightKind::from_name("not_a_real_kind"),
+            None
+        );
     }
 
     #[test]

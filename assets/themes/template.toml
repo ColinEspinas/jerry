@@ -44,6 +44,23 @@
 #   `panel` that's the same colour as `background`, or only a couple of hex digits off from it,
 #   is rejected. In practice: make panel a clearly different shade (lighter or darker) than
 #   background, not just a different hue at the same brightness.
+#
+# REAL PER-SCOPE SYNTAX COLOURS (optional)
+#   An additional [syntax] table can name literal, individually-picked colours for specific
+#   syntax buckets - unlike the five swatches above, these are not re-derived; a [syntax] entry
+#   is the exact colour that bucket renders. Every real key is one of
+#   crate::code_surface::code_view::HighlightKind's own names - keyword, function,
+#   function_method, type, type_builtin, constant, constant_builtin, string, string_escape,
+#   number, comment, comment_doc, variable, variable_parameter, variable_builtin, property,
+#   operator, punctuation_bracket, punctuation_delimiter, tag, attribute, embedded, text,
+#   heading, link, strong, emphasis - an unrecognized key is a real, rejected error, not a
+#   silently ignored typo. Entirely optional: omit the whole table (as this template does) and
+#   every syntax colour keeps coming from the five swatches above, like any other theme.
+#
+# [syntax]
+# keyword = "#b477cf"
+# string  = "#9dbb6f"
+# comment = "#5d636f"
 
 name = "My Custom Theme"
 subtitle = "replace this with a short description"

@@ -247,9 +247,97 @@ pub enum HighlightKind {
     Emphasis,
 }
 
+impl HighlightKind {
+    /// GitHub issue #141: the real, stable snake_case name a hand-authored or VSCode-converted
+    /// custom theme file's own `[syntax]` table key names this bucket by - the counterpart to
+    /// [`Self::from_name`]. Deliberately distinct from `Debug`'s own `CamelCase` output (a
+    /// derived `Debug` impl is not a real, stable public contract - a future derive-macro change
+    /// or field addition could silently reshape it) and from the tree-sitter capture-name
+    /// vocabulary [`HIGHLIGHT_NAMES`] uses (that list has dotted, grammar-facing names like
+    /// `"function.method"`; a TOML table key is a plain identifier, no dots).
+    pub fn name(self) -> &'static str {
+        match self {
+            HighlightKind::Keyword => "keyword",
+            HighlightKind::Function => "function",
+            HighlightKind::FunctionMethod => "function_method",
+            HighlightKind::Type => "type",
+            HighlightKind::TypeBuiltin => "type_builtin",
+            HighlightKind::Constant => "constant",
+            HighlightKind::ConstantBuiltin => "constant_builtin",
+            HighlightKind::String => "string",
+            HighlightKind::StringEscape => "string_escape",
+            HighlightKind::Number => "number",
+            HighlightKind::Comment => "comment",
+            HighlightKind::CommentDoc => "comment_doc",
+            HighlightKind::Variable => "variable",
+            HighlightKind::VariableParameter => "variable_parameter",
+            HighlightKind::VariableBuiltin => "variable_builtin",
+            HighlightKind::Property => "property",
+            HighlightKind::Operator => "operator",
+            HighlightKind::PunctuationBracket => "punctuation_bracket",
+            HighlightKind::PunctuationDelimiter => "punctuation_delimiter",
+            HighlightKind::Tag => "tag",
+            HighlightKind::Attribute => "attribute",
+            HighlightKind::Embedded => "embedded",
+            HighlightKind::Text => "text",
+            HighlightKind::Heading => "heading",
+            HighlightKind::Link => "link",
+            HighlightKind::Strong => "strong",
+            HighlightKind::Emphasis => "emphasis",
+        }
+    }
+
+    /// The inverse of [`Self::name`] - `None` for anything that isn't a real, exact name (a
+    /// custom theme file's own validation reports this as a real, specific
+    /// `ThemeFileError::UnknownSyntaxKey` rather than silently ignoring a typo).
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+
+    /// Every real variant, in the same order [`Self::name`]'s own `match` lists them - the real
+    /// source [`Self::from_name`] searches and
+    /// `crate::settings::custom_theme::tests::every_highlight_kind_name_round_trips_through_from_name`
+    /// checks exhaustively against.
+    pub const ALL: [HighlightKind; 27] = [
+        HighlightKind::Keyword,
+        HighlightKind::Function,
+        HighlightKind::FunctionMethod,
+        HighlightKind::Type,
+        HighlightKind::TypeBuiltin,
+        HighlightKind::Constant,
+        HighlightKind::ConstantBuiltin,
+        HighlightKind::String,
+        HighlightKind::StringEscape,
+        HighlightKind::Number,
+        HighlightKind::Comment,
+        HighlightKind::CommentDoc,
+        HighlightKind::Variable,
+        HighlightKind::VariableParameter,
+        HighlightKind::VariableBuiltin,
+        HighlightKind::Property,
+        HighlightKind::Operator,
+        HighlightKind::PunctuationBracket,
+        HighlightKind::PunctuationDelimiter,
+        HighlightKind::Tag,
+        HighlightKind::Attribute,
+        HighlightKind::Embedded,
+        HighlightKind::Text,
+        HighlightKind::Heading,
+        HighlightKind::Link,
+        HighlightKind::Strong,
+        HighlightKind::Emphasis,
+    ];
+}
+
 /// Maps a [`HighlightKind`] to its real `theme::syntax::*` colour - see that module's own docs
 /// for the fallback-chain design behind each mapping.
 pub fn color_for_kind(kind: HighlightKind) -> Rgba {
+    // GitHub issue #141: a live-selected custom theme's own real, individually-picked colour for
+    // `kind` (from an imported VSCode theme's `tokenColors`) always wins over this crate's own
+    // hardcoded default below - see `theme::syntax_override_for_kind`'s own docs.
+    if let Some(overridden) = theme::syntax_override_for_kind(kind) {
+        return overridden;
+    }
     match kind {
         HighlightKind::Keyword => theme::syntax::KEYWORD.into(),
         HighlightKind::Function => theme::syntax::FUNCTION.into(),
@@ -1490,6 +1578,56 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use wt_core::diff::{DiffHunk, DiffLine, FileChangeStatus};
+
+    /// GitHub issue #141: `color_for_kind` must check a live custom theme's own per-scope
+    /// override before falling through to this crate's hardcoded default - and must leave
+    /// `HighlightKind`s the theme names no override for completely alone. `Drop`-guarded: Rust's
+    /// default test harness reuses worker threads across different tests, so a `thread_local!`
+    /// left non-default here could leak into a completely unrelated test scheduled on the same
+    /// worker later - the same real concern `crate::theme::CURRENT_THEME_INDEX`'s own docs
+    /// already document for exactly this reason.
+    struct ResetSyntaxOverridesOnDrop;
+    impl Drop for ResetSyntaxOverridesOnDrop {
+        fn drop(&mut self) {
+            theme::set_current_syntax_overrides(None);
+        }
+    }
+
+    #[test]
+    fn color_for_kind_prefers_a_live_custom_themes_override_over_the_hardcoded_default() {
+        let _guard = ResetSyntaxOverridesOnDrop;
+        let default_keyword = color_for_kind(HighlightKind::Keyword);
+        let default_string = color_for_kind(HighlightKind::String);
+
+        let overridden = gpui::Rgba {
+            r: 1.0,
+            g: 0.0,
+            b: 0.5,
+            a: 1.0,
+        };
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(HighlightKind::Keyword, overridden);
+        theme::set_current_syntax_overrides(Some(overrides));
+
+        assert_eq!(
+            color_for_kind(HighlightKind::Keyword),
+            overridden,
+            "an overridden kind must return the theme's own real colour, not the hardcoded one"
+        );
+        assert_eq!(
+            color_for_kind(HighlightKind::String),
+            default_string,
+            "a kind the theme names no override for must be completely unaffected"
+        );
+
+        theme::set_current_syntax_overrides(None);
+        assert_eq!(
+            color_for_kind(HighlightKind::Keyword),
+            default_keyword,
+            "clearing the override must really restore the hardcoded default, not leave the \
+             last-set colour stuck"
+        );
+    }
 
     #[test]
     fn detects_lf_from_real_bytes() {

@@ -101,12 +101,34 @@ accent_blue  = "#e07a5f"
 Colours are `#rrggbb` — a `#` plus exactly six hex digits; no `#rgb` shorthand, alpha channel, or
 named CSS colours. `name` must be unique (it can't reuse a built-in theme's own name); `subtitle`
 is optional. Those five swatches are the same five every built-in theme is defined by — the rest
-of the app's roughly 200 colour tokens are derived from how they differ from Jerry Dark's own
-five (see `derive_shift` in `crates/app/src/theme.rs` for the actual HSL transform — it's a
-private function, so this means reading the source, not generated rustdoc), so authoring five
-colours re-skins the whole app, not just a preview card. `panel` also has to actually read as a
-different shade from `background`: a real perceptual-brightness check rejects a `panel` that's
-the same colour as (or only a couple of hex digits off from) `background`.
+of the app's roughly 200 chrome colour tokens (surfaces, borders, chips, ...) are derived from how
+they differ from Jerry Dark's own five (see `derive_shift` in `crates/app/src/theme.rs` for the
+actual HSL transform — it's a private function, so this means reading the source, not generated
+rustdoc), so authoring five colours re-skins the whole app's chrome, not just a preview card.
+`panel` also has to actually read as a different shade from `background`: a real
+perceptual-brightness check rejects a `panel` that's the same colour as (or only a couple of hex
+digits off from) `background`.
+
+**Real per-scope syntax colours (GitHub issue #141, optional).** An additional `[syntax]` table
+can name individual, literal colours for specific syntax buckets — unlike the five swatches
+above, these are not re-derived; a `[syntax]` entry is the exact colour that bucket renders:
+
+```toml
+[syntax]
+keyword = "#ff79c6"
+string  = "#f1fa8c"
+comment = "#6272a4"
+```
+
+Every real key is one of `crate::code_surface::code_view::HighlightKind`'s own names (`keyword`,
+`function`, `function_method`, `type`, `type_builtin`, `constant`, `constant_builtin`, `string`,
+`string_escape`, `number`, `comment`, `comment_doc`, `variable`, `variable_parameter`,
+`variable_builtin`, `property`, `operator`, `punctuation_bracket`, `punctuation_delimiter`, `tag`,
+`attribute`, `embedded`, `text`, `heading`, `link`, `strong`, `emphasis`) — an unrecognized key is
+a real, rejected error, not a silently ignored typo. The table is entirely optional and additive:
+a theme with no `[syntax]` table (every theme predating this feature) keeps getting its syntax
+colours from the same five-swatch derivation as before — real per-scope colours only ever *add*
+fidelity on top, never replace the fallback.
 
 **Where files live.** `~/.config/jerry/themes/*.toml` — a `themes` directory sitting next to
 `~/.config/jerry/settings.toml`. Every `.toml` file directly inside it is loaded as a theme at
@@ -125,16 +147,26 @@ two-click **Remove** action that deletes its backing file.
 
 **Importing a VSCode theme (GitHub issue #141).** "Import VSCode theme…" picks a real VSCode
 theme JSON file (JSONC — `//`/`/* */` comments and trailing commas are tolerated, since that's how
-most real downloaded theme files are actually written) and converts it into the same five-swatch
-format above: `background`/`panel` come from `colors["editor.background"]`/
-`colors["sideBar.background"]` (or a nearby fallback key), and the three accents come from a
-handful of real VSCode colour keys (`terminal.ansiGreen`/`terminal.ansiYellow`/
-`button.background`, among others), falling back to a `tokenColors` scope search and then to
-Jerry Dark's own accents if none of those are present. This is a real, honest palette conversion,
-not a pixel-for-pixel reproduction — VSCode's own per-scope `tokenColors` (dozens of independent
-syntax-highlight colours) can't be represented in this app's five-swatch format one-for-one, so an
-imported theme gets this app's own re-derived syntax palette, tinted by the same HSL shift every
-custom theme already goes through, not VSCode's own literal token colours.
+most real downloaded theme files are actually written) and converts it into this app's own format
+— both halves of it:
+
+- The five whole-app swatches: `background`/`panel` come from `colors["editor.background"]`/
+  `colors["sideBar.background"]` (or a nearby fallback key), and the three accents come from a
+  handful of real VSCode colour keys (`terminal.ansiGreen`/`terminal.ansiYellow`/
+  `button.background`, among others), falling back to a `tokenColors` scope search and then to
+  Jerry Dark's own accents if none of those are present.
+- Real per-scope syntax colours: the converter walks every `HighlightKind` bucket and searches the
+  theme's own `tokenColors` for a real matching textmate scope (`entity.name.function` for
+  `function`, `keyword.control` for `keyword`, `string.quoted` for `string`, and so on for every
+  bucket the `[syntax]` table above accepts), writing a real `[syntax]` table — not a re-derived
+  guess. A bucket with no direct scope match inherits its real parent bucket's own resolved colour
+  (the same dependency chain this app's own default palette already uses, e.g. a method call
+  falling back to a plain function call's colour) rather than being left unset, so a theme that
+  only styles the common cases still produces consistent results throughout.
+
+`editor.foreground` becomes the `text` override; a VSCode theme with no `tokenColors` at all (rare
+in practice) still converts, just with an empty `[syntax]` table — every bucket then keeps this
+app's own considered default, re-tinted by the five swatches above like any other custom theme.
 
 ## Building and running it
 
