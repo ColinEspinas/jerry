@@ -1,7 +1,7 @@
 use super::*;
 use crate::root::widgets::{
-    render_action_keycap_row, render_env_chip, render_hint_pair, render_keycap_row, text_tooltip,
-    KeycapSize,
+    hover_bg, render_action_keycap_row, render_env_chip, render_hint_pair, render_keycap_row,
+    text_tooltip, KeycapSize,
 };
 use gpui::{Animation, AnimationExt, DragMoveEvent};
 use std::time::Duration;
@@ -891,6 +891,14 @@ impl AdeApp {
                     .gap(px(7.0))
                     .px(px(13.0))
                     .cursor_pointer()
+                    // GitHub issue #128: only a tab's own `×` close glyph gave any hover feedback
+                    // - the much larger click target that actually activates the tab gave none.
+                    // Skipped for the already-active tab: it already reads as selected via
+                    // `colors.bg` (`theme::surface::CENTER`) on the outer tab div above, and
+                    // layering a second bg here would just muddy that. Fixed once, here, in the
+                    // shared chrome every tab kind (file, agent, graph) renders through - not
+                    // per call site.
+                    .when(!is_active, |el| hover_bg(el, theme::surface::ROW_HOVER))
                     .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                         on_activate(this, window, cx);
                     }))

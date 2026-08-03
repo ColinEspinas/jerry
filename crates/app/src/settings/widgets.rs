@@ -549,6 +549,15 @@ impl AdeApp {
                         on_select(this, index, window, cx);
                     },
                 ));
+                // GitHub issue #128: every other clickable row in the app gives hover feedback -
+                // this shared widget (behind the Diff/File toggle, right-sidebar toggle, palette
+                // scope control, and the settings TOML/JSON toggle) didn't. Only the *inactive*
+                // segments need it - the active one already reads as selected via
+                // `SEGMENT_ACTIVE` above, and layering a second bg on top of that would just
+                // muddy it.
+                if !is_active {
+                    segment = segment.hover(|el| el.bg(theme::surface::ROW_HOVER_ALT));
+                }
             }
             track = track.child(segment);
         }

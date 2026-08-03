@@ -1,8 +1,8 @@
 use super::*;
 use crate::keymap;
 use crate::root::widgets::{
-    render_keycap_row, render_menu_group_divider, render_sidebar_message, render_tag_pill,
-    text_tooltip, KeycapSize,
+    hover_bg, render_keycap_row, render_menu_group_divider, render_sidebar_message,
+    render_tag_pill, text_tooltip, KeycapSize,
 };
 use crate::settings::widgets::ChoiceOption;
 use crate::worktree_history::flow as worktree_history;
@@ -330,7 +330,8 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         let (_, message) = self.staging_error.clone()?;
-        Some(
+        // GitHub issue #128.
+        let row = hover_bg(
             div()
                 .id("staging-error")
                 .debug_selector(|| "staging-error".to_string())
@@ -341,8 +342,11 @@ impl AdeApp {
                 .font(font(theme::font::MONO))
                 .text_size(self.ui_text_size(10.0))
                 .text_color(theme::status::FAIL)
-                .cursor_pointer()
-                .tooltip(text_tooltip("Click to dismiss"))
+                .cursor_pointer(),
+            theme::surface::ROW_HOVER,
+        );
+        Some(
+            row.tooltip(text_tooltip("Click to dismiss"))
                 .child(message)
                 .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                     this.staging_error = None;
@@ -708,7 +712,8 @@ impl AdeApp {
         // The real, honest surface for a failed file operation (a refused rename, a trash
         // command that didn't run) - next to the tree it happened in, not buried in the log.
         if let Some(error) = self.tree_op_error.clone() {
-            column = column.child(
+            // GitHub issue #128.
+            let row = hover_bg(
                 div()
                     .id("file-tree-op-error")
                     .debug_selector(|| "file-tree-op-error".to_string())
@@ -719,8 +724,11 @@ impl AdeApp {
                     .font(font(theme::font::MONO))
                     .text_size(self.ui_text_size(10.0))
                     .text_color(theme::status::FAIL)
-                    .cursor_pointer()
-                    .tooltip(text_tooltip("Click to dismiss"))
+                    .cursor_pointer(),
+                theme::surface::ROW_HOVER,
+            );
+            column = column.child(
+                row.tooltip(text_tooltip("Click to dismiss"))
                     .child(error)
                     .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                         this.tree_op_error = None;
@@ -2239,6 +2247,13 @@ impl AdeApp {
 /// leading chip (unlike `crate::work_surface::render::render_dropdown_menu_row`, which this
 /// deliberately doesn't reuse: the design has no per-row glyph here). Always dimmed and
 /// non-interactive - see [`AdeApp::render_commit_menu`]'s own docs for why.
+///
+/// Deliberately no `.hover()` - `crate::work_surface::render::AdeApp::render_footer_action`'s own
+/// docs already establish this codebase's rule for an unimplemented action: never a clickable-
+/// looking no-op. The real gap GitHub issue #128 found wasn't a missing hover, it was that
+/// nothing dimmed the row enough to read as disabled *without* one - the `.opacity()` below is
+/// that fix, at the same whole-row grain `crate::graph_view::render`'s dashed elbow segments use
+/// for an analogous "still real, just visually de-emphasized" treatment.
 fn render_commit_menu_row(label: &'static str, sub: String) -> impl IntoElement {
     div()
         .id(format!("commit-menu-row-{label}"))
@@ -2249,6 +2264,7 @@ fn render_commit_menu_row(label: &'static str, sub: String) -> impl IntoElement 
         .px(px(10.0))
         .py(px(5.0))
         .cursor_default()
+        .opacity(0.5)
         .child(
             div()
                 .font(font(theme::font::SANS))

@@ -1,5 +1,5 @@
 use super::*;
-use crate::root::widgets::{render_env_chip, render_keycap_row, KeycapSize};
+use crate::root::widgets::{hover_keycap_row, render_env_chip, render_keycap_row, KeycapSize};
 use crate::settings::widgets::ChoiceOption;
 
 impl AdeApp {
@@ -169,9 +169,8 @@ impl AdeApp {
                             .child("Settings"),
                     )
                     .child(
-                        div()
-                            .id("settings-close")
-                            .cursor_pointer()
+                        // GitHub issue #128.
+                        hover_keycap_row(div().id("settings-close").cursor_pointer())
                             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                                 this.close_settings(window, cx);
                             }))
@@ -1156,6 +1155,11 @@ impl AdeApp {
                 theme::settings::CARD_SELECTED_BG
             } else {
                 theme::settings::CARD_UNSELECTED_BG
+            })
+            // GitHub issue #128 - matches `Self::render_theme_card`'s own identical hover, the
+            // adjacent card widget this one is otherwise styled just like.
+            .when(!is_selected, |el| {
+                el.hover(|el| el.border_color(theme::settings::THEME_CARD_HOVER_BORDER))
             })
             .px(px(10.0))
             .py(px(9.0))

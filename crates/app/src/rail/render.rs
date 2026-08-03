@@ -561,6 +561,13 @@ impl AdeApp {
                 .px(px(10.0))
                 .py(px(6.0))
                 .bg(theme::status::ASK_BG)
+                // GitHub issue #128: the tooltip already says "Click to dismiss," but nothing
+                // visually confirmed a hover was even registered. No dedicated hover token for
+                // this status-coloured bg exists, so this dims it slightly rather than inventing
+                // a one-off theme constant - the same `.resolve().opacity(...)` technique
+                // `crate::code_surface::minimap`'s scrollbar thumb hover already uses for an
+                // analogous "still the same colour, just a distinguishable second state" need.
+                .hover(|el| el.bg(theme::status::ASK_BG.resolve().opacity(0.7)))
                 .border_b_1()
                 .border_color(theme::border::RAIL_INNER)
                 .font(font(theme::font::MONO))
@@ -1003,6 +1010,10 @@ impl AdeApp {
                     .font(font(theme::font::MONO))
                     .text_size(self.ui_text_size(8.0))
                     .text_color(theme::text::FAINT)
+                    // GitHub issue #128 - same lightweight text-only hover
+                    // `Self::render_status_zoom_value` uses for an equally small, box-free
+                    // clickable glyph.
+                    .hover(|el| el.text_color(theme::text::SELECTED))
                     .child(if is_expanded { "\u{25be}" } else { "\u{25b8}" })
                     .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                         cx.stop_propagation();
