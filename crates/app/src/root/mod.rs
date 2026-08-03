@@ -1536,6 +1536,11 @@ pub struct AdeApp {
     /// (`Self::start_import_custom_theme`) - a single slot, since only one file-open dialog can
     /// meaningfully be in flight at a time.
     pub(crate) _custom_theme_import_task: Option<Task<()>>,
+    /// GitHub issue #141's "Import VSCode theme..." real native file-picker task
+    /// (`Self::start_import_vscode_theme`) - same one-slot reasoning as
+    /// [`Self::_custom_theme_import_task`], a separate field since a plain-TOML import and a
+    /// VSCode-JSON import are two independent real actions/dialogs.
+    pub(crate) _vscode_theme_import_task: Option<Task<()>>,
     /// The in-flight "Export theme..." real native save-file-picker task
     /// (`Self::start_export_custom_theme`) - same one-slot reasoning as
     /// [`Self::_custom_theme_import_task`].

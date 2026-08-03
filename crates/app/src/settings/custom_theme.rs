@@ -528,7 +528,21 @@ pub fn import_theme_file(
     }
     let contents =
         std::fs::read_to_string(source_path).map_err(|err| ThemeFileError::Io(err.to_string()))?;
-    let mut theme = parse_theme_file_str(&contents)?;
+    let theme = parse_theme_file_str(&contents)?;
+    validate_and_write(theme.to_file(), dest_dir)
+}
+
+/// The real, shared "validate, then write a canonical copy into `dest_dir`" tail
+/// [`import_theme_file`] (a plain-TOML source) and
+/// `crate::settings::vscode_theme`'s own import glue (a converted-from-JSON source) both need -
+/// re-validated here even though a caller may have already validated once (cheap, and keeps this
+/// function honest as the one real place a theme actually lands on disk, rather than trusting a
+/// caller's own possibly-stale validation).
+pub(crate) fn validate_and_write(
+    file: CustomThemeFile,
+    dest_dir: &Path,
+) -> Result<CustomTheme, ThemeFileError> {
+    let mut theme = file.validate()?;
     std::fs::create_dir_all(dest_dir).map_err(|err| ThemeFileError::Io(err.to_string()))?;
     let dest_path = non_colliding_dest_path(dest_dir, &theme.name);
     std::fs::write(&dest_path, theme.to_toml_string())

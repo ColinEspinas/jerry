@@ -113,14 +113,28 @@ the same colour as (or only a couple of hex digits off from) `background`.
 startup; a file that fails to parse or validate is skipped with a real, specific error shown on
 the Themes page (the rest of the directory still loads normally).
 
-**Getting started without leaving the app.** The Themes page's "Custom themes" section has three
+**Getting started without leaving the app.** The Themes page's "Custom themes" section has four
 real actions: **New from template…** writes a real, well-commented starting-point file straight
 into that directory (the same file checked into this repository at
 [`assets/themes/template.toml`](assets/themes/template.toml) — copying it by hand works exactly
 as well as clicking the button); **Import theme…** validates and copies in any `.toml` file you
-already have, via a native file picker; **Export current theme…** saves whichever theme is
+already have, via a native file picker; **Import VSCode theme…** converts a downloaded VSCode
+theme `.json` file (see below) the same way; **Export current theme…** saves whichever theme is
 currently active to a file you can hand to someone else. Every custom theme card also has a
 two-click **Remove** action that deletes its backing file.
+
+**Importing a VSCode theme (GitHub issue #141).** "Import VSCode theme…" picks a real VSCode
+theme JSON file (JSONC — `//`/`/* */` comments and trailing commas are tolerated, since that's how
+most real downloaded theme files are actually written) and converts it into the same five-swatch
+format above: `background`/`panel` come from `colors["editor.background"]`/
+`colors["sideBar.background"]` (or a nearby fallback key), and the three accents come from a
+handful of real VSCode colour keys (`terminal.ansiGreen`/`terminal.ansiYellow`/
+`button.background`, among others), falling back to a `tokenColors` scope search and then to
+Jerry Dark's own accents if none of those are present. This is a real, honest palette conversion,
+not a pixel-for-pixel reproduction — VSCode's own per-scope `tokenColors` (dozens of independent
+syntax-highlight colours) can't be represented in this app's five-swatch format one-for-one, so an
+imported theme gets this app's own re-derived syntax palette, tinted by the same HSL shift every
+custom theme already goes through, not VSCode's own literal token colours.
 
 ## Building and running it
 

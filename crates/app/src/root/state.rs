@@ -435,6 +435,7 @@ impl AdeApp {
             custom_theme_load_errors,
             custom_theme_status: None,
             _custom_theme_import_task: None,
+            _vscode_theme_import_task: None,
             _custom_theme_export_task: None,
             _custom_theme_remove_task: None,
             _custom_theme_create_task: None,

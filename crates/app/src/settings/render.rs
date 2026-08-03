@@ -1323,6 +1323,12 @@ impl AdeApp {
                         |this, cx| this.start_import_custom_theme(cx),
                     ))
                     .child(self.render_theme_action_button(
+                        "settings-theme-import-vscode",
+                        "Import VSCode theme\u{2026}",
+                        cx,
+                        |this, cx| this.start_import_vscode_theme(cx),
+                    ))
+                    .child(self.render_theme_action_button(
                         "settings-theme-export",
                         "Export current theme\u{2026}",
                         cx,
@@ -2737,6 +2743,57 @@ impl AdeApp {
         self._custom_theme_import_task = Some(task);
     }
 
+    /// GitHub issue #141: a real native file picker for a downloaded VSCode theme JSON file,
+    /// converted (`vscode_theme::import_vscode_theme_file`) into this app's own five-swatch
+    /// format and reloaded from disk - the exact same background-executor
+    /// write-then-reload-from-disk shape [`Self::start_import_custom_theme`] already uses for a
+    /// plain-TOML source, sharing [`Self::apply_custom_theme_load_result`] with it rather than a
+    /// second, parallel applier (see that function's own docs on why it's generic over its error
+    /// type to make this possible).
+    pub(in crate::settings) fn start_import_vscode_theme(&mut self, cx: &mut Context<Self>) {
+        let paths_receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import".into()),
+        });
+        let settings_path = self.settings_path.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(mut paths))) = paths_receiver.await else {
+                return;
+            };
+            let Some(source_path) = paths.pop() else {
+                return;
+            };
+            let Some(settings_path) = settings_path else {
+                let _ = this.update(cx, |this, cx| {
+                    this.custom_theme_status = Some(Err(
+                        "can't import a theme: no settings file location is known".to_string(),
+                    ));
+                    cx.notify();
+                });
+                return;
+            };
+            let dest_dir = custom_theme::custom_themes_dir_for(&settings_path);
+            let result: Result<_, vscode_theme::VscodeImportError> = cx
+                .background_executor()
+                .spawn(async move {
+                    let imported = vscode_theme::import_vscode_theme_file(&source_path, &dest_dir)?;
+                    let (themes, errors) = custom_theme::load_custom_themes_from_dir(&dest_dir);
+                    Ok((imported, themes, errors))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_custom_theme_load_result(
+                    result,
+                    |name| format!("Imported \"{name}\" from a VSCode theme."),
+                    cx,
+                );
+            });
+        });
+        self._vscode_theme_import_task = Some(task);
+    }
+
     /// GitHub issue #5's "custom icon packs": a real native directory picker
     /// (`gpui::App::prompt_for_paths`, `directories: true`) - unlike
     /// [`Self::start_import_custom_theme`], nothing is copied anywhere: the chosen directory
@@ -2813,8 +2870,12 @@ impl AdeApp {
     /// [`Self::apply_custom_theme_import_result`]'s own original "re-import the active theme"
     /// fix). `success_message` is the one real difference between the two real callers: what the
     /// status line should say for *this* action having succeeded.
+    /// Generic over its error type (anything `Display`, not just [`custom_theme::ThemeFileError`])
+    /// so `Self::start_import_vscode_theme`'s own [`vscode_theme::VscodeImportError`] - a genuinely
+    /// different error domain (a JSON conversion failure has no matching `ThemeFileError` variant
+    /// to force it into) - can share this exact same applier rather than a second, parallel one.
     #[allow(clippy::type_complexity)]
-    fn apply_custom_theme_load_result(
+    fn apply_custom_theme_load_result<E: std::fmt::Display>(
         &mut self,
         result: Result<
             (
@@ -2822,7 +2883,7 @@ impl AdeApp {
                 Vec<custom_theme::CustomTheme>,
                 Vec<String>,
             ),
-            custom_theme::ThemeFileError,
+            E,
         >,
         success_message: impl FnOnce(&str) -> String,
         cx: &mut Context<Self>,
@@ -4246,6 +4307,139 @@ mod custom_theme_settings_tests {
         assert!(
             matches!(status, Some(Err(_))),
             "a malformed import should report a real, honest error, got {status:?}"
+        );
+    }
+
+    /// GitHub issue #141: the same real validate-then-apply proof
+    /// `importing_a_real_theme_file_adds_it_to_the_registry_and_writes_a_canonical_copy` gives
+    /// the plain-TOML path, driven through `vscode_theme::import_vscode_theme_file` and the now-
+    /// generic `Self::apply_custom_theme_load_result` instead - a real VSCode theme JSON file on
+    /// disk really does become a real, selectable custom theme, and a malformed one is rejected
+    /// without touching the registry.
+    #[gpui::test]
+    fn importing_a_real_vscode_theme_file_adds_it_to_the_registry_and_writes_a_canonical_copy(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path.clone(),
+        );
+
+        let source_dir = tempfile::tempdir().expect("tempdir");
+        let source_path = source_dir.path().join("dracula.json");
+        std::fs::write(
+            &source_path,
+            r##"{
+                "name": "Dracula Imported",
+                "colors": {
+                    "editor.background": "#282a36",
+                    "sideBar.background": "#21222c",
+                    "terminal.ansiGreen": "#50fa7b",
+                    "terminal.ansiYellow": "#f1fa8c",
+                    "button.background": "#bd93f9"
+                }
+            }"##,
+        )
+        .expect("write source file");
+        let dest_dir = settings_dir.path().join("themes");
+
+        let result: Result<_, vscode_theme::VscodeImportError> =
+            vscode_theme::import_vscode_theme_file(&source_path, &dest_dir).map(|imported| {
+                let (themes, errors) = custom_theme::load_custom_themes_from_dir(&dest_dir);
+                (imported, themes, errors)
+            });
+        app.update(cx, |app, cx| {
+            app.apply_custom_theme_load_result(
+                result,
+                |name| format!("Imported \"{name}\" from a VSCode theme."),
+                cx,
+            );
+        });
+
+        assert_eq!(app.read_with(cx, |app, _| app.custom_themes.len()), 1);
+        assert_eq!(
+            app.read_with(cx, |app, _| app.custom_themes[0].name.clone()),
+            "Dracula Imported"
+        );
+        let status = app.read_with(cx, |app, _| app.custom_theme_status.clone());
+        assert!(
+            matches!(status, Some(Ok(_))),
+            "a real successful VSCode import should report a real success status, got {status:?}"
+        );
+        let expected_file = dest_dir.join("dracula-imported.toml");
+        assert!(
+            expected_file.exists(),
+            "import must write a real, canonical TOML copy into the settings-sibling themes \
+             directory"
+        );
+
+        // A source with no `editor.background` at all is rejected with a real error and does
+        // not touch the registry.
+        let bad_source = source_dir.path().join("bad.json");
+        std::fs::write(&bad_source, r#"{ "colors": {} }"#).expect("write bad source");
+        let bad_result: Result<_, vscode_theme::VscodeImportError> =
+            vscode_theme::import_vscode_theme_file(&bad_source, &dest_dir).map(|imported| {
+                let (themes, errors) = custom_theme::load_custom_themes_from_dir(&dest_dir);
+                (imported, themes, errors)
+            });
+        app.update(cx, |app, cx| {
+            app.apply_custom_theme_load_result(
+                bad_result,
+                |name| format!("Imported \"{name}\" from a VSCode theme."),
+                cx,
+            );
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.custom_themes.len()),
+            1,
+            "a VSCode file with no real background colour must not add a bogus entry"
+        );
+        let status = app.read_with(cx, |app, _| app.custom_theme_status.clone());
+        assert!(
+            matches!(status, Some(Err(_))),
+            "a malformed VSCode import should report a real, honest error, got {status:?}"
+        );
+    }
+
+    /// The real, click-driven proof the "Import VSCode theme…" button itself is wired to a real
+    /// handler - mirrors `clicking_the_real_import_button_reaches_the_real_handler`'s own
+    /// discipline for the plain-TOML button.
+    #[gpui::test]
+    fn clicking_the_real_import_vscode_theme_button_reaches_the_real_handler(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = ResetThemeStateOnDrop;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path,
+        );
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Theme, window, cx);
+        });
+        cx.run_until_parked();
+
+        let import_bounds = cx
+            .debug_bounds("settings-theme-import-vscode")
+            .expect("the Import VSCode theme… button must have painted");
+        cx.simulate_click(import_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app._vscode_theme_import_task.is_some()),
+            "a real click on the button must actually invoke Self::start_import_vscode_theme, \
+             not silently do nothing"
         );
     }
 

@@ -42,6 +42,7 @@ use crate::work_surface::state as work_surface;
 pub mod custom_theme;
 pub mod state;
 pub mod store;
+pub mod vscode_theme;
 
 pub(crate) mod render;
 pub(crate) mod widgets;
