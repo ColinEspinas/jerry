@@ -806,6 +806,17 @@ impl AdeApp {
                     );
                 }),
             )
+            // GitHub issue #148: the empty area is also a real drop target - "move to the
+            // worktree root", the same `destination_dir` every other empty-area action
+            // (New File/New Folder/Paste) already resolves to. Any row's own `on_drop` calls
+            // `cx.stop_propagation()`, so this only ever fires for a drop that genuinely misses
+            // every row.
+            .on_drop(
+                cx.listener(move |this, dragged: &TreeDragPayload, _window, cx| {
+                    let root = this.file_tree_root.clone();
+                    this.move_paths_into_dir(&dragged.paths, &root, cx);
+                }),
+            )
             .child({
                 // Where a keyboard-opened menu (`Shift+F10`) anchors - the same real
                 // `gpui::canvas` bounds-capture pattern `Self::render_tab_strip_plus` uses for
@@ -1022,7 +1033,18 @@ impl AdeApp {
             .pr(px(8.0))
             .font(font(theme::font::MONO))
             .text_size(self.ui_text_size(11.5))
-            .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED));
+            .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED))
+            // GitHub issue #148: the drop-target folder while a real file-tree drag is over it -
+            // `theme::status::ASK_BG`, the same "you can act here" amber this app already uses
+            // for its other real actionable notices, not a new one-off token. Deliberately
+            // overrides `is_selected`'s own bg (a `.when` after it, not combined into one
+            // condition) - a drop target reads as "drop here", not "also selected", even for the
+            // rare case of dragging onto an already-selected folder.
+            .when(
+                entry.is_dir
+                    && self.tree_drag_hover_target.as_deref() == Some(entry.path.as_path()),
+                |el| el.bg(theme::status::ASK_BG),
+            );
 
         // Indent guides (issue #18 §3), one per level of nesting between this row and the root.
         //
@@ -1103,6 +1125,74 @@ impl AdeApp {
                     );
                 }),
             );
+        }
+
+        // GitHub issue #148: every row can be dragged - a row already part of a real
+        // multi-selection drags the *whole* selection, matching how a click on it wouldn't
+        // collapse the selection either (a plain click on an *unselected* row still resets the
+        // selection first, the same way `Self::tree_click_select`'s own plain-click branch
+        // does, so the drag that follows only ever carries what's genuinely selected at drag
+        // start). Only real per-row state is read here - never anything that could go stale by
+        // the time the drag actually starts, since `drag_value` is captured once, now.
+        {
+            let is_selected = self.is_tree_path_selected(&entry.path);
+            let drag_paths = if is_selected && self.tree_selection_len() > 1 {
+                self.tree_selected_paths()
+            } else {
+                vec![entry.path.clone()]
+            };
+            let label = if drag_paths.len() > 1 {
+                format!("{} items", drag_paths.len())
+            } else {
+                entry.name.clone()
+            };
+            let drag_value = TreeDragPayload {
+                paths: drag_paths,
+                label,
+            };
+            row = row.on_drag(drag_value, move |dragged, _position, _window, cx| {
+                cx.new(|_| dragged.clone())
+            });
+        }
+        if entry.is_dir {
+            let drop_path = entry.path.clone();
+            let hover_path = entry.path.clone();
+            row = row
+                .on_drag_move(cx.listener(
+                    move |this, event: &gpui::DragMoveEvent<TreeDragPayload>, _window, cx| {
+                        // A folder can't be its own drop target's *visual* indication either -
+                        // `Self::move_paths_into_dir` already refuses the move itself, but
+                        // highlighting a folder that's part of what's being dragged onto it
+                        // would show an affordance for a drop this app is about to reject anyway.
+                        let hovering = event.bounds.contains(&event.event.position)
+                            && !event.drag(cx).paths.contains(&hover_path);
+                        // Only touches state (and repaints) on a real change - matching
+                        // `Self::update_tab_drag_insertion`'s own identical discipline, since
+                        // `on_drag_move` fires on every real mouse-move during the drag.
+                        if hovering {
+                            if this.tree_drag_hover_target.as_deref() != Some(hover_path.as_path())
+                            {
+                                this.tree_drag_hover_target = Some(hover_path.clone());
+                                cx.notify();
+                            }
+                        } else if this.tree_drag_hover_target.as_deref()
+                            == Some(hover_path.as_path())
+                        {
+                            this.tree_drag_hover_target = None;
+                            cx.notify();
+                        }
+                    },
+                ))
+                .on_drop(
+                    cx.listener(move |this, dragged: &TreeDragPayload, _window, cx| {
+                        // Without this, the drop would *also* reach `Self::file_tree_shell`'s own
+                        // root-drop handler right after this row's - moving the same selection into
+                        // the folder it was just dropped on, then straight back out to the root.
+                        cx.stop_propagation();
+                        this.tree_drag_hover_target = None;
+                        this.move_paths_into_dir(&dragged.paths, &drop_path, cx);
+                    }),
+                );
         }
 
         if entry.is_dir {
@@ -2645,6 +2735,35 @@ pub(in crate::sidebar) fn render_file_tree_footer(
 /// keycap in the app.
 pub(in crate::sidebar) const FILE_TREE_CONTEXT_MENU_SPEC: &str = "shift+F10";
 pub(in crate::sidebar) const FILE_TREE_RENAME_SPEC: &str = "F2";
+
+/// GitHub issue #148: what a real file-tree row drag carries - every path the gesture moves
+/// (the whole real selection, if the dragged row was already part of one; just that one row
+/// otherwise - see `AdeApp::render_file_tree_row`'s own `.on_drag` for which). Mirrors
+/// `crate::work_surface::render::DraggedTab`'s exact shape (a small `Render`ed chip showing what's
+/// being dragged) for the tab strip's own drag-and-drop, not a second, differently-behaved
+/// mechanism - GPUI's own `on_drag`/`on_drag_move`/`on_drop` triple is the same either way.
+#[derive(Clone)]
+pub(in crate::sidebar) struct TreeDragPayload {
+    pub(in crate::sidebar) paths: Vec<PathBuf>,
+    label: String,
+}
+
+impl gpui::Render for TreeDragPayload {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .opacity(0.85)
+            .px(px(10.0))
+            .py(px(4.0))
+            .rounded(theme::radius::CHIP)
+            .bg(theme::surface::PALETTE)
+            .border_1()
+            .border_color(theme::border::POPOVER)
+            .font(font(theme::font::SANS))
+            .text_size(px(11.0))
+            .text_color(theme::text::BODY)
+            .child(self.label.clone())
+    }
+}
 
 /// The file tree row's `▾`/`▸` caret, signaling a directory row is clickable/expandable,
 /// distinct from the folder icon itself. Blank but still 8px wide for a file row, to keep

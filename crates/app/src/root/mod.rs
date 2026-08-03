@@ -448,6 +448,11 @@ pub struct AdeApp {
     /// The tree's own cut/copy buffer - a real filesystem entry, deliberately not the system
     /// clipboard (see `crate::sidebar::tree_ops::TreeClipboard`).
     pub(crate) tree_clipboard: Option<tree_ops::TreeClipboard>,
+    /// GitHub issue #148: which directory row a real in-progress file-tree drag is currently
+    /// hovering, if any - the drop-target highlight `crate::sidebar::render::AdeApp::
+    /// render_file_tree_row` paints, and the folder `Self::move_paths_into_dir` moves into on a
+    /// real drop. `None` whenever no drag is over the tree at all.
+    pub(crate) tree_drag_hover_target: Option<PathBuf>,
     /// Real, already-applied file-tree operations (delete, rename, cut/paste move) that
     /// `crate::sidebar::tree_ops::AdeApp::undo_tree_op` can reverse, most recent last - the
     /// file-tree's own undo history, distinct from each text field's own `text_history::
