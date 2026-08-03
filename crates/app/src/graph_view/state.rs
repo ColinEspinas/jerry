@@ -3,7 +3,7 @@
 use crate::root::AdeApp;
 use crate::text_history::TextField;
 use crate::theme;
-use gpui::{Bounds, Context, FocusHandle, Pixels, Task};
+use gpui::{Bounds, Context, FocusHandle, Pixels, ScrollHandle, Task};
 use std::collections::HashMap;
 use wt_core::graph::{Graph, GraphScope};
 use wt_core::remote::PushForce;
@@ -113,6 +113,15 @@ pub(crate) struct GraphTabState {
     /// `AdeApp::_worktree_history_task`'s identical one-slot-per-feature pattern. `None` when
     /// [`Self::remote_op_in_flight`] is `false`.
     pub _remote_op_task: Option<Task<()>>,
+    /// GitHub issue #142: the commit row list's own scroll position, tracked so
+    /// `crate::root::scrollbar::AdeApp::render_vertical_scrollbar` has a real handle to draw
+    /// against - every other scrollable region in the app has had one since GitHub issue #30;
+    /// the graph tab shipped after that audit and was never retrofitted.
+    pub rows_scroll_handle: ScrollHandle,
+    /// The Commit panel's own scroll position - see [`Self::rows_scroll_handle`]'s docs.
+    pub commit_panel_scroll_handle: ScrollHandle,
+    /// The Branches panel's own scroll position - see [`Self::rows_scroll_handle`]'s docs.
+    pub branches_scroll_handle: ScrollHandle,
 }
 
 impl GraphTabState {
@@ -134,6 +143,9 @@ impl GraphTabState {
             remote_op_in_flight: false,
             push_force_confirm_armed: None,
             _remote_op_task: None,
+            rows_scroll_handle: ScrollHandle::new(),
+            commit_panel_scroll_handle: ScrollHandle::new(),
+            branches_scroll_handle: ScrollHandle::new(),
         }
     }
 }
