@@ -1206,14 +1206,14 @@ impl AdeApp {
             }))
     }
 
-    /// *Themes* - the six cards from `crate::settings::state::THEME_DEFS`, with persisted selection.
-    /// Selecting a card persists (`Self::settings.theme.name` round-trips through
-    /// `settings.toml`) **and** really re-skins the running app: `crate::theme`'s ~200 colour
-    /// tokens are each a `crate::theme::ColorToken`, resolved against a real, live-selected
-    /// index (`crate::theme::current_theme_index`) rather than a plain compile-time constant -
-    /// see that module's own docs for the runtime mechanism and how the five non-Jerry-Dark
-    /// palettes are derived. `Self::set_theme_name` is the one real place a selection is applied:
-    /// it updates the shared index and forces a real full repaint
+    /// *Themes* - the six cards from `crate::settings::state::THEME_DEFS`, with persisted
+    /// selection. Selecting a card persists (`Self::settings.theme.name` round-trips through
+    /// `settings.toml`) **and** really re-skins the running app: `crate::theme`'s ~270 colour
+    /// tokens are each a `crate::theme::ColorToken`, resolved against the live palette
+    /// `Self::apply_theme_selection` compiles from the selected theme's own file (and everything
+    /// up its `base` chain) rather than against a plain compile-time constant - see that module's
+    /// own docs for the runtime mechanism. `Self::set_theme_name` is the one real place a
+    /// selection is applied: it installs the compiled palette and forces a real full repaint
     /// (`App::refresh_windows`) so every already-rendered surface picks up the new colours on the
     /// very next frame, not just newly-mounted ones.
     pub(in crate::settings) fn render_settings_theme_page(

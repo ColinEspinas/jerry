@@ -244,7 +244,10 @@ const COLOR_KEY_MAP: &[(&str, &[&str])] = &[
         "surface.segment_active",
         &["inputOption.activeBackground", "button.secondaryBackground"],
     ),
-    ("surface.scrim", &["editor.background"]),
+    // `surface.scrim` is deliberately absent: it is a near-black sheet painted at 62% alpha behind
+    // the command palette, and the closest VSCode key (`editor.background`) would make it the same
+    // colour as the window it is supposed to be dimming - a mapping that reads as "the scrim
+    // stopped working". Its derived value keeps the theme's own hue while staying a real dimmer.
     // ---- borders --------------------------------------------------------------------------
     ("border.zone", &["editorGroup.border", "panel.border"]),
     ("border.inner", &["panel.border", "editorGroup.border"]),

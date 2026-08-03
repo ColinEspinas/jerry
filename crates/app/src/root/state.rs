@@ -235,7 +235,6 @@ impl AdeApp {
             tree_drag_hover_target: None,
             tree_undo_stack: Vec::new(),
             tree_redo_stack: Vec::new(),
-            tree_undo_backup_counter: 0,
             tree_op_error: None,
             tree_focus_handle,
             file_tree_bounds: gpui::Bounds::default(),

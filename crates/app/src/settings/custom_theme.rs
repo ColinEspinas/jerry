@@ -634,22 +634,31 @@ fn write_theme_toml(file: &CustomThemeFile) -> String {
         out.push_str(&format!("preview = [{}]\n", entries.join(", ")));
     }
 
-    let mut current_table: Option<&str> = None;
+    // Grouped by table, each table emitted exactly once, in first-appearance order. Grouping here
+    // rather than trusting the caller to have ordered its entries is what makes this function
+    // total: TOML rejects a table header that appears twice, so an unordered `overrides` vec would
+    // otherwise produce a file this module could not read back.
+    let mut tables: Vec<(&str, Vec<(&str, &str)>)> = Vec::new();
     for (key, value) in &file.overrides {
         let (table, entry) = key.split_once('.').unwrap_or((key.as_str(), ""));
-        if current_table != Some(table) {
-            out.push_str(&format!("\n[{table}]\n"));
-            current_table = Some(table);
+        match tables.iter_mut().find(|(name, _)| *name == table) {
+            Some((_, entries)) => entries.push((entry, value.as_str())),
+            None => tables.push((table, vec![(entry, value.as_str())])),
         }
-        // A pair/array token's own key contains a dot (`sonnet.fg`, `lanes.0`), which TOML reads
-        // as a nested table unless it's quoted - so quote exactly those. Everything else stays a
-        // plain bare key, which is what makes a generated file pleasant to hand-edit.
-        let entry_key = if entry.contains('.') {
-            quoted(entry)
-        } else {
-            entry.to_string()
-        };
-        out.push_str(&format!("{entry_key} = {}\n", quoted(value)));
+    }
+    for (table, entries) in tables {
+        out.push_str(&format!("\n[{table}]\n"));
+        for (entry, value) in entries {
+            // A pair/array token's own key contains a dot (`sonnet.fg`, `lanes.0`), which TOML
+            // reads as a nested table unless it's quoted - so quote exactly those. Everything else
+            // stays a plain bare key, which is what makes a generated file pleasant to hand-edit.
+            let entry_key = if entry.contains('.') {
+                quoted(entry)
+            } else {
+                entry.to_string()
+            };
+            out.push_str(&format!("{entry_key} = {}\n", quoted(value)));
+        }
     }
     out
 }
@@ -1175,6 +1184,31 @@ keyword = "#ff79c6"
 
     /// The writer's own escaping is real, not a `format!("{s}")` that would produce a file this
     /// module could never read back.
+    /// The writer groups by table itself rather than trusting its input's ordering - an
+    /// out-of-order entry list must still produce a file TOML (and this module) can read back,
+    /// not one with a duplicate table header.
+    #[test]
+    fn the_writer_groups_tables_even_when_the_entries_arrive_interleaved() {
+        let file = CustomThemeFile {
+            name: "Interleaved".to_string(),
+            subtitle: String::new(),
+            base: None,
+            preview: None,
+            overrides: vec![
+                ("surface.window".to_string(), "#0c0d10".to_string()),
+                ("syntax.keyword".to_string(), "#ff79c6".to_string()),
+                ("surface.card".to_string(), "#181a1e".to_string()),
+                ("syntax.string".to_string(), "#f1fa8c".to_string()),
+            ],
+        };
+        let text = write_theme_toml(&file);
+        assert_eq!(text.matches("[surface]").count(), 1, "got:\n{text}");
+        assert_eq!(text.matches("[syntax]").count(), 1, "got:\n{text}");
+        let reparsed = parse_theme_file_str(&text).expect("must re-parse");
+        assert_eq!(reparsed.overrides.len(), 4);
+        assert_eq!(reparsed.overrides["surface.card"], rgba(0x181a1e));
+    }
+
     #[test]
     fn a_name_containing_quotes_round_trips_through_the_writer() {
         let mut theme = valid_file().validate().expect("should validate");

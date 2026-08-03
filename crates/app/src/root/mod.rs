@@ -466,10 +466,6 @@ pub struct AdeApp {
     /// tree_ops::AdeApp::redo_tree_op`'s own source. Cleared by the next real (non-undo/redo)
     /// tree operation, same as every other undo/redo stack in this app.
     pub(crate) tree_redo_stack: Vec<tree_ops::TreeUndoEntry>,
-    /// Monotonic counter naming each delete's backup file/dir under [`Self::tree_undo_backup_root`],
-    /// guaranteeing two deletes of same-named files never collide there, without pulling in a
-    /// UUID dependency for something this local.
-    pub(crate) tree_undo_backup_counter: u64,
     /// The most recent file-operation failure (a refused rename, a failed trash command),
     /// surfaced under the tree rather than dropped into the log - the same small, honest error
     /// surface [`Self::file_save_error`] uses for a failed save.
