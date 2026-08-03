@@ -1,12 +1,11 @@
 use super::*;
 use crate::keymap;
 use crate::root::widgets::{
-    hover_bg, render_keycap_row, render_menu_group_divider, render_sidebar_message,
-    render_tag_pill, text_tooltip, KeycapSize,
+    hover_bg, menu_popover_chrome, render_keycap_row, render_menu_group_divider,
+    render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
 };
 use crate::settings::widgets::ChoiceOption;
 use crate::worktree_history::flow as worktree_history;
-use gpui::BoxShadow;
 
 impl AdeApp {
     /// Switches which data source the right sidebar shows. Switching *to* the Changes view
@@ -2149,7 +2148,6 @@ impl AdeApp {
     /// `work_surface::state::ActionKind::Unimplemented` convention this codebase already uses for
     /// "visible, real, but not wired up yet" (never a clickable-looking no-op).
     fn render_commit_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (shadow_x, shadow_y, shadow_blur) = theme::shadow::COMMIT_MENU;
         let branch = self
             .worktrees
             .iter()
@@ -2188,57 +2186,54 @@ impl AdeApp {
                 cx.notify();
             }))
             .child(
-                div()
-                    .id("commit-menu-popover")
-                    .debug_selector(|| "commit-menu-popover".to_string())
-                    .absolute()
-                    .left(px(12.0))
-                    .right(px(12.0))
-                    .bottom(px(44.0))
-                    // The composer itself is short (~135px of header/message-box/button-row),
-                    // shorter than this four-row popover (`bottom(px(44.0))` plus its own real
-                    // painted height) - so the popover's *top* genuinely paints above the
-                    // composer's own top edge, over the Changes rows behind it, which is outside
-                    // the scrim's own bounds (`top(0)/bottom(0)` relative to the composer, not
-                    // the whole sidebar - see this fn's own docs on the scrim being "confined to
-                    // the composer's own bounds"). Without its own `.occlude()` here, a click in
-                    // that overflow region only avoids reaching a real Changes row underneath by
-                    // relying on `Window::dispatch_mouse_event`'s bubble-phase registration
-                    // order happening to run this popover's own `stop_propagation` listener
-                    // first - a coincidence of paint order, not a structural guarantee. This
-                    // makes the block real regardless of ordering, the same reasoning as the
-                    // scrim's own `.occlude()` above.
-                    .occlude()
-                    .py(px(4.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::CARD)
-                    .shadow(vec![BoxShadow::new(
-                        shadow_x,
-                        shadow_y,
-                        gpui::black().opacity(0.5),
-                    )
-                    .blur_radius(shadow_blur)])
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }))
-                    .child(render_commit_menu_row(
-                        "Commit and push",
-                        format!("origin/{branch}"),
-                    ))
-                    .child(render_commit_menu_row(
-                        "Commit all files",
-                        format!("stages the rest first \u{2022} {total} total"),
-                    ))
-                    .child(render_commit_menu_row(
-                        "Amend last commit",
-                        "rewrites the tip".to_string(),
-                    ))
-                    .child(render_commit_menu_row(
-                        "Stash staged files",
-                        "keeps the worktree clean".to_string(),
-                    )),
+                menu_popover_chrome(
+                    div()
+                        .id("commit-menu-popover")
+                        .debug_selector(|| "commit-menu-popover".to_string())
+                        .absolute()
+                        .left(px(12.0))
+                        .right(px(12.0))
+                        .bottom(px(44.0))
+                        // The composer itself is short (~135px of header/message-box/button-row),
+                        // shorter than this four-row popover (`bottom(px(44.0))` plus its own
+                        // real painted height) - so the popover's *top* genuinely paints above
+                        // the composer's own top edge, over the Changes rows behind it, which is
+                        // outside the scrim's own bounds (`top(0)/bottom(0)` relative to the
+                        // composer, not the whole sidebar - see this fn's own docs on the scrim
+                        // being "confined to the composer's own bounds"). Without its own
+                        // `.occlude()` here, a click in that overflow region only avoids reaching
+                        // a real Changes row underneath by relying on `Window::
+                        // dispatch_mouse_event`'s bubble-phase registration order happening to
+                        // run this popover's own `stop_propagation` listener first - a
+                        // coincidence of paint order, not a structural guarantee. This makes the
+                        // block real regardless of ordering, the same reasoning as the scrim's
+                        // own `.occlude()` above.
+                        .occlude()
+                        .py(px(4.0)),
+                    // `COMMIT_MENU`, not `MENU`: same blur/alpha as every other menu (GitHub
+                    // issue #129), just a negative `y` for this popover's own upward-opening
+                    // direction - see that constant's own docs.
+                    theme::shadow::COMMIT_MENU,
+                )
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .child(render_commit_menu_row(
+                    "Commit and push",
+                    format!("origin/{branch}"),
+                ))
+                .child(render_commit_menu_row(
+                    "Commit all files",
+                    format!("stages the rest first \u{2022} {total} total"),
+                ))
+                .child(render_commit_menu_row(
+                    "Amend last commit",
+                    "rewrites the tip".to_string(),
+                ))
+                .child(render_commit_menu_row(
+                    "Stash staged files",
+                    "keeps the worktree clean".to_string(),
+                )),
             )
     }
 }
@@ -2358,7 +2353,6 @@ impl AdeApp {
     pub(crate) fn render_tree_context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let menu = self.tree_context_menu.clone();
         let macos = self.window_controls_style().is_macos();
-        let (shadow_x, shadow_y, shadow_blur) = theme::shadow::PLUS_MENU;
         let rows = menu
             .as_ref()
             .map(|menu| context_menu::menu_rows(&menu.target, self.tree_clipboard.is_some()))
@@ -2394,39 +2388,33 @@ impl AdeApp {
                 }),
             )
             .child(
-                div()
-                    .id("tree-context-menu")
-                    .debug_selector(|| "tree-context-menu".to_string())
-                    .absolute()
-                    .left(px(origin_x))
-                    // `origin_y` is window-space (it is clamped against `Window::bounds()`, from
-                    // a window-space `MouseDownEvent::position`), but this panel is positioned
-                    // relative to the scrim - which starts at `theme::band::TITLE_BAR`, not at
-                    // the window top. Without this subtraction the menu paints a whole title bar
-                    // too low. `context_menu_paints_at_its_clamped_window_space_origin` is the
-                    // assertion that keeps the two in step.
-                    .top(px(origin_y) - theme::band::TITLE_BAR)
-                    .w(px(context_menu::MENU_WIDTH))
-                    .py(px(context_menu::MENU_VERTICAL_PADDING / 2.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::CARD)
-                    .shadow(vec![gpui::BoxShadow::new(
-                        shadow_x,
-                        shadow_y,
-                        gpui::black().opacity(0.55),
-                    )
-                    .blur_radius(shadow_blur)])
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }))
-                    .children(rows.into_iter().map(|row| match row {
-                        context_menu::MenuRow::Item(item) => {
-                            self.render_tree_context_menu_row(item, macos, cx)
-                        }
-                        context_menu::MenuRow::Separator => render_menu_group_divider(),
-                    })),
+                menu_popover_chrome(
+                    div()
+                        .id("tree-context-menu")
+                        .debug_selector(|| "tree-context-menu".to_string())
+                        .absolute()
+                        .left(px(origin_x))
+                        // `origin_y` is window-space (it is clamped against `Window::bounds()`,
+                        // from a window-space `MouseDownEvent::position`), but this panel is
+                        // positioned relative to the scrim - which starts at
+                        // `theme::band::TITLE_BAR`, not at the window top. Without this
+                        // subtraction the menu paints a whole title bar too low.
+                        // `context_menu_paints_at_its_clamped_window_space_origin` is the
+                        // assertion that keeps the two in step.
+                        .top(px(origin_y) - theme::band::TITLE_BAR)
+                        .w(px(context_menu::MENU_WIDTH))
+                        .py(px(context_menu::MENU_VERTICAL_PADDING / 2.0)),
+                    theme::shadow::MENU,
+                )
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .children(rows.into_iter().map(|row| match row {
+                    context_menu::MenuRow::Item(item) => {
+                        self.render_tree_context_menu_row(item, macos, cx)
+                    }
+                    context_menu::MenuRow::Separator => render_menu_group_divider(),
+                })),
             )
     }
 
@@ -2448,7 +2436,7 @@ impl AdeApp {
     ///
     /// - **hover fill** was `theme::surface::ROW_HOVER` (`#15181b`) - the *exact* hex of
     ///   `theme::surface::PALETTE`, this panel's own background - so hovering a row painted
-    ///   nothing at all. `theme::surface::PLUS_MENU_ROW_HOVER` (`#1d2226`) is the token that
+    ///   nothing at all. `theme::surface::MENU_ROW_HOVER` (`#1d2226`) is the token that
     ///   exists for this; `theme::palette::ROW_HOVER`'s own docs record the identical trap for
     ///   the palette's rows.
     /// - **label colour and size** were `theme::text::BODY` at 11.0px, against the dropdown row's
@@ -2503,7 +2491,7 @@ impl AdeApp {
         if item.enabled {
             row = row
                 .cursor_pointer()
-                .hover(|el| el.bg(theme::surface::PLUS_MENU_ROW_HOVER))
+                .hover(|el| el.bg(theme::surface::MENU_ROW_HOVER))
                 .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                     cx.stop_propagation();
                     this.run_tree_menu_action(action, window, cx);

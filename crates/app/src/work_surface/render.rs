@@ -1,7 +1,7 @@
 use super::*;
 use crate::root::widgets::{
-    hover_bg, render_action_keycap_row, render_env_chip, render_hint_pair, render_keycap_row,
-    text_tooltip, KeycapSize,
+    hover_bg, menu_popover_chrome, render_action_keycap_row, render_env_chip, render_hint_pair,
+    render_keycap_row, text_tooltip, KeycapSize,
 };
 use gpui::{Animation, AnimationExt, DragMoveEvent};
 use std::time::Duration;
@@ -1130,7 +1130,6 @@ impl AdeApp {
     pub(crate) fn render_plus_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let macos = self.window_controls_style().is_macos();
         let bounds = self.plus_button_bounds;
-        let (shadow_x, shadow_y, shadow_blur) = theme::shadow::PLUS_MENU;
 
         let resolved_kind = self.resolved_new_agent_kind();
         let (agent_fg, agent_bg) = work_surface::agent_tint(resolved_kind);
@@ -1155,120 +1154,113 @@ impl AdeApp {
                 cx.notify();
             }))
             .child(
-                div()
-                    .id("plus-menu-popover")
-                    .absolute()
-                    .left(bounds.origin.x + px(2.0))
-                    .top(bounds.origin.y + bounds.size.height)
-                    .w(theme::zone::PLUS_MENU_WIDTH)
-                    .py(px(4.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::CARD)
-                    .shadow(vec![BoxShadow::new(
-                        shadow_x,
-                        shadow_y,
-                        gpui::black().opacity(0.55),
+                menu_popover_chrome(
+                    div()
+                        .id("plus-menu-popover")
+                        .absolute()
+                        .left(bounds.origin.x + px(2.0))
+                        .top(bounds.origin.y + bounds.size.height)
+                        .w(theme::zone::PLUS_MENU_WIDTH)
+                        .py(px(4.0)),
+                    theme::shadow::MENU,
+                )
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{276f}",
+                        theme::text::DIM.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "New terminal",
+                        "in this worktree".to_string(),
+                        keymap::resolve_combo("ctrl+shift+T", macos),
+                        true,
                     )
-                    .blur_radius(shadow_blur)])
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }))
-                    .child(
-                        render_dropdown_menu_row(
-                            "\u{276f}",
-                            theme::text::DIM.into(),
-                            theme::surface::CHIP_NEUTRAL.into(),
-                            "New terminal",
-                            "in this worktree".to_string(),
-                            keymap::resolve_combo("ctrl+shift+T", macos),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, window, cx| {
-                                this.new_agent(AgentKind::Shell, window, cx);
-                                this.plus_menu_open = false;
-                                cx.notify();
-                            },
-                        )),
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, window, cx| {
+                            this.new_agent(AgentKind::Shell, window, cx);
+                            this.plus_menu_open = false;
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        agent_initial,
+                        agent_fg,
+                        agent_bg,
+                        "New agent",
+                        new_agent_secondary,
+                        keymap::resolve_combo("mod+shift+N", macos),
+                        true,
                     )
-                    .child(
-                        render_dropdown_menu_row(
-                            agent_initial,
-                            agent_fg,
-                            agent_bg,
-                            "New agent",
-                            new_agent_secondary,
-                            keymap::resolve_combo("mod+shift+N", macos),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, _window, cx| {
-                                this.new_agent_pane(cx);
-                                this.plus_menu_open = false;
-                                cx.notify();
-                            },
-                        )),
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, _window, cx| {
+                            this.new_agent_pane(cx);
+                            this.plus_menu_open = false;
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2325}",
+                        theme::graph::TAB_CHIP_FG.into(),
+                        theme::graph::TAB_CHIP_BG.into(),
+                        "Git graph",
+                        "commit history".to_string(),
+                        keymap::resolve_combo("mod+shift+G", macos),
+                        true,
                     )
-                    .child(
-                        render_dropdown_menu_row(
-                            "\u{2325}",
-                            theme::graph::TAB_CHIP_FG.into(),
-                            theme::graph::TAB_CHIP_BG.into(),
-                            "Git graph",
-                            "commit history".to_string(),
-                            keymap::resolve_combo("mod+shift+G", macos),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, window, cx| {
-                                this.plus_menu_open = false;
-                                this.open_git_graph(window, cx);
-                            },
-                        )),
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, window, cx| {
+                            this.plus_menu_open = false;
+                            this.open_git_graph(window, cx);
+                        },
+                    )),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "@",
+                        theme::palette::COMMAND_CHIP.0.into(),
+                        theme::palette::COMMAND_CHIP.1.into(),
+                        "Open file\u{2026}",
+                        "search this worktree".to_string(),
+                        // No keycap: this row has no global keybinding (see the function
+                        // docs above), and `render_keycap_row` renders nothing for `&[]`.
+                        Vec::new(),
+                        true,
                     )
-                    .child(
-                        render_dropdown_menu_row(
-                            "@",
-                            theme::palette::COMMAND_CHIP.0.into(),
-                            theme::palette::COMMAND_CHIP.1.into(),
-                            "Open file\u{2026}",
-                            "search this worktree".to_string(),
-                            // No keycap: this row has no global keybinding (see the function
-                            // docs above), and `render_keycap_row` renders nothing for `&[]`.
-                            Vec::new(),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, window, cx| {
-                                this.plus_menu_open = false;
-                                this.open_palette(window, cx);
-                                // `open_palette` always resets `palette_scope` to
-                                // `PaletteScope::default()`, so this must be set after it
-                                // returns, not before.
-                                this.palette_scope = palette::PaletteScope::Files;
-                                cx.notify();
-                            },
-                        )),
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, window, cx| {
+                            this.plus_menu_open = false;
+                            this.open_palette(window, cx);
+                            // `open_palette` always resets `palette_scope` to
+                            // `PaletteScope::default()`, so this must be set after it
+                            // returns, not before.
+                            this.palette_scope = palette::PaletteScope::Files;
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "]",
+                        theme::text::DIM.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Next changed file",
+                        format!("{changed_count} changed"),
+                        keymap::resolve_combo("]", macos),
+                        true,
                     )
-                    .child(
-                        render_dropdown_menu_row(
-                            "]",
-                            theme::text::DIM.into(),
-                            theme::surface::CHIP_NEUTRAL.into(),
-                            "Next changed file",
-                            format!("{changed_count} changed"),
-                            keymap::resolve_combo("]", macos),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, window, cx| {
-                                this.plus_menu_open = false;
-                                this.next_changed_file(window, cx);
-                            },
-                        )),
-                    ),
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, window, cx| {
+                            this.plus_menu_open = false;
+                            this.next_changed_file(window, cx);
+                        },
+                    )),
+                ),
             )
     }
 
@@ -2299,7 +2291,7 @@ pub(crate) fn render_dropdown_menu_row(
         .px(px(10.0));
     row = if enabled {
         row.cursor_pointer()
-            .hover(|el| el.bg(theme::surface::PLUS_MENU_ROW_HOVER))
+            .hover(|el| el.bg(theme::surface::MENU_ROW_HOVER))
     } else {
         row.cursor_default()
     };

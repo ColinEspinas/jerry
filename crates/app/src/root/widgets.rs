@@ -231,6 +231,42 @@ pub(crate) fn hover_keycap_row<E: InteractiveElement + Styled>(el: E) -> E {
         .hover(|style| style.bg(theme::surface::ROW_HOVER_ALT))
 }
 
+/// The one real "floating dropdown/context-menu" chrome - background, border, radius, shadow -
+/// every menu popover in the app now builds on (GitHub issue #129): the `+` menu, the title bar
+/// menu, the file tree's context menu, the git graph's push/row menus, and the commit composer's
+/// split-button menu. Before this, each of those six popovers hand-wrote the same five style
+/// calls (`.bg(surface::PALETTE).border_1().border_color(border::POPOVER).rounded(radius::CARD)
+/// .shadow(...)`) independently - real, live-caught drift (a follow-up audit found the commit
+/// menu's own shadow had quietly drifted to a different blur/alpha with no real reason for the
+/// difference) is exactly the failure mode a shared function, not a shared *value*, closes: a
+/// seventh menu written by copying an existing one still risks copying a stale variant, but a
+/// seventh menu built on this function can't drift from the other six at all.
+///
+/// `shadow` is the one real parameter, not a second flavor to copy-paste around: every popover
+/// shares the same blur/alpha (`0.55`) inside [`theme::shadow::MENU`]/[`theme::shadow::COMMIT_MENU`],
+/// and only the `y` offset's sign genuinely differs, for the commit menu's own upward-opening
+/// direction (see that constant's own docs).
+///
+/// Deliberately not used by the command palette (kept its own distinct chrome on purpose - GitHub
+/// issue #129's own scope) or the LSP completion popup/hover card/plain tooltips (a real, mockup-
+/// verified different recipe - see `crate::lsp::completion_popup`'s own module docs for why).
+pub(crate) fn menu_popover_chrome<E: InteractiveElement + Styled>(
+    el: E,
+    shadow: (Pixels, Pixels, Pixels),
+) -> E {
+    let (shadow_x, shadow_y, shadow_blur) = shadow;
+    el.bg(theme::surface::PALETTE)
+        .border_1()
+        .border_color(theme::border::POPOVER)
+        .rounded(theme::radius::CARD)
+        .shadow(vec![gpui::BoxShadow::new(
+            shadow_x,
+            shadow_y,
+            gpui::black().opacity(0.55),
+        )
+        .blur_radius(shadow_blur)])
+}
+
 /// A plain, real GPUI tooltip view - just the given text, styled to match this app's other
 /// small popovers (`theme::surface::POPOVER`/`theme::border::POPOVER`, the same tokens
 /// `lsp::completion_popup`'s own completion popup uses). Backs [`text_tooltip`]; see that function's
