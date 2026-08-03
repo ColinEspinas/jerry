@@ -1056,7 +1056,8 @@ impl AdeApp {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            .track_scroll(&self.graph_state.rows_scroll_handle);
         for (index, row) in graph.rows.iter().enumerate() {
             list = list.child(self.render_graph_row(index, row, graph.lane_count, now, cx));
         }
@@ -1075,7 +1076,21 @@ impl AdeApp {
                     )),
             );
         }
-        list.into_any_element()
+        // GitHub issue #142.
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(list)
+            .children(self.render_vertical_scrollbar(
+                "graph-rows-scrollbar",
+                &self.graph_state.rows_scroll_handle,
+                &[],
+                cx,
+            ))
+            .into_any_element()
     }
 
     /// One row: lane canvas 100 · ref chips · subject (flex) · author 88 · relative time 40
@@ -1521,13 +1536,14 @@ impl AdeApp {
                 .into_any_element(),
         };
 
-        div()
+        let panel = div()
             .id("graph-commit-panel")
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(&self.graph_state.commit_panel_scroll_handle)
             .px(px(12.0))
             .py(px(10.0))
             .gap(px(8.0))
@@ -1602,7 +1618,20 @@ impl AdeApp {
                             }
                         })),
                     ),
-            )
+            );
+        // GitHub issue #142.
+        div()
+            .relative()
+            .flex()
+            .flex_1()
+            .min_h_0()
+            .child(panel)
+            .children(self.render_vertical_scrollbar(
+                "graph-commit-panel-scrollbar",
+                &self.graph_state.commit_panel_scroll_handle,
+                &[],
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -1637,15 +1666,30 @@ impl AdeApp {
             .child(self.render_graph_branches_filter_row(branches.len(), cx))
             .child(
                 div()
-                    .id("graph-branches-list")
+                    .relative()
                     .flex()
-                    .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .children(branches.into_iter().map(|(name, kind, is_head, lane)| {
-                        render_graph_branch_row(name, kind, is_head, lane)
-                    })),
+                    .child(
+                        div()
+                            .id("graph-branches-list")
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.graph_state.branches_scroll_handle)
+                            .children(branches.into_iter().map(|(name, kind, is_head, lane)| {
+                                render_graph_branch_row(name, kind, is_head, lane)
+                            })),
+                    )
+                    // GitHub issue #142.
+                    .children(self.render_vertical_scrollbar(
+                        "graph-branches-scrollbar",
+                        &self.graph_state.branches_scroll_handle,
+                        &[],
+                        cx,
+                    )),
             )
             .into_any_element()
     }
