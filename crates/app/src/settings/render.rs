@@ -1,5 +1,5 @@
 use super::*;
-use crate::root::widgets::{render_env_chip, render_keycap_row, KeycapSize};
+use crate::root::widgets::{hover_keycap_row, render_env_chip, render_keycap_row, KeycapSize};
 use crate::settings::widgets::ChoiceOption;
 
 impl AdeApp {
@@ -169,14 +169,8 @@ impl AdeApp {
                             .child("Settings"),
                     )
                     .child(
-                        div()
-                            .id("settings-close")
-                            .cursor_pointer()
-                            .rounded(theme::radius::CHIP)
-                            // GitHub issue #128 - same treatment as
-                            // `crate::status_bar::render::AdeApp::render_status_palette_hint`,
-                            // the app's other clickable keycap row.
-                            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                        // GitHub issue #128.
+                        hover_keycap_row(div().id("settings-close").cursor_pointer())
                             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                                 this.close_settings(window, cx);
                             }))

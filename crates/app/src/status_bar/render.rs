@@ -1,5 +1,7 @@
 use super::*;
-use crate::root::widgets::{render_env_chip, render_keycap_row, text_tooltip, KeycapSize};
+use crate::root::widgets::{
+    hover_keycap_row, render_env_chip, render_keycap_row, text_tooltip, KeycapSize,
+};
 
 /// The 28px status bar (`CHANGELOG.md`'s change 7 - height 26 -> 28, gap 12 -> 9, every value
 /// 10px mono), rebuilt from the old single `8 agents · 2 waiting · …` summary string into a
@@ -436,12 +438,8 @@ impl AdeApp {
     /// The `⌘P commands` hint: clicking it (or pressing the bound `secondary-p` - see
     /// [`TogglePalette`]) opens the command palette.
     fn render_status_palette_hint(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("status-bar-open-palette")
-            .cursor_pointer()
-            .rounded(theme::radius::CHIP)
-            // GitHub issue #128.
-            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+        // GitHub issue #128.
+        hover_keycap_row(div().id("status-bar-open-palette").cursor_pointer())
             .flex()
             .items_center()
             .gap(px(6.0))

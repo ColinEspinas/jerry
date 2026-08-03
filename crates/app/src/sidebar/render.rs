@@ -1,8 +1,8 @@
 use super::*;
 use crate::keymap;
 use crate::root::widgets::{
-    render_keycap_row, render_menu_group_divider, render_sidebar_message, render_tag_pill,
-    text_tooltip, KeycapSize,
+    hover_bg, render_keycap_row, render_menu_group_divider, render_sidebar_message,
+    render_tag_pill, text_tooltip, KeycapSize,
 };
 use crate::settings::widgets::ChoiceOption;
 use crate::worktree_history::flow as worktree_history;
@@ -330,7 +330,8 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         let (_, message) = self.staging_error.clone()?;
-        Some(
+        // GitHub issue #128.
+        let row = hover_bg(
             div()
                 .id("staging-error")
                 .debug_selector(|| "staging-error".to_string())
@@ -341,10 +342,11 @@ impl AdeApp {
                 .font(font(theme::font::MONO))
                 .text_size(self.ui_text_size(10.0))
                 .text_color(theme::status::FAIL)
-                .cursor_pointer()
-                // GitHub issue #128.
-                .hover(|el| el.bg(theme::surface::ROW_HOVER))
-                .tooltip(text_tooltip("Click to dismiss"))
+                .cursor_pointer(),
+            theme::surface::ROW_HOVER,
+        );
+        Some(
+            row.tooltip(text_tooltip("Click to dismiss"))
                 .child(message)
                 .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                     this.staging_error = None;
@@ -710,7 +712,8 @@ impl AdeApp {
         // The real, honest surface for a failed file operation (a refused rename, a trash
         // command that didn't run) - next to the tree it happened in, not buried in the log.
         if let Some(error) = self.tree_op_error.clone() {
-            column = column.child(
+            // GitHub issue #128.
+            let row = hover_bg(
                 div()
                     .id("file-tree-op-error")
                     .debug_selector(|| "file-tree-op-error".to_string())
@@ -721,10 +724,11 @@ impl AdeApp {
                     .font(font(theme::font::MONO))
                     .text_size(self.ui_text_size(10.0))
                     .text_color(theme::status::FAIL)
-                    .cursor_pointer()
-                    // GitHub issue #128.
-                    .hover(|el| el.bg(theme::surface::ROW_HOVER))
-                    .tooltip(text_tooltip("Click to dismiss"))
+                    .cursor_pointer(),
+                theme::surface::ROW_HOVER,
+            );
+            column = column.child(
+                row.tooltip(text_tooltip("Click to dismiss"))
                     .child(error)
                     .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                         this.tree_op_error = None;

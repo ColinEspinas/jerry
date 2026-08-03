@@ -207,6 +207,30 @@ fn render_action_keycap(
         .child(label.into())
 }
 
+/// This app's standard clickable-row hover fill - just `.hover(|el| el.bg(fill))`. GitHub issue
+/// #128 found eight rows across six files that each needed this and had each reimplemented the
+/// same one-line wiring independently (several not at all, which was the bug); a single generic
+/// helper is what keeps that from drifting apart again the way GitHub issue #129 later had to
+/// clean up for a different set of copy-pasted tokens (menu bg/border/radius/shadow) - see that
+/// issue's own `theme.rs` docs for the sibling problem. For a row that only wants this while some
+/// condition holds (e.g. "not already the active tab"), wrap the call in the builder's own
+/// `.when(cond, |el| hover_bg(el, fill))` rather than adding a second flag here - `.when` is
+/// already this crate's one real "conditionally apply a transform" idiom.
+pub(crate) fn hover_bg<E: InteractiveElement>(el: E, fill: impl Into<gpui::Fill>) -> E {
+    let fill = fill.into();
+    el.hover(move |style| style.bg(fill))
+}
+
+/// This app's "clickable keycap row" hover shape - a rounded chip-style fill, used by every
+/// plain clickable row whose only content is a keycap (or keycap + short label) with no
+/// surrounding padding box of its own: the settings panel's `esc`-to-close row and the status
+/// bar's "commands / ⌘P" hint. See [`hover_bg`]'s own docs for why this is a shared helper
+/// rather than copy-pasted per call site.
+pub(crate) fn hover_keycap_row<E: InteractiveElement + Styled>(el: E) -> E {
+    el.rounded(theme::radius::CHIP)
+        .hover(|style| style.bg(theme::surface::ROW_HOVER_ALT))
+}
+
 /// A plain, real GPUI tooltip view - just the given text, styled to match this app's other
 /// small popovers (`theme::surface::POPOVER`/`theme::border::POPOVER`, the same tokens
 /// `lsp::completion_popup`'s own completion popup uses). Backs [`text_tooltip`]; see that function's
