@@ -342,6 +342,8 @@ impl AdeApp {
                 .text_size(self.ui_text_size(10.0))
                 .text_color(theme::status::FAIL)
                 .cursor_pointer()
+                // GitHub issue #128.
+                .hover(|el| el.bg(theme::surface::ROW_HOVER))
                 .tooltip(text_tooltip("Click to dismiss"))
                 .child(message)
                 .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
@@ -720,6 +722,8 @@ impl AdeApp {
                     .text_size(self.ui_text_size(10.0))
                     .text_color(theme::status::FAIL)
                     .cursor_pointer()
+                    // GitHub issue #128.
+                    .hover(|el| el.bg(theme::surface::ROW_HOVER))
                     .tooltip(text_tooltip("Click to dismiss"))
                     .child(error)
                     .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
@@ -2239,6 +2243,13 @@ impl AdeApp {
 /// leading chip (unlike `crate::work_surface::render::render_dropdown_menu_row`, which this
 /// deliberately doesn't reuse: the design has no per-row glyph here). Always dimmed and
 /// non-interactive - see [`AdeApp::render_commit_menu`]'s own docs for why.
+///
+/// Deliberately no `.hover()` - `crate::work_surface::render::AdeApp::render_footer_action`'s own
+/// docs already establish this codebase's rule for an unimplemented action: never a clickable-
+/// looking no-op. The real gap GitHub issue #128 found wasn't a missing hover, it was that
+/// nothing dimmed the row enough to read as disabled *without* one - the `.opacity()` below is
+/// that fix, at the same whole-row grain `crate::graph_view::render`'s dashed elbow segments use
+/// for an analogous "still real, just visually de-emphasized" treatment.
 fn render_commit_menu_row(label: &'static str, sub: String) -> impl IntoElement {
     div()
         .id(format!("commit-menu-row-{label}"))
@@ -2249,6 +2260,7 @@ fn render_commit_menu_row(label: &'static str, sub: String) -> impl IntoElement 
         .px(px(10.0))
         .py(px(5.0))
         .cursor_default()
+        .opacity(0.5)
         .child(
             div()
                 .font(font(theme::font::SANS))

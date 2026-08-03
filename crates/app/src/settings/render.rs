@@ -172,6 +172,11 @@ impl AdeApp {
                         div()
                             .id("settings-close")
                             .cursor_pointer()
+                            .rounded(theme::radius::CHIP)
+                            // GitHub issue #128 - same treatment as
+                            // `crate::status_bar::render::AdeApp::render_status_palette_hint`,
+                            // the app's other clickable keycap row.
+                            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
                             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                                 this.close_settings(window, cx);
                             }))
@@ -1156,6 +1161,11 @@ impl AdeApp {
                 theme::settings::CARD_SELECTED_BG
             } else {
                 theme::settings::CARD_UNSELECTED_BG
+            })
+            // GitHub issue #128 - matches `Self::render_theme_card`'s own identical hover, the
+            // adjacent card widget this one is otherwise styled just like.
+            .when(!is_selected, |el| {
+                el.hover(|el| el.border_color(theme::settings::THEME_CARD_HOVER_BORDER))
             })
             .px(px(10.0))
             .py(px(9.0))

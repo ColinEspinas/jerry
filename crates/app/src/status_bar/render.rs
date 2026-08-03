@@ -439,6 +439,9 @@ impl AdeApp {
         div()
             .id("status-bar-open-palette")
             .cursor_pointer()
+            .rounded(theme::radius::CHIP)
+            // GitHub issue #128.
+            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
             .flex()
             .items_center()
             .gap(px(6.0))
