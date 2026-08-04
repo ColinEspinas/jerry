@@ -110,48 +110,95 @@ const PREVIEW_KEYS: [&str; 5] = [
     "status.run",
 ];
 
-/// The two keys the readability floor compares - the window background and the card/panel surface
-/// that sits directly on top of it. See [`readability_floor_per_mille`].
-const READABILITY_KEYS: (&str, &str) = ("surface.window", "surface.card");
-
-/// Standard ITU-R BT.709 luma weighting - the same "how bright does this actually look" mix most
-/// contrast-ratio formulas use, not a naive `(r+g+b)/3` average that would treat blue as visually
-/// as bright as green. Scaled to a per-mille (0-1000) `u32` rather than left as a bare `f64` so
-/// [`ThemeFileError::LowReadability`] can stay `#[derive(Eq)]` like every other variant (bare
-/// `f64` cannot implement `Eq`), and so tests compare exact integers instead of float epsilons.
-fn relative_luma_per_mille(color: Rgba) -> u32 {
-    let luma = 0.2126 * color.r as f64 + 0.7152 * color.g as f64 + 0.0722 * color.b as f64;
-    (luma * 1000.0).round() as u32
-}
-
-/// The real, concrete readability signal this module checks: how far apart the window background
-/// and the card surface painted on top of it actually look, in perceptual brightness. A card that
-/// is barely distinguishable from the window behind it (or identical to it) is unreadable
-/// regardless of what any accent colour is. `u32::abs_diff` rather than signed subtraction since a
-/// lighter-card-on-dark-background theme and a darker-card-on-light-background theme (e.g.
-/// "Paper") are equally valid - only the magnitude matters, not its sign.
-fn readability_delta_per_mille(window: Rgba, card: Rgba) -> u32 {
-    relative_luma_per_mille(window).abs_diff(relative_luma_per_mille(card))
-}
-
-/// The minimum real window-vs-card luma difference [`CustomThemeFile::validate`] requires before
-/// accepting any theme - half of Jerry Dark's own real shipped contrast, read straight off the
-/// two [`READABILITY_KEYS`] tokens' compiled defaults (no `THEME_DEFS` access at all, so this is
-/// safe to call from anywhere, including code reachable from that `LazyLock`'s own initializer -
-/// a real, reproduced reentrancy hang in this module's history).
+/// The real text/background pairs a theme has to keep legible, checked against its own fully
+/// compiled palette by [`check_palette_readability`]. Each entry is
+/// `(what, foreground key, background key)`.
 ///
-/// Half, not the full baseline, so this is a real but generous floor: every bundled theme clears
-/// it with room to spare while it still catches the concrete unreadable-theme case it exists for -
-/// a hand-authored `surface.card` that's the same colour as `surface.window`, or a couple of hex
-/// digits off it.
-fn readability_floor_per_mille() -> u32 {
-    let window = theme::token_for_key(READABILITY_KEYS.0)
-        .expect("surface.window is a real registered token")
-        .default;
-    let card = theme::token_for_key(READABILITY_KEYS.1)
-        .expect("surface.card is a real registered token")
-        .default;
-    readability_delta_per_mille(window, card) / 2
+/// These are *text on the surface it is painted on*, which is what actually determines whether a
+/// theme can be read. An earlier version of this check compared two **surfaces** to each other
+/// (`surface.window` against `surface.card`) on the theory that a card indistinguishable from the
+/// window behind it is unusable. That turned out to be a real, user-reported functional bug rather
+/// than a safety net: it rejected Visual Studio Code's own current default theme, Dark Modern, on
+/// import - a theme used by millions - purely because it sets `editor.background` to `#1F1F1F` and
+/// `editorWidget.background` to `#202020`, one hex step apart. That is not an unreadable theme; it
+/// is a deliberate flat-surface design that separates regions with *borders* instead of brightness,
+/// and Jerry renders it perfectly well (`border.card` is its own token). Checking surface-against-
+/// surface encoded one of Jerry Dark's own design choices as a validity rule for everyone else's
+/// themes, which it never should have been.
+const READABILITY_PAIRS: [(&str, &str, &str); 2] = [
+    ("body text", "text.body", "surface.window"),
+    ("code", "syntax.text", "surface.center"),
+];
+
+/// The minimum WCAG 2.x contrast ratio (as an integer hundredth, so
+/// [`ThemeFileError::LowContrast`] can stay `#[derive(Eq)]` - `f64` cannot) a theme's text has to
+/// keep against the surface it is painted on.
+///
+/// `1.6:1` is deliberately far below WCAG's own `4.5:1` "normal text" minimum, and that is a real,
+/// measured choice rather than a shrug. This is a *validity* floor whose only job is to reject a
+/// theme nobody could read at all - text the same colour as its background, or a hair off it - not
+/// an accessibility grade. Setting it near WCAG's number would reject a large fraction of real,
+/// widely used themes (and, for that matter, this app's own `syntax::COMMENT`, deliberately dim at
+/// a measured 3.03:1 in Jerry Dark - see `crate::theme::syntax_contrast_tests`). The real measured
+/// values this floor sits under: every bundled theme clears 5:1 on both pairs, and every VSCode
+/// default theme this crate imports in its own tests clears 8:1 - while identical
+/// foreground/background is exactly `1.0:1` and a couple-of-hex-digits miss lands near `1.1:1`.
+const MIN_CONTRAST_PER_HUNDRED: u32 = 160;
+
+/// WCAG 2.x relative luminance (<https://www.w3.org/TR/WCAG21/#dfn-relative-luminance>), applied
+/// to [`Rgba`]'s own already-`0.0..=1.0` sRGB components - the same formula every standard
+/// contrast checker uses, and the same one `crate::theme::syntax_contrast_tests` measures with.
+fn relative_luminance(color: Rgba) -> f64 {
+    fn channel(component: f32) -> f64 {
+        let component = component as f64;
+        if component <= 0.03928 {
+            component / 12.92
+        } else {
+            ((component + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+}
+
+/// The real WCAG contrast ratio between two colours, as an integer hundredth (so `1.0:1` is `100`
+/// and `21.0:1` is `2100`). Order-independent, matching the standard definition.
+fn contrast_per_hundred(a: Rgba, b: Rgba) -> u32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (higher, lower) = if la > lb { (la, lb) } else { (lb, la) };
+    (((higher + 0.05) / (lower + 0.05)) * 100.0).round() as u32
+}
+
+/// Checks a **fully compiled** palette - the theme's own entries layered over everything up its
+/// real `base` chain - for genuinely unreadable text/background pairs ([`READABILITY_PAIRS`]).
+///
+/// Taking a compiled palette is what makes this honest, and is the reason this check no longer
+/// lives inside [`CustomThemeFile::validate`]. Validation runs for the six built-in theme files
+/// from *inside* [`THEME_DEFS`]'s own `LazyLock` initializer, so anything there that needed to
+/// resolve a `base` by name would deadlock on that same `LazyLock` - which is why the old check
+/// evaluated a theme's own entries over *Jerry Dark's* defaults rather than over what the theme
+/// really resolves to. Moving the check to the two places that genuinely have the whole theme set
+/// ([`load_custom_themes_from_dir`] and [`validate_and_write`]) removes the reentrancy problem
+/// entirely instead of approximating around it: a key this palette doesn't name is now a key that
+/// really does render as `crate::theme::ColorToken::default`, so reading that default here is the
+/// exact truth rather than a stand-in for it.
+pub fn check_palette_readability(palette: &theme::Palette) -> Result<(), ThemeFileError> {
+    let resolved = |key: &str| -> Rgba {
+        let token = theme::token_for_key(key).expect("a real registered token");
+        palette.get(token.key).copied().unwrap_or(token.default)
+    };
+    for (what, foreground, background) in READABILITY_PAIRS {
+        let ratio = contrast_per_hundred(resolved(foreground), resolved(background));
+        if ratio < MIN_CONTRAST_PER_HUNDRED {
+            return Err(ThemeFileError::LowContrast {
+                what,
+                foreground,
+                background,
+                ratio_per_hundred: ratio,
+                floor_per_hundred: MIN_CONTRAST_PER_HUNDRED,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// One theme file's real, parsed-but-not-yet-validated contents - the direct shape of the TOML
@@ -211,11 +258,14 @@ pub enum ThemeFileError {
     },
     /// `preview` is present but isn't an array of exactly five `#rrggbb` strings.
     InvalidPreview(String),
-    /// `surface.card` is too close in perceptual brightness to `surface.window` to read
-    /// comfortably - see [`readability_floor_per_mille`].
-    LowReadability {
-        delta_per_mille: u32,
-        floor_per_mille: u32,
+    /// A theme's text is not legible against the surface it is painted on - see
+    /// [`check_palette_readability`], which is also where the deliberately-low floor is justified.
+    LowContrast {
+        what: &'static str,
+        foreground: &'static str,
+        background: &'static str,
+        ratio_per_hundred: u32,
+        floor_per_hundred: u32,
     },
     /// The *source* file [`import_theme_file`] was asked to import is over
     /// [`MAX_THEME_FILE_BYTES`] - checked before that file is ever read or written.
@@ -262,14 +312,18 @@ impl std::fmt::Display for ThemeFileError {
             ThemeFileError::InvalidPreview(detail) => {
                 write!(f, "`preview` must be five `#rrggbb` colours ({detail})")
             }
-            ThemeFileError::LowReadability {
-                delta_per_mille,
-                floor_per_mille,
+            ThemeFileError::LowContrast {
+                what,
+                foreground,
+                background,
+                ratio_per_hundred,
+                floor_per_hundred,
             } => write!(
                 f,
-                "`surface.card` is too close in brightness to `surface.window` to read \
-                 comfortably ({delta_per_mille} per-mille luma difference, need at least \
-                 {floor_per_mille})"
+                "this theme's {what} would be unreadable: `{foreground}` only reaches {}:1 \
+                 contrast against `{background}`, below the {}:1 minimum",
+                format_ratio(*ratio_per_hundred),
+                format_ratio(*floor_per_hundred)
             ),
             ThemeFileError::TooLarge { bytes, max_bytes } => write!(
                 f,
@@ -298,6 +352,12 @@ fn parse_hex_color(value: &str) -> Option<u32> {
         return None;
     }
     u32::from_str_radix(hex, 16).ok()
+}
+
+/// `160` -> `"1.6"` - renders an integer-hundredth contrast ratio for a real error message
+/// without pulling a float into [`ThemeFileError`] (which derives `Eq`).
+fn format_ratio(per_hundred: u32) -> String {
+    format!("{}.{}", per_hundred / 100, (per_hundred % 100) / 10)
 }
 
 pub(crate) fn format_hex_color(value: u32) -> String {
@@ -501,31 +561,6 @@ impl CustomThemeFile {
             None => None,
         };
 
-        // Readability floor. Deliberately evaluated over this file's own explicit entries layered
-        // on the *compiled* Jerry Dark defaults, never over the full `base` chain: this function
-        // runs for every built-in theme file too (via `parse_builtin_theme_file_str`, called from
-        // inside `THEME_DEFS`'s own `LazyLock` initializer), so resolving a base by name here
-        // would deadlock on that same `LazyLock`. Honestly disclosed consequence: a theme that
-        // sets only one of the two keys and inherits the other from a *non-Jerry-Dark* base is
-        // checked against Jerry Dark's value for the inherited one, so this is an approximation
-        // for that (rare, and only reachable for a hand-authored chain) case rather than an exact
-        // check - it can only ever be wrong in the permissive direction for a real theme, since a
-        // pair that reads fine against Jerry Dark's own baseline is not the unreadable case this
-        // floor exists to catch.
-        let resolved = |key: &str| -> Rgba {
-            let token = theme::token_for_key(key).expect("a real registered token");
-            overrides.get(token.key).copied().unwrap_or(token.default)
-        };
-        let delta =
-            readability_delta_per_mille(resolved(READABILITY_KEYS.0), resolved(READABILITY_KEYS.1));
-        let floor = readability_floor_per_mille();
-        if delta < floor {
-            return Err(ThemeFileError::LowReadability {
-                delta_per_mille: delta,
-                floor_per_mille: floor,
-            });
-        }
-
         Ok(CustomTheme {
             name: name.to_string(),
             subtitle: self.subtitle.trim().to_string(),
@@ -607,61 +642,23 @@ fn ordered_overrides(overrides: &HashMap<&'static str, Rgba>) -> Vec<(&'static s
         .collect()
 }
 
-/// Writes one theme file's real TOML text: the scalar fields, then one `[module]` table per group
-/// of keys, in [`ordered_overrides`]' registry order.
+/// Writes one theme file's real TOML text - see [`crate::settings::theme_file_format`], which owns
+/// the layout, ordering and the comments derived from `crate::theme`'s own source.
 ///
-/// Hand-written rather than `toml::to_string_pretty`d for the same reason
-/// [`CustomThemeFile::from_toml_str`] is hand-parsed (see its docs), plus one more: this controls
-/// key *order*, and a generated 270-line palette that's grouped and ordered the way `crate::theme`
-/// itself is is genuinely hand-editable, while a serde-serialized map sorted arbitrarily is not.
-/// String values still go through `toml::Value`'s own real escaping, never a bare `format!("{s}")`,
-/// so a name containing a quote or a backslash round-trips correctly.
+/// Hand-written rather than `toml::to_string_pretty`d for two real reasons: it controls key
+/// *order* (a generated 270-key palette grouped and explained the way `crate::theme` itself is is
+/// genuinely hand-editable, while a serde-serialized map sorted arbitrarily is not), and it can
+/// carry comments at all, which `toml`'s serializer cannot. String values still go through
+/// `toml::Value`'s own real escaping, never a bare `format!`, so a name containing a quote or a
+/// backslash round-trips correctly.
 fn write_theme_toml(file: &CustomThemeFile) -> String {
-    fn quoted(value: &str) -> String {
-        toml::Value::String(value.to_string()).to_string()
-    }
-
-    let mut out = String::new();
-    out.push_str(&format!("name = {}\n", quoted(&file.name)));
-    if !file.subtitle.is_empty() {
-        out.push_str(&format!("subtitle = {}\n", quoted(&file.subtitle)));
-    }
-    if let Some(base) = &file.base {
-        out.push_str(&format!("base = {}\n", quoted(base)));
-    }
-    if let Some(preview) = &file.preview {
-        let entries: Vec<String> = preview.iter().map(|value| quoted(value)).collect();
-        out.push_str(&format!("preview = [{}]\n", entries.join(", ")));
-    }
-
-    // Grouped by table, each table emitted exactly once, in first-appearance order. Grouping here
-    // rather than trusting the caller to have ordered its entries is what makes this function
-    // total: TOML rejects a table header that appears twice, so an unordered `overrides` vec would
-    // otherwise produce a file this module could not read back.
-    let mut tables: Vec<(&str, Vec<(&str, &str)>)> = Vec::new();
-    for (key, value) in &file.overrides {
-        let (table, entry) = key.split_once('.').unwrap_or((key.as_str(), ""));
-        match tables.iter_mut().find(|(name, _)| *name == table) {
-            Some((_, entries)) => entries.push((entry, value.as_str())),
-            None => tables.push((table, vec![(entry, value.as_str())])),
-        }
-    }
-    for (table, entries) in tables {
-        out.push_str(&format!("\n[{table}]\n"));
-        for (entry, value) in entries {
-            // A pair/array token's own key contains a dot (`sonnet.fg`, `lanes.0`), which TOML
-            // reads as a nested table unless it's quoted - so quote exactly those. Everything else
-            // stays a plain bare key, which is what makes a generated file pleasant to hand-edit.
-            let entry_key = if entry.contains('.') {
-                quoted(entry)
-            } else {
-                entry.to_string()
-            };
-            out.push_str(&format!("{entry_key} = {}\n", quoted(value)));
-        }
-    }
-    out
+    crate::settings::theme_file_format::write_theme_toml(file, DEFAULT_THEME_FILE_HEADER)
 }
+
+/// The preamble on a theme file Jerry writes for a user (an import, an export, or a
+/// generated-from-colour theme). `crate::settings::builtin_themes` passes its own instead.
+pub(crate) const DEFAULT_THEME_FILE_HEADER: &str =
+    "# A Jerry theme. Edit any value, delete any line, and reload Jerry to see it.";
 
 /// Compiles `theme` into the real, flat [`crate::theme::Palette`] the live app resolves every
 /// colour token against: everything up its `base` chain first (root-most base first), then each
@@ -878,7 +875,9 @@ pub fn load_custom_themes_from_dir(dir: &Path) -> (Vec<CustomTheme>, Vec<String>
         let mut known: Vec<&CustomTheme> = builtins;
         known.extend(themes.iter());
         for candidate in &themes {
-            if let Err(err) = compile_palette(candidate, &known) {
+            if let Err(err) = compile_palette(candidate, &known)
+                .and_then(|palette| check_palette_readability(&palette))
+            {
                 let file_name = candidate
                     .source_path
                     .as_ref()
@@ -939,6 +938,18 @@ pub(crate) fn validate_and_write(
     dest_dir: &Path,
 ) -> Result<CustomTheme, ThemeFileError> {
     let mut theme = file.validate()?;
+    // Readability is checked against what this theme really *renders* as - its own entries layered
+    // over everything up its real `base` chain - which means resolving that chain, which means
+    // knowing every other theme it could name. The built-ins plus whatever is already in
+    // `dest_dir` is exactly that set. See `check_palette_readability`'s own docs for why the check
+    // lives here and in `load_custom_themes_from_dir` rather than inside `validate`.
+    let siblings = load_custom_themes_from_dir(dest_dir).0;
+    let builtins: Vec<&CustomTheme> = THEME_DEFS.iter().map(|def| def.theme).collect();
+    let mut known: Vec<&CustomTheme> = builtins;
+    known.extend(siblings.iter().filter(|other| other.name != theme.name));
+    known.push(&theme);
+    check_palette_readability(&compile_palette(&theme, &known)?)?;
+
     std::fs::create_dir_all(dest_dir).map_err(|err| ThemeFileError::Io(err.to_string()))?;
     let dest_path = non_colliding_dest_path(dest_dir, &theme.name);
     std::fs::write(&dest_path, theme.to_toml_string())
@@ -1262,71 +1273,124 @@ keyword = "#ff79c6"
         }
     }
 
-    // ---- readability floor ------------------------------------------------------------------
+    // ---- readability ------------------------------------------------------------------------
 
+    /// A palette whose body text is literally the same colour as the surface behind it is the real
+    /// unreadable case this check exists for.
     #[test]
-    fn a_card_surface_with_no_real_contrast_against_the_window_is_rejected() {
-        let err = parse_theme_file_str(
-            "name = \"T\"\n\n[surface]\nwindow = \"#0c0d10\"\ncard = \"#0c0d10\"\n",
-        )
-        .unwrap_err();
+    fn text_the_same_colour_as_its_background_is_rejected() {
+        let mut palette = theme::Palette::new();
+        palette.insert("surface.window", rgba(0x0c0d10));
+        palette.insert("text.body", rgba(0x0c0d10));
+        let err = check_palette_readability(&palette).unwrap_err();
         assert_eq!(
             err,
-            ThemeFileError::LowReadability {
-                delta_per_mille: 0,
-                floor_per_mille: readability_floor_per_mille(),
+            ThemeFileError::LowContrast {
+                what: "body text",
+                foreground: "text.body",
+                background: "surface.window",
+                ratio_per_hundred: 100,
+                floor_per_hundred: MIN_CONTRAST_PER_HUNDRED,
             }
         );
     }
 
-    /// Pins the floor's actual real, computed magnitude - not just its existence. Every other test
-    /// here only proves it rejects a *zero*-contrast pair and accepts the bundled themes; none of
-    /// them would catch a future edit that quietly weakens [`readability_floor_per_mille`] (e.g.
-    /// dividing by `50` instead of `2`) while still passing. This is the one test that would.
+    /// A real near-miss, not just the identical-colour extreme: a hand-author could easily mistake
+    /// this for "different enough", but it is still unreadable.
     #[test]
-    fn readability_floor_per_mille_is_pinned_to_a_real_computed_value() {
-        assert_eq!(readability_floor_per_mille(), 20);
-    }
-
-    /// A real near-miss, not just the zero-contrast extreme: `card` here is a visibly different
-    /// hex string from `window` (a hand-author could easily mistake this for "different enough"),
-    /// but still well under the floor.
-    #[test]
-    fn a_card_only_a_few_hex_digits_off_from_the_window_is_still_rejected() {
-        let err = parse_theme_file_str(
-            "name = \"T\"\n\n[surface]\nwindow = \"#0c0d10\"\ncard = \"#0e0f12\"\n",
-        )
-        .unwrap_err();
+    fn text_a_few_hex_digits_off_from_its_background_is_still_rejected() {
+        let mut palette = theme::Palette::new();
+        palette.insert("surface.window", rgba(0x0c0d10));
+        palette.insert("text.body", rgba(0x11131a));
         assert!(
-            matches!(err, ThemeFileError::LowReadability { .. }),
-            "expected a LowReadability rejection, got {err:?}"
+            matches!(
+                check_palette_readability(&palette),
+                Err(ThemeFileError::LowContrast { .. })
+            ),
+            "expected a LowContrast rejection"
         );
     }
 
+    /// The code surface is checked independently of the chrome - a theme can be perfectly legible
+    /// in its panels and still have unreadable code.
     #[test]
-    fn every_built_in_theme_clears_the_readability_floor() {
-        // `parse_builtin_theme_file_str` panics on any validation failure - including a
-        // `LowReadability` rejection - so reaching the end of this loop at all is the assertion,
-        // but recomputing the real delta gives a specific failure message instead of a bare panic.
-        let floor = readability_floor_per_mille();
+    fn unreadable_code_is_caught_even_when_the_chrome_reads_fine() {
+        let mut palette = theme::Palette::new();
+        palette.insert("surface.center", rgba(0x101010));
+        palette.insert("syntax.text", rgba(0x121212));
+        let err = check_palette_readability(&palette).unwrap_err();
+        assert!(
+            matches!(err, ThemeFileError::LowContrast { what: "code", .. }),
+            "expected the code pair to be the one reported, got {err:?}"
+        );
+    }
+
+    /// The real regression for the user-reported bug this check was redesigned around: a flat
+    /// surface design - every surface within a hex step or two of the others, separation carried
+    /// by borders instead of brightness, exactly how VSCode's own Dark Modern is built - is a
+    /// perfectly readable theme and must not be rejected.
+    #[test]
+    fn a_flat_surface_design_with_readable_text_is_accepted() {
+        let mut palette = theme::Palette::new();
+        palette.insert("surface.window", rgba(0x1f1f1f));
+        palette.insert("surface.card", rgba(0x202020));
+        palette.insert("surface.center", rgba(0x1f1f1f));
+        palette.insert("text.body", rgba(0xcccccc));
+        palette.insert("syntax.text", rgba(0xcccccc));
+        assert!(
+            check_palette_readability(&palette).is_ok(),
+            "a flat-surface theme with real, legible text must import cleanly"
+        );
+    }
+
+    /// An empty palette is Jerry Dark itself - trivially readable, and the case every partial
+    /// theme file that names no text or surface keys at all lands on.
+    #[test]
+    fn an_empty_palette_is_jerry_dark_and_reads_fine() {
+        assert!(check_palette_readability(&theme::Palette::new()).is_ok());
+    }
+
+    #[test]
+    fn every_built_in_theme_is_really_readable_once_compiled() {
         for def in THEME_DEFS.iter() {
+            let palette = compile_palette_by_name(def.name, &[])
+                .expect("a bundled theme must compile")
+                .unwrap_or_default();
+            assert!(
+                check_palette_readability(&palette).is_ok(),
+                "{} is not readable: {:?}",
+                def.name,
+                check_palette_readability(&palette)
+            );
+        }
+    }
+
+    /// Pins the real measured headroom every bundled theme has over the floor - so a future edit
+    /// that quietly weakened the floor, or a palette change that quietly ate the margin, shows up
+    /// as a real test failure rather than passing on a technicality.
+    #[test]
+    fn every_built_in_theme_clears_the_floor_with_real_headroom() {
+        for def in THEME_DEFS.iter() {
+            let palette = compile_palette_by_name(def.name, &[])
+                .expect("must compile")
+                .unwrap_or_default();
             let resolved = |key: &str| -> Rgba {
                 let token = theme::token_for_key(key).expect("a real token");
-                def.theme
-                    .overrides
-                    .get(token.key)
-                    .copied()
-                    .unwrap_or(token.default)
+                palette.get(token.key).copied().unwrap_or(token.default)
             };
-            let delta = readability_delta_per_mille(
-                resolved(READABILITY_KEYS.0),
-                resolved(READABILITY_KEYS.1),
-            );
-            assert!(
-                delta >= floor,
-                "{}: window/card luma delta {delta} is below the readability floor {floor}",
-                def.name
-            );
+            for (what, foreground, background) in READABILITY_PAIRS {
+                let ratio = contrast_per_hundred(resolved(foreground), resolved(background));
+                // 4.5:1 is WCAG's own "normal text" minimum, and every bundled theme really does
+                // clear it - the tightest measured is Slate's code surface at 4.78:1. That is a
+                // real pin on the palette, well above the 1.6:1 *validity* floor an imported
+                // theme only has to clear.
+                assert!(
+                    ratio >= 450,
+                    "{}: {what} only reaches {ratio} (hundredths) - every bundled theme should \
+                     clear WCAG's own 4.5:1",
+                    def.name
+                );
+            }
         }
     }
 
@@ -1840,7 +1904,7 @@ keyword = "#ff79c6"
             "the written file must be the template's own literal bytes - comments included"
         );
         assert!(
-            on_disk.contains("READABILITY FLOOR"),
+            on_disk.contains("How a Jerry theme works"),
             "a real explanatory comment must have survived the write"
         );
 

@@ -1,329 +1,407 @@
-# Paper - a bundled Jerry theme.
+# Paper - a bundled Jerry theme, and a worked example of the theme file format.
 #
 # GENERATED FILE. Every colour below was derived from Jerry Dark's own palette by the
 # HSL transform in `crate::theme::derive_shift`, using this theme's five original
-# swatches (#f4f1ea, #e4e0d6, #3f7a52, #a8752a, #3d6c9c), and written out literally - so it renders exactly
-# as this theme always has, while now being an ordinary, hand-editable theme file with
-# no special status. Edit any line freely; delete one and that token falls back to
-# Jerry Dark's own value.
+# swatches (#f4f1ea, #e4e0d6, #3f7a52, #a8752a, #3d6c9c), then written out literally - so it renders
+# exactly as this theme always has while being an ordinary, hand-editable theme file
+# with no special status.
 #
 # Regenerate with `crate::settings::builtin_themes` - see that module's docs.
+#
+# Every key below is optional. Anything this file does not name is inherited from the theme in
+# `base`, and ultimately from Jerry Dark's own built-in value - so deleting a line is a real,
+# supported edit, and a file that sets three keys is a complete theme. New keys added by future
+# Jerry versions simply inherit too; nothing here has to be kept exhaustive.
 
 name = "Paper"
 subtitle = "light · beta"
 base = "Jerry Dark"
+
+# The five swatches this theme's card shows on the Themes page.
 preview = ["#f4f1ea", "#e4e0d6", "#3f7a52", "#a8752a", "#3d6c9c"]
 
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+# Surfaces and structure
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+
+# Backgrounds - every solid fill in the app, from the window itself down to popovers, hover
+# states and keycaps.
 [surface]
-window = "#eeeff0"
-window_border = "#c9cdd0"
-title_bar = "#eaeced"
-rail = "#ebecee"
-center = "#e5e7e9"
-pty = "#eef0f1"
-header = "#e7e8eb"
-footer = "#e8eaec"
-card = "#dfe3e5"
-card_sunk = "#e4e7e9"
-popover = "#dcdfe2"
-palette = "#e2e4e7"
-scrim = "#f9fafa"
-row_hover = "#e2e4e7"
-row_hover_alt = "#d9dcdf"
-row_selected = "#dadee0"
-segment_track = "#dfe2e4"
-segment_active = "#c9ced2"
-keycap = "#dde0e3"
-keycap_hint = "#e3e5e7"
-chip_neutral = "#cdd1d4"
-current_line = "#dcdfe2"
+window                = "#eeeff0"  # window body
+window_border         = "#c9cdd0"
+title_bar             = "#eaeced"
+rail                  = "#ebecee"  # left rail + right panel
+center                = "#e5e7e9"  # work surface
+pty                   = "#eef0f1"  # agent CLI + terminal
+header                = "#e7e8eb"  # context bar, panel headers
+footer                = "#e8eaec"  # surface footers, status strips
+card                  = "#dfe3e5"  # composer, settings cards
+card_sunk             = "#e4e7e9"  # card footers
+popover               = "#dcdfe2"  # completion popup, hover card
+palette               = "#e2e4e7"
+scrim                 = "#f9fafa"  # at 62% alpha behind the palette
+row_hover             = "#e2e4e7"
+row_hover_alt         = "#d9dcdf"  # hover on chrome buttons
+row_selected          = "#dadee0"
+segment_track         = "#dfe2e4"
+segment_active        = "#c9ced2"
+keycap                = "#dde0e3"
+keycap_hint           = "#e3e5e7"  # The hint-size keycap's own background
+chip_neutral          = "#cdd1d4"
+current_line          = "#dcdfe2"
 title_bar_close_hover = "#a22432"
-menu_row_hover = "#d4d9dc"
-tab_close_hover = "#ccd1d4"
+menu_row_hover        = "#d4d9dc"
+tab_close_hover       = "#ccd1d4"  # A file tab's close-affordance hover fill
 
+# The 1px rules that separate things - zone edges, card and popover outlines, and the
+# selected-row edge.
 [border]
-zone = "#d5d8db"
-inner = "#d7dbdd"
-rail_inner = "#dcdfe1"
-row = "#e0e3e4"
-divider = "#cfd2d6"
-card = "#ccd1d4"
-card_field = "#cdd2d5"
-composer = "#cacfd3"
-popover = "#bdc4c9"
-button = "#c2c7cb"
+zone            = "#d5d8db"  # between the three zones
+inner           = "#d7dbdd"  # between bands inside a zone
+rail_inner      = "#dcdfe1"
+row             = "#e0e3e4"  # change-list row separators
+divider         = "#cfd2d6"  # 1px vertical rules
+card            = "#ccd1d4"
+card_field      = "#cdd2d5"
+composer        = "#cacfd3"
+popover         = "#bdc4c9"
+button          = "#c2c7cb"  # outline button
 button_disabled = "#d2d6d9"
-keycap = "#c6cbcf"
-keycap_hint = "#cdd1d4"
-selected_edge = "#7793a8"
+keycap          = "#c6cbcf"
+keycap_hint     = "#cdd1d4"  # The hint-size keycap's own border
+selected_edge   = "#7793a8"  # 2px left edge on a selected row
 
+# The Files tree's own structural marks (GitHub issue #18 §3).
 [tree]
-indent_guide = "#cfd2d6"
-indent_guide_active = "#7793a8"
+indent_guide        = "#cfd2d6"
+indent_guide_active = "#7793a8"  # The guide for a level in the selected file's ancestor chain
 
+# The overlay scrollbar's own colours (GitHub issue #30) - not from design_handoff_jerry_ade
+# (that mockup has no scrollbar spec at all: every scrollable region there relies on raw,
+# invisible browser/OS scrolling), so these are a deliberate, judgment-call derivation from
+# existing neutral tokens rather than a transcription.
+[scrollbar]
+thumb       = "#adb2b6"
+thumb_hover = "#858c92"
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+# Text
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+
+# The interface text ramp, brightest to dimmest.
 [text]
-selected = "#000000"
-primary = "#000000"
-heading = "#000000"
-strong = "#030303"
-body = "#0c0d0e"
-secondary = "#1e2123"
-muted = "#313437"
-dim = "#46494b"
-dimmer = "#55595d"
-faint = "#6c7176"
-fainter = "#7d8388"
-ghost = "#91979c"
-ghoster = "#9da3a8"
-hint = "#a4a9ad"
-gutter = "#adb2b6"
-disabled = "#a8adb2"
-path = "#959ba1"
-tree_caret = "#959ba1"
+selected   = "#000000"
+primary    = "#000000"
+heading    = "#000000"
+strong     = "#030303"
+body       = "#0c0d0e"
+secondary  = "#1e2123"
+muted      = "#313437"
+dim        = "#46494b"
+dimmer     = "#55595d"
+faint      = "#6c7176"
+fainter    = "#7d8388"
+ghost      = "#91979c"
+ghoster    = "#9da3a8"
+hint       = "#a4a9ad"
+gutter     = "#adb2b6"
+disabled   = "#a8adb2"
+path       = "#959ba1"
+tree_caret = "#959ba1"  # The file tree row's ▾/▸ caret
 
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+# Meaning and state (colour carries information here)
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+
+# Status is the only place colour carries meaning in the rail.
 [status]
-ask = "#7b5823"
-ask_bg = "#e1d4c0"
-fail = "#541c1c"
-fail_bg = "#d7bebf"
-review = "#3a694a"
-review_bg = "#bdd7c7"
-run = "#25445d"
-run_bg = "#bacad6"
-idle = "#858c92"
-idle_bg = "#cfd2d6"
-ask_card_bg = "#ece7e2"
+ask           = "#7b5823"  # needs input
+ask_bg        = "#e1d4c0"
+fail          = "#541c1c"
+fail_bg       = "#d7bebf"
+review        = "#3a694a"
+review_bg     = "#bdd7c7"
+run           = "#25445d"
+run_bg        = "#bacad6"
+idle          = "#858c92"
+idle_bg       = "#cfd2d6"
+ask_card_bg   = "#ece7e2"
 ask_card_edge = "#c6a065"
-ask_card_fg = "#6f5530"
-banner_bg = "#ece7e3"
+ask_card_fg   = "#6f5530"
+banner_bg     = "#ece7e3"
 banner_border = "#dcd3c6"
 
-[rail]
-repo_header_name = "#5c6064"
-worktree_active_bg = "#dde0e3"
-worktree_hover_bg = "#e0e3e5"
-prunable_edge = "#bac0c4"
-
+# Diff and change colours - added/removed line fills and signs, hunk headers, and the
+# change-list stat bars.
 [diff]
-add_bg = "#dce8e2"
-add_fg = "#111d15"
-add_sign = "#5e9071"
-del_bg = "#e5dbdd"
-del_fg = "#180d0d"
-del_sign = "#744c4c"
-ctx_fg = "#4a4e51"
-hunk_bg = "#e1e3e6"
-hunk_fg = "#787f86"
-fold_bg = "#e7e8eb"
-fold_fg = "#959ba1"
-stat_add = "#50735d"
-stat_del = "#633e3d"
-stat_empty = "#cfd2d6"
-git_gutter = "#8fc0a3"
+add_bg     = "#dce8e2"
+add_fg     = "#111d15"
+add_sign   = "#5e9071"
+del_bg     = "#e5dbdd"
+del_fg     = "#180d0d"
+del_sign   = "#744c4c"
+ctx_fg     = "#4a4e51"
+hunk_bg    = "#e1e3e6"
+hunk_fg    = "#787f86"
+fold_bg    = "#e7e8eb"
+fold_fg    = "#959ba1"
+stat_add   = "#50735d"  # "+142" label
+stat_del   = "#633e3d"  # "-8" label
+stat_empty = "#cfd2d6"  # unused segment of the 5-bar
+git_gutter = "#8fc0a3"  # 3px agent-touched marker
 
-[syntax]
-text = "#181a1d"
-keyword = "#372043"
-function = "#112436"
-function_method = "#112436"
-type = "#2c2211"
-type_builtin = "#2c2211"
-constant = "#584330"
-constant_builtin = "#584330"
-string = "#485531"
-string_escape = "#171b0e"
-number = "#584330"
-comment = "#777e88"
-comment_doc = "#51555c"
-variable = "#3c2733"
-variable_parameter = "#6d3746"
-variable_builtin = "#584330"
-property = "#264149"
-operator = "#181a1d"
-punctuation_bracket = "#181a1d"
-punctuation_delimiter = "#181a1d"
-tag = "#2c2211"
-attribute = "#2e4843"
-embedded = "#181a1d"
-heading = "#2c2211"
-link = "#112436"
-strong = "#000000"
-emphasis = "#0c080f"
-caret = "#25445d"
-error_underline = "#541c1c"
-hover_underline = "#496881"
-diagnostic_row_bg = "#e8e4e6"
-diagnostic_inline_message = "#a08180"
-diagnostic_card_message = "#220d0d"
+# Small status tags and the file tree's own A/M change marks.
+[tag]
+"new.fg"      = "#23402d"
+"new.bg"      = "#bdd7c7"
+"deleted.fg"  = "#331a1a"
+"deleted.bg"  = "#d7bebf"
+"conflict.fg" = "#4d381a"
+"conflict.bg" = "#e1d4c0"
+tree_added    = "#50735d"  # "A" mark
+tree_modified = "#97804c"  # "M" mark
 
-[editor]
-selection = "#25445d"
-selection_inactive = "#25445d"
-current_line = "#dcdfe2"
-caret = "#25445d"
-matching_bracket = "#8eabc0"
-indent_guide = "#cfd2d6"
-indent_guide_active = "#7793a8"
-whitespace = "#a4a9ad"
-minimap_bg = "#e5e7e9"
-gutter_text = "#adb2b6"
-gutter_text_active = "#46494b"
-gutter_bg = "#e5e7e9"
-blame_text = "#6c7176"
-diff_added = "#8fc0a3"
-diff_removed = "#744c4c"
+# Tokens used only by the Revision R12 rail rewrite (design_handoff_jerry_ade/revision 3/
+# REVISION-2026-07-31.md §2) that have no exact match elsewhere in this module - every other
+# colour that section calls for (the branch/note/model/activity greys, the amber flag, the
+# spine/selection edges) already has one, reused directly at the call site rather than
+# duplicated here under a second name.
+[rail]
+repo_header_name   = "#5c6064"
+worktree_active_bg = "#dde0e3"
+worktree_hover_bg  = "#e0e3e5"  # Worktree row hover background (§2.2: "hover #16191c").
+prunable_edge      = "#bac0c4"
 
-[term]
-prompt = "#0a141c"
-text = "#222426"
-dim = "#6c7176"
-ok = "#355b3e"
-err = "#541c1c"
-warn = "#6b5226"
-heading = "#000000"
-activity = "#25445d"
-menu_sel_fg = "#4d381a"
-menu_sel_bg = "#ebe6de"
-cursor = "#25445d"
-link = "#10212e"
-link_underline = "#5884a5"
-link_hover = "#000000"
-link_underline_hover = "#1f3341"
-
-[env]
-wsl_fg = "#0a141c"
-wsl_bg = "#cfdae2"
-wsl_border = "#abbecd"
-local_fg = "#6c7176"
-local_border = "#cfd2d6"
-
+# One tint per agent.
 [agent]
 "sonnet.fg" = "#6b5226"
 "sonnet.bg" = "#e8dec9"
-"codex.fg" = "#355b3e"
-"codex.bg" = "#c6d8cd"
-"haiku.fg" = "#301c2d"
-"haiku.bg" = "#d6c5d4"
-"local.fg" = "#1a2438"
-"local.bg" = "#b6c0d4"
+"codex.fg"  = "#355b3e"
+"codex.bg"  = "#c6d8cd"
+"haiku.fg"  = "#301c2d"
+"haiku.bg"  = "#d6c5d4"
+"local.fg"  = "#1a2438"
+"local.bg"  = "#b6c0d4"
 
-[lang]
-"rs.fg" = "#775438"
-"rs.bg" = "#e5d9cd"
-"toml.fg" = "#46494b"
-"toml.bg" = "#cdd1d4"
-"md.fg" = "#1a2438"
-"md.bg" = "#c7cfd9"
-"sql.fg" = "#355b3e"
-"sql.bg" = "#d0ddd4"
-"ts.fg" = "#22384e"
-"ts.bg" = "#c1cdda"
-"vue.fg" = "#3a694a"
-"vue.bg" = "#d6e3dc"
-"py.fg" = "#736431"
-"py.bg" = "#e7e3d2"
-"go.fg" = "#2f5460"
-"go.bg" = "#cbdbe2"
-"json.fg" = "#0e0e10"
-"json.bg" = "#cdcfd3"
-"yaml.fg" = "#1a2431"
-"yaml.bg" = "#c9d2db"
-"c.fg" = "#211d32"
-"c.bg" = "#ccc9d8"
-"unknown.fg" = "#6c7176"
-"unknown.bg" = "#cdd1d4"
 
-[button]
-green_bg = "#a4ccb7"
-green_bg_hover = "#91c1a6"
-green_fg = "#0a150e"
-green_keycap = "#83b396"
-green_keycap_fg = "#1e3426"
-blue_bg = "#a4bbcc"
-blue_bg_hover = "#8eabc0"
-blue_fg = "#000000"
-blue_keycap = "#7599b1"
-amber_bg = "#e1d4c0"
-amber_bg_hover = "#dac9ae"
-amber_fg = "#4d381a"
-danger_fg = "#532c2b"
-danger_fg_hover = "#220d0d"
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+# The code surface
+# ──────────────────────────────────────────────────────────────────────────────────────────────
 
-[toggle]
-track_on = "#82bb9a"
-track_off = "#cdd1d4"
-knob_on = "#000000"
-knob_off = "#6c7176"
-checkbox_hover = "#71a783"
+# The editor's per-scope syntax palette - one ColorToken per tree-sitter-highlight capture
+# bucket crate::code_surface::code_view::HighlightKind classifies a token into.
+[syntax]
+text                      = "#181a1d"
+keyword                   = "#372043"
+function                  = "#112436"
+function_method           = "#112436"
+type                      = "#2c2211"
+type_builtin              = "#2c2211"
+constant                  = "#584330"
+constant_builtin          = "#584330"
+string                    = "#485531"
+string_escape             = "#171b0e"  # string.escape
+number                    = "#584330"
+comment                   = "#777e88"
+comment_doc               = "#51555c"  # comment.doc
+variable                  = "#3c2733"  # variable
+variable_parameter        = "#6d3746"
+variable_builtin          = "#584330"  # variable.builtin (self/this/super/cls)
+property                  = "#264149"  # property (a field/attribute access
+operator                  = "#181a1d"  # operator (+, ==, &&, ...)
+punctuation_bracket       = "#181a1d"
+punctuation_delimiter     = "#181a1d"  # punctuation.delimiter (,/;/:/./::)
+tag                       = "#2c2211"
+attribute                 = "#2e4843"
+embedded                  = "#181a1d"
+heading                   = "#2c2211"  # GitHub issue #104's own real, prose-specific buckets
+link                      = "#112436"
+strong                    = "#000000"  # text.strong (**bold**)
+emphasis                  = "#0c080f"  # text.emphasis (*italic*)
+caret                     = "#25445d"
+error_underline           = "#541c1c"  # 2px dotted
+hover_underline           = "#496881"  # 1px solid
+diagnostic_row_bg         = "#e8e4e6"
+diagnostic_inline_message = "#a08180"
+diagnostic_card_message   = "#220d0d"
 
-[tag]
-"new.fg" = "#23402d"
-"new.bg" = "#bdd7c7"
-"deleted.fg" = "#331a1a"
-"deleted.bg" = "#d7bebf"
-"conflict.fg" = "#4d381a"
-"conflict.bg" = "#e1d4c0"
-tree_added = "#50735d"
-tree_modified = "#97804c"
+# The File view's structural chrome (GitHub issue #31's "editor chrome" checklist item) -
+# selection, the current-line highlight, the caret, and a handful of tokens for editor features
+# that are real schema slots but have **no real renderer yet** in this codebase
+# (matching-bracket highlighting, indent guides inside the code surface itself - distinct from
+# tree's file-*tree* indent guides, which are real and already painted -, whitespace marks, a
+# minimap, blame text, and a removed-line gutter marker).
+[editor]
+selection           = "#25445d"  # The active text selection fill's base colour
+selection_inactive  = "#25445d"
+current_line        = "#dcdfe2"  # The current-line highlight
+caret               = "#25445d"  # The caret bar
+matching_bracket    = "#8eabc0"  # A matched/matching bracket pair's highlight fill.
+indent_guide        = "#cfd2d6"  # A resting indent guide inside the code surface.
+indent_guide_active = "#7793a8"  # The indent guide for the level the caret currently sits in.
+whitespace          = "#a4a9ad"
+minimap_bg          = "#e5e7e9"  # A minimap's own background fill.
+gutter_text         = "#adb2b6"  # The line-number gutter's text colour
+gutter_text_active  = "#46494b"  # The current row's own brighter gutter-number colour
+gutter_bg           = "#e5e7e9"  # The gutter column's own background fill.
+blame_text          = "#6c7176"  # Inline git-blame annotation text.
+diff_added          = "#8fc0a3"  # An added line's gutter marker
+diff_removed        = "#744c4c"  # A removed line's own gutter marker.
 
+# The terminal and agent CLI surface - prompt, output, its own status tones, and clickable path
+# links.
+[term]
+prompt               = "#0a141c"
+text                 = "#222426"
+dim                  = "#6c7176"
+ok                   = "#355b3e"
+err                  = "#541c1c"
+warn                 = "#6b5226"
+heading              = "#000000"
+activity             = "#25445d"  # spinner / progress line
+menu_sel_fg          = "#4d381a"
+menu_sel_bg          = "#ebe6de"
+cursor               = "#25445d"
+link                 = "#10212e"
+link_underline       = "#5884a5"
+link_hover           = "#000000"
+link_underline_hover = "#1f3341"
+
+# Exact colours for Surface C's real Completions popup item rows - read directly from
+# design_handoff_jerry_ade/revision/Jerry.dc.html's own completions/KBG/KFG data (the sel ? ...
 [completions_popup]
-item_selected_bg = "#a4bbcc"
-item_selected_fg = "#000000"
-item_fg = "#0c0d0e"
+item_selected_bg   = "#a4bbcc"
+item_selected_fg   = "#000000"
+item_fg            = "#0c0d0e"
 "kind_function.fg" = "#0a141c"
 "kind_function.bg" = "#a4bbcc"
 "kind_variable.fg" = "#6b5226"
 "kind_variable.bg" = "#e8dec9"
-"kind_type.fg" = "#150c1c"
-"kind_type.bg" = "#c9b9d4"
+"kind_type.fg"     = "#150c1c"
+"kind_type.bg"     = "#c9b9d4"
 
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+# Chrome and widgets
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+
+# Buttons, by role: green (primary/confirm), blue (secondary), amber (attention) and the danger
+# red.
+[button]
+green_bg        = "#a4ccb7"
+green_bg_hover  = "#91c1a6"
+green_fg        = "#0a150e"
+green_keycap    = "#83b396"
+green_keycap_fg = "#1e3426"
+blue_bg         = "#a4bbcc"
+blue_bg_hover   = "#8eabc0"
+blue_fg         = "#000000"
+blue_keycap     = "#7599b1"
+amber_bg        = "#e1d4c0"
+amber_bg_hover  = "#dac9ae"
+amber_fg        = "#4d381a"
+danger_fg       = "#532c2b"
+danger_fg_hover = "#220d0d"
+
+# Toggle switches and the Changes-panel staging checkbox.
+[toggle]
+track_on       = "#82bb9a"
+track_off      = "#cdd1d4"
+knob_on        = "#000000"
+knob_off       = "#6c7176"
+checkbox_hover = "#71a783"
+
+# Settings-surface-only colours read directly from Jerry.dc.html's inline literals for the
+# settingsOpen block - real values present in the mockup but missing from tokens.rs's
+# transcription (predates the Settings section).
 [settings]
-nav_row_hover = "#e1e3e4"
-subtitle = "#5e6266"
-card_row_sep = "#d2d6d9"
-agent_ready = "#3a694a"
-agent_not_found = "#541c1c"
-worktree_prunable_dot = "#a5abb0"
-card_selected_bg = "#dde2e5"
-card_unselected_bg = "#e4e7e9"
+nav_row_hover           = "#e1e3e4"
+subtitle                = "#5e6266"
+card_row_sep            = "#d2d6d9"
+agent_ready             = "#3a694a"  # A binary-found status dot on the Agents page.
+agent_not_found         = "#541c1c"  # A binary-not-found status dot on the Agents page
+worktree_prunable_dot   = "#a5abb0"  # The Worktrees page's "merged and prunable" row dot
+card_selected_bg        = "#dde2e5"
+card_unselected_bg      = "#e4e7e9"
 theme_card_hover_border = "#a9b0b6"
-snippet_section = "#150c1c"
+snippet_section         = "#150c1c"
 
-[scrollbar]
-thumb = "#adb2b6"
-thumb_hover = "#858c92"
+# Palette-only (⌘P) colours read directly from Jerry.dc.html's inline literals for the
+# paletteOpen block - real values missing from tokens.rs's transcription (predates the palette
+# section).
+[palette]
+prefix            = "#4f6272"
+group_header      = "#81878c"
+row_hover         = "#dbdfe1"
+label_selected    = "#000000"
+"command_chip.fg" = "#1a2438"
+"command_chip.bg" = "#c7cfd9"
 
+# The git graph tab (design handoff design_handoff_jerry_ade/revision 2/CHANGELOG.md, 2026-07-31
+# entry, "git graph (issue #1)") - real hex values transcribed directly from that entry's
+# §2/§3, not paraphrased.
 [graph]
-tab_chip_bg = "#d1c8d7"
-tab_chip_fg = "#301c2d"
-"lanes.0" = "#22384e"
-"lanes.1" = "#301c2d"
-"lanes.2" = "#3a694a"
-"lanes.3" = "#6b5226"
-"lanes.4" = "#775438"
-"lanes.5" = "#151529"
+tab_chip_bg             = "#d1c8d7"  # The tab chip's own background (§1: "#2a2030 bg").
+tab_chip_fg             = "#301c2d"  # The tab chip's fork-glyph colour (§1: "#c98fbf fork glyph").
+"lanes.0"               = "#22384e"  # Six lane colours, cycled by lane % 6
+"lanes.1"               = "#301c2d"  # Six lane colours, cycled by lane % 6
+"lanes.2"               = "#3a694a"  # Six lane colours, cycled by lane % 6
+"lanes.3"               = "#6b5226"  # Six lane colours, cycled by lane % 6
+"lanes.4"               = "#775438"  # Six lane colours, cycled by lane % 6
+"lanes.5"               = "#151529"  # Six lane colours, cycled by lane % 6
 "local_branch_dim_bg.0" = "#c6d3dc"
 "local_branch_dim_bg.1" = "#d1c8d7"
 "local_branch_dim_bg.2" = "#d6e3dc"
 "local_branch_dim_bg.3" = "#e5dfd1"
 "local_branch_dim_bg.4" = "#e6dbd2"
 "local_branch_dim_bg.5" = "#c5c7d7"
-head_chip_bg = "#a4bbcc"
-head_chip_fg = "#000000"
-remote_chip_border = "#c2c7cb"
-tag_chip_bg = "#e5dfd1"
-tag_chip_fg = "#6b5226"
-head_ring = "#25445d"
-working_tree_border = "#6c7176"
-header_bg = "#e9eced"
-header_label_fg = "#959ba1"
-behind_warn = "#97804c"
-branch_no_lane_dot = "#a8adb2"
+head_chip_bg            = "#a4bbcc"  # HEAD ref chip (§2: "HEAD #243c50/#a5cdf0").
+head_chip_fg            = "#000000"
+remote_chip_border      = "#c2c7cb"
+tag_chip_bg             = "#e5dfd1"  # A tag chip (§2: "tag #2b2413/#d8a94a").
+tag_chip_fg             = "#6b5226"
+head_ring               = "#25445d"  # The HEAD dot's ring colour (§2: "a 2px #5a9ad4 ring").
+working_tree_border     = "#6c7176"
+header_bg               = "#e9eced"  # The column header band's own background (§6.1: "#101315")
+header_label_fg         = "#959ba1"  # The column header labels' colour (§6.1: "#4a5057
+behind_warn             = "#97804c"
+branch_no_lane_dot      = "#a8adb2"
 
-[palette]
-prefix = "#4f6272"
-group_header = "#81878c"
-row_hover = "#dbdfe1"
-label_selected = "#000000"
-"command_chip.fg" = "#1a2438"
-"command_chip.bg" = "#c7cfd9"
+# The environment (WSL) chip's tokens - shown in the terminal footer, the status bar, and
+# Settings' Default environment row.
+[env]
+wsl_fg       = "#0a141c"
+wsl_bg       = "#cfdae2"
+wsl_border   = "#abbecd"
+local_fg     = "#6c7176"  # Defaults to text::FAINT's own value.
+local_border = "#cfd2d6"  # Defaults to border::DIVIDER's own value.
+
+# Language chips, shared by the file tree, the code tab and the palette.
+[lang]
+"rs.fg"      = "#775438"  # "rs"
+"rs.bg"      = "#e5d9cd"  # "rs"
+"toml.fg"    = "#46494b"  # "to"
+"toml.bg"    = "#cdd1d4"  # "to"
+"md.fg"      = "#1a2438"  # "md"
+"md.bg"      = "#c7cfd9"  # "md"
+"sql.fg"     = "#355b3e"  # "sq"
+"sql.bg"     = "#d0ddd4"  # "sq"
+"ts.fg"      = "#22384e"  # "ts"
+"ts.bg"      = "#c1cdda"  # "ts"
+"vue.fg"     = "#3a694a"  # "vue"
+"vue.bg"     = "#d6e3dc"  # "vue"
+"py.fg"      = "#736431"  # "py"
+"py.bg"      = "#e7e3d2"  # "py"
+"go.fg"      = "#2f5460"  # "go"
+"go.bg"      = "#cbdbe2"  # "go"
+"json.fg"    = "#0e0e10"  # "jsn"
+"json.bg"    = "#cdcfd3"  # "jsn"
+"yaml.fg"    = "#1a2431"  # "yml"
+"yaml.bg"    = "#c9d2db"  # "yml"
+"c.fg"       = "#211d32"  # "c"
+"c.bg"       = "#ccc9d8"  # "c"
+"unknown.fg" = "#6c7176"
+"unknown.bg" = "#cdd1d4"

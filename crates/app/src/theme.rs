@@ -498,6 +498,8 @@ pub fn derived_palette(shift: HslShift) -> Vec<(&'static str, Rgba)> {
         .map(|token| (token.key, apply_shift(token.default, shift)))
         .collect()
 }
+/// Backgrounds - every solid fill in the app, from the window itself down to popovers,
+/// hover states and keycaps.
 pub mod surface {
     use super::{token, ColorToken};
 
@@ -578,6 +580,8 @@ pub mod surface {
     ];
 }
 
+/// The 1px rules that separate things - zone edges, card and popover outlines, and the
+/// selected-row edge.
 pub mod border {
     use super::{token, ColorToken};
 
@@ -648,6 +652,7 @@ pub mod tree {
     ];
 }
 
+/// The interface text ramp, brightest to dimmest. Not code: that is `syntax`.
 pub mod text {
     use super::{token, ColorToken};
 
@@ -775,6 +780,8 @@ pub mod rail {
     ];
 }
 
+/// Diff and change colours - added/removed line fills and signs, hunk headers, and the
+/// change-list stat bars.
 pub mod diff {
     use super::{token, ColorToken};
 
@@ -1207,6 +1214,8 @@ pub mod editor {
     ];
 }
 
+/// The terminal and agent CLI surface - prompt, output, its own status tones, and clickable
+/// path links.
 pub mod term {
     use super::{token, ColorToken};
 
@@ -1394,6 +1403,8 @@ pub mod lang {
     ];
 }
 
+/// Buttons, by role: green (primary/confirm), blue (secondary), amber (attention) and the
+/// danger red.
 pub mod button {
     use super::{token, ColorToken};
 
@@ -1438,6 +1449,7 @@ pub mod button {
     ];
 }
 
+/// Toggle switches and the Changes-panel staging checkbox.
 pub mod toggle {
     use super::{token, ColorToken};
 
@@ -1462,6 +1474,7 @@ pub mod toggle {
     ];
 }
 
+/// Small status tags and the file tree's own A/M change marks.
 pub mod tag {
     use super::{token, ColorToken};
 

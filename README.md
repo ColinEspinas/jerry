@@ -92,33 +92,47 @@ in this repository, embedded into the binary and parsed through the exact same c
 theme's own file goes through. Jerry Dark's own file names no colours at all — it *is* the
 compiled default palette; the other five are complete, literal, hand-editable palettes.
 
-**File format.** One `.toml` file per theme:
+**File format.** One `.toml` file per theme. Jerry writes them with section headings and a
+comment on most keys — the comments are pulled from the colour tokens' own doc comments in
+`crates/app/src/theme.rs`, so they can't drift from what the code says — and reads them liberally:
+key order, grouping and comments carry no meaning, so a hand-edited file never has to look like a
+generated one.
 
 ```toml
 name = "Midnight Coral"
 subtitle = "warm accent, dark base"
 base = "Jerry Dark"
 
-[surface]
-window = "#0c0d10"
-card = "#181a1e"
-rail = "#101216"
+# The five swatches this theme's card shows on the Themes page.
+preview = ["#0c0d10", "#101216", "#5cb87f", "#e2a336", "#e07a5f"]
 
-[text]
-body = "#b9bfc7"
-muted = "#98a0a9"
+# ──────────────────────────────────────────────────────────────────────────────
+# Surfaces and structure
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Backgrounds - every solid fill in the app, from the window itself down to
+# popovers, hover states and keycaps.
+[surface]
+window       = "#0c0d10"  # window body
+rail         = "#101216"  # left rail + right panel
+card         = "#181a1e"  # composer, settings cards
+row_selected = "#1b1f26"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# The code surface
+# ──────────────────────────────────────────────────────────────────────────────
 
 [syntax]
-keyword = "#ff79c6"
-string = "#f1fa8c"
-comment = "#6272a4"
+keyword  = "#ff79c6"
+string   = "#f1fa8c"
+variable = "#bd89a5"
 ```
 
 - **`name`** — required, non-empty, and must not reuse a built-in theme's name.
 - **`subtitle`** — optional one-line description shown on the card.
-- **`base`** — optional; the theme every unnamed key is inherited from. `"Jerry Dark"` is the
-  usual choice, and omitting it is equivalent (Jerry Dark's values are the compiled defaults). A
-  `base` chain that loops back on itself is rejected with a real error naming the whole chain.
+- **`base`** — optional; the theme every unnamed key is inherited from. `"Jerry Dark"` is the usual
+  choice, and omitting it is equivalent. A `base` chain that loops is rejected with a real error
+  naming the whole chain.
 - **`preview`** — optional array of five `#rrggbb` colours for the card's swatch strip. Omitted, it
   is read from the theme's own `surface.window`/`surface.rail`/`status.review`/`status.ask`/
   `status.run`.
@@ -129,15 +143,22 @@ comment = "#6272a4"
 
 Colours are `#rrggbb` — a `#` plus exactly six hex digits; no `#rgb` shorthand, alpha channel, or
 named CSS colours. An unknown table or key is a real, specific rejection naming what it didn't
-recognise, never a silently ignored typo. `surface.card` also has to read as a genuinely different
-shade from `surface.window`: a real perceptual-brightness (ITU-R BT.709 luma) check rejects a card
-surface that's the same colour as — or a couple of hex digits off from — the window behind it.
+recognise, never a silently ignored typo.
 
-A theme naming three keys is a complete, valid theme. For the full list of real keys, copy one of
-the generated bundled palettes ([`assets/themes/slate.toml`](assets/themes/slate.toml) and its
-siblings each list every single key with a real value) or read `crates/app/src/theme.rs`, where
-most tokens carry a doc comment saying exactly what paints with them.
-[`assets/themes/template.toml`](assets/themes/template.toml) is a commented starting point.
+**A theme naming three keys is a complete, valid theme**, and stays valid as Jerry grows: keys
+added by future versions simply inherit, so a file never has to be kept exhaustive. Deleting a line
+is a real, supported edit — that key goes back to what it inherited.
+
+The one thing Jerry insists on is that text is legible: if body text or code would be effectively
+invisible against the surface behind it (below 1.6:1 contrast), the theme is rejected with an error
+saying which pair failed. Nothing else about a palette is second-guessed — flat designs that
+separate regions with borders rather than brightness (VSCode's own Dark Modern, for one) are
+perfectly fine.
+
+For the full list of real keys, open any bundled theme —
+[`assets/themes/slate.toml`](assets/themes/slate.toml) and its siblings are complete, commented
+palettes, and copying one is the fastest way to author a whole theme.
+[`assets/themes/template.toml`](assets/themes/template.toml) is a smaller commented starting point.
 
 **Where files live.** `~/.config/jerry/themes/*.toml` — a `themes` directory sitting next to
 `~/.config/jerry/settings.toml`. Every `.toml` file directly inside it is loaded as a theme at
@@ -171,6 +192,13 @@ two layers:
   `button.background`) are run through the same derivation "Generate from colour" uses, giving
   every one of Jerry's ~270 tokens a real value in the theme's own family. This is what stops an
   imported light theme from leaving half the chrome dark.
+VSCode's own default themes are defined as deltas on each other (`Dark+` is `tokenColors` plus
+`"include": "./dark_vs.json"`, and `Dark Modern` includes *that*), so the importer follows an
+`include` chain relative to the file's own directory, with the including file winning on `colors`
+and its `tokenColors` appended after the base's. Every shipped VSCode default — Dark+/Light+,
+Dark/Light Modern, the `_vs` bases — plus Monokai, Solarized Dark and One Dark Pro is imported
+end-to-end by this crate's own tests, against the real, unmodified upstream JSON.
+
 - **Every directly-mapped key on top.** Jerry's tokens are mapped onto the VSCode `colors` keys
   that genuinely mean the same thing — the editor surface, gutter, selection and line highlight;
   sidebar/activity bar/panel/status bar/title bar; list hover and selection rows; input and widget

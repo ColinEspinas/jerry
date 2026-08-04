@@ -76,6 +76,10 @@ pub enum VscodeThemeError {
     /// this app cannot even determine a background for is not a real conversion, just a guess
     /// wearing one.
     MissingBackground,
+    /// An `include` chain longer than [`MAX_INCLUDE_DEPTH`] - a malformed or circular one.
+    IncludeTooDeep {
+        limit: usize,
+    },
 }
 
 impl std::fmt::Display for VscodeThemeError {
@@ -87,6 +91,11 @@ impl std::fmt::Display for VscodeThemeError {
                 "couldn't find a real `editor.background` (or top-level `background`) colour in \
                  this VSCode theme - nothing to convert"
             ),
+            VscodeThemeError::IncludeTooDeep { limit } => write!(
+                f,
+                "this VSCode theme's `include` chain is more than {limit} files deep - it is \
+                 probably circular"
+            ),
         }
     }
 }
@@ -95,10 +104,83 @@ impl std::fmt::Display for VscodeThemeError {
 struct VscodeThemeFile {
     #[serde(default)]
     name: Option<String>,
+    /// A real VSCode theme file may be defined as a delta on another one, by relative path
+    /// (`"include": "./dark_vs.json"`). See [`load_vscode_theme_with_includes`] - this is not an
+    /// exotic corner: it is how VSCode's *own* default themes are built.
+    #[serde(default)]
+    include: Option<String>,
     #[serde(default)]
     colors: HashMap<String, String>,
     #[serde(default, rename = "tokenColors")]
     token_colors: Vec<VscodeTokenColorRule>,
+}
+
+impl VscodeThemeFile {
+    /// Layers `self` on top of `base`, with VSCode's own semantics: `colors` merge key by key with
+    /// the including file winning, and `tokenColors` are concatenated with the including file's
+    /// rules *after* the base's, since a later rule of equal specificity wins (see
+    /// [`first_scope_foreground`]).
+    fn layered_over(mut self, base: VscodeThemeFile) -> VscodeThemeFile {
+        let mut colors = base.colors;
+        colors.extend(self.colors.drain());
+        let mut token_colors = base.token_colors;
+        token_colors.append(&mut self.token_colors);
+        VscodeThemeFile {
+            // The including file names the theme; only if it doesn't does the base's name apply.
+            name: self.name.or(base.name),
+            include: None,
+            colors,
+            token_colors,
+        }
+    }
+}
+
+/// How many `include` hops [`load_vscode_theme_with_includes`] will follow. VSCode's own default
+/// themes use two (`dark_modern.json` -> `dark_plus.json` -> `dark_vs.json`); this is generous
+/// headroom over anything real, and a hard stop rather than an unbounded walk over
+/// attacker-supplied relative paths.
+const MAX_INCLUDE_DEPTH: usize = 8;
+
+/// Reads a real VSCode theme file, following its `include` chain relative to its own directory.
+///
+/// This exists because it is genuinely load-bearing, not for completeness: VSCode's current
+/// default dark theme, `dark_modern.json`, contains almost no `colors` of its own, and `Dark+`
+/// (`dark_plus.json`) contains **none** - it is `tokenColors` plus `"include": "./dark_vs.json"`.
+/// Without following that, importing the actual shipped Dark+ file failed outright with
+/// [`VscodeThemeError::MissingBackground`], because as far as the converter could see the theme
+/// defined no background at all. A real, user-reported bug.
+///
+/// A missing include target is a real error rather than a silent partial import: a theme that
+/// resolves to "no colours" would otherwise convert into something that is not the theme the user
+/// asked for. Cycles and runaway chains are bounded by [`MAX_INCLUDE_DEPTH`].
+fn load_vscode_theme_with_includes(
+    source_path: &Path,
+    depth: usize,
+) -> Result<VscodeThemeFile, VscodeThemeError> {
+    let contents = std::fs::read_to_string(source_path)
+        .map_err(|err| VscodeThemeError::Parse(format!("{}: {err}", source_path.display())))?;
+    let file = parse_vscode_theme_str(&contents)?;
+    let Some(include) = file.include.clone() else {
+        return Ok(file);
+    };
+    if depth >= MAX_INCLUDE_DEPTH {
+        return Err(VscodeThemeError::IncludeTooDeep {
+            limit: MAX_INCLUDE_DEPTH,
+        });
+    }
+    // Relative to the including file's own directory, exactly as VSCode resolves it.
+    let base_path = source_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(include.trim_start_matches("./"));
+    let base = load_vscode_theme_with_includes(&base_path, depth + 1)?;
+    Ok(file.layered_over(base))
+}
+
+/// The shared JSONC-tolerant parse step - see [`strip_jsonc_noise`].
+fn parse_vscode_theme_str(contents: &str) -> Result<VscodeThemeFile, VscodeThemeError> {
+    let stripped = strip_jsonc_noise(contents);
+    serde_json::from_str(&stripped).map_err(|err| VscodeThemeError::Parse(err.to_string()))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -782,10 +864,15 @@ pub fn convert_vscode_theme_str(
     contents: &str,
     source_stem: &str,
 ) -> Result<CustomThemeFile, VscodeThemeError> {
-    let stripped = strip_jsonc_noise(contents);
-    let file: VscodeThemeFile =
-        serde_json::from_str(&stripped).map_err(|err| VscodeThemeError::Parse(err.to_string()))?;
+    let file = parse_vscode_theme_str(contents)?;
+    convert_vscode_theme(file, source_stem)
+}
 
+/// The real conversion, over an already-parsed (and already-`include`-resolved) theme.
+fn convert_vscode_theme(
+    file: VscodeThemeFile,
+    source_stem: &str,
+) -> Result<CustomThemeFile, VscodeThemeError> {
     let swatches = swatches_from_vscode(&file)?;
 
     // Layer 1: a real, complete derived base for every token in the app.
@@ -985,13 +1072,12 @@ fn build_syntax_overrides(
 /// [`import_vscode_theme_file`]. Hands back an *unvalidated* [`CustomThemeFile`]; the caller still
 /// runs the shared validate-then-write path.
 pub fn convert_vscode_theme_file(source_path: &Path) -> Result<CustomThemeFile, VscodeThemeError> {
-    let contents = std::fs::read_to_string(source_path)
-        .map_err(|err| VscodeThemeError::Parse(err.to_string()))?;
+    let file = load_vscode_theme_with_includes(source_path, 0)?;
     let stem = source_path
         .file_stem()
         .map(|stem| stem.to_string_lossy().to_string())
         .unwrap_or_default();
-    convert_vscode_theme_str(&contents, &stem)
+    convert_vscode_theme(file, &stem)
 }
 
 /// Every real, specific way importing a VSCode theme *file* (as opposed to just converting
@@ -1433,5 +1519,211 @@ mod tests {
                 .expect("the written file must re-parse");
         assert_eq!(reparsed.overrides, validated.overrides);
         assert_eq!(reparsed.preview, validated.preview);
+    }
+}
+
+/// Real end-to-end import coverage against **actual, unmodified VSCode theme files** - not
+/// synthetic fixtures that might miss the paths a real file exercises.
+///
+/// `testdata/vscode/*.json` are the genuine files from Microsoft's own `theme-defaults` extension
+/// (MIT licensed, vendored verbatim), including their real JSONC comments, tabs, and `include`
+/// chains. Two real, user-reported bugs were found by pointing this at them rather than at a
+/// hand-written fixture:
+///
+/// - `Dark+` (`dark_plus.json`) failed to convert at all: it defines *no* `colors`, only
+///   `tokenColors` plus `"include": "./dark_vs.json"`, so ignoring `include` meant the converter
+///   genuinely could not see a background.
+/// - `Dark Modern` (`dark_modern.json`) converted but was then rejected by this crate's own
+///   readability check, because it sets `editor.background` `#1F1F1F` and
+///   `editorWidget.background` `#202020` - a deliberate flat-surface design that the old
+///   surface-against-surface check mistook for an unreadable theme.
+#[cfg(test)]
+mod real_vscode_default_theme_tests {
+    use super::*;
+    use crate::settings::custom_theme;
+
+    /// Writes the whole vendored fixture directory into a temp dir, so an `include` chain resolves
+    /// against real files on disk exactly as it does for a user importing from their VSCode
+    /// installation.
+    fn real_theme_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, contents) in [
+            ("dark_vs.json", include_str!("testdata/vscode/dark_vs.json")),
+            (
+                "dark_plus.json",
+                include_str!("testdata/vscode/dark_plus.json"),
+            ),
+            (
+                "dark_modern.json",
+                include_str!("testdata/vscode/dark_modern.json"),
+            ),
+            (
+                "light_vs.json",
+                include_str!("testdata/vscode/light_vs.json"),
+            ),
+            (
+                "light_plus.json",
+                include_str!("testdata/vscode/light_plus.json"),
+            ),
+            (
+                "light_modern.json",
+                include_str!("testdata/vscode/light_modern.json"),
+            ),
+            // Three more real, widely-used themes, for breadth beyond the shipped defaults:
+            // Monokai and Solarized Dark from VSCode's own bundled extensions, and One Dark Pro
+            // (MIT, the most-installed theme on the marketplace) - all verbatim, none hand-made.
+            ("monokai.json", include_str!("testdata/vscode/monokai.json")),
+            (
+                "solarized_dark.json",
+                include_str!("testdata/vscode/solarized_dark.json"),
+            ),
+            ("onedark.json", include_str!("testdata/vscode/onedark.json")),
+        ] {
+            std::fs::write(dir.path().join(name), contents).expect("write fixture");
+        }
+        dir
+    }
+
+    /// The non-negotiable one: every real, shipped VSCode default theme imports end to end -
+    /// converted, validated, written to disk, and loadable back as a real selectable theme.
+    #[test]
+    fn every_real_vscode_default_theme_imports_end_to_end() {
+        let source_dir = real_theme_dir();
+        let dest_dir = tempfile::tempdir().expect("tempdir");
+
+        for file_name in [
+            "dark_vs.json",
+            "dark_plus.json",
+            "dark_modern.json",
+            "light_vs.json",
+            "light_plus.json",
+            "light_modern.json",
+            "monokai.json",
+            "solarized_dark.json",
+            "onedark.json",
+        ] {
+            let imported =
+                import_vscode_theme_file(&source_dir.path().join(file_name), dest_dir.path())
+                    .unwrap_or_else(|err| {
+                        panic!("{file_name} is a real shipped VSCode theme and must import: {err}")
+                    });
+            assert_eq!(
+                imported.overrides.len(),
+                theme::all_tokens().count(),
+                "{file_name} must import as a real, complete palette"
+            );
+            let path = imported
+                .source_path
+                .as_ref()
+                .expect("an imported theme has a real backing file");
+            assert!(path.exists(), "{file_name} must really land on disk");
+        }
+
+        // And every one of them loads back cleanly from the directory it was written into.
+        let (loaded, errors) = custom_theme::load_custom_themes_from_dir(dest_dir.path());
+        assert!(
+            errors.is_empty(),
+            "re-loading the imports reported: {errors:?}"
+        );
+        assert_eq!(loaded.len(), 9, "every imported theme must load back");
+    }
+
+    /// The `include` chain is really followed, not merely tolerated: `Dark+` carries no `colors`
+    /// of its own at all, so every chrome colour in the result has to have come from
+    /// `dark_vs.json`, while its *own* `tokenColors` still win for syntax.
+    #[test]
+    fn dark_plus_really_inherits_its_colours_through_the_include_chain() {
+        let source_dir = real_theme_dir();
+        let raw = include_str!("testdata/vscode/dark_plus.json");
+        let parsed = parse_vscode_theme_str(raw).expect("the real file must parse");
+        assert!(
+            parsed.colors.is_empty(),
+            "premise: the real Dark+ file defines no colors of its own"
+        );
+        assert_eq!(parsed.include.as_deref(), Some("./dark_vs.json"));
+        assert!(
+            convert_vscode_theme_str(raw, "dark_plus").is_err(),
+            "premise: without following the include there is nothing to convert"
+        );
+
+        let file = convert_vscode_theme_file(&source_dir.path().join("dark_plus.json"))
+            .expect("following the include must make this convertible");
+        let entry = |key: &str| {
+            file.overrides
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(file.name, "Dark+");
+        assert_eq!(
+            entry("surface.window").as_deref(),
+            Some("#1e1e1e"),
+            "the window background has to have come from dark_vs.json's editor.background"
+        );
+        // Dark+'s own tokenColors style function declarations; that must still win.
+        assert_eq!(entry("syntax.function").as_deref(), Some("#dcdcaa"));
+    }
+
+    /// A circular `include` is a real, bounded error rather than a hang or a stack overflow.
+    #[test]
+    fn a_circular_include_chain_is_a_real_reported_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("a.json"),
+            r#"{ "include": "./b.json", "colors": {} }"#,
+        )
+        .expect("write");
+        std::fs::write(
+            dir.path().join("b.json"),
+            r#"{ "include": "./a.json", "colors": {} }"#,
+        )
+        .expect("write");
+
+        let err = convert_vscode_theme_file(&dir.path().join("a.json")).unwrap_err();
+        assert_eq!(
+            err,
+            VscodeThemeError::IncludeTooDeep {
+                limit: MAX_INCLUDE_DEPTH
+            }
+        );
+    }
+
+    /// A missing include target is reported honestly rather than silently importing a theme with
+    /// none of the colours the user expected.
+    #[test]
+    fn a_missing_include_target_is_a_real_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("orphan.json"),
+            r#"{ "include": "./nope.json", "colors": {} }"#,
+        )
+        .expect("write");
+        assert!(matches!(
+            convert_vscode_theme_file(&dir.path().join("orphan.json")),
+            Err(VscodeThemeError::Parse(_))
+        ));
+    }
+
+    /// The light defaults really import as light themes, and the dark ones as dark - a real check
+    /// that the whole conversion preserved the source theme's own character rather than merely
+    /// producing *something* valid.
+    #[test]
+    fn the_real_light_defaults_import_as_light_themes_and_the_dark_ones_as_dark() {
+        let source_dir = real_theme_dir();
+        for (file_name, expect_light) in [
+            ("dark_vs.json", false),
+            ("dark_modern.json", false),
+            ("light_vs.json", true),
+            ("light_modern.json", true),
+        ] {
+            let file = convert_vscode_theme_file(&source_dir.path().join(file_name))
+                .expect("must convert");
+            let theme = file.validate().expect("must validate");
+            assert_eq!(
+                theme::theme_is_light(theme.window_background()),
+                expect_light,
+                "{file_name} imported with the wrong light/dark character"
+            );
+        }
     }
 }
