@@ -1507,7 +1507,9 @@ impl EditBuffer {
         let mut result = String::with_capacity(1 + leading.len() + extra_indent.len());
         result.push('\n');
         result.push_str(leading);
-        if !extra_indent.is_empty() && indent::ends_with_opener(before_cursor) {
+        if !extra_indent.is_empty()
+            && indent::ends_with_block_opener(before_cursor, self.extension.as_deref())
+        {
             result.push_str(extra_indent);
         }
         result
@@ -2658,6 +2660,20 @@ mod tests {
         )
     }
 
+    /// Same as [`buffer`], but with a real `.py` extension - GitHub issue #121/PR #136's Python
+    /// colon-block auto-indent tests need a real `Some("py")` `EditBuffer::extension` (the same
+    /// lowercase, no-leading-dot convention `crate::language::EXTENSIONS` uses), not the `.rs`
+    /// default `buffer` hardcodes.
+    fn python_buffer(content: &str) -> EditBuffer {
+        EditBuffer::new(
+            PathBuf::from("/tmp/test.py"),
+            content.to_string(),
+            Some("py".to_string()),
+            None,
+            content.len() as u64,
+        )
+    }
+
     #[test]
     fn insert_at_position_splices_real_text_and_moves_the_caret_after_it() {
         let mut buf = buffer("fn main() {}\n");
@@ -2743,6 +2759,27 @@ mod tests {
         buf.move_to("fn main() {\n}".len());
         buf.insert_newline_with_auto_indent("    ");
         assert_eq!(buf.content, "fn main() {\n}\n\n");
+    }
+
+    /// GitHub issue #121, PR #136 review (Colin Espinas): Python block headers end with `:`, not
+    /// an opening bracket - a `.py`-extensioned buffer must still get the extra indent unit after
+    /// a line like `if True:`.
+    #[test]
+    fn insert_newline_with_auto_indent_adds_one_extra_level_after_a_python_colon_header() {
+        let mut buf = python_buffer("if True:\n    pass\n");
+        buf.move_to("if True:".len());
+        buf.insert_newline_with_auto_indent("    ");
+        assert_eq!(buf.content, "if True:\n    \n    pass\n");
+    }
+
+    /// The same trailing `:` must not trigger the extra indent for a non-Python buffer - a
+    /// colon means nothing special outside a real colon-block language.
+    #[test]
+    fn insert_newline_with_auto_indent_ignores_a_trailing_colon_outside_python() {
+        let mut buf = buffer("'outer:\n    loop {}\n");
+        buf.move_to("'outer:".len());
+        buf.insert_newline_with_auto_indent("    ");
+        assert_eq!(buf.content, "'outer:\n\n    loop {}\n");
     }
 
     /// Multi-cursor (issue #28 infrastructure, reused here): each real cursor gets its own real

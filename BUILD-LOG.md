@@ -7574,3 +7574,42 @@ indent.
 warnings`, `cargo fmt --all -- --check` - all clean. `cargo test --workspace -p app
 code_surface::`: 348 passed, 5 failed - all 5 pre-existing and environment-specific (LSP/GPU-paint
 tests unrelated to this change, already documented elsewhere in this log); all 8 new tests pass.
+
+## Enter's auto-indent gave Python no extra indent at all (PR #136 review, Colin Espinas)
+
+Colin's review of the auto-indent PR above pointed out a real gap: `indent::ends_with_opener`
+only recognizes `{`/`(`/`[`, so a Python block header (`if x:`, `def f():`, `else:`, `for i in
+xs:`, `class Foo:`, ...) - which never ends with a bracket - got zero extra indent on `Enter`,
+unlike every bracket-block language. His comment: "Missing indent when no opening character is
+there like when we use ':' in python? This should probably be per language? Idk where we could
+get the data for each language but this is not complete right now."
+
+Added `indent::ends_with_block_opener(text_before_cursor, extension)` (`crates/app/src/
+code_surface/indent.rs`): `ends_with_opener`'s existing bracket check, plus one more real case -
+a trailing `:` (after trimming real trailing whitespace) when `extension` is a real colon-block
+language, which today means exactly `"py"` (`is_colon_block_extension`, matching `crate::
+language::EXTENSIONS`'s own `"py"` entry - the one such language this crate actually has real
+LSP/highlighter support for). Deliberately scoped to just that one verified language rather than
+guessing at a general per-language table, per Colin's own "idk where we'd get that data" - a
+trailing `:` means nothing special outside a colon-block language (Rust `match` arms, struct
+field types, labeled loops), so `extension` gates it.
+
+`EditBuffer::auto_indent_insertion` now calls `ends_with_block_opener(before_cursor,
+self.extension.as_deref())` instead of `ends_with_opener(before_cursor)` directly -
+`EditBuffer::extension` already carries the same lowercase, no-leading-dot extension `crate::
+language::EXTENSIONS`/`code_view::highlighter_for_extension` use, so no new plumbing was needed
+through `handle_editor_enter_action`.
+
+Five new tests: four unit-level (`code_surface::indent::tests`) covering Python colon headers,
+a trailing colon outside Python (ignored), a bracket still winning regardless of extension, and a
+Python line with no trailing colon (no extra indent); one at the `EditBuffer` level
+(`code_surface::edit_buffer::tests`, via a new `python_buffer` test helper) plus a companion test
+confirming a non-Python trailing colon (a Rust labeled loop, `'outer:`) is ignored; one real
+end-to-end `#[gpui::test]` (`code_surface::editing::editing_tests`) driving a real `enter`
+keystroke against a real `.py` file.
+
+**Verification**: `cargo build --workspace`, `cargo fmt --all -- --check`, `cargo clippy
+--workspace --all-targets -- -D warnings` - all clean. `cargo test --workspace -p app
+code_surface::`: 379 passed, 4 failed - all 4 pre-existing and environment-specific (real
+LSP-server-readiness tests needing rust-analyzer/vue-language-server to actually finish starting,
+unrelated to this change); every new test passes.

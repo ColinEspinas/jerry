@@ -387,6 +387,33 @@ pub fn ends_with_opener(text_before_cursor: &str) -> bool {
     )
 }
 
+/// Whether `extension` (the same lowercase, no-leading-dot convention `crate::language::
+/// EXTENSIONS` and `crate::code_surface::edit_buffer::EditBuffer::extension` use) names a
+/// language whose block headers end a line with `:` rather than an opening bracket - real only
+/// for Python (`if x:`, `def f():`, `else:`, `for i in xs:`, `class Foo:`, ...), the one such
+/// language this crate actually resolves an LSP/highlighter for today (see `crate::language::
+/// EXTENSIONS`'s own `"py"` entry). Deliberately narrow per Colin Espinas's PR #136 review of
+/// GitHub issue #121 ("Missing indent when no opening character is there like when we use ':' in
+/// python ? This should probably be per language ?") - rather than guessing at other languages'
+/// own colon conventions with no real data backing them, this only recognizes the one language
+/// this codebase already has real, verified support for.
+fn is_colon_block_extension(extension: Option<&str>) -> bool {
+    matches!(extension, Some("py"))
+}
+
+/// [`ends_with_opener`], plus one more real, narrow case: `text_before_cursor` (after trimming
+/// real trailing whitespace) ends with `:` and `extension` is [`is_colon_block_extension`] - a
+/// colon-block language's own line-ending convention for opening an indented block, the same
+/// single-line, no-bracket-matching heuristic [`ends_with_opener`]'s own docs describe, just keyed
+/// off one more trailing character for the languages that use it. A trailing `:` means nothing
+/// special outside a colon-block language (e.g. Rust's `match` arms, struct field types, or
+/// labeled loops never open a new indent level just because a line happens to end with `:`), so
+/// `extension` gates it rather than checking every language's trailing `:` the same way.
+pub fn ends_with_block_opener(text_before_cursor: &str, extension: Option<&str>) -> bool {
+    ends_with_opener(text_before_cursor)
+        || (is_colon_block_extension(extension) && text_before_cursor.trim_end().ends_with(':'))
+}
+
 /// `crate::code_surface::edit_buffer::EditBuffer::indent_lines`'s own real "which lines does a
 /// selection touch" rule, factored out here so it's directly unit-testable without a live
 /// `EditBuffer`: every line the selection's `start` through `end` byte range overlaps, except a
@@ -760,6 +787,36 @@ mod tests {
         assert!(!ends_with_opener("let x = 1;"));
         assert!(!ends_with_opener(""));
         assert!(!ends_with_opener("   "));
+    }
+
+    #[test]
+    fn ends_with_block_opener_recognizes_python_colon_headers() {
+        assert!(ends_with_block_opener("if x:", Some("py")));
+        assert!(ends_with_block_opener("def f():", Some("py")));
+        assert!(ends_with_block_opener("else:", Some("py")));
+        assert!(ends_with_block_opener("for i in xs:", Some("py")));
+        assert!(ends_with_block_opener("class Foo:", Some("py")));
+        // Real trailing whitespace after the colon must not defeat the check.
+        assert!(ends_with_block_opener("if x:   ", Some("py")));
+    }
+
+    #[test]
+    fn ends_with_block_opener_ignores_a_trailing_colon_outside_python() {
+        assert!(!ends_with_block_opener("if x:", Some("rs")));
+        assert!(!ends_with_block_opener("def f():", Some("rs")));
+        assert!(!ends_with_block_opener("else:", None));
+    }
+
+    #[test]
+    fn ends_with_block_opener_still_detects_a_bracket_regardless_of_extension() {
+        assert!(ends_with_block_opener("fn foo() {", Some("rs")));
+        assert!(ends_with_block_opener("fn foo() {", Some("py")));
+        assert!(ends_with_block_opener("fn foo() {", None));
+    }
+
+    #[test]
+    fn ends_with_block_opener_is_false_for_a_python_line_with_no_trailing_colon() {
+        assert!(!ends_with_block_opener("x = 1", Some("py")));
     }
 
     #[test]

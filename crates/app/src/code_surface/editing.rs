@@ -4166,6 +4166,40 @@ mod editing_tests {
         );
     }
 
+    /// GitHub issue #121, PR #136 review (Colin Espinas: "Missing indent when no opening
+    /// character is there like when we use ':' in python"): a real Python file's block header
+    /// ending in `:` (no opening bracket at all) must still get one extra real indent level,
+    /// the same way an opening bracket already does for every language.
+    #[gpui::test]
+    fn enter_adds_one_extra_real_indent_level_after_a_python_colon_header(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.py", "if True:\n    pass\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.py");
+
+        app.update(cx, |app, cx| {
+            app.edit_buffer_mut(&relative)
+                .unwrap()
+                .move_to("if True:".len());
+            cx.notify();
+        });
+
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffer(&relative)
+                .unwrap()
+                .content
+                .clone()),
+            "if True:\n    \n    pass\n",
+            "a Python block header ending in ':' must add one real indent unit, exactly like \
+             an opening bracket does"
+        );
+    }
+
     /// Revision R8.5b audit finding 1's direct regression test: the sixth instance of this
     /// project's recurring "a keystroke gets swallowed" bug class. Before this fix, `Self::
     /// completions_open_for_active_path` returned `true` for *any* real [`CompletionsEntry`],
