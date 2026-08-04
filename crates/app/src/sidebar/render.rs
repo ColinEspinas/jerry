@@ -1280,6 +1280,7 @@ impl AdeApp {
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
+                    .truncate()
                     .text_color(if entry.is_dir {
                         theme::text::SECONDARY
                     } else {
