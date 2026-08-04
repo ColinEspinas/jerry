@@ -5,10 +5,19 @@
 //! (only [`gpui::Rgba`] is used, for plain colour data), mirroring this crate's split between
 //! pure logic modules and `crate::root`'s `Div` construction.
 //!
-//! `.rs`/`.ts`/`.tsx`/`.js`/`.jsx`/`.py`/`.toml`/`.go`/`.json`/`.yaml`/`.yml`/`.c`/`.h` get real
-//! syntax spans; other extensions (including `.vue` - see `crate::language`'s docs for why this
-//! phase doesn't spawn an LSP client for it, unrelated to highlighting, and `.md`/`.sql` - a real,
-//! stated follow-up, GitHub issue #32's own remaining scope) render as plain monospace text.
+//! `.rs`/`.ts`/`.tsx`/`.js`/`.jsx`/`.py`/`.toml`/`.go`/`.json`/`.yaml`/`.yml`/`.c`/`.h`/`.md`/
+//! `.html`/`.htm`/`.css` get real syntax spans; other extensions (including `.vue` - see
+//! `crate::language`'s docs for why this phase doesn't spawn an LSP client for it, unrelated to
+//! highlighting, and `.sql` - a real, stated follow-up, GitHub issue #32's own remaining scope)
+//! render as plain monospace text.
+//!
+//! Markdown additionally drives **real cross-language injection** (GitHub issue #154): a fenced
+//! code block's content is reparsed with whatever language its info string names, resolved against
+//! this crate's own registry through [`Grammar::for_injection_name`], and raw HTML written into a
+//! markdown document - block-level or inline - reaches `tree-sitter-html`. HTML in turn injects
+//! its own `<style>`/`<script>` bodies into CSS/JavaScript. See [`MARKDOWN_INJECTION_QUERY`] and
+//! [`MARKDOWN_BLOCK_HIGHLIGHTS_SUPPLEMENT`] for the two real, empirically-found repairs that
+//! actually takes.
 //!
 //! ## How highlighting actually works here
 //!
@@ -193,7 +202,7 @@ pub fn language_name_for_extension(extension: Option<&str>) -> &'static str {
 /// consolidation of what used to be a second, independent extension -> highlighter `match`
 /// statement `load_file` maintained on its own, invisible to that registry). `None` for an
 /// extension absent from the registry, or present with no real grammar wired
-/// ([`crate::language::ExtensionEntry::highlighter`] itself `None` - TOML/Markdown/SQL/Vue/Go).
+/// ([`crate::language::ExtensionEntry::highlighter`] itself `None` - only SQL and Vue, today).
 pub fn highlighter_for_extension(
     extension: Option<&str>,
 ) -> Option<crate::language::HighlighterFn> {
@@ -316,13 +325,22 @@ enum Grammar {
     /// through [`Grammar::Markdown`]'s own injection callback - never a file's own top-level
     /// grammar.
     MarkdownInline,
+    /// GitHub issue #154: `tree-sitter-html`, the real top-level grammar for `.html`/`.htm`. Also
+    /// reached as an *injection* target - from Markdown's own `(html_block)`/`(html_tag)` patterns
+    /// (see [`MARKDOWN_INJECTION_QUERY`] / [`MARKDOWN_INLINE_INJECTION_QUERY`]) - which is the
+    /// "including in the markdown files" half of that issue.
+    Html,
+    /// GitHub issue #154: `tree-sitter-css`, the real top-level grammar for `.css`. Also reached as
+    /// an injection target from [`Grammar::Html`]'s own bundled `injections.scm`, which routes a
+    /// `<style>` element's `(raw_text)` here.
+    Css,
 }
 
 impl Grammar {
     /// Every real grammar, in [`Grammar::index`] order - the single list both
     /// [`HIGHLIGHT_CONFIGS`]' slot count and this module's own coverage tests are derived from, so
     /// adding a grammar cannot leave either behind.
-    const ALL: [Grammar; 11] = [
+    const ALL: [Grammar; 13] = [
         Grammar::Rust,
         Grammar::TypeScript,
         Grammar::Tsx,
@@ -334,6 +352,8 @@ impl Grammar {
         Grammar::C,
         Grammar::Markdown,
         Grammar::MarkdownInline,
+        Grammar::Html,
+        Grammar::Css,
     ];
 
     const COUNT: usize = Self::ALL.len();
@@ -354,6 +374,8 @@ impl Grammar {
             Grammar::C => 8,
             Grammar::Markdown => 9,
             Grammar::MarkdownInline => 10,
+            Grammar::Html => 11,
+            Grammar::Css => 12,
         }
     }
 
@@ -370,6 +392,8 @@ impl Grammar {
             Grammar::C => tree_sitter_c::LANGUAGE.into(),
             Grammar::Markdown => tree_sitter_md::LANGUAGE.into(),
             Grammar::MarkdownInline => tree_sitter_md::INLINE_LANGUAGE.into(),
+            Grammar::Html => tree_sitter_html::LANGUAGE.into(),
+            Grammar::Css => tree_sitter_css::LANGUAGE.into(),
         }
     }
 
@@ -386,7 +410,74 @@ impl Grammar {
             Grammar::C => "c",
             Grammar::Markdown => "markdown",
             Grammar::MarkdownInline => "markdown_inline",
+            Grammar::Html => "html",
+            Grammar::Css => "css",
         }
+    }
+
+    /// The grammar an `@injection.language` capture or a `#set! injection.language` predicate
+    /// naming `name` should resolve to - the single real resolver behind
+    /// [`injection_config`], which every [`Highlighter::highlight`] call in this module
+    /// passes as its injection callback.
+    ///
+    /// Two vocabularies genuinely feed into this, which is why it is two lookups rather than one
+    /// table:
+    ///
+    /// 1. **A grammar's own internal name** ([`Grammar::name`]), which is what a hard-coded
+    ///    `#set!` predicate in a bundled `injections.scm` says: `tree-sitter-md`'s
+    ///    `"markdown_inline"` and `"html"`, `tree-sitter-html`'s `"css"`.
+    /// 2. **A fenced code block's own info string**, which is free-form author-written text
+    ///    (` ```rust `, ` ```py `, ` ```yml `) and is matched through
+    ///    [`crate::language::extension_for_fence_language`] - the one shared fence-tag alias table
+    ///    this crate has, also used by `crate::code_surface::markdown_preview`'s rendered code
+    ///    blocks, so source-view and preview-mode fences can never disagree about what ` ```py `
+    ///    means.
+    ///
+    /// An unrecognized name returns `None`, which `tree-sitter-highlight` handles by simply not
+    /// creating an injected layer (`highlight.rs:910-917`, read directly) - the content then stays
+    /// exactly as the outer grammar classified it. That is the honest fallback for a ` ```zig `
+    /// fence this app has no grammar for, and for `tree-sitter-md`'s own `"latex"` injection: no
+    /// panic, no fabricated colouring.
+    fn for_injection_name(name: &str) -> Option<Grammar> {
+        if let Some(grammar) = Grammar::ALL
+            .into_iter()
+            .find(|grammar| grammar.name() == name)
+        {
+            return Some(grammar);
+        }
+        Grammar::for_extension(crate::language::extension_for_fence_language(name)?)
+    }
+
+    /// The real grammar behind a [`crate::language::EXTENSIONS`] extension key. Kept honest
+    /// against that registry by `every_registry_extension_with_a_highlighter_has_an_injectable_
+    /// grammar`, so an extension that gains a highlighter but not an entry here (and would then
+    /// silently stop working as a markdown fence language) fails a test rather than degrading
+    /// quietly.
+    ///
+    /// This deliberately does *not* try to derive itself from `ExtensionEntry::highlighter`'s own
+    /// `fn` pointer: comparing function pointers for equality is not something Rust guarantees
+    /// (identical monomorphisations may be merged), so a table that looked derived would in fact
+    /// be relying on unspecified behaviour. An explicit match plus a real drift test is the honest
+    /// version of the same guarantee.
+    fn for_extension(extension: &str) -> Option<Grammar> {
+        Some(match extension {
+            "rs" => Grammar::Rust,
+            // `.js` reuses the plain TypeScript grammar, `.jsx` the TSX one - see
+            // [`highlight_typescript`]'s own docs, and `crate::language::EXTENSIONS`' `js`/`jsx`
+            // entries, which wire exactly this pairing.
+            "ts" | "js" => Grammar::TypeScript,
+            "tsx" | "jsx" => Grammar::Tsx,
+            "py" => Grammar::Python,
+            "toml" => Grammar::Toml,
+            "go" => Grammar::Go,
+            "json" => Grammar::Json,
+            "yaml" | "yml" => Grammar::Yaml,
+            "c" | "h" => Grammar::C,
+            "md" => Grammar::Markdown,
+            "html" | "htm" => Grammar::Html,
+            "css" => Grammar::Css,
+            _ => return None,
+        })
     }
 }
 
@@ -556,13 +647,12 @@ const HIGHLIGHT_NAMES: &[&str] = &[
     "text.reference",
     "text.strong",
     "text.emphasis",
-    // `tree-sitter-md`'s own block query's `(code_fence_content) @none` - a real, deliberate
-    // "cancel the enclosing `text.literal` colour for this span" instruction (the surrounding
-    // `(fenced_code_block) @text.literal` is still open otherwise), not a typo or an unused
-    // capture. Registering it here as a real recognized name (mapped to `Text` below) is what
-    // makes `HighlightConfiguration::configure`'s own matching rule actually resolve it, instead
-    // of the span silently inheriting whatever the parent already opened.
-    "none",
+    // `"none"` is deliberately **not** registered, and that absence is load-bearing - see
+    // [`MARKDOWN_BLOCK_HIGHLIGHTS_SUPPLEMENT`], which is what makes real per-fence language
+    // injection produce correct spans. GitHub issue #104 originally registered it (mapped to
+    // `Text`) to cancel the enclosing `(fenced_code_block) @text.literal`; issue #154 achieves
+    // the same visible result by cancelling `@text.literal` at its source instead, which - unlike
+    // a registered `"none"` - leaves no parent highlight open across an injected range.
 ];
 
 /// [`HIGHLIGHT_NAMES`]' positional parallel array: which real [`HighlightKind`] each recognized
@@ -637,7 +727,6 @@ const HIGHLIGHT_KINDS: [HighlightKind; HIGHLIGHT_NAMES.len()] = [
     HighlightKind::Link,
     HighlightKind::Strong,
     HighlightKind::Emphasis,
-    HighlightKind::Text,
 ];
 
 /// Real supplement appended after `tree-sitter-python`'s own bundled `queries/highlights.scm`,
@@ -811,6 +900,46 @@ const TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT: &str = r#"
 (predefined_type "void" @type.builtin)
 "#;
 
+/// Real supplement appended after `tree-sitter-md`'s own bundled block `highlights.scm` (GitHub
+/// issue #154). Two lines, and the first one is the single thing that makes real per-fence
+/// language injection produce *correct* spans rather than shifted, half-missing ones.
+///
+/// ## Why a parent highlight over an injected range is actively harmful
+///
+/// `tree_sitter_highlight::Highlighter::highlight` flattens every layer into one event stream, and
+/// its `HighlightEnd` events carry no identity - a consumer can only keep a stack and pop it (see
+/// [`fold_highlight_events`]). That model is only sound while highlights properly nest. They do
+/// not, across layers: at the same start byte the engine emits the *deeper* layer's start first
+/// (`sort_key` orders on `-depth`, `highlight.rs:770-800`), so a shallower highlight spanning the
+/// whole injected range gets pushed **on top of** the injected layer's own first highlight, and
+/// then the injected highlight's `HighlightEnd` pops the wrong entry.
+///
+/// That is not hypothetical - it is exactly what a ` ```rust ` fence produced before this
+/// supplement existed, measured directly off the real event stream: `fn` came out
+/// [`Text`](HighlightKind::Text) (shadowed by the block grammar's own `(code_fence_content)
+/// @none`, which this app used to register as a real `Text` bucket) while the rest of the line
+/// came out `Keyword` (the mis-popped stack). Both symptoms disappear together once no parent
+/// highlight is left open over the fence's content.
+///
+/// 1. **`(fenced_code_block) @none`** cancels the bundled query's own `[(link_title)
+///    (indented_code_block) (fenced_code_block)] @text.literal` for fenced blocks only, by the
+///    "last matching pattern wins" rule cited on [`PYTHON_HIGHLIGHTS_SUPPLEMENT`].
+///    `"none"` is deliberately absent from [`HIGHLIGHT_NAMES`], so it resolves to *no highlight at
+///    all* rather than to a `Text` one - `HighlightConfiguration::configure` leaves an unrecognized
+///    capture's `highlight_indices` entry `None`, and `next()` emits no start event for it
+///    (`highlight.rs:1058-1066`). The bundled `(code_fence_content) @none` now resolves the same
+///    way, for free. Indented code blocks and link titles keep their `@text.literal` colour; only
+///    fenced blocks, the ones that can carry an injection, are cleared.
+/// 2. **`(info_string) @text.literal`** puts back the one visible thing step 1 would otherwise
+///    take away: the language tag after the opening ` ``` ` rendered as
+///    [`String`](HighlightKind::String) before this change (it inherited the fence's own
+///    `@text.literal`), and it still does. Restating the *same* recognized name keeps that exactly
+///    as it was rather than picking a new colour for it.
+const MARKDOWN_BLOCK_HIGHLIGHTS_SUPPLEMENT: &str = r#"
+(fenced_code_block) @none
+(info_string) @text.literal
+"#;
+
 /// The real, composed highlights query source for `grammar`, built from the grammar crates' own
 /// published `queries/*.scm` files (exposed by each crate as a `&'static str` constant, so nothing
 /// here reads from disk or vendors a copy of a query file).
@@ -864,8 +993,16 @@ fn highlight_query_for(grammar: Grammar) -> String {
         ),
         Grammar::Yaml => tree_sitter_yaml::HIGHLIGHTS_QUERY.to_string(),
         Grammar::C => tree_sitter_c::HIGHLIGHT_QUERY.to_string(),
-        Grammar::Markdown => tree_sitter_md::HIGHLIGHT_QUERY_BLOCK.to_string(),
+        Grammar::Markdown => format!(
+            "{}\n{MARKDOWN_BLOCK_HIGHLIGHTS_SUPPLEMENT}",
+            tree_sitter_md::HIGHLIGHT_QUERY_BLOCK
+        ),
         Grammar::MarkdownInline => tree_sitter_md::HIGHLIGHT_QUERY_INLINE.to_string(),
+        // Both plural (`HIGHLIGHTS_QUERY`), unlike `tree-sitter-c`'s and
+        // `tree-sitter-javascript`'s singular `HIGHLIGHT_QUERY` above - checked against each
+        // crate's own `bindings/rust/lib.rs`, not assumed from a neighbour.
+        Grammar::Html => tree_sitter_html::HIGHLIGHTS_QUERY.to_string(),
+        Grammar::Css => tree_sitter_css::HIGHLIGHTS_QUERY.to_string(),
     }
 }
 
@@ -893,16 +1030,89 @@ fn highlight_query_for(grammar: Grammar) -> String {
 ///    capture silently fails to fire (confirmed directly: the exact same source highlights
 ///    correctly once this one predicate is added, nothing else changed).
 ///
-/// The bundled file's other real capability - marking fenced-code-block content, HTML blocks, and
-/// YAML/TOML frontmatter for injection into *other* languages by name (`"rust"`, `"html"`, ...) -
-/// is deliberately not reproduced here: this app's `injection_callback` only ever resolves
-/// `"markdown_inline"`, so those patterns would never fire anyway. Real cross-language injection
-/// into an arbitrary fenced code block's own language is a separate, larger feature (fuzzy
-/// matching an arbitrary fence info string against this app's existing per-extension grammar
-/// registry) left for a future revision, not fabricated here.
+/// ## Real cross-language injection (GitHub issue #154)
+///
+/// The three patterns after the `(inline)` one are the feature this constant's own docs used to
+/// describe as "a separate, larger feature ... left for a future revision": a fenced code block's
+/// content is now genuinely reparsed with the language its info string names. Each is copied
+/// **verbatim** from `tree-sitter-md`'s own bundled `tree-sitter-markdown/queries/injections.scm`
+/// (unlike the `(inline)` pattern above, whose two real bugs are described in detail below, these
+/// three are correct as shipped and needed no repair), and each was checked against the block
+/// grammar's own `src/node-types.json` rather than guessed - `(fenced_code_block)` really does
+/// carry an `(info_string)` whose own `(language)` child holds the fence tag, and a separate
+/// `(code_fence_content)` child holding the body.
+///
+/// Two details of that fenced-block pattern are load-bearing and easy to get wrong:
+///
+/// - The language comes from an **`@injection.language` capture**, not a `#set!` predicate.
+///   `tree-sitter-highlight` reads the captured node's own source text as the language name
+///   (`injection_for_match`, `highlight.rs:1262-1269`, read directly), which is what makes an
+///   arbitrary, author-written fence tag resolvable at all. [`Grammar::for_injection_name`] is
+///   what that text is then matched against.
+/// - It deliberately does **not** set `injection.include-children`, the exact opposite of the
+///   `(inline)` pattern above. `(code_fence_content)`'s only real child type is
+///   `(block_continuation)` - the leading `> ` / list-indent prefix repeated on each line of a
+///   fence nested inside a block quote or list item. Excluding children (the engine's default) is
+///   precisely what keeps those prefixes out of the reparsed range, so the injected grammar sees
+///   the code and not the markdown scaffolding around it.
+///
+/// `(html_block)` is the same feature's block-level HTML half, and the `(minus_metadata)`/
+/// `(plus_metadata)` patterns are real YAML/TOML frontmatter, all three now resolvable because
+/// this app has those grammars. The bundled file's remaining pattern - the `(document . (section
+/// . (thematic_break) ...))` frontmatter fallback - is deliberately left out: it is a
+/// heuristic for grammars built *without* the frontmatter extension, and this crate's
+/// `tree-sitter-md` build does have `(minus_metadata)`/`(plus_metadata)`, so including both would
+/// mean two patterns racing for the same bytes.
 const MARKDOWN_INJECTION_QUERY: &str = r#"
 ((inline) @injection.content
  (#set! injection.language "markdown_inline")
+ (#set! injection.include-children))
+
+((fenced_code_block
+   (info_string
+     (language) @injection.language)
+   (code_fence_content) @injection.content)
+ (#set! injection.include-children))
+
+((html_block) @injection.content
+ (#set! injection.language "html")
+ (#set! injection.include-children))
+
+((minus_metadata) @injection.content
+  (#set! injection.language "yaml"))
+
+((plus_metadata) @injection.content
+  (#set! injection.language "toml"))
+"#;
+
+/// `tree-sitter-md`'s **inline** grammar's own bundled `injections.scm`, verbatim (GitHub issue
+/// #154) - the inline half of "including in the markdown files": a raw `<span class="x">` written
+/// inline in a paragraph is an `(html_tag)` node, and now really is parsed by
+/// [`Grammar::Html`].
+///
+/// Both patterns are correctly paren-wrapped upstream, so they need none of the first repair the
+/// block file's `(inline)` pattern needs - but they need the **second** one, for exactly the same
+/// underlying reason, and without it neither fires at all. `(html_tag)` looks like a leaf and is
+/// not: read off a real parse of `Inline <span class="i">tag</span> here.`, its `<span class="i">`
+/// node carries unnamed child tokens for `<`, both `"`s and `>`. `tree-sitter-highlight` excludes
+/// an `@injection.content` node's children from the injected range by default, so what survives
+/// is a shredded, non-contiguous handful of bytes - and `intersect_ranges` can hand back nothing
+/// at all, which the engine silently drops (`highlight.rs:917`, an `if !ranges.is_empty()` with no
+/// else). That silent-drop path is precisely what this constant produced before
+/// `injection.include-children` was added: the callback was called with `"html"`, resolved
+/// correctly, and still highlighted nothing.
+///
+/// `"latex"` is kept rather than stripped: this app has no LaTeX grammar, so
+/// [`Grammar::for_injection_name`] returns `None` for it and `tree-sitter-highlight` simply
+/// creates no layer - the same honest no-op an unrecognized fence tag gets. Keeping it means the
+/// day a LaTeX grammar is added, nothing here needs editing.
+const MARKDOWN_INLINE_INJECTION_QUERY: &str = r#"
+((html_tag) @injection.content
+ (#set! injection.language "html")
+ (#set! injection.include-children))
+
+((latex_block) @injection.content
+ (#set! injection.language "latex")
  (#set! injection.include-children))
 "#;
 
@@ -910,20 +1120,25 @@ const MARKDOWN_INJECTION_QUERY: &str = r#"
 /// [`HighlightConfiguration::configure`]d against [`HIGHLIGHT_NAMES`].
 ///
 /// The locals query is deliberately always empty, and the injection query is empty for every
-/// grammar except [`Grammar::Markdown`] - both real decisions, not gaps left to fill in later:
+/// grammar except the three that genuinely have one - both real decisions, not gaps left to fill
+/// in later:
 ///
-/// - **Injections.** Every grammar except `Markdown` needs none: TSX parses JSX as part of its
-///   own single grammar rather than as an injected language, and the only injections the Rust and
-///   Python query files describe are things like SQL-in-a-string-literal, which this app has no
-///   second grammar to inject *into* anyway. Passing an injection query without a real
-///   `injection_callback` able to supply those grammars would add machinery that could never
-///   fire. None of the five GitHub-issue-#32 grammars bundle a real `queries/injections.scm`
-///   either - verified directly against each one's own `queries/` directory, not assumed.
-///   `Markdown` is the one real exception (GitHub issue #104): its own bundled block grammar
+/// - **Injections.** Only Markdown (block), Markdown (inline) and HTML get one. TSX parses JSX as
+///   part of its own single grammar rather than as an injected language, and the only injections
+///   the Rust and Python query files describe are things like SQL-in-a-string-literal, which this
+///   app has no second grammar to inject *into* anyway. None of the five GitHub-issue-#32 grammars
+///   bundles a real `queries/injections.scm` at all - verified directly against each one's own
+///   `queries/` directory, not assumed - and neither does `tree-sitter-css`.
+///   `Markdown` was the original exception (GitHub issue #104): its own bundled block grammar
 ///   genuinely never parses prose content itself, only the injected `Grammar::MarkdownInline` -
-///   see [`MARKDOWN_INJECTION_QUERY`]'s own docs. `MarkdownInline`'s own `injections.scm` (HTML/
-///   LaTeX) is left empty here for the identical "no callback able to supply those grammars"
-///   reason.
+///   see [`MARKDOWN_INJECTION_QUERY`]'s own docs. GitHub issue #154 added the other two, both
+///   real and both now backed by grammars that actually exist here: `MarkdownInline`'s inline
+///   `(html_tag)` (see [`MARKDOWN_INLINE_INJECTION_QUERY`]), and `tree-sitter-html`'s own bundled
+///   `INJECTIONS_QUERY`, used verbatim - it routes a `<style>` element's `(raw_text)` to
+///   `"css"` and a `<script>` element's to `"javascript"`, and
+///   [`Grammar::for_injection_name`] resolves both (the latter through the fence-alias table's
+///   `"javascript" -> "js"` entry, landing on the plain TypeScript grammar `.js` files already
+///   use).
 /// - **Locals.** `tree-sitter-typescript` ships a `locals.scm`, and feeding it would switch on
 ///   `tree-sitter-highlight`'s local-variable tracking, which exists to let a query colour a
 ///   variable *reference* like its *definition*. This app's buckets do not distinguish variables
@@ -935,6 +1150,8 @@ fn build_highlight_config(
 ) -> Result<HighlightConfiguration, tree_sitter::QueryError> {
     let injection_query = match grammar {
         Grammar::Markdown => MARKDOWN_INJECTION_QUERY,
+        Grammar::MarkdownInline => MARKDOWN_INLINE_INJECTION_QUERY,
+        Grammar::Html => tree_sitter_html::INJECTIONS_QUERY,
         _ => "",
     };
     let mut config = HighlightConfiguration::new(
@@ -995,6 +1212,38 @@ fn highlight_config(grammar: Grammar) -> Option<&'static HighlightConfiguration>
             }
         })
         .as_ref()
+}
+
+/// The single real `injection_callback` every [`Highlighter::highlight`] call in this module
+/// passes (GitHub issue #154). `tree-sitter-highlight` hands it the language name an
+/// `@injection.language` capture or a `#set! injection.language` predicate produced, and takes the
+/// returned configuration as the grammar to reparse that injected range with; returning `None`
+/// means no layer is created at all and the outer grammar's own classification stands
+/// (`highlight.rs:910-917`, read directly).
+///
+/// It is a plain function rather than a closure so that all three real injection sources - a
+/// markdown fence's info string, a markdown `(html_block)`, an HTML `<style>`/`<script>` element -
+/// go through exactly one resolution path. See [`Grammar::for_injection_name`] for what that path
+/// actually matches against.
+///
+/// Recursion is real and terminates for a real, structural reason rather than a depth cap: an
+/// injected range is always strictly inside its host node, so a ` ```markdown ` fence inside a
+/// markdown document reparses strictly less text each time, and a zero-length range is dropped by
+/// the engine before a layer is even built. The [`HIGHLIGHT_CONFIGS`] `OnceLock` slots cannot
+/// deadlock on that recursion either: this callback only ever runs *during*
+/// `Highlighter::highlight`, which is after the outer grammar's own `get_or_init` has already
+/// returned, so no slot is ever re-entered while it is still initialising.
+///
+/// The `'a` return lifetime is deliberate and load-bearing, not noise: `Highlighter::highlight`'s
+/// own signature is `impl FnMut(&str) -> Option<&'a HighlightConfiguration> + 'a` where that same
+/// `'a` also bounds the *source* slice and the `Highlighter` itself
+/// (`tree-sitter-highlight-0.26.9/src/highlight.rs:284-290`). A plain `fn(&str) ->
+/// Option<&'static HighlightConfiguration>` therefore forces `'a == 'static` and makes the whole
+/// call require a `'static` source - a real borrow-check error, not a style preference. Being
+/// generic here lets the caller instantiate `'a` at whatever the borrow actually is; the value
+/// returned is still always a `&'static` one out of [`HIGHLIGHT_CONFIGS`].
+fn injection_config<'a>(name: &str) -> Option<&'a HighlightConfiguration> {
+    highlight_config(Grammar::for_injection_name(name)?)
 }
 
 /// Parses `source` with `tree-sitter-rust` and classifies it through the real, official
@@ -1078,10 +1327,34 @@ pub fn highlight_c(source: &str) -> Vec<HighlightSpan> {
     highlight_with(source, Grammar::C)
 }
 
+/// Parses `source` with `tree-sitter-html` and classifies it the same way [`highlight_rust`] does -
+/// GitHub issue #154. Used for both `.html` and `.htm`.
+///
+/// Unlike most wrappers here this one really does reach two further grammars: `tree-sitter-html`'s
+/// own bundled `INJECTIONS_QUERY` is wired (see [`build_highlight_config`]), so a `<style>`
+/// element's body is genuinely parsed as CSS and a `<script>` element's body as
+/// JavaScript/TypeScript, through [`injection_config`].
+pub fn highlight_html(source: &str) -> Vec<HighlightSpan> {
+    highlight_with(source, Grammar::Html)
+}
+
+/// Parses `source` with `tree-sitter-css` and classifies it the same way [`highlight_rust`] does -
+/// GitHub issue #154. `tree-sitter-css` bundles no `injections.scm`, so this is a plain
+/// single-grammar path.
+pub fn highlight_css(source: &str) -> Vec<HighlightSpan> {
+    highlight_with(source, Grammar::Css)
+}
+
 /// The one real highlighting path every language wrapper above funnels into: run the official
 /// [`tree_sitter_highlight::Highlighter`] over `source` with `grammar`'s real
 /// [`HighlightConfiguration`], and fold the [`HighlightEvent`] stream it emits down into this
 /// app's six [`HighlightKind`] buckets.
+///
+/// [`injection_config`] is passed as the real injection callback for *every* grammar, not only the
+/// ones that have an injection query (GitHub issue #154). That is not speculative machinery: a
+/// grammar built with an empty injection query has no injection capture indices at all, so the
+/// callback is never reached for it, and the three grammars that do have one
+/// ([`build_highlight_config`]) all resolve through the same single path.
 ///
 /// The event stream is a flat, in-order sequence of `HighlightStart`/`Source`/`HighlightEnd`, and
 /// `HighlightStart`s **nest** - a Rust `\n` escape inside a string literal arrives as a real
@@ -1108,7 +1381,8 @@ fn highlight_with(source: &str, grammar: Grammar) -> Vec<HighlightSpan> {
         return Vec::new();
     };
     let mut highlighter = Highlighter::new();
-    let Ok(events) = highlighter.highlight(config, source.as_bytes(), None, |_| None) else {
+    let Ok(events) = highlighter.highlight(config, source.as_bytes(), None, injection_config)
+    else {
         return Vec::new();
     };
     fold_highlight_events(events)
@@ -1118,31 +1392,24 @@ fn highlight_with(source: &str, grammar: Grammar) -> Vec<HighlightSpan> {
 /// `tree-sitter-highlight` engine [`highlight_with`] uses - GitHub issue #104. Unlike every other
 /// grammar in this module, Markdown's own block grammar never parses prose content itself: real
 /// text (emphasis, links, code spans, ...) lives inside `(inline)` nodes the block grammar leaves
-/// opaque, and only [`Grammar::MarkdownInline`] - reached through a real
-/// `injection_callback` this function supplies, resolving exactly the one language name
-/// `MARKDOWN_INJECTION_QUERY`'s own `(#set! injection.language "markdown_inline")` rule ever
-/// requests - actually parses it. Without this callback, every real markdown document would
-/// render as a single flat `Text` region: verified directly by testing this function with
-/// `|_| None` in place first (`inline_content_is_never_left_as_a_single_flat_text_region`'s own
-/// premise).
+/// opaque, and only [`Grammar::MarkdownInline`] - reached through the real injection callback
+/// [`highlight_with`] passes, resolving `MARKDOWN_INJECTION_QUERY`'s own `(#set!
+/// injection.language "markdown_inline")` rule - actually parses it. Without that callback, every
+/// real markdown document would render as a single flat `Text` region: verified directly by
+/// testing this function with `|_| None` in place first
+/// (`inline_content_is_never_left_as_a_single_flat_text_region`'s own premise).
+///
+/// This used to carry its own bespoke, `"markdown_inline"`-only callback and so could not be
+/// expressed as a plain [`highlight_with`] call. GitHub issue #154 replaced that with the shared
+/// [`injection_config`] resolver, which is what makes a ` ```html ` / ` ```rust ` fence's *content*
+/// really reach that language's own grammar - so this is now the same one-line wrapper every other
+/// language here is, and the difference lives entirely in `Markdown`'s injection query.
 pub fn highlight_markdown(source: &str) -> Vec<HighlightSpan> {
-    let Some(block_config) = highlight_config(Grammar::Markdown) else {
-        return Vec::new();
-    };
-    let Some(inline_config) = highlight_config(Grammar::MarkdownInline) else {
-        return Vec::new();
-    };
-    let mut highlighter = Highlighter::new();
-    let Ok(events) = highlighter.highlight(block_config, source.as_bytes(), None, |name| {
-        (name == Grammar::MarkdownInline.name()).then_some(inline_config)
-    }) else {
-        return Vec::new();
-    };
-    fold_highlight_events(events)
+    highlight_with(source, Grammar::Markdown)
 }
 
-/// The one real event-folding path both [`highlight_with`] and [`highlight_markdown`] funnel
-/// into: collapses a [`tree_sitter_highlight::Highlighter::highlight`] event stream down into
+/// The one real event-folding path every highlighting entry point in this module funnels into:
+/// collapses a [`tree_sitter_highlight::Highlighter::highlight`] event stream down into
 /// this app's [`HighlightKind`] buckets.
 ///
 /// The event stream is a flat, in-order sequence of `HighlightStart`/`Source`/`HighlightEnd`, and
@@ -2487,19 +2754,347 @@ mod tests {
         );
     }
 
-    /// `(code_fence_content) @none` (GitHub issue #104) must actually cancel the surrounding
-    /// `(fenced_code_block) @text.literal`'s own `String` colour for the fence's inner content -
-    /// not silently inherit it, which is what would happen if `"none"` were left unregistered in
-    /// `HIGHLIGHT_NAMES` (see that list's own docs on this exact capture).
+    /// Fenced code content must never inherit the enclosing fence's own `@text.literal` `String`
+    /// colour. GitHub issue #104 achieved that by registering `"none"`; GitHub issue #154 achieves
+    /// it by cancelling `@text.literal` at source instead - see
+    /// [`MARKDOWN_BLOCK_HIGHLIGHTS_SUPPLEMENT`] for why the second way is the only one compatible
+    /// with a real injected layer. Either way this assertion is the same one, and it is the guard
+    /// that the swap did not quietly lose it.
     #[test]
     fn markdown_fenced_code_block_content_is_not_colored_like_a_string() {
         let spans = highlight_markdown(SAMPLE_MARKDOWN);
         assert_ne!(
             kind_at(&spans, SAMPLE_MARKDOWN, "fn main"),
             HighlightKind::String,
-            "fenced code content must not inherit the fence's own text.literal colour - this app \
-             does not (yet) inject the fence's own language, so plain Text is the honest result"
+            "fenced code content must not inherit the fence's own text.literal colour"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // GitHub issue #154: HTML and CSS, as real file types and as real markdown fence languages.
+    // ---------------------------------------------------------------------------------------
+
+    const SAMPLE_HTML: &str = "<!DOCTYPE html>\n<!-- note -->\n<div class=\"card\">\n  <p>Hi</p>\n</div>\n<style>\n.card { color: #ff0000; }\n</style>\n<script>\nconst total = 1;\n</script>\n";
+
+    /// Every real capture `tree-sitter-html`'s own bundled `queries/highlights.scm` emits, in one
+    /// test - the whole file is seven patterns long (read directly), so this is genuinely complete
+    /// coverage of it rather than a sample. Note that not one of them needed a new
+    /// [`HIGHLIGHT_NAMES`] entry: `tag`/`attribute`/`string`/`comment`/`constant`/
+    /// `punctuation.bracket` were all already registered for other languages, and the one name
+    /// that was not (`tag.error`, an unmatched closing tag) resolves through the plain `"tag"`
+    /// entry by the subset rule this module's own docs describe.
+    #[test]
+    fn html_captures_land_in_the_expected_existing_buckets() {
+        let spans = highlight_html(SAMPLE_HTML);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_HTML, "<div"),
+            HighlightKind::PunctuationBracket
+        );
+        assert_eq!(kind_at(&spans, SAMPLE_HTML, "div"), HighlightKind::Tag);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_HTML, "class"),
+            HighlightKind::Attribute
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_HTML, "card\""),
+            HighlightKind::String
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_HTML, "<!-- note -->"),
+            HighlightKind::Comment
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_HTML, "<!DOCTYPE html"),
+            HighlightKind::Constant,
+            "the doctype declaration is `(doctype) @constant`, not a tag"
+        );
+    }
+
+    /// The real reason `tree-sitter-html`'s own `INJECTIONS_QUERY` is wired rather than dropped:
+    /// a `<style>` element's body is genuinely CSS and a `<script>` element's body is genuinely
+    /// JavaScript, and both now reach those grammars for real. `#ff0000` inside `<style>` is a
+    /// `(color_value) @string.special` that only the CSS grammar has any rule for at all - HTML's
+    /// own query would leave the whole `<style>` body as one unclassified `(raw_text)` run.
+    #[test]
+    fn html_style_and_script_bodies_are_injected_into_real_css_and_javascript() {
+        let spans = highlight_html(SAMPLE_HTML);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_HTML, "color"),
+            HighlightKind::Property,
+            "a CSS property name inside <style>"
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_HTML, "#ff0000"),
+            HighlightKind::PunctuationDelimiter,
+            "the `#` of a CSS colour literal is CSS punctuation - only the CSS grammar has any \
+             rule here at all"
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_HTML, "ff0000"),
+            HighlightKind::String,
+            "the colour literal's own digits"
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_HTML, "const"),
+            HighlightKind::Keyword,
+            "a JavaScript keyword inside <script>"
+        );
+        assert_eq!(kind_at(&spans, SAMPLE_HTML, "1;"), HighlightKind::Number);
+    }
+
+    const SAMPLE_CSS: &str =
+        "/* note */\n@media screen {\n  .card > p#main { color: #ff0000; margin: 4px; }\n}\n";
+
+    #[test]
+    fn css_captures_land_in_the_expected_existing_buckets() {
+        let spans = highlight_css(SAMPLE_CSS);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_CSS, "/* note */"),
+            HighlightKind::Comment
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_CSS, "@media"),
+            HighlightKind::Keyword
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_CSS, "card >"),
+            HighlightKind::Property,
+            "a class selector's name is `(class_name) @property`"
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_CSS, "> p"),
+            HighlightKind::Operator,
+            "the child combinator"
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_CSS, "p#main"),
+            HighlightKind::Tag,
+            "a bare element selector is `(tag_name) @tag`, the same bucket JSX element names use"
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_CSS, "margin"),
+            HighlightKind::Property
+        );
+        assert_eq!(kind_at(&spans, SAMPLE_CSS, "4px"), HighlightKind::Number);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_CSS, "px;"),
+            HighlightKind::Type,
+            "`(unit) @type` - a real capture in `tree-sitter-css`'s own bundled query"
+        );
+    }
+
+    /// `(color_value) @string.special` must resolve through the plain `"string"` entry, **not**
+    /// the more specific `"string.special.key"` one that JSON registers: the recognized-name rule
+    /// requires every one of a recognized name's own dot-parts to be present in the capture, and
+    /// `key` is not present in `string.special`.
+    #[test]
+    fn css_color_literal_is_a_string_not_a_json_style_key() {
+        let spans = highlight_css(SAMPLE_CSS);
+        assert_eq!(kind_at(&spans, SAMPLE_CSS, "ff0000"), HighlightKind::String);
+    }
+
+    const SAMPLE_MARKDOWN_FENCES: &str = "# Fences\n\n```html\n<div class=\"card\">hi</div>\n```\n\n```css\n.card { color: red; }\n```\n\n```rust\nfn main() {}\n```\n\n```zig\nconst x = 1;\n```\n\n```\nplain fence\n```\n";
+
+    /// GitHub issue #154's own headline ask - "including in the markdown files". A ` ```html `
+    /// fence's *content* really is reparsed by `tree-sitter-html`: `div` comes out
+    /// [`Tag`](HighlightKind::Tag), which no markdown query has any rule capable of producing.
+    #[test]
+    fn a_markdown_html_fence_really_highlights_its_content_as_html() {
+        let spans = highlight_markdown(SAMPLE_MARKDOWN_FENCES);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "div class"),
+            HighlightKind::Tag
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "class="),
+            HighlightKind::Attribute
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "card\">"),
+            HighlightKind::String
+        );
+    }
+
+    #[test]
+    fn a_markdown_css_fence_really_highlights_its_content_as_css() {
+        let spans = highlight_markdown(SAMPLE_MARKDOWN_FENCES);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "card { "),
+            HighlightKind::Property,
+            "the class selector inside the ```css fence"
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "color: red"),
+            HighlightKind::Property
+        );
+    }
+
+    /// The proof that this is a real, general mechanism rather than an html/css special case: the
+    /// exact same injection query resolves ` ```rust ` too, with no Rust-specific code anywhere in
+    /// [`MARKDOWN_INJECTION_QUERY`] or [`Grammar::for_injection_name`].
+    #[test]
+    fn a_markdown_rust_fence_really_highlights_its_content_as_rust() {
+        let spans = highlight_markdown(SAMPLE_MARKDOWN_FENCES);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "fn main"),
+            HighlightKind::Keyword,
+            "the `fn` keyword - the first token of the fence's content, which is exactly the one \
+             a parent highlight left open over the injected range would silently steal"
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "main()"),
+            HighlightKind::Function
+        );
+    }
+
+    /// The honest fallback, both halves of it: a fence tagged with a language this app has no
+    /// grammar for, and a fence with no tag at all, are plain [`Text`](HighlightKind::Text) - not
+    /// a panic, and not some other language's colouring applied speculatively.
+    #[test]
+    fn an_unknown_or_absent_fence_language_falls_back_to_plain_text() {
+        let spans = highlight_markdown(SAMPLE_MARKDOWN_FENCES);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "const x = 1;"),
+            HighlightKind::Text,
+            "```zig - a real fence tag with no grammar here"
+        );
+        assert_eq!(
+            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "plain fence"),
+            HighlightKind::Text,
+            "a fence with no info string at all"
+        );
+    }
+
+    /// The fence's own info string kept its colour through
+    /// [`MARKDOWN_BLOCK_HIGHLIGHTS_SUPPLEMENT`]'s first line cancelling `@text.literal` for the
+    /// fenced block - that is what the supplement's second line is for, and this is the guard on
+    /// it.
+    #[test]
+    fn a_fence_info_string_is_still_colored_like_a_literal() {
+        let spans = highlight_markdown(SAMPLE_MARKDOWN_FENCES);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "html\n"),
+            HighlightKind::String
+        );
+    }
+
+    /// The other half of that same supplement's blast radius: it cancels `@text.literal` for
+    /// *fenced* blocks only, and the bundled query's `[(link_title) (indented_code_block)
+    /// (fenced_code_block)] @text.literal` still covers the other two.
+    #[test]
+    fn an_indented_code_block_is_still_colored_like_a_literal() {
+        let source = "Text.\n\n    indented code\n";
+        let spans = highlight_markdown(source);
+        assert_eq!(
+            kind_at(&spans, source, "indented code"),
+            HighlightKind::String
+        );
+    }
+
+    /// The block-level HTML half of "including in the markdown files": a raw `<div>` block written
+    /// straight into a markdown document, which `tree-sitter-md` parses as one opaque
+    /// `(html_block)` and never looks inside.
+    #[test]
+    fn a_raw_html_block_in_markdown_is_injected_into_the_html_grammar() {
+        let source = "Before.\n\n<div class=\"card\">block</div>\n\nAfter.\n";
+        let spans = highlight_markdown(source);
+        assert_eq!(kind_at(&spans, source, "div class"), HighlightKind::Tag);
+        assert_eq!(kind_at(&spans, source, "class="), HighlightKind::Attribute);
+    }
+
+    /// The inline half: a raw tag inside a paragraph is an `(html_tag)` node of the *inline*
+    /// grammar, so this only works because [`MARKDOWN_INLINE_INJECTION_QUERY`] exists and is
+    /// reached through a second level of injection (block -> inline -> html).
+    #[test]
+    fn a_raw_html_tag_inside_a_markdown_paragraph_is_injected_into_the_html_grammar() {
+        let source = "Inline <span class=\"i\">tag</span> here.\n";
+        let spans = highlight_markdown(source);
+        assert_eq!(kind_at(&spans, source, "span class"), HighlightKind::Tag);
+        assert_eq!(kind_at(&spans, source, "class="), HighlightKind::Attribute);
+    }
+
+    /// YAML frontmatter, a third real injection the same mechanism unlocked for free - the block
+    /// grammar's own `(minus_metadata)` node, which is plain `Text` without an injection.
+    #[test]
+    fn yaml_frontmatter_in_markdown_is_injected_into_the_yaml_grammar() {
+        let source = "---\nkey: true\n---\n\n# Title\n";
+        let spans = highlight_markdown(source);
+        assert_eq!(kind_at(&spans, source, "key"), HighlightKind::Property);
+        assert_eq!(
+            kind_at(&spans, source, "true"),
+            HighlightKind::ConstantBuiltin
+        );
+    }
+
+    /// [`Grammar::for_injection_name`]'s first lookup: a `#set! injection.language` predicate
+    /// naming a grammar directly, which is how `tree-sitter-md` requests `"markdown_inline"` and
+    /// `"html"` and how `tree-sitter-html` requests `"css"`.
+    #[test]
+    fn every_grammars_own_name_resolves_back_to_that_grammar() {
+        for grammar in Grammar::ALL {
+            assert_eq!(
+                Grammar::for_injection_name(grammar.name()),
+                Some(grammar),
+                "{}",
+                grammar.name()
+            );
+        }
+    }
+
+    /// The real drift guard over the second lookup. Every extension the registry claims a
+    /// highlighter for must be reachable as a fence language *and* land on a real grammar -
+    /// otherwise a ` ```yml ` fence would silently render as plain text while `.yml` files
+    /// highlight fine, with nothing to catch the gap.
+    #[test]
+    fn every_registry_extension_with_a_highlighter_is_reachable_as_a_fence_language() {
+        for entry in crate::language::EXTENSIONS
+            .iter()
+            .filter(|entry| entry.highlighter.is_some())
+        {
+            let grammar = Grammar::for_injection_name(entry.extension).unwrap_or_else(|| {
+                panic!(
+                    "a fence tagged `{}` must resolve to a real grammar - the registry says that \
+                     extension has a highlighter",
+                    entry.extension
+                )
+            });
+            assert_eq!(
+                Grammar::for_extension(entry.extension),
+                Some(grammar),
+                "{}",
+                entry.extension
+            );
+        }
+    }
+
+    /// The opposite direction: [`Grammar::for_extension`] must not claim an extension the registry
+    /// has no highlighter for, which would mean a fence highlighting in a colour the same file on
+    /// disk never gets.
+    #[test]
+    fn grammar_for_extension_claims_exactly_the_registrys_own_highlighted_extensions() {
+        let mut claimed: Vec<&str> = crate::language::EXTENSIONS
+            .iter()
+            .map(|entry| entry.extension)
+            .filter(|extension| Grammar::for_extension(extension).is_some())
+            .collect();
+        claimed.sort_unstable();
+        let mut with_highlighter: Vec<&str> = crate::language::EXTENSIONS
+            .iter()
+            .filter(|entry| entry.highlighter.is_some())
+            .map(|entry| entry.extension)
+            .collect();
+        with_highlighter.sort_unstable();
+        assert_eq!(claimed, with_highlighter);
+    }
+
+    /// A fence tag nobody has a grammar for resolves to nothing at all, which is what makes
+    /// `an_unknown_or_absent_fence_language_falls_back_to_plain_text` a real fallback rather than
+    /// an accident.
+    #[test]
+    fn an_unknown_injection_name_resolves_to_no_grammar() {
+        assert_eq!(Grammar::for_injection_name("zig"), None);
+        assert_eq!(Grammar::for_injection_name("latex"), None);
+        assert_eq!(Grammar::for_injection_name(""), None);
     }
 
     /// Both halves of the TypeScript query composition, which is the single most breakable part of

@@ -13,8 +13,9 @@
 //!
 //! `lsp: Some(..)` for Rust/TypeScript-family/Python/**Vue** - all real, live-tested end to end
 //! (see `lsp_core::client`'s own tests for Rust, and this crate's `language::tests` /
-//! `lsp::client`-adjacent integration tests for the rest). `lsp: None` for TOML/Markdown/SQL (never
-//! had a server) and Go (the user's explicit ask named TypeScript/Vue/Python, not Go; `gopls`
+//! `lsp::client`-adjacent integration tests for the rest). `lsp: None` for TOML/Markdown/SQL/
+//! JSON/YAML/C/HTML/CSS (none ever had a server here - HTML and CSS are GitHub issue #154, whose
+//! text asks for syntax support only) and Go (the user's explicit ask named TypeScript/Vue/Python, not Go; `gopls`
 //! stays PATH-detection-only on the Settings page, matching its pre-existing "not installed" real
 //! state there).
 //!
@@ -718,7 +719,83 @@ pub const EXTENSIONS: &[ExtensionEntry] = &[
         // `crate::code_surface::code_view::highlight_c`'s own docs.
         highlighter: Some(crate::code_surface::code_view::highlight_c),
     },
+    // GitHub issue #154. No `lsp` for either: this module's own scope docs above reserve a real
+    // server for a language an explicit user ask named, and issue #154's text asks for syntax
+    // support only - the same treatment TOML/Markdown/JSON/YAML/C already get.
+    ExtensionEntry {
+        extension: "html",
+        display_name: "HTML",
+        lsp_language_id: "html",
+        chip_label: "htm",
+        chip_colors: theme::lang::HTML,
+        lsp: None,
+        settings_row: None,
+        highlighter: Some(crate::code_surface::code_view::highlight_html),
+    },
+    ExtensionEntry {
+        extension: "htm",
+        display_name: "HTML",
+        lsp_language_id: "html",
+        chip_label: "htm",
+        chip_colors: theme::lang::HTML,
+        lsp: None,
+        settings_row: None,
+        // The same real grammar - `.htm` is a legacy spelling of the identical language, matching
+        // how `.yml`/`.yaml` and `.c`/`.h` already share one grammar here.
+        highlighter: Some(crate::code_surface::code_view::highlight_html),
+    },
+    ExtensionEntry {
+        extension: "css",
+        display_name: "CSS",
+        lsp_language_id: "css",
+        chip_label: "css",
+        chip_colors: theme::lang::CSS,
+        lsp: None,
+        settings_row: None,
+        highlighter: Some(crate::code_surface::code_view::highlight_css),
+    },
 ];
+
+/// The [`EXTENSIONS`] key a fenced code block's own info-string language name maps to - a fence
+/// says ` ```rust `, this registry is keyed by the file extension `"rs"`, and those are genuinely
+/// two different vocabularies, so this is a real, small alias table rather than a guess.
+///
+/// The **one** such table in this crate, deliberately. It started life private to
+/// `crate::code_surface::markdown_preview` (colouring a *rendered* preview's code cards) and was
+/// lifted here by GitHub issue #154, which needed the identical mapping for a second real caller:
+/// `crate::code_surface::code_view`'s tree-sitter injection callback, which resolves a fence's
+/// info string to a real grammar so the fence's content is highlighted in **source** view too.
+/// Two copies would have meant ` ```py ` colouring in one view and not the other, with nothing to
+/// catch it; `tests::every_fence_alias_names_a_real_registry_extension` and
+/// `crate::code_surface::code_view`'s own
+/// `every_registry_extension_with_a_highlighter_is_reachable_as_a_fence_language` are the real
+/// drift guards over that.
+///
+/// `None` for an unrecognized tag (` ```zig `, ` ```console `, or a fence with no tag at all) is
+/// the honest answer both callers already handle by rendering that block as plain text.
+pub fn extension_for_fence_language(language: &str) -> Option<&'static str> {
+    match language.to_ascii_lowercase().as_str() {
+        "rust" | "rs" => Some("rs"),
+        "python" | "py" => Some("py"),
+        "typescript" | "ts" => Some("ts"),
+        "tsx" => Some("tsx"),
+        "javascript" | "js" => Some("js"),
+        "jsx" => Some("jsx"),
+        "go" | "golang" => Some("go"),
+        "json" => Some("json"),
+        "yaml" | "yml" => Some("yaml"),
+        "toml" => Some("toml"),
+        "c" => Some("c"),
+        "h" => Some("h"),
+        // GitHub issue #154's own additions. `"markdown"`/`"md"` is real and not circular: a
+        // markdown fence tagged `markdown` reparses strictly less text than its host document
+        // (see `code_view::injection_config`'s own docs on why that terminates).
+        "html" | "htm" => Some("html"),
+        "css" => Some("css"),
+        "markdown" | "md" => Some("md"),
+        _ => None,
+    }
+}
 
 /// The real, canonical source for `crate::settings::state::LSP_LANGUAGES` - every [`ExtensionEntry`]
 /// with a real [`ExtensionEntry::settings_row`], in [`EXTENSIONS`]' own order.
@@ -1261,8 +1338,8 @@ mod tests {
         assert_eq!(
             with_highlighter,
             vec![
-                "c", "go", "h", "js", "json", "jsx", "md", "py", "rs", "toml", "ts", "tsx", "yaml",
-                "yml"
+                "c", "css", "go", "h", "htm", "html", "js", "json", "jsx", "md", "py", "rs",
+                "toml", "ts", "tsx", "yaml", "yml"
             ],
             "this is the real, current set of extensions with a genuine tree-sitter grammar \
              dependency - a change here should be a deliberate decision, not a silent drift"
@@ -1283,6 +1360,87 @@ mod tests {
                 "{ext} has no real tree-sitter grammar dependency and should not carry a \
                  fabricated highlighter"
             );
+        }
+    }
+
+    /// [`extension_for_fence_language`] must only ever return an extension that really exists in
+    /// [`EXTENSIONS`] - it is the input to two different real grammar/highlighter lookups, both of
+    /// which silently render plain text for an extension they don't recognize, so a typo here
+    /// would be invisible at runtime.
+    #[test]
+    fn every_fence_alias_names_a_real_registry_extension() {
+        for tag in [
+            "rust",
+            "rs",
+            "python",
+            "py",
+            "typescript",
+            "ts",
+            "tsx",
+            "javascript",
+            "js",
+            "jsx",
+            "go",
+            "golang",
+            "json",
+            "yaml",
+            "yml",
+            "toml",
+            "c",
+            "h",
+            "html",
+            "htm",
+            "css",
+            "markdown",
+            "md",
+        ] {
+            let extension = extension_for_fence_language(tag)
+                .unwrap_or_else(|| panic!("fence tag `{tag}` should resolve"));
+            let entry = entry_for_extension(Some(extension)).unwrap_or_else(|| {
+                panic!("fence tag `{tag}` resolved to `{extension}`, which is not a real entry")
+            });
+            assert!(
+                entry.highlighter.is_some(),
+                "fence tag `{tag}` resolves to `{extension}`, which has no real highlighter - a \
+                 fence tagged that way would silently render as plain text"
+            );
+        }
+    }
+
+    /// Fence tags are author-written free text, and the two things that must never happen are a
+    /// panic and a fabricated match. An unknown tag - and an empty one, which is what a bare
+    /// ` ``` ` fence yields - is genuinely `None`.
+    #[test]
+    fn an_unknown_fence_tag_resolves_to_nothing() {
+        assert_eq!(extension_for_fence_language("zig"), None);
+        assert_eq!(extension_for_fence_language("console"), None);
+        assert_eq!(extension_for_fence_language(""), None);
+    }
+
+    /// Fence tags are matched case-insensitively, matching [`entry_for_extension`]'s own
+    /// case-insensitive extension lookup.
+    #[test]
+    fn fence_tags_are_matched_case_insensitively() {
+        assert_eq!(extension_for_fence_language("HTML"), Some("html"));
+        assert_eq!(extension_for_fence_language("Rust"), Some("rs"));
+    }
+
+    /// GitHub issue #154's own registry additions, pinned end to end: a real display name (the
+    /// File view's status-bar label), a real chip, and a real highlighter - and deliberately no
+    /// LSP, per this module's own scope docs.
+    #[test]
+    fn html_and_css_are_real_registry_entries_with_no_language_server() {
+        for (extension, display_name) in [("html", "HTML"), ("htm", "HTML"), ("css", "CSS")] {
+            let entry = entry_for_extension(Some(extension))
+                .unwrap_or_else(|| panic!("{extension} should have a real registry entry"));
+            assert_eq!(entry.display_name, display_name);
+            assert!(entry.highlighter.is_some(), "{extension}");
+            assert!(
+                entry.lsp.is_none(),
+                "{extension} must not spawn a language server - GitHub issue #154 asked for \
+                 syntax support only"
+            );
+            assert!(entry.settings_row.is_none(), "{extension}");
         }
     }
 
