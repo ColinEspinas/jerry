@@ -651,7 +651,15 @@ impl AdeApp {
     /// top docs) always falls back straight to the user's own [`crate::settings::store::
     /// EditorSettings`] default. `None`/no edit target also falls back to the same user default -
     /// harmless, since every real caller already returns before using it in that case.
-    fn resolved_indent_settings_for_target(&self) -> indent::IndentSettings {
+    ///
+    /// `pub(in crate::code_surface)`, not private: `crate::code_surface::file_view::
+    /// AdeApp::render_file_view`'s own row builder reuses this exact same resolution for GitHub
+    /// issue #122's real indent-guide spacing, rather than re-deriving a second, possibly-drifting
+    /// notion of "the current indent width" from `Settings::editor` alone (which would ignore a
+    /// real `.editorconfig` override the same file's own Tab/Shift+Tab already honors).
+    pub(in crate::code_surface) fn resolved_indent_settings_for_target(
+        &self,
+    ) -> indent::IndentSettings {
         let user_default = indent::IndentSettings {
             insert_spaces: self.settings.editor.insert_spaces,
             tab_width: self.settings.editor.tab_width,
@@ -1409,6 +1417,15 @@ pub(in crate::code_surface) struct EditableLineContext<'a> {
     /// per row rather than re-derived; see `crate::root::caret_blink`'s module docs for the
     /// whole mechanism this feeds.
     pub caret_blink_visible: bool,
+    /// This row's own real indent-guide x positions (GitHub issue #122), already resolved by the
+    /// caller (`crate::code_surface::file_view::AdeApp::render_file_view`) from
+    /// `crate::code_surface::indent::leading_indent_levels` and a real, measured monospace
+    /// character width - empty whenever `crate::settings::store::AppearanceSettings::
+    /// show_indent_guides` is off, or the line has no leading indentation at all, so this changes
+    /// nothing about how such a row paints. Each entry is the pixel x, local to this row's own
+    /// text origin (the same origin `cursor_local`'s `x_for_index` measurements below use), of
+    /// one real indent level's own guide line.
+    pub indent_guide_xs: Vec<Pixels>,
 }
 
 /// The real quad(s) to paint for a caret at pixel range `[start_x, end_x)` on a row spanning
@@ -1515,6 +1532,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
         inline_blame,
         caret_style,
         caret_blink_visible,
+        indent_guide_xs,
     } = context;
 
     let gutter_color = if is_current {
@@ -1741,7 +1759,27 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
         .flex_1()
         .min_w_0()
         .h(row_line_height)
-        .flex()
+        .flex();
+    // GitHub issue #122's real indent guides - added *before* the code-run children below so
+    // they paint underneath the actual glyphs, matching this same function's own established
+    // "earlier-added child paints first, further back" convention (the selection fill is added,
+    // and so paints, before the caret above). `indent_guide_xs` is already empty whenever
+    // `AppearanceSettings::show_indent_guides` is off or this line has no leading indentation at
+    // all (see `EditableLineContext::indent_guide_xs`'s own docs), so an unaffected row's element
+    // tree is unchanged either way - this loop simply doesn't run.
+    for (level, x) in indent_guide_xs.into_iter().enumerate() {
+        text_row = text_row.child(
+            gpui::div()
+                .debug_selector(move || format!("file-view-indent-guide-{line_number}-{level}"))
+                .absolute()
+                .top_0()
+                .h_full()
+                .w(gpui::px(1.0))
+                .left(x)
+                .bg(theme::editor::INDENT_GUIDE),
+        );
+    }
+    text_row = text_row
         // The code runs keep their natural width in their own `flex_none` box, so they never
         // shrink; only the blame span placed beside them below yields and truncates.
         .child(gpui::div().flex_none().flex().children(visible_runs));
@@ -2578,6 +2616,51 @@ mod editing_tests {
             selected_text, "hello world",
             "a real triple-click (click_count == 3) must select the whole real line, not just \
              the one word a double-click would"
+        );
+    }
+
+    /// GitHub issue #122's real *painted* effect - other docs in this codebase
+    /// (`crate::settings::store::AppearanceSettings::show_indent_guides`'s own doc comment,
+    /// `settings::render::indent_guide_settings_tests`' module docs) describe this as covered
+    /// separately here; this is that real coverage, proving an indent guide actually paints, not
+    /// just that the setting's own boolean flips (a toggle that flips a field but changes nothing
+    /// on screen is the exact "looks wired up but isn't" gap CONTRIBUTING.md's "no fake
+    /// functionality" rule targets).
+    #[gpui::test]
+    fn an_indented_lines_indent_guide_paints_when_the_setting_is_on(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "fn main() {\n    let x = 1;\n}\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        assert!(
+            app.read_with(cx, |app, _| app.settings.appearance.show_indent_guides),
+            "sanity check: the real default is guides on"
+        );
+        open_file_for_editing(&app, cx, file_path.clone());
+
+        assert!(
+            cx.debug_bounds("file-view-indent-guide-2-0").is_some(),
+            "line 2's own real 4-space leading indentation must paint a real indent guide when \
+             the setting is on"
+        );
+    }
+
+    /// The mirror of the test above: the same indented line paints no guide at all once the
+    /// setting is off - proves `indent_guide_xs` really does end up empty, not merely that the
+    /// setting *could* gate it.
+    #[gpui::test]
+    fn no_indent_guide_paints_when_the_setting_is_off(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "fn main() {\n    let x = 1;\n}\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.settings.appearance.show_indent_guides = false;
+        });
+        open_file_for_editing(&app, cx, file_path.clone());
+
+        assert!(
+            cx.debug_bounds("file-view-indent-guide-2-0").is_none(),
+            "no indent guide may paint when the setting is off, even for a line with real \
+             leading indentation"
         );
     }
 

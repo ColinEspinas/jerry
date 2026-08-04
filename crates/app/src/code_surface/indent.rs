@@ -50,6 +50,33 @@ pub fn indent_unit(settings: IndentSettings) -> String {
     }
 }
 
+/// How many real indent-guide levels `text`'s own leading whitespace covers (GitHub issue #122:
+/// "Add settings to display indents in code editor"), tab-stop-aware so a literal leading `\t`
+/// (this module's own `indent_unit`'s real tab-mode output - one literal `\t` per level, not
+/// `tab_width` bytes) counts as advancing to the *next* `tab_width`-column stop, exactly like a
+/// real terminal/editor tab stop, rather than a fixed "one tab = one level" or "one tab = one
+/// column" approximation that would misalign against the same file's own space-indented lines.
+/// Walks only the real leading run of `' '`/`'\t'` characters - the first non-whitespace character
+/// (or the end of the line) stops the walk, so trailing/inner whitespace never contributes.
+///
+/// `crate::code_surface::editing::render_editable_file_view_line`'s real, painted indent guides
+/// (gated by `crate::settings::store::AppearanceSettings::show_indent_guides`) are the only real
+/// consumer - see that function's own docs for how `tab_width` columns become real pixel guide
+/// positions via a real, measured monospace character width (never a hardcoded pixel constant
+/// unrelated to this count).
+pub fn leading_indent_levels(text: &str, tab_width: u8) -> usize {
+    let tab_width = tab_width.max(1) as usize;
+    let mut columns = 0usize;
+    for ch in text.chars() {
+        match ch {
+            ' ' => columns += 1,
+            '\t' => columns += tab_width - (columns % tab_width),
+            _ => break,
+        }
+    }
+    columns / tab_width
+}
+
 /// One real `.editorconfig` file's own properties for whichever `[section]`s matched - `None`
 /// for a property no matching section in this file ever set, distinct from a farther file's own
 /// value being inherited (see [`merge_props`]).
@@ -372,6 +399,37 @@ mod tests {
             }),
             "\t"
         );
+    }
+
+    #[test]
+    fn leading_indent_levels_counts_whole_tab_width_steps_of_space_indentation() {
+        assert_eq!(leading_indent_levels("no indent", 4), 0);
+        assert_eq!(
+            leading_indent_levels("  two spaces, not a whole level", 4),
+            0
+        );
+        assert_eq!(leading_indent_levels("    one level", 4), 1);
+        assert_eq!(leading_indent_levels("        two levels", 4), 2);
+        assert_eq!(
+            leading_indent_levels("      six spaces, one whole level plus a remainder", 4),
+            1
+        );
+    }
+
+    #[test]
+    fn leading_indent_levels_treats_one_literal_tab_as_one_level_regardless_of_tab_width() {
+        assert_eq!(leading_indent_levels("\tone tab", 4), 1);
+        assert_eq!(leading_indent_levels("\t\ttwo tabs", 4), 2);
+        assert_eq!(leading_indent_levels("\tone tab, width 8", 8), 1);
+    }
+
+    #[test]
+    fn leading_indent_levels_only_counts_the_real_leading_run() {
+        // A blank/whitespace-only line still counts its own whitespace (there is nothing else on
+        // the line to stop the walk) - but inner/trailing whitespace inside a real code line does
+        // not contribute past the first non-whitespace character.
+        assert_eq!(leading_indent_levels("        ", 4), 2);
+        assert_eq!(leading_indent_levels("    let x = 1;    ", 4), 1);
     }
 
     #[test]
