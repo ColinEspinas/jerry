@@ -1144,15 +1144,20 @@ pub mod editor {
     /// - bracket-matching isn't implemented in the File view yet.
     pub const MATCHING_BRACKET: ColorToken = token("editor.matching_bracket", 0x2c4a63);
 
-    /// A resting indent guide inside the code surface. **Not yet painted by any real renderer** -
-    /// distinct from [`tree::INDENT_GUIDE`], the file-*tree* sidebar's own real, already-painted
-    /// indent guide. Defaults to [`super::border::DIVIDER`]'s value, matching
-    /// [`tree::INDENT_GUIDE`]'s own choice, so the two would read as the same visual language if
-    /// the code-surface version is ever built.
+    /// A resting indent guide inside the code surface (GitHub issue #122: "Add settings to
+    /// display indents in code editor") - distinct from [`tree::INDENT_GUIDE`], the file-*tree*
+    /// sidebar's own real, already-painted indent guide. Now really painted too:
+    /// `crate::code_surface::editing::render_editable_file_view_line` draws one guide per real
+    /// indent level, gated by `crate::settings::store::AppearanceSettings::show_indent_guides`.
+    /// Defaults to [`super::border::DIVIDER`]'s value, matching [`tree::INDENT_GUIDE`]'s own
+    /// choice, so the two read as the same visual language.
     pub const INDENT_GUIDE: ColorToken = token("editor.indent_guide", 0x22262a);
     /// The indent guide for the level the caret currently sits in. **Not yet painted by any real
-    /// renderer.** Defaults to [`super::border::SELECTED_EDGE`]'s value, matching
-    /// [`tree::INDENT_GUIDE_ACTIVE`].
+    /// renderer** - GitHub issue #122's own real indent guides (above) don't distinguish an
+    /// "active" level, since that would need real scope/bracket-matching data this codebase
+    /// doesn't have yet (see [`MATCHING_BRACKET`]'s own docs). Defaults to
+    /// [`super::border::SELECTED_EDGE`]'s value, matching [`tree::INDENT_GUIDE_ACTIVE`], so a real
+    /// active-level highlight has a token to plug into if bracket-matching is ever built.
     pub const INDENT_GUIDE_ACTIVE: ColorToken = token("editor.indent_guide_active", 0x3f5b74);
 
     /// A rendered whitespace mark (a middle-dot for a space, an arrow for a tab). **Not yet
@@ -1338,12 +1343,12 @@ pub mod lang {
     ); // "to"
     pub const MD: (ColorToken, ColorToken) =
         (token("lang.md.fg", 0x7f9ad4), token("lang.md.bg", 0x1d2532)); // "md"
+                                                                        // Verified directly against `design_handoff_jerry_ade/revision/tokens.rs:149-160`'s real
+                                                                        // hex values, not paraphrased.
     pub const SQL: (ColorToken, ColorToken) = (
         token("lang.sql.fg", 0x6ab97f),
         token("lang.sql.bg", 0x1b2a20),
     ); // "sq"
-       // Verified directly against `design_handoff_jerry_ade/revision/tokens.rs:149-160`'s real
-       // hex values, not paraphrased.
     pub const TS: (ColorToken, ColorToken) =
         (token("lang.ts.fg", 0x6b9bd1), token("lang.ts.bg", 0x1b2838)); // "ts"
     pub const VUE: (ColorToken, ColorToken) = (
@@ -1366,6 +1371,22 @@ pub mod lang {
     ); // "yml"
     pub const C: (ColorToken, ColorToken) =
         (token("lang.c.fg", 0x9a8cc9), token("lang.c.bg", 0x231f30)); // "c"
+                                                                      // GitHub issue #154 - two more hues, chosen the same way issue #32's three above were: each
+                                                                      // stays visually distinct from *every* existing chip rather than reusing a near-identical
+                                                                      // tint. Both hues here were genuinely unoccupied before this issue - the existing set spans
+                                                                      // orange-brown (RS), yellow (PY), greens (SQL/VUE), blues (MD/TS/YAML), cyan (GO), purple
+                                                                      // (C) and two greys (TOML/JSON), leaving red and magenta free. Enforced, not just asserted in
+                                                                      // prose, by `lang_token_tests::every_lang_chip_color_is_distinct_from_every_other`.
+    pub const HTML: (ColorToken, ColorToken) = (
+        token("lang.html.fg", 0xd1735f),
+        token("lang.html.bg", 0x2f1d18),
+    ); // "htm"
+       // Magenta, deliberately not another purple: `C`'s `#9a8cc9` is a blue-leaning violet, this
+       // is red-leaning, so the two do not read as the same chip at chip size.
+    pub const CSS: (ColorToken, ColorToken) = (
+        token("lang.css.fg", 0xc47fb0),
+        token("lang.css.bg", 0x2c1e29),
+    ); // "css"
     pub const UNKNOWN: (ColorToken, ColorToken) = (
         token("lang.unknown.fg", 0x6b7178),
         token("lang.unknown.bg", 0x23272b),
@@ -1398,6 +1419,10 @@ pub mod lang {
         ("YAML.bg", YAML.1),
         ("C.fg", C.0),
         ("C.bg", C.1),
+        ("HTML.fg", HTML.0),
+        ("HTML.bg", HTML.1),
+        ("CSS.fg", CSS.0),
+        ("CSS.bg", CSS.1),
         ("UNKNOWN.fg", UNKNOWN.0),
         ("UNKNOWN.bg", UNKNOWN.1),
     ];
@@ -2042,6 +2067,14 @@ mod lang_token_tests {
             ("vue", lang::VUE),
             ("py", lang::PY),
             ("go", lang::GO),
+            // GitHub issue #32's three and issue #154's two - the original version of this test
+            // covered only the eight chips that existed when it was written, so every chip added
+            // since had been going unchecked against the very rule its own doc comment claims.
+            ("json", lang::JSON),
+            ("yaml", lang::YAML),
+            ("c", lang::C),
+            ("html", lang::HTML),
+            ("css", lang::CSS),
             ("unknown", lang::UNKNOWN),
         ];
         for (i, (name_a, color_a)) in all.iter().enumerate() {

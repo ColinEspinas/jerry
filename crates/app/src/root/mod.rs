@@ -1448,7 +1448,26 @@ pub struct AdeApp {
     /// pattern as [`Self::body_bounds`]). [`Self::render_plus_menu`] positions the popover
     /// directly off this rather than a second, independently-computed offset that could drift
     /// once the rail's adjustable width shifts the button. `Bounds::default()` until first paint.
+    /// Only the real anchor when [`Self::plus_menu_repo_anchor`] is `None` - see that field's own
+    /// docs for the rail's per-repo `+` case.
     pub(crate) plus_button_bounds: gpui::Bounds<Pixels>,
+    /// Which control opened [`Self::plus_menu_open`]'s popover: `None` for the tab strip's own
+    /// `+` ([`Self::plus_button_bounds`]), `Some(repo_id)` for that repo's own header `+`
+    /// ([`crate::rail::render::AdeApp::render_repo_group_new_button`],
+    /// [`Self::rail_plus_button_bounds`]). GitHub issue #113's per-repo `+` used to always
+    /// position the popover off [`Self::plus_button_bounds`] regardless of which button actually
+    /// opened it - visually anchored to the tab strip even when a rail row's own `+` was clicked.
+    /// Set on every real click of either button (see both render sites), read only by
+    /// [`Self::render_plus_menu`].
+    pub(crate) plus_menu_repo_anchor: Option<RepoId>,
+    /// Each rail repo header's own `+` button's painted bounds, captured every render the same
+    /// `gpui::canvas` idiom [`Self::plus_button_bounds`] uses - keyed by [`RepoId`] since, unlike
+    /// the tab strip's single `+`, one such button paints per repo group every frame regardless
+    /// of which one (if any) was actually clicked; a single shared field would silently hold
+    /// whichever repo happened to render last. [`Self::render_plus_menu`] looks up the entry for
+    /// [`Self::plus_menu_repo_anchor`] when it is `Some`. No entry until that repo's header has
+    /// painted at least once.
+    pub(crate) rail_plus_button_bounds: std::collections::HashMap<RepoId, gpui::Bounds<Pixels>>,
     /// Which of the Windows/Linux title bar's five menu labels ([`crate::title_bar::menu::TitleMenu::ALL`])
     /// has its real dropdown open right now, if any - see [`crate::title_bar::menu::render_title_menu`]'s own
     /// docs. Closed the same way [`Self::plus_menu_open`] is: its own scrim click, picking a row,
@@ -1965,6 +1984,87 @@ impl AdeApp {
             );
         }
         self.agents.activate_for_worktree(&path, cx);
+        self.selected = None;
+        self.worktree_selection_notice = None;
+        self.reset_repo_scoped_state(path, window, cx);
+        self.load_worktrees(cx);
+        self.start_worktree_watch(cx);
+        self.start_status_polling(cx);
+    }
+
+    /// GitHub issue #113's "click a repo header in the rail, even one with zero open
+    /// worktrees, and it checks out" - the rail-native sibling of
+    /// [`Self::open_repo_in_current_window`]. Shares that method's real repo-switch reload
+    /// (`Self::reset_repo_scoped_state`, `Self::start_worktree_watch`/`Self::start_status_polling`,
+    /// forgetting a dangling [`Self::empty_state_focus_handle`] overlay target) but deliberately
+    /// does **not** call [`Self::add_repo`] or spawn an initial shell: `id` must already be a
+    /// known [`Self::repos`] entry (every row the rail renders came from there), and unlike "Open
+    /// Folder…" - which always guarantees *some* real terminal is running so a freshly opened
+    /// folder is never inert - this gesture's whole point is to make a genuinely empty repo (zero
+    /// open worktrees/agents) reachable as a real "focused, nothing open yet" state, so the user
+    /// can choose what to open next themselves (the tab strip's own `+` menu, or the rail's own
+    /// per-repo `+` - [`crate::rail::render::AdeApp::render_repo_group`]) instead of always
+    /// landing in an unwanted shell.
+    ///
+    /// A no-op if `id` isn't (or is no longer) a known repo - the same defensive guard
+    /// [`Self::focus_repo`] already has, reused here rather than duplicated - or if `id` is
+    /// already [`Self::focused_repo`] (a plain re-click of the repo already showing must not
+    /// reset any of its live state).
+    ///
+    /// Unlike [`Self::open_repo_in_current_window`], this never spawns a fallback shell: `id`'s
+    /// repo starts genuinely empty (no agents) right after this call, exactly the "focused,
+    /// nothing open yet" state this method's own module docs above describe - the user opens
+    /// something next via the tab strip's own `+` or the rail's per-repo `+`
+    /// ([`crate::rail::render::AdeApp::render_repo_group_new_button`]). Every agent that was open
+    /// before this call belongs to whatever repo was focused *before* `id` (this app's tab strip
+    /// is still single-repo-scoped - see [`Self::repos`]'s own docs), and all of them are closed
+    /// a few lines below via the same real PTY teardown [`Self::close_agent`] always uses, the
+    /// identical real fix [`Self::open_repo_in_current_window`] already applies. There is no
+    /// cross-restart persistence of *which tabs were open* for a repo yet - a real, disclosed gap,
+    /// not a silently stubbed one.
+    pub(crate) fn checkout_repo_from_rail(
+        &mut self,
+        id: RepoId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.focused_repo().map(|repo| repo.id) == Some(id) {
+            return;
+        }
+        let Some(path) = self
+            .repos
+            .iter()
+            .find(|repo| repo.id == id)
+            .map(|repo| repo.path.clone())
+        else {
+            return;
+        };
+
+        self.focus_repo(id, cx);
+
+        self.settings_focus
+            .forget_target(&self.empty_state_focus_handle);
+        self.palette_focus
+            .forget_target(&self.empty_state_focus_handle);
+
+        // See this method's own docs: every currently open agent belongs to whatever repo was
+        // focused before this call (this app's tab strip is still single-repo-scoped), so all of
+        // them become permanently unreachable through this window's UI the instant focus moves
+        // to `id` - shut them down cleanly rather than leaking their real PTY processes, the
+        // identical real fix `Self::open_repo_in_current_window` already applies.
+        let stale_ids: Vec<AgentId> = self.agents.iter().map(|agent| agent.id).collect();
+        for stale_id in stale_ids {
+            self.close_agent(stale_id, window, cx);
+        }
+
+        // No `Agents::activate_for_worktree(&path, ...)` call here (unlike
+        // `Self::open_repo_in_current_window`, right after its own equivalent teardown loop
+        // above): `id` wasn't the focused repo before this call (checked at the top), and this
+        // app's tab strip is single-repo-scoped, so no agent can already have `cwd == path` at
+        // this point - the loop just above closed every agent that was open, and none of them
+        // belonged to `path` to begin with. Calling it would resolve to `active = None`, a real
+        // no-op - see this method's own docs above for why `id`'s repo is meant to come up
+        // genuinely empty here rather than restoring anything.
         self.selected = None;
         self.worktree_selection_notice = None;
         self.reset_repo_scoped_state(path, window, cx);
@@ -3266,6 +3366,78 @@ mod repo_list_tests {
                 app.agents.iter().count(),
                 1,
                 "repo B should have exactly its own fresh initial shell agent"
+            );
+        });
+    }
+
+    /// The rail-native mirror of [`open_repo_in_current_window_closes_the_previous_repos_agents`]
+    /// just above - an independent checker audit of GitHub issue #113's fix flagged
+    /// [`AdeApp::checkout_repo_from_rail`] as untested destructive one-click teardown: clicking a
+    /// rail repo header closes every currently open agent (real PTY teardown, mirroring
+    /// [`AdeApp::open_repo_in_current_window`]'s own already-tested behavior above), but a much
+    /// cheaper gesture triggers it now - one click on a rail row, versus "File > Open Folder... >
+    /// pick a directory" before. Proves two real agents belonging to repo A (its initial shell
+    /// plus a spawned Claude session) are both really gone - removed from
+    /// [`crate::work_surface::agents::Agents`]'s own list, not merely hidden from the UI - after
+    /// checking out repo B from the rail, the same "really closed, not leaked" guarantee the
+    /// `open_repo_in_current_window` mirror test proves via the identical technique (asserting
+    /// against the live agent list, since [`crate::work_surface::agents::Agents::close`] always
+    /// calls `TerminalPane::shutdown` before removing an agent from that list).
+    #[gpui::test]
+    fn checkout_repo_from_rail_closes_the_previous_repos_agents(cx: &mut TestAppContext) {
+        let repo_a = tempfile::tempdir().expect("tempdir");
+        let repo_b = tempfile::tempdir().expect("tempdir");
+
+        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Claude,
+                repo_a.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.agents.iter().count(),
+                2,
+                "sanity check: repo A's initial shell plus the spawned Claude agent"
+            );
+        });
+
+        let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.checkout_repo_from_rail(repo_b_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.agents
+                    .iter()
+                    .filter(|agent| agent.cwd == repo_a.path())
+                    .count(),
+                0,
+                "repo A's agents must have really been closed (real PTY teardown via \
+                 `Agents::close`), not merely hidden from the UI"
+            );
+            assert_eq!(
+                app.agents.iter().count(),
+                0,
+                "unlike `open_repo_in_current_window`, checking out a repo from the rail must \
+                 not auto-spawn a fallback shell - repo B comes up genuinely empty, per \
+                 `checkout_repo_from_rail`'s own docs"
+            );
+            assert_eq!(
+                app.focused_repo_path(),
+                repo_b.path(),
+                "sanity check: repo B really is the focused repo after checkout"
             );
         });
     }

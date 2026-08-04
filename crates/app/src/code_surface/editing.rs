@@ -307,7 +307,7 @@ impl AdeApp {
     pub(crate) fn handle_editor_enter_action(
         &mut self,
         _: &EditorEnter,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Defense in depth, not the only guard: `crate::default_key_bindings` already scopes
@@ -329,9 +329,42 @@ impl AdeApp {
         if self.completions_open_for_active_path() {
             return;
         }
-        self.replace_text_in_range(None, "\n", window, cx);
+        // GitHub issue #121: predicts the new line's own indentation rather than a bare `"\n"` -
+        // `EditBuffer::insert_newline_with_auto_indent` reads the real leading whitespace off the
+        // line each cursor is leaving (never a hardcoded assumption) and, on top of that, adds one
+        // real indent unit when that line ends with an opening bracket. The indent unit itself
+        // uses the exact same real tabs-vs-spaces/width/`.editorconfig` resolution
+        // `Self::handle_editor_indent_action`'s own `Tab` already uses, so this respects the same
+        // settings Tab does rather than a hardcoded `"    "`.
+        //
+        // Dispatches per real edit target directly (rather than through the generic
+        // `EntityInputHandler::replace_text_in_range`, which only ever inserts one fixed literal
+        // string) since the text to insert here depends on the real buffer content at the insertion
+        // point - both real targets ([`EditTarget::File`]/[`EditTarget::Merge`]) share this same
+        // buffer-editing machinery, matching every other real text-changing `Editor*` handler in
+        // this file.
+        let settings = self.resolved_indent_settings_for_target();
+        let extra_indent = indent::indent_unit(settings);
+        match self.active_edit_target() {
+            Some(EditTarget::File(path)) => {
+                let Some(buffer) = self.edit_buffer_mut(&path) else {
+                    return;
+                };
+                buffer.insert_newline_with_auto_indent(&extra_indent);
+                self.schedule_rehighlight(path.clone(), cx);
+                self.schedule_lsp_sync(self.file_tree_root.clone(), path, cx);
+            }
+            Some(EditTarget::Merge) => {
+                let Some(edit) = self.merge_edit.as_mut() else {
+                    return;
+                };
+                edit.buffer.insert_newline_with_auto_indent(&extra_indent);
+            }
+            None => return,
+        }
         self.sync_cursor_and_scroll();
         self.reset_caret_blink(cx);
+        cx.notify();
     }
 
     pub(crate) fn handle_editor_left_action(
@@ -651,7 +684,15 @@ impl AdeApp {
     /// top docs) always falls back straight to the user's own [`crate::settings::store::
     /// EditorSettings`] default. `None`/no edit target also falls back to the same user default -
     /// harmless, since every real caller already returns before using it in that case.
-    fn resolved_indent_settings_for_target(&self) -> indent::IndentSettings {
+    ///
+    /// `pub(in crate::code_surface)`, not private: `crate::code_surface::file_view::
+    /// AdeApp::render_file_view`'s own row builder reuses this exact same resolution for GitHub
+    /// issue #122's real indent-guide spacing, rather than re-deriving a second, possibly-drifting
+    /// notion of "the current indent width" from `Settings::editor` alone (which would ignore a
+    /// real `.editorconfig` override the same file's own Tab/Shift+Tab already honors).
+    pub(in crate::code_surface) fn resolved_indent_settings_for_target(
+        &self,
+    ) -> indent::IndentSettings {
         let user_default = indent::IndentSettings {
             insert_spaces: self.settings.editor.insert_spaces,
             tab_width: self.settings.editor.tab_width,
@@ -1409,6 +1450,15 @@ pub(in crate::code_surface) struct EditableLineContext<'a> {
     /// per row rather than re-derived; see `crate::root::caret_blink`'s module docs for the
     /// whole mechanism this feeds.
     pub caret_blink_visible: bool,
+    /// This row's own real indent-guide x positions (GitHub issue #122), already resolved by the
+    /// caller (`crate::code_surface::file_view::AdeApp::render_file_view`) from
+    /// `crate::code_surface::indent::leading_indent_levels` and a real, measured monospace
+    /// character width - empty whenever `crate::settings::store::AppearanceSettings::
+    /// show_indent_guides` is off, or the line has no leading indentation at all, so this changes
+    /// nothing about how such a row paints. Each entry is the pixel x, local to this row's own
+    /// text origin (the same origin `cursor_local`'s `x_for_index` measurements below use), of
+    /// one real indent level's own guide line.
+    pub indent_guide_xs: Vec<Pixels>,
 }
 
 /// The real quad(s) to paint for a caret at pixel range `[start_x, end_x)` on a row spanning
@@ -1515,6 +1565,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
         inline_blame,
         caret_style,
         caret_blink_visible,
+        indent_guide_xs,
     } = context;
 
     let gutter_color = if is_current {
@@ -1741,7 +1792,27 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
         .flex_1()
         .min_w_0()
         .h(row_line_height)
-        .flex()
+        .flex();
+    // GitHub issue #122's real indent guides - added *before* the code-run children below so
+    // they paint underneath the actual glyphs, matching this same function's own established
+    // "earlier-added child paints first, further back" convention (the selection fill is added,
+    // and so paints, before the caret above). `indent_guide_xs` is already empty whenever
+    // `AppearanceSettings::show_indent_guides` is off or this line has no leading indentation at
+    // all (see `EditableLineContext::indent_guide_xs`'s own docs), so an unaffected row's element
+    // tree is unchanged either way - this loop simply doesn't run.
+    for (level, x) in indent_guide_xs.into_iter().enumerate() {
+        text_row = text_row.child(
+            gpui::div()
+                .debug_selector(move || format!("file-view-indent-guide-{line_number}-{level}"))
+                .absolute()
+                .top_0()
+                .h_full()
+                .w(gpui::px(1.0))
+                .left(x)
+                .bg(theme::editor::INDENT_GUIDE),
+        );
+    }
+    text_row = text_row
         // The code runs keep their natural width in their own `flex_none` box, so they never
         // shrink; only the blame span placed beside them below yields and truncates.
         .child(gpui::div().flex_none().flex().children(visible_runs));
@@ -2578,6 +2649,51 @@ mod editing_tests {
             selected_text, "hello world",
             "a real triple-click (click_count == 3) must select the whole real line, not just \
              the one word a double-click would"
+        );
+    }
+
+    /// GitHub issue #122's real *painted* effect - other docs in this codebase
+    /// (`crate::settings::store::AppearanceSettings::show_indent_guides`'s own doc comment,
+    /// `settings::render::indent_guide_settings_tests`' module docs) describe this as covered
+    /// separately here; this is that real coverage, proving an indent guide actually paints, not
+    /// just that the setting's own boolean flips (a toggle that flips a field but changes nothing
+    /// on screen is the exact "looks wired up but isn't" gap CONTRIBUTING.md's "no fake
+    /// functionality" rule targets).
+    #[gpui::test]
+    fn an_indented_lines_indent_guide_paints_when_the_setting_is_on(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "fn main() {\n    let x = 1;\n}\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        assert!(
+            app.read_with(cx, |app, _| app.settings.appearance.show_indent_guides),
+            "sanity check: the real default is guides on"
+        );
+        open_file_for_editing(&app, cx, file_path.clone());
+
+        assert!(
+            cx.debug_bounds("file-view-indent-guide-2-0").is_some(),
+            "line 2's own real 4-space leading indentation must paint a real indent guide when \
+             the setting is on"
+        );
+    }
+
+    /// The mirror of the test above: the same indented line paints no guide at all once the
+    /// setting is off - proves `indent_guide_xs` really does end up empty, not merely that the
+    /// setting *could* gate it.
+    #[gpui::test]
+    fn no_indent_guide_paints_when_the_setting_is_off(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "fn main() {\n    let x = 1;\n}\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.settings.appearance.show_indent_guides = false;
+        });
+        open_file_for_editing(&app, cx, file_path.clone());
+
+        assert!(
+            cx.debug_bounds("file-view-indent-guide-2-0").is_none(),
+            "no indent guide may paint when the setting is off, even for a line with real \
+             leading indentation"
         );
     }
 
@@ -3925,6 +4041,162 @@ mod editing_tests {
                 .clone()),
             content_before_escape,
             "dismissing via Escape must not touch the real buffer content"
+        );
+    }
+
+    /// GitHub issue #121, test (a): pressing a real `Enter` keystroke after an indented line
+    /// carries that exact same real leading whitespace over to the new line, through the real,
+    /// bound `EditorEnter` keystroke (not a direct handler call) - matching this file's own
+    /// established "simulate the real keystroke" precedent for `Enter` regression coverage (see
+    /// `completions_keybindings_are_correctly_scoped_in_both_the_open_and_closed_state` just
+    /// above).
+    #[gpui::test]
+    fn enter_carries_the_real_leading_whitespace_of_the_previous_line_over(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "fn main() {\n    let x = 1;\n}\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        app.update(cx, |app, cx| {
+            // Right after the `;`, before that line's own trailing newline.
+            app.edit_buffer_mut(&relative)
+                .unwrap()
+                .move_to("fn main() {\n    let x = 1;".len());
+            cx.notify();
+        });
+
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffer(&relative)
+                .unwrap()
+                .content
+                .clone()),
+            "fn main() {\n    let x = 1;\n    \n}\n",
+            "the new line must start with the exact same real 4-space indentation the line \
+             above it had, read from the real buffer content"
+        );
+    }
+
+    /// GitHub issue #121, test (b): pressing `Enter` on a real column-0 line (no leading
+    /// whitespace at all) inserts a bare newline - no whitespace fabricated out of nowhere.
+    #[gpui::test]
+    fn enter_adds_no_whitespace_after_a_column_zero_line(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "foo();\nbar();\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        app.update(cx, |app, cx| {
+            app.edit_buffer_mut(&relative).unwrap().move_to(6); // end of "foo();"
+            cx.notify();
+        });
+
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffer(&relative)
+                .unwrap()
+                .content
+                .clone()),
+            "foo();\n\nbar();\n",
+            "a column-0 line must not gain any real indentation it never had"
+        );
+    }
+
+    /// GitHub issue #121, test (c) - stretch goal: `Enter` right after a real opening bracket
+    /// adds one more real indent unit on top of the carried-over whitespace, using the exact same
+    /// real indent-unit resolution (tabs/spaces/width) `Self::handle_editor_indent_action`'s own
+    /// `Tab` uses - proven here by checking the inserted whitespace is real 4 literal spaces (the
+    /// default `EditorSettings::tab_width`/`insert_spaces`, not a hardcoded `"    "` this test
+    /// would pass even if the production code had a different, wrong hardcoded width).
+    #[gpui::test]
+    fn enter_adds_one_extra_real_indent_level_after_an_opening_bracket(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "fn main() {\n}\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        app.update(cx, |app, cx| {
+            app.edit_buffer_mut(&relative).unwrap().move_to(11); // end of "fn main() {"
+            cx.notify();
+        });
+
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffer(&relative)
+                .unwrap()
+                .content
+                .clone()),
+            "fn main() {\n    \n}\n",
+            "a line ending in an opening bracket must add one real indent unit on top of \
+             whatever it already carried over"
+        );
+
+        // Same real settings-driven indent unit as `Tab` - a hand-edited `tab_width` must change
+        // this insertion's own width too, not just `EditorIndent`'s.
+        app.update(cx, |app, cx| {
+            app.settings.editor.tab_width = 2;
+            app.edit_buffer_mut(&relative).unwrap().undo();
+            app.edit_buffer_mut(&relative).unwrap().move_to(11);
+            cx.notify();
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffer(&relative)
+                .unwrap()
+                .content
+                .clone()),
+            "fn main() {\n  \n}\n",
+            "the extra indent level must use the real, current tab_width setting, not a \
+             hardcoded 4-space guess"
+        );
+    }
+
+    /// GitHub issue #121, PR #136 review (Colin Espinas: "Missing indent when no opening
+    /// character is there like when we use ':' in python"): a real Python file's block header
+    /// ending in `:` (no opening bracket at all) must still get one extra real indent level,
+    /// the same way an opening bracket already does for every language.
+    #[gpui::test]
+    fn enter_adds_one_extra_real_indent_level_after_a_python_colon_header(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.py", "if True:\n    pass\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.py");
+
+        app.update(cx, |app, cx| {
+            app.edit_buffer_mut(&relative)
+                .unwrap()
+                .move_to("if True:".len());
+            cx.notify();
+        });
+
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .edit_buffer(&relative)
+                .unwrap()
+                .content
+                .clone()),
+            "if True:\n    \n    pass\n",
+            "a Python block header ending in ':' must add one real indent unit, exactly like \
+             an opening bracket does"
         );
     }
 

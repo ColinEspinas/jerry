@@ -147,6 +147,14 @@ pub struct AppearanceSettings {
     /// the caret permanently solid whenever it would otherwise be visible - see
     /// `crate::root::caret_blink`'s module docs for the real blink mechanism this gates.
     pub caret_blink: bool,
+    /// Whether the code editor draws real vertical indent-guide lines (GitHub issue #122: "Add
+    /// settings to display indents in code editor"). `true` by default, matching every mainstream
+    /// editor's own default. `crate::code_surface::editing::render_editable_file_view_line` is
+    /// the only real consumer - it draws one line per real indent level
+    /// (`crate::code_surface::indent::leading_indent_levels`), spaced by a real, measured
+    /// monospace character width rather than a hardcoded pixel constant, so the guides never
+    /// drift from the file's own actual leading whitespace.
+    pub show_indent_guides: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -159,6 +167,7 @@ impl Default for AppearanceSettings {
             editor_zoom_percent: EDITOR_ZOOM_PERCENT_DEFAULT,
             caret_style: CaretStyle::default(),
             caret_blink: true,
+            show_indent_guides: true,
         }
     }
 }
@@ -574,7 +583,7 @@ pub fn config_keys_line(page: ConfigPage) -> &'static str {
             "appearance.interface_scale_percent \u{b7} appearance.editor_font_size \u{b7} \
              appearance.terminal_font_size \u{b7} appearance.follow_system_text_size \u{b7} \
              appearance.editor_zoom_percent \u{b7} appearance.caret_style \u{b7} \
-             appearance.caret_blink"
+             appearance.caret_blink \u{b7} appearance.show_indent_guides"
         }
         ConfigPage::Theme => {
             "theme.name \u{b7} theme.follow_system \u{b7} theme.high_contrast_diff"
@@ -898,6 +907,7 @@ mod tests {
         settings.window.controls = WindowControlsStyle::MacosStyle;
         settings.appearance.interface_scale_percent = 125;
         settings.appearance.editor_font_size = 15.5;
+        settings.appearance.show_indent_guides = false;
         settings.theme.name = "Slate".to_string();
         settings.theme.high_contrast_diff = true;
 
@@ -905,6 +915,29 @@ mod tests {
         let loaded = Settings::load_or_init_at(&path);
 
         assert_eq!(settings, loaded);
+    }
+
+    /// GitHub issue #122's `show_indent_guides` toggle, round-tripped through real TOML
+    /// save/load exactly like [`a_settings_value_round_trips_through_real_toml_save_and_load`]
+    /// above covers several other `AppearanceSettings` fields - a dedicated test so a future
+    /// change to that shared fixture can't silently stop covering this one field.
+    #[test]
+    fn show_indent_guides_round_trips_through_real_toml_save_and_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+
+        assert!(
+            Settings::default().appearance.show_indent_guides,
+            "sanity check: the real default is guides on"
+        );
+
+        let mut settings = Settings::default();
+        settings.appearance.show_indent_guides = false;
+        settings.save_at(&path).expect("save should succeed");
+        let loaded = Settings::load_or_init_at(&path);
+
+        assert_eq!(settings, loaded);
+        assert!(!loaded.appearance.show_indent_guides);
     }
 
     #[test]
@@ -1013,6 +1046,7 @@ mod tests {
             editor_zoom_percent: 130,
             caret_style: CaretStyle::Block,
             caret_blink: false,
+            show_indent_guides: false,
         };
         let before = appearance.clone();
 

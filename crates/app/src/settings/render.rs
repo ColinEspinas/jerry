@@ -1078,6 +1078,16 @@ impl AdeApp {
                 |this, cx| this.toggle_caret_blink(cx),
             ),
         );
+        let indent_guides_row = self.render_settings_row(
+            "Indent guides",
+            "Vertical lines marking each level of leading indentation in the code editor.",
+            self.render_toggle_control(
+                "settings-indent-guides",
+                self.settings.appearance.show_indent_guides,
+                cx,
+                |this, cx| this.toggle_indent_guides(cx),
+            ),
+        );
         div()
             .flex()
             .flex_col()
@@ -1123,6 +1133,7 @@ impl AdeApp {
             )
             .child(caret_style_row)
             .child(caret_blink_row)
+            .child(indent_guides_row)
             .child(self.render_snippet_block(settings_store::ConfigPage::Appearance))
     }
 
@@ -2720,6 +2731,15 @@ impl AdeApp {
         cx.notify();
     }
 
+    /// GitHub issue #122's real indent-guide toggle - `pub(crate)` like [`Self::toggle_caret_blink`]
+    /// above, for the same reason: `indent_guide_tests` (`crate::code_surface::editing`) drives
+    /// this directly for its own real-render coverage of whether a guide actually paints.
+    pub(crate) fn toggle_indent_guides(&mut self, cx: &mut Context<Self>) {
+        self.settings.appearance.show_indent_guides = !self.settings.appearance.show_indent_guides;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
     fn adjust_editor_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.settings.appearance.editor_font_size = (self.settings.appearance.editor_font_size
             + delta)
@@ -3905,6 +3925,95 @@ mod caret_settings_tests {
         });
         assert!(
             app.read_with(cx, |app, _| app.settings.appearance.caret_blink),
+            "the real Settings field must have flipped back on"
+        );
+    }
+}
+
+/// GitHub issue #122 ("Add settings to display indents in code editor") - real coverage for
+/// [`AdeApp::toggle_indent_guides`], mirroring `caret_settings_tests`' own established "through
+/// the real mutator, assert it actually persisted" discipline. The real *painted* effect of this
+/// setting (whether a guide line actually appears/disappears in the File view) is covered
+/// separately by `crate::code_surface::editing::indent_guide_tests`, which is the one that would
+/// actually catch a toggle that flips the field but changes nothing on screen.
+#[cfg(test)]
+mod indent_guide_settings_tests {
+    use crate::root::AdeApp;
+    use crate::settings::store as settings_store;
+    use gpui::TestAppContext;
+    use std::path::PathBuf;
+
+    /// A real, temp-dir-scoped settings path - mirrors `crate::sidebar::render::fold_state_tests`'
+    /// own `open_app_with_state_dir` (that one isn't `pub(crate)`, so this is a small, deliberate
+    /// duplicate rather than a cross-module dependency on a test-only helper), which is what gives
+    /// this test a real `settings.toml` to persist to and reload from, unlike
+    /// `crate::root::focus::palette_focus_tests::open_test_app`'s deliberately unpersisted `None`.
+    ///
+    /// Loads real settings from `settings_path` first (via `Settings::load_or_init_at`, the same
+    /// real load `crate::root::mod`'s own startup path uses) rather than always constructing with
+    /// `Settings::default()` - see `keybinding_rebind_tests::
+    /// open_test_app_with_real_settings_path`'s identical real-load-before-construct pattern, one
+    /// call site up in this same file. Passing a fixed `Settings::default()` regardless of what's
+    /// really on disk would make every "reload" in this module a no-op standing in for nothing -
+    /// a real, live-caught bug in this test module's own first draft (a "reload" that never
+    /// re-reads its own file can never fail no matter what persistence bug it's meant to catch).
+    fn open_app_with_state_dir(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        settings_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        let settings = settings_store::Settings::load_or_init_at(&settings_path);
+        cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                Some(repo_path),
+                true,
+                settings,
+                Some(settings_path),
+                window,
+                cx,
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn toggle_indent_guides_flips_the_real_persisted_setting_and_persists_across_reload(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) =
+            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+
+        assert!(
+            app.read_with(cx, |app, _| app.settings.appearance.show_indent_guides),
+            "sanity check: the real default is guides on"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_indent_guides(cx);
+        });
+        assert!(
+            !app.read_with(cx, |app, _| app.settings.appearance.show_indent_guides),
+            "the real Settings field must have flipped off"
+        );
+        // `persist_settings` writes asynchronously through the real serial writer task (see
+        // `AdeApp::_settings_save_task`'s own docs) - the write must actually land on disk before
+        // reopening from the same path below, or this test just proves the in-memory flip, which
+        // the assertion right above it already covers.
+        cx.run_until_parked();
+
+        let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        assert!(
+            !reloaded.read_with(cx, |app, _| app.settings.appearance.show_indent_guides),
+            "the toggle must have really been persisted to disk, not just flipped in memory"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_indent_guides(cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.settings.appearance.show_indent_guides),
             "the real Settings field must have flipped back on"
         );
     }

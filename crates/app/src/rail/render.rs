@@ -731,7 +731,10 @@ impl AdeApp {
     /// See [`rail::group_worktrees_by_repo`]'s own docs for why every repo but
     /// [`Self::focused_repo`] still has no live data (`all_rows` empty too) today - that half is
     /// a real, separate, already-tracked data-model limitation (no per-repo worktree loading
-    /// yet), not something this function papers over.
+    /// yet), not something this function papers over. Every non-focused repo gets
+    /// `rows_loaded: false` (see [`rail::RepoWorktrees::rows_loaded`]'s own docs) so the render
+    /// side can tell that real gap apart from a repo that was actually loaded and really has zero
+    /// worktrees, rather than rendering both identically.
     pub(in crate::rail) fn build_repo_groups(&self, cx: &mut Context<Self>) -> Vec<RepoGroup> {
         let rows = self.build_worktree_rows(cx);
         let filtered: Vec<WorktreeRow> =
@@ -754,6 +757,7 @@ impl AdeApp {
                     } else {
                         Vec::new()
                     },
+                    rows_loaded: is_focused,
                 }
             })
             .collect();
@@ -767,13 +771,14 @@ impl AdeApp {
     pub(in crate::rail) fn render_rail_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let groups = self.build_repo_groups(cx);
 
-        if groups.iter().all(|group| group.rows.is_empty()) {
-            let any_real_worktrees = groups.iter().any(|group| !group.all_rows.is_empty());
-            return self.render_rail_empty_message(if any_real_worktrees {
-                "no worktrees match this filter"
-            } else {
-                "no worktrees found"
-            });
+        // GitHub issue #113: a repo with zero open worktrees is still a real, clickable rail
+        // affordance now (`Self::render_repo_group` renders and wires up every group's header
+        // regardless of `rows`/`all_rows`), so the only case left with genuinely nothing to show
+        // is no repo at all - defensive rather than reachable through any real UI path today,
+        // since `Self::render_rail` (this function's only caller) is itself only ever rendered
+        // once `Self::focused_repo` is `Some`, which requires at least one entry in `Self::repos`.
+        if groups.is_empty() {
+            return self.render_rail_empty_message("no worktrees found");
         }
 
         let mut list = div().id("rail-repo-groups").flex().flex_col();
@@ -801,70 +806,203 @@ impl AdeApp {
             .into_any_element()
     }
 
-    /// One repo group (§2.0-2.1): the header (name, `N wt` count, and the amber `N worktrees
-    /// waiting` when non-zero), then every worktree row already ranked most-urgent-first by
-    /// [`rail::group_worktrees_by_repo`].
+    /// One repo group (§2.0-2.1): the header (name, `N wt` count, the amber `N worktrees
+    /// waiting` when non-zero, and a per-repo `+`), then either every worktree row already
+    /// ranked most-urgent-first by [`rail::group_worktrees_by_repo`], or - GitHub issue #113 - a
+    /// real inline message when this repo has none to show, rather than the header (and the repo
+    /// itself) simply disappearing from the rail. Every repo's header renders and is clickable
+    /// regardless of `rows`/`all_rows`: [`Self::checkout_repo_from_rail`] is the same real
+    /// "focus/load a different repo" flow `Self::open_repo_in_current_window` (Open Folder…)
+    /// already uses, so a repo with zero open worktrees is a real, reachable "focused, nothing
+    /// open yet" state - not a dead end.
     ///
     /// The header's `N wt` and (via [`rail::RepoGroup::waiting_count`]) `N worktrees waiting`
     /// are read from `group.all_rows`, **not** `group.rows` - see [`Self::build_repo_groups`]'s
     /// docs for why: this repo's real, complete worktree list, unaffected by the rail's filter
     /// query or by which repo is currently focused. Only the rows actually rendered below the
-    /// header (`group.rows`, in the `.children(...)` call at the bottom of this function) may be
-    /// narrower.
+    /// header (`group.rows`) may be narrower - and only that narrower list, never the header
+    /// click target or the `+`, is affected by an empty vs. filtered-away distinction (see the
+    /// inline message below, which does distinguish the two for its own wording).
+    ///
+    /// `group.rows_loaded` gates the `N wt` count itself: `false` (every non-focused repo today -
+    /// see [`rail::RepoWorktrees::rows_loaded`]'s docs) renders an honest em dash instead of `0
+    /// wt`, since this repo's real worktree count was never fetched and may well be nonzero - a
+    /// literal `0 wt` would be a false claim about state this app hasn't actually loaded.
     pub(in crate::rail) fn render_repo_group(
         &self,
         group: &RepoGroup,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let waiting_label = rail::waiting_count_label(group.waiting_count());
+        let repo_id = group.repo_id;
+        let is_focused_repo = self.focused_repo == Some(repo_id);
 
-        div()
-            .id(("repo-group", group.repo_id.0))
+        let header = div()
+            .id(("repo-group-header", repo_id.0))
+            .debug_selector(move || format!("repo-group-header-{}", repo_id.0))
+            // Padding `8 12 4` (§2.1).
             .flex()
-            .flex_col()
+            .items_center()
+            .gap(px(6.0))
+            .pt(px(8.0))
+            .px(px(12.0))
+            .pb(px(4.0))
+            // The already-focused repo's own header isn't a real click target (see
+            // `Self::checkout_repo_from_rail`'s own no-op-when-already-focused guard) - no
+            // `cursor_pointer`/hover affordance for a click that would do nothing, matching
+            // `render_worktree_row`'s identical `is_selected` convention just below in this same
+            // file (see the comment near line 1407 for this file's established "non-actionable
+            // control drops cursor_pointer/hover/on_click" rule).
+            .when(!is_focused_repo, |el| {
+                el.cursor_pointer()
+                    .hover(|el| el.bg(theme::rail::WORKTREE_HOVER_BG))
+            })
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.checkout_repo_from_rail(repo_id, window, cx);
+            }))
             .child(
-                // Padding `8 12 4` (§2.1).
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .pt(px(8.0))
-                    .px(px(12.0))
-                    .pb(px(4.0))
-                    .child(
-                        div()
-                            .font(font(theme::font::SANS))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_size(self.ui_text_size(9.5))
-                            .text_color(theme::rail::REPO_HEADER_NAME)
-                            .child(group.repo_name.to_uppercase()),
-                    )
-                    .child(
-                        div()
-                            .font(font(theme::font::MONO))
-                            .text_size(self.ui_text_size(9.5))
-                            .text_color(theme::text::PATH)
-                            .child(format!("{} wt", group.all_rows.len())),
-                    )
-                    .child(div().flex_1())
-                    .when_some(waiting_label, |el, text| {
-                        el.child(
-                            div()
-                                .font(font(theme::font::SANS))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_size(self.ui_text_size(9.5))
-                                .text_color(theme::status::ASK_CARD_FG)
-                                .child(text),
-                        )
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(self.ui_text_size(9.5))
+                    .text_color(theme::rail::REPO_HEADER_NAME)
+                    .child(group.repo_name.to_uppercase()),
+            )
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(9.5))
+                    .text_color(theme::text::PATH)
+                    .child(if group.rows_loaded {
+                        format!("{} wt", group.all_rows.len())
+                    } else {
+                        // `group.all_rows` is empty here only because this repo's worktree data
+                        // was never fetched (see `Self::build_repo_groups`'s docs) - rendering
+                        // `0 wt` would falsely claim this repo really has no worktrees. An em
+                        // dash is the honest "not loaded" signal instead.
+                        "\u{2014} wt".to_string()
                     }),
             )
-            .children(
+            .child(div().flex_1())
+            .when_some(waiting_label, |el, text| {
+                el.child(
+                    div()
+                        .font(font(theme::font::SANS))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_size(self.ui_text_size(9.5))
+                        .text_color(theme::status::ASK_CARD_FG)
+                        .child(text),
+                )
+            })
+            .child(self.render_repo_group_new_button(repo_id, cx));
+
+        let mut group_div = div()
+            .id(("repo-group", repo_id.0))
+            .flex()
+            .flex_col()
+            .child(header);
+
+        if group.rows.is_empty() {
+            // GitHub issue #113: previously this repo's whole group (header included) was
+            // dropped from the rail entirely whenever it had no rows to show - see
+            // `Self::render_rail_list`'s own updated docs. A real, worded inline message now
+            // takes that empty row-list's place instead, distinguishing three real cases: this
+            // repo's data was never loaded (`!group.rows_loaded` - every non-focused repo today),
+            // it genuinely has no open worktrees, or the filter box is hiding them - never
+            // claiming "no worktrees open yet" for a repo whose data this app hasn't actually
+            // fetched, which may well have several worktrees on disk.
+            group_div = group_div.child(
+                div()
+                    .px(px(12.0))
+                    .pb(px(6.0))
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(9.5))
+                    .text_color(theme::text::GHOSTER)
+                    .child(if !group.rows_loaded {
+                        "not loaded yet \u{2013} click to open"
+                    } else if group.all_rows.is_empty() {
+                        "no worktrees open yet"
+                    } else {
+                        "no worktrees match this filter"
+                    }),
+            );
+        } else {
+            group_div = group_div.children(
                 group
                     .rows
                     .iter()
                     .enumerate()
                     .map(|(index, row)| self.render_worktree_row(row, index, cx)),
-            )
+            );
+        }
+        group_div
+    }
+
+    /// The repo header's own `+` (GitHub issue #113) - the rail-native way to create a terminal
+    /// or agent session directly in a repo, even one with zero open worktrees, without first
+    /// hunting for the tab strip's identical control. Checks `repo_id` out
+    /// ([`Self::checkout_repo_from_rail`] - a no-op if it's already focused) and then opens
+    /// exactly the same real popover the tab strip's own `+` does
+    /// ([`crate::work_surface::render::AdeApp::render_plus_menu`]), rather than reimplementing
+    /// any of its five actions (New terminal, New agent, Git graph, Open file…, Next changed
+    /// file) here: this button only ever decides *which repo* those actions target, never what
+    /// they do once clicked. `Self::load_agent_rows` refresh mirrors
+    /// `crate::work_surface::render::AdeApp::render_tab_strip_plus`'s own click handler, so the
+    /// menu's "New agent" row reflects a fresh `$PATH` search here too.
+    ///
+    /// `cx.stop_propagation()` keeps this click from also bubbling into the header's own
+    /// `on_click` right above it in the tree - both would call
+    /// [`Self::checkout_repo_from_rail`] harmlessly (its own guard makes the second call a
+    /// no-op), but only this handler should also open the menu, the same "inner control stops
+    /// the outer row's own click" pattern `render_worktree_row`'s caret already uses.
+    pub(in crate::rail) fn render_repo_group_new_button(
+        &self,
+        repo_id: repo::RepoId,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(("repo-group-new", repo_id.0))
+            .debug_selector(move || format!("repo-group-new-{}", repo_id.0))
+            .flex_none()
+            .w(px(14.0))
+            .h(px(14.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .rounded(theme::radius::CHIP)
+            .text_color(theme::text::DIM)
+            .text_size(self.ui_text_size(11.0))
+            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+            .child("+")
+            // Captures this button's own painted bounds into `Self::rail_plus_button_bounds`
+            // every render - the same `gpui::canvas` idiom `Self::plus_button_bounds` uses for
+            // the tab strip's `+` (`crate::work_surface::render::AdeApp::render_tab_strip_plus`),
+            // keyed by `repo_id` since more than one of these paints per frame. Lets
+            // `crate::work_surface::render::AdeApp::render_plus_menu` anchor the popover to
+            // *this* button rather than the tab strip's when this is the one that opened it - see
+            // `Self::plus_menu_repo_anchor`'s own docs.
+            .child({
+                let this = cx.entity();
+                gpui::canvas(
+                    move |bounds, _window, cx| {
+                        this.update(cx, |this, _cx| {
+                            this.rail_plus_button_bounds.insert(repo_id, bounds);
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            })
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                this.checkout_repo_from_rail(repo_id, window, cx);
+                this.plus_menu_open = true;
+                this.plus_menu_repo_anchor = Some(repo_id);
+                this.load_agent_rows(cx);
+                cx.notify();
+            }))
     }
 
     /// Whether `row`'s agent rows are currently shown - an explicit per-worktree override in
@@ -1931,6 +2069,244 @@ mod rail_row_tests {
             "sanity check: the *displayed* rows really did narrow to the one matching worktree \
              - proving the filter query took effect at all, just not on the header count"
         );
+    }
+}
+
+/// GitHub issue #113: "no way to select an empty repo (one with no worktrees/sessions open yet)
+/// from the rail." Real click-through coverage against the live `AdeApp`/window, mirroring
+/// `crate::code_surface::render`'s own `cx.simulate_click`-against-`debug_bounds` technique -
+/// not just calling `Self::checkout_repo_from_rail` directly, since the bug this closes was two
+/// real gaps in the *render* side (no `on_click` on the header at all, and the whole group
+/// vanishing when it had no rows) that a handler-level test alone wouldn't catch a regression of.
+#[cfg(test)]
+mod repo_checkout_tests {
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    /// Repo B is added (`Self::add_repo`) but never focused - the exact "known to the rail, zero
+    /// open worktrees/agents" state the issue describes: `Self::build_repo_groups` only
+    /// populates real row data for `Self::focused_repo` (see that function's own docs), so repo
+    /// B's group renders with both `rows` and `all_rows` empty. Before this change,
+    /// `Self::render_rail_list` dropped that whole group (header included) from the rail
+    /// entirely; now the header must still paint, with a real, working click target.
+    #[gpui::test]
+    fn clicking_an_empty_repos_header_checks_it_out(cx: &mut TestAppContext) {
+        let repo_a = tempfile::tempdir().expect("tempdir a");
+        let repo_b = tempfile::tempdir().expect("tempdir b");
+        std::fs::write(repo_b.path().join("b.txt"), "b\n").expect("write");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
+        cx.run_until_parked();
+
+        let groups = app.update(cx, |app, cx| app.build_repo_groups(cx));
+        assert_eq!(
+            groups.len(),
+            2,
+            "sanity check: both repos must produce a group at all"
+        );
+        let repo_b_group = groups
+            .iter()
+            .find(|group| group.repo_id == repo_b_id)
+            .expect("repo B's group must render despite having zero rows - GitHub issue #113");
+        assert!(
+            repo_b_group.rows.is_empty() && repo_b_group.all_rows.is_empty(),
+            "sanity check: repo B genuinely has no live worktree data loaded yet"
+        );
+        assert_ne!(
+            app.read_with(cx, |app, _| app.focused_repo_path()),
+            repo_b.path(),
+            "sanity check: repo B is not the focused repo before the click"
+        );
+
+        // A real click on repo B's header's own painted bounds, not a direct method call - see
+        // this module's own docs for why the render side matters here.
+        let selector: &'static str =
+            Box::leak(format!("repo-group-header-{}", repo_b_id.0).into_boxed_str());
+        let header_bounds = cx
+            .debug_bounds(selector)
+            .expect("repo B's header must have painted with a real debug selector");
+        cx.simulate_click(header_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.focused_repo_path(),
+                repo_b.path(),
+                "clicking repo B's header must check it out - focus its repo"
+            );
+            assert_eq!(
+                app.file_tree_root,
+                repo_b.path(),
+                "checking out repo B must really load its own file tree, not just flip a focus id"
+            );
+        });
+    }
+
+    /// A checker audit of the fix above (GitHub issue #113) found a real "no fake functionality"
+    /// violation: repo B's group renders with empty `rows`/`all_rows` not because it really has
+    /// zero worktrees, but because its data was simply never loaded (single-repo-scoped rail -
+    /// see `rail::group_worktrees_by_repo`'s own docs). Before `RepoGroup::rows_loaded` existed,
+    /// the render side had no way to tell that apart from a real zero-worktree repo, so it showed
+    /// a literal "0 wt" and "no worktrees open yet" for repo B - both false claims about state
+    /// this app hasn't actually fetched. This proves the fix: the focused repo (real data) must
+    /// report `rows_loaded: true`, and every other repo (unfetched) must report `false`.
+    #[gpui::test]
+    fn build_repo_groups_marks_only_the_focused_repos_data_as_really_loaded(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = tempfile::tempdir().expect("tempdir a");
+        let repo_b = tempfile::tempdir().expect("tempdir b");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        let repo_a_id = app.read_with(cx, |app, _| {
+            app.focused_repo()
+                .expect("sanity check: repo A is focused")
+                .id
+        });
+        let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
+        cx.run_until_parked();
+
+        let groups = app.update(cx, |app, cx| app.build_repo_groups(cx));
+
+        let group_a = groups
+            .iter()
+            .find(|g| g.repo_id == repo_a_id)
+            .expect("repo A's group must exist");
+        assert!(
+            group_a.rows_loaded,
+            "the focused repo's own data really was loaded - rows_loaded must be true"
+        );
+
+        let group_b = groups
+            .iter()
+            .find(|g| g.repo_id == repo_b_id)
+            .expect("repo B's group must exist");
+        assert!(
+            !group_b.rows_loaded,
+            "repo B's data was never fetched (it isn't the focused repo) - rows_loaded must be \
+             false, not indistinguishable from a repo that was loaded and really has zero \
+             worktrees"
+        );
+        assert!(
+            group_b.all_rows.is_empty() && group_b.rows.is_empty(),
+            "sanity check: repo B's rows are empty only because nothing was ever loaded for it"
+        );
+    }
+
+    /// A second click on the already-focused repo's own header must be a real no-op (matching
+    /// `Self::checkout_repo_from_rail`'s own guard) - proven by arming some real per-repo UI
+    /// state and confirming it survives the click, the same "did this actually reset anything"
+    /// shape `open_repo_in_current_window_clears_stale_ui_state_from_the_previous_repo`
+    /// (`crate::root::mod`) uses for the real switch case.
+    #[gpui::test]
+    fn clicking_the_already_focused_repos_header_does_not_reset_it(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let repo_id = app.read_with(cx, |app, _| {
+            app.focused_repo()
+                .expect("sanity check: a repo is focused")
+                .id
+        });
+
+        app.update(cx, |app, cx| {
+            app.commit_menu_open = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let selector: &'static str =
+            Box::leak(format!("repo-group-header-{}", repo_id.0).into_boxed_str());
+        let header_bounds = cx
+            .debug_bounds(selector)
+            .expect("the focused repo's own header must still paint (and still be clickable)");
+        cx.simulate_click(header_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.commit_menu_open),
+            "re-clicking the already-focused repo's own header must not reset its live UI state"
+        );
+    }
+
+    /// The rail's own per-repo `+` (GitHub issue #113's second half: "let the user create a
+    /// terminal / agent session ... from the rail") must check the target repo out first and
+    /// then open the exact same real popover the tab strip's own `+` uses
+    /// (`crate::work_surface::render::AdeApp::render_plus_menu`) - not a second, reimplemented
+    /// spawn path. Driven end to end: click repo B's `+`, then click the real "New terminal" row
+    /// that popover renders, and confirm the spawned terminal's `cwd` is really repo B's.
+    #[gpui::test]
+    fn the_repo_headers_plus_button_opens_the_real_plus_menu_targeting_that_repo(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = tempfile::tempdir().expect("tempdir a");
+        let repo_b = tempfile::tempdir().expect("tempdir b");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.agents
+                    .iter_for_cwd(repo_b.path().to_path_buf())
+                    .next()
+                    .is_none(),
+                "sanity check: repo B is a genuinely empty repo - no agents open in it yet"
+            );
+        });
+
+        let new_button_selector: &'static str =
+            Box::leak(format!("repo-group-new-{}", repo_b_id.0).into_boxed_str());
+        let new_button_bounds = cx
+            .debug_bounds(new_button_selector)
+            .expect("repo B's own + must have painted");
+        cx.simulate_click(new_button_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.focused_repo_path(),
+                repo_b.path(),
+                "the rail's + must check repo B out before offering to spawn into it"
+            );
+            assert!(
+                app.plus_menu_open,
+                "the rail's + must open the real tab-strip plus menu, not spawn silently"
+            );
+        });
+
+        let new_terminal_bounds = cx.debug_bounds("dropdown-menu-row-New terminal").expect(
+            "the real plus menu's own New terminal row must have painted - proving this \
+             reuses `render_plus_menu` rather than a reimplemented popover",
+        );
+        cx.simulate_click(new_terminal_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.plus_menu_open,
+                "picking a row must close the menu, same as every other plus-menu click"
+            );
+            let agent = app
+                .agents
+                .active()
+                .expect("New terminal must really spawn an agent and make it active");
+            assert_eq!(
+                agent.cwd,
+                repo_b.path(),
+                "the spawned terminal must run in repo B - the repo the rail's own + checked \
+                 out - not wherever was focused before the click"
+            );
+        });
     }
 }
 

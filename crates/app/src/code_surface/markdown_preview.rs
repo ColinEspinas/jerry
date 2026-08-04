@@ -613,31 +613,26 @@ fn build_text_runs(
     }
 }
 
-/// The extension key `code_view::highlighter_for_extension` recognizes for a fenced code block's
-/// own info-string language name - these are two different vocabularies (a fence says `"rust"`,
-/// the registry is keyed by file extension `"rs"`), so this is a real, small alias table, not a
-/// guess: every entry names a real `crate::language::EXTENSIONS` extension.
-fn extension_for_fence_language(language: &str) -> Option<&'static str> {
-    match language.to_ascii_lowercase().as_str() {
-        "rust" | "rs" => Some("rs"),
-        "python" | "py" => Some("py"),
-        "typescript" | "ts" => Some("ts"),
-        "tsx" => Some("tsx"),
-        "javascript" | "js" => Some("js"),
-        "jsx" => Some("js"),
-        "go" | "golang" => Some("go"),
-        "json" => Some("json"),
-        "yaml" | "yml" => Some("yaml"),
-        "toml" => Some("toml"),
-        "c" | "h" => Some("c"),
-        _ => None,
-    }
+/// A preview code card's real, coloured lines - split out of [`render_code_block`] purely so the
+/// colouring itself is testable without building a GPUI element (`AnyElement` exposes nothing to
+/// assert on).
+///
+/// The fence-tag alias table it resolves through used to live here as a private copy; GitHub issue
+/// #154 lifted it into [`crate::language::extension_for_fence_language`] because the *source*
+/// view's own tree-sitter injection callback needs the identical mapping, and two copies could
+/// disagree about what ` ```py ` means. Sharing it is also what gave preview mode real HTML/CSS
+/// fence colouring with no further change here - see that function's own docs.
+fn highlighted_code_block_lines(
+    language: Option<&str>,
+    text: &str,
+) -> Vec<code_view::RenderedLine> {
+    let extension = language.and_then(crate::language::extension_for_fence_language);
+    let lines: Vec<&str> = text.lines().collect();
+    code_view::highlight_block(lines, extension)
 }
 
 fn render_code_block(language: Option<&str>, text: &str) -> AnyElement {
-    let extension = language.and_then(extension_for_fence_language);
-    let lines: Vec<&str> = text.lines().collect();
-    let rendered = code_view::highlight_block(lines, extension);
+    let rendered = highlighted_code_block_lines(language, text);
     let mut card = div()
         .flex()
         .flex_col()
@@ -775,6 +770,70 @@ fn render_table(header: &[String], rows: &[Vec<String>]) -> AnyElement {
         .child(row(header, true))
         .children(rows.iter().map(|cells| row(cells, false)))
         .into_any_element()
+}
+
+#[cfg(test)]
+mod code_block_color_tests {
+    use super::*;
+    use crate::code_surface::code_view::HighlightKind;
+
+    /// The real kind covering the first occurrence of `needle` across a rendered code card's
+    /// lines - the same question `render_code_line` asks when it picks each run's colour.
+    fn kind_of(lines: &[code_view::RenderedLine], needle: &str) -> Option<HighlightKind> {
+        lines
+            .iter()
+            .flat_map(|line| &line.runs)
+            .find(|(text, _)| text.contains(needle))
+            .map(|(_, kind)| *kind)
+    }
+
+    /// GitHub issue #154 in *preview* mode, which is a genuinely separate rendering path from the
+    /// source view's own highlighting: a ` ```html ` fence's card is really coloured by
+    /// `tree-sitter-html`, not left flat.
+    #[test]
+    fn a_preview_html_fence_is_really_colored_by_the_html_grammar() {
+        let lines = highlighted_code_block_lines(Some("html"), "<div class=\"card\">hi</div>\n");
+        assert_eq!(kind_of(&lines, "div"), Some(HighlightKind::Tag));
+        assert_eq!(kind_of(&lines, "class"), Some(HighlightKind::Attribute));
+    }
+
+    #[test]
+    fn a_preview_css_fence_is_really_colored_by_the_css_grammar() {
+        let lines = highlighted_code_block_lines(Some("css"), ".card { color: red; }\n");
+        assert_eq!(kind_of(&lines, "card"), Some(HighlightKind::Property));
+    }
+
+    /// The pre-existing languages must be unaffected by the alias table moving out of this module.
+    #[test]
+    fn a_preview_rust_fence_is_still_colored_by_the_rust_grammar() {
+        let lines = highlighted_code_block_lines(Some("rust"), "fn main() {}\n");
+        assert_eq!(kind_of(&lines, "fn"), Some(HighlightKind::Keyword));
+    }
+
+    /// A real gain the shared table brought with it: this module's own private copy mapped a
+    /// ` ```jsx ` fence to the `"js"` extension, which wires the *plain* TypeScript grammar - one
+    /// that cannot parse JSX at all. It now maps to `"jsx"`, which wires the real TSX grammar.
+    #[test]
+    fn a_preview_jsx_fence_reaches_a_grammar_that_can_actually_parse_jsx() {
+        let lines = highlighted_code_block_lines(Some("jsx"), "const a = <div id=\"x\" />;\n");
+        assert_eq!(kind_of(&lines, "div"), Some(HighlightKind::Tag));
+        assert_eq!(kind_of(&lines, "id"), Some(HighlightKind::Attribute));
+    }
+
+    /// An unrecognized fence tag, and a fence with no tag at all, render as one flat unclassified
+    /// card rather than being force-fitted into some other language.
+    #[test]
+    fn an_unknown_or_absent_preview_fence_language_stays_plain_text() {
+        for language in [Some("zig"), None] {
+            let lines = highlighted_code_block_lines(language, "const x = 1;\n");
+            let kinds: Vec<HighlightKind> = lines
+                .iter()
+                .flat_map(|line| &line.runs)
+                .map(|(_, kind)| *kind)
+                .collect();
+            assert_eq!(kinds, vec![HighlightKind::Text], "{language:?}");
+        }
+    }
 }
 
 #[cfg(test)]

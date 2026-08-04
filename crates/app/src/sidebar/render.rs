@@ -1,5 +1,6 @@
 use super::*;
 use crate::keymap;
+use crate::root::scrollbar;
 use crate::root::widgets::{
     hover_bg, menu_popover_chrome, render_keycap_row, render_menu_group_divider,
     render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
@@ -918,7 +919,12 @@ impl AdeApp {
             .w_full()
             .h(theme::band::TREE_ROW)
             .pl(px(file_tree::ROW_LEFT_PAD) + indent)
-            .pr(px(8.0))
+            // GitHub issue #123: real clearance from the file tree's own overlay scrollbar
+            // (`crate::root::scrollbar::CONTENT_CLEARANCE`'s own docs), not the bare
+            // `SCROLLBAR_SIZE` this used to match exactly (flush contact, not a gap). Matches
+            // `Self::render_file_tree_row`'s own row padding below so the inline editor stays
+            // visually aligned with the normal rows around it.
+            .pr(px(scrollbar::CONTENT_CLEARANCE))
             .bg(theme::surface::ROW_SELECTED)
             .font(font(theme::font::MONO))
             .text_size(self.ui_text_size(11.5))
@@ -1029,7 +1035,14 @@ impl AdeApp {
             .gap(px(6.0))
             .h(theme::band::TREE_ROW)
             .pl(px(file_tree::ROW_LEFT_PAD) + indent)
-            .pr(px(8.0))
+            // GitHub issue #123 ("Add padding to the file tree right side icons/buttons"): this
+            // row's own trailing "new file" `+` control (added below, when `entry.is_dir`) used
+            // to sit exactly `SCROLLBAR_SIZE` from the row's right edge - precisely where the
+            // real overlay scrollbar's track begins, i.e. flush contact rather than a real gap,
+            // whenever the tree is tall enough to scroll. See
+            // `crate::root::scrollbar::CONTENT_CLEARANCE`'s own docs for the reasoning behind the
+            // exact value.
+            .pr(px(scrollbar::CONTENT_CLEARANCE))
             .font(font(theme::font::MONO))
             .text_size(self.ui_text_size(11.5))
             .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED))
@@ -1154,7 +1167,8 @@ impl AdeApp {
             });
         }
         if entry.is_dir {
-            let drop_path = entry.path.clone();
+            let drop_path = AdeApp::tree_drop_target_dir(&entry.path, true)
+                .expect("a directory's own path is always its own drop target");
             let hover_path = entry.path.clone();
             row = row
                 .on_drag_move(cx.listener(
@@ -1187,6 +1201,48 @@ impl AdeApp {
                         // Without this, the drop would *also* reach `Self::file_tree_shell`'s own
                         // root-drop handler right after this row's - moving the same selection into
                         // the folder it was just dropped on, then straight back out to the root.
+                        cx.stop_propagation();
+                        this.tree_drag_hover_target = None;
+                        this.move_paths_into_dir(&dragged.paths, &drop_path, cx);
+                    }),
+                );
+        } else if let Some(drop_path) = AdeApp::tree_drop_target_dir(&entry.path, false) {
+            // GitHub issue #152: a file row is not itself a drop target the way a folder row is
+            // (there's nowhere "inside" a file to move something into), but it must still catch a
+            // drop rather than let one fall through to `Self::file_tree_shell`'s own root-only
+            // fallback below - most rows in any populated folder are files, not that folder's own
+            // header row, so "release roughly where the dragged item already was" overwhelmingly
+            // means releasing over a sibling *file*, not the parent directory's row. Without this,
+            // that ordinary "changed my mind, drop it back" gesture silently relocated the whole
+            // selection to the worktree root instead of leaving it alone - the real bug this
+            // fixes. `Self::tree_drop_target_dir` resolves this to the file's own parent
+            // directory - see that function's own docs, including why it's a real, directly
+            // testable function rather than logic inlined only here.
+            let hover_path = drop_path.clone();
+            row = row
+                .on_drag_move(cx.listener(
+                    move |this, event: &gpui::DragMoveEvent<TreeDragPayload>, _window, cx| {
+                        // Highlights the *parent folder's* row (if visible), not this file row
+                        // itself - the same "which row does dropping here really target"
+                        // affordance the folder-row handler above gives, just one level up, since
+                        // dropping is never "onto" a file the way it can be "into" a folder.
+                        let hovering = event.bounds.contains(&event.event.position);
+                        if hovering {
+                            if this.tree_drag_hover_target.as_deref() != Some(hover_path.as_path())
+                            {
+                                this.tree_drag_hover_target = Some(hover_path.clone());
+                                cx.notify();
+                            }
+                        } else if this.tree_drag_hover_target.as_deref()
+                            == Some(hover_path.as_path())
+                        {
+                            this.tree_drag_hover_target = None;
+                            cx.notify();
+                        }
+                    },
+                ))
+                .on_drop(
+                    cx.listener(move |this, dragged: &TreeDragPayload, _window, cx| {
                         cx.stop_propagation();
                         this.tree_drag_hover_target = None;
                         this.move_paths_into_dir(&dragged.paths, &drop_path, cx);
@@ -1267,6 +1323,7 @@ impl AdeApp {
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
+                    .truncate()
                     .text_color(if entry.is_dir {
                         theme::text::SECONDARY
                     } else {
@@ -1296,6 +1353,14 @@ impl AdeApp {
             row = row.child(
                 div()
                     .id(format!("file-tree-new-file-{}", entry.path.display()))
+                    // Test-only (see `crate::root::scrollbar`'s own `render_vertical_scrollbar`
+                    // for the identical pattern) - `.id()` alone doesn't register a
+                    // `debug_bounds`-queryable selector, so GitHub issue #123's own geometric
+                    // regression test needs this to read this button's real painted bounds.
+                    .debug_selector({
+                        let path = entry.path.clone();
+                        move || format!("file-tree-new-file-{}", path.display())
+                    })
                     .flex_none()
                     .cursor_pointer()
                     .px(px(4.0))
@@ -1356,7 +1421,17 @@ impl AdeApp {
             .h(theme::band::CHROME_HEADER)
             .flex()
             .items_center()
-            .px(px(10.0))
+            .pl(px(10.0))
+            // GitHub issue #123 ("Add padding to the file tree right side icons/buttons"): this
+            // header sits directly above the file tree's own overlay scrollbar track (same
+            // `w_full` column, same right edge - `Self::render_right_sidebar`'s `container` has
+            // no side padding of its own), so its right-aligned action cluster below (collapse-
+            // all, "New file" `+`) needs the same real clearance the tree's own rows now use,
+            // not the plain `px(10.0)` this used to share on both sides - that left only 2px of
+            // real gap past the scrollbar's own `SCROLLBAR_SIZE`, i.e. barely more than flush,
+            // which is what the issue's screenshot shows. See
+            // `crate::root::scrollbar::CONTENT_CLEARANCE`'s own docs for the value.
+            .pr(px(scrollbar::CONTENT_CLEARANCE))
             .border_b_1()
             .border_color(theme::border::INNER)
             .child(toggle)
@@ -1432,6 +1507,12 @@ impl AdeApp {
                         el.child(
                             div()
                                 .id("file-tree-new-file-root")
+                                // Test-only (see `crate::root::scrollbar`'s own
+                                // `render_vertical_scrollbar` for the identical pattern) - lets a
+                                // real render test read this cluster's actual right-most painted
+                                // bounds back, rather than only proving a padding *number*
+                                // changed.
+                                .debug_selector(|| "file-tree-new-file-root".to_string())
                                 .flex_none()
                                 .cursor_pointer()
                                 .px(px(5.0))
@@ -1748,7 +1829,13 @@ impl AdeApp {
             .gap(px(6.0))
             .h(theme::band::CHANGE_ROW)
             .pl(px(9.0))
-            .pr(px(10.0))
+            // GitHub issue #123: reuses the same shared clearance the file tree's own rows use
+            // (`crate::root::scrollbar::CONTENT_CLEARANCE`'s own docs) - this row sits next to
+            // the identical overlay scrollbar (`Self::render_changes_rows`'s
+            // "changes-rows-scrollbar"), so it needs the same real gap, not just a
+            // similar-looking bare number that happens to already clear the *old*,
+            // insufficient value.
+            .pr(px(scrollbar::CONTENT_CLEARANCE))
             .border_b_1()
             .border_color(theme::border::ROW)
             .cursor_pointer()
@@ -3113,6 +3200,77 @@ mod virtualization_tests {
             cx.debug_bounds("change-row-f-39.txt").is_none(),
             "the 40th changed file's row is past any plausible viewport, so a virtualized \
              list must never build it as an element at all"
+        );
+    }
+
+    /// GitHub issue #123 ("Add padding to the file tree right side icons/buttons"): before this
+    /// revision's fix, a directory row's own trailing "new file" `+` control sat at exactly
+    /// `SCROLLBAR_SIZE` from the row's right edge - precisely where the real overlay scrollbar's
+    /// track begins (`crate::root::scrollbar::render_vertical_scrollbar`'s own `right_0()`
+    /// `.w(px(SCROLLBAR_SIZE))`), i.e. touching it with zero real daylight between them whenever
+    /// the tree genuinely scrolled - the collision the issue's screenshot shows.
+    ///
+    /// This proves the fix with real painted geometry, not merely that a padding *number*
+    /// changed: `min_gap` is a real threshold on its own, independent of whatever
+    /// `crate::root::scrollbar::CONTENT_CLEARANCE` production code currently uses, so this test
+    /// keeps proving genuine daylight even if that constant's value ever changes, rather than
+    /// silently re-checking a value against itself.
+    #[gpui::test]
+    fn file_tree_row_and_header_actions_clear_the_real_scrollbar(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        fs::create_dir(repo.path().join("src")).expect("mkdir");
+        fs::write(repo.path().join("src/main.rs"), "//\n").expect("write");
+        // Enough flat files that the tree genuinely overflows its viewport and the real overlay
+        // scrollbar actually renders - `render_vertical_scrollbar` returns `None`, painting
+        // nothing at all, when the list doesn't overflow (see that function's own early return
+        // on `max_offset <= 0.5`).
+        for index in 0..300 {
+            fs::write(repo.path().join(format!("file-{index:03}.txt")), "x\n").expect("write");
+        }
+        let (_app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let scrollbar = cx.debug_bounds("file-tree-scrollbar").expect(
+            "the tree must genuinely overflow for this test to prove anything about the real \
+             scrollbar's geometry - if this is `None` the precondition itself is broken",
+        );
+
+        // A real minimum gap - deliberately not derived from `CONTENT_CLEARANCE` itself (see
+        // this test's own docs above).
+        let min_gap = px(4.0);
+
+        // Directories sort before files at the same depth (`file_tree`'s own sort), so "src" is
+        // the tree's very first row - guaranteed to paint inside any plausible viewport,
+        // regardless of virtualization.
+        // `debug_bounds` takes `&'static str`; this codebase's established test-only pattern for
+        // a selector that must embed a real runtime path (see `crate::root::focus`'s own tests)
+        // is a deliberate, test-only leak via `Box::leak`.
+        let row_selector: &'static str = Box::leak(
+            format!("file-tree-new-file-{}", repo.path().join("src").display()).into_boxed_str(),
+        );
+        let row_button = cx
+            .debug_bounds(row_selector)
+            .expect("the \"src\" directory row's own \"+\" control must really paint");
+        assert!(
+            row_button.right() + min_gap <= scrollbar.left(),
+            "the file tree row's own \"+\" control (right edge {:?}) must clear the real \
+             scrollbar's own left edge ({:?}) by a real, visually distinct margin - not just \
+             avoid literal pixel overlap, which is what collided in GitHub issue #123's \
+             screenshot",
+            row_button.right(),
+            scrollbar.left(),
+        );
+
+        let header_button = cx.debug_bounds("file-tree-new-file-root").expect(
+            "the header's own root \"New file\" control must really paint in the Files view",
+        );
+        assert!(
+            header_button.right() + min_gap <= scrollbar.left(),
+            "the header's action cluster (right edge {:?}) must also clear the real \
+             scrollbar's own left edge ({:?}) by a real margin - this is the exact control \
+             GitHub issue #123's screenshot shows colliding with the scrollbar",
+            header_button.right(),
+            scrollbar.left(),
         );
     }
 }

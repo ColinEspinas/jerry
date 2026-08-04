@@ -50,6 +50,33 @@ pub fn indent_unit(settings: IndentSettings) -> String {
     }
 }
 
+/// How many real indent-guide levels `text`'s own leading whitespace covers (GitHub issue #122:
+/// "Add settings to display indents in code editor"), tab-stop-aware so a literal leading `\t`
+/// (this module's own `indent_unit`'s real tab-mode output - one literal `\t` per level, not
+/// `tab_width` bytes) counts as advancing to the *next* `tab_width`-column stop, exactly like a
+/// real terminal/editor tab stop, rather than a fixed "one tab = one level" or "one tab = one
+/// column" approximation that would misalign against the same file's own space-indented lines.
+/// Walks only the real leading run of `' '`/`'\t'` characters - the first non-whitespace character
+/// (or the end of the line) stops the walk, so trailing/inner whitespace never contributes.
+///
+/// `crate::code_surface::editing::render_editable_file_view_line`'s real, painted indent guides
+/// (gated by `crate::settings::store::AppearanceSettings::show_indent_guides`) are the only real
+/// consumer - see that function's own docs for how `tab_width` columns become real pixel guide
+/// positions via a real, measured monospace character width (never a hardcoded pixel constant
+/// unrelated to this count).
+pub fn leading_indent_levels(text: &str, tab_width: u8) -> usize {
+    let tab_width = tab_width.max(1) as usize;
+    let mut columns = 0usize;
+    for ch in text.chars() {
+        match ch {
+            ' ' => columns += 1,
+            '\t' => columns += tab_width - (columns % tab_width),
+            _ => break,
+        }
+    }
+    columns / tab_width
+}
+
 /// One real `.editorconfig` file's own properties for whichever `[section]`s matched - `None`
 /// for a property no matching section in this file ever set, distinct from a farther file's own
 /// value being inherited (see [`merge_props`]).
@@ -330,6 +357,63 @@ pub fn leading_dedent_len(line_text: &str, width: u8) -> usize {
     count
 }
 
+/// The real leading whitespace (spaces and/or tabs) at the very start of `text` - GitHub issue
+/// #121's own real "predict the next line's indentation" baseline reads this from `crate::
+/// code_surface::edit_buffer::EditBuffer::insert_newline_with_auto_indent`'s own real buffer
+/// content (never a hardcoded assumption) to carry a line's indentation over to the new line
+/// `Enter` creates below it. Stops at the first character that isn't a space or a tab (or the end
+/// of `text`), so a line with no real leading whitespace at all returns `""` - a genuine no-op
+/// carry-over, not a fabricated one.
+pub fn leading_whitespace(text: &str) -> &str {
+    let end = text
+        .find(|ch: char| ch != ' ' && ch != '\t')
+        .unwrap_or(text.len());
+    &text[..end]
+}
+
+/// Whether `text_before_cursor` (a line's own real text up to, but not including, the caret),
+/// after trimming real trailing whitespace, ends with one of the three real opening brackets
+/// (`{`, `(`, `[`). [`crate::code_surface::edit_buffer::EditBuffer::insert_newline_with_auto_indent`]'s
+/// own real, single-line "does the line I'm leaving open a block" heuristic (GitHub issue #121's
+/// stretch goal): a genuinely common shape across every language this app highlights via
+/// tree-sitter. Deliberately does not attempt real bracket matching across multiple lines, does
+/// not track whether the bracket is itself inside a string/comment, and does not look past the
+/// caret: a narrow, single-line heuristic real editors use for this exact gesture, not full
+/// re-indentation.
+pub fn ends_with_opener(text_before_cursor: &str) -> bool {
+    matches!(
+        text_before_cursor.trim_end().chars().next_back(),
+        Some('{') | Some('(') | Some('[')
+    )
+}
+
+/// Whether `extension` (the same lowercase, no-leading-dot convention `crate::language::
+/// EXTENSIONS` and `crate::code_surface::edit_buffer::EditBuffer::extension` use) names a
+/// language whose block headers end a line with `:` rather than an opening bracket - real only
+/// for Python (`if x:`, `def f():`, `else:`, `for i in xs:`, `class Foo:`, ...), the one such
+/// language this crate actually resolves an LSP/highlighter for today (see `crate::language::
+/// EXTENSIONS`'s own `"py"` entry). Deliberately narrow per Colin Espinas's PR #136 review of
+/// GitHub issue #121 ("Missing indent when no opening character is there like when we use ':' in
+/// python ? This should probably be per language ?") - rather than guessing at other languages'
+/// own colon conventions with no real data backing them, this only recognizes the one language
+/// this codebase already has real, verified support for.
+fn is_colon_block_extension(extension: Option<&str>) -> bool {
+    matches!(extension, Some("py"))
+}
+
+/// [`ends_with_opener`], plus one more real, narrow case: `text_before_cursor` (after trimming
+/// real trailing whitespace) ends with `:` and `extension` is [`is_colon_block_extension`] - a
+/// colon-block language's own line-ending convention for opening an indented block, the same
+/// single-line, no-bracket-matching heuristic [`ends_with_opener`]'s own docs describe, just keyed
+/// off one more trailing character for the languages that use it. A trailing `:` means nothing
+/// special outside a colon-block language (e.g. Rust's `match` arms, struct field types, or
+/// labeled loops never open a new indent level just because a line happens to end with `:`), so
+/// `extension` gates it rather than checking every language's trailing `:` the same way.
+pub fn ends_with_block_opener(text_before_cursor: &str, extension: Option<&str>) -> bool {
+    ends_with_opener(text_before_cursor)
+        || (is_colon_block_extension(extension) && text_before_cursor.trim_end().ends_with(':'))
+}
+
 /// `crate::code_surface::edit_buffer::EditBuffer::indent_lines`'s own real "which lines does a
 /// selection touch" rule, factored out here so it's directly unit-testable without a live
 /// `EditBuffer`: every line the selection's `start` through `end` byte range overlaps, except a
@@ -372,6 +456,37 @@ mod tests {
             }),
             "\t"
         );
+    }
+
+    #[test]
+    fn leading_indent_levels_counts_whole_tab_width_steps_of_space_indentation() {
+        assert_eq!(leading_indent_levels("no indent", 4), 0);
+        assert_eq!(
+            leading_indent_levels("  two spaces, not a whole level", 4),
+            0
+        );
+        assert_eq!(leading_indent_levels("    one level", 4), 1);
+        assert_eq!(leading_indent_levels("        two levels", 4), 2);
+        assert_eq!(
+            leading_indent_levels("      six spaces, one whole level plus a remainder", 4),
+            1
+        );
+    }
+
+    #[test]
+    fn leading_indent_levels_treats_one_literal_tab_as_one_level_regardless_of_tab_width() {
+        assert_eq!(leading_indent_levels("\tone tab", 4), 1);
+        assert_eq!(leading_indent_levels("\t\ttwo tabs", 4), 2);
+        assert_eq!(leading_indent_levels("\tone tab, width 8", 8), 1);
+    }
+
+    #[test]
+    fn leading_indent_levels_only_counts_the_real_leading_run() {
+        // A blank/whitespace-only line still counts its own whitespace (there is nothing else on
+        // the line to stop the walk) - but inner/trailing whitespace inside a real code line does
+        // not contribute past the first non-whitespace character.
+        assert_eq!(leading_indent_levels("        ", 4), 2);
+        assert_eq!(leading_indent_levels("    let x = 1;    ", 4), 1);
     }
 
     #[test]
@@ -645,6 +760,63 @@ mod tests {
     #[test]
     fn leading_dedent_len_is_zero_for_a_line_with_no_leading_whitespace() {
         assert_eq!(leading_dedent_len("foo", 4), 0);
+    }
+
+    #[test]
+    fn leading_whitespace_returns_the_real_leading_spaces_or_tabs() {
+        assert_eq!(leading_whitespace("    foo"), "    ");
+        assert_eq!(leading_whitespace("\tfoo"), "\t");
+        assert_eq!(leading_whitespace("\t  foo"), "\t  ");
+        assert_eq!(leading_whitespace("foo"), "");
+        assert_eq!(leading_whitespace(""), "");
+        assert_eq!(leading_whitespace("    "), "    ");
+    }
+
+    #[test]
+    fn ends_with_opener_detects_the_three_real_opening_brackets() {
+        assert!(ends_with_opener("fn foo() {"));
+        assert!(ends_with_opener("let xs = ["));
+        assert!(ends_with_opener("foo("));
+        // Real trailing whitespace after the opener must not defeat the check.
+        assert!(ends_with_opener("fn foo() {   "));
+    }
+
+    #[test]
+    fn ends_with_opener_is_false_for_a_closer_or_plain_text() {
+        assert!(!ends_with_opener("fn foo() {}"));
+        assert!(!ends_with_opener("let x = 1;"));
+        assert!(!ends_with_opener(""));
+        assert!(!ends_with_opener("   "));
+    }
+
+    #[test]
+    fn ends_with_block_opener_recognizes_python_colon_headers() {
+        assert!(ends_with_block_opener("if x:", Some("py")));
+        assert!(ends_with_block_opener("def f():", Some("py")));
+        assert!(ends_with_block_opener("else:", Some("py")));
+        assert!(ends_with_block_opener("for i in xs:", Some("py")));
+        assert!(ends_with_block_opener("class Foo:", Some("py")));
+        // Real trailing whitespace after the colon must not defeat the check.
+        assert!(ends_with_block_opener("if x:   ", Some("py")));
+    }
+
+    #[test]
+    fn ends_with_block_opener_ignores_a_trailing_colon_outside_python() {
+        assert!(!ends_with_block_opener("if x:", Some("rs")));
+        assert!(!ends_with_block_opener("def f():", Some("rs")));
+        assert!(!ends_with_block_opener("else:", None));
+    }
+
+    #[test]
+    fn ends_with_block_opener_still_detects_a_bracket_regardless_of_extension() {
+        assert!(ends_with_block_opener("fn foo() {", Some("rs")));
+        assert!(ends_with_block_opener("fn foo() {", Some("py")));
+        assert!(ends_with_block_opener("fn foo() {", None));
+    }
+
+    #[test]
+    fn ends_with_block_opener_is_false_for_a_python_line_with_no_trailing_colon() {
+        assert!(!ends_with_block_opener("x = 1", Some("py")));
     }
 
     #[test]

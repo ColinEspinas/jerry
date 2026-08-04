@@ -345,11 +345,22 @@ impl AdeApp {
         let has_buffer = self.edit_buffer_contains(&relative_path_buf);
         let below_content_click_path = relative_path_buf.clone();
         let minimap_relative_path = relative_path_buf.clone();
+        // GitHub issue #122's real indent guides - resolved once here, outside the per-range
+        // processor closure below, from the exact same `resolved_indent_settings_for_target`
+        // Tab/Shift+Tab already uses (see that method's own docs on why this reuse matters: a
+        // real `.editorconfig` override changes this file's own indent width, and the guides
+        // must track it, not just the plain `Settings::editor` fallback). `code_font_size_px`
+        // is `row_line_height`'s own real input (`effective_code_rem_px`), captured again here
+        // so the per-range closure below can measure a real monospace character width at the
+        // exact same font size the code text itself renders at.
+        let show_indent_guides = self.settings.appearance.show_indent_guides;
+        let indent_settings = self.resolved_indent_settings_for_target();
+        let code_font_size_px = self.effective_code_rem_px();
 
         let mut code = uniform_list(
             "file-view-code",
             line_count,
-            cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
+            cx.processor(move |this: &mut Self, range: Range<usize>, window, cx| {
                 let relative_path = relative_path_buf.clone();
                 let has_buffer = this.edit_buffer_contains(&relative_path);
                 if has_buffer {
@@ -374,6 +385,26 @@ impl AdeApp {
                     let cursor_line_index = this
                         .edit_buffer(&relative_path)
                         .map(|buffer| buffer.line_col_for_offset(buffer.cursor_offset()).0);
+                    // GitHub issue #122: one real indent level's own pixel width, measured via
+                    // GPUI's real font-metrics API (`Window::text_system().advance`, verified
+                    // against `crate::terminal::pane::AdeApp::cell_size`'s own identical real
+                    // usage of the same call - see that method's own docs) at the code text's
+                    // real font size, not a hardcoded pixel constant unrelated to it. `None`
+                    // whenever the setting is off (skips the measurement entirely) or an outright
+                    // measurement failure - either way every row's `indent_guide_xs` below ends
+                    // up empty, the same honest "nothing to paint" a real measurement failure
+                    // should produce rather than a guessed fallback width.
+                    let indent_column_width_px = if show_indent_guides {
+                        let font_id = window.text_system().resolve_font(&font(theme::font::MONO));
+                        window
+                            .text_system()
+                            .advance(font_id, px(code_font_size_px), ' ')
+                            .map(|advance| advance.width)
+                            .ok()
+                            .filter(|width| *width > px(0.0))
+                    } else {
+                        None
+                    };
                     let mut rows = Vec::with_capacity(end.saturating_sub(start));
                     for index in start..end {
                         let Some(buffer) = this.edit_buffer(&relative_path) else {
@@ -410,6 +441,26 @@ impl AdeApp {
                         let secondary_selections_local =
                             buffer.secondary_selections_within_line(index);
                         let secondary_cursors_local = buffer.secondary_cursors_within_line(index);
+                        // GitHub issue #122: one guide per real indent level this specific line's
+                        // own leading whitespace covers (`indent::leading_indent_levels`), each at
+                        // `level * tab_width` real monospace columns from the row's own text
+                        // origin - empty whenever the setting is off (`indent_column_width_px` is
+                        // `None`) or this line has no leading indentation at all.
+                        let indent_guide_xs: Vec<Pixels> = match indent_column_width_px {
+                            Some(column_width) => {
+                                let levels = crate::code_surface::indent::leading_indent_levels(
+                                    &line.text,
+                                    indent_settings.tab_width,
+                                );
+                                (0..levels)
+                                    .map(|level| {
+                                        column_width
+                                            * (level as f32 * indent_settings.tab_width as f32)
+                                    })
+                                    .collect()
+                            }
+                            None => Vec::new(),
+                        };
                         let context = crate::code_surface::editing::EditableLineContext {
                             entity: entity.clone(),
                             focus_handle: code_focus_handle.clone(),
@@ -431,6 +482,7 @@ impl AdeApp {
                             inline_blame: is_current.then_some(inline_blame.as_ref()).flatten(),
                             caret_style: this.settings.appearance.caret_style,
                             caret_blink_visible: this.caret_blink_visible,
+                            indent_guide_xs,
                         };
                         rows.push(
                             crate::code_surface::editing::render_editable_file_view_line(
