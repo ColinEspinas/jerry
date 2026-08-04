@@ -153,6 +153,17 @@ tree-sitter-yaml = "0.7.2"
 tree-sitter-go = "0.25.0"
 tree-sitter-c = "0.24.2"
 tree-sitter-md = "0.5.3"
+# GitHub issue #154 ("Add html and css support. Including in the markdown files."), same plain
+# crates.io treatment as every grammar above. Note the two crates export their query constants
+# under *different* names - `tree-sitter-html::HIGHLIGHTS_QUERY`/`INJECTIONS_QUERY` (plural on
+# both) versus `tree-sitter-css::HIGHLIGHTS_QUERY` and no injections file at all - checked
+# against each crate's own `bindings/rust/lib.rs`, not assumed from the neighbouring entries
+# (`tree-sitter-c` and `tree-sitter-javascript`, for instance, both use the *singular*
+# `HIGHLIGHT_QUERY`). `tree-sitter-html` also ships a real `queries/injections.scm` that
+# `crate::code_surface::code_view` genuinely drives - `<style>` content into the CSS grammar and
+# `<script>` content into this crate's TypeScript grammar - which is why these two land together.
+tree-sitter-html = "0.23.2"
+tree-sitter-css = "0.25.0"
 
 # Real per-target `gpui_platform` backend selection (Revision R11, extended in R12 to add
 # real X11 support). `gpui_platform`'s own Cargo.toml

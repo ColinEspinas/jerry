@@ -887,6 +887,17 @@ pub mod lang {
     pub const JSON: (ColorToken, ColorToken) = (hex(0xb8bcc4), hex(0x24262b)); // "jsn"
     pub const YAML: (ColorToken, ColorToken) = (hex(0x8aa8cf), hex(0x1c2530)); // "yml"
     pub const C: (ColorToken, ColorToken) = (hex(0x9a8cc9), hex(0x231f30)); // "c"
+                                                                            // GitHub issue #154 - two more hues, chosen the same way issue #32's three above were: each
+                                                                            // stays visually distinct from *every* existing chip rather than reusing a near-identical
+                                                                            // tint. Both hues here were genuinely unoccupied before this issue - the existing set spans
+                                                                            // orange-brown (RS), yellow (PY), greens (SQL/VUE), blues (MD/TS/YAML), cyan (GO), purple
+                                                                            // (C) and two greys (TOML/JSON), leaving red and magenta free.
+                                                                            // Enforced, not just asserted in prose, by `lang_token_tests::
+                                                                            // every_lang_chip_color_is_distinct_from_every_other`.
+    pub const HTML: (ColorToken, ColorToken) = (hex(0xd1735f), hex(0x2f1d18)); // "htm"
+                                                                               // Magenta, deliberately not another purple: `C`'s `#9a8cc9` is a blue-leaning violet, this
+                                                                               // is red-leaning, so the two do not read as the same chip at chip size.
+    pub const CSS: (ColorToken, ColorToken) = (hex(0xc47fb0), hex(0x2c1e29)); // "css"
     pub const UNKNOWN: (ColorToken, ColorToken) = (hex(0x6b7178), hex(0x23272b));
     // "."
 }
@@ -1382,6 +1393,14 @@ mod lang_token_tests {
             ("vue", lang::VUE),
             ("py", lang::PY),
             ("go", lang::GO),
+            // GitHub issue #32's three and issue #154's two - the original version of this test
+            // covered only the eight chips that existed when it was written, so every chip added
+            // since had been going unchecked against the very rule its own doc comment claims.
+            ("json", lang::JSON),
+            ("yaml", lang::YAML),
+            ("c", lang::C),
+            ("html", lang::HTML),
+            ("css", lang::CSS),
             ("unknown", lang::UNKNOWN),
         ];
         for (i, (name_a, color_a)) in all.iter().enumerate() {
