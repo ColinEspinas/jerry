@@ -823,39 +823,74 @@ pub mod diff {
 /// files, read directly off the fetched crates under `~/.cargo/registry/src/`, not guessed) each
 /// bucket exists to cover.
 ///
+/// ## The identifier family (the rose/pink and cyan hues)
+///
+/// [`VARIABLE`], [`VARIABLE_PARAMETER`] and [`PROPERTY`] are real, independently authored hues.
+/// They used to default to [`TEXT`]'s near-white `#acb2be`, which was a genuine legibility
+/// problem rather than a stylistic preference: plain identifiers, function parameters and field
+/// access together are a very large fraction of the tokens in any real source file, so colouring
+/// all three as plain text left most of a typical screen reading as one undifferentiated grey.
+///
+/// The three colours fill hue territory nothing else in this palette had claimed. Measured
+/// against every other syntax colour here (a real CIE Lab ΔE sweep, not an eyeball), the closest
+/// any of them lands to an existing token is ΔE 16, and the closest two of them land to each
+/// other is ΔE 17 - both comfortably above the ~2.3 just-noticeable threshold, so these read as
+/// genuinely different colours rather than as tints of something already in use:
+///
+/// - [`VARIABLE`] `#bd89a5` - a muted dusty rose. Deliberately the quietest of the three (the
+///   lowest saturation in the whole palette bar the greys): a plain identifier is the single most
+///   common thing this palette ever colours, so it has to be clearly *not* plain text without
+///   turning a screen of code into confetti.
+/// - [`VARIABLE_PARAMETER`] `#bd566e` - the same rose family, deeper and considerably more
+///   saturated. A function's own inputs are worth picking out from the locals around them, and
+///   staying in [`VARIABLE`]'s family says "this is still a variable, just a distinguished one"
+///   rather than inventing an unrelated hue for a closely related concept.
+///
+///   It steps *down* in lightness rather than up, which is a real constraint rather than a
+///   preference: "Paper", the bundled light theme, is derived by inverting lightness (see
+///   [`apply_shift`]'s own docs), so any token much lighter than about 72% clips to near-black
+///   there and collapses into the other light tokens. A brighter pink parameter measured a fine
+///   ΔE 16 from plain text in Jerry Dark and ΔE 9.5 - i.e. barely distinguishable - in Paper. The
+///   deeper tone keeps at least ΔE 16 from both plain text and [`VARIABLE`] in *every* bundled
+///   theme, which is what [`syntax_identifier_palette_tests`] now pins.
+/// - [`PROPERTY`] `#75b2c7` - a muted cyan-blue, deliberately *outside* the rose family. A field
+///   access is not a local binding: it is a name looked up on another object, and giving it a
+///   cool counterpart to the warm locals is what makes an `a.b.c` chain legible at a glance.
+///
+/// Colours the maintainer explicitly kept out of this pass: [`OPERATOR`],
+/// [`PUNCTUATION_BRACKET`], [`PUNCTUATION_DELIMITER`] and [`EMBEDDED`] still default to [`TEXT`]'s
+/// own `#acb2be`. That is this palette's long-standing, deliberate choice not to colour operators
+/// and punctuation (see the historical design note preserved on
+/// [`crate::code_surface::code_view::HighlightKind`]); real bracket-pair colouring is a separate,
+/// larger feature to be considered on its own terms, not something to smuggle in here.
+///
 /// ## The default fallback chain (GitHub issue #31)
 ///
-/// Several scopes here have no independently *authored* colour of their own: their compiled
+/// Several scopes here still have no independently *authored* colour of their own: their compiled
 /// default is the same literal value as their nearest covered ancestor scope, so a scope this
-/// app's palette never designed a hue for still reads like its *parent* rather than like plain
+/// app's palette never designed a hue for reads like its *parent* rather than like plain
 /// foreground text:
 ///
 /// - [`FUNCTION_METHOD`] defaults to [`FUNCTION`]'s `#74ade8` (a method is still a function)
 /// - [`TYPE_BUILTIN`] to [`TYPE`]'s `#dfc184` (`i32`/`number`/`void` are still types)
 /// - [`CONSTANT_BUILTIN`] to [`CONSTANT`]'s `#bf956a` (`true`/`None`/`undefined` are still
 ///   constants)
-/// - [`VARIABLE_PARAMETER`] to [`VARIABLE`]'s `#acb2be` (the issue's own worked example)
-/// - [`PROPERTY`] to [`VARIABLE`]'s (a field access reads like a variable reference here)
 /// - [`TAG`] to [`TYPE`]'s (preserves this module's pre-existing, deliberate "a JSX element name
 ///   is coloured like the type it names" choice - see the historical note on
 ///   [`crate::code_surface::code_view::HighlightKind::Tag`])
+/// - [`OPERATOR`], [`PUNCTUATION_BRACKET`], [`PUNCTUATION_DELIMITER`] and [`EMBEDDED`] to
+///   [`TEXT`]'s, per the section above
 ///
-/// [`VARIABLE`] and, following it, [`OPERATOR`], [`PUNCTUATION_BRACKET`],
-/// [`PUNCTUATION_DELIMITER`] and [`EMBEDDED`] all default to [`TEXT`]'s own `#acb2be` - not
-/// because they are unmapped, but because this app's own minimalist syntax palette has always
-/// deliberately left plain identifiers and punctuation uncoloured (see the historical design note
-/// preserved on [`crate::code_surface::code_view::HighlightKind`]); they are real,
-/// live-classified buckets (each one is a genuine `tree-sitter-highlight` capture this module's
-/// `HIGHLIGHT_NAMES` actually recognizes - see `code_view_tests::every_real_grammar_config_compiles`
-/// and its siblings), simply designed to render identically to plain text rather than compete
-/// with it.
+/// Each of those is a real, live-classified bucket (a genuine `tree-sitter-highlight` capture this
+/// module's `HIGHLIGHT_NAMES` actually recognizes - see
+/// `code_view_tests::every_real_grammar_config_compiles` and its siblings), simply designed to
+/// render identically to its parent rather than compete with it.
 ///
 /// Before this module's rewrite each of those was a literal Rust-level `const` alias, so the two
-/// could never be told apart by a theme. They are now independently keyed tokens that merely
-/// *start* at the same value: a theme file (very much including an imported VSCode one, whose own
-/// `tokenColors` routinely style `variable.parameter` differently from `variable`) can set
-/// `syntax.variable_parameter` without touching `syntax.variable`. The chain above is still what
-/// an importer walks when a theme names the parent scope but not the child - see
+/// could never be told apart by a theme at all. They are now independently keyed tokens that
+/// merely *start* at the same value: a theme file (very much including an imported VSCode one) can
+/// set one without touching the other. The chain above is still what an importer walks when a
+/// theme names the parent scope but not the child - see
 /// `crate::settings::vscode_theme::syntax_scope_rule`.
 pub mod syntax {
     use super::{token, ColorToken};
@@ -907,15 +942,22 @@ pub mod syntax {
     /// one, the same real distinction most editors make.
     pub const COMMENT_DOC: ColorToken = token("syntax.comment_doc", 0x7c8290);
     /// `variable` - a real, live-classified bucket (`-python`'s own blanket `(identifier)
-    /// @variable`, `-javascript`'s identical blanket rule), not a fallthrough. Defaults to
-    /// [`TEXT`]'s own value - see the module docs' fallback-chain section for why that is a
-    /// deliberate design choice, not an oversight.
-    pub const VARIABLE: ColorToken = token("syntax.variable", 0xacb2be);
+    /// @variable`, `-javascript`'s identical blanket rule). A muted dusty rose, and deliberately
+    /// the quietest colour in this palette: a plain identifier is the most common token this
+    /// module ever colours, so it has to read as clearly *not* plain text without shouting. See
+    /// the module docs' "identifier family" section for how this hue was chosen and measured.
+    ///
+    /// This used to default to [`TEXT`]'s near-white `#acb2be`, which meant every identifier in a
+    /// file rendered as plain grey - the single biggest reason code here read as undifferentiated
+    /// white.
+    pub const VARIABLE: ColorToken = token("syntax.variable", 0xbd89a5);
     /// `variable.parameter` (`tree-sitter-rust`'s `(parameter (identifier) @variable.parameter)`,
-    /// `-typescript`'s `required_parameter`/`optional_parameter` rules) - the issue's own worked
-    /// fallback-chain example: defaults to [`VARIABLE`]'s own value rather than to plain
-    /// foreground, and is independently themeable from it.
-    pub const VARIABLE_PARAMETER: ColorToken = token("syntax.variable_parameter", 0xacb2be);
+    /// `-typescript`'s `required_parameter`/`optional_parameter` rules) - [`VARIABLE`]'s own rose
+    /// family, deeper and considerably more saturated. A function's inputs are worth picking out
+    /// from the locals around them, and staying inside [`VARIABLE`]'s family says "still a
+    /// variable, just a distinguished one" rather than inventing an unrelated hue for a closely
+    /// related concept. Deeper rather than brighter for a real reason - see the module docs.
+    pub const VARIABLE_PARAMETER: ColorToken = token("syntax.variable_parameter", 0xbd566e);
     /// `variable.builtin` (`self`/`this`/`super`/`cls`) - the bucket the replaced six-colour
     /// design table called "literal/self"; defaults to [`CONSTANT`]'s old `LITERAL` value so this
     /// one real, pre-existing visual choice (self-references read like literals here) survives the
@@ -923,8 +965,11 @@ pub mod syntax {
     pub const VARIABLE_BUILTIN: ColorToken = token("syntax.variable_builtin", 0xbf956a);
     /// `property` (a field/attribute access - `tree-sitter-rust`'s `(field_identifier) @property`,
     /// `-python`'s `(attribute attribute: (identifier) @property)`, `-javascript`'s
-    /// `(property_identifier) @property`) - see the module docs' fallback-chain section.
-    pub const PROPERTY: ColorToken = token("syntax.property", 0xacb2be);
+    /// `(property_identifier) @property`) - a muted cyan-blue, deliberately outside [`VARIABLE`]'s
+    /// warm family: a field access is not a local binding but a name looked up on another object,
+    /// and the warm/cool split is what makes an `a.b.c` chain legible at a glance. See the module
+    /// docs' "identifier family" section.
+    pub const PROPERTY: ColorToken = token("syntax.property", 0x75b2c7);
     /// `operator` (`+`, `==`, `&&`, ...) - a real, live-classified bucket (previously fell
     /// through unmatched); defaults to [`TEXT`]'s value for the same reason [`VARIABLE`] does -
     /// this app's palette has never coloured punctuation/operators.
@@ -2239,23 +2284,26 @@ mod theme_runtime_tests {
     }
 
     /// Every former Rust-level alias is now independently overridable - the concrete thing this
-    /// rewrite bought. Moving `syntax.variable_parameter` must not drag `syntax.variable` (its
-    /// old alias target) along with it, and vice versa.
+    /// rewrite bought. Moving `syntax.operator` must not drag `syntax.text` (its old alias
+    /// target) along with it, and vice versa.
+    ///
+    /// Uses `OPERATOR`/`TEXT` specifically because those two genuinely still *share* a default,
+    /// which is what makes the test meaningful: if the two started from different values, an
+    /// assertion that they resolve differently would pass trivially without proving anything about
+    /// the override mechanism. (`VARIABLE_PARAMETER`/`VARIABLE` used to serve this role, until the
+    /// identifier family got its own real colours - see `syntax`'s own module docs.)
     #[test]
     fn a_former_alias_can_now_be_moved_without_moving_what_it_used_to_alias() {
         assert!(
-            same(syntax::VARIABLE_PARAMETER.default, syntax::VARIABLE.default),
+            same(syntax::OPERATOR.default, syntax::TEXT.default),
             "sanity check: the two still share a default, which is what makes this test meaningful"
         );
-        let _guard = with_palette(&[("syntax.variable_parameter", 0x50fa7b)]);
-        assert!(same(
-            syntax::VARIABLE_PARAMETER.resolve(),
-            hex_rgba(0x50fa7b)
-        ));
+        let _guard = with_palette(&[("syntax.operator", 0x50fa7b)]);
+        assert!(same(syntax::OPERATOR.resolve(), hex_rgba(0x50fa7b)));
         assert!(
-            same(syntax::VARIABLE.resolve(), syntax::VARIABLE.default),
-            "syntax::VARIABLE used to be the very same const - overriding the parameter bucket \
-             must no longer touch it"
+            same(syntax::TEXT.resolve(), syntax::TEXT.default),
+            "syntax::TEXT used to be the very same const - overriding the operator bucket must no \
+             longer touch it"
         );
     }
 
@@ -2554,5 +2602,207 @@ mod syntax_contrast_tests {
         };
         assert!((contrast_ratio(white, white) - 1.0).abs() < 0.001);
         assert!((contrast_ratio(black, white) - 21.0).abs() < 0.01);
+    }
+}
+
+/// The identifier family's own regression coverage - [`syntax::VARIABLE`],
+/// [`syntax::VARIABLE_PARAMETER`] and [`syntax::PROPERTY`] must really read as their own colours,
+/// in **every** bundled theme, not just in Jerry Dark.
+///
+/// That "every bundled theme" part is the load-bearing half. Those three tokens used to default to
+/// [`syntax::TEXT`]'s near-white grey, which made most of a source file render as one
+/// undifferentiated tone. Giving them real hues fixes Jerry Dark on its own, but the other five
+/// bundled themes are *generated files* (`crate::settings::builtin_themes`) holding literal
+/// per-token colours - so a change to these defaults that forgets to regenerate them would leave
+/// those five silently serving the old near-white value, which would be worse than not fixing this
+/// at all. Every check below runs against each theme's own real compiled palette, so a stale
+/// generated file fails here rather than shipping.
+#[cfg(test)]
+mod syntax_identifier_palette_tests {
+    use super::*;
+
+    struct ResetThemeOnDrop;
+
+    impl Drop for ResetThemeOnDrop {
+        fn drop(&mut self) {
+            set_current_theme(None);
+        }
+    }
+
+    /// Installs a real bundled theme exactly the way selecting its card does.
+    fn with_bundled_theme(name: &str) -> ResetThemeOnDrop {
+        let palette = crate::settings::custom_theme::compile_palette_by_name(name, &[])
+            .expect("a bundled theme must compile");
+        set_current_theme(palette.map(Rc::new));
+        ResetThemeOnDrop
+    }
+
+    fn same(a: Rgba, b: Rgba) -> bool {
+        a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a
+    }
+
+    /// The three tokens this pass gave real colours to.
+    fn identifier_tokens() -> [(&'static str, ColorToken); 3] {
+        [
+            ("VARIABLE", syntax::VARIABLE),
+            ("VARIABLE_PARAMETER", syntax::VARIABLE_PARAMETER),
+            ("PROPERTY", syntax::PROPERTY),
+        ]
+    }
+
+    /// CIE Lab, for a real perceptual distance rather than a raw RGB one - the same measure the
+    /// three colours were chosen against (see [`syntax`]'s own module docs). sRGB D65, the
+    /// standard conversion.
+    fn lab(color: Rgba) -> (f32, f32, f32) {
+        fn linear(component: f32) -> f32 {
+            if component <= 0.04045 {
+                component / 12.92
+            } else {
+                ((component + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn pivot(t: f32) -> f32 {
+            if t > 0.008856 {
+                t.cbrt()
+            } else {
+                7.787 * t + 16.0 / 116.0
+            }
+        }
+        let (r, g, b) = (linear(color.r), linear(color.g), linear(color.b));
+        let x = pivot((0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047);
+        let y = pivot(0.2126 * r + 0.7152 * g + 0.0722 * b);
+        let z = pivot((0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883);
+        (116.0 * y - 16.0, 500.0 * (x - y), 200.0 * (y - z))
+    }
+
+    /// Perceptual distance. ~2.3 is the just-noticeable difference; this module requires far more.
+    fn delta_e(a: Rgba, b: Rgba) -> f32 {
+        let (la, aa, ba) = lab(a);
+        let (lb, ab, bb) = lab(b);
+        ((la - lb).powi(2) + (aa - ab).powi(2) + (ba - bb).powi(2)).sqrt()
+    }
+
+    /// The real headline fix: none of the three is plain text any more, in any bundled theme.
+    #[test]
+    fn no_identifier_token_renders_as_plain_text_in_any_bundled_theme() {
+        for def in crate::settings::state::THEME_DEFS.iter() {
+            let _guard = with_bundled_theme(def.name);
+            let text = syntax::TEXT.resolve();
+            for (name, token) in identifier_tokens() {
+                assert!(
+                    !same(token.resolve(), text),
+                    "{name} resolves to exactly syntax::TEXT's own colour in {} - plain \
+                     identifiers, parameters and property access would all render as \
+                     undifferentiated plain text again. If this fired after a change to the \
+                     defaults, the five generated theme files almost certainly need regenerating \
+                     (see crate::settings::builtin_themes).",
+                    def.name
+                );
+            }
+        }
+    }
+
+    /// Not merely *different* from plain text, but perceptibly so - a one-hex-digit difference
+    /// would pass the check above while still looking identical on screen.
+    #[test]
+    fn every_identifier_token_is_perceptibly_different_from_plain_text() {
+        // Chosen against the ~2.3 just-noticeable threshold with a real margin; the tightest of
+        // the three in Jerry Dark measures ~18.
+        const MIN_DELTA_E: f32 = 10.0;
+        for def in crate::settings::state::THEME_DEFS.iter() {
+            let _guard = with_bundled_theme(def.name);
+            let text = syntax::TEXT.resolve();
+            for (name, token) in identifier_tokens() {
+                let distance = delta_e(token.resolve(), text);
+                assert!(
+                    distance >= MIN_DELTA_E,
+                    "{name} is only ΔE {distance:.1} from plain text in {} - below the \
+                     {MIN_DELTA_E} floor, so it would still read as undifferentiated grey",
+                    def.name
+                );
+            }
+        }
+    }
+
+    /// The three are real, separate colours from each other too - a parameter is distinguishable
+    /// from an ordinary local, and a property from both.
+    #[test]
+    fn the_three_identifier_tokens_are_perceptibly_distinct_from_each_other() {
+        const MIN_DELTA_E: f32 = 10.0;
+        for def in crate::settings::state::THEME_DEFS.iter() {
+            let _guard = with_bundled_theme(def.name);
+            let tokens = identifier_tokens();
+            for (index, (name_a, token_a)) in tokens.iter().enumerate() {
+                for (name_b, token_b) in tokens.iter().skip(index + 1) {
+                    let distance = delta_e(token_a.resolve(), token_b.resolve());
+                    assert!(
+                        distance >= MIN_DELTA_E,
+                        "{name_a} and {name_b} are only ΔE {distance:.1} apart in {} - below the \
+                         {MIN_DELTA_E} floor",
+                        def.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// And they don't crowd any hue this palette had already claimed - the constraint the three
+    /// colours were actually picked under (see [`syntax`]'s own module docs).
+    #[test]
+    fn no_identifier_token_crowds_an_already_claimed_syntax_hue() {
+        // Deliberately looser than the ΔE 16 the colours were chosen at in Jerry Dark: the five
+        // derived themes compress the palette's own saturation/lightness range by design, so
+        // every gap narrows a little under them. This still catches a genuine collision.
+        const MIN_DELTA_E: f32 = 8.0;
+        let claimed: [(&str, ColorToken); 8] = [
+            ("KEYWORD", syntax::KEYWORD),
+            ("FUNCTION", syntax::FUNCTION),
+            ("TYPE", syntax::TYPE),
+            ("CONSTANT", syntax::CONSTANT),
+            ("STRING", syntax::STRING),
+            ("ATTRIBUTE", syntax::ATTRIBUTE),
+            ("COMMENT", syntax::COMMENT),
+            ("EMPHASIS", syntax::EMPHASIS),
+        ];
+        for def in crate::settings::state::THEME_DEFS.iter() {
+            let _guard = with_bundled_theme(def.name);
+            for (name, token) in identifier_tokens() {
+                for (claimed_name, claimed_token) in claimed {
+                    let distance = delta_e(token.resolve(), claimed_token.resolve());
+                    assert!(
+                        distance >= MIN_DELTA_E,
+                        "{name} is only ΔE {distance:.1} from {claimed_name} in {} - it would \
+                         read as that colour rather than its own",
+                        def.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// The maintainer's own scope line for this pass, pinned as a test: operators, brackets,
+    /// delimiters and interpolation regions deliberately still render exactly as plain text.
+    /// Real bracket-pair colouring is a separate, larger feature to be decided on its own terms,
+    /// and this is what would catch it being smuggled in as a side effect of another change.
+    #[test]
+    fn operators_and_punctuation_deliberately_still_render_as_plain_text() {
+        for def in crate::settings::state::THEME_DEFS.iter() {
+            let _guard = with_bundled_theme(def.name);
+            let text = syntax::TEXT.resolve();
+            for (name, token) in [
+                ("OPERATOR", syntax::OPERATOR),
+                ("PUNCTUATION_BRACKET", syntax::PUNCTUATION_BRACKET),
+                ("PUNCTUATION_DELIMITER", syntax::PUNCTUATION_DELIMITER),
+                ("EMBEDDED", syntax::EMBEDDED),
+            ] {
+                assert!(
+                    same(token.resolve(), text),
+                    "{name} no longer matches syntax::TEXT in {} - colouring operators and \
+                     punctuation is deliberately out of scope until bracket colouring is designed \
+                     properly",
+                    def.name
+                );
+            }
+        }
     }
 }

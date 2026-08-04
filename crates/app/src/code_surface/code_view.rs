@@ -205,8 +205,8 @@ pub fn highlighter_for_extension(
 /// `design_handoff_jerry_ade/README.md` File view table), plus the [`Text`](HighlightKind::Text)
 /// fallback every byte a query doesn't classify at all still receives. See [`HIGHLIGHT_NAMES`] for
 /// the real, verified capture names each variant is reached through, and
-/// `theme::syntax`'s own module docs for the fallback-chain design (which variants are real,
-/// independently-authored colours versus real, direct aliases of a parent scope).
+/// `theme::syntax`'s own module docs for the palette design (which variants are real,
+/// independently-authored colours versus ones whose default is simply their parent scope's).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HighlightKind {
     Keyword,
