@@ -1,6 +1,11 @@
 use super::*;
 use crate::code_surface::state::{DiffLoadState, FileLoadState};
 use crate::sidebar::render::RightSidebarView;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Backs [`AdeApp::tree_undo_instance_id`] - see that field's own docs for why per-process
+/// uniqueness isn't enough.
+static NEXT_TREE_UNDO_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 
 impl AdeApp {
     /// Production entry point - loads `~/.config/jerry/settings.toml` (`Settings::load_or_init`)
@@ -230,13 +235,15 @@ impl AdeApp {
             tree_context_menu: None,
             tree_inline_edit: None,
             tree_clipboard: None,
+            tree_drag_hover_target: None,
             tree_undo_stack: Vec::new(),
             tree_redo_stack: Vec::new(),
             tree_undo_backup_counter: 0,
+            tree_undo_instance_id: NEXT_TREE_UNDO_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             tree_op_error: None,
             tree_focus_handle,
             file_tree_bounds: gpui::Bounds::default(),
-            _tree_delete_task: None,
+            _tree_delete_tasks: Vec::new(),
             _tree_copy_task: None,
             staged_files: HashSet::new(),
             staging_error: None,
@@ -247,7 +254,10 @@ impl AdeApp {
             close_tab_confirm_armed: None,
             open_diff_file_cache: None,
             selected_tree_path: None,
+            additional_tree_selection: HashSet::new(),
             code_view: code_view::CodeView::Diff,
+            markdown_view: markdown_preview::MarkdownView::Source,
+            markdown_preview_scroll_handle: gpui::ScrollHandle::new(),
             code_focus_handle,
             code_focus: OverlayFocus::default(),
             // `true`/`Task::ready(())`: no blink loop is running yet (nothing is focused at
@@ -261,6 +271,7 @@ impl AdeApp {
             graph_tab_open: false,
             graph_tab_active: false,
             graph_focus_handle: cx.focus_handle(),
+            graph_view_focused: false,
             graph_focus: OverlayFocus::default(),
             graph_state: graph_view::state::GraphTabState::new(cx),
             _load_graph_task: None,
@@ -903,6 +914,7 @@ impl AdeApp {
             &mut self.open_change,
             &mut self.expanded_dirs,
             &mut self.selected_tree_path,
+            &mut self.additional_tree_selection,
         );
         // The tree's fold state is per-worktree *persisted* state, not merely per-worktree
         // transient state: the reset above clears the live set, and this re-derives it from
@@ -975,6 +987,7 @@ impl AdeApp {
         // to belong to a different `file_tree_root`) - reset for the same reason as above.
         // Dropping `_file_load_task` cancels any in-flight load for whatever was left.
         self.code_view = code_view::CodeView::Diff;
+        self.markdown_view = markdown_preview::MarkdownView::Source;
         self.file_view_cache = None;
         self.file_load_state = FileLoadState::Idle;
         self.file_view_changed_lines = HashSet::new();
@@ -1226,11 +1239,13 @@ pub(super) fn reset_per_worktree_ui_state(
     open_change: &mut Option<PathBuf>,
     expanded_dirs: &mut HashSet<PathBuf>,
     selected_tree_path: &mut Option<PathBuf>,
+    additional_tree_selection: &mut HashSet<PathBuf>,
 ) {
     staged_files.clear();
     *open_change = None;
     expanded_dirs.clear();
     *selected_tree_path = None;
+    additional_tree_selection.clear();
 }
 
 #[cfg(test)]
@@ -1245,12 +1260,14 @@ mod tests {
         let mut open_change = Some(PathBuf::from("src/main.rs"));
         let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
+        let mut additional_tree_selection = HashSet::new();
 
         reset_per_worktree_ui_state(
             &mut staged_files,
             &mut open_change,
             &mut expanded_dirs,
             &mut selected_tree_path,
+            &mut additional_tree_selection,
         );
 
         assert!(staged_files.is_empty());
@@ -1263,12 +1280,14 @@ mod tests {
         let mut open_change = None;
         let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
+        let mut additional_tree_selection = HashSet::new();
 
         reset_per_worktree_ui_state(
             &mut staged_files,
             &mut open_change,
             &mut expanded_dirs,
             &mut selected_tree_path,
+            &mut additional_tree_selection,
         );
 
         assert!(staged_files.is_empty());
@@ -1282,6 +1301,7 @@ mod tests {
         let mut open_change = None;
         let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = None;
+        let mut additional_tree_selection = HashSet::new();
         expanded_dirs.insert(PathBuf::from("/repo/worktree-a/src"));
         expanded_dirs.insert(PathBuf::from("/repo/worktree-a/tests"));
 
@@ -1290,6 +1310,7 @@ mod tests {
             &mut open_change,
             &mut expanded_dirs,
             &mut selected_tree_path,
+            &mut additional_tree_selection,
         );
 
         assert!(expanded_dirs.is_empty());
@@ -1301,15 +1322,19 @@ mod tests {
         let mut open_change = None;
         let mut expanded_dirs = HashSet::new();
         let mut selected_tree_path = Some(PathBuf::from("/repo/worktree-a/src/main.rs"));
+        let mut additional_tree_selection = HashSet::new();
+        additional_tree_selection.insert(PathBuf::from("/repo/worktree-a/src/lib.rs"));
 
         reset_per_worktree_ui_state(
             &mut staged_files,
             &mut open_change,
             &mut expanded_dirs,
             &mut selected_tree_path,
+            &mut additional_tree_selection,
         );
 
         assert_eq!(selected_tree_path, None);
+        assert!(additional_tree_selection.is_empty());
     }
 
     /// [`AdeApp::open_files`]/[`AdeApp::open_files_mut`] resolve through

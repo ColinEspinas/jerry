@@ -399,6 +399,7 @@ impl AdeApp {
         }
         self.open_change = Some(relative.clone());
         self.code_view = code_view::CodeView::File;
+        self.markdown_view = markdown_preview::MarkdownView::Source;
         self.selected_tree_path = Some(absolute_path.clone());
         // Now that the tree starts collapsed (GitHub issue #18 §1), a file created inside a
         // folder nobody has expanded yet would otherwise be highlighted on a row that isn't

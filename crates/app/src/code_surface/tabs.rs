@@ -173,6 +173,7 @@ impl AdeApp {
         self.push_open_file(&relative);
         self.open_change = Some(relative);
         self.code_view = view;
+        self.markdown_view = markdown_preview::MarkdownView::Source;
         // Every "this file is now the selected tree row" path reveals it (GitHub issue #18 §5).
         // A click in the tree has its ancestors expanded already, so this is a no-op there - but
         // go-to-definition (`Self::navigate_to_definition`), a palette result and a terminal link
@@ -191,6 +192,11 @@ impl AdeApp {
         if absolute.starts_with(&self.file_tree_root) {
             self.reveal_in_tree(&absolute, cx);
             self.selected_tree_path = Some(absolute);
+            // GitHub issue #145: opening any single file - from the tree itself, the palette, a
+            // terminal link, go-to-definition, wherever - collapses a stray multi-selection down
+            // to just that file, the same way a plain click on a tree row already did before
+            // multi-selection existed.
+            self.additional_tree_selection.clear();
         }
         self.refresh_open_diff_file_cache();
         // A hover card is only valid for the file it was requested against - and so is a real
@@ -311,6 +317,7 @@ impl AdeApp {
 
         if self.open_change.as_deref() == Some(path.as_path()) {
             self.code_view = code_view::CodeView::File;
+            self.markdown_view = markdown_preview::MarkdownView::Source;
             cx.notify();
             return;
         }
@@ -328,6 +335,7 @@ impl AdeApp {
         } else {
             code_view::CodeView::File
         };
+        self.markdown_view = markdown_preview::MarkdownView::Source;
         self.refresh_open_diff_file_cache();
         self.hover = None;
         // See `Self::open_and_focus_file`'s identical `dismiss_completions()` call for why
@@ -747,6 +755,27 @@ impl AdeApp {
             DiffLoadState::Loaded(base) => base.diff(),
             _ => None,
         }
+    }
+
+    /// The absolute, on-disk path [`Self::open_change`] really names, resolved against whichever
+    /// root it's actually relative to - [`Self::diff_root`] while [`Self::code_view`] is `Diff`,
+    /// [`Self::file_tree_root`] otherwise (`Self::open_and_focus_file`'s own two callers,
+    /// [`Self::open_change_diff`]/[`Self::open_file_view`], resolve exactly this way). `None` iff
+    /// no file tab is showing at all.
+    ///
+    /// GitHub issue #127: this - not [`Self::selected_tree_path`] - is the Files tree's real
+    /// "which row is the open file" signal, since it stays correct regardless of tree focus and
+    /// survives every way `selected_tree_path` can drift from the centre pane's actual content: a
+    /// directory click (which updates `selected_tree_path` to a path that was never opened at
+    /// all) and switching tabs via the tab strip ([`Self::activate_file_tab`] never touches
+    /// `selected_tree_path`).
+    pub(crate) fn open_change_absolute_path(&self) -> Option<PathBuf> {
+        let relative = self.open_change.as_ref()?;
+        let root = match self.code_view {
+            code_view::CodeView::Diff => &self.diff_root,
+            code_view::CodeView::File => &self.file_tree_root,
+        };
+        Some(root.join(relative))
     }
 }
 

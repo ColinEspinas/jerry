@@ -61,6 +61,7 @@ use wt_core::merge::ConflictHunk;
 
 use crate::code_surface::code_view;
 use crate::code_surface::edit_buffer;
+use crate::code_surface::markdown_preview;
 use crate::env_info;
 use crate::graph_view;
 use crate::keymap::WindowControlsStyle;
@@ -185,7 +186,6 @@ actions!(
         TextUndo,
         TextRedo,
         CloseFocusedTab,
-        FileTreeContextMenu,
         FileTreeRename,
         FileTreeCopy,
         FileTreeCut,
@@ -193,6 +193,7 @@ actions!(
         FileTreeDelete,
         FileTreeUndo,
         FileTreeRedo,
+        TerminalClear,
     ]
 );
 
@@ -448,6 +449,11 @@ pub struct AdeApp {
     /// The tree's own cut/copy buffer - a real filesystem entry, deliberately not the system
     /// clipboard (see `crate::sidebar::tree_ops::TreeClipboard`).
     pub(crate) tree_clipboard: Option<tree_ops::TreeClipboard>,
+    /// GitHub issue #148: which directory row a real in-progress file-tree drag is currently
+    /// hovering, if any - the drop-target highlight `crate::sidebar::render::AdeApp::
+    /// render_file_tree_row` paints, and the folder `Self::move_paths_into_dir` moves into on a
+    /// real drop. `None` whenever no drag is over the tree at all.
+    pub(crate) tree_drag_hover_target: Option<PathBuf>,
     /// Real, already-applied file-tree operations (delete, rename, cut/paste move) that
     /// `crate::sidebar::tree_ops::AdeApp::undo_tree_op` can reverse, most recent last - the
     /// file-tree's own undo history, distinct from each text field's own `text_history::
@@ -463,6 +469,15 @@ pub struct AdeApp {
     /// guaranteeing two deletes of same-named files never collide there, without pulling in a
     /// UUID dependency for something this local.
     pub(crate) tree_undo_backup_counter: u64,
+    /// This `AdeApp` instance's own share of [`Self::tree_undo_backup_root`], assigned once at
+    /// construction from a process-wide atomic counter. `std::process::id()` alone identifies the
+    /// *process*, not the instance - every `#[gpui::test]` in a `cargo test` binary runs in the
+    /// same process, so two tests each starting `tree_undo_backup_counter` back at 0 would
+    /// otherwise write their first delete's backup to the exact same path, and the second test's
+    /// backup would silently fail with `AlreadyExists` (or worse, its cleanup would delete the
+    /// first test's still-referenced backup). This is what actually caused GitHub issue #105's
+    /// undo/redo delete test to fail intermittently in full-suite runs while always passing alone.
+    pub(crate) tree_undo_instance_id: u64,
     /// The most recent file-operation failure (a refused rename, a failed trash command),
     /// surfaced under the tree rather than dropped into the log - the same small, honest error
     /// surface [`Self::file_save_error`] uses for a failed save.
@@ -477,10 +492,14 @@ pub struct AdeApp {
     /// render (the same pattern [`Self::plus_button_bounds`] uses) - where a *keyboard*-opened
     /// context menu (`Shift+F10`) anchors, since there is no cursor position to use.
     pub(crate) file_tree_bounds: gpui::Bounds<Pixels>,
-    /// The in-flight confirmed delete (a real `gio trash` child process, or a real
-    /// `remove_dir_all`), one slot: a second delete can't be requested until the confirmation
-    /// panel is open again, so there is never more than one.
-    pub(crate) _tree_delete_task: Option<Task<()>>,
+    /// Every in-flight confirmed delete (a real `gio trash` child process, or a real
+    /// `remove_dir_all`) - a real `Vec`, not one slot, since GitHub issue #145's bulk delete
+    /// starts one real task per selected path in the same call: a single `Option` overwritten in
+    /// a loop would drop (and, being a `Task`, therefore cancel) every delete but the last one.
+    /// Finished tasks are never removed - `Task<()>` completing is a no-op to poll again, and
+    /// this only ever grows by a handful of entries per bulk delete, not worth the bookkeeping to
+    /// prune.
+    pub(crate) _tree_delete_tasks: Vec<Task<()>>,
     /// The in-flight Duplicate / paste-a-copy - a real, recursive `std::fs` tree copy, run on the
     /// background executor rather than in the click listener that started it (see
     /// `crate::sidebar::tree_ops::AdeApp::spawn_tree_copy`). One slot, superseding: a second copy
@@ -561,13 +580,31 @@ pub struct AdeApp {
     pub(crate) open_diff_file_cache: Option<DiffFile>,
     /// File-tree path last resolved from a palette file result with no diff to open
     /// (`Self::open_palette_file_result`) - highlighted in `Self::render_file_tree_row` like a
-    /// Changes row's own selection highlight.
+    /// Changes row's own selection highlight. GitHub issue #145: also the multi-selection's
+    /// *anchor* - the row a plain click lands on, a Shift+click range starts from, and the only
+    /// row F2/rename ever targets. See [`Self::additional_tree_selection`]'s own docs for the
+    /// rest of a real multi-selection.
     pub(crate) selected_tree_path: Option<PathBuf>,
-    /// Surface C's `Diff | File` toggle for whichever file [`Self::open_change`] names - set to
+    /// GitHub issue #145: every multi-selected file-tree row *besides* the anchor
+    /// ([`Self::selected_tree_path`]) - Ctrl/Cmd+click toggles membership, Shift+click replaces
+    /// this with the range between the anchor and the clicked row. The tree's real selection is
+    /// always this set plus the anchor together (`Self::tree_selected_paths`), never either alone,
+    /// and it's a `HashSet` rather than a `Vec` since membership (`Self::is_tree_path_selected`,
+    /// read on every visible row every frame) is the only real query this needs - row order comes
+    /// from the tree itself, not from this field, whenever an operation needs an ordered list.
+    pub(crate) additional_tree_selection: HashSet<PathBuf>,
+    /// Surface C's `File | Diff` toggle for whichever file [`Self::open_change`] names - set to
     /// `Diff` by [`Self::open_change_diff`] and `File` by [`Self::open_file_view`], read by
     /// [`Self::render_code_surface`] alongside a "does this file even have a diff" check (a
     /// diff-less file always renders as `File` regardless of this field).
     pub(crate) code_view: code_view::CodeView,
+    /// GitHub issue #115: a `.md` file's `Source | Preview` toggle - reset the same way
+    /// [`Self::code_view`] is (see that field's own docs), not persisted per tab.
+    pub(crate) markdown_view: markdown_preview::MarkdownView,
+    /// Scroll position for [`Self::render_markdown_preview`] - plain [`gpui::ScrollHandle`]
+    /// rather than [`Self::file_view_scroll_handle`]'s `UniformListScrollHandle`, since the
+    /// preview is a real nested block tree, not a virtualized flat line list.
+    pub(crate) markdown_preview_scroll_handle: gpui::ScrollHandle,
     /// Surface C's Diff/File focus target, `track_focus`'d by
     /// [`Self::render_code_surface`]'s outer container - see [`OverlayFocus`]/[`restore_focus`]
     /// for the dangling-focus invariant this and [`Self::code_focus`] exist to satisfy.
@@ -605,6 +642,22 @@ pub struct AdeApp {
     /// The git graph tab's own keyboard-focus target, `track_focus`'d by
     /// `crate::graph_view::render::AdeApp::render_graph_view`'s container.
     pub(crate) graph_focus_handle: FocusHandle,
+    /// Whether [`Self::graph_focus_handle`] is genuinely focused right now (GitHub issue #127) -
+    /// kept as a plain bool, set directly alongside each real `window.focus(&self.
+    /// graph_focus_handle, ...)` call (`crate::graph_view::render::AdeApp::open_git_graph`/
+    /// `Self::toggle_graph_row_menu`) and cleared in `crate::graph_view::render::AdeApp::
+    /// leave_graph_tab`, rather than read live at render time or driven by a `cx.on_focus`
+    /// subscription. Two real reasons, not one: the row list's own render call chain
+    /// (`crate::graph_view::render::AdeApp::render_graph_row`, reached through `Self::
+    /// render_center_pane`) never carries a real `&Window` to check `FocusHandle::is_focused`
+    /// against (`render_center_pane` is also called as a bare "force a redraw" helper from dozens
+    /// of non-rendering call sites with no window at all); and a `cx.on_focus`/`cx.on_blur`
+    /// subscription registered at construction - the shape `Self::wire_caret_blink` uses
+    /// successfully for other handles - was live-tested here and never fired, since
+    /// `graph_focus_handle` is only ever `track_focus`'d conditionally (only while
+    /// `Self::graph_tab_active`) and the very first focus of it can happen before that node has
+    /// ever been part of a rendered frame.
+    pub(crate) graph_view_focused: bool,
     /// Pre-open focus target for [`Self::graph_focus_handle`] - see [`OverlayFocus`]. Captured
     /// only on the closed-to-open transition and moved on only when something else becomes the
     /// active centre-pane content - see `crate::graph_view::render::AdeApp::leave_graph_tab`.
@@ -2065,6 +2118,7 @@ impl Render for AdeApp {
             .on_action(cx.listener(Self::handle_jump_to_agent_7_action))
             .on_action(cx.listener(Self::handle_jump_to_agent_8_action))
             .on_action(cx.listener(Self::handle_close_focused_tab_action))
+            .on_action(cx.listener(Self::handle_terminal_clear_action))
             .child(self.render_title_bar(cx))
             // The Settings surface (`design_handoff_jerry_ade/README.md`: "a separate surface,
             // not a modal: it replaces the three zones while the title bar and status bar

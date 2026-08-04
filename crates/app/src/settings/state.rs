@@ -572,14 +572,6 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::TextUndo" => Some("Text: undo"),
         "app::TextRedo" => Some("Text: redo"),
         "app::CloseFocusedTab" => Some("Close focused tab"),
-        // Deliberately says what it is *for*, not just what it opens. This page has no
-        // description column - a row's label is the whole explanation a user ever gets - and
-        // "Files tree: context menu" left a real reader with no idea why the app binds Shift+F10
-        // at all. It is the keyboard equivalent of right-clicking the selected row, which is what
-        // GitHub issue #19 §2 required and what this wording now states outright. The Files
-        // tree's own footer hint strip
-        // (`crate::sidebar::render::render_file_tree_footer`) is the other half of that answer.
-        "app::FileTreeContextMenu" => Some("Files tree: open the selected row's actions menu"),
         "app::FileTreeRename" => Some("Files tree: rename"),
         "app::FileTreeCopy" => Some("Files tree: copy"),
         "app::FileTreeCut" => Some("Files tree: cut"),
@@ -587,6 +579,7 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::FileTreeDelete" => Some("Files tree: delete"),
         "app::FileTreeUndo" => Some("Files tree: undo"),
         "app::FileTreeRedo" => Some("Files tree: redo"),
+        "app::TerminalClear" => Some("Terminal: clear"),
         _ => None,
     }
 }
@@ -1277,7 +1270,6 @@ mod tests {
                 // `"file-tree && !tree-editing"` - see `crate::default_key_bindings`' own docs
                 // and `crate::sidebar::tree_ops`' module docs for why both halves of that
                 // predicate are load-bearing.
-                "Files tree: open the selected row's actions menu",
                 "Files tree: rename",
                 "Files tree: copy",
                 "Files tree: cut",
@@ -1291,6 +1283,8 @@ mod tests {
                 "Files tree: redo",
                 // GitHub issue #26's `Ctrl+W` - closes the focused tab, scoped `Some("!terminal")`.
                 "Close focused tab",
+                // GitHub issue #20's terminal footer `clear`, scoped `Some("terminal")`.
+                "Terminal: clear",
             ]
         );
     }
@@ -1354,6 +1348,11 @@ mod tests {
         // immediately - no confirmation step, so no different scoping from Copy/Cut/Paste/Rename
         // above it) and its own `FileTreeUndo`/`FileTreeRedo` (`Ctrl+Z`/`Ctrl+Shift+Z`) - distinct
         // actions from `TextUndo`/`TextRedo`, all three `Some("file-tree && !tree-editing")`.
+        // GitHub issue #20 added 1 more real scoped binding: `TerminalClear`
+        // (`cmd-k`/`ctrl-shift-l`), `Some("terminal")`.
+        // GitHub issue #155 removed 1: `FileTreeContextMenu` (`Shift+F10`) - right-click plus
+        // each row's own already-bound shortcut covers the same ground, so a second
+        // keyboard-only path to the menu had no real justification of its own.
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings, &[]);
         assert!(!rows.is_empty());
@@ -1365,18 +1364,19 @@ mod tests {
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
              every real Completions* binding (5) plus every real merge-editor binding (18) plus \
              TextUndo/TextRedo (3, GitHub issue #17) plus every real \
-             file-tree binding (8, GitHub issues #19 and #105) plus every real word-wise Editor* \
+             file-tree binding (7, GitHub issues #19 and #105, less 1 for issue #155's removed \
+             FileTreeContextMenu) plus every real word-wise Editor* \
              binding (8, GitHub issue #27) plus every real multi-cursor Editor* binding (4, \
              GitHub issue #28) plus every real GitHub issue #26 binding (7, not counting \
-             EditorCollapseCursors above, which is issue #28's own action) to be scoped, not \
-             global"
+             EditorCollapseCursors above, which is issue #28's own action) plus TerminalClear \
+             (1, GitHub issue #20) to be scoped, not global"
         );
         assert!(
             scoped
                 .iter()
                 .filter(|row| row.command.starts_with("Files tree: "))
                 .count()
-                == 8,
+                == 7,
             "every file-tree binding must be reported as scoped - a globally-bound Ctrl+C would \
              be exactly the keystroke-swallowing bug class this list's own docs catalogue"
         );

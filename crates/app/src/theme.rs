@@ -394,9 +394,17 @@ pub mod surface {
     /// (`#E81123`, the same color Windows 10/11's own native title bar uses) instead - a
     /// deliberate override of the handoff, not a stale-spec bug.
     pub const TITLE_BAR_CLOSE_HOVER: ColorToken = hex(0xe81123);
-    /// The tab strip's `+` menu popover row hover fill - distinct from [`ROW_HOVER`]/
-    /// [`ROW_HOVER_ALT`].
-    pub const PLUS_MENU_ROW_HOVER: ColorToken = hex(0x1d2226);
+    /// GitHub issue #129: the shared row-hover fill for every dropdown/context-menu in the app
+    /// (`+` menu, title bar menu, tree context menu, git graph's push/row menus) - distinct from
+    /// [`ROW_HOVER`]/[`ROW_HOVER_ALT`], which are for plain list rows and chrome buttons, not
+    /// menu popovers. Named `MENU_ROW_HOVER`, not `PLUS_MENU_ROW_HOVER` (its name before this
+    /// issue) - it was already shared by four menus, not just the `+` one, before this rename;
+    /// only the name had drifted from what it actually covers. Deliberately *not* used by the
+    /// command palette (`theme::palette::ROW_HOVER`, its own real token - GitHub issue #129 kept
+    /// the palette its own thing on purpose) or the LSP completion popup (keyboard-navigated, not
+    /// mouse-hover styled at all - a real, mockup-verified design difference, not drift; see
+    /// `crate::lsp::completion_popup`'s own module docs).
+    pub const MENU_ROW_HOVER: ColorToken = hex(0x1d2226);
     /// A file tab's close-affordance hover fill - one hex step off [`CHIP_NEUTRAL`]
     /// (`#23272b`), kept as its own token.
     pub const TAB_CLOSE_HOVER: ColorToken = hex(0x23282c);
@@ -1154,9 +1162,11 @@ pub mod band {
     use super::{px, Pixels};
 
     pub const TITLE_BAR: Pixels = px(38.0);
-    pub const TAB_STRIP: Pixels = px(34.0);
-    pub const RAIL_HEADER: Pixels = px(36.0);
-    pub const PANEL_HEADER: Pixels = px(36.0);
+    /// Shared height for the work-surface tab strip, the session-rail header, and the
+    /// files/changes panel header - the three sit side by side under the title bar and must
+    /// line up pixel-perfect, so they read off one constant instead of three values that could
+    /// drift independently.
+    pub const CHROME_HEADER: Pixels = px(36.0);
     pub const CONTEXT_BAR: Pixels = px(32.0);
     pub const DIFF_TOOLBAR: Pixels = px(31.0);
     pub const FILTER_ROW: Pixels = px(30.0);
@@ -1209,14 +1219,20 @@ pub mod shadow {
     pub const POPOVER: (Pixels, Pixels, Pixels) = (px(0.0), px(8.0), px(20.0)); // rgba(0,0,0,0.50)
     pub const PALETTE: (Pixels, Pixels, Pixels) = (px(0.0), px(12.0), px(34.0));
     // rgba(0,0,0,0.55)
-    /// The `+` menu popover's own shadow - distinct from [`PALETTE`]'s `0 12 34`.
-    pub const PLUS_MENU: (Pixels, Pixels, Pixels) = (px(0.0), px(14.0), px(30.0));
+    /// GitHub issue #129: the shared shadow for every dropdown/context-menu in the app - distinct
+    /// from [`PALETTE`]'s `0 12 34`. Named `MENU`, not `PLUS_MENU` (its name before this issue) -
+    /// it was already used by the title bar menu, tree context menu, and git graph's push/row
+    /// menus too, not just the `+` menu; only the name had drifted from what it actually covers.
+    pub const MENU: (Pixels, Pixels, Pixels) = (px(0.0), px(14.0), px(30.0));
     // rgba(0,0,0,0.55)
-    /// The commit composer's `▾` split-button popover shadow (Revision R12 §5) - a negative `y`
-    /// since, unlike every other popover in this module, it opens *upward* from a button near the
-    /// bottom of the Changes panel.
-    pub const COMMIT_MENU: (Pixels, Pixels, Pixels) = (px(0.0), px(-10.0), px(26.0));
-    // rgba(0,0,0,0.5)
+    /// The commit composer's `▾` split-button popover shadow (Revision R12 §5) - same blur/alpha
+    /// as [`MENU`], just a negative `y`: unlike every other popover in this module, it opens
+    /// *upward* from a button near the bottom of the Changes panel. Before GitHub issue #129 this
+    /// also had its own, slightly different blur/alpha (`26`/`0.5`, vs `MENU`'s `30`/`0.55`) with
+    /// no real reason for the difference beyond having been introduced separately - direction is
+    /// the only genuine difference this popover needs.
+    pub const COMMIT_MENU: (Pixels, Pixels, Pixels) = (px(0.0), px(-14.0), px(30.0));
+    // rgba(0,0,0,0.55)
 }
 
 /// Honestly-scoped application of `Settings.appearance.interface_scale_percent` - text-size

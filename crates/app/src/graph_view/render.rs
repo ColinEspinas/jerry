@@ -3,11 +3,11 @@
 //! AdeApp` glue that opens/closes/loads it. See `super`'s module docs for scope.
 
 use super::*;
-use crate::root::widgets::{render_sidebar_message, render_tag_pill};
+use crate::root::widgets::{menu_popover_chrome, render_sidebar_message, render_tag_pill};
 use crate::settings::widgets;
 use crate::sidebar::changes;
 use crate::work_surface::render::{render_dropdown_menu_row, DraggedTab, TabChromeArgs};
-use gpui::{BoxShadow, KeyDownEvent, Pixels};
+use gpui::{KeyDownEvent, Pixels};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use wt_core::graph::{DotKind, ElbowKind, Graph, GraphRow, GraphScope, RefKind};
 
@@ -83,6 +83,13 @@ impl AdeApp {
             self.graph_focus.capture(window, &self.agents, cx);
         }
         window.focus(&self.graph_focus_handle, cx);
+        // GitHub issue #127: set alongside the real `window.focus` call, not via a `cx.on_focus`
+        // subscription - `graph_focus_handle` is only ever `track_focus`'d conditionally
+        // (`Self::render_center_pane` renders `Self::render_graph_view` only while
+        // `graph_tab_active` is `true`), and a live-tested subscription registered before that
+        // first render never actually fired for it. See [`AdeApp::graph_view_focused`]'s own
+        // docs for why the row-selection highlight needs this at all.
+        self.graph_view_focused = true;
 
         if matches!(self.graph_state.load, GraphLoadState::NotLoaded) {
             self.load_graph(cx);
@@ -142,6 +149,10 @@ impl AdeApp {
             return;
         }
         self.graph_tab_active = false;
+        // GitHub issue #127: the tab becoming inactive means `graph_focus_handle` stops being
+        // `track_focus`'d at all (see the comment just below), so it definitionally can't be
+        // focused any more, regardless of which handle `restore_focus` below lands on next.
+        self.graph_view_focused = false;
         // Two handles stop being `track_focus`'d here, not one: `graph_focus_handle` itself, and
         // the Branches panel's real filter box (`graph_state.branches_filter_focus_handle`),
         // which is only rendered while this tab is active and can independently hold real
@@ -375,6 +386,8 @@ impl AdeApp {
         // "which overlay owns the next click" property this change is already about.
         self.graph_state.push_menu_open = false;
         window.focus(&self.graph_focus_handle, cx);
+        // GitHub issue #127 - see `Self::open_git_graph`'s own matching comment.
+        self.graph_view_focused = true;
         cx.notify();
     }
 
@@ -917,7 +930,6 @@ impl AdeApp {
 
     pub(crate) fn render_graph_push_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let bounds = self.graph_state.push_button_bounds;
-        let (shadow_x, shadow_y, shadow_blur) = theme::shadow::PLUS_MENU;
         div()
             .id("graph-push-menu-scrim")
             .absolute()
@@ -930,89 +942,82 @@ impl AdeApp {
                 cx.notify();
             }))
             .child(
-                div()
-                    .id("graph-push-menu-popover")
-                    .absolute()
-                    .left(bounds.origin.x)
-                    .top(bounds.origin.y + bounds.size.height + px(2.0))
-                    .w(theme::graph::PUSH_MENU_WIDTH)
-                    .py(px(4.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::CARD)
-                    .shadow(vec![BoxShadow::new(
-                        shadow_x,
-                        shadow_y,
-                        gpui::black().opacity(0.55),
+                menu_popover_chrome(
+                    div()
+                        .id("graph-push-menu-popover")
+                        .absolute()
+                        .left(bounds.origin.x)
+                        .top(bounds.origin.y + bounds.size.height + px(2.0))
+                        .w(theme::graph::PUSH_MENU_WIDTH)
+                        .py(px(4.0)),
+                    theme::shadow::MENU,
+                )
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2191}",
+                        theme::button::BLUE_FG.into(),
+                        theme::button::BLUE_BG.into(),
+                        "Push",
+                        "fast-forwards the remote branch".to_string(),
+                        Vec::new(),
+                        true,
                     )
-                    .blur_radius(shadow_blur)])
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }))
-                    .child(
-                        render_dropdown_menu_row(
-                            "\u{2191}",
-                            theme::button::BLUE_FG.into(),
-                            theme::button::BLUE_BG.into(),
-                            "Push",
-                            "fast-forwards the remote branch".to_string(),
-                            Vec::new(),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                this.request_graph_push(wt_core::remote::PushForce::None, cx);
-                            },
-                        )),
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            this.request_graph_push(wt_core::remote::PushForce::None, cx);
+                        },
+                    )),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2191}",
+                        theme::button::DANGER_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Force with lease",
+                        if self.graph_state.push_force_confirm_armed
+                            == Some(wt_core::remote::PushForce::WithLease)
+                        {
+                            "click again to really push".to_string()
+                        } else {
+                            "aborts if the remote moved".to_string()
+                        },
+                        Vec::new(),
+                        true,
                     )
-                    .child(
-                        render_dropdown_menu_row(
-                            "\u{2191}",
-                            theme::button::DANGER_FG.into(),
-                            theme::surface::CHIP_NEUTRAL.into(),
-                            "Force with lease",
-                            if self.graph_state.push_force_confirm_armed
-                                == Some(wt_core::remote::PushForce::WithLease)
-                            {
-                                "click again to really push".to_string()
-                            } else {
-                                "aborts if the remote moved".to_string()
-                            },
-                            Vec::new(),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                this.request_graph_push(wt_core::remote::PushForce::WithLease, cx);
-                            },
-                        )),
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            this.request_graph_push(wt_core::remote::PushForce::WithLease, cx);
+                        },
+                    )),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2191}",
+                        theme::button::DANGER_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Force",
+                        if self.graph_state.push_force_confirm_armed
+                            == Some(wt_core::remote::PushForce::Force)
+                        {
+                            "click again to really push".to_string()
+                        } else {
+                            "overwrites the remote unconditionally".to_string()
+                        },
+                        Vec::new(),
+                        true,
                     )
-                    .child(
-                        render_dropdown_menu_row(
-                            "\u{2191}",
-                            theme::button::DANGER_FG.into(),
-                            theme::surface::CHIP_NEUTRAL.into(),
-                            "Force",
-                            if self.graph_state.push_force_confirm_armed
-                                == Some(wt_core::remote::PushForce::Force)
-                            {
-                                "click again to really push".to_string()
-                            } else {
-                                "overwrites the remote unconditionally".to_string()
-                            },
-                            Vec::new(),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                this.request_graph_push(wt_core::remote::PushForce::Force, cx);
-                            },
-                        )),
-                    ),
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            this.request_graph_push(wt_core::remote::PushForce::Force, cx);
+                        },
+                    )),
+                ),
             )
     }
 
@@ -1043,7 +1048,8 @@ impl AdeApp {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            .track_scroll(&self.graph_state.rows_scroll_handle);
         for (index, row) in graph.rows.iter().enumerate() {
             list = list.child(self.render_graph_row(index, row, graph.lane_count, now, cx));
         }
@@ -1062,7 +1068,21 @@ impl AdeApp {
                     )),
             );
         }
-        list.into_any_element()
+        // GitHub issue #142.
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(list)
+            .children(self.render_vertical_scrollbar(
+                "graph-rows-scrollbar",
+                &self.graph_state.rows_scroll_handle,
+                &[],
+                cx,
+            ))
+            .into_any_element()
     }
 
     /// One row: lane canvas 100 · ref chips · subject (flex) · author 88 · relative time 40
@@ -1082,7 +1102,14 @@ impl AdeApp {
         now_unix: i64,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let selected = self.graph_state.selected_row == Some(index);
+        // GitHub issue #127: the selected-row highlight (background + left edge) must clear once
+        // real keyboard focus genuinely moves away from the graph view, not stay lit forever
+        // against whatever row was last selected. `graph_view_focused` is a plain bool set
+        // explicitly alongside every real `window.focus(&self.graph_focus_handle, ...)`/
+        // graph-tab-exit call site, rather than a live `FocusHandle::is_focused` check here,
+        // since this render call chain never carries a real `&Window` - see that field's own
+        // docs for why.
+        let selected = self.graph_view_focused && self.graph_state.selected_row == Some(index);
         let is_working_tree = row.commit.id.is_empty();
         let relative = if row.commit.id.is_empty() {
             "now".to_string()
@@ -1250,7 +1277,6 @@ impl AdeApp {
         let Some(row) = self.current_graph_row(index) else {
             return gpui::Empty.into_any_element();
         };
-        let (shadow_x, shadow_y, shadow_blur) = theme::shadow::PLUS_MENU;
         let sha = row.commit.id.clone();
         let short_sha = row.commit.short_id.clone();
         let subject = row.commit.subject.clone();
@@ -1290,114 +1316,192 @@ impl AdeApp {
                 }),
             )
             .child(
-                div()
-                    .id("graph-row-menu-popover")
-                    .debug_selector(|| "graph-row-menu-popover".to_string())
-                    .absolute()
-                    .left(menu.origin_x)
-                    .top(menu.origin_y)
-                    .w(theme::graph::ROW_MENU_WIDTH)
-                    .py(px(4.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::CARD)
-                    .shadow(vec![BoxShadow::new(shadow_x, shadow_y, gpui::black().opacity(0.55))
-                        .blur_radius(shadow_blur)])
-                    // Occludes so a right-click *inside* the popover's own bounds can never fall
-                    // through to whatever row it happens to be painted on top of (a real,
-                    // adversarial-audit-found bug: the popover opens *over* the row list, and
-                    // without this a right-click on the panel itself retargeted the menu to
-                    // whichever row was underneath it). Scoped to the panel alone, not the whole
-                    // scrim above - the panel is a small, content-sized rectangle that never
-                    // reaches the title bar, so (unlike `render_tree_context_menu`'s own
-                    // full-window occluding scrim, which had to start below the title bar for
-                    // exactly this reason - see that method's docs) no caption-button interaction
-                    // is possible here.
-                    .occlude()
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }))
-                    .child(render_graph_row_menu_header("Branch"))
-                    .child(render_dropdown_menu_row(
-                        "\u{2713}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Check out", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
-                    .child(render_dropdown_menu_row(
-                        "+", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Create branch here", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
-                    .child(render_dropdown_menu_row(
-                        "\u{25b8}", theme::button::BLUE_FG.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Start agent from this commit", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
-                    .child(render_graph_row_menu_header("Apply"))
-                    .child(render_dropdown_menu_row(
-                        "\u{2398}", theme::button::BLUE_FG.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Cherry-pick", String::new(), Vec::new(), true,
-                    ).on_click(cx.listener({
+                menu_popover_chrome(
+                    div()
+                        .id("graph-row-menu-popover")
+                        .debug_selector(|| "graph-row-menu-popover".to_string())
+                        .absolute()
+                        .left(menu.origin_x)
+                        .top(menu.origin_y)
+                        .w(theme::graph::ROW_MENU_WIDTH)
+                        .py(px(4.0)),
+                    theme::shadow::MENU,
+                )
+                // Occludes so a right-click *inside* the popover's own bounds can never fall
+                // through to whatever row it happens to be painted on top of (a real,
+                // adversarial-audit-found bug: the popover opens *over* the row list, and
+                // without this a right-click on the panel itself retargeted the menu to
+                // whichever row was underneath it). Scoped to the panel alone, not the whole
+                // scrim above - the panel is a small, content-sized rectangle that never
+                // reaches the title bar, so (unlike `render_tree_context_menu`'s own
+                // full-window occluding scrim, which had to start below the title bar for
+                // exactly this reason - see that method's docs) no caption-button interaction
+                // is possible here.
+                .occlude()
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .child(render_graph_row_menu_header("Branch"))
+                .child(render_dropdown_menu_row(
+                    "\u{2713}",
+                    theme::text::GHOST.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
+                    "Check out",
+                    "not implemented yet".to_string(),
+                    Vec::new(),
+                    false,
+                ))
+                .child(render_dropdown_menu_row(
+                    "+",
+                    theme::text::GHOST.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
+                    "Create branch here",
+                    "not implemented yet".to_string(),
+                    Vec::new(),
+                    false,
+                ))
+                .child(render_dropdown_menu_row(
+                    "\u{25b8}",
+                    theme::button::BLUE_FG.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
+                    "Start agent from this commit",
+                    "not implemented yet".to_string(),
+                    Vec::new(),
+                    false,
+                ))
+                .child(render_graph_row_menu_header("Apply"))
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2398}",
+                        theme::button::BLUE_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Cherry-pick",
+                        String::new(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
                         let sha = sha.clone();
                         move |this, _event: &ClickEvent, _window, cx| {
                             this.request_graph_cherry_pick(sha.clone(), cx);
                         }
-                    })))
-                    .child(render_dropdown_menu_row(
-                        "\u{21b6}", theme::button::AMBER_FG.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Revert", String::new(), Vec::new(), true,
-                    ).on_click(cx.listener({
+                    })),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{21b6}",
+                        theme::button::AMBER_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Revert",
+                        String::new(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
                         let sha = sha.clone();
                         move |this, _event: &ClickEvent, _window, cx| {
                             this.request_graph_revert(sha.clone(), cx);
                         }
-                    })))
-                    .child(render_dropdown_menu_row(
-                        "\u{2191}", theme::button::BLUE_FG.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Rebase onto this commit", String::new(), Vec::new(), true,
-                    ).on_click(cx.listener({
+                    })),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2191}",
+                        theme::button::BLUE_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Rebase onto this commit",
+                        String::new(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
                         let sha = sha.clone();
                         move |this, _event: &ClickEvent, _window, cx| {
                             this.request_graph_rebase_onto(sha.clone(), cx);
                         }
-                    })))
-                    .child(render_dropdown_menu_row(
-                        "\u{2191}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Interactive rebase from here", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
-                    .child(render_graph_row_menu_header("Reset"))
-                    .child(render_dropdown_menu_row(
-                        "\u{21ba}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Soft", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
-                    .child(render_dropdown_menu_row(
-                        "\u{21ba}", theme::text::GHOST.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Mixed", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
-                    .child(render_dropdown_menu_row(
-                        "\u{21ba}", theme::button::DANGER_FG.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Hard", "not implemented yet".to_string(), Vec::new(), false,
-                    ))
-                    .child(render_graph_row_menu_header("Copy"))
-                    .child(render_dropdown_menu_row(
-                        "#", theme::text::SECONDARY.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Copy SHA", short_sha, Vec::new(), true,
-                    ).on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                        this.copy_graph_text(sha.clone(), cx);
-                    })))
-                    .child(render_dropdown_menu_row(
-                        "\u{ab}", theme::text::SECONDARY.into(), theme::surface::CHIP_NEUTRAL.into(),
-                        "Copy subject", String::new(), Vec::new(), true,
-                    ).on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                        this.copy_graph_text(subject.clone(), cx);
-                    })))
-                    .child(
-                        div()
-                            .px(px(11.0))
-                            .pt(px(4.0))
-                            .font(font(theme::font::SANS))
-                            .text_size(px(9.5))
-                            .text_color(theme::text::GHOSTER)
-                            .child("rebase and reset run in the focused worktree, never the main checkout"),
-                    ),
+                    })),
+                )
+                .child(render_dropdown_menu_row(
+                    "\u{2191}",
+                    theme::text::GHOST.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
+                    "Interactive rebase from here",
+                    "not implemented yet".to_string(),
+                    Vec::new(),
+                    false,
+                ))
+                .child(render_graph_row_menu_header("Reset"))
+                .child(render_dropdown_menu_row(
+                    "\u{21ba}",
+                    theme::text::GHOST.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
+                    "Soft",
+                    "not implemented yet".to_string(),
+                    Vec::new(),
+                    false,
+                ))
+                .child(render_dropdown_menu_row(
+                    "\u{21ba}",
+                    theme::text::GHOST.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
+                    "Mixed",
+                    "not implemented yet".to_string(),
+                    Vec::new(),
+                    false,
+                ))
+                .child(render_dropdown_menu_row(
+                    "\u{21ba}",
+                    theme::button::DANGER_FG.into(),
+                    theme::surface::CHIP_NEUTRAL.into(),
+                    "Hard",
+                    "not implemented yet".to_string(),
+                    Vec::new(),
+                    false,
+                ))
+                .child(render_graph_row_menu_header("Copy"))
+                .child(
+                    render_dropdown_menu_row(
+                        "#",
+                        theme::text::SECONDARY.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Copy SHA",
+                        short_sha,
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener(
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.copy_graph_text(sha.clone(), cx);
+                        },
+                    )),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{ab}",
+                        theme::text::SECONDARY.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Copy subject",
+                        String::new(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener(
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.copy_graph_text(subject.clone(), cx);
+                        },
+                    )),
+                )
+                .child(
+                    div()
+                        .px(px(11.0))
+                        .pt(px(4.0))
+                        .font(font(theme::font::SANS))
+                        .text_size(px(9.5))
+                        .text_color(theme::text::GHOSTER)
+                        .child(
+                            "rebase and reset run in the focused worktree, never the main checkout",
+                        ),
+                ),
             )
             .into_any_element()
     }
@@ -1501,13 +1605,14 @@ impl AdeApp {
                 .into_any_element(),
         };
 
-        div()
+        let panel = div()
             .id("graph-commit-panel")
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(&self.graph_state.commit_panel_scroll_handle)
             .px(px(12.0))
             .py(px(10.0))
             .gap(px(8.0))
@@ -1582,7 +1687,20 @@ impl AdeApp {
                             }
                         })),
                     ),
-            )
+            );
+        // GitHub issue #142.
+        div()
+            .relative()
+            .flex()
+            .flex_1()
+            .min_h_0()
+            .child(panel)
+            .children(self.render_vertical_scrollbar(
+                "graph-commit-panel-scrollbar",
+                &self.graph_state.commit_panel_scroll_handle,
+                &[],
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -1617,15 +1735,30 @@ impl AdeApp {
             .child(self.render_graph_branches_filter_row(branches.len(), cx))
             .child(
                 div()
-                    .id("graph-branches-list")
+                    .relative()
                     .flex()
-                    .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .children(branches.into_iter().map(|(name, kind, is_head, lane)| {
-                        render_graph_branch_row(name, kind, is_head, lane)
-                    })),
+                    .child(
+                        div()
+                            .id("graph-branches-list")
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.graph_state.branches_scroll_handle)
+                            .children(branches.into_iter().map(|(name, kind, is_head, lane)| {
+                                render_graph_branch_row(name, kind, is_head, lane)
+                            })),
+                    )
+                    // GitHub issue #142.
+                    .children(self.render_vertical_scrollbar(
+                        "graph-branches-scrollbar",
+                        &self.graph_state.branches_scroll_handle,
+                        &[],
+                        cx,
+                    )),
             )
             .into_any_element()
     }
@@ -4684,6 +4817,57 @@ mod graph_selection_render_tests {
             "selecting a row must never resize its own content (unselected: {:?}, selected: \
              {:?})",
             bounds_unselected, bounds_selected
+        );
+    }
+
+    /// GitHub issue #127: `AdeApp::graph_view_focused` - the bool `Self::render_graph_row`'s own
+    /// selected-row highlight reads, since that render call chain never carries a real `&Window`
+    /// to check `FocusHandle::is_focused` against directly - is set explicitly alongside every
+    /// real `window.focus(&self.graph_focus_handle, ...)`/graph-tab-exit call site
+    /// (`Self::open_git_graph`, `Self::open_graph_row_menu_at`, `Self::leave_graph_tab`), not via
+    /// a `cx.on_focus` subscription - one was tried and, live-tested, never fired for
+    /// `graph_focus_handle`, since it's only ever `track_focus`'d conditionally
+    /// (`Self::render_center_pane` renders `Self::render_graph_view` only while `graph_tab_active`
+    /// is `true`). Direct coverage of every site that flips the bool.
+    #[gpui::test]
+    fn graph_view_focused_tracks_real_focus_and_blur_of_the_graph_view(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        assert!(
+            app.read_with(cx, |app, _| app.graph_view_focused),
+            "premise: opening the graph tab genuinely focuses the graph view"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.leave_graph_tab(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.graph_view_focused),
+            "leaving the graph tab must clear it"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.graph_view_focused),
+            "reopening the graph tab must set it again"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.leave_graph_tab(window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.open_graph_row_menu_at(0, px(0.0), px(0.0), window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.graph_view_focused),
+            "opening a row's context menu must also set it, since it explicitly refocuses \
+             graph_focus_handle to fix keyboard focus after a right-click's own stop_propagation"
         );
     }
 }

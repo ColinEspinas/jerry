@@ -1,12 +1,11 @@
 use super::*;
 use crate::keymap;
 use crate::root::widgets::{
-    render_keycap_row, render_menu_group_divider, render_sidebar_message, render_tag_pill,
-    text_tooltip, KeycapSize,
+    hover_bg, menu_popover_chrome, render_keycap_row, render_menu_group_divider,
+    render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
 };
 use crate::settings::widgets::ChoiceOption;
 use crate::worktree_history::flow as worktree_history;
-use gpui::BoxShadow;
 
 impl AdeApp {
     /// Switches which data source the right sidebar shows. Switching *to* the Changes view
@@ -330,7 +329,8 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         let (_, message) = self.staging_error.clone()?;
-        Some(
+        // GitHub issue #128.
+        let row = hover_bg(
             div()
                 .id("staging-error")
                 .debug_selector(|| "staging-error".to_string())
@@ -341,8 +341,11 @@ impl AdeApp {
                 .font(font(theme::font::MONO))
                 .text_size(self.ui_text_size(10.0))
                 .text_color(theme::status::FAIL)
-                .cursor_pointer()
-                .tooltip(text_tooltip("Click to dismiss"))
+                .cursor_pointer(),
+            theme::surface::ROW_HOVER,
+        );
+        Some(
+            row.tooltip(text_tooltip("Click to dismiss"))
                 .child(message)
                 .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                     this.staging_error = None;
@@ -583,7 +586,7 @@ impl AdeApp {
         let list = uniform_list(
             "file-tree-list",
             rendered_count,
-            cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
+            cx.processor(move |this: &mut Self, range: Range<usize>, window, cx| {
                 // Both the row range and each index into `file_tree` are clamped/checked rather
                 // than trusted, so a future divergence degrades to "renders fewer rows" instead
                 // of panicking. `start` is clamped to `end`, not just to the length: clamping
@@ -598,7 +601,7 @@ impl AdeApp {
                             .file_tree
                             .get(*index)
                             .cloned()
-                            .map(|entry| this.render_file_tree_row(&entry, &marks, cx)),
+                            .map(|entry| this.render_file_tree_row(&entry, &marks, window, cx)),
                         TreeRow::InlineEditor => {
                             Some(this.render_tree_inline_edit_row(editor_depth, cx))
                         }
@@ -708,7 +711,8 @@ impl AdeApp {
         // The real, honest surface for a failed file operation (a refused rename, a trash
         // command that didn't run) - next to the tree it happened in, not buried in the log.
         if let Some(error) = self.tree_op_error.clone() {
-            column = column.child(
+            // GitHub issue #128.
+            let row = hover_bg(
                 div()
                     .id("file-tree-op-error")
                     .debug_selector(|| "file-tree-op-error".to_string())
@@ -719,8 +723,11 @@ impl AdeApp {
                     .font(font(theme::font::MONO))
                     .text_size(self.ui_text_size(10.0))
                     .text_color(theme::status::FAIL)
-                    .cursor_pointer()
-                    .tooltip(text_tooltip("Click to dismiss"))
+                    .cursor_pointer(),
+                theme::surface::ROW_HOVER,
+            );
+            column = column.child(
+                row.tooltip(text_tooltip("Click to dismiss"))
                     .child(error)
                     .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                         this.tree_op_error = None;
@@ -767,7 +774,6 @@ impl AdeApp {
             .id("file-tree-shell")
             .key_context(key_context)
             .track_focus(&self.tree_focus_handle)
-            .on_action(cx.listener(Self::handle_file_tree_context_menu_action))
             .on_action(cx.listener(Self::handle_file_tree_rename_action))
             .on_action(cx.listener(Self::handle_file_tree_copy_action))
             .on_action(cx.listener(Self::handle_file_tree_cut_action))
@@ -797,6 +803,17 @@ impl AdeApp {
                         window,
                         cx,
                     );
+                }),
+            )
+            // GitHub issue #148: the empty area is also a real drop target - "move to the
+            // worktree root", the same `destination_dir` every other empty-area action
+            // (New File/New Folder/Paste) already resolves to. Any row's own `on_drop` calls
+            // `cx.stop_propagation()`, so this only ever fires for a drop that genuinely misses
+            // every row.
+            .on_drop(
+                cx.listener(move |this, dragged: &TreeDragPayload, _window, cx| {
+                    let root = this.file_tree_root.clone();
+                    this.move_paths_into_dir(&dragged.paths, &root, cx);
                 }),
             )
             .child({
@@ -952,15 +969,40 @@ impl AdeApp {
         &self,
         entry: &FileTreeEntry,
         marks: &HashMap<PathBuf, (&'static str, gpui::Rgba)>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let indent = px(file_tree::INDENT_STEP * entry.depth as f32);
         let is_open = entry.is_dir && self.expanded_dirs.contains(&entry.path);
         let mark = marks.get(&entry.path).copied();
-        // The Files tree's row-selection highlight (README's Zone 3 "Selected row bg
-        // `#1a1e21`") - set by `Self::open_file_view` (this row's own click handler, below)
-        // and by `Self::open_palette_file_result` for a palette file result with no diff.
-        let is_selected = self.selected_tree_path.as_deref() == Some(entry.path.as_path());
+        // GitHub issue #127: the row-selection highlight (README's Zone 3 "Selected row bg
+        // `#1a1e21`") and the ancestor-chain indent-guide highlight just below both used to key
+        // purely off `Self::selected_tree_path` - the last-opened path, set by `Self::
+        // open_file_view`/`Self::open_palette_file_result` - with no check against real keyboard
+        // focus at all. That left the row looking selected/focused indefinitely after focus
+        // genuinely moved to the editor, a terminal, or the Changes panel.
+        //
+        // Two genuinely different things were being conflated under one field, though: "this row
+        // is what the centre pane is actually showing" (should stay lit no matter where focus
+        // is, the same way VS Code keeps the open file highlighted in its explorer while you're
+        // typing in the editor) versus "this row is the tree's own keyboard-navigation cursor"
+        // (should go idle the moment focus genuinely leaves the tree - a stale cursor left glowing
+        // over whatever directory you last clicked is exactly the bug this issue was filed for).
+        // `Self::open_change_absolute_path` answers the first question directly from
+        // `Self::open_change` - independent of `selected_tree_path`, which a directory click (or
+        // a tab-strip switch, which never touches it at all) can leave pointing somewhere the
+        // centre pane isn't showing.
+        let tree_focused = self.tree_focus_handle.is_focused(window);
+        let open_change_path = self.open_change_absolute_path();
+        let is_open_file = open_change_path.as_deref() == Some(entry.path.as_path());
+        // GitHub issue #145: a Ctrl/Cmd- or Shift-selected row (beyond the anchor) highlights
+        // exactly like the anchor itself does - same focus gating, since it's a keyboard-
+        // navigation-style selection, not a standing "this is open" marker the way `is_open_file`
+        // is.
+        let is_selected = is_open_file
+            || (tree_focused
+                && (self.selected_tree_path.as_deref() == Some(entry.path.as_path())
+                    || self.additional_tree_selection.contains(&entry.path)));
 
         // `debug_selector` is a no-op outside test builds; lets a real render test assert on
         // which rows this list genuinely painted, which is the only way to prove the
@@ -990,7 +1032,18 @@ impl AdeApp {
             .pr(px(8.0))
             .font(font(theme::font::MONO))
             .text_size(self.ui_text_size(11.5))
-            .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED));
+            .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED))
+            // GitHub issue #148: the drop-target folder while a real file-tree drag is over it -
+            // `theme::status::ASK_BG`, the same "you can act here" amber this app already uses
+            // for its other real actionable notices, not a new one-off token. Deliberately
+            // overrides `is_selected`'s own bg (a `.when` after it, not combined into one
+            // condition) - a drop target reads as "drop here", not "also selected", even for the
+            // rare case of dragging onto an already-selected folder.
+            .when(
+                entry.is_dir
+                    && self.tree_drag_hover_target.as_deref() == Some(entry.path.as_path()),
+                |el| el.bg(theme::status::ASK_BG),
+            );
 
         // Indent guides (issue #18 §3), one per level of nesting between this row and the root.
         //
@@ -1004,11 +1057,16 @@ impl AdeApp {
         // recycle" failure the issue calls out. Each guide spans the row's full 22px height with
         // no gap or inset, so consecutive rows' segments meet exactly and read as one continuous
         // line down the subtree.
-        let active_levels = file_tree::active_guide_levels(
-            &self.file_tree_root,
-            &entry.path,
-            self.selected_tree_path.as_deref(),
-        );
+        // GitHub issue #127: highlights the open file's own ancestor chain regardless of focus
+        // (same reasoning as `is_open_file` above - it helps find the open file in a deep,
+        // collapsed tree), falling back to the focus-gated tree cursor otherwise.
+        let active_chain_target = open_change_path.as_deref().or_else(|| {
+            tree_focused
+                .then_some(self.selected_tree_path.as_deref())
+                .flatten()
+        });
+        let active_levels =
+            file_tree::active_guide_levels(&self.file_tree_root, &entry.path, active_chain_target);
         for level in 0..entry.depth {
             let active = level < active_levels;
             row = row.child(
@@ -1068,21 +1126,100 @@ impl AdeApp {
             );
         }
 
+        // GitHub issue #148: every row can be dragged - a row already part of a real
+        // multi-selection drags the *whole* selection, matching how a click on it wouldn't
+        // collapse the selection either (a plain click on an *unselected* row still resets the
+        // selection first, the same way `Self::tree_click_select`'s own plain-click branch
+        // does, so the drag that follows only ever carries what's genuinely selected at drag
+        // start). Only real per-row state is read here - never anything that could go stale by
+        // the time the drag actually starts, since `drag_value` is captured once, now.
+        {
+            let is_selected = self.is_tree_path_selected(&entry.path);
+            let drag_paths = if is_selected && self.tree_selection_len() > 1 {
+                self.tree_selected_paths()
+            } else {
+                vec![entry.path.clone()]
+            };
+            let label = if drag_paths.len() > 1 {
+                format!("{} items", drag_paths.len())
+            } else {
+                entry.name.clone()
+            };
+            let drag_value = TreeDragPayload {
+                paths: drag_paths,
+                label,
+            };
+            row = row.on_drag(drag_value, move |dragged, _position, _window, cx| {
+                cx.new(|_| dragged.clone())
+            });
+        }
+        if entry.is_dir {
+            let drop_path = entry.path.clone();
+            let hover_path = entry.path.clone();
+            row = row
+                .on_drag_move(cx.listener(
+                    move |this, event: &gpui::DragMoveEvent<TreeDragPayload>, _window, cx| {
+                        // A folder can't be its own drop target's *visual* indication either -
+                        // `Self::move_paths_into_dir` already refuses the move itself, but
+                        // highlighting a folder that's part of what's being dragged onto it
+                        // would show an affordance for a drop this app is about to reject anyway.
+                        let hovering = event.bounds.contains(&event.event.position)
+                            && !event.drag(cx).paths.contains(&hover_path);
+                        // Only touches state (and repaints) on a real change - matching
+                        // `Self::update_tab_drag_insertion`'s own identical discipline, since
+                        // `on_drag_move` fires on every real mouse-move during the drag.
+                        if hovering {
+                            if this.tree_drag_hover_target.as_deref() != Some(hover_path.as_path())
+                            {
+                                this.tree_drag_hover_target = Some(hover_path.clone());
+                                cx.notify();
+                            }
+                        } else if this.tree_drag_hover_target.as_deref()
+                            == Some(hover_path.as_path())
+                        {
+                            this.tree_drag_hover_target = None;
+                            cx.notify();
+                        }
+                    },
+                ))
+                .on_drop(
+                    cx.listener(move |this, dragged: &TreeDragPayload, _window, cx| {
+                        // Without this, the drop would *also* reach `Self::file_tree_shell`'s own
+                        // root-drop handler right after this row's - moving the same selection into
+                        // the folder it was just dropped on, then straight back out to the root.
+                        cx.stop_propagation();
+                        this.tree_drag_hover_target = None;
+                        this.move_paths_into_dir(&dragged.paths, &drop_path, cx);
+                    }),
+                );
+        }
+
         if entry.is_dir {
             let path = entry.path.clone();
             row = row
                 .cursor_pointer()
                 .hover(|el| el.bg(theme::surface::ROW_HOVER))
-                .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     // Selecting *and* focusing, both real: a folder click is what gives the tree
                     // keyboard focus (so its `Ctrl+C`/`F2`/`Shift+F10` bindings can match at
                     // all) and what gives those bindings a target. Deliberately here, in the
                     // click handler, and not inside `toggle_dir_expanded` - that method is also
                     // called programmatically (`start_tree_new_entry`, the reveal paths), where
                     // moving the selection would be a side effect nobody asked for.
-                    this.selected_tree_path = Some(path.clone());
                     this.focus_file_tree(window, cx);
-                    this.toggle_dir_expanded(path.clone(), cx);
+                    let modifiers = event.modifiers();
+                    // GitHub issue #145: Ctrl/Cmd- or Shift-click only ever adjusts the
+                    // selection, never the expand/collapse state - a modifier-click that also
+                    // toggled the folder open would be a second, unrelated effect nobody asked
+                    // for from what's meant to be a pure selection gesture.
+                    if modifiers.secondary() || modifiers.shift {
+                        this.tree_click_select(path.clone(), modifiers);
+                    } else {
+                        this.selected_tree_path = Some(path.clone());
+                        this.additional_tree_selection.clear();
+                        this.toggle_dir_expanded(path.clone(), cx);
+                    }
+                    cx.notify();
                 }));
         } else {
             // GitHub issue #105: uses `Self::open_file_view_from_tree_click`, not
@@ -1097,9 +1234,20 @@ impl AdeApp {
             row = row
                 .cursor_pointer()
                 .hover(|el| el.bg(theme::surface::ROW_HOVER))
-                .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                    this.open_file_view_from_tree_click(path.clone(), window, cx);
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     this.focus_file_tree(window, cx);
+                    let modifiers = event.modifiers();
+                    // GitHub issue #145: a modifier-click only ever adjusts the selection, never
+                    // opens the file - opening every Ctrl/Cmd- or Shift-selected file at once
+                    // would be a real, surprising side effect of what's meant to be a pure
+                    // selection gesture (and would fight the very "build up a selection" the
+                    // modifier is for).
+                    if modifiers.secondary() || modifiers.shift {
+                        this.tree_click_select(path.clone(), modifiers);
+                        cx.notify();
+                    } else {
+                        this.open_file_view_from_tree_click(path.clone(), window, cx);
+                    }
                 }));
         }
 
@@ -1205,7 +1353,7 @@ impl AdeApp {
 
         div()
             .flex_none()
-            .h(theme::band::PANEL_HEADER)
+            .h(theme::band::CHROME_HEADER)
             .flex()
             .items_center()
             .px(px(10.0))
@@ -2117,7 +2265,6 @@ impl AdeApp {
     /// `work_surface::state::ActionKind::Unimplemented` convention this codebase already uses for
     /// "visible, real, but not wired up yet" (never a clickable-looking no-op).
     fn render_commit_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (shadow_x, shadow_y, shadow_blur) = theme::shadow::COMMIT_MENU;
         let branch = self
             .worktrees
             .iter()
@@ -2156,57 +2303,54 @@ impl AdeApp {
                 cx.notify();
             }))
             .child(
-                div()
-                    .id("commit-menu-popover")
-                    .debug_selector(|| "commit-menu-popover".to_string())
-                    .absolute()
-                    .left(px(12.0))
-                    .right(px(12.0))
-                    .bottom(px(44.0))
-                    // The composer itself is short (~135px of header/message-box/button-row),
-                    // shorter than this four-row popover (`bottom(px(44.0))` plus its own real
-                    // painted height) - so the popover's *top* genuinely paints above the
-                    // composer's own top edge, over the Changes rows behind it, which is outside
-                    // the scrim's own bounds (`top(0)/bottom(0)` relative to the composer, not
-                    // the whole sidebar - see this fn's own docs on the scrim being "confined to
-                    // the composer's own bounds"). Without its own `.occlude()` here, a click in
-                    // that overflow region only avoids reaching a real Changes row underneath by
-                    // relying on `Window::dispatch_mouse_event`'s bubble-phase registration
-                    // order happening to run this popover's own `stop_propagation` listener
-                    // first - a coincidence of paint order, not a structural guarantee. This
-                    // makes the block real regardless of ordering, the same reasoning as the
-                    // scrim's own `.occlude()` above.
-                    .occlude()
-                    .py(px(4.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::CARD)
-                    .shadow(vec![BoxShadow::new(
-                        shadow_x,
-                        shadow_y,
-                        gpui::black().opacity(0.5),
-                    )
-                    .blur_radius(shadow_blur)])
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }))
-                    .child(render_commit_menu_row(
-                        "Commit and push",
-                        format!("origin/{branch}"),
-                    ))
-                    .child(render_commit_menu_row(
-                        "Commit all files",
-                        format!("stages the rest first \u{2022} {total} total"),
-                    ))
-                    .child(render_commit_menu_row(
-                        "Amend last commit",
-                        "rewrites the tip".to_string(),
-                    ))
-                    .child(render_commit_menu_row(
-                        "Stash staged files",
-                        "keeps the worktree clean".to_string(),
-                    )),
+                menu_popover_chrome(
+                    div()
+                        .id("commit-menu-popover")
+                        .debug_selector(|| "commit-menu-popover".to_string())
+                        .absolute()
+                        .left(px(12.0))
+                        .right(px(12.0))
+                        .bottom(px(44.0))
+                        // The composer itself is short (~135px of header/message-box/button-row),
+                        // shorter than this four-row popover (`bottom(px(44.0))` plus its own
+                        // real painted height) - so the popover's *top* genuinely paints above
+                        // the composer's own top edge, over the Changes rows behind it, which is
+                        // outside the scrim's own bounds (`top(0)/bottom(0)` relative to the
+                        // composer, not the whole sidebar - see this fn's own docs on the scrim
+                        // being "confined to the composer's own bounds"). Without its own
+                        // `.occlude()` here, a click in that overflow region only avoids reaching
+                        // a real Changes row underneath by relying on `Window::
+                        // dispatch_mouse_event`'s bubble-phase registration order happening to
+                        // run this popover's own `stop_propagation` listener first - a
+                        // coincidence of paint order, not a structural guarantee. This makes the
+                        // block real regardless of ordering, the same reasoning as the scrim's
+                        // own `.occlude()` above.
+                        .occlude()
+                        .py(px(4.0)),
+                    // `COMMIT_MENU`, not `MENU`: same blur/alpha as every other menu (GitHub
+                    // issue #129), just a negative `y` for this popover's own upward-opening
+                    // direction - see that constant's own docs.
+                    theme::shadow::COMMIT_MENU,
+                )
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .child(render_commit_menu_row(
+                    "Commit and push",
+                    format!("origin/{branch}"),
+                ))
+                .child(render_commit_menu_row(
+                    "Commit all files",
+                    format!("stages the rest first \u{2022} {total} total"),
+                ))
+                .child(render_commit_menu_row(
+                    "Amend last commit",
+                    "rewrites the tip".to_string(),
+                ))
+                .child(render_commit_menu_row(
+                    "Stash staged files",
+                    "keeps the worktree clean".to_string(),
+                )),
             )
     }
 }
@@ -2215,6 +2359,13 @@ impl AdeApp {
 /// leading chip (unlike `crate::work_surface::render::render_dropdown_menu_row`, which this
 /// deliberately doesn't reuse: the design has no per-row glyph here). Always dimmed and
 /// non-interactive - see [`AdeApp::render_commit_menu`]'s own docs for why.
+///
+/// Deliberately no `.hover()` - `crate::work_surface::render::AdeApp::render_footer_action`'s own
+/// docs already establish this codebase's rule for an unimplemented action: never a clickable-
+/// looking no-op. The real gap GitHub issue #128 found wasn't a missing hover, it was that
+/// nothing dimmed the row enough to read as disabled *without* one - the `.opacity()` below is
+/// that fix, at the same whole-row grain `crate::graph_view::render`'s dashed elbow segments use
+/// for an analogous "still real, just visually de-emphasized" treatment.
 fn render_commit_menu_row(label: &'static str, sub: String) -> impl IntoElement {
     div()
         .id(format!("commit-menu-row-{label}"))
@@ -2225,6 +2376,7 @@ fn render_commit_menu_row(label: &'static str, sub: String) -> impl IntoElement 
         .px(px(10.0))
         .py(px(5.0))
         .cursor_default()
+        .opacity(0.5)
         .child(
             div()
                 .font(font(theme::font::SANS))
@@ -2318,7 +2470,6 @@ impl AdeApp {
     pub(crate) fn render_tree_context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let menu = self.tree_context_menu.clone();
         let macos = self.window_controls_style().is_macos();
-        let (shadow_x, shadow_y, shadow_blur) = theme::shadow::PLUS_MENU;
         let rows = menu
             .as_ref()
             .map(|menu| context_menu::menu_rows(&menu.target, self.tree_clipboard.is_some()))
@@ -2354,39 +2505,33 @@ impl AdeApp {
                 }),
             )
             .child(
-                div()
-                    .id("tree-context-menu")
-                    .debug_selector(|| "tree-context-menu".to_string())
-                    .absolute()
-                    .left(px(origin_x))
-                    // `origin_y` is window-space (it is clamped against `Window::bounds()`, from
-                    // a window-space `MouseDownEvent::position`), but this panel is positioned
-                    // relative to the scrim - which starts at `theme::band::TITLE_BAR`, not at
-                    // the window top. Without this subtraction the menu paints a whole title bar
-                    // too low. `context_menu_paints_at_its_clamped_window_space_origin` is the
-                    // assertion that keeps the two in step.
-                    .top(px(origin_y) - theme::band::TITLE_BAR)
-                    .w(px(context_menu::MENU_WIDTH))
-                    .py(px(context_menu::MENU_VERTICAL_PADDING / 2.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::CARD)
-                    .shadow(vec![gpui::BoxShadow::new(
-                        shadow_x,
-                        shadow_y,
-                        gpui::black().opacity(0.55),
-                    )
-                    .blur_radius(shadow_blur)])
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }))
-                    .children(rows.into_iter().map(|row| match row {
-                        context_menu::MenuRow::Item(item) => {
-                            self.render_tree_context_menu_row(item, macos, cx)
-                        }
-                        context_menu::MenuRow::Separator => render_menu_group_divider(),
-                    })),
+                menu_popover_chrome(
+                    div()
+                        .id("tree-context-menu")
+                        .debug_selector(|| "tree-context-menu".to_string())
+                        .absolute()
+                        .left(px(origin_x))
+                        // `origin_y` is window-space (it is clamped against `Window::bounds()`,
+                        // from a window-space `MouseDownEvent::position`), but this panel is
+                        // positioned relative to the scrim - which starts at
+                        // `theme::band::TITLE_BAR`, not at the window top. Without this
+                        // subtraction the menu paints a whole title bar too low.
+                        // `context_menu_paints_at_its_clamped_window_space_origin` is the
+                        // assertion that keeps the two in step.
+                        .top(px(origin_y) - theme::band::TITLE_BAR)
+                        .w(px(context_menu::MENU_WIDTH))
+                        .py(px(context_menu::MENU_VERTICAL_PADDING / 2.0)),
+                    theme::shadow::MENU,
+                )
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .children(rows.into_iter().map(|row| match row {
+                    context_menu::MenuRow::Item(item) => {
+                        self.render_tree_context_menu_row(item, macos, cx)
+                    }
+                    context_menu::MenuRow::Separator => render_menu_group_divider(),
+                })),
             )
     }
 
@@ -2408,7 +2553,7 @@ impl AdeApp {
     ///
     /// - **hover fill** was `theme::surface::ROW_HOVER` (`#15181b`) - the *exact* hex of
     ///   `theme::surface::PALETTE`, this panel's own background - so hovering a row painted
-    ///   nothing at all. `theme::surface::PLUS_MENU_ROW_HOVER` (`#1d2226`) is the token that
+    ///   nothing at all. `theme::surface::MENU_ROW_HOVER` (`#1d2226`) is the token that
     ///   exists for this; `theme::palette::ROW_HOVER`'s own docs record the identical trap for
     ///   the palette's rows.
     /// - **label colour and size** were `theme::text::BODY` at 11.0px, against the dropdown row's
@@ -2463,7 +2608,7 @@ impl AdeApp {
         if item.enabled {
             row = row
                 .cursor_pointer()
-                .hover(|el| el.bg(theme::surface::PLUS_MENU_ROW_HOVER))
+                .hover(|el| el.bg(theme::surface::MENU_ROW_HOVER))
                 .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                     cx.stop_propagation();
                     this.run_tree_menu_action(action, window, cx);
@@ -2508,13 +2653,6 @@ pub(in crate::sidebar) fn render_changes_footer(text_size: Pixels) -> impl IntoE
 /// the cursor. (The Changes view's *no-diff* arm still has no footer; that arm renders a single
 /// message rather than a list, so there is nothing for a footer to sit under.)
 ///
-/// This exists to answer a real, reported complaint: `Shift+F10` opens the tree's context menu
-/// (issue #19 §2 required the menu to be reachable from the keyboard, so right-click alone was
-/// never enough) but nothing in the product said so. A user's only encounter with it was a row in
-/// Settings → Keybindings reading "Files tree: context menu", which explains what it does and not
-/// why it exists or that it is the right-click equivalent. Two surfaces now do: that row's own
-/// label (`crate::settings::state::action_label`), and this strip.
-///
 /// The shape is the hint strip the design handoff already specifies for
 /// exactly this job - `design_handoff_jerry_ade/revision/Jerry.dc.html`'s own `diffHints` strip:
 /// `height:28px ... padding:0 12px;background:#111316;border-top:1px solid #1c2023`, hints at
@@ -2523,17 +2661,16 @@ pub(in crate::sidebar) fn render_changes_footer(text_size: Pixels) -> impl IntoE
 /// `theme::band::SURFACE_FOOTER`/`surface::FOOTER`/`border::INNER`/`text::PATH` and the
 /// `KeycapSize::Hint` keycap it already had.
 ///
-/// The keystrokes are resolved through [`keymap::resolve_combo`], the same per-platform
-/// resolution the context menu's own row keycaps use - never a hard-coded keystroke string that
-/// could drift from the real binding, which is also why the tooltip below names no key at all and
-/// points at the keycaps instead. Both hints are for real, registered bindings in
-/// `crate::default_key_bindings`, asserted by
-/// `crate::sidebar::tree_ops`'s own
+/// The keystroke is resolved through [`keymap::resolve_combo`], the same per-platform resolution
+/// the context menu's own row keycaps use - never a hard-coded keystroke string that could drift
+/// from the real binding, which is also why the tooltip below names no key at all and points at
+/// the keycap instead. It names a real, registered binding in `crate::default_key_bindings`,
+/// asserted by `crate::sidebar::tree_ops`'s own
 /// `the_file_tree_footer_only_advertises_real_registered_bindings`.
 ///
-/// `live` is the other half of that honesty: both bindings are scoped
+/// `live` is the other half of that honesty: the binding is scoped
 /// `"file-tree && !tree-editing && !tree-delete-confirm"`, so while an inline name editor or the
-/// delete confirmation is open they genuinely do not fire, and the strip drops its hints rather
+/// delete confirmation is open it genuinely does not fire, and the strip drops its hint rather
 /// than advertising a dead shortcut. The band itself stays, so the tree doesn't jump 28px.
 ///
 /// `text_size` - see [`render_changes_footer`]'s docs for why this takes an already-scaled value.
@@ -2576,19 +2713,41 @@ pub(in crate::sidebar) fn render_file_tree_footer(
             "Right-click a row for file actions. The keycaps here are the keyboard equivalents, \
              for the row currently selected in the tree.",
         ))
-        .when(live, |el| {
-            el.child(hint(FILE_TREE_CONTEXT_MENU_SPEC, "actions"))
-                .child(hint(FILE_TREE_RENAME_SPEC, "rename"))
-        })
+        .when(live, |el| el.child(hint(FILE_TREE_RENAME_SPEC, "rename")))
 }
 
-/// The two `crate::keymap::resolve_combo` specs [`render_file_tree_footer`] advertises, named so
-/// its own test can assert each one really is a registered binding rather than a plausible
-/// string. `shift+F10` has no `mod` in it and so resolves identically on every platform; it still
-/// goes through `resolve_combo` rather than being written out, so the glyphs match every other
-/// keycap in the app.
-pub(in crate::sidebar) const FILE_TREE_CONTEXT_MENU_SPEC: &str = "shift+F10";
+/// The `crate::keymap::resolve_combo` spec [`render_file_tree_footer`] advertises, named so its
+/// own test can assert it really is a registered binding rather than a plausible string.
 pub(in crate::sidebar) const FILE_TREE_RENAME_SPEC: &str = "F2";
+
+/// GitHub issue #148: what a real file-tree row drag carries - every path the gesture moves
+/// (the whole real selection, if the dragged row was already part of one; just that one row
+/// otherwise - see `AdeApp::render_file_tree_row`'s own `.on_drag` for which). Mirrors
+/// `crate::work_surface::render::DraggedTab`'s exact shape (a small `Render`ed chip showing what's
+/// being dragged) for the tab strip's own drag-and-drop, not a second, differently-behaved
+/// mechanism - GPUI's own `on_drag`/`on_drag_move`/`on_drop` triple is the same either way.
+#[derive(Clone)]
+pub(in crate::sidebar) struct TreeDragPayload {
+    pub(in crate::sidebar) paths: Vec<PathBuf>,
+    label: String,
+}
+
+impl gpui::Render for TreeDragPayload {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .opacity(0.85)
+            .px(px(10.0))
+            .py(px(4.0))
+            .rounded(theme::radius::CHIP)
+            .bg(theme::surface::PALETTE)
+            .border_1()
+            .border_color(theme::border::POPOVER)
+            .font(font(theme::font::SANS))
+            .text_size(px(11.0))
+            .text_color(theme::text::BODY)
+            .child(self.label.clone())
+    }
+}
 
 /// The file tree row's `▾`/`▸` caret, signaling a directory row is clickable/expandable,
 /// distinct from the folder icon itself. Blank but still 8px wide for a file row, to keep
@@ -3805,6 +3964,95 @@ mod indent_guide_tests {
         (app, cx)
     }
 
+    /// GitHub issue #127: the *open* file's own ancestor-chain highlight must stay lit regardless
+    /// of where keyboard focus is - `Self::open_file_view` moves focus to the editor (not the
+    /// tree), and the highlight must survive that exactly like VS Code keeps its explorer's open-
+    /// file highlight lit while you're typing. A first draft of this fix instead cleared the
+    /// highlight the moment focus left the tree at all, hiding which file was open the instant
+    /// you started editing it - caught by manual review, not a test, since every prior test here
+    /// only ever checked a *mere selection* (a directory click), never a genuinely open file.
+    #[gpui::test]
+    fn the_open_files_ancestor_chain_highlight_survives_focus_leaving_the_tree(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        let (app, cx) = open_deep_tree(cx, &repo);
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(repo.path().join("a/b/c/deep.txt"), window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, _cx| {
+            assert!(
+                !app.tree_focus_handle.is_focused(window),
+                "premise: opening a file via the normal path focuses the editor, not the tree"
+            );
+        });
+        assert!(
+            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
+                .is_some(),
+            "the open file's own chain must stay lit even with the editor (not the tree) focused"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-guide-idle-deep.txt-0").is_none(),
+            "and must not also render idle"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.focus_file_tree(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
+                .is_some(),
+            "and must stay lit once the tree regains focus too"
+        );
+    }
+
+    /// The counterpart to the test above: a row that was merely *selected* in the tree (a
+    /// directory click, which never opens anything - `Self::open_change` stays `None`) is a real,
+    /// live keyboard-navigation cursor, not a standing "this is open" marker, so *its* chain must
+    /// go idle the instant real focus leaves the tree - the original GitHub issue #127 report: a
+    /// stale highlight glowing over whatever was last clicked long after focus moved away.
+    #[gpui::test]
+    fn a_merely_selected_directorys_ancestor_chain_highlight_clears_once_focus_leaves_the_tree(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        let (app, cx) = open_deep_tree(cx, &repo);
+
+        app.update_in(cx, |app, window, cx| {
+            app.selected_tree_path = Some(repo.path().join("a/b/c"));
+            app.focus_file_tree(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
+                .is_some(),
+            "premise: with the tree focused, the selected directory's own chain renders active \
+             (deep.txt sits inside it, at the deepest level the chain reaches)"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.agents.focus_active(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.open_change.is_none()),
+            "premise: focusing a terminal agent never opens a file tab"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-guide-idle-deep.txt-0").is_some(),
+            "a mere selection - nothing was ever opened - must go idle once focus genuinely \
+             leaves the tree"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
+                .is_none(),
+            "and must not also render active"
+        );
+    }
+
     /// One guide per nesting level, each at exactly its level's chevron offset from the row's
     /// own left edge, and none at all for a root-level row.
     #[gpui::test]
@@ -4001,6 +4249,10 @@ mod indent_guide_tests {
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(repo.path().join("a/b/c/deep.txt"), window, cx);
+            // GitHub issue #127: the ancestor-chain highlight now also requires the tree to be
+            // genuinely focused, not just a real selected path - `open_file_view` moves focus to
+            // the editor, so this test's premise needs a real tree focus afterward too.
+            app.focus_file_tree(window, cx);
         });
         cx.run_until_parked();
 

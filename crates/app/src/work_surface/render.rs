@@ -1,7 +1,7 @@
 use super::*;
 use crate::root::widgets::{
-    render_action_keycap_row, render_env_chip, render_hint_pair, render_keycap_row, text_tooltip,
-    KeycapSize,
+    hover_bg, menu_popover_chrome, render_action_keycap_row, render_env_chip, render_hint_pair,
+    render_keycap_row, text_tooltip, KeycapSize,
 };
 use gpui::{Animation, AnimationExt, DragMoveEvent};
 use std::time::Duration;
@@ -156,6 +156,25 @@ impl AdeApp {
         if let Some(id) = self.agents.active_id() {
             self.close_agent(id, window, cx);
             cx.notify();
+        }
+    }
+
+    /// GitHub issue #20's "stays rebindable" requirement for the terminal footer's `clear`
+    /// action - see [`Self::render_pty_info_footer`] for the click entry point this shares
+    /// [`crate::terminal::pane::TerminalPane::clear`] with. Scoped to `Some("terminal")` in
+    /// `crate::default_key_bindings`, exactly like [`Self::handle_close_focused_tab_action`]'s
+    /// own `Some("!terminal")` - a real terminal keeps its own control bytes for anything not
+    /// bound here, and this only ever fires while a `TerminalPane` genuinely has focus. Acts on
+    /// whichever agent is currently active, matching `handle_close_focused_tab_action`'s own
+    /// "the centre pane is genuinely showing right now" target.
+    pub(crate) fn handle_terminal_clear_action(
+        &mut self,
+        _action: &TerminalClear,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(agent) = self.agents.active() {
+            agent.pane.clone().update(cx, |pane, cx| pane.clear(cx));
         }
     }
 
@@ -697,7 +716,7 @@ impl AdeApp {
             .flex()
             .flex_none()
             .items_stretch()
-            .h(theme::band::TAB_STRIP)
+            .h(theme::band::CHROME_HEADER)
             .bg(theme::surface::TITLE_BAR)
             .border_b_1()
             .border_color(theme::border::ZONE);
@@ -891,6 +910,14 @@ impl AdeApp {
                     .gap(px(7.0))
                     .px(px(13.0))
                     .cursor_pointer()
+                    // GitHub issue #128: only a tab's own `×` close glyph gave any hover feedback
+                    // - the much larger click target that actually activates the tab gave none.
+                    // Skipped for the already-active tab: it already reads as selected via
+                    // `colors.bg` (`theme::surface::CENTER`) on the outer tab div above, and
+                    // layering a second bg here would just muddy that. Fixed once, here, in the
+                    // shared chrome every tab kind (file, agent, graph) renders through - not
+                    // per call site.
+                    .when(!is_active, |el| hover_bg(el, theme::surface::ROW_HOVER))
                     .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                         on_activate(this, window, cx);
                     }))
@@ -1122,7 +1149,6 @@ impl AdeApp {
     pub(crate) fn render_plus_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let macos = self.window_controls_style().is_macos();
         let bounds = self.plus_button_bounds;
-        let (shadow_x, shadow_y, shadow_blur) = theme::shadow::PLUS_MENU;
 
         let resolved_kind = self.resolved_new_agent_kind();
         let (agent_fg, agent_bg) = work_surface::agent_tint(resolved_kind);
@@ -1147,120 +1173,113 @@ impl AdeApp {
                 cx.notify();
             }))
             .child(
-                div()
-                    .id("plus-menu-popover")
-                    .absolute()
-                    .left(bounds.origin.x + px(2.0))
-                    .top(bounds.origin.y + bounds.size.height)
-                    .w(theme::zone::PLUS_MENU_WIDTH)
-                    .py(px(4.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::CARD)
-                    .shadow(vec![BoxShadow::new(
-                        shadow_x,
-                        shadow_y,
-                        gpui::black().opacity(0.55),
+                menu_popover_chrome(
+                    div()
+                        .id("plus-menu-popover")
+                        .absolute()
+                        .left(bounds.origin.x + px(2.0))
+                        .top(bounds.origin.y + bounds.size.height)
+                        .w(theme::zone::PLUS_MENU_WIDTH)
+                        .py(px(4.0)),
+                    theme::shadow::MENU,
+                )
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{276f}",
+                        theme::text::DIM.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "New terminal",
+                        "in this worktree".to_string(),
+                        keymap::resolve_combo("ctrl+shift+T", macos),
+                        true,
                     )
-                    .blur_radius(shadow_blur)])
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }))
-                    .child(
-                        render_dropdown_menu_row(
-                            "\u{276f}",
-                            theme::text::DIM.into(),
-                            theme::surface::CHIP_NEUTRAL.into(),
-                            "New terminal",
-                            "in this worktree".to_string(),
-                            keymap::resolve_combo("ctrl+shift+T", macos),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, window, cx| {
-                                this.new_agent(AgentKind::Shell, window, cx);
-                                this.plus_menu_open = false;
-                                cx.notify();
-                            },
-                        )),
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, window, cx| {
+                            this.new_agent(AgentKind::Shell, window, cx);
+                            this.plus_menu_open = false;
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        agent_initial,
+                        agent_fg,
+                        agent_bg,
+                        "New agent",
+                        new_agent_secondary,
+                        keymap::resolve_combo("mod+shift+N", macos),
+                        true,
                     )
-                    .child(
-                        render_dropdown_menu_row(
-                            agent_initial,
-                            agent_fg,
-                            agent_bg,
-                            "New agent",
-                            new_agent_secondary,
-                            keymap::resolve_combo("mod+shift+N", macos),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, _window, cx| {
-                                this.new_agent_pane(cx);
-                                this.plus_menu_open = false;
-                                cx.notify();
-                            },
-                        )),
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, _window, cx| {
+                            this.new_agent_pane(cx);
+                            this.plus_menu_open = false;
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2325}",
+                        theme::graph::TAB_CHIP_FG.into(),
+                        theme::graph::TAB_CHIP_BG.into(),
+                        "Git graph",
+                        "commit history".to_string(),
+                        keymap::resolve_combo("mod+shift+G", macos),
+                        true,
                     )
-                    .child(
-                        render_dropdown_menu_row(
-                            "\u{2325}",
-                            theme::graph::TAB_CHIP_FG.into(),
-                            theme::graph::TAB_CHIP_BG.into(),
-                            "Git graph",
-                            "commit history".to_string(),
-                            keymap::resolve_combo("mod+shift+G", macos),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, window, cx| {
-                                this.plus_menu_open = false;
-                                this.open_git_graph(window, cx);
-                            },
-                        )),
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, window, cx| {
+                            this.plus_menu_open = false;
+                            this.open_git_graph(window, cx);
+                        },
+                    )),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "@",
+                        theme::palette::COMMAND_CHIP.0.into(),
+                        theme::palette::COMMAND_CHIP.1.into(),
+                        "Open file\u{2026}",
+                        "search this worktree".to_string(),
+                        // No keycap: this row has no global keybinding (see the function
+                        // docs above), and `render_keycap_row` renders nothing for `&[]`.
+                        Vec::new(),
+                        true,
                     )
-                    .child(
-                        render_dropdown_menu_row(
-                            "@",
-                            theme::palette::COMMAND_CHIP.0.into(),
-                            theme::palette::COMMAND_CHIP.1.into(),
-                            "Open file\u{2026}",
-                            "search this worktree".to_string(),
-                            // No keycap: this row has no global keybinding (see the function
-                            // docs above), and `render_keycap_row` renders nothing for `&[]`.
-                            Vec::new(),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, window, cx| {
-                                this.plus_menu_open = false;
-                                this.open_palette(window, cx);
-                                // `open_palette` always resets `palette_scope` to
-                                // `PaletteScope::default()`, so this must be set after it
-                                // returns, not before.
-                                this.palette_scope = palette::PaletteScope::Files;
-                                cx.notify();
-                            },
-                        )),
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, window, cx| {
+                            this.plus_menu_open = false;
+                            this.open_palette(window, cx);
+                            // `open_palette` always resets `palette_scope` to
+                            // `PaletteScope::default()`, so this must be set after it
+                            // returns, not before.
+                            this.palette_scope = palette::PaletteScope::Files;
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "]",
+                        theme::text::DIM.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Next changed file",
+                        format!("{changed_count} changed"),
+                        keymap::resolve_combo("]", macos),
+                        true,
                     )
-                    .child(
-                        render_dropdown_menu_row(
-                            "]",
-                            theme::text::DIM.into(),
-                            theme::surface::CHIP_NEUTRAL.into(),
-                            "Next changed file",
-                            format!("{changed_count} changed"),
-                            keymap::resolve_combo("]", macos),
-                            true,
-                        )
-                        .on_click(cx.listener(
-                            |this, _event: &ClickEvent, window, cx| {
-                                this.plus_menu_open = false;
-                                this.next_changed_file(window, cx);
-                            },
-                        )),
-                    ),
+                    .on_click(cx.listener(
+                        |this, _event: &ClickEvent, window, cx| {
+                            this.plus_menu_open = false;
+                            this.next_changed_file(window, cx);
+                        },
+                    )),
+                ),
             )
     }
 
@@ -1778,10 +1797,9 @@ impl AdeApp {
 
     /// Surface A/B's shared header: the resolved program label (this app has no saved-agent
     /// resumability, so there's no resume argument to show alongside it), a `Shell` agent's
-    /// cwd, and a hint row (`mod + click a path to open it`, and a click-only `clear`) rendered
-    /// for every agent kind - `TerminalPane` behaves identically for shell and agents
-    /// (see its module docs), so link-click and `clear` are exactly as real for a `Claude`/
-    /// `Codex` panic frame as for a shell prompt.
+    /// cwd, and a `mod + click a path to open it` hint, rendered for every agent kind -
+    /// `TerminalPane` behaves identically for shell and agents (see its module docs), so
+    /// link-click is exactly as real for a `Claude`/`Codex` panic frame as for a shell prompt.
     ///
     /// A `Shell` label gets a ` · wsl` suffix when running inside WSL (`crate::env_info::is_wsl`).
     /// The design's third hint, `split`, is deliberately not rendered - this app has no
@@ -1790,19 +1808,10 @@ impl AdeApp {
     /// [`Self::render_plus_menu`]'s "Open file…" row sets).
     ///
     /// A `Claude`/`Codex` agent's pid is shown once, in the info footer below
-    /// ([`Self::render_pty_info_footer`]) - not duplicated here.
-    ///
-    /// `clear` is click-only, not a global keybinding, even though the design shows `mod+K`:
-    /// `Ctrl+K` is a standard readline binding (`kill-line`) every focused shell relies on, and
-    /// `"mod"` resolves to plain `Ctrl` on Linux/Windows (`crate::keymap`'s docs) - binding it
-    /// globally would risk the same "app-level shortcut steals terminal input" class of bug
-    /// `crate::default_key_bindings`'s own `"]"`/`secondary-z` entries deliberately scope away
-    /// from - unlike `secondary-p`, which the project ultimately accepted eating a focused
-    /// terminal's own Ctrl+P as a deliberate, discussed tradeoff (see that binding's own docs),
-    /// there's no equivalent case made here for doing the same to `kill-line`. Zed's own
-    /// keymaps confirm this isn't overcaution: `terminal::Clear` is bound to `ctrl-shift-l` on
-    /// Linux/Windows and reserved for `cmd-k` on macOS alone, where a platform-modified keystroke
-    /// never reaches the pty in the first place (`crate::terminal::pane::keystroke_to_bytes`).
+    /// ([`Self::render_pty_info_footer`]) - not duplicated here. GitHub issue #20 moved `clear`
+    /// into that same info footer, alongside pid/grid-dims/env - see that method's own docs for
+    /// the click entry point, and [`Self::handle_terminal_clear_action`] for the real, rebindable
+    /// keybinding that now sits behind it too.
     pub(in crate::work_surface) fn render_pty_header(
         &self,
         agent: &Agent,
@@ -1859,7 +1868,6 @@ impl AdeApp {
         };
 
         let macos = self.window_controls_style().is_macos();
-        let pane_entity = agent.pane.clone();
         let header = header.child(div().flex_1()).child(
             div()
                 .id("pty-header-hints")
@@ -1869,19 +1877,7 @@ impl AdeApp {
                 .child(render_hint_pair(
                     &keymap::resolve_combo("mod", macos),
                     "click a path to open it",
-                ))
-                .child(
-                    div()
-                        .id("pty-header-clear")
-                        .cursor_pointer()
-                        .rounded(theme::radius::CHIP)
-                        .px(px(3.0))
-                        .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
-                        .child(render_hint_pair(&[], "clear"))
-                        .on_click(cx.listener(move |_this, _event: &ClickEvent, _window, cx| {
-                            pane_entity.update(cx, |pane, cx| pane.clear(cx));
-                        })),
-                ),
+                )),
         );
 
         header.child(
@@ -1894,12 +1890,13 @@ impl AdeApp {
         )
     }
 
-    /// The terminal pane's info footer: pid, grid dimensions, the environment chip, and a hint
-    /// about file:line references. Rendered for every agent kind - `TerminalPane` is the same
-    /// component behind a `Shell` tab and a `Claude`/`Codex` tab (see that module's docs), so pid
-    /// and grid dimensions are equally meaningful for either. Distinct from, and rendered
-    /// alongside, [`Self::render_pty_footer`] - the agent-level Interrupt/Retry/Archive action
-    /// footer.
+    /// The terminal pane's info footer: pid, grid dimensions, the environment chip, `clear`
+    /// (GitHub issue #20 - moved here from the header, see [`Self::render_pty_header`]'s own
+    /// docs), and a hint about file:line references. Rendered for every agent kind -
+    /// `TerminalPane` is the same component behind a `Shell` tab and a `Claude`/`Codex` tab (see
+    /// that module's docs), so pid, grid dimensions, and `clear` are equally meaningful for
+    /// either. Distinct from, and rendered alongside, [`Self::render_pty_footer`] - the
+    /// agent-level Interrupt/Retry/Archive action footer.
     pub(in crate::work_surface) fn render_pty_info_footer(
         &self,
         agent: &Agent,
@@ -1942,10 +1939,27 @@ impl AdeApp {
                 .child(mono_text(format!("pid {pid}")))
                 .child(divider());
         }
+        let macos = self.window_controls_style().is_macos();
+        let clear_combo =
+            keymap::resolve_combo(if macos { "mod+K" } else { "ctrl+shift+L" }, macos);
+        let pane_entity = agent.pane.clone();
         footer = footer
             .child(mono_text(format!("{cols}\u{d7}{rows}")))
             .child(divider())
-            .child(render_env_chip());
+            .child(render_env_chip())
+            .child(divider())
+            .child(
+                div()
+                    .id("pty-info-footer-clear")
+                    .cursor_pointer()
+                    .rounded(theme::radius::CHIP)
+                    .px(px(3.0))
+                    .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                    .child(render_hint_pair(&clear_combo, "clear"))
+                    .on_click(cx.listener(move |_this, _event: &ClickEvent, _window, cx| {
+                        pane_entity.update(cx, |pane, cx| pane.clear(cx));
+                    })),
+            );
 
         footer.child(div().flex_1()).child(
             div()
@@ -2126,7 +2140,6 @@ impl AdeApp {
                             this.open_companion_terminal(cwd.clone(), window, cx)
                         }
                         work_surface::ActionKind::Respawn => this.respawn_agent(id, window, cx),
-                        work_surface::ActionKind::Archive => this.archive_agent(id, window, cx),
                         work_surface::ActionKind::KeepAllChanges => this.keep_all_changes(id, cx),
                         work_surface::ActionKind::DiscardWorktree => {
                             this.request_discard_worktree(id, window, cx)
@@ -2291,7 +2304,7 @@ pub(crate) fn render_dropdown_menu_row(
         .px(px(10.0));
     row = if enabled {
         row.cursor_pointer()
-            .hover(|el| el.bg(theme::surface::PLUS_MENU_ROW_HOVER))
+            .hover(|el| el.bg(theme::surface::MENU_ROW_HOVER))
     } else {
         row.cursor_default()
     };
@@ -3959,6 +3972,90 @@ mod tab_scoping_tests {
             persisted.len(),
             3,
             "the on-disk persisted order must keep all three files"
+        );
+    }
+}
+
+/// GitHub issue #20's `TerminalClear` action - real coverage that dispatching it reaches
+/// whichever agent is genuinely active right now, and only that one, mirroring
+/// `crate::terminal::pane::clear_pty_signal_tests`' own "observe the pty's real echo, not a
+/// direct call" discipline for proving `clear()`'s pty-signal half actually fired.
+#[cfg(test)]
+mod terminal_clear_action_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn dispatching_terminal_clear_signals_only_the_active_agents_pty(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let (first_id, second_id) = app.update_in(cx, |app, window, cx| {
+            let first = app.agents.spawn(
+                AgentKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            let second = app.agents.spawn(
+                AgentKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+            (first, second)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.agents.active_id()),
+            Some(second_id),
+            "sanity check: spawning a second agent must make it the active one"
+        );
+
+        cx.dispatch_action(TerminalClear);
+
+        let mut saw_caret_l_on_second = false;
+        for _ in 0..50 {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(8));
+            cx.run_until_parked();
+            let second_lines = app.read_with(cx, |app, cx| {
+                app.agents
+                    .iter()
+                    .find(|agent| agent.id == second_id)
+                    .expect("second agent")
+                    .pane
+                    .read(cx)
+                    .visible_text_lines()
+            });
+            if second_lines.iter().any(|line| line.contains("^L")) {
+                saw_caret_l_on_second = true;
+                break;
+            }
+        }
+        assert!(
+            saw_caret_l_on_second,
+            "expected the active (second) agent's pty to echo back the real Ctrl-L byte \
+             TerminalClear's handler sends"
+        );
+
+        let first_lines = app.read_with(cx, |app, cx| {
+            app.agents
+                .iter()
+                .find(|agent| agent.id == first_id)
+                .expect("first agent")
+                .pane
+                .read(cx)
+                .visible_text_lines()
+        });
+        assert!(
+            !first_lines.iter().any(|line| line.contains("^L")),
+            "the inactive (first) agent must never receive the clear signal - only the active \
+             agent, matching handle_close_focused_tab_action's own 'act on whichever tab is \
+             genuinely showing right now' target"
         );
     }
 }

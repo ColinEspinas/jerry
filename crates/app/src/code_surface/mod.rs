@@ -75,6 +75,7 @@ pub(crate) mod diff_view;
 pub(crate) mod editing;
 pub(crate) mod file_view;
 pub(crate) mod lsp_ui;
+pub(crate) mod markdown_preview;
 pub(crate) mod minimap;
 pub(crate) mod render;
 pub(crate) mod state;
