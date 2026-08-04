@@ -1116,6 +1116,10 @@ impl AdeApp {
             })
             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                 this.plus_menu_open = !this.plus_menu_open;
+                // This is the tab strip's own `+`, not a rail repo header's - see
+                // `Self::plus_menu_repo_anchor`'s own docs for why `Self::render_plus_menu` needs
+                // to know which one opened it.
+                this.plus_menu_repo_anchor = None;
                 if this.plus_menu_open {
                     this.load_agent_rows(cx);
                 }
@@ -1148,7 +1152,18 @@ impl AdeApp {
     /// the spec keeps.
     pub(crate) fn render_plus_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let macos = self.window_controls_style().is_macos();
-        let bounds = self.plus_button_bounds;
+        // See `Self::plus_menu_repo_anchor`'s own docs: a rail repo header's own `+` positions
+        // this popover off that header's own painted bounds, not the tab strip's - falling back
+        // to the tab strip's bounds if that repo's header hasn't painted this popover's anchor
+        // yet (defensive; not a real reachable path through this app's own UI).
+        let bounds = match self.plus_menu_repo_anchor {
+            Some(repo_id) => self
+                .rail_plus_button_bounds
+                .get(&repo_id)
+                .copied()
+                .unwrap_or(self.plus_button_bounds),
+            None => self.plus_button_bounds,
+        };
 
         let resolved_kind = self.resolved_new_agent_kind();
         let (agent_fg, agent_bg) = work_surface::agent_tint(resolved_kind);

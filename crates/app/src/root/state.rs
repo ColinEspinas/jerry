@@ -422,6 +422,8 @@ impl AdeApp {
             ),
             plus_menu_open: false,
             plus_button_bounds: gpui::Bounds::default(),
+            plus_menu_repo_anchor: None,
+            rail_plus_button_bounds: HashMap::new(),
             title_menu_open: None,
             title_menu_button_bounds: [gpui::Bounds::default(); title_bar::TitleMenu::ALL.len()],
             _new_agent_pane_task: TaskPool::new(),
