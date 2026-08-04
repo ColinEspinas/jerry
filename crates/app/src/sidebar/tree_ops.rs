@@ -961,6 +961,40 @@ impl AdeApp {
     /// through. `sources` already inside `dir` are silently skipped (dropping a selection back
     /// onto its own current parent is a real no-op, not an error, matching `paste_into_dir`'s
     /// identical "already exactly where it was asked to go" rule).
+    /// The real directory a drop *on* `entry_path` resolves to - `crate::sidebar::render::
+    /// AdeApp::render_file_tree_row`'s one real call site for both the directory-row and
+    /// file-row `on_drop` handlers, so the row wiring itself stays a thin call into logic this
+    /// module can test directly (GPUI has no drag/drop gesture simulator - see
+    /// `tree_drag_move_tests`'s own module docs - so the closures themselves can't be driven by a
+    /// test, but the rule they apply can be).
+    ///
+    /// A directory is dropped *into* - the folder itself is the target, matching every file
+    /// manager's own convention. A file has nowhere "inside" it to drop into, so a drop on a file
+    /// row resolves to that file's own *parent* directory instead - GitHub issue #152's real fix:
+    /// before this existed, a file row had no `on_drop` of its own at all, so a drop landing on
+    /// one (the overwhelmingly common case in any populated folder, since most rows are files,
+    /// not a folder's own header row) fell all the way through to `render::AdeApp::
+    /// file_tree_shell`'s catch-all fallback, which unconditionally resolved to the *worktree
+    /// root* - so releasing a file roughly back where it already was silently relocated it to
+    /// the repo root instead of leaving it alone. Resolving to the file's own parent here means
+    /// `Self::move_paths_into_dir`'s existing "already inside `dir`" no-op skip (see that
+    /// method's own docs) sees the real, correct directory for a genuine same-location drop.
+    ///
+    /// `None` only for a file with no parent component at all, which cannot happen for a real
+    /// path inside a worktree (even a root-level file's parent is the worktree root itself) -
+    /// kept as a real `Option` rather than an `unwrap`/`expect` so a future caller with a less
+    /// guaranteed path shape fails honestly instead of panicking.
+    pub(in crate::sidebar) fn tree_drop_target_dir(
+        entry_path: &Path,
+        entry_is_dir: bool,
+    ) -> Option<PathBuf> {
+        if entry_is_dir {
+            Some(entry_path.to_path_buf())
+        } else {
+            entry_path.parent().map(Path::to_path_buf)
+        }
+    }
+
     pub(in crate::sidebar) fn move_paths_into_dir(
         &mut self,
         sources: &[PathBuf],
@@ -3928,6 +3962,7 @@ mod tree_multiselect_tests {
 #[cfg(test)]
 mod tree_drag_move_tests {
     use crate::root::focus::palette_focus_tests;
+    use crate::root::AdeApp;
     use gpui::TestAppContext;
     use std::fs;
     use tempfile::TempDir;
@@ -4046,6 +4081,91 @@ mod tree_drag_move_tests {
                  there is nothing to undo"
             );
         });
+    }
+
+    /// GitHub issue #152's real end-to-end regression: a drop landing on a *file* row (not the
+    /// folder's own header row) must still resolve to that file's own current parent, the same
+    /// directory `Self::tree_drop_target_dir` (see `tree_drop_target_dir_tests` for its own unit
+    /// coverage) hands `render_file_tree_row`'s file-row `on_drop` closure - proving the fix at
+    /// the real API boundary those closures call into, not just the pure resolution rule in
+    /// isolation.
+    #[gpui::test]
+    fn dropping_a_selection_back_onto_a_sibling_file_row_in_the_same_folder_is_a_real_no_op(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        fs::create_dir_all(repo.path().join("src")).expect("mkdir src");
+        fs::write(repo.path().join("src/util.rs"), "// util\n").expect("write util.rs");
+        fs::write(repo.path().join("src/lib.rs"), "// lib\n").expect("write lib.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let dragged = repo.path().join("src/util.rs");
+        let sibling_row = repo.path().join("src/lib.rs");
+        // What `render_file_tree_row`'s file-row `on_drop` closure really resolves the drop
+        // target to when the pointer released over `sibling_row` - not `sibling_row` itself,
+        // which is exactly the bug: before this fix, a file row had no drop target of its own at
+        // all, and the drop fell through to the worktree root instead.
+        let drop_target =
+            AdeApp::tree_drop_target_dir(&sibling_row, false).expect("a file always has a parent");
+        assert_eq!(
+            drop_target,
+            repo.path().join("src"),
+            "premise: dropping on a sibling file row must resolve to their shared parent, not \
+             the sibling's own path"
+        );
+
+        let undo_len_before = app.read_with(cx, |app, _| app.tree_undo_stack.len());
+        app.update(cx, |app, cx| {
+            app.move_paths_into_dir(std::slice::from_ref(&dragged), &drop_target, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            dragged.exists(),
+            "the dragged file must still be exactly where it was, not relocated to the \
+             worktree root"
+        );
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.tree_undo_stack.len(),
+                undo_len_before,
+                "a same-folder drop must not record a real move"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod tree_drop_target_dir_tests {
+    use super::*;
+
+    #[test]
+    fn a_directory_entry_resolves_to_its_own_path() {
+        let dir = Path::new("/repo/src");
+        assert_eq!(
+            AdeApp::tree_drop_target_dir(dir, true),
+            Some(dir.to_path_buf())
+        );
+    }
+
+    #[test]
+    fn a_file_entry_resolves_to_its_parent_not_itself() {
+        let file = Path::new("/repo/src/main.rs");
+        assert_eq!(
+            AdeApp::tree_drop_target_dir(file, false),
+            Some(Path::new("/repo/src").to_path_buf())
+        );
+    }
+
+    #[test]
+    fn a_root_level_file_resolves_to_the_worktree_root() {
+        let file = Path::new("/repo/README.md");
+        assert_eq!(
+            AdeApp::tree_drop_target_dir(file, false),
+            Some(Path::new("/repo").to_path_buf())
+        );
     }
 }
 

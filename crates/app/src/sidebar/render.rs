@@ -1167,7 +1167,8 @@ impl AdeApp {
             });
         }
         if entry.is_dir {
-            let drop_path = entry.path.clone();
+            let drop_path = AdeApp::tree_drop_target_dir(&entry.path, true)
+                .expect("a directory's own path is always its own drop target");
             let hover_path = entry.path.clone();
             row = row
                 .on_drag_move(cx.listener(
@@ -1200,6 +1201,48 @@ impl AdeApp {
                         // Without this, the drop would *also* reach `Self::file_tree_shell`'s own
                         // root-drop handler right after this row's - moving the same selection into
                         // the folder it was just dropped on, then straight back out to the root.
+                        cx.stop_propagation();
+                        this.tree_drag_hover_target = None;
+                        this.move_paths_into_dir(&dragged.paths, &drop_path, cx);
+                    }),
+                );
+        } else if let Some(drop_path) = AdeApp::tree_drop_target_dir(&entry.path, false) {
+            // GitHub issue #152: a file row is not itself a drop target the way a folder row is
+            // (there's nowhere "inside" a file to move something into), but it must still catch a
+            // drop rather than let one fall through to `Self::file_tree_shell`'s own root-only
+            // fallback below - most rows in any populated folder are files, not that folder's own
+            // header row, so "release roughly where the dragged item already was" overwhelmingly
+            // means releasing over a sibling *file*, not the parent directory's row. Without this,
+            // that ordinary "changed my mind, drop it back" gesture silently relocated the whole
+            // selection to the worktree root instead of leaving it alone - the real bug this
+            // fixes. `Self::tree_drop_target_dir` resolves this to the file's own parent
+            // directory - see that function's own docs, including why it's a real, directly
+            // testable function rather than logic inlined only here.
+            let hover_path = drop_path.clone();
+            row = row
+                .on_drag_move(cx.listener(
+                    move |this, event: &gpui::DragMoveEvent<TreeDragPayload>, _window, cx| {
+                        // Highlights the *parent folder's* row (if visible), not this file row
+                        // itself - the same "which row does dropping here really target"
+                        // affordance the folder-row handler above gives, just one level up, since
+                        // dropping is never "onto" a file the way it can be "into" a folder.
+                        let hovering = event.bounds.contains(&event.event.position);
+                        if hovering {
+                            if this.tree_drag_hover_target.as_deref() != Some(hover_path.as_path())
+                            {
+                                this.tree_drag_hover_target = Some(hover_path.clone());
+                                cx.notify();
+                            }
+                        } else if this.tree_drag_hover_target.as_deref()
+                            == Some(hover_path.as_path())
+                        {
+                            this.tree_drag_hover_target = None;
+                            cx.notify();
+                        }
+                    },
+                ))
+                .on_drop(
+                    cx.listener(move |this, dragged: &TreeDragPayload, _window, cx| {
                         cx.stop_propagation();
                         this.tree_drag_hover_target = None;
                         this.move_paths_into_dir(&dragged.paths, &drop_path, cx);
