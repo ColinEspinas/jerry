@@ -1519,26 +1519,27 @@ pub(crate) fn caret_paint_quad(
 /// The real, editable File view's per-row renderer - the `"real cursor/selection needs real
 /// per-row `ShapedLine` shaping"` piece this phase's design calls for (see this module's own top
 /// docs). Structurally mirrors `crate::code_surface::file_view::render_file_view_line`'s gutter/git-
-/// gutter/diagnostics chrome (kept as ordinary `div`s - no reason to reinvent that) **and** its
-/// real per-run `div`-per-token text rendering (see [`build_text_run_divs`]) - a real, live-
-/// measured bug an audit caught in an earlier version of this function ruled out rendering the
-/// visible glyphs from a bare `gpui::canvas` instead: a `canvas` contributes *no* intrinsic
+/// gutter/diagnostics chrome (kept as ordinary `div`s - no reason to reinvent that), while the
+/// code text itself is one real `gpui::StyledText` (see [`build_visible_line_text`]) - a real,
+/// live-measured bug an audit caught in an earlier version of this function ruled out rendering
+/// the visible glyphs from a bare `gpui::canvas` instead: a `canvas` contributes *no* intrinsic
 /// content size to GPUI's own layout pass (it has no text for the ordinary text-measurement path
 /// to see), so a canvas-only row collapsed to a near-fixed handful of pixels regardless of the
 /// real line's length, confirmed via `cx.debug_bounds` - exactly the "looks right in the one
-/// case tried, silently wrong otherwise" bug class this project's history keeps finding. Reusing
-/// the read-only path's own proven `div`-per-run text rendering for the *visible* glyphs (real,
-/// already-correct content-based sizing) fixes that; a `gpui::canvas` is still used, but only as
-/// an `.absolute().size_full()` overlay on top of that now-correctly-sized row (GPUI's own "low
-/// level paint API without defining a whole custom element", `vendor/zed/crates/gpui/src/
-/// elements/canvas.rs`), purely to shape the line once (`Window::text_system().shape_line`, for
-/// real pixel-accurate `x_for_index`/`closest_index_for_x` cursor/selection/click math - the
-/// actual glyphs it shapes are never painted, since the sibling `div`s already show them) and to
-/// paint the real cursor bar/selection fill and (only for the caret's own row) register the real
-/// `EntityInputHandler` wiring - not fabricated pixel math, and no risk of the overlay's shaped
-/// text visually disagreeing with the `div`s' own real glyphs, since both are built from the
-/// exact same `line`/`diagnostics`/`hovered_byte_range`/`marked_local` inputs under the same
-/// ambient font/size.
+/// case tried, silently wrong otherwise" bug class this project's history keeps finding. A real
+/// in-flow text element for the *visible* glyphs (real, already-correct content-based sizing)
+/// fixes that; a `gpui::canvas` is still used, but only as an `.absolute().size_full()` overlay
+/// on top of that now-correctly-sized row (GPUI's own "low level paint API without defining a
+/// whole custom element", `vendor/zed/crates/gpui/src/elements/canvas.rs`), purely to shape the
+/// line once (`Window::text_system().shape_line`, for real pixel-accurate `x_for_index`/
+/// `closest_index_for_x` cursor/selection/click math - the actual glyphs it shapes are never
+/// painted, since the sibling `StyledText` already shows them) and to paint the real cursor bar/
+/// selection fill and (only for the caret's own row) register the real `EntityInputHandler`
+/// wiring - not fabricated pixel math, and no risk of the overlay's shaped text disagreeing with
+/// the visible glyphs, since both are literally the same `line_text`/`runs` pair shaped by the
+/// same code under the same ambient font/size (GitHub issue #170 - this used to be one `div` per
+/// syntax run, which measured and rounded independently and so really did drift; see
+/// [`build_visible_line_text`]'s own docs for the measured numbers).
 pub(in crate::code_surface) fn render_editable_file_view_line(
     context: EditableLineContext<'_>,
     row_line_height: Pixels,
@@ -1583,13 +1584,12 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
         &marked_local,
     );
     let line_text: gpui::SharedString = line.text.clone().into();
-    let visible_runs = build_text_run_divs(
-        line,
-        diagnostics,
-        worst_severity,
-        &hovered_byte_range,
-        &marked_local,
-    );
+    // GitHub issue #170: the row's visible glyphs and the caret/selection/click math must come
+    // out of *one* shaping of *one* string, so `visible_text` is built from the exact same
+    // `runs`/`line_text` the `cursor_overlay` canvas below shapes - see
+    // [`build_visible_line_text`]'s own docs for the real, measured drift the previous per-run
+    // `div` rendering caused.
+    let visible_text = build_visible_line_text(line_text.clone(), runs.clone());
 
     let row_path = path.clone();
     // A second, independent clone for the `.on_mouse_move` drag-extend handler below - it needs
@@ -1815,7 +1815,16 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
     text_row = text_row
         // The code runs keep their natural width in their own `flex_none` box, so they never
         // shrink; only the blame span placed beside them below yields and truncates.
-        .child(gpui::div().flex_none().flex().children(visible_runs));
+        .child(
+            gpui::div()
+                // `debug_selector` is a no-op outside test builds; lets
+                // `caret_alignment_tests::the_painted_code_text_is_exactly_as_wide_as_the_shaping_
+                // the_caret_math_uses` measure this row's real painted glyph box against the
+                // `ShapedLine` the caret is positioned from (GitHub issue #170).
+                .debug_selector(move || format!("file-view-code-text-{line_number}"))
+                .flex_none()
+                .child(visible_text),
+        );
     // GitHub issue #29: the current line's dimmed inline git blame, placed *in-flow* immediately
     // after the code text so it begins right at the end of the line and is truncated at the
     // pane's right edge - rather than pinned to the far right of the row (a flex sibling of the
@@ -2075,7 +2084,17 @@ fn build_text_runs(
             Some(UnderlineStyle {
                 color: Some(color.into()),
                 thickness: gpui::px(1.0),
-                wavy: false,
+                // `wavy`, not the flat 1px line hover/IME-composition use below. GitHub issue
+                // #170's fix moved this row's visible glyphs from one `div` per run onto a single
+                // `gpui::StyledText` (see [`render_editable_file_view_line`]'s own docs for why),
+                // which means these `TextRun::underline`s are now what actually paints - the
+                // per-`div` path they replaced drew a diagnostic as a 2px *dashed* bottom border,
+                // visually distinct from the 1px solid one it drew for hover/composition.
+                // `gpui::UnderlineStyle` has no dashed variant (`color`/`thickness`/`wavy` are
+                // its only fields - `vendor/zed/crates/gpui/src/style.rs`), so `wavy` is the one
+                // real way to keep a diagnostic distinguishable at a glance from those other two
+                // underlines rather than collapsing all three into the same flat line.
+                wavy: true,
             })
         } else if hovered_byte_range.as_ref() == Some(&(start..end)) {
             Some(UnderlineStyle {
@@ -2099,123 +2118,108 @@ fn build_text_runs(
     if let Some(marked) = marked_local {
         runs = split_runs_for_marked_range(runs, marked);
     }
-    runs
+    force_runs_to_cover(&line.text, runs)
 }
 
-/// Builds the real, visible per-run `div`s for one editable row's text - the same real
-/// `diagnostics_view::overlay_diagnostic_runs`-driven classification/diagnostic/hover treatment
-/// `crate::code_surface::file_view::render_file_view_line` (the read-only path) already uses, so the
-/// two rendering paths can never visually disagree on what a given run should look like. See
-/// [`render_editable_file_view_line`]'s own docs for why these `div`s - not the sibling
-/// `gpui::canvas` overlay - are what's actually responsible for both the visible glyphs and the
-/// row's own real, content-based width/height.
-fn build_text_run_divs(
-    line: &code_view::RenderedLine,
-    diagnostics: &[diagnostics_view::LineDiagnostic],
-    worst_severity: Option<diagnostics_view::Severity>,
-    hovered_byte_range: &Option<Range<usize>>,
-    marked_local: &Option<Range<usize>>,
-) -> Vec<gpui::AnyElement> {
-    let mut cursor = 0usize;
-    let mut elements = Vec::new();
-    for (text, kind, is_diagnostic) in
-        diagnostics_view::overlay_diagnostic_runs(&line.runs, diagnostics)
-    {
-        let start = cursor;
-        let end = start + text.len();
-        cursor = end;
-        let is_hovered = hovered_byte_range.as_ref() == Some(&(start..end));
-
-        // Splits this run further at the real marked (IME composition) range's own byte
-        // boundaries, if it overlaps at all - the same real byte-accurate splitting
-        // `split_runs_for_marked_range` applies to `TextRun`s, applied here to display `div`s
-        // instead, so a composition that starts or ends mid-run still gets a precisely-bounded
-        // underline rather than one rounded out to the whole run (which - since a fresh edit
-        // always resets a line to one big plain-`Text` run via `EditBuffer::rebuild_plain` until
-        // the next debounced re-highlight - would otherwise routinely underline far more than
-        // the real composing text, most severely misleadingly the *entire line*).
-        let marked_overlap = marked_local.as_ref().and_then(|marked| {
-            let overlap_start = marked.start.max(start);
-            let overlap_end = marked.end.min(end);
-            (overlap_start < overlap_end).then_some((overlap_start, overlap_end))
-        });
-
-        let Some((marked_start, marked_end)) = marked_overlap else {
-            elements.push(text_run_div(
-                kind,
-                text.as_ref(),
-                is_diagnostic,
-                is_hovered,
-                worst_severity,
-                false,
-            ));
+/// Guarantees `runs`' byte lengths sum to exactly `text.len()`, trimming any excess and appending
+/// one plain [`code_view::HighlightKind::Text`] run for any shortfall.
+///
+/// Both inputs of a row's real caret math depend on this holding: `gpui::TextSystem::shape_line`
+/// silently shapes only the prefix `runs` actually covers (leaving `x_for_index` answering with
+/// the *short* line's width for every offset past it), and `gpui::StyledText::with_runs` -
+/// [`render_editable_file_view_line`]'s single shaped text element - outright `assert!`s the
+/// exact same invariant, so an under-covering run list would take the whole window down rather
+/// than mis-place a caret.
+///
+/// Today `code_view::build_lines` is documented and tested to produce a gapless run list per
+/// line (`fold_highlight_events` never emits overlapping spans), and every transform applied on
+/// top of it here - `diagnostics_view::overlay_diagnostic_runs`, [`split_runs_for_marked_range`] -
+/// only ever *splits* runs, preserving the total. This is therefore a real structural backstop
+/// for a future highlighter/diagnostic-range change breaking that invariant, not a workaround for
+/// a known-broken producer: it converts what would be a panic (or an invisibly mis-placed caret)
+/// into a row that still renders all of its real text, just with the uncovered tail unstyled.
+/// Every emitted boundary is also snapped back to a real UTF-8 char boundary, since
+/// `StyledText::with_runs` walks the text by `str::get(run.len..)` and a run ending mid-character
+/// fails that just as hard as one running off the end - a real concern for this app's own text,
+/// which is arbitrary file content (accented letters, CJK, emoji), not ASCII.
+pub(crate) fn force_runs_to_cover(text: &str, runs: Vec<TextRun>) -> Vec<TextRun> {
+    // `covered` is a real char boundary at every step by induction: it starts at 0 and only ever
+    // advances to an `end` this loop has already snapped onto one.
+    let mut covered = 0usize;
+    let mut result = Vec::with_capacity(runs.len() + 1);
+    for mut run in runs {
+        if covered >= text.len() {
+            break;
+        }
+        let mut end = covered.saturating_add(run.len).min(text.len());
+        while end > covered && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == covered {
             continue;
-        };
-        if marked_start > start {
-            elements.push(text_run_div(
-                kind,
-                &text[0..marked_start - start],
-                is_diagnostic,
-                is_hovered,
-                worst_severity,
-                false,
-            ));
         }
-        elements.push(text_run_div(
-            kind,
-            &text[marked_start - start..marked_end - start],
-            is_diagnostic,
-            is_hovered,
-            worst_severity,
-            true,
-        ));
-        if end > marked_end {
-            elements.push(text_run_div(
-                kind,
-                &text[marked_end - start..],
-                is_diagnostic,
-                is_hovered,
-                worst_severity,
-                false,
-            ));
-        }
+        run.len = end - covered;
+        covered = end;
+        result.push(run);
     }
-    elements
+    if covered < text.len() {
+        result.push(TextRun {
+            len: text.len() - covered,
+            font: gpui::font(crate::theme::font::MONO),
+            color: code_view::color_for_kind(code_view::HighlightKind::Text).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        });
+    }
+    result
 }
 
-/// Builds one real display `div` for a single (possibly marked-range-split) text piece - shared
-/// by every branch of [`build_text_run_divs`]'s own real splitting logic.
-fn text_run_div(
-    kind: code_view::HighlightKind,
-    text: &str,
-    is_diagnostic: bool,
-    is_hovered: bool,
-    worst_severity: Option<diagnostics_view::Severity>,
-    is_marked: bool,
+/// Builds the one real, visible text element for an editable row's glyphs (GitHub issue #170).
+///
+/// One `gpui::StyledText` carrying the *same* `runs` the row's `gpui::canvas` overlay hands to
+/// `Window::text_system().shape_line` - not one `div` per syntax run, which is what this used to
+/// be. That older shape had a real, measured caret-misplacement bug: GPUI rounds every
+/// custom-measured leaf node's size *up* to a whole device pixel before layout
+/// (`snap_measured_size_to_device_pixels` in `vendor/zed/crates/gpui/src/taffy.rs`, and the
+/// "Custom-measured leaf nodes have their measured sizes rounded up to integer device-pixel
+/// lengths" note in that file's own pixel-snapping docs), so a row painted as N separately-
+/// measured text leaves places its glyphs at the running sum of N *rounded-up* run widths, while
+/// the caret, the selection fill and every click-to-offset hit test are all computed from
+/// `ShapedLine::x_for_index`/`closest_index_for_x` over the line shaped *once*, unrounded. The
+/// two disagree by up to one device pixel per preceding run, and the error accumulates left to
+/// right across the line.
+///
+/// That is not a sub-pixel curiosity: measured live in this repo's own test window (IBM Plex
+/// Mono at the default 13px code size, `scale_factor` 2), a single 70-character Rust line that
+/// `tree-sitter` splits into 39 runs painted 556px wide against a 546px shaped line - 10px of
+/// drift, about 1.3 whole characters at that font's 7.8px advance. It is also exactly the
+/// "sometimes" in the issue's own title: a plain-text file, or a line whose caret sits before the
+/// first token boundary, is a single run and drifts by nothing at all, while a densely tokenized
+/// line drifts further the further right the caret goes.
+///
+/// Shaping the row once removes the disagreement structurally rather than trying to re-derive
+/// GPUI's rounding in the caret math (which could not work anyway - post-layout edge snapping
+/// depends on each box's *absolute* window position, not just its own metrics). The per-run
+/// diagnostic/hover/composition treatment is unchanged in substance: it now rides on
+/// `TextRun::underline`, which [`build_text_runs`] was already computing and already feeding to
+/// `shape_line`, instead of on a `div` bottom border - see that function's own docs for the one
+/// deliberate visual substitution this forced (dashed diagnostic border -> wavy underline).
+pub(crate) fn build_visible_line_text(
+    line_text: gpui::SharedString,
+    runs: Vec<TextRun>,
 ) -> gpui::AnyElement {
-    let mut run = gpui::div()
-        .text_color(code_view::color_for_kind(kind))
-        .child(text.to_string());
-    if is_diagnostic {
-        // A diagnostic underline always wins over a hover/composition underline on the same
-        // piece, matching the read-only path's own precedence.
-        let underline_color = worst_severity
-            .map(diagnostic_underline_color)
-            .unwrap_or(theme::syntax::ERROR_UNDERLINE.into());
-        run = run
-            .border_b_2()
-            .border_color(underline_color)
-            .border_dashed();
-    } else if is_marked {
-        run = run
-            .border_b_1()
-            .border_color(code_view::color_for_kind(kind));
-    } else if is_hovered {
-        run = run
-            .border_b_1()
-            .border_color(theme::syntax::HOVER_UNDERLINE);
-    }
-    run.into_any_element()
+    // `whitespace_nowrap`: `gpui::StyledText` wraps at the available width whenever the ambient
+    // `TextStyle::white_space` is `Normal` (`TextLayout::layout` in
+    // `vendor/zed/crates/gpui/src/elements/text.rs` derives its `wrap_width` from the available
+    // space in that case). This editor does not soft-wrap - a long line overflows its row, which
+    // is what the read-only path and the caret math both already assume - and a wrapped row would
+    // additionally break the single-`ShapedLine` correspondence this whole element exists to
+    // guarantee, since the caret overlay shapes with `shape_line` (never wrapped).
+    gpui::div()
+        .whitespace_nowrap()
+        .child(gpui::StyledText::new(line_text).with_runs(runs))
+        .into_any_element()
 }
 
 /// Overlays a real IME-composition underline onto `runs`, splitting any run(s) `marked` crosses -
@@ -4750,6 +4754,348 @@ mod editing_tests {
             "B-EDIT worktree b original\n",
             "worktree B's own real unsaved edit must survive too, untouched by worktree A's \
              identical-relative-path buffer"
+        );
+    }
+}
+
+/// GitHub issue #170 ("Sometimes the carrets are not at the right place"): real, measured proof
+/// that an editable row's visible glyphs and its caret geometry come out of the same shaping.
+///
+/// See [`build_visible_line_text`]'s own docs for the root cause these cover. The bug was
+/// invisible to every existing test because both sides of the disagreement were individually
+/// self-consistent: the caret quad, the selection fill and click-to-offset hit testing all read
+/// the same `ShapedLine`, so tests written against any one of them agreed with the others while
+/// all three disagreed with what the user could actually see. Only a measurement that crosses
+/// from the shaped geometry into the *painted element bounds* can catch it, which is what these
+/// do.
+#[cfg(test)]
+mod caret_alignment_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    /// A deliberately dense single line: `tree-sitter` splits it into dozens of real runs
+    /// (identifiers, punctuation, operators, number literals), which is exactly the condition the
+    /// old one-`div`-per-run rendering accumulated its rounding error over. A plain-text file, or
+    /// a line with one or two tokens, drifted by a fraction of a pixel and would not have failed
+    /// these assertions - the issue's own "sometimes".
+    const DENSE_LINE: &str =
+        "    let x = foo.bar(1, 2, 3) + baz.qux(4, 5, 6) - quux.corge(7, 8, 9);";
+
+    fn open_dense_rust_file(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<AdeApp>,
+        &mut gpui::VisualTestContext,
+        PathBuf,
+        tempfile::TempDir,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("dense.rs");
+        std::fs::write(&file_path, format!("fn main() {{\n{DENSE_LINE}\n}}\n")).expect("write");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path, window, cx);
+        });
+        // Three real render passes around `run_until_parked`: the first dispatches the background
+        // load, the second paints the freshly-seeded buffer, and the third paints it again with
+        // the real, debounced `tree-sitter` highlight applied - without that last one the line is
+        // still a single plain `Text` run and would not exercise multi-run rendering at all.
+        for _ in 0..3 {
+            app.update(cx, |app, cx| {
+                app.render_center_pane(cx);
+            });
+            cx.run_until_parked();
+        }
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        (app, cx, PathBuf::from("dense.rs"), repo)
+    }
+
+    /// The core invariant. `file-view-code-text-2` is the row's real painted glyph box; the
+    /// `ShapedLine` built from the very same text and runs is what every caret/selection/click x
+    /// on that row is derived from. If the two widths disagree, the caret is painted somewhere
+    /// the user's own letters are not.
+    ///
+    /// Before the fix this measured 556px painted against a 545.99963px shaping - 10px, roughly
+    /// 1.3 characters at IBM Plex Mono 13px. One device pixel of slack is the real, irreducible
+    /// remainder: GPUI rounds the single measured text leaf's own size up to a whole device pixel
+    /// (`snap_measured_size_to_device_pixels`), which the shaping itself does not do.
+    #[gpui::test]
+    fn painted_code_text_is_exactly_as_wide_as_the_shaping_the_caret_math_uses(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, cx, relative, _repo) = open_dense_rust_file(cx);
+
+        let run_count = app.read_with(cx, |app, _| {
+            let buffer = app.edit_buffer(&relative).expect("real edit buffer");
+            assert_eq!(
+                buffer.lines[1].text, DENSE_LINE,
+                "sanity check: line 2 is the real dense line this test is about"
+            );
+            buffer.lines[1].runs.len()
+        });
+        assert!(
+            run_count > 10,
+            "sanity check: this test only exercises the real bug if `tree-sitter` really split \
+             the line into many runs (the old rendering rounded each one up independently) - got \
+             {run_count}, so either highlighting never landed or the line stopped being dense"
+        );
+
+        let painted = cx
+            .debug_bounds("file-view-code-text-2")
+            .expect("line 2's real code text should have painted real bounds");
+
+        let shaped_width = app.update_in(cx, |app, window, _cx| {
+            let font_size = gpui::px(app.effective_code_rem_px());
+            let buffer = app.edit_buffer(&relative).expect("real edit buffer");
+            let line = &buffer.lines[1];
+            let runs = build_text_runs(line, &[], None, &None, &None);
+            window
+                .text_system()
+                .shape_line(
+                    gpui::SharedString::from(line.text.clone()),
+                    font_size,
+                    &runs,
+                    None,
+                )
+                .width
+        });
+
+        let drift = painted.size.width - shaped_width;
+        assert!(
+            drift >= gpui::px(0.0) && drift <= gpui::px(1.0),
+            "the real painted code text ({:?}) must be the same width as the `ShapedLine` the \
+             caret, the selection fill and every click-to-offset hit test are computed from \
+             ({shaped_width:?}), to within the one device pixel GPUI rounds a measured text leaf \
+             up by - got {drift:?} of drift across {run_count} syntax runs, which is exactly how \
+             far the caret would sit from the letter it belongs to",
+            painted.size.width,
+        );
+    }
+
+    /// The same width invariant on a line of real multi-byte text. Nothing in the fix is
+    /// ASCII-specific - the caret math and the glyphs now come from one shaping of one byte
+    /// string - but a caret bug reported as "not placed correctly to the letter we are typing"
+    /// deserves coverage for the letters whose byte length and column count disagree, which is
+    /// also where a byte-vs-char mistake in any future change here would surface first.
+    #[gpui::test]
+    fn painted_code_text_matches_the_caret_shaping_for_real_multi_byte_text(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        // 2-byte Latin-1 accents, 3-byte CJK and a 4-byte emoji, all inside real Rust string
+        // literals so `tree-sitter` still splits the line into several runs around them.
+        let line = "    let s = \"café\" ; let t = \"日本語\" ; let u = \"🙂\" ;";
+        let file_path = repo.path().join("unicode.rs");
+        std::fs::write(&file_path, format!("fn main() {{\n{line}\n}}\n")).expect("write");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path, window, cx);
+        });
+        for _ in 0..3 {
+            app.update(cx, |app, cx| {
+                app.render_center_pane(cx);
+            });
+            cx.run_until_parked();
+        }
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+
+        let relative = PathBuf::from("unicode.rs");
+        app.read_with(cx, |app, _| {
+            let buffer = app.edit_buffer(&relative).expect("real edit buffer");
+            assert_eq!(
+                buffer.lines[1].text, line,
+                "sanity check: line 2 is the real multi-byte line"
+            );
+            assert!(
+                buffer.lines[1].text.len() > buffer.lines[1].text.chars().count(),
+                "sanity check: this line really does contain multi-byte characters (byte length \
+                 must exceed char count), or it is not testing what it claims to"
+            );
+        });
+
+        let painted = cx
+            .debug_bounds("file-view-code-text-2")
+            .expect("line 2's real code text should have painted real bounds");
+
+        let shaped_width = app.update_in(cx, |app, window, _cx| {
+            let font_size = gpui::px(app.effective_code_rem_px());
+            let buffer = app.edit_buffer(&relative).expect("real edit buffer");
+            let buffer_line = &buffer.lines[1];
+            let runs = build_text_runs(buffer_line, &[], None, &None, &None);
+            window
+                .text_system()
+                .shape_line(
+                    gpui::SharedString::from(buffer_line.text.clone()),
+                    font_size,
+                    &runs,
+                    None,
+                )
+                .width
+        });
+
+        let drift = painted.size.width - shaped_width;
+        assert!(
+            drift >= gpui::px(0.0) && drift <= gpui::px(1.0),
+            "the real painted multi-byte code text ({:?}) must match the `ShapedLine` the caret \
+             is placed from ({shaped_width:?}) to within one device pixel - got {drift:?}",
+            painted.size.width,
+        );
+    }
+
+    /// The same disagreement stated the way a user meets it: put the caret at the very end of a
+    /// densely highlighted line and it must sit at the end of the visible text.
+    ///
+    /// Both sides here are the app's own real geometry, not recomputed by the test:
+    /// `AdeApp::file_view_last_bounds`/`file_view_last_layout` are what the row's paint closure
+    /// actually stored this frame, and `bounds.left() + shaped.x_for_index(offset)` is verbatim
+    /// the expression the caret quad is built from in `render_editable_file_view_line`.
+    #[gpui::test]
+    fn an_end_of_line_caret_lands_on_the_end_of_the_real_painted_text(cx: &mut TestAppContext) {
+        let (app, cx, relative, _repo) = open_dense_rust_file(cx);
+
+        app.update(cx, |app, cx| {
+            let line_start = app
+                .edit_buffer(&relative)
+                .expect("real edit buffer")
+                .line_ranges[1]
+                .clone();
+            app.edit_buffer_mut(&relative)
+                .expect("real edit buffer")
+                .move_to(line_start.end);
+            app.code_cursor = Some(2);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        let painted = cx
+            .debug_bounds("file-view-code-text-2")
+            .expect("line 2's real code text should have painted real bounds");
+
+        let caret_x = app.read_with(cx, |app, _| {
+            let bounds = app
+                .file_view_last_bounds
+                .expect("the caret row's real paint should have recorded its bounds");
+            let shaped = app
+                .file_view_last_layout
+                .clone()
+                .expect("the caret row's real paint should have recorded its shaped line");
+            assert_eq!(
+                shaped.text.as_ref(),
+                DENSE_LINE,
+                "sanity check: the recorded shaping really is the caret's own line"
+            );
+            bounds.left() + shaped.x_for_index(DENSE_LINE.len())
+        });
+
+        let gap = painted.right() - caret_x;
+        assert!(
+            gap >= gpui::px(0.0) && gap <= gpui::px(1.0),
+            "an end-of-line caret is painted at {caret_x:?}, but the real visible text ends at \
+             {:?} - a {gap:?} gap between the caret and the last letter the user actually typed. \
+             Only the single device pixel GPUI rounds the text element's measured width up by is \
+             acceptable here",
+            painted.right(),
+        );
+    }
+}
+
+/// Unit coverage for [`force_runs_to_cover`]'s two real failure modes - see its own docs for why
+/// both are load-bearing rather than defensive noise: an over-covering run list makes
+/// `gpui::StyledText::with_runs` panic, and an under-covering one makes `shape_line` shape a
+/// short line that every caret x on the row is then measured against.
+#[cfg(test)]
+mod force_runs_to_cover_tests {
+    use super::*;
+
+    fn run(len: usize) -> TextRun {
+        TextRun {
+            len,
+            font: gpui::font(crate::theme::font::MONO),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }
+    }
+
+    fn total(runs: &[TextRun]) -> usize {
+        runs.iter().map(|r| r.len).sum()
+    }
+
+    #[test]
+    fn an_already_exact_run_list_is_returned_unchanged() {
+        let runs = force_runs_to_cover("hello world", vec![run(5), run(6)]);
+        assert_eq!(
+            runs.iter().map(|r| r.len).collect::<Vec<_>>(),
+            vec![5, 6],
+            "the ordinary case - a gapless run list from `code_view::build_lines` - must pass \
+             through untouched, not be rebuilt into something else"
+        );
+    }
+
+    #[test]
+    fn a_short_run_list_gets_one_real_plain_run_for_the_uncovered_tail() {
+        let text = "hello world";
+        let runs = force_runs_to_cover(text, vec![run(5)]);
+        assert_eq!(total(&runs), text.len());
+        assert_eq!(
+            runs.len(),
+            2,
+            "the uncovered tail must become one real, plain run - not be dropped, which would \
+             leave `shape_line` measuring a 5-byte line for an 11-byte row and put every caret \
+             past byte 5 in the wrong place"
+        );
+    }
+
+    #[test]
+    fn an_over_covering_run_list_is_trimmed_to_the_real_text_length() {
+        let text = "hello";
+        let runs = force_runs_to_cover(text, vec![run(3), run(9), run(4)]);
+        assert_eq!(
+            total(&runs),
+            text.len(),
+            "runs claiming more bytes than the line really has must be trimmed to it - \
+             `StyledText::with_runs` asserts on exactly this and would take the window down"
+        );
+        assert_eq!(runs.iter().map(|r| r.len).collect::<Vec<_>>(), vec![3, 2]);
+    }
+
+    /// The real multi-byte case: "é" is two bytes, so a run boundary landing between them is not
+    /// a char boundary at all. `StyledText::with_runs` walks the text with `str::get(run.len..)`,
+    /// which returns `None` there and panics - so trimming has to snap *back* onto a real
+    /// boundary, never just clamp to a byte count.
+    #[test]
+    fn a_trimmed_boundary_snaps_back_onto_a_real_char_boundary() {
+        let text = "café"; // 5 bytes: 'c','a','f' then a 2-byte 'é'
+        assert_eq!(text.len(), 5);
+        let runs = force_runs_to_cover(text, vec![run(4), run(4)]);
+        assert_eq!(total(&runs), text.len());
+        let mut covered = 0usize;
+        for r in &runs {
+            covered += r.len;
+            assert!(
+                text.is_char_boundary(covered),
+                "every emitted run must end on a real char boundary - {covered} is mid-'é' in \
+                 {text:?}, which `StyledText::with_runs` cannot slice at"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_line_stays_an_empty_run_list() {
+        assert!(
+            force_runs_to_cover("", vec![run(3)]).is_empty(),
+            "a real empty line has nothing to shape - emitting a run for it would make \
+             `with_runs` assert"
         );
     }
 }
