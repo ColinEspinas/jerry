@@ -3026,6 +3026,38 @@ mod tests {
         );
     }
 
+    /// A fence nested inside a list item or a block quote, which is the case
+    /// [`MARKDOWN_INJECTION_QUERY`]'s `injection.include-children` decision most plausibly puts at
+    /// risk: including children means the `(block_continuation)` nodes carrying each line's `  `
+    /// or `> ` prefix are now inside the injected range too. Both really work - the content
+    /// highlights as Rust, and the block quote's own `> ` markers keep their own colour rather
+    /// than being swallowed by the injected layer.
+    #[test]
+    fn a_fence_nested_in_a_list_or_block_quote_still_highlights_its_real_language() {
+        let list = "- item\n\n  ```rust\n  fn main() {}\n  ```\n";
+        let list_spans = highlight_markdown(list);
+        assert_eq!(
+            kind_at(&list_spans, list, "fn main"),
+            HighlightKind::Keyword
+        );
+        assert_eq!(
+            kind_at(&list_spans, list, "main()"),
+            HighlightKind::Function
+        );
+
+        let quote = "> quote\n>\n> ```rust\n> fn main() {}\n> ```\n";
+        let quote_spans = highlight_markdown(quote);
+        assert_eq!(
+            kind_at(&quote_spans, quote, "fn main"),
+            HighlightKind::Keyword
+        );
+        assert_eq!(
+            kind_at(&quote_spans, quote, "> fn"),
+            HighlightKind::Operator,
+            "the block quote marker on the fence's own content line keeps its markdown colour"
+        );
+    }
+
     /// [`Grammar::for_injection_name`]'s first lookup: a `#set! injection.language` predicate
     /// naming a grammar directly, which is how `tree-sitter-md` requests `"markdown_inline"` and
     /// `"html"` and how `tree-sitter-html` requests `"css"`.
