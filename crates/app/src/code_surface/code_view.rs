@@ -221,6 +221,8 @@ pub enum HighlightKind {
     Keyword,
     Function,
     FunctionMethod,
+    /// A function/method *definition site* - see `RUST_DEFINITION_SUPPLEMENT`.
+    FunctionDefinition,
     Type,
     TypeBuiltin,
     Constant,
@@ -295,6 +297,7 @@ impl HighlightKind {
             HighlightKind::Keyword => "keyword",
             HighlightKind::Function => "function",
             HighlightKind::FunctionMethod => "function_method",
+            HighlightKind::FunctionDefinition => "function_definition",
             HighlightKind::Type => "type",
             HighlightKind::TypeBuiltin => "type_builtin",
             HighlightKind::Constant => "constant",
@@ -339,10 +342,11 @@ impl HighlightKind {
     /// source [`Self::from_name`] searches and
     /// `crate::settings::custom_theme::tests::every_highlight_kind_name_round_trips_through_from_name`
     /// checks exhaustively against.
-    pub const ALL: [HighlightKind; 33] = [
+    pub const ALL: [HighlightKind; 34] = [
         HighlightKind::Keyword,
         HighlightKind::Function,
         HighlightKind::FunctionMethod,
+        HighlightKind::FunctionDefinition,
         HighlightKind::Type,
         HighlightKind::TypeBuiltin,
         HighlightKind::Constant,
@@ -414,6 +418,7 @@ pub fn color_for_kind(kind: HighlightKind) -> Rgba {
         HighlightKind::Keyword => theme::syntax::KEYWORD.into(),
         HighlightKind::Function => theme::syntax::FUNCTION.into(),
         HighlightKind::FunctionMethod => theme::syntax::FUNCTION_METHOD.into(),
+        HighlightKind::FunctionDefinition => theme::syntax::FUNCTION_DEFINITION.into(),
         HighlightKind::Type => theme::syntax::TYPE.into(),
         HighlightKind::TypeBuiltin => theme::syntax::TYPE_BUILTIN.into(),
         HighlightKind::Constant => theme::syntax::CONSTANT.into(),
@@ -702,17 +707,22 @@ impl Grammar {
 ///   the real capture name (`-rust`: `(escape_sequence) @escape`; `-python`: identical). Neither
 ///   JavaScript's nor TypeScript's own bundled query captures an escape sequence at all - verified
 ///   directly, not assumed - so this bucket is genuinely reachable for Rust/Python source only.
-///   `"string.escape"` (the issue's own checklist name) is registered too, purely so a future
-///   grammar or query supplement that does emit it starts working with no further change here;
-///   it never matches anything today, which is harmless.
+///   `"string.escape"` (the issue's own checklist name) is registered too, and - correcting what
+///   this comment claimed until the theme redesign audited it - it is **not** dead: both
+///   `tree-sitter-markdown` and `tree-sitter-markdown-inline` really do emit
+///   `(backslash_escape) @string.escape`, so a `\*` in a markdown document reaches this bucket
+///   through it. The claim that it "never matches anything today" was written before Markdown
+///   support existed (GitHub issue #104) and was never revisited.
 /// - **`number`** - real in Python/JS/TS (`[(integer)(float)] @number` / `(number) @number`).
 ///   Rust has no `number` capture at all; its numeric literals are `@constant.builtin` instead
 ///   (unchanged from before this issue).
-/// - **`comment.documentation`, registered here alongside `comment.doc`** - `comment.documentation`
-///   is the real capture name (`-rust`: `(line_comment (doc_comment)) @comment.documentation`);
-///   none of the other three grammars has a doc-comment concept in their bundled query.
-///   `"comment.doc"` (the issue's own checklist name) is registered for the same forward-
-///   compatibility reason `"string.escape"` is.
+/// - **`comment.documentation`** - the real capture name (`-rust`: `(line_comment (doc_comment))
+///   @comment.documentation`); no other grammar here has a doc-comment concept in its bundled
+///   query. `"comment.doc"` (GitHub issue #31's own checklist name) used to be registered
+///   alongside it as a forward-compatibility synonym; the theme redesign's coverage audit found it
+///   was the *only* genuinely dead entry in this list - no grammar emits it, and unlike
+///   `"string.escape"` none has started to - so it was removed rather than left to imply a
+///   coverage it never had.
 /// - **`variable`** - real, and a genuinely large behavioural change from before this issue:
 ///   `-python`'s query captures *every* identifier as `@variable` via one blanket top-of-file
 ///   rule (`(identifier) @variable`), and `-javascript`'s does the same. Previously unregistered,
@@ -783,6 +793,7 @@ const HIGHLIGHT_NAMES: &[&str] = &[
     "keyword",
     "function",
     "function.method",
+    "function.definition",
     "type",
     "type.builtin",
     "constructor",
@@ -795,7 +806,6 @@ const HIGHLIGHT_NAMES: &[&str] = &[
     "number",
     "comment",
     "comment.documentation",
-    "comment.doc",
     "variable",
     "variable.parameter",
     "variable.builtin",
@@ -865,6 +875,7 @@ const HIGHLIGHT_KINDS: [HighlightKind; HIGHLIGHT_NAMES.len()] = [
     HighlightKind::Keyword,
     HighlightKind::Function,
     HighlightKind::FunctionMethod,
+    HighlightKind::FunctionDefinition,
     HighlightKind::Type,
     HighlightKind::TypeBuiltin,
     HighlightKind::Type,
@@ -876,7 +887,6 @@ const HIGHLIGHT_KINDS: [HighlightKind; HIGHLIGHT_NAMES.len()] = [
     HighlightKind::StringEscape,
     HighlightKind::Number,
     HighlightKind::Comment,
-    HighlightKind::CommentDoc,
     HighlightKind::CommentDoc,
     HighlightKind::Variable,
     HighlightKind::VariableParameter,
@@ -1083,6 +1093,117 @@ const C_BRACKET_SUPPLEMENT: &str = r#"
 ["(" ")" "[" "]" "{" "}"] @punctuation.bracket
 "#;
 
+// ---------------------------------------------------------------------------------------------
+// Definition-site supplements
+// ---------------------------------------------------------------------------------------------
+//
+/// Real supplements that split a *function definition* out from a *function call*.
+///
+/// ## Why these have to exist at all
+///
+/// Not one of the bundled grammar queries distinguishes the two. `tree-sitter-rust`'s own
+/// `queries/highlights.scm` captures a call as `function: (identifier) @function` (line 43) and a
+/// definition as `(function_item (identifier) @function)` (line 67) - the *same* capture name.
+/// Python, JavaScript, TypeScript, Go and C all do the same. So "colour the definition, leave the
+/// call at plain foreground" is not a palette change: it needs new query rules, which is what these
+/// are.
+///
+/// The design principle behind wanting it is `theme::syntax`' own module docs' "what earns a
+/// colour" section: a definition site is rare and tells you where a name *comes from*, a call site
+/// is one of the most common things in any file. Colouring both spends the whole contrast budget on
+/// the frequent half.
+///
+/// ## How they win, and how they fail safe
+///
+/// Appended after the bundled query, so the "last matching pattern wins" rule cited on
+/// [`PYTHON_HIGHLIGHTS_SUPPLEMENT`] makes them override the bundled `@function`. Verified by
+/// execution against the real grammars, not assumed: with these appended, `fn alpha()` classifies
+/// as `function.definition` while the call `beta()` stays `function`.
+///
+/// Verified the other way too: if `"function.definition"` were ever dropped from
+/// [`HIGHLIGHT_NAMES`], `HighlightConfiguration::configure` leaves it unrecognized and the token
+/// falls back to the `@function` its dotted parent still matches - so a half-finished change
+/// degrades to the old colour rather than to unstyled text.
+///
+/// Every node kind and field name below was checked against that grammar's own real
+/// `src/node-types.json` under `~/.cargo/registry/src/`, and each pattern was compiled and run.
+const RUST_DEFINITION_SUPPLEMENT: &str = r#"
+(function_item name: (identifier) @function.definition)
+(function_signature_item name: (identifier) @function.definition)
+"#;
+
+/// See [`RUST_DEFINITION_SUPPLEMENT`]. `function_definition`'s `name` field is an `identifier`
+/// only (no metavariable case, unlike Rust). A `lambda` has no name node at all, so it is
+/// correctly untouched.
+const PYTHON_DEFINITION_SUPPLEMENT: &str = r#"
+(function_definition name: (identifier) @function.definition)
+"#;
+
+/// See [`RUST_DEFINITION_SUPPLEMENT`]. Composed onto the JavaScript query, so it covers TypeScript
+/// and TSX too (both inherit it - see [`highlight_query_for`]).
+///
+/// Three of these fix real gaps rather than just recolouring:
+/// - `generator_function_declaration` has **no** rule in `tree-sitter-javascript`'s own bundled
+///   query at all, so `function* gen()` was previously classified as a plain `@variable`.
+/// - `private_property_identifier` is why the `method_definition` rule is an alternation: matching
+///   only `(property_identifier)` silently misses a `#priv()` private method.
+/// - the `variable_declarator` rule catches `const f = () => {}` / `const f = function () {}`,
+///   which is how a large fraction of real JavaScript declares functions. It keeps working under a
+///   TypeScript type annotation, because `type` is a separate field from `value`.
+const JAVASCRIPT_DEFINITION_SUPPLEMENT: &str = r#"
+(function_declaration name: (identifier) @function.definition)
+(generator_function_declaration name: (identifier) @function.definition)
+(method_definition
+  name: [(property_identifier) (private_property_identifier)] @function.definition)
+(variable_declarator
+  name: (identifier) @function.definition
+  value: [(arrow_function) (function_expression)])
+"#;
+
+/// See [`RUST_DEFINITION_SUPPLEMENT`] - the TypeScript-only declaration forms, which have no
+/// JavaScript counterpart: an ambient `declare function`, an interface member signature, and an
+/// `abstract` class method.
+const TYPESCRIPT_DEFINITION_SUPPLEMENT: &str = r#"
+(function_signature name: (identifier) @function.definition)
+(method_signature name: (property_identifier) @function.definition)
+(abstract_method_signature name: (property_identifier) @function.definition)
+"#;
+
+/// See [`RUST_DEFINITION_SUPPLEMENT`]. A method's own name node is a `field_identifier`, not an
+/// `identifier` - a real difference from `function_declaration`, checked against
+/// `tree-sitter-go`'s `node-types.json` rather than assumed symmetrical. `method_elem` is the
+/// interface-method node kind in this grammar version (it was `method_spec` in older ones).
+const GO_DEFINITION_SUPPLEMENT: &str = r#"
+(function_declaration name: (identifier) @function.definition)
+(method_declaration name: (field_identifier) @function.definition)
+(method_elem name: (field_identifier) @function.definition)
+"#;
+
+/// See [`RUST_DEFINITION_SUPPLEMENT`]. C is the one language here that needs the *outer*
+/// `function_definition` node in the pattern rather than the declarator alone, and the reason is
+/// real rather than stylistic: `(function_declarator declarator: (identifier))` - the shape the
+/// bundled query itself uses for `@function` - fires identically on a **prototype**
+/// (`int f(int);`) and on a definition (`int f(int) {...}`), so appending it under this name would
+/// relabel every prototype in a header as a definition.
+///
+/// Anchoring on `function_definition` fixes that, at the cost of one pattern per pointer depth: a
+/// pointer return type nests the `function_declarator` under one `pointer_declarator` per `*`
+/// (`char **three(void) {}` parses as `pointer_declarator > pointer_declarator >
+/// function_declarator > identifier`, confirmed from a real parse). Two levels is what is written
+/// here - it covers `T *f()` and `T **f()`, i.e. essentially all real code. A three-star return
+/// type would need a fourth pattern and is deliberately not chased.
+const C_DEFINITION_SUPPLEMENT: &str = r#"
+(function_definition
+  declarator: (function_declarator declarator: (identifier) @function.definition))
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (function_declarator declarator: (identifier) @function.definition)))
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (pointer_declarator
+      declarator: (function_declarator declarator: (identifier) @function.definition))))
+"#;
+
 /// Real supplement appended after the composed JavaScript + TypeScript query (see
 /// [`highlight_query_for`]), repairing two regressions that a live old-vs-new diff over real
 /// TypeScript caught. Both come from the same root cause: `tree-sitter-typescript`'s own
@@ -1178,27 +1299,33 @@ const MARKDOWN_BLOCK_HIGHLIGHTS_SUPPLEMENT: &str = r#"
 /// outright rather than degrade quietly.
 fn highlight_query_for(grammar: Grammar) -> String {
     match grammar {
-        Grammar::Rust => tree_sitter_rust::HIGHLIGHTS_QUERY.to_string(),
+        Grammar::Rust => format!(
+            "{}\n{RUST_DEFINITION_SUPPLEMENT}",
+            tree_sitter_rust::HIGHLIGHTS_QUERY
+        ),
         Grammar::Python => {
             format!(
-                "{}\n{PYTHON_HIGHLIGHTS_SUPPLEMENT}\n{PYTHON_BRACKET_SUPPLEMENT}",
+                "{}\n{PYTHON_HIGHLIGHTS_SUPPLEMENT}\n{PYTHON_BRACKET_SUPPLEMENT}\n\
+                 {PYTHON_DEFINITION_SUPPLEMENT}",
                 tree_sitter_python::HIGHLIGHTS_QUERY
             )
         }
         Grammar::TypeScript => format!(
-            "{}\n{}\n{TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT}",
+            "{}\n{}\n{TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT}\n\
+             {JAVASCRIPT_DEFINITION_SUPPLEMENT}\n{TYPESCRIPT_DEFINITION_SUPPLEMENT}",
             tree_sitter_javascript::HIGHLIGHT_QUERY,
             tree_sitter_typescript::HIGHLIGHTS_QUERY
         ),
         Grammar::Tsx => format!(
-            "{}\n{}\n{}\n{TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT}",
+            "{}\n{}\n{}\n{TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT}\n\
+             {JAVASCRIPT_DEFINITION_SUPPLEMENT}\n{TYPESCRIPT_DEFINITION_SUPPLEMENT}",
             tree_sitter_javascript::HIGHLIGHT_QUERY,
             tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
             tree_sitter_typescript::HIGHLIGHTS_QUERY
         ),
         Grammar::Toml => tree_sitter_toml_ng::HIGHLIGHTS_QUERY.to_string(),
         Grammar::Go => format!(
-            "{}\n{GO_HIGHLIGHTS_SUPPLEMENT}\n{GO_BRACKET_SUPPLEMENT}",
+            "{}\n{GO_HIGHLIGHTS_SUPPLEMENT}\n{GO_BRACKET_SUPPLEMENT}\n{GO_DEFINITION_SUPPLEMENT}",
             tree_sitter_go::HIGHLIGHTS_QUERY
         ),
         Grammar::Json => format!(
@@ -1206,7 +1333,10 @@ fn highlight_query_for(grammar: Grammar) -> String {
             tree_sitter_json::HIGHLIGHTS_QUERY
         ),
         Grammar::Yaml => tree_sitter_yaml::HIGHLIGHTS_QUERY.to_string(),
-        Grammar::C => format!("{}\n{C_BRACKET_SUPPLEMENT}", tree_sitter_c::HIGHLIGHT_QUERY),
+        Grammar::C => format!(
+            "{}\n{C_BRACKET_SUPPLEMENT}\n{C_DEFINITION_SUPPLEMENT}",
+            tree_sitter_c::HIGHLIGHT_QUERY
+        ),
         Grammar::Markdown => format!(
             "{}\n{MARKDOWN_BLOCK_HIGHLIGHTS_SUPPLEMENT}",
             tree_sitter_md::HIGHLIGHT_QUERY_BLOCK
@@ -2639,7 +2769,7 @@ mod tests {
     fn a_function_name_is_classified_as_function() {
         let spans = highlight_rust(SAMPLE_RUST);
         let span = find_span(&spans, SAMPLE_RUST, "add").expect("function name span");
-        assert_eq!(span.kind, HighlightKind::Function);
+        assert_eq!(span.kind, HighlightKind::FunctionDefinition);
     }
 
     #[test]
@@ -2711,7 +2841,7 @@ mod tests {
     fn typescript_function_declaration_name_is_classified_as_function() {
         let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
         let span = find_span(&spans, SAMPLE_TYPESCRIPT, "add").expect("function name span");
-        assert_eq!(span.kind, HighlightKind::Function);
+        assert_eq!(span.kind, HighlightKind::FunctionDefinition);
     }
 
     #[test]
@@ -2789,7 +2919,7 @@ mod tests {
         let span = find_span(&spans, source, "length").expect("method name span");
         // `(method_definition name: (property_identifier) @function.method)` - its own
         // dedicated bucket since GitHub issue #31 (previously folded into plain `Function`).
-        assert_eq!(span.kind, HighlightKind::FunctionMethod);
+        assert_eq!(span.kind, HighlightKind::FunctionDefinition);
     }
 
     /// The same real collision, for a real function call's callee (`call_expression`'s
@@ -2803,9 +2933,17 @@ mod tests {
             .filter(|span| source[span.start..span.end] == *"top")
             .collect();
         assert_eq!(function_spans.len(), 2, "the declaration and the call site");
-        assert!(function_spans
-            .iter()
-            .all(|span| span.kind == HighlightKind::Function));
+        assert_eq!(
+            function_spans[0].kind,
+            HighlightKind::FunctionDefinition,
+            "the `function top()` declaration is a real definition site"
+        );
+        assert_eq!(
+            function_spans[1].kind,
+            HighlightKind::Function,
+            "the `top()` call site stays a plain function - this split is the whole point of \
+             JAVASCRIPT_DEFINITION_SUPPLEMENT"
+        );
     }
 
     /// A real TSX tag name (`jsx_self_closing_element`'s own `name` field) is the same real
@@ -2852,7 +2990,7 @@ mod tests {
     fn python_function_definition_name_is_classified_as_function() {
         let spans = highlight_python(SAMPLE_PYTHON);
         let span = find_span(&spans, SAMPLE_PYTHON, "add").expect("function name span");
-        assert_eq!(span.kind, HighlightKind::Function);
+        assert_eq!(span.kind, HighlightKind::FunctionDefinition);
     }
 
     #[test]
@@ -2919,7 +3057,7 @@ mod tests {
         let source = "class Foo:\n    def bar(self):\n        pass\n";
         let spans = highlight_python(source);
         let span = find_span(&spans, source, "bar").expect("method name span");
-        assert_eq!(span.kind, HighlightKind::Function);
+        assert_eq!(span.kind, HighlightKind::FunctionDefinition);
     }
 
     /// The real call-expression collision one more time, for Python's own `call` node kind
@@ -2933,9 +3071,16 @@ mod tests {
             .filter(|span| source[span.start..span.end] == *"top")
             .collect();
         assert_eq!(function_spans.len(), 2, "the definition and the call site");
-        assert!(function_spans
-            .iter()
-            .all(|span| span.kind == HighlightKind::Function));
+        assert_eq!(
+            function_spans[0].kind,
+            HighlightKind::FunctionDefinition,
+            "the `def top()` name is a real definition site"
+        );
+        assert_eq!(
+            function_spans[1].kind,
+            HighlightKind::Function,
+            "the `top()` call site stays a plain function"
+        );
     }
 
     #[test]
@@ -2990,6 +3135,89 @@ mod tests {
     /// [`HIGHLIGHT_NAMES`] and [`HIGHLIGHT_KINDS`] are a positional parallel array pair, and the
     /// whole classification mapping is wrong-but-compiling if they ever drift. The array length is
     /// already tied together at compile time; this pins the *content* of every real mapping -
+    /// The definition-site split, as one cross-language contract rather than six per-language
+    /// tests: in every language that has real definition-site rules, the *declared* name is a
+    /// `FunctionDefinition` and a *call* of that same name is a plain `Function`.
+    ///
+    /// This is what makes "colour definition sites, leave calls at plain foreground" implementable
+    /// at all - see `RUST_DEFINITION_SUPPLEMENT` for why no bundled grammar query gives it to us.
+    #[test]
+    fn a_definition_site_and_a_call_site_are_really_different_buckets_in_every_language() {
+        let cases: [(&str, crate::language::HighlighterFn, &str); 5] = [
+            (
+                "rust",
+                highlight_rust,
+                "fn zeta() {}\nfn caller() { zeta(); }\n",
+            ),
+            (
+                "python",
+                highlight_python,
+                "def zeta():\n    pass\n\nzeta()\n",
+            ),
+            ("typescript", highlight_ts, "function zeta() {}\nzeta();\n"),
+            (
+                "go",
+                highlight_go,
+                "package m\n\nfunc zeta() {}\n\nfunc caller() { zeta() }\n",
+            ),
+            (
+                "c",
+                highlight_c,
+                "int zeta(void) { return 0; }\nint caller(void) { return zeta(); }\n",
+            ),
+        ];
+        for (label, highlighter, source) in cases {
+            let spans = highlighter(source);
+            let kinds: Vec<HighlightKind> = spans
+                .iter()
+                .filter(|span| source[span.start..span.end] == *"zeta")
+                .map(|span| span.kind)
+                .collect();
+            assert_eq!(
+                kinds.len(),
+                2,
+                "{label}: premise - the definition and the call must both be classified spans, \
+                 got {kinds:?}"
+            );
+            assert_eq!(
+                kinds[0],
+                HighlightKind::FunctionDefinition,
+                "{label}: the declaration of `zeta` must be a definition site"
+            );
+            assert_eq!(
+                kinds[1],
+                HighlightKind::Function,
+                "{label}: the call to `zeta` must stay a plain function"
+            );
+        }
+    }
+
+    /// C is the one language whose definition rule had to anchor on the outer `function_definition`
+    /// node: the shape the bundled query uses for `@function` fires identically on a prototype and
+    /// on a definition, so the obvious rule would relabel every prototype in a header as a
+    /// definition. See `C_DEFINITION_SUPPLEMENT`.
+    #[test]
+    fn a_c_prototype_is_not_a_definition_site_but_the_definition_below_it_is() {
+        let source = "int zeta(int a);\nint zeta(int a) { return a; }\n";
+        let spans = highlight_c(source);
+        let kinds: Vec<HighlightKind> = spans
+            .iter()
+            .filter(|span| source[span.start..span.end] == *"zeta")
+            .map(|span| span.kind)
+            .collect();
+        assert_eq!(
+            kinds.len(),
+            2,
+            "the prototype and the definition, got {kinds:?}"
+        );
+        assert_eq!(
+            kinds[0],
+            HighlightKind::Function,
+            "a prototype declares nothing here - it must not read as the definition site"
+        );
+        assert_eq!(kinds[1], HighlightKind::FunctionDefinition);
+    }
+
     /// GitHub issue #31's full extended scope list, not just the original six-bucket handful.
     #[test]
     fn recognized_highlight_names_map_to_the_intended_buckets() {
@@ -3003,6 +3231,10 @@ mod tests {
         assert_eq!(bucket("keyword"), HighlightKind::Keyword);
         assert_eq!(bucket("function"), HighlightKind::Function);
         assert_eq!(bucket("function.method"), HighlightKind::FunctionMethod);
+        assert_eq!(
+            bucket("function.definition"),
+            HighlightKind::FunctionDefinition
+        );
         assert_eq!(bucket("type"), HighlightKind::Type);
         assert_eq!(bucket("type.builtin"), HighlightKind::TypeBuiltin);
         assert_eq!(bucket("constant"), HighlightKind::Constant);
@@ -3027,14 +3259,14 @@ mod tests {
         );
         assert_eq!(bucket("attribute"), HighlightKind::Attribute);
         assert_eq!(bucket("embedded"), HighlightKind::Embedded);
-        // The real capture names verified directly against the grammars' own bundled query files
-        // (`escape`, `comment.documentation`), plus their checklist-name synonyms
-        // (`string.escape`, `comment.doc`) that no grammar here actually emits today - both sides
-        // of each pair resolve to the same bucket.
+        // The real capture names verified directly against the grammars' own bundled query
+        // files. `escape` is Rust's and Python's; `string.escape` is Markdown's own
+        // `(backslash_escape) @string.escape` - both sides of the pair resolve to one bucket.
+        // (`comment.doc` used to be asserted here too, until the coverage audit found no grammar
+        // emits it and it was removed from HIGHLIGHT_NAMES entirely.)
         assert_eq!(bucket("escape"), HighlightKind::StringEscape);
         assert_eq!(bucket("string.escape"), HighlightKind::StringEscape);
         assert_eq!(bucket("comment.documentation"), HighlightKind::CommentDoc);
-        assert_eq!(bucket("comment.doc"), HighlightKind::CommentDoc);
         // The non-obvious ones, each argued for in `HIGHLIGHT_KINDS`' own docs.
         assert_eq!(bucket("constructor"), HighlightKind::Type);
         assert_eq!(bucket("tag"), HighlightKind::Tag);
@@ -3247,7 +3479,10 @@ mod tests {
     #[test]
     fn go_function_definition_name_is_classified_as_function() {
         let spans = highlight_go(SAMPLE_GO);
-        assert_eq!(kind_at(&spans, SAMPLE_GO, "add"), HighlightKind::Function);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_GO, "add"),
+            HighlightKind::FunctionDefinition
+        );
     }
 
     /// `@function.builtin` (`len`) needs no new registration of its own - it already reads as
@@ -3343,7 +3578,10 @@ mod tests {
     #[test]
     fn c_function_definition_name_is_classified_as_function() {
         let spans = highlight_c(SAMPLE_C);
-        assert_eq!(kind_at(&spans, SAMPLE_C, "add"), HighlightKind::Function);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_C, "add"),
+            HighlightKind::FunctionDefinition
+        );
     }
 
     /// `(statement_identifier) @label` - the new `"label"` registration's C half (a goto target,
@@ -3622,7 +3860,7 @@ mod tests {
         );
         assert_eq!(
             kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "main()"),
-            HighlightKind::Function
+            HighlightKind::FunctionDefinition
         );
     }
 
@@ -3721,7 +3959,7 @@ mod tests {
         );
         assert_eq!(
             kind_at(&list_spans, list, "main()"),
-            HighlightKind::Function
+            HighlightKind::FunctionDefinition
         );
 
         let quote = "> quote\n>\n> ```rust\n> fn main() {}\n> ```\n";
@@ -3831,13 +4069,15 @@ mod tests {
         let spans = highlight_typescript(source, false);
         assert_eq!(
             kind_at(&spans, source, "Badge"),
-            HighlightKind::Function,
+            HighlightKind::FunctionDefinition,
             "a capitalised function declaration is still a function, not a type"
         );
         assert_eq!(
             kind_at(&spans, source, "String("),
             HighlightKind::Function,
-            "a capitalised call is still a call, not a type"
+            "a capitalised *call* is still a call, not a type - and, since the definition-site \
+             supplements landed, still a plain `Function` rather than the `FunctionDefinition` \
+             the declaration above it gets"
         );
         assert_eq!(
             kind_at(&spans, source, "Widget = "),
@@ -4284,7 +4524,8 @@ mod tests {
             .iter()
             .flat_map(|line| &line.runs)
             .any(|(text, kind)| {
-                text.as_ref() == "highlighter_for_extension" && *kind == HighlightKind::Function
+                text.as_ref() == "highlighter_for_extension"
+                    && *kind == HighlightKind::FunctionDefinition
             });
         assert!(
             has_fn_name,

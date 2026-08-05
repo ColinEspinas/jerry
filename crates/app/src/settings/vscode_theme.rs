@@ -965,6 +965,18 @@ fn syntax_scope_rule(kind: HighlightKind) -> (&'static [&'static str], Option<Hi
             None,
         ),
         Function => (&["entity.name.function", "support.function"], None),
+        // A VSCode theme's `entity.name.function.definition` is rare; almost every real one styles
+        // only the shared `entity.name.function`. Falling back to `Function` is what keeps an
+        // imported theme internally consistent - it would be worse to leave definition sites on
+        // Jerry's own accent while the theme repainted every call site.
+        FunctionDefinition => (
+            &[
+                "entity.name.function.definition",
+                "entity.name.function.declaration",
+                "entity.name.function",
+            ],
+            Some(Function),
+        ),
         FunctionMethod => (
             &[
                 "entity.name.function.method",

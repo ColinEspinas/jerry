@@ -1001,6 +1001,15 @@ pub mod syntax {
     /// `function.method` (`tree-sitter-rust`'s `@function.method`, `-javascript`'s own) - see the
     /// module docs' fallback-chain section.
     pub const FUNCTION_METHOD: ColorToken = token("syntax.function_method", 0x74ade8);
+    /// `function.definition` - a function or method's name **where it is declared**, the one
+    /// place the reader learns where a name comes from. See
+    /// `crate::code_surface::code_view`'s own `RUST_DEFINITION_SUPPLEMENT` for the real query
+    /// rules that separate this from a call site (no bundled grammar query does).
+    ///
+    /// Starts life as a direct alias of [`FUNCTION`], so this commit is a pure classification
+    /// change with no visual difference at all - the palette rebuild that follows is what gives
+    /// the definition site its own accent and moves the call site to plain foreground.
+    pub const FUNCTION_DEFINITION: ColorToken = token("syntax.function_definition", 0x74ade8);
     pub const TYPE: ColorToken = token("syntax.type", 0xdfc184);
     /// `type.builtin` (`tree-sitter-rust`'s `(primitive_type) @type.builtin`, `-typescript`'s
     /// `(predefined_type) @type.builtin`) - see the module docs' fallback-chain section.
@@ -1177,6 +1186,7 @@ pub mod syntax {
         ("KEYWORD", KEYWORD),
         ("FUNCTION", FUNCTION),
         ("FUNCTION_METHOD", FUNCTION_METHOD),
+        ("FUNCTION_DEFINITION", FUNCTION_DEFINITION),
         ("TYPE", TYPE),
         ("TYPE_BUILTIN", TYPE_BUILTIN),
         ("CONSTANT", CONSTANT),

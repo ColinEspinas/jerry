@@ -198,6 +198,7 @@ text                      = "#181a1d"
 keyword                   = "#372043"
 function                  = "#112436"
 function_method           = "#112436"
+function_definition       = "#112436"  # function.definition
 type                      = "#2c2211"
 type_builtin              = "#2c2211"
 constant                  = "#584330"

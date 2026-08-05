@@ -3138,7 +3138,8 @@ impl QueryBuilder {
         );
         assert_eq!(
             find_kind(&buf, "foo"),
-            Some(code_view::HighlightKind::Function)
+            Some(code_view::HighlightKind::FunctionDefinition),
+            "`fn foo` is a declaration, so its name is a definition site"
         );
 
         // A real single-character keystroke inside the line, away from both "fn" and "foo" -
@@ -3170,7 +3171,7 @@ impl QueryBuilder {
         );
         assert_eq!(
             find_kind(&buf, "foo"),
-            Some(code_view::HighlightKind::Function),
+            Some(code_view::HighlightKind::FunctionDefinition),
             "the untouched \"foo\" function name must likewise keep its own real highlighting"
         );
 
@@ -3188,7 +3189,7 @@ impl QueryBuilder {
         );
         assert_eq!(
             find_kind(&buf, "foo"),
-            Some(code_view::HighlightKind::Function)
+            Some(code_view::HighlightKind::FunctionDefinition)
         );
     }
 

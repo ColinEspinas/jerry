@@ -2506,8 +2506,8 @@ mod editing_tests {
             "\"fn\" should now be a real keyword: {kinds_after:?}"
         );
         assert!(
-            kinds_after.contains(&code_view::HighlightKind::Function),
-            "\"foo\" should now be a real function name: {kinds_after:?}"
+            kinds_after.contains(&code_view::HighlightKind::FunctionDefinition),
+            "\"foo\" should now be a real function *definition* name: {kinds_after:?}"
         );
     }
 
