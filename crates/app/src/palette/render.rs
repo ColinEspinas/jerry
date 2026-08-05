@@ -825,7 +825,7 @@ impl AdeApp {
             .border_color(if selected {
                 theme::border::SELECTED_EDGE
             } else {
-                theme::ColorToken(work_surface::TRANSPARENT)
+                theme::ColorToken::literal(work_surface::TRANSPARENT)
             })
             .when(selected, |el| el.bg(theme::surface::ROW_SELECTED))
             .when(!selected, |el| {

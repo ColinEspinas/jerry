@@ -39,9 +39,12 @@ use crate::theme;
 use crate::work_surface::agents::AgentKind;
 use crate::work_surface::state as work_surface;
 
+pub mod builtin_themes;
 pub mod custom_theme;
 pub mod state;
 pub mod store;
+pub mod theme_file_format;
+pub mod vscode_theme;
 
 pub(crate) mod render;
 pub(crate) mod widgets;

@@ -155,6 +155,7 @@ impl AdeApp {
         let tree_focus_handle = cx.focus_handle();
         let filter_focus_handle = cx.focus_handle();
         let settings_keymap_filter_focus_handle = cx.focus_handle();
+        let theme_seed_focus_handle = cx.focus_handle();
         let caret_blink_subscriptions = AdeApp::wire_caret_blink(
             &[
                 &code_focus_handle,
@@ -163,6 +164,7 @@ impl AdeApp {
                 &tree_focus_handle,
                 &filter_focus_handle,
                 &settings_keymap_filter_focus_handle,
+                &theme_seed_focus_handle,
             ],
             window,
             cx,
@@ -407,6 +409,9 @@ impl AdeApp {
             _lsp_rows_task: None,
             settings_keymap_filter: text_history::TextField::new(),
             settings_keymap_filter_focus_handle,
+            theme_seed_input: text_history::TextField::new(),
+            theme_seed_focus_handle,
+            _theme_generate_task: None,
             keymap_recording: None,
             _keymap_intercept: None,
             keymap_rebind_error: None,
@@ -443,6 +448,7 @@ impl AdeApp {
             custom_theme_load_errors,
             custom_theme_status: None,
             _custom_theme_import_task: None,
+            _vscode_theme_import_task: None,
             _custom_theme_export_task: None,
             _custom_theme_remove_task: None,
             _custom_theme_create_task: None,

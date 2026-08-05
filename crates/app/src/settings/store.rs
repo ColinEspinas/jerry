@@ -72,8 +72,10 @@
 //! entirely - see `crate::code_surface`'s zoom methods for the surviving mechanism.
 //!
 //! [`ThemeSettings`] round-trips **and** really re-skins the running app: `crate::root::AdeApp::
-//! apply_theme_selection` applies `name` against `crate::theme::set_current_theme_index` (see
-//! that module's own docs for the runtime colour-token mechanism this drives), and `follow_system`
+//! apply_theme_selection` compiles `name` into a real palette and installs it through
+//! `crate::theme::set_current_theme` (see that module's own docs for the runtime colour-token
+//! mechanism this drives, and `crate::settings::custom_theme` for the file format), and
+//! `follow_system`
 //! is real too (`crate::root::AdeApp::sync_theme_to_system_appearance`, a live
 //! `Window::observe_window_appearance` subscription). `high_contrast_diff` stays persisted-only -
 //! no real diff-colour-intensity mechanism exists yet to apply it through.

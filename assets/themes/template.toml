@@ -1,55 +1,135 @@
-# Jerry custom theme template
+# Jerry theme template
 #
-# Copy this file (or click "New from template..." on Settings -> Themes, which writes this
-# exact file for you) into your own custom themes directory and edit the values below to
-# author your own Jerry theme. Lines starting with "#" are comments - the TOML parser ignores
-# them, so keep or delete as many as you like.
+# Copy this file - or click "New from template..." on Settings -> Themes, which writes this exact
+# file for you - into ~/.config/jerry/themes/ and edit it. Lines starting with "#" are comments;
+# keep or delete as many as you like.
 #
-# WHERE THIS FILE GOES
-#   ~/.config/jerry/themes/<any-file-name>.toml - a "themes" directory sitting right next to
-#   ~/.config/jerry/settings.toml. Jerry loads every *.toml file directly inside it at startup,
-#   one theme per file. The file's own name doesn't matter to Jerry - only the `name` field
-#   below does, since that's what's shown on the Themes page and what a theme is selected by.
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+# How a Jerry theme works
+# ──────────────────────────────────────────────────────────────────────────────────────────────
 #
-# FIELDS
-#   name          Required, non-empty, and must not match a built-in theme's name (Jerry Dark,
-#                 Jerry Dim, Slate, Ember, Moss, Paper) - shown as the card title on the Themes
-#                 page.
-#   subtitle      Optional (defaults to empty if omitted) - a short one-line description shown
-#                 under the name on the card.
-#   background    The app's main window background.
-#   panel         Sidebar/panel backgrounds, sitting on top of `background`.
-#   accent_green  The app's "success"-ish accent.
-#   accent_amber  The app's "in-progress / needs attention"-ish accent.
-#   accent_blue   The app's "info / selection"-ish accent.
+# Jerry's interface is painted from about 270 named colours, grouped into tables like [surface],
+# [text] and [syntax]. A theme file names as many or as few of them as it likes. Anything it does
+# NOT name is inherited from the theme in `base`, and ultimately from Jerry Dark's own built-in
+# value.
 #
-# These are the same five swatches every built-in theme is defined by. You are not expected to
-# hand-author all of the app's ~200 individual colour tokens (borders, hover states, syntax
-# highlighting, diff colours, ...) - they're derived automatically from how these five swatches
-# differ from Jerry Dark's own five, the same real derivation every non-Jerry-Dark built-in
-# theme already goes through. Picking these five well re-skins the whole app, not just the
-# preview card.
+# That has three consequences worth knowing up front:
 #
-# COLOUR FORMAT
-#   Exactly "#rrggbb" - a "#" followed by six hex digits. No "#rgb" shorthand, no alpha
-#   channel, and no named CSS colours (e.g. "black") - any of those are rejected with a real
-#   error naming the offending field.
+#   * This file is a complete, valid theme even though it only sets a few dozen keys.
+#   * Deleting a line is a real edit - that key simply goes back to what it inherited.
+#   * New keys added by future Jerry versions inherit too, so a theme file never goes stale or
+#     needs to be kept exhaustive.
 #
-# READABILITY FLOOR
-#   `panel` must be clearly different in *perceived brightness* from `background` - specifically
-#   at least 28 per-mille (out of 1000) of standard-weighted (ITU-R BT.709) luma difference,
-#   which is about half of Jerry Dark's own built-in panel/background contrast. (See
-#   `readability_floor_per_mille` in crates/app/src/settings/custom_theme.rs for exactly how
-#   this is computed, in case Jerry Dark's own swatches - and so this number - ever change.) A
-#   `panel` that's the same colour as `background`, or only a couple of hex digits off from it,
-#   is rejected. In practice: make panel a clearly different shade (lighter or darker) than
-#   background, not just a different hue at the same brightness.
+# For the full list of every real key with a real value, open any bundled theme -
+# assets/themes/slate.toml (or ember/moss/paper/jerry-dim) is a complete, commented palette, and
+# copying one is the fastest way to author a whole theme rather than a few tweaks.
+#
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+# The rules
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+#
+#   name       Required. Must not reuse a built-in theme's name (Jerry Dark, Jerry Dim, Slate,
+#              Ember, Moss, Paper).
+#   subtitle   Optional. One line, shown under the name on the Themes page.
+#   base       Optional. The theme every key you don't set is inherited from; "Jerry Dark" is the
+#              usual choice, and omitting it means the same thing. A base chain that loops is
+#              rejected with a real error naming the loop.
+#   preview    Optional. Five "#rrggbb" colours for this theme's card. Omit it and the card is
+#              painted from your own surface.window / surface.rail / status.review / status.ask /
+#              status.run.
+#
+#   Colours are "#rrggbb" - a "#" and exactly six hex digits. No "#rgb" shorthand, no alpha, no
+#   named CSS colours. An unknown table or key is rejected with an error naming it, so a typo
+#   never silently does nothing.
+#
+#   Key names follow the source exactly: module name, then the constant name lowercased.
+#   theme::surface::WINDOW is [surface] window. A few tokens are pairs or lists and use a quoted
+#   dotted key, because TOML would otherwise read the dot as a nested table:
+#
+#       [agent]
+#       "sonnet.fg" = "#d8a94a"
+#       "sonnet.bg" = "#33280f"
+#       [graph]
+#       "lanes.0" = "#6b9bd1"
+#
+#   The one thing Jerry insists on: your text has to be legible. If body text or code ends up
+#   effectively invisible against the surface behind it (below 1.6:1 contrast), the theme is
+#   rejected with an error saying which pair failed. Nothing else about your colour choices is
+#   second-guessed - flat designs that separate regions with borders rather than brightness are
+#   perfectly fine.
+#
+#   Prefer a starting point over a blank page? Settings -> Themes -> "Generate from colour..."
+#   takes one hex colour and writes a complete, literal, editable theme built around it.
 
 name = "My Custom Theme"
 subtitle = "replace this with a short description"
+base = "Jerry Dark"
 
-background   = "#0c0d10"
-panel        = "#181a1e"
-accent_green = "#5cb87f"
-accent_amber = "#e2a336"
-accent_blue  = "#e07a5f"
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+# Surfaces and structure
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+
+# Backgrounds - every solid fill in the app, from the window itself down to popovers, hover
+# states and keycaps.
+[surface]
+window       = "#0c0d10"  # window body
+rail         = "#101216"  # left rail + right panel
+center       = "#0f1013"  # work surface
+card         = "#181a1e"  # composer, settings cards
+popover      = "#1b1e24"  # completion popup, hover card
+row_hover    = "#15181d"
+row_selected = "#1b1f26"
+
+# The 1px rules that separate things - zone edges, card and popover outlines, and the
+# selected-row edge.
+[border]
+divider       = "#22262d"
+card          = "#23282f"
+selected_edge = "#e07a5f"  # 2px left edge on a selected row
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+# Text
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+
+# The interface text ramp, brightest to dimmest. Not code: that is [syntax]. There are twelve
+# levels in all - see any bundled theme for the rest.
+[text]
+primary = "#d6dae0"
+body    = "#b9bfc7"
+muted   = "#98a0a9"
+faint   = "#6b7278"
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+# Meaning and state (colour carries information here)
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+
+# Status is the only place colour carries meaning in the rail. Recolour these freely, but keep
+# them telling four different stories - they are how an agent's state reads at a glance.
+[status]
+review = "#5cb87f"  # ready to review
+ask    = "#e2a336"  # needs input
+fail   = "#e07a5f"
+run    = "#74ade8"
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+# The code surface
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+
+# Syntax highlighting. Every bucket is settable on its own; leave one out and it keeps the colour
+# it inherits. Note that operators, brackets and delimiters deliberately render as plain text in
+# Jerry's own themes - you can colour them here if you want to.
+[syntax]
+text               = "#b0b6c2"
+keyword            = "#c98fbf"
+function           = "#74ade8"
+type               = "#dfc184"
+string             = "#9dbb6f"
+constant           = "#e07a5f"
+comment            = "#5d636f"
+variable           = "#bd89a5"
+variable_parameter = "#bd566e"
+property           = "#75b2c7"

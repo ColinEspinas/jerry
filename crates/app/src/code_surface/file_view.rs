@@ -1029,7 +1029,7 @@ pub(in crate::code_surface) fn render_file_view_line(
                 .bg(if is_changed {
                     theme::editor::DIFF_ADDED
                 } else {
-                    theme::ColorToken(work_surface::TRANSPARENT)
+                    theme::ColorToken::literal(work_surface::TRANSPARENT)
                 }),
         )
         .child(
