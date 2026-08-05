@@ -235,8 +235,34 @@ pub enum HighlightKind {
     VariableBuiltin,
     Property,
     Operator,
+    /// A `(`/`)`/`[`/`]`/`{`/`}` the grammar's own `punctuation.bracket` capture matched - **and
+    /// which [`colorize_bracket_pairs`] could not pair up with a real partner**, plus every
+    /// `<`/`>` that capture matches (a generic argument list's, an HTML tag's), which that pass
+    /// deliberately never tracks. A bracket that *is* half of a real matched pair is reclassified
+    /// into one of [`HighlightKind::BRACKET_DEPTH_RING`]'s six buckets instead. See
+    /// [`colorize_bracket_pairs`] for both decisions.
     PunctuationBracket,
     PunctuationDelimiter,
+    /// GitHub issue #168: a real matched bracket pair at nesting depth 0, 6, 12, ... - see
+    /// [`HighlightKind::BRACKET_DEPTH_RING`] and `theme::syntax::BRACKET_1`. Unlike every other
+    /// variant here this is never produced by a `tree-sitter-highlight` capture (it is not in
+    /// [`HIGHLIGHT_NAMES`] and never can be - no grammar knows a bracket's nesting depth); it is
+    /// assigned by [`colorize_bracket_pairs`] as a post-process over an already-classified span
+    /// list. It is a real [`HighlightKind`] all the same, so it is independently themeable and
+    /// reaches every renderer that already goes through [`color_for_kind`] - the File view, the
+    /// minimap, the Diff and Merge views, the Markdown preview's fenced code blocks - with no
+    /// per-renderer wiring at all.
+    Bracket1,
+    /// Bracket-pair depth ring, colour 2 of 6 (nesting depth 1, 7, ...) - see [`Bracket1`](Self::Bracket1).
+    Bracket2,
+    /// Bracket-pair depth ring, colour 3 of 6 (nesting depth 2, 8, ...) - see [`Bracket1`](Self::Bracket1).
+    Bracket3,
+    /// Bracket-pair depth ring, colour 4 of 6 (nesting depth 3, 9, ...) - see [`Bracket1`](Self::Bracket1).
+    Bracket4,
+    /// Bracket-pair depth ring, colour 5 of 6 (nesting depth 4, 10, ...) - see [`Bracket1`](Self::Bracket1).
+    Bracket5,
+    /// Bracket-pair depth ring, colour 6 of 6 (nesting depth 5, 11, ...) - see [`Bracket1`](Self::Bracket1).
+    Bracket6,
     Tag,
     Attribute,
     Embedded,
@@ -285,6 +311,12 @@ impl HighlightKind {
             HighlightKind::Operator => "operator",
             HighlightKind::PunctuationBracket => "punctuation_bracket",
             HighlightKind::PunctuationDelimiter => "punctuation_delimiter",
+            HighlightKind::Bracket1 => "bracket_1",
+            HighlightKind::Bracket2 => "bracket_2",
+            HighlightKind::Bracket3 => "bracket_3",
+            HighlightKind::Bracket4 => "bracket_4",
+            HighlightKind::Bracket5 => "bracket_5",
+            HighlightKind::Bracket6 => "bracket_6",
             HighlightKind::Tag => "tag",
             HighlightKind::Attribute => "attribute",
             HighlightKind::Embedded => "embedded",
@@ -307,7 +339,7 @@ impl HighlightKind {
     /// source [`Self::from_name`] searches and
     /// `crate::settings::custom_theme::tests::every_highlight_kind_name_round_trips_through_from_name`
     /// checks exhaustively against.
-    pub const ALL: [HighlightKind; 27] = [
+    pub const ALL: [HighlightKind; 33] = [
         HighlightKind::Keyword,
         HighlightKind::Function,
         HighlightKind::FunctionMethod,
@@ -327,6 +359,12 @@ impl HighlightKind {
         HighlightKind::Operator,
         HighlightKind::PunctuationBracket,
         HighlightKind::PunctuationDelimiter,
+        HighlightKind::Bracket1,
+        HighlightKind::Bracket2,
+        HighlightKind::Bracket3,
+        HighlightKind::Bracket4,
+        HighlightKind::Bracket5,
+        HighlightKind::Bracket6,
         HighlightKind::Tag,
         HighlightKind::Attribute,
         HighlightKind::Embedded,
@@ -336,6 +374,28 @@ impl HighlightKind {
         HighlightKind::Strong,
         HighlightKind::Emphasis,
     ];
+
+    /// GitHub issue #168's rotating bracket-pair depth ring, in ring order: a real matched pair at
+    /// nesting depth `d` paints `BRACKET_DEPTH_RING[d % BRACKET_DEPTH_RING.len()]`, both halves
+    /// alike. Six is the ring length VSCode and most editors shipping this feature settled on -
+    /// short enough that two depths a reader is actually comparing (`d` and `d + 1`, which nest
+    /// directly inside one another) are always maximally far apart in the palette, long enough
+    /// that a wrap-around collision needs six levels of nesting to happen at all. See
+    /// `theme::syntax`'s own "bracket-pair depth ring" docs for how the six colours were measured.
+    pub const BRACKET_DEPTH_RING: [HighlightKind; 6] = [
+        HighlightKind::Bracket1,
+        HighlightKind::Bracket2,
+        HighlightKind::Bracket3,
+        HighlightKind::Bracket4,
+        HighlightKind::Bracket5,
+        HighlightKind::Bracket6,
+    ];
+
+    /// The ring colour a real matched pair at nesting `depth` paints - the one place the `% 6`
+    /// wrap-around lives, so no caller open-codes it.
+    pub fn for_bracket_depth(depth: usize) -> Self {
+        Self::BRACKET_DEPTH_RING[depth % Self::BRACKET_DEPTH_RING.len()]
+    }
 }
 
 /// Maps a [`HighlightKind`] to its real `theme::syntax::*` colour - see that module's own docs
@@ -370,6 +430,12 @@ pub fn color_for_kind(kind: HighlightKind) -> Rgba {
         HighlightKind::Operator => theme::syntax::OPERATOR.into(),
         HighlightKind::PunctuationBracket => theme::syntax::PUNCTUATION_BRACKET.into(),
         HighlightKind::PunctuationDelimiter => theme::syntax::PUNCTUATION_DELIMITER.into(),
+        HighlightKind::Bracket1 => theme::syntax::BRACKET_1.into(),
+        HighlightKind::Bracket2 => theme::syntax::BRACKET_2.into(),
+        HighlightKind::Bracket3 => theme::syntax::BRACKET_3.into(),
+        HighlightKind::Bracket4 => theme::syntax::BRACKET_4.into(),
+        HighlightKind::Bracket5 => theme::syntax::BRACKET_5.into(),
+        HighlightKind::Bracket6 => theme::syntax::BRACKET_6.into(),
         HighlightKind::Tag => theme::syntax::TAG.into(),
         HighlightKind::Attribute => theme::syntax::ATTRIBUTE.into(),
         HighlightKind::Embedded => theme::syntax::EMBEDDED.into(),
@@ -960,6 +1026,49 @@ const JSON_HIGHLIGHTS_SUPPLEMENT: &str = r#"
   key: (_) @string.special.key)
 "#;
 
+/// GitHub issue #168's real prerequisite for four of this module's grammars: a
+/// `punctuation.bracket` capture they simply do not ship one of.
+///
+/// [`colorize_bracket_pairs`] colours brackets the *grammar* identified, which is precisely what
+/// keeps a `{` inside a string or comment out of it. That only works if the grammar's own query
+/// actually names its bracket tokens - and `tree-sitter-python`, `-go`, `-json` and `-c` do not
+/// (verified by reading each crate's own bundled `queries/highlights.scm` on disk: Python's
+/// mentions `punctuation` only for `@punctuation.delimiter`/`.special`, and Go's, JSON's and C's
+/// not at all). Before this, those four languages emitted **no**
+/// [`HighlightKind::PunctuationBracket`] span whatsoever - a real pre-existing gap, not something
+/// bracket colouring introduced, and the reason bracket colouring would otherwise have silently
+/// done nothing in half of this app's supported languages.
+///
+/// Each list below is per-grammar rather than one shared constant because these are *anonymous
+/// token* patterns: naming a token a grammar doesn't have is a query **compile** error, not a
+/// pattern that harmlessly never matches, and JSON genuinely has no `(`/`)` token at all.
+/// (`every_real_grammar_config_compiles` is what would catch getting that wrong.)
+///
+/// Matching an anonymous token is also exactly why this stays safe: a `(` inside a string literal
+/// or a comment is not a token in the tree at all - it is part of the string/comment node's own
+/// text - so it cannot match, and needs no exclusion rule of its own. This is the same blanket
+/// shape `tree-sitter-rust`'s own bundled query already uses (`"(" @punctuation.bracket`, ...),
+/// not a new idea.
+///
+/// Appended last, so the last-pattern-wins rule this module's docs describe means these win over
+/// any earlier pattern that had captured the same token under another name.
+const PYTHON_BRACKET_SUPPLEMENT: &str = r#"
+["(" ")" "[" "]" "{" "}"] @punctuation.bracket
+"#;
+/// See [`PYTHON_BRACKET_SUPPLEMENT`].
+const GO_BRACKET_SUPPLEMENT: &str = r#"
+["(" ")" "[" "]" "{" "}"] @punctuation.bracket
+"#;
+/// See [`PYTHON_BRACKET_SUPPLEMENT`] - JSON has no parenthesis token, only the two bracket shapes
+/// its own grammar defines.
+const JSON_BRACKET_SUPPLEMENT: &str = r#"
+["[" "]" "{" "}"] @punctuation.bracket
+"#;
+/// See [`PYTHON_BRACKET_SUPPLEMENT`].
+const C_BRACKET_SUPPLEMENT: &str = r#"
+["(" ")" "[" "]" "{" "}"] @punctuation.bracket
+"#;
+
 /// Real supplement appended after the composed JavaScript + TypeScript query (see
 /// [`highlight_query_for`]), repairing two regressions that a live old-vs-new diff over real
 /// TypeScript caught. Both come from the same root cause: `tree-sitter-typescript`'s own
@@ -1058,7 +1167,7 @@ fn highlight_query_for(grammar: Grammar) -> String {
         Grammar::Rust => tree_sitter_rust::HIGHLIGHTS_QUERY.to_string(),
         Grammar::Python => {
             format!(
-                "{}\n{PYTHON_HIGHLIGHTS_SUPPLEMENT}",
+                "{}\n{PYTHON_HIGHLIGHTS_SUPPLEMENT}\n{PYTHON_BRACKET_SUPPLEMENT}",
                 tree_sitter_python::HIGHLIGHTS_QUERY
             )
         }
@@ -1075,15 +1184,15 @@ fn highlight_query_for(grammar: Grammar) -> String {
         ),
         Grammar::Toml => tree_sitter_toml_ng::HIGHLIGHTS_QUERY.to_string(),
         Grammar::Go => format!(
-            "{}\n{GO_HIGHLIGHTS_SUPPLEMENT}",
+            "{}\n{GO_HIGHLIGHTS_SUPPLEMENT}\n{GO_BRACKET_SUPPLEMENT}",
             tree_sitter_go::HIGHLIGHTS_QUERY
         ),
         Grammar::Json => format!(
-            "{}\n{JSON_HIGHLIGHTS_SUPPLEMENT}",
+            "{}\n{JSON_HIGHLIGHTS_SUPPLEMENT}\n{JSON_BRACKET_SUPPLEMENT}",
             tree_sitter_json::HIGHLIGHTS_QUERY
         ),
         Grammar::Yaml => tree_sitter_yaml::HIGHLIGHTS_QUERY.to_string(),
-        Grammar::C => tree_sitter_c::HIGHLIGHT_QUERY.to_string(),
+        Grammar::C => format!("{}\n{C_BRACKET_SUPPLEMENT}", tree_sitter_c::HIGHLIGHT_QUERY),
         Grammar::Markdown => format!(
             "{}\n{MARKDOWN_BLOCK_HIGHLIGHTS_SUPPLEMENT}",
             tree_sitter_md::HIGHLIGHT_QUERY_BLOCK
@@ -1476,7 +1585,13 @@ fn highlight_with(source: &str, grammar: Grammar) -> Vec<HighlightSpan> {
     else {
         return Vec::new();
     };
-    fold_highlight_events(events)
+    // GitHub issue #168. This is the single funnel every `highlight_*` entry point - and so every
+    // `crate::language::HighlighterFn` in the extension registry - goes through, which is why
+    // bracket-pair colouring is wired here rather than at each of the thirteen wrappers or at each
+    // renderer: one call site, no `HighlighterFn` signature change, and an injected layer
+    // (a markdown fence's Rust, an HTML `<script>`'s JavaScript) is already interleaved into these
+    // events in source-byte order, so its brackets nest correctly against the host document's.
+    colorize_bracket_pairs(source, fold_highlight_events(events))
 }
 
 /// Parses `source` with `tree-sitter-md`'s real block grammar and classifies it through the same
@@ -1571,6 +1686,183 @@ fn fold_highlight_events(
         }
     }
     spans
+}
+
+/// The three bracket shapes [`colorize_bracket_pairs`] really tracks, opener paired with closer.
+/// See that function's docs for why `<`/`>` is deliberately not a fourth entry.
+const TRACKED_BRACKET_PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+
+/// The closer that matches `opener`, or `None` if `opener` isn't a tracked opening bracket.
+fn closer_for(opener: char) -> Option<char> {
+    TRACKED_BRACKET_PAIRS
+        .iter()
+        .find(|(open, _)| *open == opener)
+        .map(|(_, close)| *close)
+}
+
+/// Whether `ch` is a tracked *closing* bracket.
+fn is_tracked_closer(ch: char) -> bool {
+    TRACKED_BRACKET_PAIRS.iter().any(|(_, close)| *close == ch)
+}
+
+/// GitHub issue #168's bracket-pair colourization: rewrites `spans` so that every `(`/`[`/`{`
+/// which really has a matching partner - and that partner - carry the same
+/// [`HighlightKind::for_bracket_depth`] ring colour for their pair's nesting depth, instead of the
+/// flat [`HighlightKind::PunctuationBracket`] the grammar's own capture gave them.
+///
+/// Pure, whole-source, and deliberately *not* a second parse. It needs no tree-sitter tree of its
+/// own because [`fold_highlight_events`] has already done the hard part: the grammar's own
+/// `punctuation.bracket` capture is what identifies a real bracket *token*, so a `{` written
+/// inside a string literal or a comment never arrives here as `PunctuationBracket` at all - it is
+/// part of a `String`/`Comment` span and is invisible to this pass by construction, not by a
+/// string-skipping heuristic this function would otherwise have had to reimplement per language.
+/// (`brackets_inside_strings_and_comments_are_never_coloured` pins exactly that.)
+///
+/// ## `<` and `>` deliberately do not participate
+///
+/// They genuinely do reach this function as `PunctuationBracket`: `tree-sitter-rust` captures
+/// `(type_arguments "<" @punctuation.bracket ">" @punctuation.bracket)` (and the same for
+/// `type_parameters`), `tree-sitter-typescript` the same for `type_arguments`, and
+/// `tree-sitter-html` captures a *tag's* own `<`/`>` under that name too. They are still skipped
+/// entirely - not pushed, not popped, left plain - for two real reasons rather than one:
+///
+/// 1. HTML would be actively wrong. `<div>` `</div>` are separate `<`/`>` pairs at the *same*
+///    nesting level, not an open/close pair, so a stack matcher colours a whole HTML document as
+///    one flat depth-0 ring while implying structure that isn't there.
+/// 2. Rust and TypeScript would be noisy for no gain. `HashMap<String, Vec<u8>>` is already
+///    unambiguous to read, and `a < b` / `->` / `=>` mean the same characters are a comparison or
+///    an arrow elsewhere in the same file - the grammar tells those apart, but the reader now has
+///    to, every time they see a coloured `<`.
+///
+/// VSCode's own bracket colourization makes the same call for the same reason.
+///
+/// ## What "unmatched" does
+///
+/// A bracket is recoloured **if and only if** it is half of a really-matched pair. Everything else
+/// keeps `PunctuationBracket`'s plain-text colour, which is why that token is still deliberately
+/// aliased to `syntax::TEXT` (see `theme::syntax`' own docs). Concretely:
+///
+/// - A closer with an empty stack, or whose shape doesn't match the innermost open bracket
+///   (`([)]`'s `)`), is left plain and **does not pop**. Not popping is the conservative choice: a
+///   stray closer is a local anomaly, and consuming a legitimately-open bracket for it would
+///   miscolour everything after it rather than just itself.
+/// - An opener still on the stack at the end of the source is left plain too. This is the common
+///   mid-edit case - the moment you type `{`, that `{` is genuinely unmatched - and leaving it
+///   plain until its partner exists is honest about what is actually known.
+///
+/// One consequence worth stating rather than hiding: an unmatched opener stays on the stack, so
+/// every pair *after* it in the file is nested one deeper than it looks, and the ring is offset by
+/// one from there on. Fixing that would need lookahead this pass deliberately doesn't do; the
+/// pairs it colours are all still really matched, and the offset resolves itself the moment the
+/// source balances again.
+///
+/// ## Why it re-splits spans
+///
+/// [`fold_highlight_events`] coalesces adjacent same-bucket spans, so `}}` or `<(` arrive as *one*
+/// `PunctuationBracket` span covering several characters. Every tracked bracket therefore has to
+/// be split out to its own span before it can be coloured individually - and the output is
+/// re-coalesced on the way out, so a run this pass leaves entirely plain (`<>`, `))` where both
+/// are unmatched) collapses back to the single span it came in as rather than inflating
+/// [`build_lines`]' per-line run count.
+///
+/// Runs once per real content change, on whatever thread already owned that highlight - never per
+/// frame: it is called from [`highlight_with`], the single funnel every `highlight_*` entry point
+/// (and so every `crate::language::HighlighterFn`) goes through, whose three callers are
+/// [`load_file_with_source`], `EditBuffer::new` and `crate::code_surface::editing`'s debounced
+/// background re-highlight. Cost is one linear pass over a span list that was just built by a
+/// parse costing orders of magnitude more.
+pub fn colorize_bracket_pairs(source: &str, spans: Vec<HighlightSpan>) -> Vec<HighlightSpan> {
+    // Pass 1: find every tracked bracket character, in source order, and work out which ones are
+    // halves of a real pair. `depths[i]` stays `None` for a bracket that never found its partner.
+    // `bracket_bytes` records where each of those was, so pass 2 can `debug_assert` it is walking
+    // the exact same sequence - the two passes iterate the same spans by the same rule, and this
+    // is what would catch them ever drifting apart and silently colouring the wrong characters.
+    let mut bracket_bytes: Vec<usize> = Vec::new();
+    let mut depths: Vec<Option<usize>> = Vec::new();
+    // (expected closer, index into `depths` of the opener, that opener's nesting depth).
+    let mut stack: Vec<(char, usize, usize)> = Vec::new();
+
+    for span in &spans {
+        if span.kind != HighlightKind::PunctuationBracket {
+            continue;
+        }
+        let Some(text) = source.get(span.start..span.end) else {
+            continue;
+        };
+        for (offset, ch) in text.char_indices() {
+            if let Some(closer) = closer_for(ch) {
+                stack.push((closer, depths.len(), stack.len()));
+                bracket_bytes.push(span.start + offset);
+                depths.push(None);
+            } else if is_tracked_closer(ch) {
+                bracket_bytes.push(span.start + offset);
+                depths.push(None);
+                let closer_index = depths.len() - 1;
+                if let Some(&(expected, opener_index, depth)) = stack.last() {
+                    if expected == ch {
+                        stack.pop();
+                        depths[opener_index] = Some(depth);
+                        depths[closer_index] = Some(depth);
+                    }
+                }
+            }
+        }
+    }
+
+    if bracket_bytes.is_empty() {
+        return spans;
+    }
+
+    // Pass 2: rebuild the span list, splitting each `PunctuationBracket` span into its individual
+    // characters so a matched bracket can carry its own ring colour, then re-coalescing.
+    let mut out: Vec<HighlightSpan> = Vec::with_capacity(spans.len());
+    let mut next_bracket = 0usize;
+    for span in spans {
+        if span.kind != HighlightKind::PunctuationBracket {
+            push_coalesced(&mut out, span);
+            continue;
+        }
+        let Some(text) = source.get(span.start..span.end) else {
+            push_coalesced(&mut out, span);
+            continue;
+        };
+        for (offset, ch) in text.char_indices() {
+            let start = span.start + offset;
+            let mut kind = HighlightKind::PunctuationBracket;
+            if closer_for(ch).is_some() || is_tracked_closer(ch) {
+                debug_assert_eq!(
+                    bracket_bytes.get(next_bracket),
+                    Some(&start),
+                    "pass 2 walked a different bracket sequence than pass 1"
+                );
+                if let Some(Some(depth)) = depths.get(next_bracket) {
+                    kind = HighlightKind::for_bracket_depth(*depth);
+                }
+                next_bracket += 1;
+            }
+            push_coalesced(
+                &mut out,
+                HighlightSpan {
+                    start,
+                    end: start + ch.len_utf8(),
+                    kind,
+                },
+            );
+        }
+    }
+    out
+}
+
+/// Appends `span`, merging it into the previous one when they're adjacent and the same bucket -
+/// the same invariant [`fold_highlight_events`] maintains, restored after
+/// [`colorize_bracket_pairs`] splits a multi-character bracket run apart.
+fn push_coalesced(spans: &mut Vec<HighlightSpan>, span: HighlightSpan) {
+    match spans.last_mut() {
+        Some(previous) if previous.end == span.start && previous.kind == span.kind => {
+            previous.end = span.end;
+        }
+        _ => spans.push(span),
+    }
 }
 
 /// One already-highlighted display line: its text (never including line-ending bytes) plus a
@@ -3822,5 +4114,616 @@ mod tests {
         let rendered = highlight_block([""], Some("rs"));
         assert_eq!(rendered.len(), 1);
         assert_eq!(rendered[0].text, "");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // GitHub issue #168: bracket-pair colourization.
+    //
+    // The pure matcher first, driven by hand-built span lists - no grammar, no parse, no render.
+    // A `HighlightSpan` list is exactly what `fold_highlight_events` hands `colorize_bracket_pairs`
+    // in production, so building one directly tests the real contract rather than a stand-in.
+    // The real-grammar and real-`RenderedLine` tests come after these.
+    // ---------------------------------------------------------------------------------------
+
+    /// Classifies every byte of `source` that is one of `bracket_chars` as
+    /// [`HighlightKind::PunctuationBracket`] and everything else as [`HighlightKind::Text`],
+    /// coalescing adjacent same-kind bytes exactly the way `fold_highlight_events` really does -
+    /// so `"{}"` arrives as one two-character span, which is the case that forced
+    /// `colorize_bracket_pairs` to be able to split a span at all.
+    fn bracket_spans(source: &str, bracket_chars: &str) -> Vec<HighlightSpan> {
+        let mut spans: Vec<HighlightSpan> = Vec::new();
+        for (offset, ch) in source.char_indices() {
+            let kind = if bracket_chars.contains(ch) {
+                HighlightKind::PunctuationBracket
+            } else {
+                HighlightKind::Text
+            };
+            push_coalesced(
+                &mut spans,
+                HighlightSpan {
+                    start: offset,
+                    end: offset + ch.len_utf8(),
+                    kind,
+                },
+            );
+        }
+        spans
+    }
+
+    /// The bucket each byte of `source` ends up in after `colorize_bracket_pairs`, rendered as one
+    /// compact string for easy whole-shape assertions: `.` for anything that isn't a bracket,
+    /// `-` for a bracket left plain (unmatched, or an untracked `<`/`>`), and `1`..`6` for the ring
+    /// colour a matched bracket really got.
+    fn depth_map(source: &str, bracket_chars: &str) -> String {
+        let spans = colorize_bracket_pairs(source, bracket_spans(source, bracket_chars));
+        let mut out = String::new();
+        for (offset, _) in source.char_indices() {
+            let span = spans
+                .iter()
+                .find(|span| span.start <= offset && offset < span.end)
+                .expect("colorize_bracket_pairs must stay gapless over the whole source");
+            out.push(match span.kind {
+                HighlightKind::PunctuationBracket => '-',
+                HighlightKind::Text => '.',
+                kind => match HighlightKind::BRACKET_DEPTH_RING
+                    .iter()
+                    .position(|ring| *ring == kind)
+                {
+                    Some(index) => char::from_digit(index as u32 + 1, 10).expect("1..=6"),
+                    None => panic!("unexpected bucket {kind:?}"),
+                },
+            });
+        }
+        out
+    }
+
+    /// The headline case from the issue: three different bracket shapes nesting inside one
+    /// another, each pair's two halves sharing one colour, each level a different one.
+    #[test]
+    fn mixed_bracket_shapes_nest_and_each_pair_shares_one_ring_colour() {
+        assert_eq!(depth_map("foo([{}])", "([{}])"), "...123321");
+    }
+
+    /// Siblings are not nesting: two pairs at the same level both get depth 0, so a long flat
+    /// argument list doesn't drift through the ring.
+    #[test]
+    fn sibling_pairs_at_the_same_level_all_get_the_same_ring_colour() {
+        assert_eq!(depth_map("()()()", "()"), "111111");
+        // Both inner pairs are siblings *inside* the outer one, so both are at depth 1 - a
+        // sibling never advances the ring, only nesting does.
+        assert_eq!(depth_map("(()())", "()"), "122221");
+    }
+
+    /// The ring is `% 6`, so the seventh level of nesting really does come back around to colour
+    /// 1 - and the matching closer comes back around with it.
+    #[test]
+    fn the_seventh_nesting_level_wraps_back_to_the_first_ring_colour() {
+        // Eight levels: depths 0..7 colour as 1,2,3,4,5,6 and then wrap to 1,2 - and every
+        // closer comes back around with its own opener.
+        assert_eq!(depth_map("(((((((())))))))", "()"), "1234561221654321");
+    }
+
+    /// A stray closer is left plain and, critically, does **not** pop: the `(` around it is still
+    /// really open, so its own eventual `)` must still find it. Popping here would miscolour
+    /// everything after the anomaly instead of just the anomaly itself.
+    #[test]
+    fn a_stray_closer_is_left_plain_and_does_not_consume_the_open_bracket() {
+        assert_eq!(depth_map("(a)b)", "()"), "1.1.-");
+        assert_eq!(depth_map("()) ()", "()"), "11-.11");
+        // The load-bearing one: the stray `)` sits *inside* a real pair.
+        assert_eq!(depth_map("( ) )", "()"), "1.1.-");
+        assert_eq!(depth_map("[ ) ]", "[)]"), "1.-.1");
+    }
+
+    /// The mid-edit case every real editor has to tolerate: an opener with no partner yet keeps
+    /// plain punctuation colouring rather than claiming a depth it can't prove.
+    #[test]
+    fn an_opener_that_never_closes_is_left_plain() {
+        assert_eq!(depth_map("fn f() {", "(){}"), "....11.-");
+        assert_eq!(depth_map("{[", "{["), "--");
+    }
+
+    /// Shapes have to agree, not just counts - a naive depth counter would happily colour `([)]`
+    /// as two nested pairs. The real stack matcher pairs `[` with `]` and leaves both the `(` and
+    /// the `)` plain, because neither ever met a partner of its own shape.
+    #[test]
+    fn mismatched_shapes_do_not_pair_up() {
+        assert_eq!(depth_map("([)]", "([)]"), "-2-2");
+    }
+
+    /// Nothing panics or produces nonsense on input that is nothing but noise - the honest
+    /// degradation the issue asks for. Everything unmatched, nothing coloured.
+    #[test]
+    fn thoroughly_unbalanced_input_degrades_to_plain_brackets_without_panicking() {
+        assert_eq!(depth_map(")))", "()"), "---");
+        assert_eq!(depth_map("}{", "{}"), "--");
+        assert_eq!(depth_map(")}]([{", "()[]{}"), "------");
+    }
+
+    /// The reason this pass needs no string/comment awareness of its own: a `{` inside a string
+    /// literal or a comment is never classified `PunctuationBracket` by the grammar's own query
+    /// in the first place, so it is invisible here by construction. Modelled exactly as the real
+    /// pipeline delivers it - the brackets inside the quotes carry `String`/`Comment` spans.
+    #[test]
+    fn brackets_inside_strings_and_comments_are_never_coloured() {
+        // `f("(", /* ) */)` - only the outer `(` and the final `)` are real bracket tokens.
+        let source = r#"f("(", /* ) */)"#;
+        let spans = vec![
+            HighlightSpan {
+                start: 0,
+                end: 1,
+                kind: HighlightKind::Function,
+            },
+            HighlightSpan {
+                start: 1,
+                end: 2,
+                kind: HighlightKind::PunctuationBracket,
+            },
+            HighlightSpan {
+                start: 2,
+                end: 5,
+                kind: HighlightKind::String,
+            },
+            HighlightSpan {
+                start: 5,
+                end: 7,
+                kind: HighlightKind::PunctuationDelimiter,
+            },
+            HighlightSpan {
+                start: 7,
+                end: 14,
+                kind: HighlightKind::Comment,
+            },
+            HighlightSpan {
+                start: 14,
+                end: 15,
+                kind: HighlightKind::PunctuationBracket,
+            },
+        ];
+        let out = colorize_bracket_pairs(source, spans);
+        let kind_of = |byte: usize| {
+            out.iter()
+                .find(|span| span.start <= byte && byte < span.end)
+                .expect("gapless")
+                .kind
+        };
+        assert_eq!(
+            kind_of(1),
+            HighlightKind::Bracket1,
+            "the real opening paren must be a matched depth-0 pair"
+        );
+        assert_eq!(
+            kind_of(14),
+            HighlightKind::Bracket1,
+            "its partner is the final paren, not the one inside the string"
+        );
+        assert_eq!(
+            kind_of(3),
+            HighlightKind::String,
+            "the `(` inside the string literal must stay part of the string"
+        );
+        assert_eq!(
+            kind_of(10),
+            HighlightKind::Comment,
+            "the `)` inside the comment must stay part of the comment"
+        );
+    }
+
+    /// `<`/`>` really do arrive here as `PunctuationBracket` (Rust and TypeScript both capture a
+    /// type-argument list's angle brackets that way, and `tree-sitter-html` captures a tag's) and
+    /// are deliberately skipped - see `colorize_bracket_pairs`' own docs. They must not push, not
+    /// pop, and not disturb the depth of the real brackets around them.
+    #[test]
+    fn angle_brackets_never_participate_and_never_disturb_the_stack() {
+        assert_eq!(depth_map("<>", "<>"), "--");
+        // A generic argument list wrapping a real paren pair: the parens are still depth 0.
+        assert_eq!(depth_map("f::<A>(x)", "<>()"), "...-.-1.1");
+        // HTML, the case that would be actively wrong if angle brackets were tracked.
+        assert_eq!(depth_map("<p></p>", "<>"), "-.--..-");
+    }
+
+    /// `fold_highlight_events` coalesces adjacent same-bucket spans, so a run like `}})` really
+    /// does reach this function as *one* span. Each bracket in it still has to be coloured
+    /// individually.
+    #[test]
+    fn a_coalesced_multi_character_bracket_run_is_split_per_bracket() {
+        let source = "((a))";
+        let spans = bracket_spans(source, "()");
+        assert_eq!(
+            spans.len(),
+            3,
+            "premise: the two leading parens must arrive as one coalesced span - got {spans:?}"
+        );
+        assert_eq!(depth_map(source, "()"), "12.21");
+    }
+
+    /// The flip side: a bracket run this pass leaves entirely plain must come back out as the
+    /// single span it went in as, not as N one-character spans - otherwise every `<>` in a
+    /// TypeScript file would inflate `build_lines`' per-line run count for nothing.
+    #[test]
+    fn an_untouched_bracket_run_is_re_coalesced_rather_than_left_split() {
+        let source = "a<>b()";
+        let out = colorize_bracket_pairs(source, bracket_spans(source, "<>()"));
+        let angle = out
+            .iter()
+            .find(|span| span.start == 1)
+            .expect("a span starting at the `<`");
+        assert_eq!(
+            (angle.start, angle.end, angle.kind),
+            (1, 3, HighlightKind::PunctuationBracket),
+            "the untouched `<>` run must stay one span - got {out:?}"
+        );
+    }
+
+    /// Source with no bracket tokens at all is handed straight back, untouched - the early-out
+    /// that keeps this pass free for prose, YAML, plain text and every other bracket-light file.
+    #[test]
+    fn source_with_no_bracket_tokens_is_returned_completely_unchanged() {
+        let source = "let x = 1;";
+        let spans = bracket_spans(source, "");
+        let before = spans.clone();
+        assert_eq!(colorize_bracket_pairs(source, spans), before);
+        assert!(colorize_bracket_pairs("", Vec::new()).is_empty());
+    }
+
+    /// The output has to stay the gapless, ordered, non-overlapping span list every consumer
+    /// downstream (`build_lines`, `minimap`, `edit_buffer`'s stale-span reuse) already relies on -
+    /// splitting and re-coalescing must not break that invariant.
+    #[test]
+    fn the_rewritten_span_list_stays_gapless_ordered_and_non_overlapping() {
+        let source = "fn main() { let v = vec![(1, 2), (3, 4)]; }";
+        let out = colorize_bracket_pairs(source, bracket_spans(source, "()[]{}"));
+        assert_eq!(out.first().map(|span| span.start), Some(0));
+        assert_eq!(out.last().map(|span| span.end), Some(source.len()));
+        for pair in out.windows(2) {
+            assert_eq!(
+                pair[0].end, pair[1].start,
+                "spans must remain gapless and ordered: {out:?}"
+            );
+            assert_ne!(
+                pair[0].kind, pair[1].kind,
+                "adjacent same-kind spans must have been coalesced: {out:?}"
+            );
+        }
+    }
+
+    /// Multi-byte characters between brackets must not shift any byte offset - the split loop
+    /// walks `char_indices`, and this is what would catch it walking bytes instead.
+    #[test]
+    fn multi_byte_characters_do_not_shift_bracket_offsets() {
+        let source = "(\"héllo → wörld\")";
+        let out = colorize_bracket_pairs(source, bracket_spans(source, "()"));
+        assert_eq!(
+            out.first().map(|span| (span.start, span.end, span.kind)),
+            Some((0, 1, HighlightKind::Bracket1))
+        );
+        assert_eq!(
+            out.last().map(|span| (span.start, span.end, span.kind)),
+            Some((source.len() - 1, source.len(), HighlightKind::Bracket1))
+        );
+    }
+
+    /// `for_bracket_depth` is the single home of the `% 6` wrap-around, and the ring it indexes is
+    /// really six distinct buckets (not six aliases of one).
+    #[test]
+    fn the_depth_ring_is_six_distinct_buckets_and_wraps_at_six() {
+        let ring = HighlightKind::BRACKET_DEPTH_RING;
+        for (index, kind) in ring.iter().enumerate() {
+            assert_eq!(HighlightKind::for_bracket_depth(index), *kind);
+            assert_eq!(HighlightKind::for_bracket_depth(index + 6), *kind);
+            assert_eq!(HighlightKind::for_bracket_depth(index + 600), *kind);
+        }
+        let unique: HashSet<HighlightKind> = ring.into_iter().collect();
+        assert_eq!(unique.len(), ring.len(), "ring buckets must all differ");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Real grammars, real spans: the pure matcher above is only worth anything if the actual
+    // highlighting pipeline really delivers depth-varying brackets for real source in real
+    // languages. These parse with the genuine grammars, through the same `highlight_*` entry
+    // points the app calls.
+    // ---------------------------------------------------------------------------------------
+
+    /// The bucket the span covering `byte` classifies it as. Deliberately *not* `kind_at`, which
+    /// looks its argument up by substring search and so always finds the first `(` in the file -
+    /// useless when the whole question is which of several identical characters this one is.
+    fn kind_at_byte(spans: &[HighlightSpan], byte: usize) -> HighlightKind {
+        spans
+            .iter()
+            .find(|span| span.start <= byte && byte < span.end)
+            .map_or(HighlightKind::Text, |span| span.kind)
+    }
+
+    /// The ring colour a real bracket at `byte` got, or `None` if the pipeline left it plain.
+    fn ring_index_at(spans: &[HighlightSpan], byte: usize) -> Option<usize> {
+        let kind = spans
+            .iter()
+            .find(|span| span.start <= byte && byte < span.end)
+            .map(|span| span.kind)?;
+        HighlightKind::BRACKET_DEPTH_RING
+            .iter()
+            .position(|ring| *ring == kind)
+    }
+
+    /// The byte offset of the `nth` occurrence (0-based) of `needle` in `source`.
+    fn nth_offset(source: &str, needle: char, nth: usize) -> usize {
+        source
+            .char_indices()
+            .filter(|(_, ch)| *ch == needle)
+            .map(|(offset, _)| offset)
+            .nth(nth)
+            .unwrap_or_else(|| panic!("{source:?} has no {nth}th {needle:?}"))
+    }
+
+    /// Rust, through the real `tree-sitter-rust` grammar: three nesting levels, each a different
+    /// ring colour, each pair's two halves sharing one. The string literal's own `(` is the
+    /// control: it must stay part of the string.
+    #[test]
+    fn real_rust_source_gets_real_depth_varying_bracket_colours() {
+        let source = "fn main() {\n    let v = vec![(1, \"(\")];\n}\n";
+        let spans = highlight_rust(source);
+
+        let brace_open = nth_offset(source, '{', 0);
+        let bracket_open = nth_offset(source, '[', 0);
+        let paren_open = nth_offset(source, '(', 1); // after `main(`
+        let paren_close = nth_offset(source, ')', 1);
+        let bracket_close = nth_offset(source, ']', 0);
+        let brace_close = nth_offset(source, '}', 0);
+
+        assert_eq!(ring_index_at(&spans, brace_open), Some(0));
+        assert_eq!(ring_index_at(&spans, bracket_open), Some(1));
+        assert_eq!(ring_index_at(&spans, paren_open), Some(2));
+        assert_eq!(
+            ring_index_at(&spans, paren_close),
+            Some(2),
+            "a closer must carry its own pair's colour, not the next one's"
+        );
+        assert_eq!(ring_index_at(&spans, bracket_close), Some(1));
+        assert_eq!(ring_index_at(&spans, brace_close), Some(0));
+
+        // `main()`'s own empty parameter list is a sibling of the body brace, not nested in it.
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '(', 0)), Some(0));
+
+        // The control: the `(` inside the string literal is not a bracket token at all.
+        let in_string = nth_offset(source, '(', 2);
+        assert_eq!(
+            kind_at_byte(&spans, in_string),
+            HighlightKind::String,
+            "a paren inside a string literal must never reach the bracket ring"
+        );
+        assert_eq!(ring_index_at(&spans, in_string), None);
+    }
+
+    /// TypeScript, through the real `tree-sitter-typescript` grammar. Also the real proof of the
+    /// `<`/`>` decision: `Map<string, number>`'s angle brackets are genuinely captured as
+    /// `punctuation.bracket` by that grammar, and must still come out plain.
+    #[test]
+    fn real_typescript_source_gets_real_depth_varying_bracket_colours() {
+        let source = "function f(m: Map<string, number>) {\n  return [{ a: 1 }];\n}\n";
+        let spans = highlight_ts(source);
+
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '(', 0)), Some(0));
+        assert_eq!(ring_index_at(&spans, nth_offset(source, ')', 0)), Some(0));
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '{', 0)), Some(0));
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '[', 0)), Some(1));
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '{', 1)), Some(2));
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '}', 0)), Some(2));
+        assert_eq!(ring_index_at(&spans, nth_offset(source, ']', 0)), Some(1));
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '}', 1)), Some(0));
+
+        let angle_open = nth_offset(source, '<', 0);
+        assert_eq!(
+            kind_at_byte(&spans, angle_open),
+            HighlightKind::PunctuationBracket,
+            "premise: this grammar really does capture a type-argument `<` as punctuation.bracket"
+        );
+        assert_eq!(
+            ring_index_at(&spans, angle_open),
+            None,
+            "an angle bracket must stay plain - see colorize_bracket_pairs' own docs"
+        );
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '>', 0)), None);
+    }
+
+    /// Python, through the real `tree-sitter-python` grammar - a third language, and the one whose
+    /// comment syntax differs most from the other two.
+    #[test]
+    fn real_python_source_gets_real_depth_varying_bracket_colours() {
+        let source =
+            "def f():\n    return sorted([(k, v) for k, v in d.items()])  # ) not a bracket\n";
+        let spans = highlight_python(source);
+
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '(', 1)), Some(0)); // sorted(
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '[', 0)), Some(1));
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '(', 2)), Some(2)); // (k, v)
+        assert_eq!(ring_index_at(&spans, nth_offset(source, ')', 1)), Some(2));
+        assert_eq!(ring_index_at(&spans, nth_offset(source, ']', 0)), Some(1));
+
+        let in_comment = nth_offset(source, ')', 4);
+        assert_eq!(
+            kind_at_byte(&spans, in_comment),
+            HighlightKind::Comment,
+            "a paren inside a `#` comment must never reach the bracket ring"
+        );
+        assert_eq!(ring_index_at(&spans, in_comment), None);
+    }
+
+    /// End of the real pipeline, not the middle of it: the `RenderedLine` runs the File view
+    /// actually paints carry the ring buckets, and `color_for_kind` turns them into genuinely
+    /// different colours on screen. This is what proves the feature is wired all the way through
+    /// rather than merely computed - `build_lines` is the last step before rendering, and
+    /// `color_for_kind` is what `file_view`/`minimap`/`diff_view`/`merge::render` all call.
+    #[test]
+    fn rendered_line_runs_really_carry_distinct_bracket_colours() {
+        let source = "fn main() {\n    let v = vec![(1, 2)];\n}\n";
+        let lines = build_lines(source, &highlight_rust(source));
+
+        let ring_runs: Vec<(String, HighlightKind)> = lines
+            .iter()
+            .flat_map(|line| line.runs.iter())
+            .filter(|(_, kind)| HighlightKind::BRACKET_DEPTH_RING.contains(kind))
+            .map(|(text, kind)| (text.to_string(), *kind))
+            .collect();
+
+        // Every bracket character in this sample is really matched, so every one of them must be
+        // inside a ring run - counted by character, because two *adjacent* brackets at the same
+        // depth (`main()`'s own empty parameter list) legitimately coalesce back into one run.
+        // That merge is invisible on screen - both halves paint the same colour either way - and
+        // it is the same run-count economy `fold_highlight_events` already practises.
+        let coloured_chars: usize = ring_runs.iter().map(|(text, _)| text.chars().count()).sum();
+        assert_eq!(
+            coloured_chars,
+            source.chars().filter(|ch| "()[]{}".contains(*ch)).count(),
+            "every matched bracket character must be inside a ring run - got {ring_runs:?}"
+        );
+        for (text, _) in &ring_runs {
+            assert!(
+                text.chars().all(|ch| "()[]{}".contains(ch)),
+                "a ring run must contain nothing but brackets - got {ring_runs:?}"
+            );
+        }
+        let distinct: HashSet<HighlightKind> = ring_runs.iter().map(|(_, kind)| *kind).collect();
+        assert!(
+            distinct.len() >= 3,
+            "this sample nests three levels deep, so at least three ring buckets must appear - \
+             got {ring_runs:?}"
+        );
+
+        // ... and those buckets really paint different colours.
+        let colors: HashSet<[u32; 4]> = distinct
+            .iter()
+            .map(|kind| {
+                let color = color_for_kind(*kind);
+                [
+                    color.r.to_bits(),
+                    color.g.to_bits(),
+                    color.b.to_bits(),
+                    color.a.to_bits(),
+                ]
+            })
+            .collect();
+        assert_eq!(
+            colors.len(),
+            distinct.len(),
+            "every distinct ring bucket must resolve to its own distinct colour"
+        );
+        assert!(
+            !colors.contains(&{
+                let plain = color_for_kind(HighlightKind::PunctuationBracket);
+                [
+                    plain.r.to_bits(),
+                    plain.g.to_bits(),
+                    plain.b.to_bits(),
+                    plain.a.to_bits(),
+                ]
+            }),
+            "no ring colour may equal the plain unmatched-bracket colour"
+        );
+    }
+
+    /// The honest coverage matrix: which of this module's languages bracket-pair colouring really
+    /// works in, asserted rather than assumed.
+    ///
+    /// Six of these needed no work - their grammars ship a `punctuation.bracket` capture. Four
+    /// (Python, Go, JSON, C) shipped none at all and emitted *no* bracket span whatsoever before
+    /// this; they work through the per-grammar bracket supplements (see
+    /// [`PYTHON_BRACKET_SUPPLEMENT`]). This test is what would catch a grammar upgrade silently
+    /// dropping either.
+    ///
+    /// Markdown and HTML are the two real, deliberate exclusions, and they are asserted as such
+    /// rather than left ambiguous: Markdown prose has no bracket *tokens* (a `(` in a sentence is
+    /// text, and its fenced code blocks reach the ring through their injected language instead -
+    /// see the next test), and HTML's only bracketed tokens are the `<`/`>` of a tag, which
+    /// `colorize_bracket_pairs` deliberately never tracks.
+    #[test]
+    fn bracket_colouring_really_works_in_every_language_that_can_support_it() {
+        /// `(language label, its real highlighter, a nesting sample)`.
+        type LanguageSample = (&'static str, crate::language::HighlighterFn, &'static str);
+
+        let coloured: [LanguageSample; 10] = [
+            ("rust", highlight_rust, "fn f() { g(vec![1]); }"),
+            ("typescript", highlight_ts, "function f() { g([1]); }"),
+            ("tsx", highlight_tsx, "function f() { g([1]); }"),
+            ("python", highlight_python, "def f():\n    g([1])\n"),
+            ("toml", highlight_toml, "a = [[1], [2]]\n"),
+            ("go", highlight_go, "func f() { g([]int{1}) }"),
+            ("json", highlight_json, "{\"a\": [1]}"),
+            ("yaml", highlight_yaml, "a: [1, {b: 2}]\n"),
+            (
+                "c",
+                highlight_c,
+                "int f(void) { int a[] = {1}; return a[0]; }",
+            ),
+            ("css", highlight_css, ".a { color: rgb(1, 2, 3); }"),
+        ];
+        for (name, highlight, source) in coloured {
+            let spans = highlight(source);
+            let ring: Vec<&str> = spans
+                .iter()
+                .filter(|span| HighlightKind::BRACKET_DEPTH_RING.contains(&span.kind))
+                .map(|span| &source[span.start..span.end])
+                .collect();
+            assert!(
+                ring.len() >= 2,
+                "{name} must really get depth-coloured brackets - got {ring:?}"
+            );
+            let distinct: HashSet<HighlightKind> = spans
+                .iter()
+                .map(|span| span.kind)
+                .filter(|kind| HighlightKind::BRACKET_DEPTH_RING.contains(kind))
+                .collect();
+            assert!(
+                distinct.len() >= 2,
+                "{name}'s sample nests, so it must really show more than one ring colour - got \
+                 {ring:?}"
+            );
+        }
+
+        let excluded: [LanguageSample; 2] = [
+            ("markdown", highlight_markdown, "prose (a) [b]\n"),
+            ("html", highlight_html, "<div><p>x</p></div>"),
+        ];
+        for (name, highlight, source) in excluded {
+            let spans = highlight(source);
+            assert!(
+                !spans
+                    .iter()
+                    .any(|span| HighlightKind::BRACKET_DEPTH_RING.contains(&span.kind)),
+                "{name} is a deliberate exclusion - see this test's own docs"
+            );
+        }
+    }
+
+    /// A markdown fenced code block's Rust reaches the ring too - the injection path really goes
+    /// through the same `highlight_with` funnel, so this needed no markdown-specific wiring.
+    #[test]
+    fn brackets_inside_a_markdown_fenced_code_block_reach_the_ring() {
+        let source = "# Title\n\n```rust\nfn f() { g(1); }\n```\n";
+        let spans = highlight_markdown(source);
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '{', 0)), Some(0));
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '(', 1)), Some(1));
+    }
+
+    /// A diff hunk highlighted on its own (`highlight_block`) is a partial, hunk-local source by
+    /// design, so its depths are hunk-relative and a bracket whose partner is outside the hunk
+    /// stays plain. That is the honest degradation, and it is worth pinning rather than leaving as
+    /// an undiscovered surprise.
+    #[test]
+    fn a_partial_hunk_colours_its_own_balanced_pairs_and_leaves_the_dangling_ones_plain() {
+        let rendered = highlight_block(["    let v = vec![1];", "}"], Some("rs"));
+        let runs: Vec<HighlightKind> = rendered
+            .iter()
+            .flat_map(|line| line.runs.iter())
+            .map(|(_, kind)| *kind)
+            .collect();
+        assert!(
+            runs.iter()
+                .any(|kind| HighlightKind::BRACKET_DEPTH_RING.contains(kind)),
+            "the hunk's own balanced `[1]` must still be coloured - got {runs:?}"
+        );
+        assert!(
+            runs.contains(&HighlightKind::PunctuationBracket),
+            "the trailing `}}`, whose partner is outside the hunk, must stay plain - got {runs:?}"
+        );
     }
 }

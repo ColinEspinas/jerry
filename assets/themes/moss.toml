@@ -214,6 +214,12 @@ property                  = "#699bae"  # property (a field/attribute access
 operator                  = "#979ca7"  # operator (+, ==, &&, ...)
 punctuation_bracket       = "#979ca7"
 punctuation_delimiter     = "#979ca7"  # punctuation.delimiter (,/;/:/./::)
+bracket_1                 = "#38c8bd"
+bracket_2                 = "#9b4bcd"
+bracket_3                 = "#3fac40"
+bracket_4                 = "#ba615a"
+bracket_5                 = "#3675b5"
+bracket_6                 = "#c3b141"
 tag                       = "#c5ab73"
 attribute                 = "#71a19b"
 embedded                  = "#979ca7"

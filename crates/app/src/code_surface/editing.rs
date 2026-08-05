@@ -2447,8 +2447,17 @@ mod editing_tests {
             "\"foo\"'s own already-known real highlighting must survive this edit untouched, not \
              just get lucky in the eventual re-highlight: {kinds_immediately:?}"
         );
+        // GitHub issue #168 turned these brackets into real matched pairs, so what has to survive
+        // the splice is a *ring* bucket, not the plain `PunctuationBracket` this used to name.
+        // Same assertion, same reason - the incremental splice must carry an untouched token's
+        // already-known colour through rather than dropping it back to plain text.
         assert!(
-            kinds_immediately.contains(&code_view::HighlightKind::PunctuationBracket),
+            kinds_immediately
+                .iter()
+                .any(
+                    |kind| code_view::HighlightKind::BRACKET_DEPTH_RING.contains(kind)
+                        || *kind == code_view::HighlightKind::PunctuationBracket
+                ),
             "the untouched brackets' own already-known real highlighting must survive too: \
              {kinds_immediately:?}"
         );
