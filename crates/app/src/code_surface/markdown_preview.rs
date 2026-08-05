@@ -433,6 +433,7 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let blocks = parse_markdown(source);
+        let options = self.highlight_options();
         let content = div()
             .id("markdown-preview-content")
             // Test-only lookup key for `VisualTestContext::debug_bounds` - matches
@@ -449,7 +450,7 @@ impl AdeApp {
             .px(px(28.0))
             .py(px(20.0))
             .gap(px(10.0))
-            .children(blocks.iter().map(render_block));
+            .children(blocks.iter().map(|block| render_block(block, options)));
         let scrolled = div()
             .relative()
             .flex()
@@ -468,17 +469,22 @@ impl AdeApp {
     }
 }
 
-fn render_block(block: &MdBlock) -> AnyElement {
+/// `options` is threaded down from [`AdeApp::render_markdown_preview`]'s own `&self` rather than
+/// read from ambient state, so a fenced code block honours `appearance.bracket_pair_colorization`
+/// exactly like the source view does - see `code_view::HighlightOptions`' own docs.
+fn render_block(block: &MdBlock, options: code_view::HighlightOptions) -> AnyElement {
     match block {
         MdBlock::Heading { level, inline } => render_heading(*level, inline),
         MdBlock::Paragraph(inline) => render_prose(inline, theme::text::BODY, prose_font()),
-        MdBlock::CodeBlock { language, text } => render_code_block(language.as_deref(), text),
+        MdBlock::CodeBlock { language, text } => {
+            render_code_block(language.as_deref(), text, options)
+        }
         MdBlock::List {
             ordered,
             start,
             items,
-        } => render_list(*ordered, *start, items),
-        MdBlock::BlockQuote(blocks) => render_block_quote(blocks),
+        } => render_list(*ordered, *start, items, options),
+        MdBlock::BlockQuote(blocks) => render_block_quote(blocks, options),
         MdBlock::ThematicBreak => render_thematic_break(),
         MdBlock::Table { header, rows } => render_table(header, rows),
     }
@@ -625,14 +631,19 @@ fn build_text_runs(
 fn highlighted_code_block_lines(
     language: Option<&str>,
     text: &str,
+    options: code_view::HighlightOptions,
 ) -> Vec<code_view::RenderedLine> {
     let extension = language.and_then(crate::language::extension_for_fence_language);
     let lines: Vec<&str> = text.lines().collect();
-    code_view::highlight_block(lines, extension)
+    code_view::highlight_block(lines, extension, options)
 }
 
-fn render_code_block(language: Option<&str>, text: &str) -> AnyElement {
-    let rendered = highlighted_code_block_lines(language, text);
+fn render_code_block(
+    language: Option<&str>,
+    text: &str,
+    options: code_view::HighlightOptions,
+) -> AnyElement {
+    let rendered = highlighted_code_block_lines(language, text, options);
     let mut card = div()
         .flex()
         .flex_col()
@@ -678,7 +689,12 @@ fn render_code_line(line: &code_view::RenderedLine) -> AnyElement {
     StyledText::new(text).with_runs(runs).into_any_element()
 }
 
-fn render_list(ordered: bool, start: u64, items: &[Vec<MdBlock>]) -> AnyElement {
+fn render_list(
+    ordered: bool,
+    start: u64,
+    items: &[Vec<MdBlock>],
+    options: code_view::HighlightOptions,
+) -> AnyElement {
     let mut list = div().flex().flex_col().gap(px(4.0));
     for (index, item_blocks) in items.iter().enumerate() {
         let marker: SharedString = if ordered {
@@ -705,14 +721,14 @@ fn render_list(ordered: bool, start: u64, items: &[Vec<MdBlock>]) -> AnyElement 
                     .flex_1()
                     .min_w_0()
                     .gap(px(6.0))
-                    .children(item_blocks.iter().map(render_block)),
+                    .children(item_blocks.iter().map(|block| render_block(block, options))),
             );
         list = list.child(row);
     }
     div().pl(px(INDENT_PX * 0.0)).child(list).into_any_element()
 }
 
-fn render_block_quote(blocks: &[MdBlock]) -> AnyElement {
+fn render_block_quote(blocks: &[MdBlock], options: code_view::HighlightOptions) -> AnyElement {
     div()
         .flex()
         .flex_col()
@@ -722,7 +738,7 @@ fn render_block_quote(blocks: &[MdBlock]) -> AnyElement {
         .border_l_2()
         .border_color(theme::border::DIVIDER)
         .text_color(theme::text::SECONDARY)
-        .children(blocks.iter().map(render_block))
+        .children(blocks.iter().map(|block| render_block(block, options)))
         .into_any_element()
 }
 
@@ -792,21 +808,33 @@ mod code_block_color_tests {
     /// `tree-sitter-html`, not left flat.
     #[test]
     fn a_preview_html_fence_is_really_colored_by_the_html_grammar() {
-        let lines = highlighted_code_block_lines(Some("html"), "<div class=\"card\">hi</div>\n");
+        let lines = highlighted_code_block_lines(
+            Some("html"),
+            "<div class=\"card\">hi</div>\n",
+            code_view::HighlightOptions::default(),
+        );
         assert_eq!(kind_of(&lines, "div"), Some(HighlightKind::Tag));
         assert_eq!(kind_of(&lines, "class"), Some(HighlightKind::Attribute));
     }
 
     #[test]
     fn a_preview_css_fence_is_really_colored_by_the_css_grammar() {
-        let lines = highlighted_code_block_lines(Some("css"), ".card { color: red; }\n");
+        let lines = highlighted_code_block_lines(
+            Some("css"),
+            ".card { color: red; }\n",
+            code_view::HighlightOptions::default(),
+        );
         assert_eq!(kind_of(&lines, "card"), Some(HighlightKind::Property));
     }
 
     /// The pre-existing languages must be unaffected by the alias table moving out of this module.
     #[test]
     fn a_preview_rust_fence_is_still_colored_by_the_rust_grammar() {
-        let lines = highlighted_code_block_lines(Some("rust"), "fn main() {}\n");
+        let lines = highlighted_code_block_lines(
+            Some("rust"),
+            "fn main() {}\n",
+            code_view::HighlightOptions::default(),
+        );
         assert_eq!(kind_of(&lines, "fn"), Some(HighlightKind::Keyword));
     }
 
@@ -815,7 +843,11 @@ mod code_block_color_tests {
     /// that cannot parse JSX at all. It now maps to `"jsx"`, which wires the real TSX grammar.
     #[test]
     fn a_preview_jsx_fence_reaches_a_grammar_that_can_actually_parse_jsx() {
-        let lines = highlighted_code_block_lines(Some("jsx"), "const a = <div id=\"x\" />;\n");
+        let lines = highlighted_code_block_lines(
+            Some("jsx"),
+            "const a = <div id=\"x\" />;\n",
+            code_view::HighlightOptions::default(),
+        );
         assert_eq!(kind_of(&lines, "div"), Some(HighlightKind::Tag));
         assert_eq!(kind_of(&lines, "id"), Some(HighlightKind::Attribute));
     }
@@ -825,7 +857,11 @@ mod code_block_color_tests {
     #[test]
     fn an_unknown_or_absent_preview_fence_language_stays_plain_text() {
         for language in [Some("zig"), None] {
-            let lines = highlighted_code_block_lines(language, "const x = 1;\n");
+            let lines = highlighted_code_block_lines(
+                language,
+                "const x = 1;\n",
+                code_view::HighlightOptions::default(),
+            );
             let kinds: Vec<HighlightKind> = lines
                 .iter()
                 .flat_map(|line| &line.runs)

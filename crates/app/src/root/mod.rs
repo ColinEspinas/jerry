@@ -1655,6 +1655,69 @@ impl AdeApp {
         theme::ui_scale::scaled_px(base_px, self.settings.appearance.interface_scale_percent)
     }
 
+    /// The real [`crate::code_surface::code_view::HighlightOptions`] every production highlight in
+    /// this app runs under - the one place a user's own syntax-highlighting preferences are turned
+    /// into the value the pipeline consumes, so no call site reads
+    /// `self.settings.appearance.*` for this and risks disagreeing with another.
+    ///
+    /// Read on the foreground thread and passed **by value** into whatever background work needs
+    /// it (`spawn_file_load`, `schedule_rehighlight`). It deliberately isn't ambient state: a
+    /// `thread_local!` (the `theme::CURRENT_THEME` pattern) would be invisible to the background
+    /// executor these highlights actually run on, and a process-global was already tried and
+    /// reverted in this codebase for the parallel-test flakes it caused - see `CURRENT_THEME`'s
+    /// own docs.
+    pub(crate) fn highlight_options(&self) -> crate::code_surface::code_view::HighlightOptions {
+        crate::code_surface::code_view::HighlightOptions {
+            bracket_pair_colorization: self.settings.appearance.bracket_pair_colorization,
+        }
+    }
+
+    /// Drops every cached syntax-highlighting result and re-derives it, so a settings change that
+    /// alters *span production* rather than paint-time colour really takes effect on already-open
+    /// content instead of only on the next file opened.
+    ///
+    /// Needed because [`Self::highlight_options`] feeds
+    /// `crate::code_surface::code_view::HighlightOptions`, whose output is baked into
+    /// `RenderedLine` runs and then cached in four independent places - none of which key their
+    /// freshness on settings (the File view's on `(path, mtime, len)`, the Diff view's on whole-
+    /// `DiffFile` equality, the Merge view's on `(path, hunk)`, and each `EditBuffer`'s on its own
+    /// `highlight_dirty` flag). Nulling a cache is not enough on its own for the Diff and Merge
+    /// ones: their `ensure_*` methods early-return on an equality check, so each has to be cleared
+    /// *and* re-driven. The Markdown preview needs nothing here - it re-renders from source every
+    /// frame and so picks the change up for free.
+    ///
+    /// Every open [`edit_buffer::EditBuffer`] is marked dirty and re-highlighted through the same
+    /// debounced background path typing already uses, rather than a synchronous foreground parse
+    /// of every open file - see `crate::code_surface::code_view`'s own "Re-highlighting cost"
+    /// notes for why a foreground parse of a large file is the thing to avoid.
+    pub(crate) fn invalidate_syntax_highlighting(&mut self, cx: &mut Context<Self>) {
+        self.file_view_cache = None;
+        self.file_view_last_freshness_check = None;
+
+        self.diff_highlight_cache = None;
+        self.ensure_diff_highlight_cache();
+
+        self.merge_highlight_cache = None;
+        self.ensure_active_merge_highlight_cache();
+
+        // Keyed by `(cwd, path)`; `schedule_rehighlight` resolves against the *current*
+        // `file_tree_root`, so only buffers belonging to it can be re-driven here. Buffers from
+        // another worktree are still marked dirty, so they re-highlight the moment that worktree
+        // is selected again rather than being silently left stale.
+        let cwd = self.file_tree_root.clone();
+        let mut to_rehighlight = Vec::new();
+        for ((buffer_cwd, path), buffer) in self.edit_buffers.iter_mut() {
+            buffer.highlight_dirty = true;
+            if buffer_cwd == &cwd {
+                to_rehighlight.push(path.clone());
+            }
+        }
+        for path in to_rehighlight {
+            self.schedule_rehighlight(path, cx);
+        }
+        cx.notify();
+    }
+
     /// Sets [`Self::window_controls_style`] and persists it. The one write path both the
     /// General settings page and the palette's `Window controls: …` entries call, so they can
     /// never disagree about which override is active.

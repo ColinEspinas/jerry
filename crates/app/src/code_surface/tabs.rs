@@ -526,6 +526,10 @@ impl AdeApp {
             .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_string());
+        // Read on the foreground thread, before the background read is spawned - the background
+        // closure has no `self` to consult (see `spawn_file_load`'s own stale-worktree discipline
+        // above, which captures everything it needs up front for the same reason).
+        let highlight_options = self.highlight_options();
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -538,11 +542,19 @@ impl AdeApp {
                     // rather than on the foreground thread once this task resumes. See
                     // `code_surface::symbols`' own docs for why the outline is flattened to plain
                     // data at this point instead of a tree being carried across the await.
+                    //
+                    // GitHub issue #168: uses `load_file_with_options`, not `load_file_with_source`
+                    // - the user's real bracket-pair-colorization setting (read on the foreground
+                    // thread above) must govern this parse too, not silently fall back to
+                    // `HighlightOptions::default()`.
                     async move {
-                        code_view::load_file_with_source(&path).map(|(parsed, source)| {
-                            let symbols = symbols::symbol_outline(&source, extension.as_deref());
-                            (parsed, source, symbols)
-                        })
+                        code_view::load_file_with_options(&path, highlight_options).map(
+                            |(parsed, source)| {
+                                let symbols =
+                                    symbols::symbol_outline(&source, extension.as_deref());
+                                (parsed, source, symbols)
+                            },
+                        )
                     }
                 })
                 .await;

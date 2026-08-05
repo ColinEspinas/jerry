@@ -37,10 +37,16 @@
 //! debug-toolbar, chart, and extension-button colour families have no counterpart in this app at
 //! all (there is no such surface to paint); its `*.border` keys are mostly per-widget and would
 //! flatten onto Jerry's four structural border levels in a way that reads worse than the derived
-//! values; and its `editorBracketHighlight.foreground1..6` family maps onto nothing here because
-//! this app has no bracket-pair colouring yet (`theme::editor::MATCHING_BRACKET` is a real token
-//! but nothing paints it - see its own docs). Every one of those keeps its derived value, which is
-//! a real colour in the theme's own family, not a Jerry Dark leftover.
+//! values. Every one of those keeps its derived value, which is a real colour in the theme's own
+//! family, not a Jerry Dark leftover.
+//!
+//! Its `editorBracketHighlight.foreground1..6` family *is* mapped, as of GitHub issue #168 - onto
+//! `theme::syntax::BRACKET_1..BRACKET_6`, this app's own real bracket-pair depth ring. It is
+//! handled in [`COLOR_KEY_MAP`] rather than [`build_syntax_overrides`] because it lives in
+//! VSCode's `colors` map, not in `tokenColors`; see [`syntax_scope_rule`]'s own note on why there
+//! is no textmate scope for a bracket's nesting depth. (`editorBracketMatch.background`, a
+//! different feature - the matching-bracket *box* around the caret's own bracket - stays mapped
+//! onto `theme::editor::MATCHING_BRACKET`, which is still a real token nothing paints yet.)
 //!
 //! ## JSONC tolerance
 //!
@@ -424,6 +430,16 @@ const COLOR_KEY_MAP: &[(&str, &[&str])] = &[
     ("editor.blame_text", &["descriptionForeground"]),
     // ---- syntax chrome that lives outside the tokenColors world -----------------------------
     ("syntax.caret", &["editorCursor.foreground"]),
+    // GitHub issue #168: VSCode's own bracket-pair depth ring. A `colors` family, not a
+    // `tokenColors` scope (see `syntax_scope_rule`'s own note), so it belongs here rather than in
+    // `build_syntax_overrides` - and because that function emits nothing for these six kinds,
+    // these entries are never overwritten by it.
+    ("syntax.bracket_1", &["editorBracketHighlight.foreground1"]),
+    ("syntax.bracket_2", &["editorBracketHighlight.foreground2"]),
+    ("syntax.bracket_3", &["editorBracketHighlight.foreground3"]),
+    ("syntax.bracket_4", &["editorBracketHighlight.foreground4"]),
+    ("syntax.bracket_5", &["editorBracketHighlight.foreground5"]),
+    ("syntax.bracket_6", &["editorBracketHighlight.foreground6"]),
     ("syntax.error_underline", &["editorError.foreground"]),
     (
         "syntax.hover_underline",
@@ -1010,6 +1026,15 @@ fn syntax_scope_rule(kind: HighlightKind) -> (&'static [&'static str], Option<Hi
             ],
             Some(Text),
         ),
+        // GitHub issue #168's six bracket-depth buckets. No textmate scope exists for "a bracket
+        // at nesting depth 3" - a scope describes what a token *is*, and depth is a property of
+        // the surrounding structure - so VSCode carries these in its `colors` map instead
+        // (`editorBracketHighlight.foreground1..6`), which [`COLOR_KEY_MAP`] maps directly. Hence
+        // no scopes here, and deliberately **no parent**: inheriting `Text` would flatten the
+        // whole ring to the imported theme's plain foreground and silently delete the feature for
+        // every theme that doesn't set those six keys, which is far worse than keeping this app's
+        // own six designed colours.
+        Bracket1 | Bracket2 | Bracket3 | Bracket4 | Bracket5 | Bracket6 => (&[], None),
         Tag => (&["entity.name.tag"], Some(Type)),
         Attribute => (&["entity.other.attribute-name", "storage.modifier"], None),
         Embedded => (&[], Some(Text)),

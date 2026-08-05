@@ -408,10 +408,32 @@ impl EditBuffer {
         mtime: Option<SystemTime>,
         len: u64,
     ) -> Self {
-        let spans = match code_view::highlighter_for_extension(extension.as_deref()) {
-            Some(highlighter) => highlighter(&content),
-            None => Vec::new(),
-        };
+        Self::new_with_options(
+            path,
+            content,
+            extension,
+            mtime,
+            len,
+            code_view::HighlightOptions::default(),
+        )
+    }
+
+    /// [`Self::new`] with a real, caller-supplied [`code_view::HighlightOptions`] - what the two
+    /// production callers (`crate::root::new_file` and `crate::merge::flow`) use, so a buffer
+    /// created inside the app honours the user's own `appearance.bracket_pair_colorization`
+    /// rather than silently getting the default.
+    pub fn new_with_options(
+        path: PathBuf,
+        content: String,
+        extension: Option<String>,
+        mtime: Option<SystemTime>,
+        len: u64,
+        options: code_view::HighlightOptions,
+    ) -> Self {
+        let spans = options.highlight(
+            &content,
+            code_view::highlighter_for_extension(extension.as_deref()),
+        );
         let lines = code_view::build_lines(&content, &spans);
         // Same "fine for a directly-built buffer, too slow for the production path" trade the
         // highlight above already makes - `from_highlighted` takes both off a caller that

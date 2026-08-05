@@ -32,7 +32,7 @@ impl AdeApp {
     /// constant (300 lines, split across several hunk-sized calls) took ~5-6ms - the real,
     /// measured reason this stays a synchronous call at a real, infrequent change point rather
     /// than needing a background task.
-    pub(in crate::code_surface) fn ensure_diff_highlight_cache(&mut self) {
+    pub(crate) fn ensure_diff_highlight_cache(&mut self) {
         let Some(file) = self.open_diff_file_cache.clone() else {
             self.diff_highlight_cache = None;
             return;
@@ -45,6 +45,7 @@ impl AdeApp {
             return;
         }
         let extension = file.path.extension().and_then(|ext| ext.to_str());
+        let highlight_options = self.highlight_options();
         let mut remaining = MAX_RENDERED_DIFF_LINES_PER_FILE;
         let mut per_hunk = Vec::with_capacity(file.hunks.len());
         let mut per_hunk_numbers = Vec::with_capacity(file.hunks.len());
@@ -59,7 +60,11 @@ impl AdeApp {
                 .map(|line| line.content.as_str())
                 .collect();
             remaining -= capped_lines.len();
-            per_hunk.push(code_view::highlight_block(capped_lines, extension));
+            per_hunk.push(code_view::highlight_block(
+                capped_lines,
+                extension,
+                highlight_options,
+            ));
             // Computed once here, alongside the highlighting it's index-aligned with, rather
             // than fresh inside `render_diff_file_detail`'s per-render loop (a real per-frame
             // `Vec` reallocation for every hunk that loop used to pay unconditionally).
@@ -767,7 +772,11 @@ mod diff_render_tests {
     fn cache_identity_guard_rejects_a_mismatched_cache_entry() {
         let file_a = sample_diff_file("a.rs");
         let file_b = sample_diff_file("b.rs"); // Same shape as `file_a`, different real path.
-        let per_hunk = vec![code_view::highlight_block(["unchanged"], Some("rs"))];
+        let per_hunk = vec![code_view::highlight_block(
+            ["unchanged"],
+            Some("rs"),
+            code_view::HighlightOptions::default(),
+        )];
         let per_hunk_numbers = vec![vec![(Some(1), Some(1))]];
         let cache = Some((file_a, per_hunk, per_hunk_numbers));
 
@@ -784,7 +793,11 @@ mod diff_render_tests {
     #[test]
     fn cache_identity_guard_accepts_a_matching_cache_entry() {
         let file = sample_diff_file("a.rs");
-        let per_hunk = vec![code_view::highlight_block(["unchanged"], Some("rs"))];
+        let per_hunk = vec![code_view::highlight_block(
+            ["unchanged"],
+            Some("rs"),
+            code_view::HighlightOptions::default(),
+        )];
         let per_hunk_numbers = vec![vec![(Some(1), Some(1))]];
         let cache = Some((file.clone(), per_hunk, per_hunk_numbers));
 

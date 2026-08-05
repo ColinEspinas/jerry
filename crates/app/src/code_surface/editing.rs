@@ -225,6 +225,10 @@ impl AdeApp {
         // re-read from `self.file_tree_root` once this task resumes - see `AdeApp::
         // edit_buffers`'s own docs for the stale-worktree bug class this prevents.
         let cwd = self.file_tree_root.clone();
+        // Captured on the foreground thread for the same reason `cwd` is: the background closure
+        // below has no `self` to consult, and this is the one highlight path that actually runs
+        // while the user is typing.
+        let highlight_options = self.highlight_options();
         let task = cx.spawn({
             let path = path.clone();
             let content_snapshot = content_snapshot.clone();
@@ -235,7 +239,8 @@ impl AdeApp {
                     .spawn({
                         let content_snapshot = content_snapshot.clone();
                         async move {
-                            let spans = highlighter(&content_snapshot);
+                            let spans = highlight_options
+                                .apply(&content_snapshot, highlighter(&content_snapshot));
                             let lines = code_view::build_lines(&content_snapshot, &spans);
                             let symbols =
                                 symbols::symbol_outline(&content_snapshot, extension.as_deref());
@@ -2462,8 +2467,17 @@ mod editing_tests {
             "\"foo\"'s own already-known real highlighting must survive this edit untouched, not \
              just get lucky in the eventual re-highlight: {kinds_immediately:?}"
         );
+        // GitHub issue #168 turned these brackets into real matched pairs, so what has to survive
+        // the splice is a *ring* bucket, not the plain `PunctuationBracket` this used to name.
+        // Same assertion, same reason - the incremental splice must carry an untouched token's
+        // already-known colour through rather than dropping it back to plain text.
         assert!(
-            kinds_immediately.contains(&code_view::HighlightKind::PunctuationBracket),
+            kinds_immediately
+                .iter()
+                .any(
+                    |kind| code_view::HighlightKind::BRACKET_DEPTH_RING.contains(kind)
+                        || *kind == code_view::HighlightKind::PunctuationBracket
+                ),
             "the untouched brackets' own already-known real highlighting must survive too: \
              {kinds_immediately:?}"
         );
@@ -4769,6 +4783,72 @@ mod editing_tests {
             "B-EDIT worktree b original\n",
             "worktree B's own real unsaved edit must survive too, untouched by worktree A's \
              identical-relative-path buffer"
+        );
+    }
+
+    /// GitHub issue #168: toggling `appearance.bracket_pair_colorization` really re-highlights
+    /// content that is **already open**, rather than only affecting the next file loaded.
+    ///
+    /// This is the test that would catch the whole feature being wired correctly at the pipeline
+    /// level but doing nothing visible when the user actually flips the switch - the failure mode
+    /// that matters here, because the ring is baked into cached `RenderedLine`s rather than
+    /// resolved at paint time like every other appearance toggle in this app.
+    #[gpui::test]
+    fn toggling_bracket_pair_colorization_re_highlights_an_already_open_buffer(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(
+            repo.path(),
+            "sample.rs",
+            "fn main() { let v = vec![(1, 2)]; }\n",
+        );
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+
+        let relative = PathBuf::from("sample.rs");
+        let ring_runs = |app: &Entity<AdeApp>, cx: &mut gpui::VisualTestContext| -> usize {
+            app.read_with(cx, |app, _| {
+                app.edit_buffer(&relative)
+                    .expect("buffer should exist")
+                    .lines
+                    .iter()
+                    .flat_map(|line| line.runs.iter())
+                    .filter(|(_, kind)| code_view::HighlightKind::BRACKET_DEPTH_RING.contains(kind))
+                    .count()
+            })
+        };
+
+        assert!(
+            ring_runs(&app, cx) > 0,
+            "premise: the file opens with real depth-coloured brackets by default"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_bracket_pair_colorization(cx);
+        });
+        // The re-highlight goes through the same debounced background path typing uses.
+        cx.background_executor
+            .advance_clock(REHIGHLIGHT_DEBOUNCE + Duration::from_millis(50));
+        cx.run_until_parked();
+
+        assert_eq!(
+            ring_runs(&app, cx),
+            0,
+            "turning the setting off must really re-highlight the already-open buffer, not just \
+             affect files opened later"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_bracket_pair_colorization(cx);
+        });
+        cx.background_executor
+            .advance_clock(REHIGHLIGHT_DEBOUNCE + Duration::from_millis(50));
+        cx.run_until_parked();
+
+        assert!(
+            ring_runs(&app, cx) > 0,
+            "turning it back on must restore the ring on the same already-open buffer"
         );
     }
 }

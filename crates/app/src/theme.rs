@@ -871,6 +871,99 @@ pub mod diff {
 /// [`crate::code_surface::code_view::HighlightKind`]); real bracket-pair colouring is a separate,
 /// larger feature to be considered on its own terms, not something to smuggle in here.
 ///
+/// ## The bracket-pair depth ring (GitHub issue #168)
+///
+/// That separate feature has since landed, and it deliberately did **not** change the paragraph
+/// above: [`PUNCTUATION_BRACKET`] is still exactly [`TEXT`], pinned by
+/// [`syntax_contrast_tests::operators_and_punctuation_deliberately_still_render_as_plain_text`].
+/// It is now the *fallback* a bracket keeps when it has no real matching partner, which is what
+/// makes malformed/mid-edit code degrade visibly-but-quietly instead of lying about structure.
+///
+/// A bracket that *is* half of a real matched pair paints one of six ring colours
+/// ([`BRACKET_1`] .. [`BRACKET_6`]), chosen by `nesting depth % 6`, both halves alike - so a pair
+/// and everything scoped inside it can be traced at a glance. Six, cycling quickly, matches what
+/// VSCode and most editors that ship this feature use; a longer ring buys nothing once adjacent
+/// depths are already unmistakable. `graph::LANES` is this file's existing precedent for an
+/// N-colour rotation, but these are six independent flat consts rather than a `[ColorToken; 6]`
+/// array for a real reason: each one's key has to be exactly `syntax.{HighlightKind::name()}`
+/// (see [`crate::settings::vscode_theme::tests::every_highlight_kind_maps_onto_a_real_syntax_token`]),
+/// and an array token's key carries a dotted index (`graph.lanes.0`) that a `[syntax]` table key
+/// is documented never to have.
+///
+/// The six are **not independently chosen colours**. Each one is derived from a hue this palette
+/// already speaks, held at this palette's own chroma and lightness register, so the ring reads as
+/// "this palette, cycling" rather than as six new colours nobody else in this file uses:
+///
+/// | ring slot | hue borrowed from | Lab hue (anchor) |
+/// |---|---|---|
+/// | [`BRACKET_1`] `#eb7f7b` salmon | [`VARIABLE_PARAMETER`]'s rose-red | 27 (9) |
+/// | [`BRACKET_2`] `#7dd7b9` mint | [`ATTRIBUTE`]'s teal | 169 (185) |
+/// | [`BRACKET_3`] `#c48648` amber | [`CONSTANT`]'s brown | 68 (71) |
+/// | [`BRACKET_4`] `#8f7cbd` violet | [`KEYWORD`]'s purple | 304 (317) |
+/// | [`BRACKET_5`] `#6c9052` moss | [`STRING`]'s green | 130 (123) |
+/// | [`BRACKET_6`] `#2d96c7` steel blue | [`FUNCTION`]'s blue | 249 (266) |
+///
+/// Those six anchors are the widest-spread six of this palette's nine real hues (minimum gap 51
+/// degrees), so the ring covers the whole wheel without ever leaving the palette's vocabulary.
+/// Each slot is then offset from its anchor - in hue by up to ~18 degrees, and more importantly in
+/// lightness - so a coloured bracket never impersonates the semantic token it borrows from: the
+/// tightest is [`BRACKET_6`] against [`FUNCTION`] at ΔE 14.8, and no ring colour comes within
+/// ΔE 14 of any semantic token.
+///
+/// ## Why this replaced the first version of this ring
+///
+/// The first ring shipped here (`#39e9d9` turquoise, `#af52ec` violet, `#36d535` green, ...) was
+/// produced by maximising pairwise CIE-Lab ΔE in open colour space, and it was wrong in a way the
+/// distinctness tests could not see. Maximising ΔE rewards **chroma**, so the optimiser bought
+/// separation by cranking saturation, and the result sat completely outside this palette's own
+/// register:
+///
+/// | | mean C* | max C* |
+/// |---|---|---|
+/// | this palette's non-neutral tokens | 33.7 | 53.4 ([`KEYWORD`]) |
+/// | the replaced ring | **66.4** | **93.3** |
+/// | this ring | 39.7 | 46.0 |
+///
+/// Two of the six were nearly twice as saturated as the most saturated colour this palette had
+/// ever used. Every distinctness check passed; it still read as a jarring accent dropped on top of
+/// a muted palette, which is exactly what it was. The lesson is recorded here because the failure
+/// is not obvious from the tests: *a colour set can be perfectly distinguishable and still not
+/// belong*, and [`syntax_bracket_ring_tests::the_ring_stays_inside_the_palettes_own_chroma_register`]
+/// exists specifically to catch a future change re-introducing it.
+///
+/// The distinctness floors below are correspondingly lower than the replaced ring's, and
+/// deliberately so - they are now set from what a reader actually needs rather than from what an
+/// unconstrained optimiser happened to reach. Measured across **every** bundled theme, not just
+/// Jerry Dark (the five others are generated from these defaults by [`derive_shift`], so a value
+/// that is fine here can still collapse under one of them):
+///
+/// - **Cyclically adjacent depths** (`n` against `n + 1`, the only comparison a reader actually
+///   makes, since those two nest directly inside one another): worst ΔE 34.0, and 63.7 in Jerry
+///   Dark itself. That is >14x the ~2.3 just-noticeable difference.
+/// - **Any two ring colours**: worst ΔE 26.7.
+/// - **Against plain text**, so a matched bracket never reads like an unmatched one (a real,
+///   load-bearing distinction here - see [`BRACKET_1`]): worst ΔE 19.0.
+/// - **Readable**: every colour clears 2.5:1 against [`super::surface::CENTER`] in every bundled
+///   theme. A bracket is one thin glyph, so it is held to the floor
+///   [`syntax_contrast_tests::every_syntax_token_clears_a_real_contrast_floor_in_jerry_dark_and_paper`]
+///   only demands of Jerry Dark and `Paper`, not the looser 1.5:1 the other four get.
+///
+/// The narrow lightness band these sit in is load-bearing for one specific reason: `Paper` derives
+/// from these defaults through [`derive_shift`]'s *inverting* lightness fit
+/// (`l' = -1.286 l + 1.015`), so a source colour much lighter than ~0.68 lands near-black there. An
+/// earlier draft had exactly that bug - a `#9b8cff` periwinkle deriving to `#020109`, ΔE 8.8 from
+/// `Paper`'s own plain text, i.e. a "coloured" bracket indistinguishable from an uncoloured one.
+///
+/// **Not verified against a rendered window.** This environment cannot screenshot real GPUI
+/// output, so every claim above is measured colour maths and hue-family reasoning, not something
+/// anyone has looked at. The register mismatch that motivated this rewrite was caught by a
+/// maintainer looking at the real thing, not by any of the numbers here.
+///
+/// The five generated theme files carry their own derived values for all six (see
+/// [`crate::settings::builtin_themes`]), and an imported VSCode theme maps its own
+/// `editorBracketHighlight.foreground1..6` family straight onto them - see
+/// [`crate::settings::vscode_theme`]'s `COLOR_KEY_MAP`.
+///
 /// ## The default fallback chain (GitHub issue #31)
 ///
 /// Several scopes here still have no independently *authored* colour of their own: their compiled
@@ -986,6 +1079,26 @@ pub mod syntax {
     pub const PUNCTUATION_BRACKET: ColorToken = token("syntax.punctuation_bracket", 0xacb2be);
     /// `punctuation.delimiter` (`,`/`;`/`:`/`.`/`::`) - see [`OPERATOR`]'s own docs.
     pub const PUNCTUATION_DELIMITER: ColorToken = token("syntax.punctuation_delimiter", 0xacb2be);
+
+    /// GitHub issue #168's rotating bracket-pair depth ring, colour 1 of 6 - the colour a real,
+    /// *matched* `(`/`[`/`{` pair at nesting depth 0 (and 6, and 12, ...) paints, both halves of
+    /// the pair alike. See this module's own "bracket-pair depth ring" section for how these six
+    /// were chosen and measured, and
+    /// [`crate::code_surface::code_view::colorize_bracket_pairs`] for the real matcher that
+    /// decides which brackets reach these buckets at all (an unmatched one keeps
+    /// [`PUNCTUATION_BRACKET`]'s plain-text colour, which is exactly why that token stays aliased
+    /// to [`TEXT`]).
+    pub const BRACKET_1: ColorToken = token("syntax.bracket_1", 0xeb7f7b);
+    /// Bracket-pair depth ring, colour 2 of 6 (nesting depth 1, 7, ...) - see [`BRACKET_1`].
+    pub const BRACKET_2: ColorToken = token("syntax.bracket_2", 0x7dd7b9);
+    /// Bracket-pair depth ring, colour 3 of 6 (nesting depth 2, 8, ...) - see [`BRACKET_1`].
+    pub const BRACKET_3: ColorToken = token("syntax.bracket_3", 0xc48648);
+    /// Bracket-pair depth ring, colour 4 of 6 (nesting depth 3, 9, ...) - see [`BRACKET_1`].
+    pub const BRACKET_4: ColorToken = token("syntax.bracket_4", 0x8f7cbd);
+    /// Bracket-pair depth ring, colour 5 of 6 (nesting depth 4, 10, ...) - see [`BRACKET_1`].
+    pub const BRACKET_5: ColorToken = token("syntax.bracket_5", 0x6c9052);
+    /// Bracket-pair depth ring, colour 6 of 6 (nesting depth 5, 11, ...) - see [`BRACKET_1`].
+    pub const BRACKET_6: ColorToken = token("syntax.bracket_6", 0x2d96c7);
     /// `tag` (a lowercase JSX element name, `-javascript`'s own JSX query) - see the module docs'
     /// fallback-chain section for why this defaults to [`TYPE`]'s value rather than its own hue: it
     /// preserves this module's pre-existing "a JSX element name is coloured like the type it
@@ -1080,6 +1193,12 @@ pub mod syntax {
         ("OPERATOR", OPERATOR),
         ("PUNCTUATION_BRACKET", PUNCTUATION_BRACKET),
         ("PUNCTUATION_DELIMITER", PUNCTUATION_DELIMITER),
+        ("BRACKET_1", BRACKET_1),
+        ("BRACKET_2", BRACKET_2),
+        ("BRACKET_3", BRACKET_3),
+        ("BRACKET_4", BRACKET_4),
+        ("BRACKET_5", BRACKET_5),
+        ("BRACKET_6", BRACKET_6),
         ("TAG", TAG),
         ("ATTRIBUTE", ATTRIBUTE),
         ("EMBEDDED", EMBEDDED),
@@ -2532,7 +2651,7 @@ mod derivation_tests {
 mod syntax_contrast_tests {
     use super::*;
 
-    struct ResetThemeOnDrop;
+    pub(super) struct ResetThemeOnDrop;
 
     impl Drop for ResetThemeOnDrop {
         fn drop(&mut self) {
@@ -2542,7 +2661,7 @@ mod syntax_contrast_tests {
 
     /// Installs a real bundled theme exactly the way selecting its card does - compiled from its
     /// own checked-in file through the real `base` chain, not a synthesized palette.
-    fn with_bundled_theme(name: &str) -> ResetThemeOnDrop {
+    pub(super) fn with_bundled_theme(name: &str) -> ResetThemeOnDrop {
         let palette = crate::settings::custom_theme::compile_palette_by_name(name, &[])
             .expect("a bundled theme must compile");
         set_current_theme(palette.map(Rc::new));
@@ -2565,7 +2684,7 @@ mod syntax_contrast_tests {
 
     /// The real WCAG contrast ratio between two resolved colours - order-independent (always
     /// `>= 1.0`), matching the standard definition.
-    fn contrast_ratio(a: Rgba, b: Rgba) -> f32 {
+    pub(super) fn contrast_ratio(a: Rgba, b: Rgba) -> f32 {
         let (luminance_a, luminance_b) = (relative_luminance(a), relative_luminance(b));
         let (higher, lower) = if luminance_a > luminance_b {
             (luminance_a, luminance_b)
@@ -2663,6 +2782,289 @@ mod syntax_contrast_tests {
 /// those five silently serving the old near-white value, which would be worse than not fixing this
 /// at all. Every check below runs against each theme's own real compiled palette, so a stale
 /// generated file fails here rather than shipping.
+/// GitHub issue #168's bracket-pair depth ring, pinned the same way the identifier family below
+/// is: the three properties the six colours were actually selected against, measured in **every**
+/// bundled theme rather than only in Jerry Dark. The five non-Jerry-Dark themes are generated by
+/// running [`derive_shift`] over these defaults, so a change to a default that looks fine in Jerry
+/// Dark can still collapse under the derivation - which is not hypothetical: an earlier draft's
+/// `#9b8cff` derived to `#020109` under `Paper`'s inverting lightness fit, ΔE 8.8 from that
+/// theme's own plain text, i.e. a coloured bracket indistinguishable from an uncoloured one. Every
+/// floor here would have caught it.
+#[cfg(test)]
+mod syntax_bracket_ring_tests {
+    use super::syntax_contrast_tests::{contrast_ratio, with_bundled_theme};
+    use super::syntax_identifier_palette_tests::delta_e;
+    use super::*;
+    use crate::code_surface::code_view::HighlightKind;
+
+    /// A colour's CIE-Lab chroma (`sqrt(a*^2 + b* ^2)`) - how *saturated* it is, independent of
+    /// how light it is. The one number that exposed the replaced ring as out of family, and the
+    /// one every ΔE-only check was blind to.
+    fn chroma(color: Rgba) -> f32 {
+        let (_, a, b) = super::syntax_identifier_palette_tests::lab(color);
+        (a * a + b * b).sqrt()
+    }
+
+    /// The ring's six real tokens, in ring order - read through `HighlightKind` rather than
+    /// hand-listed, so this can't silently drift from what the renderer actually paints.
+    fn ring_tokens() -> Vec<(&'static str, ColorToken)> {
+        HighlightKind::BRACKET_DEPTH_RING
+            .into_iter()
+            .map(|kind| {
+                let key: &'static str =
+                    Box::leak(format!("syntax.{}", kind.name()).into_boxed_str());
+                (
+                    key,
+                    token_for_key(key).expect("every ring bucket has a real syntax token"),
+                )
+            })
+            .collect()
+    }
+
+    /// The whole point of the feature: two nesting levels a reader is comparing must not look
+    /// alike. Cyclically adjacent (depth `n` against `n + 1`) is the pair that matters most, since
+    /// those two nest directly inside one another.
+    #[test]
+    fn cyclically_adjacent_ring_colours_stay_far_apart_in_every_bundled_theme() {
+        // Lower than the replaced ring's 40 on purpose: that number came from an unconstrained
+        // optimiser that bought ΔE with saturation this palette never uses. 30 is set from what a
+        // reader needs - >13x the ~2.3 just-noticeable difference - and the real measured worst
+        // case across every bundled theme is 34.0. See this module's own "bracket-pair depth ring"
+        // docs for the full story.
+        const MIN_DELTA_E: f32 = 30.0;
+        for def in crate::settings::state::THEME_DEFS.iter() {
+            let _guard = with_bundled_theme(def.name);
+            let ring = ring_tokens();
+            for index in 0..ring.len() {
+                let (name_a, token_a) = ring[index];
+                let (name_b, token_b) = ring[(index + 1) % ring.len()];
+                let distance = delta_e(token_a.resolve(), token_b.resolve());
+                assert!(
+                    distance >= MIN_DELTA_E,
+                    "{name_a} and {name_b} are adjacent depths but only ΔE {distance:.1} apart in \
+                     {} - a reader could not tell one nesting level from the next",
+                    def.name
+                );
+            }
+        }
+    }
+
+    /// Non-adjacent depths matter too, just less: six levels of nesting has to stay legible, not
+    /// merely three.
+    #[test]
+    fn no_two_ring_colours_collide_in_any_bundled_theme() {
+        // Non-adjacent depths matter less than adjacent ones - see the floor above for why these
+        // numbers moved down. Real measured worst case: 26.7.
+        const MIN_DELTA_E: f32 = 24.0;
+        for def in crate::settings::state::THEME_DEFS.iter() {
+            let _guard = with_bundled_theme(def.name);
+            let ring = ring_tokens();
+            for (index, (name_a, token_a)) in ring.iter().enumerate() {
+                for (name_b, token_b) in ring.iter().skip(index + 1) {
+                    let distance = delta_e(token_a.resolve(), token_b.resolve());
+                    assert!(
+                        distance >= MIN_DELTA_E,
+                        "{name_a} and {name_b} are only ΔE {distance:.1} apart in {}",
+                        def.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// A *matched* bracket reading identically to an *unmatched* one would erase the whole
+    /// matched/unmatched distinction this feature's honest-degradation design rests on - and
+    /// `syntax::PUNCTUATION_BRACKET` is exactly `syntax::TEXT` by deliberate design, so this one
+    /// check covers both.
+    #[test]
+    fn every_ring_colour_is_perceptibly_different_from_plain_text() {
+        // Real measured worst case: 19.0, in `Paper`. Still nearly 2x the floor the identifier
+        // family is held to against the same background.
+        const MIN_DELTA_E: f32 = 17.0;
+        for def in crate::settings::state::THEME_DEFS.iter() {
+            let _guard = with_bundled_theme(def.name);
+            let text = syntax::TEXT.resolve();
+            for (name, token) in ring_tokens() {
+                let distance = delta_e(token.resolve(), text);
+                assert!(
+                    distance >= MIN_DELTA_E,
+                    "{name} is only ΔE {distance:.1} from plain text in {} - a matched bracket \
+                     would be indistinguishable from an unmatched one. If this fired after a \
+                     change to the defaults, the five generated theme files probably need \
+                     regenerating (see crate::settings::builtin_themes).",
+                    def.name
+                );
+            }
+        }
+    }
+
+    /// A bracket is one thin glyph, so the ring is held to a stricter contrast floor than the
+    /// 1.5:1 `syntax_contrast_tests` applies to the four non-Jerry-Dark, non-`Paper` themes.
+    #[test]
+    fn every_ring_colour_clears_a_stricter_contrast_floor_than_the_palette_at_large() {
+        const MIN_RATIO: f32 = 2.5;
+        for def in crate::settings::state::THEME_DEFS.iter() {
+            let _guard = with_bundled_theme(def.name);
+            let background = surface::CENTER.resolve();
+            for (name, token) in ring_tokens() {
+                let ratio = contrast_ratio(token.resolve(), background);
+                assert!(
+                    ratio >= MIN_RATIO,
+                    "{name} only reaches {ratio:.2}:1 against surface::CENTER in {} - below the \
+                     {MIN_RATIO}:1 floor a single-glyph token needs",
+                    def.name
+                );
+            }
+        }
+    }
+
+    /// The regression test for the real bug this ring was rewritten to fix, and the one thing
+    /// every other check here missed.
+    ///
+    /// The first version of this ring was produced by maximising pairwise ΔE in open colour space.
+    /// Maximising ΔE rewards chroma, so it bought its separation with saturation: two of its six
+    /// colours reached C* 88.7 and 93.3 against a palette whose most saturated token
+    /// ([`syntax::KEYWORD`]) is C* 53.4 and whose mean is 33.7. Every distinctness test above
+    /// passed. It still looked wrong, because a colour set can be perfectly distinguishable and
+    /// still not belong to the palette it sits in.
+    ///
+    /// So: no ring colour may be more saturated than this palette's own most saturated token, and
+    /// the ring's mean chroma must stay near the palette's. That is what "derived from the theme's
+    /// own hues" actually has to mean numerically.
+    #[test]
+    fn the_ring_stays_inside_the_palettes_own_chroma_register() {
+        /// The real, semantic (non-neutral, non-ring) tokens the ring has to live alongside.
+        fn palette_chromas() -> Vec<f32> {
+            [
+                syntax::KEYWORD,
+                syntax::FUNCTION,
+                syntax::TYPE,
+                syntax::CONSTANT,
+                syntax::STRING,
+                syntax::STRING_ESCAPE,
+                syntax::VARIABLE,
+                syntax::VARIABLE_PARAMETER,
+                syntax::PROPERTY,
+                syntax::ATTRIBUTE,
+                syntax::EMPHASIS,
+            ]
+            .into_iter()
+            .map(|token| chroma(token.resolve()))
+            .collect()
+        }
+
+        // Enforced strictly in Jerry Dark, which is where these colours are actually *authored*.
+        // The other five are mechanical `derive_shift` transforms of exactly these values, and
+        // that transform scales HSL saturation uniformly while CIE-Lab chroma responds
+        // non-uniformly by hue and lightness - so a derived theme can push one ring colour a
+        // little past its own palette max (measured worst: Ember, 1.44x) without anything being
+        // wrong with the choice made here. Those get a loose blowout bound instead of a strict
+        // one; tightening it would be pinning an artifact of the derivation, not the palette work.
+        {
+            let _guard = with_bundled_theme("Jerry Dark");
+            let palette = palette_chromas();
+            let palette_max = palette.iter().copied().fold(0.0f32, f32::max);
+            let palette_mean = palette.iter().sum::<f32>() / palette.len() as f32;
+            for (name, token) in ring_tokens() {
+                let ring_chroma = chroma(token.resolve());
+                assert!(
+                    ring_chroma <= palette_max,
+                    "{name} has chroma {ring_chroma:.1}, above this palette's own most saturated \
+                     token ({palette_max:.1}) - the bracket ring must belong to the palette's \
+                     register, not shout over it. The replaced ring reached 93.3 here."
+                );
+            }
+            let ring_mean = ring_tokens()
+                .into_iter()
+                .map(|(_, token)| chroma(token.resolve()))
+                .sum::<f32>()
+                / 6.0;
+            assert!(
+                ring_mean <= palette_mean * 1.25,
+                "the ring's mean chroma is {ring_mean:.1} against the palette's own \
+                 {palette_mean:.1} ({:.2}x) - it has drifted out of register. If this fired after \
+                 a colour change, the ring was probably re-picked by ΔE distance alone, which \
+                 rewards saturation; see this module's \"bracket-pair depth ring\" docs. The \
+                 replaced ring measured 1.97x here.",
+                ring_mean / palette_mean
+            );
+        }
+
+        // Every bundled theme: a loose bound that still catches a gross blowout.
+        for def in crate::settings::state::THEME_DEFS.iter() {
+            let _guard = with_bundled_theme(def.name);
+            let palette = palette_chromas();
+            let palette_mean = palette.iter().sum::<f32>() / palette.len() as f32;
+            let ring_mean = ring_tokens()
+                .into_iter()
+                .map(|(_, token)| chroma(token.resolve()))
+                .sum::<f32>()
+                / 6.0;
+            assert!(
+                ring_mean <= palette_mean * 1.6,
+                "the ring's mean chroma is {ring_mean:.1} against {}'s own {palette_mean:.1} - \
+                 far enough out of register to read as a foreign accent",
+                def.name
+            );
+        }
+    }
+
+    /// Each ring colour deliberately *borrows* a semantic token's hue - that is the whole point -
+    /// but must never be mistakable for it. Real measured worst case: ΔE 14.8, `BRACKET_6` against
+    /// `FUNCTION`, both blues.
+    #[test]
+    fn no_ring_colour_impersonates_the_semantic_token_it_borrows_its_hue_from() {
+        const MIN_DELTA_E: f32 = 12.0;
+        let semantic: [(&str, ColorToken); 8] = [
+            ("KEYWORD", syntax::KEYWORD),
+            ("FUNCTION", syntax::FUNCTION),
+            ("TYPE", syntax::TYPE),
+            ("CONSTANT", syntax::CONSTANT),
+            ("STRING", syntax::STRING),
+            ("VARIABLE", syntax::VARIABLE),
+            ("VARIABLE_PARAMETER", syntax::VARIABLE_PARAMETER),
+            ("ATTRIBUTE", syntax::ATTRIBUTE),
+        ];
+        let _guard = with_bundled_theme("Jerry Dark");
+        for (ring_name, ring_token) in ring_tokens() {
+            for (semantic_name, semantic_token) in semantic {
+                let distance = delta_e(ring_token.resolve(), semantic_token.resolve());
+                assert!(
+                    distance >= MIN_DELTA_E,
+                    "{ring_name} is only ΔE {distance:.1} from {semantic_name} - a coloured \
+                     bracket would read as that token rather than as structure"
+                );
+            }
+        }
+    }
+
+    /// The ring is six *independently keyed* tokens a theme file can move one at a time, not six
+    /// aliases of one colour - the mistake that would quietly turn this feature back into the flat
+    /// single-bracket-colour non-solution GitHub issue #168 explicitly rejected.
+    #[test]
+    fn the_six_ring_tokens_are_six_real_independently_keyed_colours() {
+        let keys: std::collections::HashSet<&str> =
+            ring_tokens().into_iter().map(|(key, _)| key).collect();
+        assert_eq!(keys.len(), 6, "six distinct registered keys");
+        for def in crate::settings::state::THEME_DEFS.iter() {
+            let _guard = with_bundled_theme(def.name);
+            let values: std::collections::HashSet<[u32; 4]> = ring_tokens()
+                .into_iter()
+                .map(|(_, token)| {
+                    let color = token.resolve();
+                    [
+                        color.r.to_bits(),
+                        color.g.to_bits(),
+                        color.b.to_bits(),
+                        color.a.to_bits(),
+                    ]
+                })
+                .collect();
+            assert_eq!(values.len(), 6, "six distinct colours in {}", def.name);
+        }
+    }
+}
+
 #[cfg(test)]
 mod syntax_identifier_palette_tests {
     use super::*;
@@ -2699,7 +3101,7 @@ mod syntax_identifier_palette_tests {
     /// CIE Lab, for a real perceptual distance rather than a raw RGB one - the same measure the
     /// three colours were chosen against (see [`syntax`]'s own module docs). sRGB D65, the
     /// standard conversion.
-    fn lab(color: Rgba) -> (f32, f32, f32) {
+    pub(super) fn lab(color: Rgba) -> (f32, f32, f32) {
         fn linear(component: f32) -> f32 {
             if component <= 0.04045 {
                 component / 12.92
@@ -2722,7 +3124,7 @@ mod syntax_identifier_palette_tests {
     }
 
     /// Perceptual distance. ~2.3 is the just-noticeable difference; this module requires far more.
-    fn delta_e(a: Rgba, b: Rgba) -> f32 {
+    pub(super) fn delta_e(a: Rgba, b: Rgba) -> f32 {
         let (la, aa, ba) = lab(a);
         let (lb, ab, bb) = lab(b);
         ((la - lb).powi(2) + (aa - ab).powi(2) + (ba - bb).powi(2)).sqrt()
@@ -2828,8 +3230,13 @@ mod syntax_identifier_palette_tests {
 
     /// The maintainer's own scope line for this pass, pinned as a test: operators, brackets,
     /// delimiters and interpolation regions deliberately still render exactly as plain text.
-    /// Real bracket-pair colouring is a separate, larger feature to be decided on its own terms,
-    /// and this is what would catch it being smuggled in as a side effect of another change.
+    ///
+    /// GitHub issue #168's bracket-pair colouring landed **without** relaxing this, which is the
+    /// whole point of keeping it: the rainbow lives in its own six
+    /// [`syntax::BRACKET_1`]..[`syntax::BRACKET_6`] tokens, and `PUNCTUATION_BRACKET` stays plain
+    /// as the real fallback an *unmatched* bracket keeps. If a future change ever "implements
+    /// bracket colouring" by giving this one token a hue instead, that is the flat single-colour
+    /// non-solution issue #168 explicitly rejected, and this is what catches it.
     #[test]
     fn operators_and_punctuation_deliberately_still_render_as_plain_text() {
         for def in crate::settings::state::THEME_DEFS.iter() {
@@ -2844,8 +3251,9 @@ mod syntax_identifier_palette_tests {
                 assert!(
                     same(token.resolve(), text),
                     "{name} no longer matches syntax::TEXT in {} - colouring operators and \
-                     punctuation is deliberately out of scope until bracket colouring is designed \
-                     properly",
+                     punctuation flatly is deliberately out of scope; bracket-pair colouring is \
+                     done through syntax::BRACKET_1..BRACKET_6 instead, and PUNCTUATION_BRACKET \
+                     has to stay plain to remain a usable fallback for an unmatched bracket",
                     def.name
                 );
             }
