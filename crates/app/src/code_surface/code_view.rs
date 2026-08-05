@@ -454,7 +454,21 @@ pub struct HighlightSpan {
     pub start: usize,
     pub end: usize,
     pub kind: HighlightKind,
+    /// Which real *injected region* of the file this span's bytes came from - see
+    /// [`injection_scopes`]. [`OUTER_SCOPE`] for the host language's own top-level text (which is
+    /// every span in a file whose grammar injects nothing at all, i.e. all but Markdown and HTML);
+    /// `1..` identifies one specific injected range, in source order.
+    ///
+    /// It exists for exactly one consumer, [`colorize_bracket_pairs`], which must not pair a `{`
+    /// in one fenced code block with a `}` in the *next* one. Carrying the region on the span is
+    /// what lets that pass stay a pure function of the span list while still being
+    /// injection-aware - the alternative (teaching every caller to also thread a range list
+    /// alongside the spans) would put the same invariant in nine places instead of one.
+    pub scope: u32,
 }
+
+/// [`HighlightSpan::scope`] for the host language's own text, outside every injected region.
+pub const OUTER_SCOPE: u32 = 0;
 /// Which real grammar a piece of source is parsed and queried with. `TypeScript` and `Tsx` are
 /// two genuinely different grammars in `tree-sitter-typescript` (not one grammar with a flag), and
 /// they need two different composed query strings - see [`highlight_query_for`].
@@ -1348,12 +1362,7 @@ const MARKDOWN_INLINE_INJECTION_QUERY: &str = r#"
 fn build_highlight_config(
     grammar: Grammar,
 ) -> Result<HighlightConfiguration, tree_sitter::QueryError> {
-    let injection_query = match grammar {
-        Grammar::Markdown => MARKDOWN_INJECTION_QUERY,
-        Grammar::MarkdownInline => MARKDOWN_INLINE_INJECTION_QUERY,
-        Grammar::Html => tree_sitter_html::INJECTIONS_QUERY,
-        _ => "",
-    };
+    let injection_query = injection_query_source(grammar);
     let mut config = HighlightConfiguration::new(
         grammar.language(),
         grammar.name(),
@@ -1388,6 +1397,143 @@ fn build_highlight_config(
 /// which is cheap to construct and is created fresh per call.
 static HIGHLIGHT_CONFIGS: [OnceLock<Option<HighlightConfiguration>>; Grammar::COUNT] =
     [const { OnceLock::new() }; Grammar::COUNT];
+
+/// The real injection-query source `grammar` drives language injection with, or `""` for a grammar
+/// that injects nothing. The single source of truth for both consumers: the
+/// [`HighlightConfiguration`] the highlighting engine itself uses ([`build_highlight_config`]), and
+/// [`injection_scopes`]' own separate parse. Keeping them on one constant is what stops the two
+/// from ever disagreeing about where an injected region begins.
+fn injection_query_source(grammar: Grammar) -> &'static str {
+    match grammar {
+        Grammar::Markdown => MARKDOWN_INJECTION_QUERY,
+        Grammar::MarkdownInline => MARKDOWN_INLINE_INJECTION_QUERY,
+        Grammar::Html => tree_sitter_html::INJECTIONS_QUERY,
+        _ => "",
+    }
+}
+
+/// Compiled [`injection_query_source`]s, cached per grammar exactly like [`HIGHLIGHT_CONFIGS`] -
+/// building a `tree_sitter::Query` costs real work and must not happen per keystroke. `None` for a
+/// grammar with no injection query at all, and also for the (test-covered, not expected) case of
+/// one that fails to compile.
+static INJECTION_QUERIES: [OnceLock<Option<tree_sitter::Query>>; Grammar::COUNT] =
+    [const { OnceLock::new() }; Grammar::COUNT];
+
+fn injection_query(grammar: Grammar) -> Option<&'static tree_sitter::Query> {
+    INJECTION_QUERIES[grammar.index()]
+        .get_or_init(|| {
+            let source = injection_query_source(grammar);
+            if source.is_empty() {
+                return None;
+            }
+            match tree_sitter::Query::new(&grammar.language(), source) {
+                Ok(query) => Some(query),
+                Err(error) => {
+                    log::error!(
+                        "bracket-pair scoping disabled for {}: its injection query failed to \
+                         compile: {error}",
+                        grammar.name()
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Every real *injected region* in `source`, as byte ranges, in source order - one entry per
+/// ` ```rust ` fence body, per markdown `(inline)` node, per `<script>`/`<style>` body, and so on,
+/// taken from the grammar's own [`injection_query_source`]'s `@injection.content` captures.
+///
+/// ## Why this exists (GitHub issue: bracket pairs matched across fenced code blocks)
+///
+/// [`colorize_bracket_pairs`] is a stack matcher over the whole file's bracket tokens. Before this,
+/// it ran one single stack over every bracket in the document, which is wrong the moment a file
+/// contains more than one *independent* body of code. A markdown file with two ` ```rust ` fences
+/// is exactly that, and the bug it produced was real and reproducible: an unclosed `{` in the first
+/// fence paired with a `}` in the second, painting two brackets in two different code blocks - in
+/// two different languages, potentially - as one matched pair, and shifting every depth in the
+/// second fence by the first fence's leftover stack.
+///
+/// `tree_sitter_highlight::HighlightEvent` carries no layer identity (`Source`/`HighlightStart`/
+/// `HighlightEnd` only - `tree-sitter-highlight-0.26.9/src/highlight.rs:106-110`, read directly),
+/// and the engine flattens every injected layer into one event stream, so [`fold_highlight_events`]
+/// genuinely cannot tell which layer a byte came from. Recovering it needs a separate look at the
+/// tree, which is what this does.
+///
+/// ## Cost, stated plainly
+///
+/// This is a real second parse of `source`. It runs **only** for a grammar that actually has an
+/// injection query - Markdown, MarkdownInline and HTML, three of thirteen - and returns immediately
+/// with no parse at all for the other ten, so opening a Rust or TypeScript file costs exactly what
+/// it did before. For the three that do pay it, one extra parse is the honest price of not
+/// mis-pairing brackets across code blocks, and it is still amortised over a real content change
+/// rather than a frame.
+///
+/// Deliberately **one level deep**, not recursive: an injected region's own nested injections
+/// (HTML inside a markdown fence, CSS inside that HTML) are not sub-divided further. That is a real
+/// limitation rather than an oversight - it keeps this to a single parse, and one level is what
+/// separates the case that actually misbehaves (sibling fences). A bracket pair spanning two
+/// *nested* injected regions is not reachable in practice, since the inner region is entirely
+/// contained in the outer one.
+fn injection_scopes(source: &str, grammar: Grammar) -> Vec<(usize, usize)> {
+    use streaming_iterator::StreamingIterator;
+
+    let Some(query) = injection_query(grammar) else {
+        return Vec::new();
+    };
+    let Some(content_index) = query
+        .capture_names()
+        .iter()
+        .position(|name| *name == "injection.content")
+    else {
+        return Vec::new();
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar.language()).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
+    while let Some(query_match) = matches.next() {
+        for capture in query_match.captures {
+            if capture.index as usize == content_index {
+                let node = capture.node;
+                if node.start_byte() < node.end_byte() {
+                    ranges.push((node.start_byte(), node.end_byte()));
+                }
+            }
+        }
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    ranges
+}
+
+/// [`HighlightSpan::scope`] for a span starting at `start`, given `scopes` from
+/// [`injection_scopes`] - the index of the innermost containing range, plus one, or
+/// [`OUTER_SCOPE`] when no range contains it.
+///
+/// `scopes` is sorted by start byte, and the ranges are either disjoint or properly nested (they
+/// are syntax-node ranges), so the *last* range that starts at or before `start` and still contains
+/// it is the innermost one.
+fn scope_for_byte(scopes: &[(usize, usize)], start: usize) -> u32 {
+    let mut scope = OUTER_SCOPE;
+    for (index, (range_start, range_end)) in scopes.iter().enumerate() {
+        if *range_start > start {
+            break;
+        }
+        if start < *range_end {
+            scope = index as u32 + 1;
+        }
+    }
+    scope
+}
 
 /// `grammar`'s real, shared [`HighlightConfiguration`], compiling it on first use, or `None` if
 /// its query failed to compile.
@@ -1585,7 +1731,10 @@ fn highlight_with(source: &str, grammar: Grammar) -> Vec<HighlightSpan> {
     else {
         return Vec::new();
     };
-    fold_highlight_events(events)
+    // Empty (and free - no parse at all) for the ten grammars that inject nothing; see
+    // `injection_scopes` for why the three that do inject pay a second parse.
+    let scopes = injection_scopes(source, grammar);
+    fold_highlight_events(events, &scopes)
 }
 
 /// Parses `source` with `tree-sitter-md`'s real block grammar and classifies it through the same
@@ -1638,6 +1787,7 @@ pub fn highlight_markdown(source: &str) -> Vec<HighlightSpan> {
 /// posture [`highlight_block`] already documents for partial input.
 fn fold_highlight_events(
     events: impl Iterator<Item = Result<HighlightEvent, tree_sitter_highlight::Error>>,
+    scopes: &[(usize, usize)],
 ) -> Vec<HighlightSpan> {
     let mut spans: Vec<HighlightSpan> = Vec::new();
     let mut open: Vec<HighlightKind> = Vec::new();
@@ -1659,6 +1809,7 @@ fn fold_highlight_events(
                     continue;
                 }
                 let kind = open.last().copied().unwrap_or(HighlightKind::Text);
+                let scope = scope_for_byte(scopes, start);
                 // Coalesce with the previous span when it is both adjacent and the same bucket.
                 // Real, not cosmetic: the engine splits `Source` at every highlight boundary, so a
                 // keyword list like Rust's `"as" @keyword ... "async" @keyword ...` arrives as one
@@ -1671,10 +1822,19 @@ fn fold_highlight_events(
                 // rather than disappearing into the surrounding string - see
                 // `escapes_inside_a_string_are_their_own_real_string_escape_run`.
                 match spans.last_mut() {
-                    Some(previous) if previous.end == start && previous.kind == kind => {
+                    Some(previous)
+                        if previous.end == start
+                            && previous.kind == kind
+                            && previous.scope == scope =>
+                    {
                         previous.end = end;
                     }
-                    _ => spans.push(HighlightSpan { start, end, kind }),
+                    _ => spans.push(HighlightSpan {
+                        start,
+                        end,
+                        kind,
+                        scope,
+                    }),
                 }
             }
         }
@@ -1808,6 +1968,19 @@ fn is_tracked_closer(ch: char) -> bool {
 /// pairs it colours are all still really matched, and the offset resolves itself the moment the
 /// source balances again.
 ///
+/// ## Injected regions pair independently
+///
+/// Matching runs one **separate stack per [`HighlightSpan::scope`]**, so a `{` in one ` ```rust `
+/// fence can never pair with a `}` in the next one, and an unbalanced fence cannot shift the ring
+/// for the fences after it. Before that, one global stack ran over the whole document and did
+/// exactly both of those things - see [`injection_scopes`] for the real reproduction and for why
+/// the region has to be recovered from a separate parse rather than read off the highlight event
+/// stream.
+///
+/// Depth is counted *within* a scope, so every fence's outermost pair starts at ring colour 0
+/// regardless of what the fences before it did, and regardless of how deeply the host document
+/// nests the fence.
+///
 /// ## Why it re-splits spans
 ///
 /// [`fold_highlight_events`] coalesces adjacent same-bucket spans, so `}}` or `<(` arrive as *one*
@@ -1831,8 +2004,10 @@ pub fn colorize_bracket_pairs(source: &str, spans: Vec<HighlightSpan>) -> Vec<Hi
     // is what would catch them ever drifting apart and silently colouring the wrong characters.
     let mut bracket_bytes: Vec<usize> = Vec::new();
     let mut depths: Vec<Option<usize>> = Vec::new();
-    // (expected closer, index into `depths` of the opener, that opener's nesting depth).
-    let mut stack: Vec<(char, usize, usize)> = Vec::new();
+    // One independent stack per `HighlightSpan::scope` - see this function's own "Injected regions
+    // pair independently" docs. Each entry is (expected closer, index into `depths` of the opener,
+    // that opener's nesting depth *within its own scope*).
+    let mut stacks: HashMap<u32, Vec<(char, usize, usize)>> = HashMap::new();
 
     for span in &spans {
         if span.kind != HighlightKind::PunctuationBracket {
@@ -1841,6 +2016,7 @@ pub fn colorize_bracket_pairs(source: &str, spans: Vec<HighlightSpan>) -> Vec<Hi
         let Some(text) = source.get(span.start..span.end) else {
             continue;
         };
+        let stack = stacks.entry(span.scope).or_default();
         for (offset, ch) in text.char_indices() {
             if let Some(closer) = closer_for(ch) {
                 stack.push((closer, depths.len(), stack.len()));
@@ -1898,6 +2074,7 @@ pub fn colorize_bracket_pairs(source: &str, spans: Vec<HighlightSpan>) -> Vec<Hi
                     start,
                     end: start + ch.len_utf8(),
                     kind,
+                    scope: span.scope,
                 },
             );
         }
@@ -1910,7 +2087,11 @@ pub fn colorize_bracket_pairs(source: &str, spans: Vec<HighlightSpan>) -> Vec<Hi
 /// [`colorize_bracket_pairs`] splits a multi-character bracket run apart.
 fn push_coalesced(spans: &mut Vec<HighlightSpan>, span: HighlightSpan) {
     match spans.last_mut() {
-        Some(previous) if previous.end == span.start && previous.kind == span.kind => {
+        Some(previous)
+            if previous.end == span.start
+                && previous.kind == span.kind
+                && previous.scope == span.scope =>
+        {
             previous.end = span.end;
         }
         _ => spans.push(span),
@@ -4222,6 +4403,8 @@ mod tests {
                     start: offset,
                     end: offset + ch.len_utf8(),
                     kind,
+                    // This helper models a single-language file, which is exactly one scope.
+                    scope: OUTER_SCOPE,
                 },
             );
         }
@@ -4331,31 +4514,37 @@ mod tests {
                 start: 0,
                 end: 1,
                 kind: HighlightKind::Function,
+                scope: OUTER_SCOPE,
             },
             HighlightSpan {
                 start: 1,
                 end: 2,
                 kind: HighlightKind::PunctuationBracket,
+                scope: OUTER_SCOPE,
             },
             HighlightSpan {
                 start: 2,
                 end: 5,
                 kind: HighlightKind::String,
+                scope: OUTER_SCOPE,
             },
             HighlightSpan {
                 start: 5,
                 end: 7,
                 kind: HighlightKind::PunctuationDelimiter,
+                scope: OUTER_SCOPE,
             },
             HighlightSpan {
                 start: 7,
                 end: 14,
                 kind: HighlightKind::Comment,
+                scope: OUTER_SCOPE,
             },
             HighlightSpan {
                 start: 14,
                 end: 15,
                 kind: HighlightKind::PunctuationBracket,
+                scope: OUTER_SCOPE,
             },
         ];
         let out = colorize_bracket_pairs(source, spans);
@@ -4385,6 +4574,67 @@ mod tests {
             HighlightKind::Comment,
             "the `)` inside the comment must stay part of the comment"
         );
+    }
+
+    /// Two independent ` ```rust ` fences in one markdown document must pair their brackets
+    /// **separately**. This is the real bug `HighlightSpan::scope` and `injection_scopes` exist to
+    /// fix, reproduced exactly as it was found: before the fix, `colorize_bracket_pairs` ran one
+    /// global stack over the whole document, so the unclosed `{` in the first fence paired with the
+    /// `}` that opens the second - two brackets in two different code blocks, painted as one
+    /// matched pair, with every depth in the second fence shifted by the first fence's leftovers.
+    #[test]
+    fn brackets_never_pair_across_two_separate_markdown_fences() {
+        let source = "```rust\nfn a() { // no closer\n```\n\nprose\n\n```rust\n} fn b() {}\n```\n";
+        let spans = ring_spans(source, highlight_markdown);
+
+        let unclosed_brace = nth_offset(source, '{', 0);
+        let stray_closer = nth_offset(source, '}', 0);
+        assert_eq!(
+            kind_at_byte(&spans, unclosed_brace),
+            HighlightKind::PunctuationBracket,
+            "the first fence's `{{` has no partner *inside its own fence* and must stay plain"
+        );
+        assert_eq!(
+            kind_at_byte(&spans, stray_closer),
+            HighlightKind::PunctuationBracket,
+            "the second fence's leading `}}` has no partner inside its own fence either - pairing \
+             it with the first fence's `{{` is exactly the bug this test pins"
+        );
+    }
+
+    /// The other half of the same fix: an *unbalanced* fence must not shift the depth ring for the
+    /// fences after it. `fn b`'s own braces are the outermost pair in their own fence, so they must
+    /// paint ring colour 0 - not 2, which is what the leaked global stack produced.
+    #[test]
+    fn an_unbalanced_fence_does_not_shift_the_ring_for_later_fences() {
+        let source = "```rust\nfn a() { let x = (;\n```\n\n```rust\nfn b() { c([1]); }\n```\n";
+        let spans = ring_spans(source, highlight_markdown);
+
+        // `fn b`'s body brace - the second `{` in the document.
+        let body_brace = nth_offset(source, '{', 1);
+        assert_eq!(
+            ring_index_at(&spans, body_brace),
+            Some(0),
+            "the second fence's outermost pair must start the ring over at 0"
+        );
+        // ...and the `(` of `c(` nested one level inside it. That is the *fourth* `(` in the
+        // document: `fn a(`, the unclosed `(`, `fn b(`, then this one.
+        let call_paren = nth_offset(source, '(', 3);
+        assert_eq!(
+            ring_index_at(&spans, call_paren),
+            Some(1),
+            "one level in from a depth-0 pair is ring 1, regardless of the previous fence"
+        );
+    }
+
+    /// A fence whose code is genuinely balanced is unaffected by this fix - both fences already
+    /// started at 0 before it, and must still.
+    #[test]
+    fn two_balanced_fences_each_start_the_ring_at_zero() {
+        let source = "```rust\nfn a() { b(); }\n```\n\n```rust\nfn c() { d(); }\n```\n";
+        let spans = ring_spans(source, highlight_markdown);
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '{', 0)), Some(0));
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '{', 1)), Some(0));
     }
 
     /// `<`/`>` really do arrive here as `PunctuationBracket` (Rust and TypeScript both capture a

@@ -279,6 +279,12 @@ fn spans_for_byte_window(
             start: start as usize,
             end: end as usize,
             kind: *kind,
+            // These spans are re-derived from already-rendered runs, not from a parse, and a
+            // `RenderedLine` run carries no injection scope to recover. `OUTER_SCOPE` is the honest
+            // value: the only consumer of the field is `colorize_bracket_pairs`, which has already
+            // run by the time these exist (this path re-splices *its* output while the debounced
+            // background re-highlight is still in flight), so nothing reads it back here.
+            scope: code_view::OUTER_SCOPE,
         });
     }
     spans

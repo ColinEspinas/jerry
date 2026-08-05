@@ -281,6 +281,7 @@ dependencies = [
  "self_update",
  "serde",
  "serde_json",
+ "streaming-iterator",
  "tempfile",
  "toml 0.8.23",
  "tree-sitter",
