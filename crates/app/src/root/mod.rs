@@ -78,7 +78,7 @@ use crate::settings::state as settings;
 use crate::settings::state::SettingsPage;
 use crate::settings::store::{self as settings_store, CfgFormat, Settings};
 use crate::sidebar::changes::{self, ChangeTag};
-use crate::sidebar::file_tree::{self, FileTreeEntry};
+use crate::sidebar::file_tree;
 use crate::sidebar::fold_state;
 use crate::sidebar::tree_ops;
 use crate::status_bar::process_stats;
@@ -343,7 +343,7 @@ pub struct AdeApp {
     pub(crate) rail_scroll_handle: gpui::ScrollHandle,
     pub(crate) selected: Option<usize>,
     pub(crate) agents: Agents,
-    pub(crate) file_tree: Vec<FileTreeEntry>,
+    pub(crate) file_tree: file_tree::FileTree,
     pub(crate) file_tree_root: PathBuf,
     pub(crate) file_tree_error: Option<String>,
     pub(crate) right_sidebar_view: RightSidebarView,
@@ -418,26 +418,15 @@ pub struct AdeApp {
     pub(crate) fold_state_save_pending: bool,
     /// See [`Self::settings_save_running`] - same contract, for the fold-state file.
     pub(crate) fold_state_save_running: bool,
-    /// Whether the last completed file-tree walk stopped early at its configured entry cap
-    /// (`Settings.file_tree.max_entries`, or [`Self::file_tree_limit_override`]). Drives the
-    /// sidebar's real "load more" action - the explicit replacement for the removed
-    /// "... and N more entries not shown" row.
-    pub(crate) file_tree_truncated: bool,
-    /// Whether that walk was a *complete* inventory of the worktree's directories
-    /// (`file_tree::FileTreeListing::is_complete`) - false when it was truncated, and also when
-    /// it silently skipped an unreadable or too-deep subdirectory. The only condition under
-    /// which `AdeApp::prune_stale_fold_state` may read "not in this listing" as "deleted".
+    /// Whether the last completed file-tree walk was a *complete* inventory of the worktree's
+    /// directories (`file_tree::FileTreeListing::is_complete`) - false when it silently skipped
+    /// an unreadable or too-deep subdirectory. The only condition under which
+    /// `AdeApp::prune_stale_fold_state` may read "not in this listing" as "deleted".
+    ///
+    /// There is no `file_tree_truncated` companion any more: GitHub issue #160 removed the walk's
+    /// entry cap, so "the walk stopped early because it ran out of budget" is no longer a state
+    /// this app can be in.
     pub(crate) file_tree_complete: bool,
-    /// Set by the sidebar's "load more" action (`Self::load_more_file_tree_entries`): the cap
-    /// this worktree's walks use instead of `Settings.file_tree.max_entries`, raised tenfold per
-    /// click. Deliberately still a cap and never `None`: a single click that re-walked a
-    /// bind-mounted `$HOME` with an unbounded budget would allocate millions of `PathBuf`s on a
-    /// background thread and then hand them all to `rebuild_palette_file_candidates`. Each click
-    /// raises the bound and the row keeps reporting where the walk stopped, so the listing is
-    /// never *silently* cut off - which is what issue #18 §4 actually asks for. Agent-scoped
-    /// and per-worktree: reset on every worktree switch, since "show me more of *this* tree"
-    /// says nothing about the next one.
-    pub(crate) file_tree_limit_override: Option<usize>,
     /// The file tree's open right-click context menu (GitHub issue #19 §1), `None` when closed -
     /// see `crate::sidebar::tree_ops::TreeContextMenu`.
     pub(crate) tree_context_menu: Option<tree_ops::TreeContextMenu>,
@@ -877,9 +866,10 @@ pub struct AdeApp {
     /// Pre-open focus target and active agent for [`Self::palette_focus_handle`] - see
     /// [`OverlayFocus`]/[`restore_focus`].
     pub(crate) palette_focus: OverlayFocus,
-    /// The palette's file-candidate list (`crate::palette::state::FileCandidate`, one per non-directory
-    /// [`Self::file_tree`] entry, up to `Settings.file_tree.max_entries`) - built once by
-    /// [`Self::rebuild_palette_file_candidates`] when `file_tree`/the diff reload, not rebuilt on
+    /// The palette's file-candidate list (`crate::palette::state::FileCandidate`, one per
+    /// non-directory [`Self::file_tree`] entry) - built once when `file_tree`/the diff reload
+    /// (on the background executor for the tree walk, see [`Self::load_file_tree`]; via
+    /// [`Self::rebuild_palette_file_candidates`] for the diff), not rebuilt on
     /// every `Self::build_palette_groups` call (which runs on every render while the palette is
     /// open, up to ~30x/sec during a streaming agent). Agent/command candidates aren't
     /// cached the same way: they're few, and an agent's status dot is genuinely live per-render

@@ -1,5 +1,6 @@
 use super::*;
 use crate::code_surface::state::{DiffLoadState, FileLoadState};
+use crate::palette::render as palette_render;
 use crate::sidebar::render::RightSidebarView;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -210,7 +211,7 @@ impl AdeApp {
             rail_scroll_handle: gpui::ScrollHandle::new(),
             selected: None,
             agents: Agents::new(),
-            file_tree: Vec::new(),
+            file_tree: file_tree::FileTree::default(),
             file_tree_error: None,
             right_sidebar_view: RightSidebarView::Files,
             file_tree_scroll_handle: UniformListScrollHandle::new(),
@@ -230,10 +231,8 @@ impl AdeApp {
             _fold_state_save_task: None,
             fold_state_save_pending: false,
             fold_state_save_running: false,
-            file_tree_truncated: false,
             // Nothing has been walked yet, so nothing may be pruned yet either.
             file_tree_complete: false,
-            file_tree_limit_override: None,
             tree_context_menu: None,
             tree_inline_edit: None,
             tree_clipboard: None,
@@ -617,7 +616,7 @@ impl AdeApp {
                             .map(|item| item.path.clone())
                             .unwrap_or_else(|| this.focused_repo_path());
                         this.set_file_tree_root(new_root.clone(), cx);
-                        this.file_tree = Vec::new();
+                        this.file_tree = file_tree::FileTree::default();
                         this.reload_expanded_dirs_from_fold_state();
                         this.load_file_tree(new_root.clone(), cx);
                         this.load_diff(new_root, cx);
@@ -698,52 +697,96 @@ impl AdeApp {
         self.start_file_tree_watch(cx);
     }
 
+    /// Walks [`Self::file_tree_root`] and applies the result, off the foreground thread.
+    ///
+    /// GitHub issue #160 removed this walk's entry cap ("File tree should load all folders and
+    /// files"), so the amount of work here is now bounded only by what is actually on disk. Two
+    /// steps run on `gpui::BackgroundExecutor` because of it, not one:
+    ///
+    /// 1. the walk itself (`file_tree::build_file_tree`), as it always has; and
+    /// 2. the palette's file-candidate list, which allocates a
+    ///    `crate::palette::state::FileCandidate` per file and used to be built by
+    ///    [`Self::rebuild_palette_file_candidates`] right here in the completion handler - on the
+    ///    foreground thread, which was one of the two real costs the old cap existed to bound.
+    ///
+    /// The diff marks those candidates carry are snapshotted between the two
+    /// (`palette::render::file_diff_marks`), on the foreground, because they live on `self`. That
+    /// snapshot is bounded by the *diff's* size (tens of files), not the tree's, so it is the one
+    /// piece of this that stays on the foreground thread and is genuinely cheap there.
     pub(crate) fn load_file_tree(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.set_file_tree_root(root.clone(), cx);
-        // Always a real bound - see [`Self::file_tree_limit_override`] for why even the "load
-        // more" escape hatch raises the cap rather than removing it.
-        let limit = Some(
-            self.file_tree_limit_override
-                .unwrap_or(self.settings.file_tree.max_entries),
-        );
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn({
                     let root = root.clone();
-                    async move { file_tree::build_file_tree(&root, limit) }
+                    async move { file_tree::build_file_tree(&root) }
                 })
                 .await;
+
+            // Identity guard, applied at *every* point this task touches the app: a worktree
+            // switch that lands while the walk is still running replaces `_load_file_tree_task`
+            // (cancelling it) *and* moves `file_tree_root` - but a task already past an `await`
+            // point can still reach here. Applying a stale walk would show one worktree's tree
+            // under another's root, and - far worse - prune the *new* worktree's fold state
+            // against the *old* worktree's directory list.
+            let listing = match result {
+                Ok(listing) => listing,
+                Err(err) => {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.file_tree_root != root {
+                            return;
+                        }
+                        this.file_tree = file_tree::FileTree::default();
+                        this.file_tree_complete = false;
+                        this.file_tree_error = Some(err.to_string());
+                        this.rebuild_palette_file_candidates();
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+
+            let Ok(Some(marks)) = this.update(cx, |this, _| {
+                (this.file_tree_root == root)
+                    .then(|| palette_render::file_diff_marks(this.current_diff()))
+            }) else {
+                return;
+            };
+
+            let complete = listing.is_complete();
+            let (tree, candidates) = cx
+                .background_executor()
+                .spawn({
+                    let root = root.clone();
+                    let marks = marks.clone();
+                    async move {
+                        let candidates =
+                            palette_render::build_file_candidates(&listing.tree, &root, &marks);
+                        (listing.tree, candidates)
+                    }
+                })
+                .await;
+
             let _ = this.update(cx, |this, cx| {
-                // Identity guard: a worktree switch that lands while this walk is still running
-                // replaces `_load_file_tree_task` (cancelling it) *and* moves
-                // `file_tree_root` - but a task already past its `await` point can still reach
-                // here. Applying a stale walk would show one worktree's tree under another's
-                // root, and - far worse now - prune the *new* worktree's fold state against the
-                // *old* worktree's directory list.
                 if this.file_tree_root != root {
                     return;
                 }
-                match result {
-                    Ok(listing) => {
-                        this.file_tree_truncated = listing.truncated;
-                        this.file_tree_complete = listing.is_complete();
-                        this.file_tree = listing.entries;
-                        this.file_tree_error = None;
-                        this.prune_stale_fold_state(cx);
-                    }
-                    Err(err) => {
-                        this.file_tree = Vec::new();
-                        this.file_tree_truncated = false;
-                        this.file_tree_complete = false;
-                        this.file_tree_error = Some(err.to_string());
-                    }
+                this.file_tree_complete = complete;
+                this.file_tree = tree;
+                this.file_tree_error = None;
+                // Applied in the same update as the tree they were built from, so the palette can
+                // never be showing candidates for one walk while the sidebar shows another's rows.
+                this.palette_file_candidates = candidates;
+                // A `load_diff` that landed during the background hop above built its candidates
+                // from the *old* tree, and the ones just applied carry the marks as they were
+                // before it. Re-deriving here is the O(loaded files) foreground pass this whole
+                // arrangement exists to avoid, so it is gated on the marks having genuinely moved
+                // - which needs one cheap comparison over the diff's files, not the tree's.
+                if palette_render::file_diff_marks(this.current_diff()) != marks {
+                    this.rebuild_palette_file_candidates();
                 }
-                // The palette's cached file-candidate list (`Self::palette_file_candidates`) is
-                // derived from `file_tree` - refresh it here, the real point that input changes,
-                // rather than leaving it stale until some unrelated `load_diff` happens to
-                // refresh it too.
-                this.rebuild_palette_file_candidates();
+                this.prune_stale_fold_state(cx);
                 cx.notify();
             });
         });
@@ -937,7 +980,7 @@ impl AdeApp {
         // `set_dir_expanded` with a path from an entirely different worktree/repo. Clearing
         // `file_tree` makes that window render an honestly empty tree instead.
         self.set_file_tree_root(new_root.clone(), cx);
-        self.file_tree = Vec::new();
+        self.file_tree = file_tree::FileTree::default();
         self.reload_expanded_dirs_from_fold_state();
         // Every one of these holds an absolute path in whatever was just left (GitHub issue #19):
         // an open context menu targeting a row that is about to stop existing, a half-typed name
@@ -955,9 +998,6 @@ impl AdeApp {
         // delete backups this leaves unreachable.
         self.clear_tree_undo_history();
         self.tree_op_error = None;
-        // "Show me the whole listing" was a decision about whatever was left.
-        self.file_tree_limit_override = None;
-        self.file_tree_truncated = false;
         self.file_tree_complete = false;
         // `focus_newly_spawned_agent` (despite its name - its body has no "newly spawned" logic
         // in it, just the shared "move focus unless a file tab/Settings is showing" guard) closes

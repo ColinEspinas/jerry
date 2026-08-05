@@ -250,7 +250,7 @@ impl AdeApp {
     }
 
     /// The tree's whole real selection - the anchor plus every additionally-selected path -
-    /// ordered the way the tree itself displays them (via [`file_tree::visible_indices`]) rather
+    /// ordered the way the tree itself displays them (via [`file_tree::FileTree::visible_indices`]) rather
     /// than insertion order, so a bulk action's own visible order (a "delete these 3 files" log,
     /// say) reads the same way the rows did. A selected path currently hidden inside a collapsed
     /// ancestor (reachable via Shift+click through an ancestor that was later re-collapsed) sorts
@@ -260,7 +260,7 @@ impl AdeApp {
         if self.additional_tree_selection.is_empty() {
             return self.selected_tree_path.iter().cloned().collect();
         }
-        let visible = file_tree::visible_indices(&self.file_tree, &self.expanded_dirs);
+        let visible = self.file_tree.visible_indices(&self.expanded_dirs);
         let mut ordered: Vec<PathBuf> = Vec::with_capacity(self.tree_selection_len());
         let mut remaining = self.additional_tree_selection.clone();
         if let Some(anchor) = &self.selected_tree_path {
@@ -337,7 +337,7 @@ impl AdeApp {
             self.additional_tree_selection.clear();
             return;
         };
-        let visible = file_tree::visible_indices(&self.file_tree, &self.expanded_dirs);
+        let visible = self.file_tree.visible_indices(&self.expanded_dirs);
         let anchor_index = visible
             .iter()
             .position(|&index| self.file_tree[index].path == anchor);

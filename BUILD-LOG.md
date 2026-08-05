@@ -7613,3 +7613,78 @@ keystroke against a real `.py` file.
 code_surface::`: 379 passed, 4 failed - all 4 pre-existing and environment-specific (real
 LSP-server-readiness tests needing rust-analyzer/vue-language-server to actually finish starting,
 unrelated to this change); every new test passes.
+
+## The file tree should load all folders and files (GitHub issue #160)
+
+**The ask.** "Remove the 'Stopped at 20000 entries - load more' button at the bottom of file tree.
+File tree should load all folders and files."
+
+**What the cap actually was.** `file_tree::build_file_tree` took a `limit: Option<usize>` and
+stopped mid-walk when it ran out, setting `FileTreeListing::truncated`. `AdeApp::load_file_tree`
+always passed a real bound (`Settings.file_tree.max_entries`, 20,000 by default, clamped to
+`FILE_TREE_MAX_ENTRIES_MAX` = 100,000). `render_file_tree` grew a footer off `file_tree_truncated`:
+a clickable "Stopped at N entries – load more" row that raised `file_tree_limit_override` tenfold
+and re-walked, degrading to a plain non-interactive disclosure once the ceiling was reached.
+
+**Why it was not just a `git rm` of the check.** The walk itself has always run on
+`cx.background_executor()`, so it was never the thing that could hang a frame. The cap's real
+job - documented on `FILE_TREE_MAX_ENTRIES_MAX` - was to bound two pieces of *foreground* work
+that scaled with the loaded entry count:
+
+1. `rebuild_palette_file_candidates`, called from `load_file_tree`'s completion handler, which
+   allocates a `FileCandidate` (a cloned `PathBuf` plus two `String`s) per file; and
+2. `file_tree::visible_indices`, called once per frame by `render_file_tree`, which scanned
+   *every* loaded entry - including every entry inside a collapsed folder - to decide which rows
+   were showing.
+
+Deleting the cap without touching either would have traded a visible-but-honest "load more" row
+for an invisible per-frame regression on exactly the trees the issue is about. So both were fixed:
+
+- **Candidates now build on the background executor.** `load_file_tree` is a three-step task:
+  walk (background) → snapshot the diff marks (foreground, bounded by the *diff's* size, tens of
+  files) → build the candidates (background) → apply tree + candidates in one `update`. The
+  identity guard (`this.file_tree_root != root`) is re-applied at every point the task touches the
+  app, since there are now three of them. `rebuild_palette_file_candidates` survives for the cheap
+  "same tree, new diff marks" case (`load_diff`, `open_file_tab`) and shares one
+  `build_file_candidates` with the background path, so the two can't disagree.
+- **Visibility resolution is now O(visible rows), not O(loaded entries).** New
+  `file_tree::FileTree` owns the entries plus a derived per-entry subtree span, so a collapsed
+  directory is stepped over in one addition. The spans are private and derived in `FileTree::new`,
+  the only constructor - a stale span wouldn't error, it would silently show a collapsed folder's
+  children, so there is deliberately no way to hand-write one. `FileTree` derefs to
+  `[FileTreeEntry]`, so every read site (indexing, `iter`, `len`) is unchanged.
+
+**Removed.** `FileTreeListing::truncated`, `MAX_LOAD_MORE_ENTRIES`, `AdeApp::file_tree_truncated`,
+`AdeApp::file_tree_limit_override`, `load_more_file_tree_entries`,
+`file_tree_limit_is_at_ceiling`, both footer branches in `render_file_tree`, and the whole
+`FileTreeSettings` section (`file_tree.max_entries` and its three constants) - a persisted setting
+with nothing left to configure would be exactly the "looks wired up but isn't" this project
+forbids. `Settings` has no `deny_unknown_fields`, so an older `settings.toml` still carrying
+`[file_tree]` loads as a no-op rather than falling back to defaults; there is a test for that.
+`FileTreeListing::partial` and `MAX_DEPTH` stay - the depth bound is a stack-overflow guard, not
+an entry budget, and `partial` is still what stops `prune_stale_fold_state` from reading an
+incomplete listing as "these folders were deleted".
+
+**Tests.** Two new ones prove the actual ask, at both levels: `file_tree::tests::
+a_tree_larger_than_the_removed_twenty_thousand_entry_cap_loads_completely` (a real 21,200-entry
+tempdir, asserting the count, `is_complete()`, and that the *last* file of the *last* directory -
+~1,200 entries past the old cut-off - is present by path), and `sidebar::render::file_tree_tests::
+a_tree_past_the_removed_cap_loads_every_entry_with_no_load_more_row` (the same fixture through a
+real window: full entry count, no `file-tree-show-all` element, the palette's candidate list
+covering the whole tree, and a folder past the cut-off expanding into real visible rows).
+`span_based_visibility_matches_the_depth_scan_for_every_expansion` pins the new span-based skip
+against the depth scan it replaced (kept as a `#[cfg(test)]` oracle) across all 32 expansion
+combinations of a real 5-directory tree. The three tests that asserted the old capped behaviour
+are gone; `a_truncated_walk_never_prunes_fold_state` became
+`an_incomplete_walk_never_prunes_fold_state`, driven through the incompleteness that genuinely
+remains - a `chmod 000` directory with the expanded folder inside it - rather than a cap that no
+longer exists.
+
+**Verification**: `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings` - all clean. `cargo test --workspace --lib --
+--test-threads=1`: 1592 passed, 1 failed - `code_surface::diff_view::diff_render_tests::
+opening_a_real_diff_renders_real_syntax_highlighted_rows`, the already-known flake, which passes
+in isolation. An earlier run of the same suite also showed 15 `spawn_*_watcher` failures; those
+were the host running out of inotify instances (measured at 124/128, with three other worktrees'
+suites running concurrently), not this change - no watcher file is touched by it, and all 18
+watcher tests pass once the host has headroom.

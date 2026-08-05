@@ -25,6 +25,78 @@ fn window_controls_secondary(current: WindowControlsStyle, option: WindowControl
     }
 }
 
+/// One changed file's contribution to a [`palette::FileCandidate`] - what a diff overlays onto a
+/// row that otherwise comes purely from the file tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileDiffMark {
+    pub add: u32,
+    pub del: u32,
+    pub changed: Option<palette::FileChangeKind>,
+}
+
+/// Every changed file's [`FileDiffMark`], keyed by the repo-relative path `wt_core::diff` reports
+/// (see `crate::sidebar::changes::split_dir_name`'s docs on that shape).
+///
+/// Owned rather than borrowed from the diff, and bounded by the *diff's* size rather than the
+/// tree's, so `AdeApp::load_file_tree` can take a snapshot of it on the foreground thread in
+/// constant-ish time and then hand it to a background task. Built once, not once per file - that
+/// avoids an O(files × diff_files) rescan (the same idiom as `AdeApp::tree_change_marks`).
+pub(crate) type FileDiffMarks = HashMap<PathBuf, FileDiffMark>;
+
+/// Snapshots the currently loaded diff as [`FileDiffMarks`].
+pub(crate) fn file_diff_marks(diff: Option<&wt_core::diff::WorktreeDiff>) -> FileDiffMarks {
+    let Some(diff) = diff else {
+        return FileDiffMarks::default();
+    };
+    diff.files
+        .iter()
+        .map(|file: &DiffFile| {
+            let (add, del) = changes::diff_file_stats(file);
+            let changed = match file.status {
+                FileChangeStatus::Added => Some(palette::FileChangeKind::Added),
+                FileChangeStatus::Deleted => Some(palette::FileChangeKind::Deleted),
+                FileChangeStatus::Modified | FileChangeStatus::Renamed => None,
+            };
+            (file.path.clone(), FileDiffMark { add, del, changed })
+        })
+        .collect()
+}
+
+/// Builds the palette's file-candidate list: one [`palette::FileCandidate`] per non-directory
+/// entry in an already-walked file tree, with `marks` overlaid where the file has a diff.
+///
+/// Pure, and deliberately free of `AdeApp` - this is `O(entries)` with a handful of allocations
+/// each, which since GitHub issue #160 removed the walk's entry cap is unbounded work.
+/// `AdeApp::load_file_tree` therefore runs it on `gpui::BackgroundExecutor`, not in its
+/// walk-completion handler; `AdeApp::rebuild_palette_file_candidates` still calls it directly for
+/// the much cheaper "same tree, new diff marks" case.
+pub(crate) fn build_file_candidates(
+    entries: &[file_tree::FileTreeEntry],
+    root: &std::path::Path,
+    marks: &FileDiffMarks,
+) -> Vec<palette::FileCandidate> {
+    entries
+        .iter()
+        .filter(|entry| !entry.is_dir)
+        .map(|entry| {
+            let relative = entry
+                .path
+                .strip_prefix(root)
+                .unwrap_or(entry.path.as_path());
+            let mark = marks.get(relative).copied();
+            let (dir, name) = changes::split_dir_name(relative);
+            palette::FileCandidate {
+                path: entry.path.clone(),
+                name,
+                dir,
+                add: mark.map(|mark| mark.add).unwrap_or(0),
+                del: mark.map(|mark| mark.del).unwrap_or(0),
+                changed: mark.and_then(|mark| mark.changed),
+            }
+        })
+        .collect()
+}
+
 impl AdeApp {
     pub(crate) fn handle_toggle_palette_action(
         &mut self,
@@ -45,9 +117,11 @@ impl AdeApp {
     /// built fresh every call so what's drawn and what `⏎`/`↑`/`↓` act on can never disagree.
     ///
     /// `agents`/`commands` are cheap (bounded by open-tab count plus 10 fixed commands) and
-    /// built fresh here. `files` is the expensive part (as many entries as the whole loaded
-    /// tree has, bounded by `Settings.file_tree.max_entries`) and is *not* rebuilt here - this reads [`Self::palette_file_candidates`], which
-    /// [`Self::rebuild_palette_file_candidates`] keeps current at its own two mutation points.
+    /// built fresh here. `files` is the expensive part - one candidate per file in the whole
+    /// loaded tree, and since GitHub issue #160 removed the walk's entry cap that is unbounded -
+    /// so it is *not* rebuilt here: this reads the cached [`Self::palette_file_candidates`],
+    /// which is refreshed only at the two points its inputs really change (see
+    /// [`Self::rebuild_palette_file_candidates`] and [`Self::load_file_tree`]).
     pub(crate) fn build_palette_groups(&self, cx: &App) -> Vec<palette::PaletteGroup> {
         let agents: Vec<palette::AgentCandidate> = self
             .agents
@@ -151,55 +225,21 @@ impl AdeApp {
     }
 
     /// Rebuilds [`Self::palette_file_candidates`] from the current real [`Self::file_tree`]/
-    /// [`Self::current_diff`] - called from the two real points either input can change
-    /// ([`Self::load_file_tree`]'s and [`Self::load_diff`]'s completion handlers), never from
-    /// [`Self::build_palette_groups`] itself. See [`Self::palette_file_candidates`]'s docs for
-    /// the real per-render cost this avoids.
+    /// [`Self::current_diff`], on the calling (foreground) thread. This is the *diff* side's
+    /// entry point - [`Self::load_diff`]'s completion handler, and `open_file_tab`'s - where the
+    /// tree is unchanged and only the marks laid over it moved.
+    ///
+    /// The *tree* side no longer comes through here: [`Self::load_file_tree`] builds the same
+    /// candidates on the background executor, in the same task as the walk, because that is the
+    /// one path whose cost scales with the whole loaded tree and GitHub issue #160 removed the
+    /// cap that used to bound it. Both call the same [`build_file_candidates`], so the two can't
+    /// produce different candidates for the same inputs.
     pub(crate) fn rebuild_palette_file_candidates(&mut self) {
-        // Built once, not once per file - avoids an O(files * diff_files) rescan per row (same
-        // idiom as `Self::tree_change_marks`).
-        let diff_by_relative_path: HashMap<&std::path::Path, &DiffFile> = self
-            .current_diff()
-            .map(|diff| {
-                diff.files
-                    .iter()
-                    .map(|file| (file.path.as_path(), file))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        self.palette_file_candidates = self
-            .file_tree
-            .iter()
-            .filter(|entry| !entry.is_dir)
-            .map(|entry| {
-                let relative = entry
-                    .path
-                    .strip_prefix(&self.file_tree_root)
-                    .unwrap_or(entry.path.as_path());
-                let (add, del, changed) = match diff_by_relative_path.get(relative) {
-                    Some(file) => {
-                        let (add, del) = changes::diff_file_stats(file);
-                        let changed = match file.status {
-                            FileChangeStatus::Added => Some(palette::FileChangeKind::Added),
-                            FileChangeStatus::Deleted => Some(palette::FileChangeKind::Deleted),
-                            FileChangeStatus::Modified | FileChangeStatus::Renamed => None,
-                        };
-                        (add, del, changed)
-                    }
-                    None => (0, 0, None),
-                };
-                let (dir, name) = changes::split_dir_name(relative);
-                palette::FileCandidate {
-                    path: entry.path.clone(),
-                    name,
-                    dir,
-                    add,
-                    del,
-                    changed,
-                }
-            })
-            .collect();
+        self.palette_file_candidates = build_file_candidates(
+            &self.file_tree,
+            &self.file_tree_root,
+            &file_diff_marks(self.current_diff()),
+        );
     }
 
     /// Moves the palette's keyboard selection by `delta` rows (`↑`/`↓`), clamped to the current
