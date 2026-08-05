@@ -550,6 +550,49 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
             root::TerminalClear,
             Some("terminal"),
         ),
+        // GitHub issue #158: with the terminal focused, copy and paste did nothing at all -
+        // there was no binding of any kind scoped to `"terminal"` for either. `secondary-c`/
+        // `secondary-v` above are `Some("file-editor")`/`Some("merge-editor")`/
+        // `Some("file-tree && !tree-editing")`, none of which is ever live over a focused
+        // terminal, so both keystrokes fell straight through to `crate::terminal::pane::
+        // keystroke_to_bytes` - and its control-byte branch turned Ctrl+C into `0x03`
+        // (`SIGINT`) and Ctrl+V into `0x16` (readline `quoted-insert`). That is *correct*
+        // behavior for the unshifted keys and must stay: a terminal that can't interrupt a
+        // running agent CLI is broken in a much worse way. Hence the shifted variants, the
+        // universal terminal-emulator answer to exactly this conflict (GNOME Terminal, Konsole,
+        // Windows Terminal, Alacritty and Zed all put terminal copy/paste on
+        // `Ctrl+Shift+C`/`Ctrl+Shift+V` for this reason), following the same
+        // `cfg!(target_os = "macos")` split `TerminalClear` immediately above already uses and
+        // for the same reason: on macOS `cmd-c`/`cmd-v` never reach the pty at all
+        // (`keystroke_to_bytes` returns `None` for any `modifiers.platform` keystroke), while on
+        // Linux/Windows its control-byte formula ignores shift entirely, so `ctrl-shift-c` is a
+        // real, distinct `KeyBinding` match that leaves plain Ctrl+C's `SIGINT` byte untouched.
+        //
+        // Note that the shifted keystroke needing its own binding is not optional: without one,
+        // `keystroke_to_bytes`'s shift-ignoring control-byte branch means pressing Ctrl+Shift+C
+        // over a terminal *interrupts the running process*. A bound action wins - GPUI
+        // dispatches matching `KeyBinding`s before any `on_key_down` listener and an action
+        // handler stops propagation by default in the bubble phase (`vendor/zed/crates/gpui/
+        // src/window.rs:5205-5218` and `:5450`), so `TerminalPane::handle_key_down` never sees
+        // the keystroke.
+        gpui::KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-c"
+            } else {
+                "ctrl-shift-c"
+            },
+            root::TerminalCopy,
+            Some("terminal"),
+        ),
+        gpui::KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-v"
+            } else {
+                "ctrl-shift-v"
+            },
+            root::TerminalPaste,
+            Some("terminal"),
+        ),
     ]
 }
 
@@ -769,6 +812,76 @@ mod undo_scoping_matrix_tests {
             assert_eq!(
                 text_enabled, wants_text,
                 "text undo enablement for {description}"
+            );
+        }
+    }
+
+    /// GitHub issue #158's root cause, asserted directly: before the fix there was **no**
+    /// binding of any kind that reached an action while a terminal had focus for either copy or
+    /// paste, so both keystrokes fell through to `crate::terminal::pane::keystroke_to_bytes`
+    /// and did something else entirely. This fails against the pre-fix keymap.
+    #[test]
+    fn a_focused_terminal_has_real_copy_and_paste_bindings() {
+        let contexts = stack(&["app", "terminal"]);
+        for action in ["app::TerminalCopy", "app::TerminalPaste"] {
+            let live: Vec<_> = crate::default_key_bindings()
+                .into_iter()
+                .filter(|binding| binding.action().name() == action && enabled(binding, &contexts))
+                .collect();
+            assert_eq!(
+                live.len(),
+                1,
+                "exactly one real {action} binding must be live while a terminal has focus"
+            );
+        }
+    }
+
+    /// The copy/paste bindings must be *terminal-only*. A global one would claim the keystroke
+    /// over the File view and the file tree, where `secondary-c`/`secondary-v` already have
+    /// their own real, differently-scoped bindings - the exact "keystroke reaches the wrong
+    /// handler" bug class this whole matrix exists for.
+    #[test]
+    fn terminal_copy_and_paste_are_dead_everywhere_but_a_terminal() {
+        for parts in real_context_stacks() {
+            if parts.contains(&"terminal") {
+                continue;
+            }
+            let contexts = stack(&parts);
+            for binding in crate::default_key_bindings() {
+                let name = binding.action().name();
+                if name != "app::TerminalCopy" && name != "app::TerminalPaste" {
+                    continue;
+                }
+                assert!(
+                    !enabled(&binding, &contexts),
+                    "{name} must not be live on the {parts:?} context stack"
+                );
+            }
+        }
+    }
+
+    /// Plain `Ctrl+C`/`Ctrl+V` must stay genuinely unbound over a terminal - they are the pty's
+    /// own `SIGINT` (`0x03`) and readline `quoted-insert` (`0x16`) bytes. This is what forces
+    /// issue #158's copy/paste onto the shifted variants instead of the obvious `secondary-c`/
+    /// `secondary-v`, so it is asserted rather than left as a comment. (On macOS `secondary-` is
+    /// `cmd-`, which is a different physical keystroke from `ctrl-c` and never reaches the pty
+    /// anyway, so the literal `ctrl-` keystrokes are what matters on every platform.)
+    #[test]
+    fn plain_ctrl_c_and_ctrl_v_are_never_claimed_over_a_focused_terminal() {
+        let contexts = stack(&["app", "terminal"]);
+        for binding in crate::default_key_bindings() {
+            if binding.keystrokes().len() != 1 {
+                continue;
+            }
+            let keystroke = binding.keystrokes()[0].inner().unparse();
+            if keystroke != "ctrl-c" && keystroke != "ctrl-v" {
+                continue;
+            }
+            assert!(
+                !enabled(&binding, &contexts),
+                "{} must not claim {keystroke} while a terminal has focus - that byte belongs \
+                 to the running process",
+                binding.action().name()
             );
         }
     }

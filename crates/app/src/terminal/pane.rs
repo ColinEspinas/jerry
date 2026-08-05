@@ -72,7 +72,10 @@ use gpui::{
 };
 use pty_core::{ExitStatus, PtyError, PtySession, SpawnOptions};
 
-use crate::terminal::grid::{GridCell, TerminalGrid, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND};
+use crate::terminal::grid::{
+    CellPosition, CellSide, GridCell, TerminalGrid, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND,
+    SELECTION_BACKGROUND,
+};
 use crate::terminal::links::{self as terminal_links, LinkMatch};
 use crate::theme;
 
@@ -458,6 +461,12 @@ pub struct TerminalPane {
     /// writer, resynced on every active-agent change); `true` at construction because
     /// `Agents::spawn` makes a new agent active in the same step.
     is_foreground: bool,
+    /// `true` between a real left mouse-down inside the grid and the matching mouse-up - i.e.
+    /// while a text-selection drag is genuinely in progress (GitHub issue #158). Gates
+    /// [`Self::handle_mouse_move`] so an ordinary hover never extends a selection; the
+    /// selection *itself* lives in `alacritty_terminal`'s own `Term::selection` (see
+    /// `crate::terminal::grid`'s selection docs), not here.
+    selecting: bool,
 }
 
 impl TerminalPane {
@@ -485,6 +494,7 @@ impl TerminalPane {
             resize_latch: ResizeLatch::default(),
             _task: None,
             is_foreground: true,
+            selecting: false,
         };
         this.spawn_process(cx);
         this
@@ -659,6 +669,130 @@ impl TerminalPane {
         cx.notify();
     }
 
+    // ------------------------------------------------------------ clipboard (GitHub issue #158)
+
+    /// Writes this pane's real current selection to the real OS clipboard
+    /// (`gpui::App::write_to_clipboard`, the same call `crate::sidebar::tree_ops::AdeApp::
+    /// copy_path_to_system_clipboard` already uses for "Copy Path" - one clipboard mechanism in
+    /// this app, not two). Returns whether anything was actually copied.
+    ///
+    /// A no-op when nothing is selected, deliberately: `Ctrl+Shift+C` with no selection must
+    /// leave whatever the user copied earlier alone rather than replacing it with an empty
+    /// string. See [`crate::terminal::grid::TerminalGrid::selected_text`] for what "nothing
+    /// selected" covers (no anchor, an undragged anchor, or an all-blank span).
+    pub fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self.grid.selected_text() else {
+            return false;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        true
+    }
+
+    /// Reads the real OS clipboard and feeds it to the child process through
+    /// `PtySession::write_input` - the exact same path [`Self::handle_key_down`] writes typed
+    /// keystrokes through, so a paste is indistinguishable to the child from very fast typing.
+    /// Returns whether bytes were actually written.
+    ///
+    /// Framing is [`paste_payload`]'s job; see its docs for why a raw write of the clipboard
+    /// text would be wrong.
+    pub fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return false;
+        };
+        if text.is_empty() {
+            return false;
+        }
+        let Some(session) = &self.session else {
+            return false;
+        };
+        let payload = paste_payload(&text, self.grid.bracketed_paste_enabled());
+        if let Err(err) = session.write_input(payload.as_bytes()) {
+            self.spawn_error = Some(format!("failed to write input: {err}"));
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
+    /// Maps a window-space pointer position onto the grid cell under it, or `None` before this
+    /// pane has ever painted (no measured [`Self::content_bounds`] to resolve against yet).
+    ///
+    /// The grid's own origin is the pane's padding box inset by [`PANE_PADDING_PX`] (see
+    /// [`Self::maybe_resize_pty`]'s docs for why `content_bounds` is the padding box), pushed
+    /// down one further line when the spawn-error message is occupying the first rendered line:
+    /// `render` draws that message *above* the grid rows, so ignoring it would shift every
+    /// computed row by one on exactly the panes that show it.
+    fn cell_position_at(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        window: &Window,
+    ) -> Option<CellPosition> {
+        let bounds = self.content_bounds?;
+        let cell_size = self.cell_size(window);
+        let leading_rows = if self.spawn_error.is_some() { 1.0 } else { 0.0 };
+        let origin = gpui::point(
+            bounds.origin.x + px(PANE_PADDING_PX),
+            bounds.origin.y + px(PANE_PADDING_PX) + cell_size.height * leading_rows,
+        );
+        let (cols, rows) = self.grid.dimensions();
+        Some(cell_position_in_grid(
+            position, origin, cell_size, rows, cols,
+        ))
+    }
+
+    /// Anchors a fresh selection under the pointer and takes focus - a real left mouse-down
+    /// inside the grid. Anchoring on *every* left mouse-down (not only ones that turn into
+    /// drags) is what makes a plain click clear the previous selection, since an undragged
+    /// anchor is empty - see [`crate::terminal::grid::TerminalGrid::start_selection`]'s docs.
+    fn handle_mouse_down(
+        &mut self,
+        event: &gpui::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        let Some(position) = self.cell_position_at(event.position, window) else {
+            return;
+        };
+        self.grid.start_selection(position);
+        self.selecting = true;
+        cx.notify();
+    }
+
+    /// Extends an in-progress selection to the pointer. Gated on [`Self::selecting`] *and* on
+    /// the left button still being held: a mouse-up that happens outside this pane's bounds
+    /// never reaches [`Self::handle_mouse_up`] (GPUI's `on_mouse_up` only fires over a hovered
+    /// hitbox), so without the second check a drag released elsewhere would leave this pane
+    /// extending its selection on every later hover.
+    fn handle_mouse_move(
+        &mut self,
+        event: &gpui::MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.selecting {
+            return;
+        }
+        if event.pressed_button != Some(gpui::MouseButton::Left) {
+            self.selecting = false;
+            return;
+        }
+        let Some(position) = self.cell_position_at(event.position, window) else {
+            return;
+        };
+        self.grid.update_selection(position);
+        cx.notify();
+    }
+
+    fn handle_mouse_up(
+        &mut self,
+        _event: &gpui::MouseUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.selecting = false;
+    }
+
     /// Test-only seam: feeds bytes straight into this pane's grid, exactly as
     /// [`Self::spawn_process`]'s poll loop does for pty output - lets a test put known,
     /// deterministic text on screen without synchronizing against a real child process's
@@ -667,6 +801,31 @@ impl TerminalPane {
     pub(crate) fn inject_bytes_for_test(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         self.grid.append_bytes(bytes);
         cx.notify();
+    }
+
+    /// Test-only seam: the pane's real current selection text, so a test outside this module
+    /// can assert on what a simulated drag actually selected.
+    #[cfg(test)]
+    pub(crate) fn selected_text_for_test(&self) -> Option<String> {
+        self.grid.selected_text()
+    }
+
+    /// Test-only seam: anchors and drags a selection over the given cell span, exactly as
+    /// [`Self::handle_mouse_down`]/[`Self::handle_mouse_move`] do - lets a test outside this
+    /// module (e.g. the `TerminalCopy` action's own coverage) set up a real selection without
+    /// also depending on painted pixel geometry.
+    #[cfg(test)]
+    pub(crate) fn select_cells_for_test(&mut self, row: usize, columns: std::ops::Range<usize>) {
+        self.grid.start_selection(CellPosition {
+            row,
+            column: columns.start,
+            side: CellSide::Left,
+        });
+        self.grid.update_selection(CellPosition {
+            row,
+            column: columns.end.saturating_sub(1),
+            side: CellSide::Right,
+        });
     }
 
     /// Test-only seam: this pane's measured content-area bounds - lets a test compute a click
@@ -1075,6 +1234,66 @@ fn size_to_grid(size: Size<Pixels>, cell_size: Size<Pixels>) -> (u16, u16) {
     (rows, cols)
 }
 
+/// Maps a window-space pointer position onto the grid cell under it, given the grid's own
+/// painted `origin` (top-left of row 0, column 0), the measured `cell_size`, and the grid's
+/// current `rows`/`cols`. Pure - independent of `Window` and this pane's state - so the
+/// pixel-to-cell arithmetic is directly unit-testable, the same split [`size_to_grid`] uses.
+///
+/// Clamped into the grid on every side rather than returning `None` off-grid: a drag that runs
+/// past the last column or below the last row is an ordinary "select to the end" gesture, and
+/// every terminal treats it that way. The clamped-past-the-right-edge case resolves to
+/// [`CellSide::Right`] specifically, so the final column is genuinely *included* in the
+/// selection - `Selection::to_range`'s own `range_simple` drops the last cell when the
+/// selection ends on a cell's left side (`selection.rs:333`).
+fn cell_position_in_grid(
+    position: gpui::Point<Pixels>,
+    origin: gpui::Point<Pixels>,
+    cell_size: Size<Pixels>,
+    rows: u16,
+    cols: u16,
+) -> CellPosition {
+    // `.max(1.0)`: a degenerate zero cell size can only come from a failed font measurement,
+    // and dividing by it would produce `inf`/`NaN` column indexes.
+    let cell_width = cell_size.width.as_f32().max(1.0);
+    let cell_height = cell_size.height.as_f32().max(1.0);
+    let dx = (position.x - origin.x).as_f32().max(0.0);
+    let dy = (position.y - origin.y).as_f32().max(0.0);
+
+    let last_row = rows.saturating_sub(1) as usize;
+    let last_column = cols.saturating_sub(1) as usize;
+    let row = ((dy / cell_height) as usize).min(last_row);
+    let raw_column = dx / cell_width;
+    let column = (raw_column as usize).min(last_column);
+    let side = if raw_column as usize > last_column || raw_column - column as f32 >= 0.5 {
+        CellSide::Right
+    } else {
+        CellSide::Left
+    };
+
+    CellPosition { row, column, side }
+}
+
+/// Frames clipboard text for writing into a pty, matching
+/// `vendor/zed/crates/terminal/src/terminal.rs`'s own `paste` (`:2306`) rather than writing the
+/// raw string:
+///
+/// - **Bracketed paste on** (`DECSET 2004`, which shells like `zsh`/`fish` and every full-screen
+///   editor turn on): wrap in `ESC[200~`/`ESC[201~` so the program knows this was pasted, not
+///   typed - that is exactly what stops a multi-line paste from auto-executing each line in a
+///   shell, and what lets `vim` skip auto-indent. Any `ESC` inside the pasted text is stripped,
+///   since a payload containing `ESC[201~` could otherwise close the bracket early and have the
+///   rest interpreted as commands.
+/// - **Bracketed paste off**: newlines are normalized to `\r`, the byte the Enter key actually
+///   sends ([`keystroke_to_bytes`]'s own `"enter" => b"\r"`). A raw `\n` is a line *feed*, not a
+///   carriage return, and a shell reading it in canonical mode would not run the line.
+fn paste_payload(text: &str, bracketed_paste: bool) -> String {
+    if bracketed_paste {
+        format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
+    } else {
+        text.replace("\r\n", "\r").replace('\n', "\r")
+    }
+}
+
 /// Converts [`TerminalPane::content_bounds`]'s raw padding-box measurement into the content-box
 /// size glyphs actually render into, by subtracting [`PANE_PADDING_PX`] from each side - see
 /// [`TerminalPane::maybe_resize_pty`]'s docs for the padding-box-vs-content-box bug this fixes.
@@ -1232,6 +1451,10 @@ fn same_run_style(a: &GridCell, b: &GridCell) -> bool {
         && a.italic == b.italic
         && a.underline == b.underline
         && a.strikethrough == b.strikethrough
+        // GitHub issue #158: selection is a rendered attribute (it repaints the cell's
+        // background), so a run must break at the selection's own edges - merging across one
+        // would paint unselected characters as selected.
+        && a.selected == b.selected
 }
 
 /// One segment of a grid row - either a span of the row's original style-per-cell text, or a
@@ -1286,7 +1509,11 @@ fn split_segments(row_char_count: usize, links: &[LinkMatch]) -> Vec<RowSegment>
 
 fn plain_span(style: &GridCell, text: String) -> impl IntoElement {
     let mut span = div().text_color(rgb(pack_rgb(style.fg)));
-    if style.bg != DEFAULT_BACKGROUND {
+    // The selection fill wins over the cell's own ANSI background, so a selection is visible
+    // across text a program has coloured - which is most of what an agent CLI prints.
+    if style.selected {
+        span = span.bg(rgb(pack_rgb(SELECTION_BACKGROUND)));
+    } else if style.bg != DEFAULT_BACKGROUND {
         span = span.bg(rgb(pack_rgb(style.bg)));
     }
     if style.bold {
@@ -1330,6 +1557,7 @@ fn render_link_span(
     cwd: &Path,
     row_index: usize,
     link_ordinal: usize,
+    selected: bool,
     cx: &mut Context<TerminalPane>,
 ) -> impl IntoElement {
     let target = terminal_links::resolve(cwd, &link.path);
@@ -1342,6 +1570,9 @@ fn render_link_span(
         .border_b_1()
         .border_color(theme::term::LINK_UNDERLINE)
         .child(text);
+    if selected {
+        span = span.bg(rgb(pack_rgb(SELECTION_BACKGROUND)));
+    }
     span.style().border_style = Some(BorderStyle::Dashed);
 
     span.hover(|mut el| {
@@ -1415,16 +1646,31 @@ fn render_row(
                 }
             }
             RowSegment::Link { start, end, link } => {
-                let text: String = row[start..end].iter().map(|cell| cell.c).collect();
-                line = line.child(render_link_span(
-                    text,
-                    &link,
-                    cwd,
-                    row_index,
-                    link_ordinal,
-                    cx,
-                ));
-                link_ordinal += 1;
+                // A selection can end part-way through a link, so the link is split into one
+                // span per selected/unselected run rather than highlighted as a unit - every
+                // sub-span keeps the same click target, so clicking any part of the link still
+                // opens the same file. In the overwhelmingly common (unselected) case this is
+                // one iteration producing exactly the single span it always did.
+                let mut inner = start;
+                while inner < end {
+                    let selected = row[inner].selected;
+                    let mut run_end = inner + 1;
+                    while run_end < end && row[run_end].selected == selected {
+                        run_end += 1;
+                    }
+                    let text: String = row[inner..run_end].iter().map(|cell| cell.c).collect();
+                    line = line.child(render_link_span(
+                        text,
+                        &link,
+                        cwd,
+                        row_index,
+                        link_ordinal,
+                        selected,
+                        cx,
+                    ));
+                    link_ordinal += 1;
+                    inner = run_end;
+                }
             }
         }
     }
@@ -1467,6 +1713,9 @@ fn render_plain_line_with_links(
                     // own `row_index` never reaches anywhere close to `usize::MAX`).
                     usize::MAX,
                     link_ordinal,
+                    // The spawn-error line is not part of the grid, so it is never part of a
+                    // grid selection.
+                    false,
                     cx,
                 ));
                 link_ordinal += 1;
@@ -1523,6 +1772,15 @@ impl Render for TerminalPane {
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                 window.focus(&this.focus_handle, cx);
             }))
+            // Real mouse text selection (GitHub issue #158). Left-button only: a right-click
+            // has no selection meaning here, and a middle-click is the X11 primary-selection
+            // paste gesture this pane deliberately does not claim.
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(Self::handle_mouse_down),
+            )
+            .on_mouse_move(cx.listener(Self::handle_mouse_move))
+            .on_mouse_up(gpui::MouseButton::Left, cx.listener(Self::handle_mouse_up))
             .relative()
             .flex()
             .flex_col()
@@ -2236,5 +2494,429 @@ mod clear_pty_signal_tests {
              appear in the grid - this is what actually proves the byte reached the pty, not \
              just that write_input() was called"
         );
+    }
+}
+
+/// GitHub issue #158's pixel-to-cell arithmetic - the half of mouse text selection that has
+/// nothing to do with GPUI. A wrong mapping here is invisible in a screenshot but silently
+/// copies the wrong characters, so it is pinned exactly.
+#[cfg(test)]
+mod cell_position_tests {
+    use super::*;
+    use gpui::{point, size};
+
+    /// A 10x20px cell grid whose origin is at (100, 200) - deliberately not (0, 0), so an
+    /// implementation that forgot to subtract the origin fails instead of accidentally passing.
+    fn at(x: f32, y: f32) -> CellPosition {
+        cell_position_in_grid(
+            point(px(100.0 + x), px(200.0 + y)),
+            point(px(100.0), px(200.0)),
+            size(px(10.0), px(20.0)),
+            24, // rows
+            80, // cols
+        )
+    }
+
+    #[test]
+    fn the_top_left_pixel_is_row_zero_column_zero() {
+        assert_eq!(
+            at(0.0, 0.0),
+            CellPosition {
+                row: 0,
+                column: 0,
+                side: CellSide::Left
+            }
+        );
+    }
+
+    #[test]
+    fn a_position_resolves_to_the_cell_containing_it() {
+        // x = 34px -> column 3 (30..40), 0.4 of the way in -> left half.
+        // y = 55px -> row 2 (40..60).
+        assert_eq!(
+            at(34.0, 55.0),
+            CellPosition {
+                row: 2,
+                column: 3,
+                side: CellSide::Left
+            }
+        );
+    }
+
+    /// The side is what decides whether the cell under the pointer is included in the selection
+    /// at all (`Selection::to_range`'s `range_simple` drops a cell the selection ends left of),
+    /// so the half-cell boundary is real behavior, not a detail.
+    #[test]
+    fn the_right_half_of_a_cell_reports_the_right_side() {
+        assert_eq!(at(35.0, 0.0).side, CellSide::Right);
+        assert_eq!(at(39.9, 0.0).side, CellSide::Right);
+        assert_eq!(at(34.9, 0.0).side, CellSide::Left);
+        assert_eq!(
+            at(35.0, 0.0).column,
+            3,
+            "the column is unchanged by the side"
+        );
+    }
+
+    #[test]
+    fn a_drag_past_the_right_edge_clamps_to_the_last_column_inclusively() {
+        let position = at(10_000.0, 0.0);
+        assert_eq!(position.column, 79);
+        assert_eq!(
+            position.side,
+            CellSide::Right,
+            "clamping to the *left* of the last column would silently drop that column from \
+             the selection"
+        );
+    }
+
+    #[test]
+    fn a_drag_past_the_bottom_clamps_to_the_last_row() {
+        assert_eq!(at(0.0, 10_000.0).row, 23);
+    }
+
+    /// Dragging back above/left of the grid origin (a real gesture - the pointer leaves the
+    /// pane) must clamp to the first cell rather than underflow into a huge `usize`.
+    #[test]
+    fn a_position_above_and_left_of_the_origin_clamps_to_the_first_cell() {
+        let position = cell_position_in_grid(
+            point(px(0.0), px(0.0)),
+            point(px(100.0), px(200.0)),
+            size(px(10.0), px(20.0)),
+            24,
+            80,
+        );
+        assert_eq!(position.row, 0);
+        assert_eq!(position.column, 0);
+    }
+
+    /// A failed font measurement can only produce a zero cell size; dividing by it would make
+    /// every index `inf as usize`. Guarded rather than left to chance.
+    #[test]
+    fn a_degenerate_zero_cell_size_does_not_produce_a_garbage_index() {
+        let position = cell_position_in_grid(
+            point(px(50.0), px(50.0)),
+            point(px(0.0), px(0.0)),
+            size(px(0.0), px(0.0)),
+            24,
+            80,
+        );
+        assert!(position.row < 24);
+        assert!(position.column < 80);
+    }
+}
+
+/// GitHub issue #158's paste framing. Writing the raw clipboard string to the pty is wrong in
+/// both modes for different reasons - see [`paste_payload`]'s own docs.
+#[cfg(test)]
+mod paste_payload_tests {
+    use super::*;
+
+    #[test]
+    fn without_bracketed_paste_newlines_become_carriage_returns() {
+        assert_eq!(paste_payload("one\ntwo", false), "one\rtwo");
+        assert_eq!(
+            paste_payload("one\r\ntwo", false),
+            "one\rtwo",
+            "a CRLF clipboard payload (Windows, or copied out of a browser) must not send two \
+             separate line endings"
+        );
+        assert_eq!(paste_payload("plain", false), "plain");
+    }
+
+    #[test]
+    fn with_bracketed_paste_the_text_is_wrapped_and_left_otherwise_intact() {
+        assert_eq!(
+            paste_payload("one\ntwo", true),
+            "\x1b[200~one\ntwo\x1b[201~",
+            "inside brackets the receiving program decides what a newline means - rewriting it \
+             here is what makes a multi-line paste auto-execute"
+        );
+    }
+
+    /// The real reason `ESC` is stripped: a payload carrying its own `ESC[201~` would close the
+    /// bracket early and have everything after it interpreted as typed input.
+    #[test]
+    fn a_pasted_escape_cannot_close_the_bracket_early() {
+        let payload = paste_payload("safe\x1b[201~rm -rf /", true);
+        assert_eq!(payload.matches("\x1b[201~").count(), 1);
+        assert!(payload.ends_with("\x1b[201~"));
+    }
+}
+
+/// GitHub issue #158, end to end at the pane level: a real selection produces a real OS
+/// clipboard write, and a real clipboard read produces real bytes on a real pty.
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn new_pane(cx: &mut TestAppContext, program: &str) -> gpui::Entity<TerminalPane> {
+        cx.new(|cx| {
+            TerminalPane::new(
+                TerminalSpec::command(program, Vec::new(), std::env::temp_dir()),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn copying_a_real_selection_writes_it_to_the_real_system_clipboard(cx: &mut TestAppContext) {
+        let pane = new_pane(cx, "cat");
+        cx.run_until_parked();
+
+        cx.update(|cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into())));
+
+        let copied = pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(b"hello world", cx);
+            pane.grid.start_selection(CellPosition {
+                row: 0,
+                column: 6,
+                side: CellSide::Left,
+            });
+            pane.grid.update_selection(CellPosition {
+                row: 0,
+                column: 10,
+                side: CellSide::Right,
+            });
+            pane.copy_selection(cx)
+        });
+
+        assert!(
+            copied,
+            "a real, non-empty selection must report a real copy"
+        );
+        let text = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(text.as_deref(), Some("world"));
+    }
+
+    /// Copy with nothing selected must leave the clipboard alone. Overwriting it with `""` (the
+    /// obvious way to write this) would silently destroy whatever the user copied last, every
+    /// time they hit the shortcut out of habit.
+    #[gpui::test]
+    fn copying_with_no_selection_leaves_the_clipboard_untouched(cx: &mut TestAppContext) {
+        let pane = new_pane(cx, "cat");
+        cx.run_until_parked();
+
+        cx.update(|cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("keep me".into())));
+
+        let copied = pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(b"hello world", cx);
+            pane.copy_selection(cx)
+        });
+
+        assert!(!copied);
+        let text = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(text.as_deref(), Some("keep me"));
+    }
+
+    /// End-to-end proof that paste reaches the *child process*, observed the same way
+    /// [`clear_pty_signal_tests`] proves `clear()`'s byte does: a real `cat` on a real pty
+    /// echoes back what it is fed, so the pasted text appearing in the grid is round-tripped
+    /// evidence the bytes genuinely left the app, not an assertion that `write_input` was
+    /// called.
+    #[gpui::test]
+    fn pasting_writes_the_real_clipboard_text_to_the_real_pty(cx: &mut TestAppContext) {
+        let pane = new_pane(cx, "cat");
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("ade-pasted-text".into()))
+        });
+        let pasted = pane.update(cx, |pane, cx| pane.paste_from_clipboard(cx));
+        assert!(pasted, "a live session must accept a real paste");
+
+        let mut saw_pasted_text = false;
+        for _ in 0..50 {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+            let lines = pane.read_with(cx, |pane, _| pane.visible_text_lines());
+            if lines.iter().any(|line| line.contains("ade-pasted-text")) {
+                saw_pasted_text = true;
+                break;
+            }
+        }
+        assert!(
+            saw_pasted_text,
+            "expected the real pty's own echo of the pasted bytes to appear in the grid"
+        );
+    }
+
+    #[gpui::test]
+    fn pasting_an_empty_clipboard_writes_nothing(cx: &mut TestAppContext) {
+        let pane = new_pane(cx, "cat");
+        cx.run_until_parked();
+
+        cx.update(|cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(String::new())));
+        let pasted = pane.update(cx, |pane, cx| pane.paste_from_clipboard(cx));
+        assert!(!pasted);
+    }
+}
+
+/// GitHub issue #158's mouse half, end to end through real GPUI event dispatch: before this,
+/// `TerminalPane` registered no mouse-down/move/up handlers at all, so no amount of dragging
+/// produced a selection and "copy" would have had nothing to copy even with a binding in place.
+///
+/// Backed by a real `cat` child rather than a shell: `cat` writes nothing of its own, so the
+/// grid contains exactly the injected bytes and the pixel geometry the drag is computed from
+/// can't be moved out from under the test by a prompt arriving mid-run.
+#[cfg(test)]
+mod mouse_selection_tests {
+    use super::*;
+    use gpui::{point, Entity, Modifiers, MouseButton, TestAppContext, VisualTestContext};
+
+    /// Opens a real window on a `cat`-backed pane, puts `"hello world"` on row 0, and returns
+    /// the painted geometry a drag position is computed from.
+    fn painted_pane(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<TerminalPane>,
+        &mut VisualTestContext,
+        Bounds<Pixels>,
+        Size<Pixels>,
+    ) {
+        let (pane, cx) = cx.add_window_view(|_window, cx| {
+            TerminalPane::new(
+                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(b"hello world", cx);
+        });
+        cx.run_until_parked();
+
+        let (bounds, cell_size) = pane.update_in(cx, |pane, window, _cx| {
+            (
+                pane.content_bounds_for_test(),
+                pane.cell_size_for_test(window),
+            )
+        });
+        let bounds = bounds.expect("the pane must have painted at least once");
+        (pane, cx, bounds, cell_size)
+    }
+
+    /// The centre of cell `(row, column)` in window space.
+    fn cell_centre(
+        bounds: Bounds<Pixels>,
+        cell_size: Size<Pixels>,
+        row: usize,
+        column: usize,
+    ) -> gpui::Point<Pixels> {
+        point(
+            bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * (column as f32 + 0.5),
+            bounds.origin.y + px(PANE_PADDING_PX) + cell_size.height * (row as f32 + 0.5),
+        )
+    }
+
+    #[gpui::test]
+    fn a_real_mouse_drag_selects_the_text_it_dragged_over(cx: &mut TestAppContext) {
+        let (pane, cx, bounds, cell_size) = painted_pane(cx);
+
+        // "hello world": drag from the left edge of 'w' (column 6) to the right edge of 'd'
+        // (column 10). Starting a touch left of centre and ending a touch right of centre is
+        // what a real user's drag looks like, and is what makes both boundary cells included.
+        let start = point(
+            bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * 6.1,
+            cell_centre(bounds, cell_size, 0, 6).y,
+        );
+        let end = point(
+            bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * 10.9,
+            cell_centre(bounds, cell_size, 0, 10).y,
+        );
+
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.selected_text_for_test())
+                .as_deref(),
+            Some("world"),
+            "a real left-drag across the grid must produce a real alacritty_terminal selection"
+        );
+    }
+
+    /// A plain click is how a user dismisses a selection, and it must not leave a one-character
+    /// one behind.
+    #[gpui::test]
+    fn a_plain_click_clears_a_previous_selection(cx: &mut TestAppContext) {
+        let (pane, cx, bounds, cell_size) = painted_pane(cx);
+
+        let start = cell_centre(bounds, cell_size, 0, 0);
+        let end = cell_centre(bounds, cell_size, 0, 4);
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            pane.read_with(cx, |pane, _| pane.selected_text_for_test())
+                .is_some(),
+            "sanity check: the drag must have selected something to then clear"
+        );
+
+        cx.simulate_click(cell_centre(bounds, cell_size, 2, 3), Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.selected_text_for_test()),
+            None
+        );
+    }
+
+    /// Moving the mouse over the terminal with no button held must never start or extend a
+    /// selection - the drag has to be gated on a real mouse-down having happened.
+    #[gpui::test]
+    fn hovering_without_a_button_held_selects_nothing(cx: &mut TestAppContext) {
+        let (pane, cx, bounds, cell_size) = painted_pane(cx);
+
+        cx.simulate_mouse_move(
+            cell_centre(bounds, cell_size, 0, 0),
+            None,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            cell_centre(bounds, cell_size, 0, 10),
+            None,
+            Modifiers::none(),
+        );
+        cx.run_until_parked();
+
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.selected_text_for_test()),
+            None
+        );
+    }
+
+    /// A drag repaints the cells it covers - the flag has to survive all the way into what
+    /// `render_row` consumes, or the user gets no visual feedback at all while dragging.
+    #[gpui::test]
+    fn a_drag_marks_the_covered_cells_selected_for_the_renderer(cx: &mut TestAppContext) {
+        let (pane, cx, bounds, cell_size) = painted_pane(cx);
+
+        let start = point(
+            bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * 0.1,
+            cell_centre(bounds, cell_size, 0, 0).y,
+        );
+        let end = point(
+            bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * 4.9,
+            cell_centre(bounds, cell_size, 0, 4).y,
+        );
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        let flagged = pane.read_with(cx, |pane, _| {
+            pane.grid.visible_rows()[0]
+                .iter()
+                .filter(|cell| cell.selected)
+                .map(|cell| cell.c)
+                .collect::<String>()
+        });
+        assert_eq!(flagged, "hello");
     }
 }
