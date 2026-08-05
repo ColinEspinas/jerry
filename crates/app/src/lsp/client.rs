@@ -1944,20 +1944,10 @@ pub(crate) fn lsp_file_status(
         return LspFileStatus::Indexing;
     }
     let diagnostics = connection.diagnostics_for_uri(uri).unwrap_or_default();
-    let errors = diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            diagnostics_view::Severity::from_lsp(diagnostic.severity)
-                == diagnostics_view::Severity::Error
-        })
-        .count();
-    let warnings = diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            diagnostics_view::Severity::from_lsp(diagnostic.severity)
-                == diagnostics_view::Severity::Warning
-        })
-        .count();
+    // One shared implementation with the breadcrumb's own counts (GitHub issue #178) - see
+    // `diagnostics_view::count_errors_and_warnings`' docs for why counting must not go through
+    // the per-line index.
+    let (errors, warnings) = diagnostics_view::count_errors_and_warnings(&diagnostics);
     LspFileStatus::Analyzed { errors, warnings }
 }
 
