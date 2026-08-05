@@ -7,10 +7,22 @@ toplevel. See `BUILD-LOG.md`'s screenshot correction for the recipe and for what
 
 | file | theme | what it shows |
 |---|---|---|
-| `jerry-dark-rust.png` | Jerry Dark | A real Rust file. Function **definition** name in blue, method calls (`.arg`, `.stdin`, `.spawn`, `.expect`) and locals (`child`, `descendants`, `pid`) at plain foreground, types (`Command`, `Stdio`, `Duration`, `Signal`) in cyan, strings in green, numbers in amber, keywords (`let`, `mut`, `fn`, `use`, `for`) at plain foreground, brackets on the depth ring. |
+| `jerry-dark-rust.png` | Jerry Dark | A real Rust file. Locals (`child`, `descendants`, `sh_pid`, `pid`) in the **rose identifier tint**, the function **definition** name in blue, method calls (`.arg`, `.stdin`, `.spawn`, `.expect`) and keywords (`let`, `mut`, `fn`, `use`, `for`) at plain foreground, types (`Command`, `Stdio`, `Duration`, `Signal`) in cyan, strings in green, `200` and `SIGKILL` in amber, `#[cfg(all(test, unix))]` in amber, brackets on the depth ring. |
 | `jerry-dark-rust-doc-comments.png` | Jerry Dark | The comment-readability fix. A screenful of `///` doc comments at the brighter `comment_doc` tone, plus screaming-case constants in amber and `usize`/`i64`/`u32` in cyan. |
 | `jerry-dark-markdown.png` | Jerry Dark | Markdown prose: headings in cyan, inline code in green, bold at the brighter neutral. The fenced block visible here is **untagged**, so it shows no language injection — the per-fence injection behaviour is covered by `fixture_corpus_tests` instead. |
 | `paper-chrome.png` | Paper | The light theme's chrome. **No editor tab is open in this one** — it does not show syntax colours. |
+
+## Verified by pixel diff, not by eye
+
+`jerry-dark-rust.png` replaced an earlier capture of the *same file at the same scroll position*
+taken before variables were given colour. Diffing the two over the code column: **3297 pixels
+changed**, dominated by `#acb2bc -> #de99be` (plain foreground to the rose identifier tint, 231
+instances), with **zero** `#d8a76d -> #de99be` (the attribute regression, 65 instances in an
+intermediate build, now fixed).
+
+That diff is also what caught the underlying bug: an earlier attempt at the same palette change
+produced **zero** changed pixels, which is how `tree-sitter-rust`'s missing blanket
+`(identifier) @variable` rule was found. See `THEME.md` §2.
 
 ## What is missing, and why
 

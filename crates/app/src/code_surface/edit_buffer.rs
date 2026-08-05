@@ -3099,10 +3099,17 @@ impl QueryBuilder {
         buf.replace_range(None, "fn ");
         assert_eq!(buf.content, "fn foo");
         assert!(buf.highlight_dirty);
-        assert!(buf.lines[0]
-            .runs
-            .iter()
-            .all(|(_, kind)| *kind == code_view::HighlightKind::Text));
+        // The spliced runs carry the *pre-edit* classification, not a fresh parse: `foo` on its own
+        // is a real `Variable` (Rust gained a blanket `(identifier) @variable` rule - see
+        // `RUST_VARIABLE_PREFIX`), and nothing here has yet re-parsed it as `fn foo`. What matters
+        // for this test's premise is only that the *new* meaning has not appeared yet.
+        let before: Vec<code_view::HighlightKind> =
+            buf.lines[0].runs.iter().map(|(_, kind)| *kind).collect();
+        assert!(
+            !before.contains(&code_view::HighlightKind::Keyword)
+                && !before.contains(&code_view::HighlightKind::FunctionDefinition),
+            "the edit's new syntax meaning must not appear until a real re-highlight: {before:?}"
+        );
 
         // A real re-highlight (as `AdeApp`'s debounced background task would apply) turns "fn"
         // into a real keyword and "foo" into a real function name.

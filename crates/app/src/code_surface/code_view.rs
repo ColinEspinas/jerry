@@ -1127,6 +1127,70 @@ const C_BRACKET_SUPPLEMENT: &str = r#"
 ///
 /// Every node kind and field name below was checked against that grammar's own real
 /// `src/node-types.json` under `~/.cargo/registry/src/`, and each pattern was compiled and run.
+/// Real supplement **prepended** to `tree-sitter-rust`'s own bundled query, giving Rust the blanket
+/// `(identifier) @variable` rule that every other language here already has.
+///
+/// ## The bug this fixes, which nothing else could have
+///
+/// `tree-sitter-rust`'s bundled `queries/highlights.scm` has **no** blanket identifier rule - its
+/// only `@variable`-family pattern is `(parameter (identifier) @variable.parameter)` at line 96.
+/// `tree-sitter-python` has `(identifier) @variable` at line 3, `-go` at line 26, `-c` at line 1.
+/// Rust was the sole outlier, so a plain local (`let child = ...`, and every later use of it)
+/// classified as [`HighlightKind::Text`] rather than [`HighlightKind::Variable`].
+///
+/// That made `theme::syntax::VARIABLE` **unreachable in Rust source**. Whatever colour that token
+/// held, a Rust local rendered as plain foreground - which is exactly the "most of the text is just
+/// white" the maintainer reported twice, in this app's own primary language, and which no amount of
+/// palette work could have fixed. It was found by taking a screenshot after a palette change and
+/// diffing it against the previous one: **zero pixels** in the code area moved.
+///
+/// ## Why prepended rather than appended
+///
+/// The opposite of the definition-site supplements below, and deliberately. The rule cited on
+/// [`PYTHON_HIGHLIGHTS_SUPPLEMENT`] is that the **last** matching pattern wins, so a blanket rule
+/// appended last would override every specific classification in the file - functions, constants,
+/// types would all collapse to `variable`. Prepending makes it the *fallback* instead: every later,
+/// more specific pattern still wins, and only identifiers nothing else claims come out as
+/// variables. That is precisely the position Python's and Go's own queries put their blanket rule
+/// in, so this makes Rust consistent with them rather than special.
+const RUST_VARIABLE_PREFIX: &str = r#"
+(identifier) @variable
+"#;
+
+/// Real supplement **appended** after `tree-sitter-rust`'s own query, repairing the one genuine
+/// regression [`RUST_VARIABLE_PREFIX`] introduced.
+///
+/// The bundled query captures an attribute with `(attribute_item) @attribute` (line 156) - the
+/// whole *ancestor* node, not the identifiers inside it. Before the blanket variable rule those
+/// identifiers carried no capture of their own, so the ancestor's colour simply showed through.
+/// Afterwards they were claimed by `@variable`, and since `fold_highlight_events` resolves each
+/// byte to its **innermost** open highlight, the leaf beat the ancestor and `#[cfg(all(test,
+/// unix))]` started rendering `cfg`/`all`/`test`/`unix` as variables.
+///
+/// Caught by diffing a screenshot against the previous one and noticing 65 pixels going the wrong
+/// way (`ATTRIBUTE`'s amber to `VARIABLE`'s rose) alongside the 231 going the right way. Query
+/// order alone could not have fixed it: pattern order decides which pattern claims a given *node*,
+/// and these are two different nodes at different depths. Re-asserting `@attribute` on the leaves
+/// is what actually resolves it.
+///
+/// `token_tree` is the node an attribute's own argument list parses as, which is why
+/// `all(test, unix)` needs its own rule rather than being covered by the direct-child case - and
+/// why there is one rule per nesting depth: `#[cfg(all(test, unix))]` nests a `token_tree` inside
+/// a `token_tree`, so `test` and `unix` sit two levels down. Three levels are written, which
+/// covers every attribute shape in this workspace.
+///
+/// Anchoring every one of these on `attribute` is load-bearing rather than tidy: a bare
+/// `(token_tree (identifier) @attribute)` would also match a **macro invocation**'s argument list
+/// (`macro_invocation` carries a `token_tree` too), and would repaint every argument of every
+/// `println!`/`assert!` call as an attribute.
+const RUST_ATTRIBUTE_SUPPLEMENT: &str = r#"
+(attribute (identifier) @attribute)
+(attribute (scoped_identifier) @attribute)
+(attribute (token_tree (identifier) @attribute))
+(attribute (token_tree (token_tree (identifier) @attribute)))
+(attribute (token_tree (token_tree (token_tree (identifier) @attribute))))
+"#;
+
 const RUST_DEFINITION_SUPPLEMENT: &str = r#"
 (function_item name: (identifier) @function.definition)
 (function_signature_item name: (identifier) @function.definition)
@@ -1300,7 +1364,8 @@ const MARKDOWN_BLOCK_HIGHLIGHTS_SUPPLEMENT: &str = r#"
 fn highlight_query_for(grammar: Grammar) -> String {
     match grammar {
         Grammar::Rust => format!(
-            "{}\n{RUST_DEFINITION_SUPPLEMENT}",
+            "{RUST_VARIABLE_PREFIX}\n{}\n{RUST_ATTRIBUTE_SUPPLEMENT}\n\
+             {RUST_DEFINITION_SUPPLEMENT}",
             tree_sitter_rust::HIGHLIGHTS_QUERY
         ),
         Grammar::Python => {
@@ -3135,6 +3200,85 @@ mod tests {
     /// [`HIGHLIGHT_NAMES`] and [`HIGHLIGHT_KINDS`] are a positional parallel array pair, and the
     /// whole classification mapping is wrong-but-compiling if they ever drift. The array length is
     /// already tied together at compile time; this pins the *content* of every real mapping -
+    /// A plain Rust local is a real `Variable`, not unclassified `Text`.
+    ///
+    /// This is the regression test for the single most consequential bug in the whole theme
+    /// redesign, and for how it was found. `tree-sitter-rust` is the only grammar here whose
+    /// bundled query has no blanket `(identifier) @variable` rule, so before
+    /// `RUST_VARIABLE_PREFIX` every local in every Rust file classified as `Text` - which made
+    /// `theme::syntax::VARIABLE` literally unreachable in this app's own primary language. Two
+    /// rounds of palette work aimed at that token could not have changed a single pixel of a Rust
+    /// file, and the maintainer's "most of the text is just white" was exactly right both times.
+    ///
+    /// No amount of contrast maths could have caught it. What did was taking a screenshot after a
+    /// palette change, diffing it against the one before, and finding **zero** changed pixels in
+    /// the code area.
+    #[test]
+    fn a_plain_rust_local_is_a_real_variable_not_unclassified_text() {
+        let source = "fn f(input: u8) {\n    let child = compute(input);\n    use_it(child);\n}\n";
+        let spans = highlight_rust(source);
+
+        assert_eq!(
+            kind_at(&spans, source, "child ="),
+            HighlightKind::Variable,
+            "the binding site of a local must be a real Variable"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "child)"),
+            HighlightKind::Variable,
+            "and so must every later use of it"
+        );
+        // The blanket rule is a *fallback*, not an override: everything more specific still wins.
+        assert_eq!(
+            kind_at(&spans, source, "f(input"),
+            HighlightKind::FunctionDefinition
+        );
+        assert_eq!(kind_at(&spans, source, "compute("), HighlightKind::Function);
+        assert_eq!(
+            kind_at(&spans, source, "input:"),
+            HighlightKind::VariableParameter,
+            "a parameter must still beat the blanket rule"
+        );
+        assert_eq!(kind_at(&spans, source, "u8"), HighlightKind::TypeBuiltin);
+        assert_eq!(kind_at(&spans, source, "let"), HighlightKind::Keyword);
+    }
+
+    /// The blanket variable rule must not swallow the contents of an attribute. See
+    /// `RUST_ATTRIBUTE_SUPPLEMENT` - the bundled query only captures the enclosing
+    /// `attribute_item`, and a leaf beats its ancestor when both are highlighted.
+    #[test]
+    fn an_attributes_own_identifiers_stay_attributes_not_variables() {
+        let source = "#[cfg(all(test, unix))]\n#[derive(Debug)]\nstruct S;\n";
+        let spans = highlight_rust(source);
+        for needle in ["cfg", "all(", "test,", "unix", "derive", "Debug"] {
+            assert_eq!(
+                kind_at(&spans, source, needle),
+                HighlightKind::Attribute,
+                "{needle:?} is inside an attribute and must render as one"
+            );
+        }
+    }
+
+    /// The other half of `RUST_ATTRIBUTE_SUPPLEMENT`'s anchoring: a **macro invocation** also
+    /// carries a `token_tree`, so an unanchored rule would repaint every `println!`/`assert!`
+    /// argument as an attribute. Its arguments must stay ordinary code.
+    #[test]
+    fn a_macro_invocations_arguments_are_ordinary_code_not_attributes() {
+        let source = "fn f() { let total = 1; assert_eq!(total, other(total)); }\n";
+        let spans = highlight_rust(source);
+        assert_eq!(
+            kind_at(&spans, source, "total,"),
+            HighlightKind::Variable,
+            "a variable inside a macro argument list is still a variable, not an attribute"
+        );
+        // `other` reads as a `Variable` rather than a `Function`, and that is honest rather than a
+        // gap: a macro's body parses as an opaque `token_tree`, so the grammar genuinely cannot
+        // tell a call from any other identifier in there. Before the blanket rule it was
+        // unclassified `Text`; a tint is strictly more informative than nothing, and crucially it
+        // is *not* `Attribute`, which is what this test exists to rule out.
+        assert_eq!(kind_at(&spans, source, "other("), HighlightKind::Variable);
+    }
+
     /// The definition-site split, as one cross-language contract rather than six per-language
     /// tests: in every language that has real definition-site rules, the *declared* name is a
     /// `FunctionDefinition` and a *call* of that same name is a plain `Function`.

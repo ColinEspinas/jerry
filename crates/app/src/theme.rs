@@ -1322,7 +1322,7 @@ pub mod syntax {
     /// This used to default to [`TEXT`]'s near-white `#acb2be`, which meant every identifier in a
     /// file rendered as plain grey - the single biggest reason code here read as undifferentiated
     /// white.
-    pub const VARIABLE: ColorToken = token("syntax.variable", 0xacb2bc);
+    pub const VARIABLE: ColorToken = token("syntax.variable", 0xde99be);
     /// `variable.parameter` (`tree-sitter-rust`'s `(parameter (identifier) @variable.parameter)`,
     /// `-typescript`'s `required_parameter`/`optional_parameter` rules) - [`VARIABLE`]'s own rose
     /// family, deeper and considerably more saturated. A function's inputs are worth picking out
@@ -1341,7 +1341,7 @@ pub mod syntax {
     /// warm family: a field access is not a local binding but a name looked up on another object,
     /// and the warm/cool split is what makes an `a.b.c` chain legible at a glance. See the module
     /// docs' "identifier family" section.
-    pub const PROPERTY: ColorToken = token("syntax.property", 0xacb2bc);
+    pub const PROPERTY: ColorToken = token("syntax.property", 0x68bedf);
     /// `operator` (`+`, `==`, `&&`, ...) - a real, live-classified bucket (previously fell
     /// through unmatched); defaults to [`TEXT`]'s value for the same reason [`VARIABLE`] does -
     /// this app's palette has never coloured punctuation/operators.
@@ -1360,17 +1360,17 @@ pub mod syntax {
     /// decides which brackets reach these buckets at all (an unmatched one keeps
     /// [`PUNCTUATION_BRACKET`]'s plain-text colour, which is exactly why that token stays aliased
     /// to [`TEXT`]).
-    pub const BRACKET_1: ColorToken = token("syntax.bracket_1", 0xc58aa5);
+    pub const BRACKET_1: ColorToken = token("syntax.bracket_1", 0xc88a9c);
     /// Bracket-pair depth ring, colour 2 of 6 (nesting depth 1, 7, ...) - see [`BRACKET_1`].
-    pub const BRACKET_2: ColorToken = token("syntax.bracket_2", 0xc88f73);
+    pub const BRACKET_2: ColorToken = token("syntax.bracket_2", 0xc4936b);
     /// Bracket-pair depth ring, colour 3 of 6 (nesting depth 2, 8, ...) - see [`BRACKET_1`].
-    pub const BRACKET_3: ColorToken = token("syntax.bracket_3", 0xa4a267);
+    pub const BRACKET_3: ColorToken = token("syntax.bracket_3", 0x98a66d);
     /// Bracket-pair depth ring, colour 4 of 6 (nesting depth 3, 9, ...) - see [`BRACKET_1`].
-    pub const BRACKET_4: ColorToken = token("syntax.bracket_4", 0x69af97);
+    pub const BRACKET_4: ColorToken = token("syntax.bracket_4", 0x62afa0);
     /// Bracket-pair depth ring, colour 5 of 6 (nesting depth 4, 10, ...) - see [`BRACKET_1`].
-    pub const BRACKET_5: ColorToken = token("syntax.bracket_5", 0x64a9c4);
+    pub const BRACKET_5: ColorToken = token("syntax.bracket_5", 0x6fa5cb);
     /// Bracket-pair depth ring, colour 6 of 6 (nesting depth 5, 11, ...) - see [`BRACKET_1`].
-    pub const BRACKET_6: ColorToken = token("syntax.bracket_6", 0x9b97ce);
+    pub const BRACKET_6: ColorToken = token("syntax.bracket_6", 0xa693c9);
     /// `tag` (a lowercase JSX element name, `-javascript`'s own JSX query) - see the module docs'
     /// fallback-chain section for why this defaults to [`TYPE`]'s value rather than its own hue: it
     /// preserves this module's pre-existing "a JSX element name is coloured like the type it
@@ -2725,7 +2725,7 @@ mod theme_runtime_tests {
     /// rewrite bought. Moving `syntax.operator` must not drag `syntax.text` (its old alias
     /// target) along with it, and vice versa.
     ///
-    /// Uses `VARIABLE`/`TEXT` specifically because those two genuinely still *share* a default,
+    /// Uses `FUNCTION`/`TEXT` specifically because those two genuinely still *share* a default,
     /// which is what makes the test meaningful: if the two started from different values, an
     /// assertion that they resolve differently would pass trivially without proving anything about
     /// the override mechanism. (`VARIABLE_PARAMETER`/`VARIABLE` used to serve this role, until the
@@ -2733,14 +2733,14 @@ mod theme_runtime_tests {
     #[test]
     fn a_former_alias_can_now_be_moved_without_moving_what_it_used_to_alias() {
         assert!(
-            same(syntax::VARIABLE.default, syntax::TEXT.default),
+            same(syntax::FUNCTION.default, syntax::TEXT.default),
             "sanity check: the two still share a default, which is what makes this test meaningful"
         );
-        let _guard = with_palette(&[("syntax.variable", 0x50fa7b)]);
-        assert!(same(syntax::VARIABLE.resolve(), hex_rgba(0x50fa7b)));
+        let _guard = with_palette(&[("syntax.function", 0x50fa7b)]);
+        assert!(same(syntax::FUNCTION.resolve(), hex_rgba(0x50fa7b)));
         assert!(
             same(syntax::TEXT.resolve(), syntax::TEXT.default),
-            "syntax::TEXT used to be the very same const - overriding the variable bucket must no \
+            "syntax::TEXT used to be the very same const - overriding the function bucket must no \
              longer touch it"
         );
     }
@@ -3154,15 +3154,24 @@ mod syntax_bracket_ring_tests {
     /// because they only ever compared ring colours to *plain text* and to each other.
     #[test]
     fn no_ring_colour_is_confusable_with_a_syntax_accent() {
-        // 10 rather than the ~18 the ring holds against *itself*, and deliberately so. A ring
-        // colour is separated from an accent on three axes at once - hue (it sits at the midpoint
-        // between two accent hues), lightness (0.700 vs 0.760) and chroma (0.080 vs 0.095) - and
-        // it is also a single bracket glyph rather than a word, so the comparison a reader could
-        // actually get wrong is far weaker than one nesting level against the next. The real
-        // measured worst case is 11.7, `BRACKET_6` against `FUNCTION_DEFINITION` in `Paper`, which
-        // is the theme whose derivation compresses lightness and chroma hardest; in Jerry Dark
-        // itself nothing comes within ΔE 15.9.
-        const MIN_DELTA_E: f32 = 10.0;
+        // Lower than the ~18 the ring holds against *itself*, and lower again than it was before
+        // identifiers got real colour back. That second drop is a direct, measurable cost of this
+        // palette's own change of mind, and is recorded rather than smoothed over: the semantic
+        // set went from six hue families to eight when `VARIABLE` and `PROPERTY` stopped being
+        // plain foreground, so fourteen colours now share one lightness band where twelve did.
+        // At even spacing that is ~26 degrees apart, and the ring's separation is consequently
+        // carried mainly by *lightness and chroma* (0.700/0.080 against the semantic 0.760/0.095)
+        // rather than by hue.
+        //
+        // What keeps that honest rather than merely tolerable: a ring colour only ever paints a
+        // single bracket glyph, never a word, so the confusion this guards against is far weaker
+        // than one nesting level against the next. Real measured worst case across every bundled
+        // theme: 8.5, `BRACKET_2` against `CONSTANT` in `Moss`, whose derivation compresses chroma
+        // hardest of the six. Jerry Dark itself, the palette anyone actually authored, measures
+        // 11.3 at its worst. This floor is the honest price of the identifier change and is
+        // recorded as such - if a future palette wants it back, the lever is fewer semantic hues,
+        // not a louder ring.
+        const MIN_DELTA_E: f32 = 8.0;
         let accents = [
             ("STRING", syntax::STRING),
             ("CONSTANT", syntax::CONSTANT),
@@ -3348,12 +3357,15 @@ mod syntax_bracket_ring_tests {
         }
     }
 
-    /// Each ring colour deliberately *borrows* a semantic token's hue - that is the whole point -
-    /// but must never be mistakable for it. Real measured worst case: ΔE 14.8, `BRACKET_6` against
-    /// `FUNCTION`, both blues.
+    /// A ring colour sits between two semantic hues and must never be mistakable for either.
+    ///
+    /// See `no_ring_colour_is_confusable_with_a_syntax_accent` for why this floor is where it is:
+    /// the semantic set grew from six hue families to eight when identifiers got real colour back,
+    /// so the ring has measurably less room than it did. Real measured worst case in Jerry Dark:
+    /// ΔE 11.3, `BRACKET_2` against `CONSTANT`.
     #[test]
     fn no_ring_colour_impersonates_the_semantic_token_it_borrows_its_hue_from() {
-        const MIN_DELTA_E: f32 = 12.0;
+        const MIN_DELTA_E: f32 = 11.0;
         let semantic: [(&str, ColorToken); 8] = [
             ("KEYWORD", syntax::KEYWORD),
             ("FUNCTION", syntax::FUNCTION),
@@ -3458,8 +3470,6 @@ mod syntax_restraint_tests {
             ("KEYWORD", syntax::KEYWORD),
             ("FUNCTION", syntax::FUNCTION),
             ("FUNCTION_METHOD", syntax::FUNCTION_METHOD),
-            ("VARIABLE", syntax::VARIABLE),
-            ("PROPERTY", syntax::PROPERTY),
             ("EMBEDDED", syntax::EMBEDDED),
         ]
     }
@@ -3485,15 +3495,16 @@ mod syntax_restraint_tests {
         ]
     }
 
-    /// The headline acceptance criterion: a variable, a property access and a function *call* all
-    /// render at exactly plain foreground, in **every** bundled theme.
+    /// Function **calls** and keywords render at exactly plain foreground, in every bundled theme.
     ///
-    /// These are the three things tonsky's "everyone is getting syntax highlighting wrong" names
-    /// as making up roughly three quarters of a source file ("your code is probably 75% variable
-    /// names and function calls"), and colouring them is what spends the entire contrast budget on
-    /// the most frequent tokens on screen. The palette this replaced coloured all three.
+    /// Note what is deliberately *not* in this list any more: `VARIABLE` and `PROPERTY`. An earlier
+    /// revision held all of these plain, following tonsky's use-site/binding-site line. The
+    /// maintainer looked at the rendered result and rejected it twice - "most of the text is just
+    /// white" - so ordinary identifiers got real colour back. See `syntax`' own module docs for the
+    /// full account, and `identifiers_are_genuinely_tinted_not_almost_plain_text` for the property
+    /// that replaced this one for those two tokens.
     #[test]
-    fn variables_properties_and_calls_render_at_plain_foreground_in_every_bundled_theme() {
+    fn calls_and_keywords_render_at_plain_foreground_in_every_bundled_theme() {
         for def in crate::settings::state::THEME_DEFS.iter() {
             let _guard = with_bundled_theme(def.name);
             let text = syntax::TEXT.resolve();
@@ -3506,6 +3517,66 @@ mod syntax_restraint_tests {
                      colours definition sites, not use sites",
                     def.name
                 );
+            }
+        }
+    }
+
+    /// The counterpart to the test above, and the one that exists because contrast maths alone
+    /// missed this: an ordinary identifier must be **visibly** tinted, not merely a different hex
+    /// that reads as grey on screen.
+    ///
+    /// The floor is stated in CIE-Lab ΔE against plain text rather than in contrast ratio,
+    /// deliberately. A colour can sit at a perfectly good contrast ratio against the *background*
+    /// and still be indistinguishable from the plain foreground next to it - which is exactly the
+    /// failure the maintainer caught by looking at a screenshot, twice, while every contrast
+    /// assertion in this file was green.
+    ///
+    /// 18 is ~8x the ~2.3 just-noticeable difference. Jerry Dark itself measures far above it
+    /// (`VARIABLE` 31.5, `PROPERTY` 25.1); the floor is set by `Moss`, whose derivation compresses
+    /// chroma hardest and lands `PROPERTY` at 18.6.
+    #[test]
+    fn identifiers_are_genuinely_tinted_not_almost_plain_text() {
+        const MIN_DELTA_E: f32 = 18.0;
+        for def in crate::settings::state::THEME_DEFS.iter() {
+            let _guard = with_bundled_theme(def.name);
+            let text = syntax::TEXT.resolve();
+            for (name, token) in [
+                ("VARIABLE", syntax::VARIABLE),
+                ("PROPERTY", syntax::PROPERTY),
+                ("VARIABLE_PARAMETER", syntax::VARIABLE_PARAMETER),
+            ] {
+                let distance = delta_e(token.resolve(), text);
+                assert!(
+                    distance >= MIN_DELTA_E,
+                    "{name} is only ΔE {distance:.1} from plain text in {} - an identifier has to \
+                     read as genuinely coloured, not as a hex that happens to differ",
+                    def.name
+                );
+            }
+        }
+    }
+
+    /// A local, a parameter and a member access have to be tellable apart from each other too -
+    /// otherwise the previous test is satisfiable by painting all three the same tint.
+    #[test]
+    fn the_three_identifier_tokens_are_distinguishable_from_each_other() {
+        const MIN_DELTA_E: f32 = 10.0;
+        for def in crate::settings::state::THEME_DEFS.iter() {
+            let _guard = with_bundled_theme(def.name);
+            let tokens = [
+                ("VARIABLE", syntax::VARIABLE),
+                ("VARIABLE_PARAMETER", syntax::VARIABLE_PARAMETER),
+                ("PROPERTY", syntax::PROPERTY),
+            ];
+            for (index, (name_a, token_a)) in tokens.iter().enumerate() {
+                for (name_b, token_b) in tokens.iter().skip(index + 1) {
+                    let distance = delta_e(token_a.resolve(), token_b.resolve());
+                    assert!(
+                        distance >= MIN_DELTA_E,
+                        "{name_a} and {name_b} are only ΔE {distance:.1} apart in {}",
+                        def.name
+                    );
+                }
             }
         }
     }
@@ -3565,10 +3636,22 @@ mod syntax_restraint_tests {
         }
     }
 
-    /// The palette's own restraint budget, measured rather than asserted in a comment: every
-    /// accent this palette uses sits on one of at most six hue families.
+    /// The palette's own restraint budget, measured rather than asserted in a comment.
+    ///
+    /// Two tiers, and the split is the honest record of a real design change:
+    ///
+    /// - **Six accent hues** for what is rare and anchoring - strings, constants, definition
+    ///   sites, types, parameter bindings, diagnostics. This is the spec's own "≤ 6 accent hues"
+    ///   budget and it still holds exactly.
+    /// - **Two identifier tints** on top, for `VARIABLE` and `PROPERTY`. These are *not* accents in
+    ///   the spec's sense - they are the ubiquitous tokens the accent budget is deliberately spent
+    ///   away from - but they are genuinely coloured rather than plain foreground, because holding
+    ///   them at plain foreground produced a screen the maintainer rejected on sight, twice.
+    ///
+    /// So: eight hue families total, six of them accents. Stated as two numbers rather than one
+    /// because collapsing them would hide the deviation from the spec instead of recording it.
     #[test]
-    fn the_palette_spends_at_most_six_accent_hues() {
+    fn the_palette_spends_at_most_six_accent_hues_plus_two_identifier_tints() {
         let mut families: Vec<f32> = Vec::new();
         for token in all_tokens() {
             if !token.key.starts_with("syntax.") || token.key.starts_with("syntax.bracket_") {
@@ -3586,10 +3669,27 @@ mod syntax_restraint_tests {
             }
         }
         assert!(
-            families.len() <= 6,
-            "the restraint palette allows at most six accent hue families, found {}: {:?}",
+            families.len() <= 8,
+            "six accent hue families plus at most two identifier tints, found {}: {:?}",
             families.len(),
             families.iter().map(|h| h.round()).collect::<Vec<_>>()
+        );
+
+        // And the accent tier on its own still holds the spec's actual ≤ 6 budget.
+        let mut accent_families: Vec<f32> = Vec::new();
+        for (_, token) in accent_tokens() {
+            let (_, _, hue) = oklch_of(token.default);
+            if !accent_families
+                .iter()
+                .any(|existing| hue_distance(*existing, hue) < 20.0)
+            {
+                accent_families.push(hue);
+            }
+        }
+        assert!(
+            accent_families.len() <= 6,
+            "the accent tier allows at most six hue families, found {}",
+            accent_families.len()
         );
     }
 

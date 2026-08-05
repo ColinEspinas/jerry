@@ -15,9 +15,9 @@ JERRY_REGENERATE_THEMES=1 cargo test -p app --lib builtin_themes -- --nocapture
 
 ## 1. The design, in one paragraph
 
-Six accent hues, all at one OKLCH lightness (**L 0.760**) and one chroma (**C 0.095**), differing
-only in hue. Everything a source file is *made of* — variables, property accesses, function calls,
-keywords — renders at plain foreground. Punctuation sits deliberately below plain foreground.
+Six accent hues plus two identifier tints, all at one OKLCH lightness (**L 0.760**) and one chroma
+(**C 0.095**), differing only in hue. Function calls and keywords render at plain foreground;
+ordinary identifiers are genuinely tinted. Punctuation sits deliberately below plain foreground.
 Comments are held to the full body-text contrast floor, not a relaxed one. The bracket-pair ring is
 a seventh set of six hues held **under** the accents in both lightness and chroma, so a bracket can
 never shout louder than a string.
@@ -32,62 +32,82 @@ The colour → meaning mapping is meant to be recitable from memory:
 | cyan | 195 | types, JSX tags, markdown headings |
 | magenta | 320 | parameter bindings, markdown emphasis |
 | red | 25 | diagnostics only |
+| rose | 346 | ordinary variables *(identifier tint)* |
+| cyan-blue | 225 | property / member access *(identifier tint)* |
 
 ---
 
-## 2. Why variables and function calls are not coloured
+## 2. Variables: coloured, after a reversal
 
-This was the one genuinely contested decision, and it was resolved from the references rather than
-by preference.
+This is the one genuinely contested decision, and the record of how it moved matters more than the
+answer.
 
-**tonsky, [*I am sorry, but everyone is getting syntax highlighting wrong*](https://tonsky.me/blog/syntax-highlighting/)**
-states the position directly:
+### What was tried first, and why it was reasonable
+
+The redesign initially held variables, property accesses, function calls **and** keywords at plain
+foreground, following tonsky's [*I am sorry, but everyone is getting syntax highlighting
+wrong*](https://tonsky.me/blog/syntax-highlighting/):
 
 > I don't highlight variables or function calls — they are everywhere, your code is probably 75%
 > variable names and function calls.
 
-But the more useful part of his argument is *where he draws the line*, which is not at "identifiers"
-but at **use sites versus binding sites**:
+with the line drawn not at identifiers but at **use sites versus binding sites**:
 
 > Notice that we've kept variable declarations. These are not as ubiquitous and help you quickly
 > answer a common question: where does this thing come from?
 
-**Motlin, [*How to pick colors for a syntax highlighting theme*](https://motlin.medium.com/how-to-pick-colors-for-a-syntax-highlighting-theme-96d3e06c19dc)**
-is often read as arguing the opposite. He does not. His claim is *relational* — "Keywords,
-parameters, locals, and fields should use distinct colors", i.e. *if* you colour these, they must
-differ from each other. He never asserts that a variable reference deserves colour against plain
-foreground. His own stated principle points the other way:
+[Motlin](https://motlin.medium.com/how-to-pick-colors-for-a-syntax-highlighting-theme-96d3e06c19dc)
+does not actually contradict this. His claim is *relational* — "Keywords, parameters, locals, and
+fields should use distinct colors", i.e. *if* you colour these they must differ from each other —
+and his own principle ("Contrast is a scarce resource which we only spend to resolve ambiguity",
+plus his escape-sequence argument that context can substitute for contrast) points the same way.
 
-> Contrast is a scarce resource which we only spend to resolve ambiguity.
+### Why it was reversed
 
-> Escape sequences don't get confused with anything else, because they're inside a string.
+The maintainer looked at the rendered result and rejected it — twice, independently, in the same
+words both times: *"most of the text is just white."*
 
-That second quote is the general rule that **context can substitute for contrast**, and it is
-exactly what makes a plain use site affordable once its declaration nearby is distinguished.
+**The reasoning above was sound; the thing it produced was not what this editor's user wants to look
+at.** That is a legitimate verdict from the person who reads this screen all day, and it is recorded
+here as a reversal rather than smoothed into the original argument, because a future reader
+comparing this palette against tonsky's essay deserves to know the difference was deliberate.
 
-So the synthesis both authors' stated principles endorse: **use sites plain, binding sites
-coloured.**
+So: **`syntax.variable` and `syntax.property` carry real colour.** `syntax.function` /
+`syntax.function_method` (call sites) and `syntax.keyword` stay at plain foreground — the complaint
+was specifically about identifiers reading as an undifferentiated wall, not about calls.
 
-Three consequences:
+### The bug hiding underneath, which is the real lesson
 
-- `syntax.function` and `syntax.function_method` (call sites) are plain foreground;
-  `syntax.function_definition` gets the blue accent. This distinction did not previously exist and
-  is not expressible from any bundled grammar query — no grammar here distinguishes a definition
-  from a call — so `code_view.rs` grew real per-language definition-site query rules to make it
-  possible.
-- `syntax.variable_parameter` keeps a real accent, and this is tonsky's rule rather than an
-  exception to it: every grammar here captures `@variable.parameter` at the *parameter declaration*
-  (`tree-sitter-rust`'s `(parameter (identifier) @variable.parameter)`), never at a use inside the
-  body. It is already a binding site — and it resolves precisely the local-versus-parameter
-  ambiguity Motlin names.
-- `syntax.property` is plain foreground. This is where the two authors genuinely disagree: Motlin's
-  strongest case is a bare `count++` where you cannot tell a field from a local without scrolling.
-  tonsky simply prices that answer as unaffordable at 75% of the screen. This palette takes tonsky's
-  side, on the grounds that a member access is already marked by the `.` in front of it — context
-  doing the work contrast would otherwise have to.
+The first attempt at this reversal changed `syntax.variable` and **nothing happened on screen.**
 
-`syntax.keyword` is plain foreground for the same frequency reason ("Don't highlight language
-keywords").
+`tree-sitter-rust`'s bundled query has no blanket `(identifier) @variable` rule. Its only
+`@variable`-family pattern is `(parameter (identifier) @variable.parameter)`. Every other grammar
+here has one — `tree-sitter-python` at line 3, `-javascript` at line 4, `-go` at line 26, `-c` at
+line 1. Rust was the sole outlier, so a plain Rust local classified as unstyled `Text`, and
+`syntax.variable` was **literally unreachable in this app's primary language.**
+
+Two rounds of palette work aimed at that token could not have moved a single pixel of a Rust file.
+The maintainer's complaint was correct both times, and both times it was diagnosed as a colour
+problem when it was a *classification* problem.
+
+No contrast or ΔE calculation could have caught this. What caught it was taking a screenshot after
+the change, diffing it against the one before, and finding **zero changed pixels** in the code area.
+`RUST_VARIABLE_PREFIX` is the fix; `a_plain_rust_local_is_a_real_variable_not_unclassified_text`
+pins it.
+
+That fix in turn caused one real regression — the blanket rule claimed the identifiers inside
+`#[cfg(all(test, unix))]`, because `fold_highlight_events` resolves each byte to its *innermost*
+open highlight and the bundled query only captures the enclosing `attribute_item`. Also found by
+pixel diff (65 pixels moving the wrong way alongside 231 moving the right way) and fixed by
+`RUST_ATTRIBUTE_SUPPLEMENT`.
+
+### Where the two authors genuinely disagree
+
+Motlin's strongest case is a bare `count++` where you cannot tell a field from a local without
+scrolling. This palette now answers it: `syntax.property` is a cool cyan-blue against
+`syntax.variable`'s warm rose — the warm/cool split that makes an `a.b.c` chain legible at a glance.
+`syntax.variable_parameter` stays in the rose family, deeper and more saturated, saying "still a
+variable, just a distinguished one".
 
 ---
 
@@ -193,50 +213,56 @@ not run and brackets render with the de-emphasized punctuation style.
 
 ## 6. Every syntax token
 
-`L`/`C`/`H` are OKLCH. Contrast is WCAG 2.x against `surface.center` `#131518`.
+`L`/`C`/`H` are OKLCH. Contrast is WCAG 2.x against the **real** editor background, `surface.pty`
+`#0d0f11` — which is what `code_surface::file_view` actually paints behind code.
+
+Note a deliberate conservatism: `enforce_syntax_contrast_floors` measures against `surface.center`
+`#131518` instead, which is *lighter*. Every ratio below is therefore better than the one the guard
+enforced, and no floor can be violated by the difference. Worth correcting one day; harmless as it
+stands, and recorded rather than quietly left as a discrepancy between the docs and the code.
 
 | token | hex | L | C | H | contrast |
 |---|---|---|---|---|---|
-| `syntax.text` | `#acb2bc` | 0.762 | 0.016 | 261 | 8.58:1 |
-| `syntax.keyword` | `#acb2bc` | 0.762 | 0.016 | 261 | 8.58:1 |
-| `syntax.function` | `#acb2bc` | 0.762 | 0.016 | 261 | 8.58:1 |
-| `syntax.function_method` | `#acb2bc` | 0.762 | 0.016 | 261 | 8.58:1 |
-| `syntax.function_definition` | `#88b4ed` | 0.760 | 0.095 | 255 | 8.53:1 |
-| `syntax.type` | `#5ec4c4` | 0.760 | 0.095 | 195 | 8.86:1 |
-| `syntax.type_builtin` | `#5ec4c4` | 0.760 | 0.095 | 195 | 8.86:1 |
-| `syntax.constant` | `#d8a76d` | 0.761 | 0.095 | 70 | 8.42:1 |
-| `syntax.constant_builtin` | `#d8a76d` | 0.761 | 0.095 | 70 | 8.42:1 |
-| `syntax.string` | `#8bc18c` | 0.759 | 0.094 | 145 | 8.80:1 |
-| `syntax.string_escape` | `#a8e0a9` | 0.854 | 0.095 | 145 | 12.11:1 |
-| `syntax.number` | `#d8a76d` | 0.761 | 0.095 | 70 | 8.42:1 |
-| `syntax.comment` | `#7a818a` | 0.600 | 0.016 | 255 | 4.65:1 |
-| `syntax.comment_doc` | `#8c939c` | 0.660 | 0.016 | 255 | 5.90:1 |
-| `syntax.variable` | `#acb2bc` | 0.762 | 0.016 | 261 | 8.58:1 |
-| `syntax.variable_parameter` | `#cc9ed7` | 0.761 | 0.094 | 320 | 8.22:1 |
-| `syntax.variable_builtin` | `#d8a76d` | 0.761 | 0.095 | 70 | 8.42:1 |
-| `syntax.property` | `#acb2bc` | 0.762 | 0.016 | 261 | 8.58:1 |
-| `syntax.operator` | `#6f757e` | 0.560 | 0.016 | 258 | 3.94:1 |
-| `syntax.punctuation_bracket` | `#6f757e` | 0.560 | 0.016 | 258 | 3.94:1 |
-| `syntax.punctuation_delimiter` | `#6f757e` | 0.560 | 0.016 | 258 | 3.94:1 |
-| `syntax.bracket_1` | `#c58aa5` | 0.700 | 0.080 | 350 | 6.58:1 |
-| `syntax.bracket_2` | `#c88f73` | 0.699 | 0.080 | 47 | 6.65:1 |
-| `syntax.bracket_3` | `#a4a267` | 0.700 | 0.079 | 107 | 6.92:1 |
-| `syntax.bracket_4` | `#69af97` | 0.701 | 0.080 | 170 | 7.12:1 |
-| `syntax.bracket_5` | `#64a9c4` | 0.699 | 0.080 | 225 | 6.98:1 |
-| `syntax.bracket_6` | `#9b97ce` | 0.700 | 0.080 | 287 | 6.72:1 |
-| `syntax.tag` | `#5ec4c4` | 0.760 | 0.095 | 195 | 8.86:1 |
-| `syntax.attribute` | `#d8a76d` | 0.761 | 0.095 | 70 | 8.42:1 |
-| `syntax.embedded` | `#acb2bc` | 0.762 | 0.016 | 261 | 8.58:1 |
-| `syntax.heading` | `#5ec4c4` | 0.760 | 0.095 | 195 | 8.86:1 |
-| `syntax.link` | `#88b4ed` | 0.760 | 0.095 | 255 | 8.53:1 |
-| `syntax.strong` | `#d3dae4` | 0.886 | 0.016 | 257 | 12.99:1 |
-| `syntax.emphasis` | `#cc9ed7` | 0.761 | 0.094 | 320 | 8.22:1 |
-| `syntax.caret` | `#5894e0` | 0.660 | 0.130 | 255 | 5.86:1 |
-| `syntax.error_underline` | `#dc655f` | 0.651 | 0.151 | 25 | 5.29:1 |
-| `syntax.hover_underline` | `#5f82b0` | 0.599 | 0.081 | 256 | 4.62:1 |
-| `syntax.diagnostic_row_bg` | `#191416` | 0.198 | 0.009 | 352 | 1.00:1 |
-| `syntax.diagnostic_inline_message` | `#b6706b` | 0.619 | 0.090 | 24 | 4.81:1 |
-| `syntax.diagnostic_card_message` | `#f07f77` | 0.721 | 0.140 | 25 | 6.97:1 |
+| `syntax.text` | `#acb2bc` | 0.762 | 0.016 | 261 | 9.01:1 |
+| `syntax.keyword` | `#acb2bc` | 0.762 | 0.016 | 261 | 9.01:1 |
+| `syntax.function` | `#acb2bc` | 0.762 | 0.016 | 261 | 9.01:1 |
+| `syntax.function_method` | `#acb2bc` | 0.762 | 0.016 | 261 | 9.01:1 |
+| `syntax.function_definition` | `#88b4ed` | 0.760 | 0.095 | 255 | 8.96:1 |
+| `syntax.type` | `#5ec4c4` | 0.760 | 0.095 | 195 | 9.30:1 |
+| `syntax.type_builtin` | `#5ec4c4` | 0.760 | 0.095 | 195 | 9.30:1 |
+| `syntax.constant` | `#d8a76d` | 0.761 | 0.095 | 70 | 8.84:1 |
+| `syntax.constant_builtin` | `#d8a76d` | 0.761 | 0.095 | 70 | 8.84:1 |
+| `syntax.string` | `#8bc18c` | 0.759 | 0.094 | 145 | 9.24:1 |
+| `syntax.string_escape` | `#a8e0a9` | 0.854 | 0.095 | 145 | 12.71:1 |
+| `syntax.number` | `#d8a76d` | 0.761 | 0.095 | 70 | 8.84:1 |
+| `syntax.comment` | `#7a818a` | 0.600 | 0.016 | 255 | 4.88:1 |
+| `syntax.comment_doc` | `#8c939c` | 0.660 | 0.016 | 255 | 6.19:1 |
+| `syntax.variable` | `#de99be` | 0.761 | 0.095 | 346 | 8.60:1 |
+| `syntax.variable_parameter` | `#cc9ed7` | 0.761 | 0.094 | 320 | 8.63:1 |
+| `syntax.variable_builtin` | `#d8a76d` | 0.761 | 0.095 | 70 | 8.84:1 |
+| `syntax.property` | `#68bedf` | 0.760 | 0.096 | 225 | 9.16:1 |
+| `syntax.operator` | `#6f757e` | 0.560 | 0.016 | 258 | 4.13:1 |
+| `syntax.punctuation_bracket` | `#6f757e` | 0.560 | 0.016 | 258 | 4.13:1 |
+| `syntax.punctuation_delimiter` | `#6f757e` | 0.560 | 0.016 | 258 | 4.13:1 |
+| `syntax.bracket_1` | `#c88a9c` | 0.700 | 0.079 | 0 | 6.92:1 |
+| `syntax.bracket_2` | `#c4936b` | 0.701 | 0.080 | 60 | 7.07:1 |
+| `syntax.bracket_3` | `#98a66d` | 0.700 | 0.080 | 120 | 7.33:1 |
+| `syntax.bracket_4` | `#62afa0` | 0.700 | 0.080 | 180 | 7.46:1 |
+| `syntax.bracket_5` | `#6fa5cb` | 0.699 | 0.080 | 240 | 7.24:1 |
+| `syntax.bracket_6` | `#a693c9` | 0.699 | 0.080 | 300 | 6.98:1 |
+| `syntax.tag` | `#5ec4c4` | 0.760 | 0.095 | 195 | 9.30:1 |
+| `syntax.attribute` | `#d8a76d` | 0.761 | 0.095 | 70 | 8.84:1 |
+| `syntax.embedded` | `#acb2bc` | 0.762 | 0.016 | 261 | 9.01:1 |
+| `syntax.heading` | `#5ec4c4` | 0.760 | 0.095 | 195 | 9.30:1 |
+| `syntax.link` | `#88b4ed` | 0.760 | 0.095 | 255 | 8.96:1 |
+| `syntax.strong` | `#d3dae4` | 0.886 | 0.016 | 257 | 13.64:1 |
+| `syntax.emphasis` | `#cc9ed7` | 0.761 | 0.094 | 320 | 8.63:1 |
+| `syntax.caret` | `#5894e0` | 0.660 | 0.130 | 255 | 6.15:1 |
+| `syntax.error_underline` | `#dc655f` | 0.651 | 0.151 | 25 | 5.55:1 |
+| `syntax.hover_underline` | `#5f82b0` | 0.599 | 0.081 | 256 | 4.85:1 |
+| `syntax.diagnostic_row_bg` | `#191416` | 0.198 | 0.009 | 352 | 1.05:1 |
+| `syntax.diagnostic_inline_message` | `#b6706b` | 0.619 | 0.090 | 24 | 5.05:1 |
+| `syntax.diagnostic_card_message` | `#f07f77` | 0.721 | 0.140 | 25 | 7.32:1 |
 
 `syntax.diagnostic_row_bg` is a background tint, not a foreground, so a contrast ratio against the
 editor background is not meaningful for it and no floor is applied.
@@ -259,6 +285,7 @@ lookup.
 | `function` | Function | a **call site**; plain foreground |
 | `function.method` | FunctionMethod | a method call; plain foreground |
 | `function.definition` | FunctionDefinition | **binding site** — blue. Added by per-language supplement rules; no bundled grammar query distinguishes this from a call |
+| *(none — `token_tree` contents)* | Variable | inside a macro body the grammar parses only opaque tokens, so a call there is indistinguishable from any other identifier and reads as a variable. Honest rather than a gap |
 | `type`, `constructor` | Type | rare and anchoring — cyan |
 | `type.builtin` | TypeBuiltin | `i32`/`void` are still types |
 | `tag` | Tag | a JSX element names a type |
@@ -269,14 +296,14 @@ lookup.
 | `string.special.key` | Property | a JSON key is a property name, not a string value |
 | `comment` | Comment | readable grey at 4.65:1 |
 | `comment.documentation` | CommentDoc | a `///` comment reads brighter than a `//` one |
-| `variable`, `label` | Variable | plain foreground |
+| `variable`, `label` | Variable | **rose tint.** Rust needs `RUST_VARIABLE_PREFIX` to emit this at all — see §2 |
 | `variable.parameter` | VariableParameter | **binding site** — magenta |
 | `variable.builtin` | VariableBuiltin | `self`/`this`; amber, like a literal |
-| `property` | Property | plain foreground — the `.` already marks it |
+| `property` | Property | **cyan-blue tint** — cool against the warm locals, so an `a.b.c` chain reads at a glance |
 | `operator`, `punctuation.special` | Operator | de-emphasized |
 | `punctuation.bracket` | PunctuationBracket | de-emphasized; the ring's fallback for an unmatched bracket |
 | `punctuation.delimiter`, `delimiter` | PunctuationDelimiter | de-emphasized |
-| `attribute` | Attribute | amber — a fixed marker, like a constant |
+| `attribute` | Attribute | amber — a fixed marker, like a constant. `RUST_ATTRIBUTE_SUPPLEMENT` re-asserts it on the identifiers *inside* an attribute, which the blanket variable rule would otherwise claim |
 | `embedded` | Embedded | plain foreground; rarely visible, inner tokens win by nesting |
 | `text.title` | Heading | cyan; shares the type hue, unambiguous in context |
 | `text.uri`, `text.reference` | Link | blue |
