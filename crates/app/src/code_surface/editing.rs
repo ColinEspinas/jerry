@@ -57,6 +57,7 @@ use crate::code_surface::indent;
 use crate::code_surface::lsp_ui::{
     diagnostic_inline_message_color, diagnostic_row_bg, diagnostic_underline_color,
 };
+use crate::code_surface::symbols;
 use crate::lsp::diagnostics as diagnostics_view;
 use crate::lsp::hover as hover_view;
 use crate::root::{
@@ -191,6 +192,13 @@ impl AdeApp {
     /// A single slot per path in [`AdeApp::_rehighlight_tasks`]: assigning a fresh task here drops
     /// (cancels) whatever earlier debounce timer for the same path was still waiting, so only the
     /// most recent keystroke's timer ever actually fires - real debounce, not a queue.
+    ///
+    /// GitHub issue #178: the same background task also rebuilds the File view breadcrumb's
+    /// enclosing-symbol outline (`crate::code_surface::symbols::symbol_outline`), and
+    /// [`EditBuffer::apply_highlight`] installs the two together under one content-snapshot
+    /// guard. Riding along here rather than getting its own timer is deliberate: the outline is
+    /// stale for exactly as long as the highlighting is, so the breadcrumb can never claim a
+    /// symbol structure that disagrees with the colours on screen.
     pub(crate) fn schedule_rehighlight(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let Some(buffer) = self.edit_buffer(&path) else {
             return;
@@ -209,6 +217,10 @@ impl AdeApp {
             return;
         };
         let content_snapshot = buffer.content.clone();
+        // Cloned now (not read back off the buffer once this task resumes) for exactly the same
+        // reason `cwd` below is - this buffer may be gone or replaced by the time the debounce
+        // fires, and the parse must describe the snapshot it was actually handed.
+        let extension = buffer.extension.clone();
         // Captured now (synchronously, before the real debounce timer below) rather than
         // re-read from `self.file_tree_root` once this task resumes - see `AdeApp::
         // edit_buffers`'s own docs for the stale-worktree bug class this prevents.
@@ -222,20 +234,23 @@ impl AdeApp {
             let content_snapshot = content_snapshot.clone();
             async move |this, cx| {
                 cx.background_executor().timer(REHIGHLIGHT_DEBOUNCE).await;
-                let lines = cx
+                let (lines, symbols) = cx
                     .background_executor()
                     .spawn({
                         let content_snapshot = content_snapshot.clone();
                         async move {
                             let spans = highlight_options
                                 .apply(&content_snapshot, highlighter(&content_snapshot));
-                            code_view::build_lines(&content_snapshot, &spans)
+                            let lines = code_view::build_lines(&content_snapshot, &spans);
+                            let symbols =
+                                symbols::symbol_outline(&content_snapshot, extension.as_deref());
+                            (lines, symbols)
                         }
                     })
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     if let Some(buffer) = this.edit_buffer_at_mut(&cwd, &path) {
-                        if buffer.apply_highlight(&content_snapshot, lines) {
+                        if buffer.apply_highlight(&content_snapshot, lines, symbols) {
                             cx.notify();
                         }
                     }

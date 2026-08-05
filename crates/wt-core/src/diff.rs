@@ -693,6 +693,12 @@ fn read_streams_concurrently(
 /// actual file content into the temp index - unnecessary, since `git diff <commit>` (no
 /// `--cached`) always compares against the real working-tree file content directly
 /// regardless of what's staged.
+///
+/// The copy also inherits the real index's **mtime**, not just its bytes - an index's cached
+/// stat data only means anything relative to that index file's own timestamp (git's
+/// racy-index rule). See the inline comment at the copy itself, and the
+/// `a_same_length_edit_racy_against_the_index_timestamp_is_still_reported` test, for the real
+/// bug (GitHub issue #163) that came of not doing this.
 fn prepare_shadow_index(worktree_path: &Path) -> Result<tempfile::NamedTempFile, Error> {
     let index_path_args: Vec<OsString> =
         vec!["rev-parse".into(), "--git-path".into(), "index".into()];
@@ -716,6 +722,32 @@ fn prepare_shadow_index(worktree_path: &Path) -> Result<tempfile::NamedTempFile,
                 .write_all(&real_index_bytes)
                 .map_err(Error::WorktreeIo)?;
             (&shadow).flush().map_err(Error::WorktreeIo)?;
+            // GitHub issue #163. Copying the bytes is not enough: an index's cached stat data
+            // is only meaningful *relative to that index file's own mtime*. Git compares a
+            // working-tree file against its entry by whole-second mtime plus size (sub-second
+            // precision is a `USE_NSEC` build option that is off by default and off in every
+            // mainstream distro's git), so a same-length edit landing in the same second as
+            // the cached stat is indistinguishable from "unchanged" by stat alone. Git's
+            // defence is the racy-index rule: an entry whose cached mtime is not strictly
+            // older than the index file's own mtime is suspect, so its content gets re-read
+            // instead of trusted.
+            //
+            // A fresh `NamedTempFile` carries *now* as its mtime, which silently moves every
+            // copied entry out of that suspect window - git then trusts stat data the real
+            // index would have rechecked, and a genuine same-length edit disappears from the
+            // diff entirely. Carrying the source index's mtime across keeps the copy's
+            // racy-index verdict identical to the real index's, so `git add` below observes
+            // the same suspect entries git itself would and writes the shadow out with their
+            // stat data invalidated. Best-effort: a filesystem that refuses the timestamp
+            // update leaves the copy no worse than it was before this call existed, and
+            // failing the whole diff over it would be a far bigger regression than the narrow
+            // race it guards.
+            if let Ok(mtime) = std::fs::metadata(&real_index_path).and_then(|meta| meta.modified())
+            {
+                let _ = shadow
+                    .as_file()
+                    .set_times(std::fs::FileTimes::new().set_modified(mtime));
+            }
         }
         Err(_) => {
             // A repository whose index has never been written (e.g. immediately after
@@ -1105,6 +1137,93 @@ mod tests {
         assert!(paths.contains(&Path::new("file.txt")));
         assert!(paths.contains(&Path::new("new.txt")));
         assert_eq!(via_diff_accessor, Some(uncommitted));
+    }
+
+    /// GitHub issue #163: the shadow index must not silently disable git's own racy-index
+    /// protection.
+    ///
+    /// Git (built without `USE_NSEC`, which is the default and what every mainstream distro
+    /// ships) compares a working-tree file against its index entry using **whole-second**
+    /// mtime plus size. So an edit that keeps a file's length identical and lands in the same
+    /// second as the stat data git cached for it is indistinguishable from "unchanged" by stat
+    /// alone. Git's defence is the *racy index* rule: an entry whose cached mtime is not
+    /// strictly older than the index file's **own** mtime is treated as suspect, and its
+    /// content is re-read rather than trusted.
+    ///
+    /// That rule is defined relative to the mtime of the index file git actually read - which
+    /// is exactly what [`prepare_shadow_index`] used to destroy: it copied the real index's
+    /// bytes into a brand-new temp file, giving the copy a *fresh* mtime while leaving every
+    /// cached entry's mtime untouched. Entries that were legitimately racy against the real
+    /// index looked comfortably old against the copy, so git trusted the stale stat data and
+    /// reported the file as unmodified - a real, same-length edit vanishing from the Changes
+    /// panel entirely.
+    ///
+    /// This test forces that exact alignment deterministically (rather than waiting for the
+    /// sub-second race to happen on its own, which is how it was originally found - as an
+    /// intermittent failure of `app`'s own
+    /// `switching_the_open_diff_to_a_different_file_recomputes_the_highlight_cache`): the
+    /// file's cached mtime, its on-disk mtime and the real index's mtime are all pinned to one
+    /// whole second, and the rewrite keeps the byte length identical.
+    #[test]
+    fn a_same_length_edit_racy_against_the_index_timestamp_is_still_reported() {
+        use std::time::{Duration, SystemTime};
+
+        // A whole second, safely in the past so nothing else can land on it by accident.
+        let racy = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .expect("clock after epoch")
+                    .as_secs()
+                    - 60,
+            );
+        let pin_mtime = |path: &Path| {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .expect("open for set_times");
+            file.set_times(fs::FileTimes::new().set_modified(racy))
+                .expect("set_times");
+        };
+
+        let repo = TempDir::new().expect("tempdir");
+        let path = repo.path();
+        git(path, &["init", "-b", "main"]);
+        git(path, &["config", "user.email", "test@example.com"]);
+        git(path, &["config", "user.name", "Test User"]);
+        fs::write(path.join("a.rs"), "fn a() -> i32 {\n    1\n}\n").expect("write a.rs");
+        // Pinned *before* `git add`, so this is the mtime git records in the index entry.
+        pin_mtime(&path.join("a.rs"));
+        git(path, &["add", "."]);
+        git(path, &["commit", "-m", "initial"]);
+        git(path, &["checkout", "-b", "feature"]);
+
+        // The edit: byte-for-byte the same length as the committed content, and pinned back to
+        // the same second the index entry already records.
+        fs::write(path.join("a.rs"), "fn a() -> i32 {\n    2\n}\n").expect("rewrite a.rs");
+        pin_mtime(&path.join("a.rs"));
+        // The real index sits in the racy window too - which is what makes git's own
+        // protection apply here, and therefore what the shadow copy must not throw away.
+        let index = fs::OpenOptions::new()
+            .write(true)
+            .open(path.join(".git/index"))
+            .expect("open index");
+        index
+            .set_times(fs::FileTimes::new().set_modified(racy))
+            .expect("set index times");
+
+        let result = diff_against_base(path).expect("diff_against_base");
+        let paths: Vec<PathBuf> = result
+            .diff()
+            .map(|diff| diff.files.iter().map(|file| file.path.clone()).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("a.rs")],
+            "a same-length edit whose mtime is racy against the index must still be diffed - \
+             the shadow index has to preserve the real index's own mtime so git's racy-index \
+             protection still applies to it"
+        );
     }
 
     #[test]

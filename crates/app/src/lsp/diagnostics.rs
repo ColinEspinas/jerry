@@ -102,6 +102,33 @@ fn number_or_string_to_string(code: &lsp_types::NumberOrString) -> String {
     }
 }
 
+/// The real error and warning counts (in that order) over a raw published diagnostics list.
+///
+/// Counted **per diagnostic**, straight off `lsp_types::Diagnostic::severity`, which is why this
+/// exists as its own function rather than being derived from [`index_diagnostics_by_line`]'s
+/// output: that index deliberately records a multi-line diagnostic on *every* line it touches, so
+/// counting it would report one three-line error as three. `crate::root::AdeApp::
+/// file_view_error_count`'s own docs already flag that trap; this is the single implementation
+/// both the File view footer's `N errors, M warnings` label and (GitHub issue #178) the
+/// breadcrumb's right-hand error/warning counts ultimately read, through
+/// `crate::lsp::client::lsp_file_status`.
+///
+/// `Information`/`Hint` are counted as neither - they are real diagnostics, but the design's
+/// breadcrumb and status-bar treatments only define an error and a warning slot, and folding a
+/// hint into either would overstate how bad the file is.
+pub fn count_errors_and_warnings(diagnostics: &[lsp_types::Diagnostic]) -> (usize, usize) {
+    let mut errors = 0;
+    let mut warnings = 0;
+    for diagnostic in diagnostics {
+        match Severity::from_lsp(diagnostic.severity) {
+            Severity::Error => errors += 1,
+            Severity::Warning => warnings += 1,
+            Severity::Information | Severity::Hint => {}
+        }
+    }
+    (errors, warnings)
+}
+
 /// Builds a per-line (1-based, matching `code_view`/`crate::root`'s convention) index of every
 /// diagnostic that touches at least one line of `lines`. A diagnostic whose range spans multiple
 /// lines is recorded on *every* line it touches, clipped to each line's own bounds (from the
@@ -273,6 +300,66 @@ mod tests {
             tags: None,
             data: None,
         }
+    }
+
+    /// Same shape as [`diagnostic`], but with a caller-chosen severity - the counting tests below
+    /// need real `WARNING`/`HINT` values, not the `ERROR` that helper hardcodes.
+    fn diagnostic_with_severity(
+        severity: lsp_types::DiagnosticSeverity,
+        start_line: u32,
+        end_line: u32,
+    ) -> lsp_types::Diagnostic {
+        let mut diagnostic = diagnostic(start_line, 0, end_line, 4, "boom");
+        diagnostic.severity = Some(severity);
+        diagnostic
+    }
+
+    #[test]
+    fn count_errors_and_warnings_counts_a_real_mixed_severity_list() {
+        let diagnostics = vec![
+            diagnostic_with_severity(lsp_types::DiagnosticSeverity::ERROR, 0, 0),
+            diagnostic_with_severity(lsp_types::DiagnosticSeverity::WARNING, 1, 1),
+            diagnostic_with_severity(lsp_types::DiagnosticSeverity::WARNING, 2, 2),
+            diagnostic_with_severity(lsp_types::DiagnosticSeverity::HINT, 3, 3),
+            diagnostic_with_severity(lsp_types::DiagnosticSeverity::INFORMATION, 4, 4),
+        ];
+        assert_eq!(count_errors_and_warnings(&diagnostics), (1, 2));
+    }
+
+    #[test]
+    fn count_errors_and_warnings_is_empty_for_an_empty_list() {
+        assert_eq!(count_errors_and_warnings(&[]), (0, 0));
+    }
+
+    #[test]
+    fn a_diagnostic_with_no_severity_at_all_counts_as_a_real_error() {
+        // `Severity::from_lsp` already treats a missing severity as `Error` (rust-analyzer does
+        // send some); the count must agree with that rather than silently dropping it.
+        let mut diagnostic = diagnostic(0, 0, 0, 4, "boom");
+        diagnostic.severity = None;
+        assert_eq!(
+            count_errors_and_warnings(std::slice::from_ref(&diagnostic)),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn a_multi_line_diagnostic_is_counted_once_not_once_per_line_it_touches() {
+        // The exact trap `count_errors_and_warnings` exists to avoid: one error spanning four
+        // lines lands on four keys in `index_diagnostics_by_line`, and a count taken from that
+        // index would report four errors for one.
+        let spanning = diagnostic_with_severity(lsp_types::DiagnosticSeverity::ERROR, 0, 3);
+        let lines = ["one", "two", "three", "four"].map(line);
+        let by_line = index_diagnostics_by_line(std::slice::from_ref(&spanning), &lines);
+        assert_eq!(
+            by_line.len(),
+            4,
+            "sanity check: the per-line index really does record this one diagnostic four times"
+        );
+        assert_eq!(
+            count_errors_and_warnings(std::slice::from_ref(&spanning)),
+            (1, 0)
+        );
     }
 
     #[test]

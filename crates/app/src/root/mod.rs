@@ -78,7 +78,7 @@ use crate::settings::state as settings;
 use crate::settings::state::SettingsPage;
 use crate::settings::store::{self as settings_store, CfgFormat, Settings};
 use crate::sidebar::changes::{self, ChangeTag};
-use crate::sidebar::file_tree::{self, FileTreeEntry};
+use crate::sidebar::file_tree;
 use crate::sidebar::fold_state;
 use crate::sidebar::tree_ops;
 use crate::status_bar::process_stats;
@@ -194,6 +194,8 @@ actions!(
         FileTreeUndo,
         FileTreeRedo,
         TerminalClear,
+        TerminalCopy,
+        TerminalPaste,
     ]
 );
 
@@ -343,7 +345,7 @@ pub struct AdeApp {
     pub(crate) rail_scroll_handle: gpui::ScrollHandle,
     pub(crate) selected: Option<usize>,
     pub(crate) agents: Agents,
-    pub(crate) file_tree: Vec<FileTreeEntry>,
+    pub(crate) file_tree: file_tree::FileTree,
     pub(crate) file_tree_root: PathBuf,
     pub(crate) file_tree_error: Option<String>,
     pub(crate) right_sidebar_view: RightSidebarView,
@@ -418,26 +420,15 @@ pub struct AdeApp {
     pub(crate) fold_state_save_pending: bool,
     /// See [`Self::settings_save_running`] - same contract, for the fold-state file.
     pub(crate) fold_state_save_running: bool,
-    /// Whether the last completed file-tree walk stopped early at its configured entry cap
-    /// (`Settings.file_tree.max_entries`, or [`Self::file_tree_limit_override`]). Drives the
-    /// sidebar's real "load more" action - the explicit replacement for the removed
-    /// "... and N more entries not shown" row.
-    pub(crate) file_tree_truncated: bool,
-    /// Whether that walk was a *complete* inventory of the worktree's directories
-    /// (`file_tree::FileTreeListing::is_complete`) - false when it was truncated, and also when
-    /// it silently skipped an unreadable or too-deep subdirectory. The only condition under
-    /// which `AdeApp::prune_stale_fold_state` may read "not in this listing" as "deleted".
+    /// Whether the last completed file-tree walk was a *complete* inventory of the worktree's
+    /// directories (`file_tree::FileTreeListing::is_complete`) - false when it silently skipped
+    /// an unreadable or too-deep subdirectory. The only condition under which
+    /// `AdeApp::prune_stale_fold_state` may read "not in this listing" as "deleted".
+    ///
+    /// There is no `file_tree_truncated` companion any more: GitHub issue #160 removed the walk's
+    /// entry cap, so "the walk stopped early because it ran out of budget" is no longer a state
+    /// this app can be in.
     pub(crate) file_tree_complete: bool,
-    /// Set by the sidebar's "load more" action (`Self::load_more_file_tree_entries`): the cap
-    /// this worktree's walks use instead of `Settings.file_tree.max_entries`, raised tenfold per
-    /// click. Deliberately still a cap and never `None`: a single click that re-walked a
-    /// bind-mounted `$HOME` with an unbounded budget would allocate millions of `PathBuf`s on a
-    /// background thread and then hand them all to `rebuild_palette_file_candidates`. Each click
-    /// raises the bound and the row keeps reporting where the walk stopped, so the listing is
-    /// never *silently* cut off - which is what issue #18 §4 actually asks for. Agent-scoped
-    /// and per-worktree: reset on every worktree switch, since "show me more of *this* tree"
-    /// says nothing about the next one.
-    pub(crate) file_tree_limit_override: Option<usize>,
     /// The file tree's open right-click context menu (GitHub issue #19 §1), `None` when closed -
     /// see `crate::sidebar::tree_ops::TreeContextMenu`.
     pub(crate) tree_context_menu: Option<tree_ops::TreeContextMenu>,
@@ -541,8 +532,22 @@ pub struct AdeApp {
     /// Whether the commit composer's `▾` split-button popover (Revision R12 §5: *Commit and
     /// push* / *Commit all N files* / *Amend last commit* / *Stash staged files*) is open. Closed
     /// on every worktree switch (`Self::select_worktree`) since it targets that worktree's own
-    /// staged set.
+    /// staged set, whenever any other [`menus::MenuSurface`] opens, when the right sidebar leaves
+    /// the Changes view (the composer stops being rendered, and a latched-open flag would pop the
+    /// popover back up on return), and when the window loses focus.
     pub(crate) commit_menu_open: bool,
+    /// The commit composer's own painted bounds, captured every render by a `gpui::canvas` child
+    /// (the same pattern [`Self::plus_button_bounds`] uses). `Bounds::default()` until the
+    /// composer has really painted once.
+    ///
+    /// GitHub issue #176: the popover used to be a *child* of the composer, which made its
+    /// "click-away dismisses" scrim - `absolute()` with inset 0 - resolve against the composer's
+    /// own ~135px box instead of the window, so clicking the Changes list, the file tree, the
+    /// rail, the tab strip or the editor did not close it ("the commit one is particularly bugged
+    /// and hard to close"). It is now a sibling of `Self::render_plus_menu` in [`Render::render`]
+    /// with a genuinely full-window scrim, which means it has to carry its anchor in window space
+    /// like every other popover here does.
+    pub(crate) commit_composer_bounds: gpui::Bounds<Pixels>,
     /// Ordered list of currently-open file tabs, rendered after every agent's own tab by
     /// `Self::render_tab_strip` - **per worktree**, keyed by [`Self::file_tree_root`]
     /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §3: "Switching worktrees
@@ -877,9 +882,10 @@ pub struct AdeApp {
     /// Pre-open focus target and active agent for [`Self::palette_focus_handle`] - see
     /// [`OverlayFocus`]/[`restore_focus`].
     pub(crate) palette_focus: OverlayFocus,
-    /// The palette's file-candidate list (`crate::palette::state::FileCandidate`, one per non-directory
-    /// [`Self::file_tree`] entry, up to `Settings.file_tree.max_entries`) - built once by
-    /// [`Self::rebuild_palette_file_candidates`] when `file_tree`/the diff reload, not rebuilt on
+    /// The palette's file-candidate list (`crate::palette::state::FileCandidate`, one per
+    /// non-directory [`Self::file_tree`] entry) - built once when `file_tree`/the diff reload
+    /// (on the background executor for the tree walk, see [`Self::load_file_tree`]; via
+    /// [`Self::rebuild_palette_file_candidates`] for the diff), not rebuilt on
     /// every `Self::build_palette_groups` call (which runs on every render while the palette is
     /// open, up to ~30x/sec during a streaming agent). Agent/command candidates aren't
     /// cached the same way: they're few, and an agent's status dot is genuinely live per-render
@@ -1439,8 +1445,22 @@ pub struct AdeApp {
     /// once at construction regardless of whether `Settings.theme.follow_system` starts on (see
     /// that method's own docs for why).
     pub(crate) _window_appearance_subscription: Subscription,
+    /// The live `Window::observe_window_activation` subscription that closes every open
+    /// dropdown/context menu when the window itself loses OS focus (GitHub issue #176: "when a
+    /// dropdown loses focus it should be closed"). Held for the entity's whole lifetime, like
+    /// [`Self::_window_appearance_subscription`] beside it - a dropped `Subscription` stops
+    /// firing.
+    ///
+    /// A menu is a transient, click-away surface anchored to a control in *this* window; leaving
+    /// one painted while the user is working in another window means coming back to a stale
+    /// popover positioned off bounds that may since have moved. Only the six
+    /// [`menus::MenuSurface`]s are swept - the palette/Settings/"New file" overlays own real
+    /// keyboard focus and half-typed input, and closing those out from under an alt-tab would
+    /// destroy real work.
+    pub(crate) _window_activation_subscription: Subscription,
     /// Whether the tab strip's `+` menu popover is open - see [`Self::render_plus_menu`].
-    /// Closed by its own scrim click, by picking a row, and defensively by
+    /// Closed by its own scrim click, by picking a row, by opening any other
+    /// [`menus::MenuSurface`], by the window losing focus, and defensively by
     /// [`Self::open_palette`]/[`Self::open_settings`] (it's rendered as an unconditional sibling
     /// of both, so it would otherwise paint over a surface it no longer makes sense above).
     pub(crate) plus_menu_open: bool,
@@ -2257,7 +2277,7 @@ impl AdeApp {
 }
 
 impl Render for AdeApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
@@ -2296,6 +2316,8 @@ impl Render for AdeApp {
             .on_action(cx.listener(Self::handle_jump_to_agent_8_action))
             .on_action(cx.listener(Self::handle_close_focused_tab_action))
             .on_action(cx.listener(Self::handle_terminal_clear_action))
+            .on_action(cx.listener(Self::handle_terminal_copy_action))
+            .on_action(cx.listener(Self::handle_terminal_paste_action))
             .child(self.render_title_bar(cx))
             // The Settings surface (`design_handoff_jerry_ade/README.md`: "a separate surface,
             // not a modal: it replaces the three zones while the title bar and status bar
@@ -2348,6 +2370,25 @@ impl Render for AdeApp {
             .when_some(self.title_menu_open, |el, menu| {
                 el.child(self.render_title_menu(menu, cx))
             })
+            // The commit composer's `▾` menu (GitHub issue #176) - a window-positioned overlay for
+            // the same reason `render_plus_menu` is one: it is anchored off a `gpui::canvas`-
+            // captured, window-space `Self::commit_composer_bounds`, and its click-away scrim has
+            // to cover the whole window rather than the composer's own 135px box. See
+            // `crate::sidebar::render::AdeApp::render_commit_menu`'s own docs.
+            //
+            // Gated on the composer really being rendered underneath: Settings replaces the
+            // workspace body, the right sidebar may be showing Files instead of Changes, and the
+            // Changes view itself falls back to an error message when there is no real diff - in
+            // all three cases `commit_composer_bounds` is a stale anchor from an earlier frame.
+            // `Self::close_right_sidebar_view`'s own clear keeps `commit_menu_open` from latching
+            // across a view switch; this guard is the belt to that braces.
+            .when(
+                self.commit_menu_open
+                    && !self.settings_open
+                    && self.right_sidebar_view == RightSidebarView::Changes
+                    && self.current_diff().is_some(),
+                |el| el.child(self.render_commit_menu(window, cx)),
+            )
             .children(self.render_hover_card(cx))
             .children(self.render_completions_popover(cx))
             .when(self.new_file_input.is_some(), |el| {
@@ -3621,6 +3662,7 @@ mod repo_list_tests {
 pub(crate) mod caret_blink;
 pub(crate) mod focus;
 pub mod layout;
+pub(crate) mod menus;
 pub(crate) mod new_file;
 pub(crate) mod rem_scope;
 pub(crate) mod resize;

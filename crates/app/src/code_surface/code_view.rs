@@ -459,7 +459,7 @@ pub struct HighlightSpan {
 /// two genuinely different grammars in `tree-sitter-typescript` (not one grammar with a flag), and
 /// they need two different composed query strings - see [`highlight_query_for`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Grammar {
+pub(in crate::code_surface) enum Grammar {
     Rust,
     TypeScript,
     Tsx,
@@ -536,7 +536,7 @@ impl Grammar {
         }
     }
 
-    fn language(self) -> tree_sitter::Language {
+    pub(in crate::code_surface) fn language(self) -> tree_sitter::Language {
         match self {
             Grammar::Rust => tree_sitter_rust::LANGUAGE.into(),
             Grammar::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
@@ -616,7 +616,7 @@ impl Grammar {
     /// (identical monomorphisations may be merged), so a table that looked derived would in fact
     /// be relying on unspecified behaviour. An explicit match plus a real drift test is the honest
     /// version of the same guarantee.
-    fn for_extension(extension: &str) -> Option<Grammar> {
+    pub(in crate::code_surface) fn for_extension(extension: &str) -> Option<Grammar> {
         Some(match extension {
             "rs" => Grammar::Rust,
             // `.js` reuses the plain TypeScript grammar, `.jsx` the TSX one - see

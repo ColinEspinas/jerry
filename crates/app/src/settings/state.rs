@@ -582,6 +582,9 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::FileTreeUndo" => Some("Files tree: undo"),
         "app::FileTreeRedo" => Some("Files tree: redo"),
         "app::TerminalClear" => Some("Terminal: clear"),
+        // GitHub issue #158.
+        "app::TerminalCopy" => Some("Terminal: copy selection"),
+        "app::TerminalPaste" => Some("Terminal: paste"),
         _ => None,
     }
 }
@@ -1317,6 +1320,9 @@ mod tests {
                 "Close focused tab",
                 // GitHub issue #20's terminal footer `clear`, scoped `Some("terminal")`.
                 "Terminal: clear",
+                // GitHub issue #158's terminal copy/paste, both scoped `Some("terminal")`.
+                "Terminal: copy selection",
+                "Terminal: paste",
             ]
         );
     }
@@ -1385,6 +1391,10 @@ mod tests {
         // GitHub issue #155 removed 1: `FileTreeContextMenu` (`Shift+F10`) - right-click plus
         // each row's own already-bound shortcut covers the same ground, so a second
         // keyboard-only path to the menu had no real justification of its own.
+        // GitHub issue #158 added 2 more real scoped bindings: `TerminalCopy`/`TerminalPaste`
+        // (`cmd-c`/`cmd-v` on macOS, `ctrl-shift-c`/`ctrl-shift-v` elsewhere), both
+        // `Some("terminal")` - see `crate::default_key_bindings`'s own entry for why the shifted
+        // variants, and why leaving them unbound was the bug.
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings, &[]);
         assert!(!rows.is_empty());
@@ -1392,7 +1402,7 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            73,
+            75,
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
              every real Completions* binding (5) plus every real merge-editor binding (18) plus \
              TextUndo/TextRedo (3, GitHub issue #17) plus every real \
@@ -1401,7 +1411,8 @@ mod tests {
              binding (8, GitHub issue #27) plus every real multi-cursor Editor* binding (4, \
              GitHub issue #28) plus every real GitHub issue #26 binding (7, not counting \
              EditorCollapseCursors above, which is issue #28's own action) plus TerminalClear \
-             (1, GitHub issue #20) to be scoped, not global"
+             (1, GitHub issue #20) plus TerminalCopy/TerminalPaste (2, GitHub issue #158) to be \
+             scoped, not global"
         );
         assert!(
             scoped

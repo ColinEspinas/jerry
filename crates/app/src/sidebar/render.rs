@@ -56,6 +56,12 @@ impl AdeApp {
             self.settings_focus.forget_target(&self.tree_focus_handle);
             self.code_focus.forget_target(&self.tree_focus_handle);
         }
+        if view != RightSidebarView::Changes {
+            // GitHub issue #176, the mirror image of the block above: leaving Changes unrenders
+            // the commit composer, but `commit_menu_open` used to stay latched `true` - so coming
+            // back to Changes popped the `▾` popover open again on its own, with no click.
+            self.commit_menu_open = false;
+        }
         self.right_sidebar_view = view;
         if view == RightSidebarView::Changes {
             self.load_diff(self.diff_root.clone(), cx);
@@ -216,44 +222,6 @@ impl AdeApp {
             self.fold_state_owned.insert(root_key);
             self.persist_fold_state(cx);
         }
-    }
-
-    /// Whether the current walk budget is already at [`file_tree::MAX_LOAD_MORE_ENTRIES`], so
-    /// [`Self::load_more_file_tree_entries`] has nothing left to raise - the condition that turns
-    /// the sidebar's action row into a plain disclosure rather than a button that re-walks a
-    /// ceiling's worth of entries to no effect.
-    pub(crate) fn file_tree_limit_is_at_ceiling(&self) -> bool {
-        self.file_tree_limit_override
-            .unwrap_or(self.settings.file_tree.max_entries)
-            >= file_tree::MAX_LOAD_MORE_ENTRIES
-    }
-
-    /// The "load more" action's real handler - re-walks the current tree with a tenfold larger
-    /// entry budget. Genuinely reloads rather than revealing something already loaded: the
-    /// capped walk never collected those entries. Still bounded, deliberately - see
-    /// [`AdeApp::file_tree_limit_override`] for why this raises the cap instead of removing it.
-    pub(crate) fn load_more_file_tree_entries(&mut self, cx: &mut Context<Self>) {
-        let current = self
-            .file_tree_limit_override
-            .unwrap_or(self.settings.file_tree.max_entries);
-        // Ceilinged *and* monotonic. The ceiling is why this can't escalate into the unbounded
-        // walk again (see `file_tree::MAX_LOAD_MORE_ENTRIES`); the `.max(current)` is a real bug
-        // fix rather than defensive padding - a `max_entries` above the ceiling would otherwise
-        // make one click *shrink* the budget, so "load more" would visibly remove rows from the
-        // tree. A limit this action produces can never be smaller than the one it replaced.
-        let next = current
-            .saturating_mul(10)
-            .min(file_tree::MAX_LOAD_MORE_ENTRIES)
-            .max(current);
-        if next == current {
-            // Already at the ceiling: re-walking would burn a whole budget's worth of work to
-            // produce byte-identical rows. `render_file_tree` doesn't offer the action at all in
-            // this state (it renders a plain disclosure instead); this is the same fact enforced
-            // at the handler, so no other caller can reintroduce the dead-but-expensive click.
-            return;
-        }
-        self.file_tree_limit_override = Some(next);
-        self.load_file_tree(self.file_tree_root.clone(), cx);
     }
 
     /// Toggles a file's staged state (Revision R12 §5: the checkbox **is** staging) - the
@@ -548,7 +516,7 @@ impl AdeApp {
         // indices are valid for exactly as long as they need to be, since nothing can mutate
         // `file_tree` between this line and the closure's last call within one frame. They are
         // still bounds-checked below rather than indexed blindly.
-        let visible_indices = file_tree::visible_indices(&self.file_tree, &self.expanded_dirs);
+        let visible_indices = self.file_tree.visible_indices(&self.expanded_dirs);
         // The in-progress inline name editor is woven into that same row list as a real row
         // (issue #19 §2: "an inline name editor at the right spot in the tree"), rather than
         // floating over it - so it scrolls with the tree, is indented like its neighbours, and
@@ -581,9 +549,10 @@ impl AdeApp {
         //
         // The former `MAX_RENDERED_FILE_ENTRIES` (500) cap is gone: virtualization already
         // removed the per-frame cost it was originally guarding, and hiding real entries behind
-        // a "... and N more" row was the dishonesty issue #18 §4 set out to remove. The one
-        // surviving cap is a *load*-time one (`Settings.file_tree.max_entries`), and it announces
-        // itself with the real "load more" action below rather than a silent cut-off.
+        // a "... and N more" row was the dishonesty issue #18 §4 set out to remove. The
+        // *load*-time cap that used to survive alongside it (`Settings.file_tree.max_entries`,
+        // plus its "load more" action) is gone too, as of GitHub issue #160 - there is no cap of
+        // any kind on this tree now.
         let list = uniform_list(
             "file-tree-list",
             rendered_count,
@@ -662,52 +631,9 @@ impl AdeApp {
             .min_h_0()
             .py(px(4.0))
             .child(list);
-        // The explicit replacement for the old truncation row: not a message saying entries were
-        // silently dropped, but a real action that goes and loads more of them
-        // (`Self::load_more_file_tree_entries`). Only ever shown when the walk genuinely stopped
-        // early, and it names the exact count it stopped at rather than implying a total it
-        // cannot know without walking the rest.
-        if self.file_tree_truncated && self.file_tree_limit_is_at_ceiling() {
-            // The honest end of the escalation: still truncated, but no larger budget is
-            // available, so an action here would be a button that re-walks a whole ceiling's
-            // worth of entries to produce exactly the same rows. A plain, non-interactive
-            // disclosure instead - it still names the count, so the listing is never *silently*
-            // cut off, which is the actual requirement.
-            column = column.child(render_sidebar_message(
-                format!(
-                    "Showing the first {} entries (the most this tree can load)",
-                    self.file_tree.len()
-                ),
-                theme::text::FAINT.into(),
-            ));
-        } else if self.file_tree_truncated {
-            let loaded = self.file_tree.len();
-            column = column.child(
-                div()
-                    .id("file-tree-show-all")
-                    .debug_selector(|| "file-tree-show-all".to_string())
-                    .flex_none()
-                    .w_full()
-                    .cursor_pointer()
-                    .px(px(10.0))
-                    .py(px(5.0))
-                    .font(font(theme::font::MONO))
-                    .text_size(self.ui_text_size(10.5))
-                    .text_color(theme::text::DIM)
-                    .hover(|el| {
-                        el.bg(theme::surface::ROW_HOVER)
-                            .text_color(theme::text::PRIMARY)
-                    })
-                    .tooltip(text_tooltip(
-                        "Re-read this worktree with a 10x larger entry limit. Set \
-                         `file_tree.max_entries` in settings.toml to raise it permanently.",
-                    ))
-                    .child(format!("Stopped at {loaded} entries \u{2013} load more"))
-                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                        this.load_more_file_tree_entries(cx);
-                    })),
-            );
-        }
+        // No truncation row and no "load more" action live here any more: GitHub issue #160
+        // removed the walk's entry cap, so there is no "stopped early" state left to disclose.
+        // The tree below `list` is the whole tree.
 
         // The real, honest surface for a failed file operation (a refused rename, a trash
         // command that didn't run) - next to the tree it happened in, not buried in the log.
@@ -2101,7 +2027,6 @@ impl AdeApp {
         // rendering after a promotion to "real" with no binding behind it - "a real keycap must
         // never render for a keystroke that does nothing" - so this composer never grows one in
         // the first place.
-        let menu_open = self.commit_menu_open;
 
         // Test-only (no-op outside `cfg(test)`/`test-support`, matching every other
         // `debug_selector` in this file - see e.g. `Self::render_status_zoom_value`'s own
@@ -2118,8 +2043,9 @@ impl AdeApp {
             format!("commit-composer-message-{message}")
         };
 
-        let mut composer = div()
+        let composer = div()
             .id("commit-composer")
+            .debug_selector(|| "commit-composer".to_string())
             .relative()
             .flex_none()
             .flex()
@@ -2130,6 +2056,33 @@ impl AdeApp {
             .border_t_1()
             .border_color(theme::border::INNER)
             .bg(theme::surface::FOOTER)
+            .child({
+                // GitHub issue #176: the `▾` popover is no longer a child of this composer (see
+                // `AdeApp::commit_composer_bounds`' own docs), so it needs this composer's real
+                // window-space bounds to anchor off - the same `gpui::canvas` capture
+                // `crate::work_surface::render::AdeApp::render_tab_strip_plus` uses for the `+`
+                // button.
+                let this = cx.entity();
+                gpui::canvas(
+                    move |bounds, _window, cx| {
+                        this.update(cx, |this, _cx| {
+                            this.commit_composer_bounds = bounds;
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                // Explicit insets rather than `.size_full()`: an absolutely-positioned child with
+                // no insets takes its *static* position, which here is the composer's content box
+                // (inside the 12px horizontal padding) while `size_full` still resolves against
+                // the padding box - so the captured origin and size would describe two different
+                // rectangles. Pinning all four edges makes this exactly the composer's own box,
+                // which is what `render_commit_menu` then insets by the design's 12px.
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+            })
             .child(
                 // Header row: `COMMIT` · `N of M staged` · staged diffstat, right-aligned.
                 div()
@@ -2308,7 +2261,11 @@ impl AdeApp {
                             .text_color(theme::text::DIMMER)
                             .child("\u{25be}")
                             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                                this.commit_menu_open = !this.commit_menu_open;
+                                let opening = !this.commit_menu_open;
+                                // GitHub issue #176 - see `AdeApp::close_menu_surfaces_except`.
+                                let _ = this
+                                    .close_menu_surfaces_except(Some(menus::MenuSurface::Commit));
+                                this.commit_menu_open = opening;
                                 cx.notify();
                             })),
                     )
@@ -2327,23 +2284,30 @@ impl AdeApp {
                     ),
             );
 
-        if menu_open {
-            composer = composer.child(self.render_commit_menu(cx));
-        }
-
         composer
     }
 
     /// The commit composer's `▾` split-button popover (Revision R12 §5): *Commit and push* /
     /// *Commit all N files* / *Amend last commit* / *Stash staged files*. Opens **upward** -
     /// `bottom`-anchored, not `top` - since the button it hangs off sits near the bottom of the
-    /// Changes panel. A transparent, `.occlude()`d scrim confined to the composer's own bounds
-    /// (matching [`crate::work_surface::render::AdeApp::render_plus_menu`]'s click-away-
-    /// dismisses shape, scoped smaller here since the composer itself is the only positioned
-    /// ancestor available) closes the menu on a click anywhere else *within the composer* -
-    /// this is not a window-wide click-away like `render_plus_menu`'s own scrim, only the
-    /// composer's own footprint; the popover panel itself also `.occlude()`s and stops that
-    /// click from bubbling further.
+    /// Changes panel.
+    ///
+    /// ## Why this is rendered from `AdeApp::render`, not from the composer (GitHub issue #176)
+    ///
+    /// This popover used to be a *child* of [`Self::render_commit_composer`], which made its
+    /// click-away scrim - `absolute()` with inset 0 - resolve against the composer's own
+    /// `.relative()` box (~135px tall, at the foot of the Changes panel) rather than the window.
+    /// Clicking the Changes list, the file tree, the rail, the tab strip, the editor or the title
+    /// bar therefore did *not* dismiss it, and none of its four rows is clickable either, so the
+    /// only gesture that reliably closed it was a second click on the `▾` toggle itself. That is
+    /// the issue's "the commit one is particularly bugged and hard to close".
+    ///
+    /// It is now a sibling of [`crate::work_surface::render::AdeApp::render_plus_menu`] and the
+    /// file tree's context menu in `AdeApp::render`, with the same genuinely full-window
+    /// `.occlude()`d scrim they use - the established shape in this app for a popover whose anchor
+    /// is a `gpui::canvas`-captured, window-space bounds ([`AdeApp::commit_composer_bounds`]).
+    /// `crate::graph_view::render::AdeApp::render_graph_view`'s own docs record the same move for
+    /// the graph's two menus, made for the same reason.
     ///
     /// Every row is real, visible, and **honestly non-interactive**: only the primary `Commit N
     /// files` button (`Self::commit_staged_files`, backed by a real `wt_core::undo::commit_paths`)
@@ -2351,7 +2315,21 @@ impl AdeApp {
     /// phase doesn't add - each row is dimmed and un-clickable, the same
     /// `work_surface::state::ActionKind::Unimplemented` convention this codebase already uses for
     /// "visible, real, but not wired up yet" (never a clickable-looking no-op).
-    fn render_commit_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_commit_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // The composer's own painted box, in window space. The popover keeps its R12 §5 geometry
+        // relative to that box - inset 12px on both sides, 44px of clearance above the composer's
+        // bottom edge so it clears the primary button row - just expressed against the window now
+        // that this is a root-level child.
+        let composer = self.commit_composer_bounds;
+        let window_height = window.bounds().size.height;
+        let popover_left = composer.origin.x + px(12.0);
+        let popover_width = (composer.size.width - px(24.0)).max(px(0.0));
+        let popover_bottom = window_height - (composer.origin.y + composer.size.height) + px(44.0);
+
         let branch = self
             .worktrees
             .iter()
@@ -2367,7 +2345,12 @@ impl AdeApp {
             .id("commit-menu-scrim")
             .debug_selector(|| "commit-menu-scrim".to_string())
             .absolute()
-            .top(px(0.0))
+            // Starts *below* the title bar, exactly like the file tree's own context-menu scrim
+            // (`Self::render_tree_context_menu`) and for the same real reason it documents: a
+            // full-window `.occlude()`ing layer swallows the window's own close/minimise/maximise
+            // caption buttons and the title bar's drag region, so the window could not be closed
+            // or moved while the menu was up.
+            .top(theme::band::TITLE_BAR)
             .left(px(0.0))
             .right(px(0.0))
             .bottom(px(0.0))
@@ -2389,29 +2372,32 @@ impl AdeApp {
                 this.commit_menu_open = false;
                 cx.notify();
             }))
+            // A right-click anywhere else must dismiss too - the same rule the file tree's and the
+            // graph row's own scrims already follow, so the next right-click doesn't land on an
+            // invisible layer and appear to do nothing at all.
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(|this, _event: &gpui::MouseDownEvent, _window, cx| {
+                    this.commit_menu_open = false;
+                    cx.notify();
+                }),
+            )
             .child(
                 menu_popover_chrome(
                     div()
                         .id("commit-menu-popover")
                         .debug_selector(|| "commit-menu-popover".to_string())
                         .absolute()
-                        .left(px(12.0))
-                        .right(px(12.0))
-                        .bottom(px(44.0))
-                        // The composer itself is short (~135px of header/message-box/button-row),
-                        // shorter than this four-row popover (`bottom(px(44.0))` plus its own
-                        // real painted height) - so the popover's *top* genuinely paints above
-                        // the composer's own top edge, over the Changes rows behind it, which is
-                        // outside the scrim's own bounds (`top(0)/bottom(0)` relative to the
-                        // composer, not the whole sidebar - see this fn's own docs on the scrim
-                        // being "confined to the composer's own bounds"). Without its own
-                        // `.occlude()` here, a click in that overflow region only avoids reaching
-                        // a real Changes row underneath by relying on `Window::
-                        // dispatch_mouse_event`'s bubble-phase registration order happening to
-                        // run this popover's own `stop_propagation` listener first - a
-                        // coincidence of paint order, not a structural guarantee. This makes the
-                        // block real regardless of ordering, the same reasoning as the scrim's
-                        // own `.occlude()` above.
+                        .left(popover_left)
+                        .w(popover_width)
+                        // The scrim starts at `theme::band::TITLE_BAR`, not at the window top, so
+                        // a distance measured from the *window's* bottom edge still lands right -
+                        // `bottom` is unaffected by where the top edge was clipped.
+                        .bottom(popover_bottom)
+                        // Kept from when this popover lived inside the composer: it paints over
+                        // real Changes rows and the primary commit button, and blocking the mouse
+                        // structurally (rather than relying on bubble-phase listener ordering)
+                        // is what stops a click on the panel reaching them.
                         .occlude()
                         .py(px(4.0)),
                     // `COMMIT_MENU`, not `MENU`: same blur/alpha as every other menu (GitHub
@@ -3297,25 +3283,11 @@ mod fold_state_tests {
         repo_path: PathBuf,
         settings_path: PathBuf,
     ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
-        open_app_with_state_dir_and_settings(
-            cx,
-            repo_path,
-            settings_path,
-            settings_store::Settings::default(),
-        )
-    }
-
-    fn open_app_with_state_dir_and_settings(
-        cx: &mut TestAppContext,
-        repo_path: PathBuf,
-        settings_path: PathBuf,
-        settings: settings_store::Settings,
-    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
         cx.add_window_view(|window, cx| {
             AdeApp::new_with_settings(
                 Some(repo_path),
                 true,
-                settings,
+                settings_store::Settings::default(),
                 Some(settings_path),
                 window,
                 cx,
@@ -3360,7 +3332,8 @@ mod fold_state_tests {
 
         assert!(app.read_with(cx, |app, _| app.expanded_dirs.is_empty()));
         let visible = app.read_with(cx, |app, _| {
-            file_tree::visible_entries(&app.file_tree, &app.expanded_dirs)
+            app.file_tree
+                .visible_entries(&app.expanded_dirs)
                 .iter()
                 .map(|entry| entry.name.clone())
                 .collect::<Vec<_>>()
@@ -3756,7 +3729,7 @@ mod fold_state_tests {
         cx.run_until_parked();
 
         let visible = app.read_with(cx, |app, _| {
-            file_tree::visible_entries(&app.file_tree, &app.expanded_dirs).len()
+            app.file_tree.visible_entries(&app.expanded_dirs).len()
         });
         assert_eq!(
             visible, 801,
@@ -3764,12 +3737,13 @@ mod fold_state_tests {
              would have silently hidden 301 of them"
         );
         assert!(
-            !app.read_with(cx, |app, _| app.file_tree_truncated),
-            "800 entries is far below the configured load cap, so nothing was truncated"
+            app.read_with(cx, |app, _| app.file_tree_complete),
+            "the walk reached everything, so the listing is a complete inventory"
         );
         assert!(
             cx.debug_bounds("file-tree-show-all").is_none(),
-            "and no 'Show all entries' action may appear for a complete listing"
+            "the 'load more' action was removed outright (GitHub issue #160) and must never \
+             render again"
         );
 
         assert!(cx.debug_bounds("file-tree-row-f-000.txt").is_some());
@@ -3798,105 +3772,30 @@ mod fold_state_tests {
         );
     }
 
-    /// §4's surviving load cap, and its honest replacement for the old silent cut-off: when the
-    /// walk really does stop early, a real action appears that goes and loads more - and the cap
-    /// it re-walks with is still a real cap, so a pathological tree can't be pulled into memory
-    /// wholesale by one click.
+    /// GitHub issue #160, end to end through the real app: a tree with more entries than the
+    /// removed 20,000-entry cap loads *completely* into the sidebar, and the "Stopped at N
+    /// entries - load more" row it used to grow instead is gone.
+    ///
+    /// This is the expensive fixture (21,200 real files and folders on disk) but it is the only
+    /// honest way to test the thing the issue asks for: a smaller tree would pass identically
+    /// before and after the change.
     #[gpui::test]
-    fn hitting_the_load_cap_offers_a_load_more_action_that_really_loads_more(
+    fn a_tree_past_the_removed_cap_loads_every_entry_with_no_load_more_row(
         cx: &mut TestAppContext,
     ) {
+        const DIRS: usize = 200;
+        const FILES_PER_DIR: usize = 105;
+        const EXPECTED: usize = DIRS + DIRS * FILES_PER_DIR;
+
         let repo = TempDir::new().expect("tempdir");
         let state_dir = TempDir::new().expect("tempdir");
-        for index in 0..40 {
-            fs::write(repo.path().join(format!("f-{index:02}.txt")), "x\n").expect("write");
+        for d in 0..DIRS {
+            let sub = repo.path().join(format!("d-{d:03}"));
+            fs::create_dir(&sub).expect("mkdir");
+            for f in 0..FILES_PER_DIR {
+                fs::write(sub.join(format!("f-{f:03}.txt")), "x\n").expect("write");
+            }
         }
-        let mut settings = settings_store::Settings::default();
-        settings.file_tree.max_entries = 10;
-
-        let (app, cx) = open_app_with_state_dir_and_settings(
-            cx,
-            repo.path().to_path_buf(),
-            state_dir.path().join("settings.toml"),
-            settings,
-        );
-        cx.run_until_parked();
-
-        assert_eq!(app.read_with(cx, |app, _| app.file_tree.len()), 10);
-        assert!(app.read_with(cx, |app, _| app.file_tree_truncated));
-        assert!(
-            cx.debug_bounds("file-tree-show-all").is_some(),
-            "a walk that stopped early must say so with a real action, never silently"
-        );
-
-        app.update(cx, |app, cx| app.load_more_file_tree_entries(cx));
-        cx.run_until_parked();
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.file_tree.len()),
-            40,
-            "the action must genuinely re-walk with a bigger budget - the capped walk never \
-             collected these entries, so nothing else could have produced them"
-        );
-        assert!(!app.read_with(cx, |app, _| app.file_tree_truncated));
-        assert!(cx.debug_bounds("file-tree-show-all").is_none());
-        assert_eq!(
-            app.read_with(cx, |app, _| app.file_tree_limit_override),
-            Some(100),
-            "the escape hatch raises the bound tenfold - it never removes it, or one click on a \
-             pathological tree would pull the whole thing into memory"
-        );
-    }
-
-    /// CRITICAL 1: "load more" must never *shrink* the budget. With a `max_entries` above the
-    /// escalation ceiling, the old `saturating_mul(10).min(ceiling)` computed a smaller limit
-    /// than the one already in force, so clicking "load more" would visibly remove rows from the
-    /// tree.
-    #[gpui::test]
-    fn load_more_can_never_shrink_the_walk_budget(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
-        let state_dir = TempDir::new().expect("tempdir");
-        seed_tree(&repo);
-        // Deliberately above `MAX_LOAD_MORE_ENTRIES`. `sanitize` clamps this on load from a real
-        // file, so this is constructed directly - the handler must still be correct for it.
-        let mut settings = settings_store::Settings::default();
-        settings.file_tree.max_entries = file_tree::MAX_LOAD_MORE_ENTRIES * 5;
-
-        let (app, cx) = open_app_with_state_dir_and_settings(
-            cx,
-            repo.path().to_path_buf(),
-            state_dir.path().join("settings.toml"),
-            settings,
-        );
-        cx.run_until_parked();
-
-        app.update(cx, |app, cx| app.load_more_file_tree_entries(cx));
-        cx.run_until_parked();
-
-        let effective = app.read_with(cx, |app, _| {
-            app.file_tree_limit_override
-                .unwrap_or(app.settings.file_tree.max_entries)
-        });
-        assert!(
-            effective >= file_tree::MAX_LOAD_MORE_ENTRIES * 5,
-            "the effective walk budget went *down* from {} to {effective} - one click on \
-             `load more` would remove rows from the tree",
-            file_tree::MAX_LOAD_MORE_ENTRIES * 5
-        );
-    }
-
-    /// CRITICAL 1, other half: once the budget is at the ceiling and the walk is *still*
-    /// truncated, the row must stop being an action. Clicking it would re-walk a whole ceiling's
-    /// worth of entries to produce byte-identical rows.
-    ///
-    /// The at-the-ceiling state is set directly rather than reached by walking: producing it
-    /// honestly needs `MAX_LOAD_MORE_ENTRIES` real files on disk. Everything asserted *from* that
-    /// precondition is real behaviour - what renders, and what the handler does.
-    #[gpui::test]
-    fn at_the_ceiling_the_row_stops_being_a_button(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
-        let state_dir = TempDir::new().expect("tempdir");
-        seed_tree(&repo);
 
         let (app, cx) = open_app_with_state_dir(
             cx,
@@ -3905,27 +3804,43 @@ mod fold_state_tests {
         );
         cx.run_until_parked();
 
-        app.update(cx, |app, cx| {
-            app.file_tree_truncated = true;
-            app.file_tree_limit_override = Some(file_tree::MAX_LOAD_MORE_ENTRIES);
-            cx.notify();
-        });
-        cx.run_until_parked();
-
+        assert_eq!(
+            app.read_with(cx, |app, _| app.file_tree.len()),
+            EXPECTED,
+            "the walk used to stop at 20,000 entries - every folder and file must now load"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.file_tree_complete),
+            "and a walk that reached everything is a complete inventory, so fold-state pruning \
+             may trust it"
+        );
         assert!(
             cx.debug_bounds("file-tree-show-all").is_none(),
-            "at the ceiling there is nothing left to load, so the clickable row must be gone - \
-             a button that re-walks a ceiling's worth of entries for identical results is worse \
-             than no button"
+            "the 'Stopped at N entries - load more' row must not exist any more"
         );
 
-        let before = app.read_with(cx, |app, _| app.file_tree_limit_override);
-        app.update(cx, |app, cx| app.load_more_file_tree_entries(cx));
-        cx.run_until_parked();
+        // The palette's own candidate list is derived from the same walk, on the background
+        // executor now that it is unbounded - it must cover the whole tree, not the first 20,000.
         assert_eq!(
-            app.read_with(cx, |app, _| app.file_tree_limit_override),
-            before,
-            "and the handler itself must be a no-op at the ceiling, not just unreachable"
+            app.read_with(cx, |app, _| app.palette_file_candidates.len()),
+            DIRS * FILES_PER_DIR,
+            "one candidate per file (directories are not candidates), across the whole tree"
+        );
+
+        // A folder well past the old cut-off must expand and render for real, not just be
+        // counted: `d-199` starts at entry ~21,000.
+        let last_dir = repo.path().join(format!("d-{:03}", DIRS - 1));
+        app.update(cx, |app, cx| app.toggle_dir_expanded(last_dir.clone(), cx));
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| {
+                app.file_tree
+                    .visible_entries(&app.expanded_dirs)
+                    .iter()
+                    .any(|entry| entry.path == last_dir.join("f-104.txt"))
+            }),
+            "the last file of the last directory is ~1,200 entries past the removed cap and must \
+             be a real, visible row"
         );
     }
 
@@ -4018,18 +3933,25 @@ mod fold_state_tests {
         );
     }
 
-    /// A truncated walk must never be used as evidence that the directories it never reached are
-    /// gone - pruning against it would silently, and permanently, destroy good state. Driven
-    /// through a walk that genuinely truncates, not by hand-setting the flag.
+    /// An incomplete walk must never be used as evidence that the directories it never reached
+    /// are gone - pruning against it would silently, and permanently, destroy good state.
+    ///
+    /// GitHub issue #160 removed the entry cap this used to be driven through, so it is now
+    /// driven through the incompleteness that genuinely remains: a directory the walk cannot
+    /// read. The expanded folder lives *inside* that directory, so it really is absent from the
+    /// listing while the listing really is `partial` - the exact combination that would delete
+    /// its fold state if `prune_stale_fold_state` trusted an incomplete inventory.
+    #[cfg(unix)]
     #[gpui::test]
-    fn a_truncated_walk_never_prunes_fold_state(cx: &mut TestAppContext) {
+    fn an_incomplete_walk_never_prunes_fold_state(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+
         let repo = TempDir::new().expect("tempdir");
         let state_dir = TempDir::new().expect("tempdir");
-        // Directories sort first and then alphabetically, so a 1-entry budget reaches `aaa` and
-        // stops - `zzz`, the one whose expansion is recorded, is never seen by the capped walk.
-        fs::create_dir(repo.path().join("aaa")).expect("mkdir");
-        fs::create_dir(repo.path().join("zzz")).expect("mkdir");
-        fs::write(repo.path().join("zzz/inside.txt"), "x\n").expect("write");
+        let outer = repo.path().join("outer");
+        fs::create_dir(&outer).expect("mkdir");
+        fs::create_dir(outer.join("zzz")).expect("mkdir");
+        fs::write(outer.join("zzz/inside.txt"), "x\n").expect("write");
         let settings_path = state_dir.path().join("settings.toml");
         let fold_path = state_dir.path().join("file-tree-state.toml");
 
@@ -4037,7 +3959,7 @@ mod fold_state_tests {
             open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
         cx.run_until_parked();
         app.update(cx, |app, cx| {
-            app.toggle_dir_expanded(repo.path().join("zzz"), cx);
+            app.toggle_dir_expanded(outer.join("zzz"), cx);
         });
         cx.run_until_parked();
         assert_eq!(
@@ -4047,27 +3969,32 @@ mod fold_state_tests {
             1
         );
 
-        let mut capped = settings_store::Settings::default();
-        capped.file_tree.max_entries = 1;
-        let (reloaded, cx) = open_app_with_state_dir_and_settings(
-            cx,
-            repo.path().to_path_buf(),
-            settings_path,
-            capped,
-        );
+        fs::set_permissions(&outer, fs::Permissions::from_mode(0o000)).expect("chmod");
+        if fs::read_dir(&outer).is_ok() {
+            // Running as root (or on a filesystem that ignores the mode) - the premise doesn't
+            // hold, so this would pass for the wrong reason.
+            fs::set_permissions(&outer, fs::Permissions::from_mode(0o755)).expect("chmod back");
+            return;
+        }
+
+        let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
         cx.run_until_parked();
 
+        let complete = reloaded.read_with(cx, |app, _| app.file_tree_complete);
+        let saw_zzz = reloaded.read_with(cx, |app, _| {
+            app.file_tree.iter().any(|entry| entry.name == "zzz")
+        });
+        // Restore before any assertion can fail, or `TempDir`'s own cleanup fails too.
+        fs::set_permissions(&outer, fs::Permissions::from_mode(0o755)).expect("chmod back");
+
         assert!(
-            reloaded.read_with(cx, |app, _| app.file_tree_truncated),
-            "precondition: the walk really must have stopped early, from the real cap - not \
-             from a flag this test set itself"
+            !complete,
+            "precondition: the walk really must have come back incomplete, from a real \
+             unreadable directory - not from a flag this test set itself"
         );
         assert!(
-            reloaded.read_with(cx, |app, _| !app
-                .file_tree
-                .iter()
-                .any(|entry| entry.name == "zzz")),
-            "precondition: the expanded directory really must be absent from the capped listing"
+            !saw_zzz,
+            "precondition: the expanded directory really must be absent from that listing"
         );
 
         assert_eq!(
@@ -4811,6 +4738,194 @@ mod commit_composer_tests {
                 "a real click on {selector} must never change the real staged set"
             );
         }
+    }
+
+    /// GitHub issue #176's "the commit one is particularly bugged and hard to close". Before this
+    /// fix the popover's dismiss scrim was a child of the composer, so it only covered the
+    /// composer's own ~130px box: a real click anywhere else in the window - the Changes list, the
+    /// file tree, the centre pane - went straight past it and the menu stayed open. This clicks a
+    /// point that is genuinely outside the composer and genuinely inside the window.
+    #[gpui::test]
+    fn a_real_click_far_outside_the_composer_closes_the_commit_menu(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let composer = cx
+            .debug_bounds("commit-composer")
+            .expect("the composer must really paint");
+        let toggle = cx
+            .debug_bounds("commit-composer-menu-toggle")
+            .expect("the ▾ toggle must really paint");
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.commit_menu_open),
+            "premise: the menu must really be open before the click-away below"
+        );
+
+        let popover = cx
+            .debug_bounds("commit-menu-popover")
+            .expect("the popover must really paint while the menu is open");
+
+        // Well up and to the left of both the composer and the popover: the centre pane, hundreds
+        // of pixels from anything the old composer-scoped scrim covered.
+        let away = gpui::Point {
+            x: composer.origin.x / 2.0,
+            y: popover.origin.y / 2.0,
+        };
+        assert!(
+            !composer.contains(&away) && !popover.contains(&away),
+            "premise: {away:?} must really be outside both the composer {composer:?} and the \
+             popover {popover:?}, or this test would be clicking the menu itself"
+        );
+        cx.simulate_click(away, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app.commit_menu_open),
+            "a real click far outside the composer must close the commit menu - the popover's \
+             scrim is window-wide now, not confined to the composer that used to own it"
+        );
+        assert!(
+            cx.debug_bounds("commit-menu-popover").is_none(),
+            "closing must really unpaint the popover, not just flip a flag"
+        );
+    }
+
+    /// The popover moved out of the composer and into `AdeApp::render` (GitHub issue #176), so its
+    /// position is now derived from a `gpui::canvas`-captured window-space anchor rather than from
+    /// its parent's own box. This pins the geometry that move had to preserve: Revision R12 §5's
+    /// 12px inset on both sides of the composer, and an upward-opening panel that clears the
+    /// primary commit button row.
+    #[gpui::test]
+    fn the_commit_menu_popover_really_paints_anchored_to_the_composer(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let toggle = cx
+            .debug_bounds("commit-composer-menu-toggle")
+            .expect("the ▾ toggle must really paint");
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let composer = cx
+            .debug_bounds("commit-composer")
+            .expect("the composer must really paint");
+        let popover = cx
+            .debug_bounds("commit-menu-popover")
+            .expect("the popover must really paint while the menu is open");
+
+        assert_eq!(
+            popover.origin.x,
+            composer.origin.x + px(12.0),
+            "the popover must be inset 12px from the composer's own left edge - a popover \
+             anchored off stale or wrongly-scoped bounds would land somewhere else entirely"
+        );
+        assert_eq!(
+            popover.size.width,
+            composer.size.width - px(24.0),
+            "and inset the same 12px on the right"
+        );
+        assert!(
+            popover.origin.y + popover.size.height < composer.origin.y + composer.size.height,
+            "the popover opens *upward*: its bottom edge {:?} must sit above the composer's own \
+             bottom edge {:?}, clearing the primary commit button row",
+            popover.origin.y + popover.size.height,
+            composer.origin.y + composer.size.height
+        );
+        assert!(
+            popover.origin.y < composer.origin.y,
+            "the four-row popover is taller than the composer, so its top must genuinely paint \
+             above the composer - the exact overflow that made a composer-scoped scrim wrong"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.commit_menu_open),
+            "sanity check: none of the geometry above may be read from a closed menu"
+        );
+    }
+
+    /// Leaving the Changes view unrenders the composer. `commit_menu_open` used to stay latched
+    /// `true` through that, so coming back to Changes popped the popover open again with no click
+    /// (GitHub issue #176).
+    #[gpui::test]
+    fn leaving_the_changes_view_really_closes_the_commit_menu(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let toggle = cx
+            .debug_bounds("commit-composer-menu-toggle")
+            .expect("the ▾ toggle must really paint");
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.commit_menu_open),
+            "premise: the menu must really be open before the view switch"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.set_right_sidebar_view(RightSidebarView::Files, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.commit_menu_open),
+            "switching away from Changes must close the menu, not latch it"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.set_right_sidebar_view(RightSidebarView::Changes, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("commit-menu-popover").is_none(),
+            "returning to Changes must not resurrect a popover the user never reopened"
+        );
+    }
+
+    /// The reported "2 context menus open at the same time", for this pair, end to end through a
+    /// real click on the real `▾` trigger.
+    ///
+    /// Honest about what it discriminates: the `+` menu's own scrim is full-window and
+    /// non-occluding, so that click would incidentally dismiss it even without
+    /// `close_menu_surfaces_except`. What this pins is the *outcome* - one menu open, never two -
+    /// through a real interaction; the sweep itself is what makes that outcome structural rather
+    /// than a coincidence of which scrim happens to be painted where, and
+    /// `crate::root::menus::menu_surface_tests::opening_any_one_surface_closes_all_five_others`
+    /// is the test that fails the moment the sweep stops covering a surface.
+    #[gpui::test]
+    fn opening_the_commit_menu_closes_an_already_open_plus_menu(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        app.update(cx, |app, cx| {
+            app.plus_menu_open = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("dropdown-menu-row-Git graph").is_some(),
+            "premise: the + menu must really be painted before the commit menu opens"
+        );
+
+        let toggle = cx
+            .debug_bounds("commit-composer-menu-toggle")
+            .expect("the ▾ toggle must really paint");
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.commit_menu_open,
+                "the click must really open the commit menu"
+            );
+            assert!(
+                !app.plus_menu_open,
+                "and must close the + menu - two popovers painted at once is the reported bug"
+            );
+        });
+        assert!(
+            cx.debug_bounds("dropdown-menu-row-Git graph").is_none(),
+            "the + menu must really stop painting, not merely have its flag cleared"
+        );
     }
 
     #[gpui::test]
