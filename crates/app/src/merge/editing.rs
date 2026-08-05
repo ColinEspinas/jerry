@@ -347,7 +347,13 @@ fn render_merge_edit_line(
 
     let runs = build_plain_text_runs(line, &marked_local);
     let line_text: gpui::SharedString = line.text.clone().into();
-    let visible_runs = build_plain_text_run_divs(line, &marked_local);
+    // GitHub issue #170: one shaping for both the visible glyphs and the caret geometry - see
+    // `crate::code_surface::editing::build_visible_line_text`'s own docs for the real, measured
+    // drift the per-run `div` rendering this replaced caused on the File view (this surface is
+    // plain-text-only, so it only ever splits into several runs during a real IME composition,
+    // but it is the same caret-bearing structure and now shares the same one fix).
+    let visible_text =
+        crate::code_surface::editing::build_visible_line_text(line_text.clone(), runs.clone());
 
     let row_path = relative_path.clone();
     let click_line_index = line_index;
@@ -447,7 +453,7 @@ fn render_merge_edit_line(
         .min_w_0()
         .h(row_line_height)
         .flex()
-        .children(visible_runs)
+        .child(visible_text)
         .child(cursor_overlay)
         .on_mouse_down(
             gpui::MouseButton::Left,
@@ -545,70 +551,9 @@ fn build_plain_text_runs(
     if let Some(marked) = marked_local {
         runs = split_runs_for_marked_range(runs, marked);
     }
-    runs
-}
-
-/// The real, visible per-run `div`s for one row's text - splits a run further at a real
-/// IME-composition range's own byte boundaries, mirroring
-/// `crate::code_surface::editing::build_text_run_divs`'s identical real splitting (minus the
-/// diagnostic/hover cases that function also handles, which don't apply here).
-fn build_plain_text_run_divs(
-    line: &code_view::RenderedLine,
-    marked_local: &Option<Range<usize>>,
-) -> Vec<gpui::AnyElement> {
-    let mut cursor = 0usize;
-    let mut elements = Vec::new();
-    for (text, kind) in &line.runs {
-        let start = cursor;
-        let end = start + text.len();
-        cursor = end;
-
-        let marked_overlap = marked_local.as_ref().and_then(|marked| {
-            let overlap_start = marked.start.max(start);
-            let overlap_end = marked.end.min(end);
-            (overlap_start < overlap_end).then_some((overlap_start, overlap_end))
-        });
-
-        let Some((marked_start, marked_end)) = marked_overlap else {
-            elements.push(plain_text_run_div(*kind, text.as_ref(), false));
-            continue;
-        };
-        if marked_start > start {
-            elements.push(plain_text_run_div(
-                *kind,
-                &text[0..marked_start - start],
-                false,
-            ));
-        }
-        elements.push(plain_text_run_div(
-            *kind,
-            &text[marked_start - start..marked_end - start],
-            true,
-        ));
-        if end > marked_end {
-            elements.push(plain_text_run_div(
-                *kind,
-                &text[marked_end - start..],
-                false,
-            ));
-        }
-    }
-    elements
-}
-
-/// One real display `div` for a single (possibly marked-range-split) text piece.
-fn plain_text_run_div(
-    kind: code_view::HighlightKind,
-    text: &str,
-    is_marked: bool,
-) -> gpui::AnyElement {
-    let mut run = div()
-        .text_color(code_view::color_for_kind(kind))
-        .child(text.to_string());
-    if is_marked {
-        run = run
-            .border_b_1()
-            .border_color(code_view::color_for_kind(kind));
-    }
-    run.into_any_element()
+    // See `crate::code_surface::editing::force_runs_to_cover`'s own docs: `gpui::StyledText::
+    // with_runs` (which `build_visible_line_text` above hands these to) asserts the run lengths
+    // sum to exactly the text's own length, and `shape_line` silently shapes only the covered
+    // prefix otherwise.
+    crate::code_surface::editing::force_runs_to_cover(&line.text, runs)
 }
