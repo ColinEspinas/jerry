@@ -183,6 +183,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::code_surface::code_view;
 use crate::code_surface::indent;
+use crate::code_surface::symbols;
 use crate::language::HighlighterFn;
 use crate::text_history::{self, EditKind, SelectionSnapshot, TextEdit, TextHistory};
 
@@ -368,6 +369,15 @@ pub struct EditBuffer {
     /// in). See this module's own "Multi-cursor" docs for the overall design and every method that
     /// populates/consumes this.
     pub secondary_cursors: Vec<SecondaryCursor>,
+    /// GitHub issue #178: the real enclosing-declaration outline of [`Self::content`], as of the
+    /// last parse - what the File view breadcrumb turns into `› impl QueryBuilder › build` for
+    /// wherever [`Self::cursor_offset`] currently is. Refreshed on exactly the same schedule as
+    /// [`Self::lines`] (seeded at construction, then recomputed by
+    /// `crate::code_surface::editing::AdeApp::schedule_rehighlight`'s debounced background parse
+    /// and installed by [`Self::apply_highlight`]), so the two can never describe different
+    /// revisions of the text. Empty - never fabricated - for a language with no symbol support;
+    /// see `crate::code_surface::symbols` for which those are and why.
+    pub symbols: Vec<symbols::SymbolSpan>,
 }
 
 /// One additional cursor/selection beyond the primary `EditBuffer::selected_range`/
@@ -403,22 +413,28 @@ impl EditBuffer {
             None => Vec::new(),
         };
         let lines = code_view::build_lines(&content, &spans);
-        Self::assemble(path, content, extension, lines, mtime, len)
+        // Same "fine for a directly-built buffer, too slow for the production path" trade the
+        // highlight above already makes - `from_highlighted` takes both off a caller that
+        // computed them on the background executor instead.
+        let symbols = symbols::symbol_outline(&content, extension.as_deref());
+        Self::assemble(path, content, extension, lines, symbols, mtime, len)
     }
 
-    /// Production constructor: takes already-highlighted `lines` (computed off the foreground
-    /// thread by whichever background load also read `content`) rather than re-running the real
-    /// highlighter here - see this module's own "Re-highlighting cost" docs for the measured
-    /// reason a synchronous foreground `tree-sitter` parse of a large file must be avoided.
+    /// Production constructor: takes already-highlighted `lines` and an already-computed
+    /// `symbols` outline (both computed off the foreground thread by whichever background load
+    /// also read `content`) rather than re-running the real highlighter/parser here - see this
+    /// module's own "Re-highlighting cost" docs for the measured reason a synchronous foreground
+    /// `tree-sitter` parse of a large file must be avoided.
     pub fn from_highlighted(
         path: PathBuf,
         content: String,
         extension: Option<String>,
         lines: Vec<code_view::RenderedLine>,
+        symbols: Vec<symbols::SymbolSpan>,
         mtime: Option<SystemTime>,
         len: u64,
     ) -> Self {
-        Self::assemble(path, content, extension, lines, mtime, len)
+        Self::assemble(path, content, extension, lines, symbols, mtime, len)
     }
 
     fn assemble(
@@ -426,6 +442,7 @@ impl EditBuffer {
         content: String,
         extension: Option<String>,
         lines: Vec<code_view::RenderedLine>,
+        symbols: Vec<symbols::SymbolSpan>,
         mtime: Option<SystemTime>,
         len: u64,
     ) -> Self {
@@ -449,6 +466,7 @@ impl EditBuffer {
             history: TextHistory::new(),
             replaying: false,
             secondary_cursors: Vec::new(),
+            symbols,
         }
     }
 
@@ -780,11 +798,18 @@ impl EditBuffer {
         &mut self,
         content_snapshot: &str,
         lines: Vec<code_view::RenderedLine>,
+        symbols: Vec<symbols::SymbolSpan>,
     ) -> bool {
         if self.content != content_snapshot {
             return false;
         }
         self.lines = lines;
+        // Installed under the exact same content-snapshot guard as `lines`, and only together
+        // with them: a symbol outline whose byte ranges describe text this buffer has already
+        // moved past would put the breadcrumb inside a function the caret isn't in. Rejecting
+        // both as one unit is what keeps `Self::symbols` and `Self::lines` describing the same
+        // revision (see `Self::symbols`' own docs).
+        self.symbols = symbols;
         self.highlight_dirty = false;
         true
     }
@@ -1336,6 +1361,7 @@ impl EditBuffer {
         &mut self,
         new_content: String,
         lines: Vec<code_view::RenderedLine>,
+        symbols: Vec<symbols::SymbolSpan>,
         mtime: Option<SystemTime>,
         len: u64,
     ) -> bool {
@@ -1365,6 +1391,11 @@ impl EditBuffer {
         self.utf16_line_starts =
             Self::cumulative_utf16_line_starts(&self.content, &self.line_ranges);
         self.lines = lines;
+        // The reloaded text is genuinely different bytes at genuinely different offsets, so the
+        // outline this buffer was holding describes content that no longer exists - replaced
+        // here, from the same background parse that produced `lines`, rather than left stale
+        // (which would point the breadcrumb at symbol boundaries from the pre-reload revision).
+        self.symbols = symbols;
         self.highlight_dirty = false;
         self.saved_content = self.content.clone();
         self.saved_mtime = mtime;
@@ -2660,6 +2691,112 @@ mod tests {
         )
     }
 
+    /// GitHub issue #178: the File view breadcrumb's enclosing-symbol chain is read, live, out of
+    /// `EditBuffer::symbols` at `EditBuffer::cursor_offset` - this is that exact expression, as
+    /// `crate::code_surface::file_view::AdeApp::render_file_view` evaluates it, so these tests
+    /// exercise the real production path rather than a parallel reimplementation of it.
+    fn breadcrumb_symbol_path(buffer: &EditBuffer) -> Vec<String> {
+        symbols::symbol_path_at(&buffer.symbols, buffer.cursor_offset())
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    const OUTLINE_SOURCE: &str = "\
+impl QueryBuilder {
+    pub fn select(&self) {
+        let a = 1;
+    }
+
+    pub fn build(&self) {
+        let b = 2;
+    }
+}
+";
+
+    #[test]
+    fn a_freshly_constructed_buffer_already_holds_a_real_symbol_outline() {
+        let buf = buffer(OUTLINE_SOURCE);
+        let labels: Vec<&str> = buf.symbols.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, vec!["impl QueryBuilder", "select", "build"]);
+    }
+
+    #[test]
+    fn moving_the_real_caret_really_changes_the_breadcrumbs_symbol_path() {
+        let mut buf = buffer(OUTLINE_SOURCE);
+        // Caret at the very end of the file - past the `impl` block's own closing brace, so
+        // genuinely inside nothing. (Offset 0 is *not* such a position here: `impl QueryBuilder`
+        // starts at byte 0, so the caret really is inside it there.)
+        buf.move_to(buf.content.len());
+        assert!(breadcrumb_symbol_path(&buf).is_empty());
+
+        buf.move_to(OUTLINE_SOURCE.find("let a = 1;").expect("marker") + 3);
+        assert_eq!(
+            breadcrumb_symbol_path(&buf),
+            vec!["impl QueryBuilder", "select"]
+        );
+
+        buf.move_to(OUTLINE_SOURCE.find("let b = 2;").expect("marker") + 3);
+        assert_eq!(
+            breadcrumb_symbol_path(&buf),
+            vec!["impl QueryBuilder", "build"],
+            "arrowing from one method into another must really move the last crumb with it"
+        );
+    }
+
+    #[test]
+    fn a_file_whose_language_has_no_symbol_concept_holds_an_honestly_empty_outline() {
+        let buf = EditBuffer::new(
+            PathBuf::from("/tmp/Cargo.toml"),
+            "[package]\nname = \"ade\"\n".to_string(),
+            Some("toml".to_string()),
+            None,
+            0,
+        );
+        assert!(buf.symbols.is_empty());
+    }
+
+    #[test]
+    fn a_rejected_stale_highlight_also_leaves_the_previous_symbol_outline_untouched() {
+        let mut buf = buffer(OUTLINE_SOURCE);
+        let good_outline = buf.symbols.clone();
+        assert!(!good_outline.is_empty());
+
+        // Content moves on, so the background result computed against the old snapshot is stale.
+        let stale_snapshot = buf.content.clone();
+        buf.move_to(0);
+        buf.replace_range(None, "// edited\n");
+        assert_ne!(buf.content, stale_snapshot);
+
+        let stale_lines = code_view::build_lines(&stale_snapshot, &[]);
+        let stale_outline = symbols::symbol_outline("fn totally_different() {}\n", Some("rs"));
+        assert!(!buf.apply_highlight(&stale_snapshot, stale_lines, stale_outline));
+        assert_eq!(
+            buf.symbols, good_outline,
+            "a rejected highlight result must not smuggle its symbol outline in either"
+        );
+    }
+
+    #[test]
+    fn an_external_reload_replaces_the_symbol_outline_rather_than_keeping_a_stale_one() {
+        let mut buffer = buffer(OUTLINE_SOURCE);
+        assert!(!buffer.symbols.is_empty());
+        let rewritten = "fn only_this_one() {\n    let c = 3;\n}\n".to_string();
+        let lines = code_view::build_lines(&rewritten, &[]);
+        let outline = symbols::symbol_outline(&rewritten, Some("rs"));
+        assert!(buffer.reload_from_disk(
+            rewritten.clone(),
+            lines,
+            outline,
+            None,
+            rewritten.len() as u64
+        ));
+        let labels: Vec<&str> = buffer.symbols.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, vec!["only_this_one"]);
+        buffer.move_to(rewritten.find("let c = 3;").expect("marker") + 3);
+        assert_eq!(breadcrumb_symbol_path(&buffer), vec!["only_this_one"]);
+    }
+
     /// Same as [`buffer`], but with a real `.py` extension - GitHub issue #121/PR #136's Python
     /// colon-block auto-indent tests need a real `Some("py")` `EditBuffer::extension` (the same
     /// lowercase, no-leading-dot convention `crate::language::EXTENSIONS` uses), not the `.rs`
@@ -2944,7 +3081,8 @@ mod tests {
         let spans = code_view::highlight_rust(&buf.content);
         let lines = code_view::build_lines(&buf.content, &spans);
         let content_snapshot = buf.content.clone();
-        assert!(buf.apply_highlight(&content_snapshot, lines));
+        let outline = symbols::symbol_outline(&content_snapshot, Some("rs"));
+        assert!(buf.apply_highlight(&content_snapshot, lines, outline));
         assert!(!buf.highlight_dirty);
         let kinds: Vec<code_view::HighlightKind> =
             buf.lines[0].runs.iter().map(|(_, kind)| *kind).collect();
@@ -3013,7 +3151,8 @@ mod tests {
         let spans = code_view::highlight_rust(&buf.content);
         let lines = code_view::build_lines(&buf.content, &spans);
         let content_snapshot = buf.content.clone();
-        assert!(buf.apply_highlight(&content_snapshot, lines));
+        let outline = symbols::symbol_outline(&content_snapshot, Some("rs"));
+        assert!(buf.apply_highlight(&content_snapshot, lines, outline));
         assert!(!buf.highlight_dirty);
         assert_eq!(
             find_kind(&buf, "fn"),
@@ -3036,7 +3175,8 @@ mod tests {
         buf.replace_range(None, "bar");
         assert_ne!(buf.content, stale_snapshot);
 
-        assert!(!buf.apply_highlight(&stale_snapshot, stale_lines));
+        let stale_outline = symbols::symbol_outline(&stale_snapshot, Some("rs"));
+        assert!(!buf.apply_highlight(&stale_snapshot, stale_lines, stale_outline));
         assert!(
             buf.highlight_dirty,
             "a stale highlight result must not clear the dirty flag"
@@ -3747,7 +3887,13 @@ mod tests {
         // ...and now a real external writer (an agent CLI running in this worktree) rewrites it.
         let rewritten = "rewritten by an agent\n".to_string();
         let lines = code_view::build_lines(&rewritten, &[]);
-        assert!(buffer.reload_from_disk(rewritten.clone(), lines, None, rewritten.len() as u64));
+        assert!(buffer.reload_from_disk(
+            rewritten.clone(),
+            lines,
+            Vec::new(),
+            None,
+            rewritten.len() as u64
+        ));
         assert_eq!(buffer.content, rewritten);
         assert!(!buffer.is_dirty(), "the reloaded buffer matches disk");
 
@@ -3776,7 +3922,7 @@ mod tests {
     fn a_reload_whose_content_is_identical_records_no_step_at_all() {
         let mut buffer = buffer("same\n");
         let lines = code_view::build_lines("same\n", &[]);
-        assert!(!buffer.reload_from_disk("same\n".to_string(), lines, None, 5));
+        assert!(!buffer.reload_from_disk("same\n".to_string(), lines, Vec::new(), None, 5));
         assert!(
             !buffer.can_undo(),
             "a reload that changes nothing must not push an empty step the user has to press \
@@ -3794,7 +3940,13 @@ mod tests {
         buffer.move_to(20);
         let short = "hi\n".to_string();
         let lines = code_view::build_lines(&short, &[]);
-        assert!(buffer.reload_from_disk(short.clone(), lines, None, short.len() as u64));
+        assert!(buffer.reload_from_disk(
+            short.clone(),
+            lines,
+            Vec::new(),
+            None,
+            short.len() as u64
+        ));
         assert!(
             buffer.cursor_offset() <= buffer.content.len(),
             "the caret must be clamped into the new content, never left dangling past its end"

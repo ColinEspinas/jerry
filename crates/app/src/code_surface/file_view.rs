@@ -285,6 +285,29 @@ impl AdeApp {
             Some(LspFileStatus::Analyzed { errors, .. }) => Some(*errors),
             _ => None,
         };
+        // GitHub issue #178: the breadcrumb's right-hand counts, read off the exact same
+        // `LspFileStatus` this frame's footer label is built from rather than re-derived, so the
+        // two can never disagree about how many problems this file has. `None` for every
+        // non-`Analyzed` status (no server, still spawning/indexing, or a failed one) - the band
+        // then draws no dots at all instead of an unearned `0`.
+        let breadcrumb_diagnostic_counts = match &lsp_status {
+            Some(LspFileStatus::Analyzed { errors, warnings }) => Some((*errors, *warnings)),
+            _ => None,
+        };
+        // The live enclosing-declaration chain at the caret, from the outline the buffer's own
+        // last parse produced (`crate::code_surface::symbols`). Read here, before the `parsed`
+        // borrow below, and materialized as owned `String`s so the breadcrumb can be built
+        // further down without holding a borrow of `self` across it. Empty - and the breadcrumb
+        // then honestly shows the path alone - whenever there's no live edit buffer for this file
+        // (still loading, or truncated/non-UTF-8 and therefore permanently read-only), which is
+        // also the only state where there is no real caret offset to look anything up by.
+        let breadcrumb_symbol_path: Vec<String> = match self.edit_buffer(&relative_path_buf) {
+            Some(buffer) => symbols::symbol_path_at(&buffer.symbols, buffer.cursor_offset())
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            None => Vec::new(),
+        };
 
         let Some(parsed) = self.file_view_cache.as_ref() else {
             return render_sidebar_message("no file loaded".to_string(), theme::text::FAINT.into());
@@ -595,7 +618,11 @@ impl AdeApp {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .child(render_file_breadcrumb(relative_path));
+            .child(render_file_breadcrumb(
+                relative_path,
+                &breadcrumb_symbol_path,
+                breadcrumb_diagnostic_counts,
+            ));
 
         // GitHub issue #30's real editor scrollbar decoration marks - see `Self::render_file_tree`'s
         // own docs (`crate::sidebar::render`) on why the scrollbar must be a sibling of the
@@ -810,14 +837,64 @@ mod editor_scrollbar_mark_tests {
     }
 }
 
-/// The File view's breadcrumb, built from `relative_path`'s segments
-/// (`code_view::breadcrumb_segments`). The design's deeper symbol-path suffix (`› impl
-/// QueryBuilder › build`) is out of scope: it needs symbol/AST-position tracking this read-only
-/// viewer doesn't build. The last (file name) segment is the active crumb; earlier segments are
-/// dimmer ancestor directories.
-pub(in crate::code_surface) fn render_file_breadcrumb(relative_path: &Path) -> impl IntoElement {
+/// One rendered breadcrumb crumb - see [`breadcrumb_crumbs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::code_surface) struct Crumb {
+    pub text: String,
+    /// `true` for exactly one crumb: the file's own name. The design (`design_handoff_jerry_ade/
+    /// revision/Jerry.dc.html`, the File view breadcrumb band) renders that one at `#a9b0b7` and
+    /// every other crumb - ancestor directories *and* enclosing symbols alike - at `#5e646a`.
+    pub active: bool,
+}
+
+/// The File view breadcrumb's real crumb list: `relative_path`'s own directory/file segments
+/// (`code_view::breadcrumb_segments`) followed by `symbol_path`, the chain of declarations
+/// enclosing wherever the caret currently is (`crate::code_surface::symbols::symbol_path_at`).
+///
+/// GitHub issue #178: the path half alone is what this band used to render, which the Surface C
+/// toolbar directly above it already shows - the literal duplicate the issue is about. The symbol
+/// half is what makes it the design's `src › db › query_builder.rs › impl QueryBuilder › build`
+/// instead. `symbol_path` is legitimately empty in real, reachable states (caret at a file's top
+/// level, a language with no enclosing-declaration concept, or no live edit buffer for this file
+/// yet), and the band then honestly renders the path alone rather than padding it out.
+///
+/// Pure and separately tested, so "what does the breadcrumb actually say for this caret" is a
+/// real assertion rather than something only reachable through a GPUI window.
+pub(in crate::code_surface) fn breadcrumb_crumbs(
+    relative_path: &Path,
+    symbol_path: &[String],
+) -> Vec<Crumb> {
     let segments = code_view::breadcrumb_segments(relative_path);
-    let last_index = segments.len().saturating_sub(1);
+    let last_path_index = segments.len().saturating_sub(1);
+    let mut crumbs: Vec<Crumb> = segments
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| Crumb {
+            text,
+            active: index == last_path_index,
+        })
+        .collect();
+    crumbs.extend(symbol_path.iter().map(|text| Crumb {
+        text: text.clone(),
+        active: false,
+    }));
+    crumbs
+}
+
+/// The File view's breadcrumb (`design_handoff_jerry_ade/README.md`: "Breadcrumb 26 (`src › db ›
+/// query_builder.rs › impl QueryBuilder › build`, 10.5px mono, separators `#3d4248`, active crumb
+/// `#a9b0b7`) with error/warning counts right").
+///
+/// `symbol_path` is the live enclosing-symbol chain at the caret and `diagnostic_counts` the real
+/// `(errors, warnings)` pair from this same frame's `LspFileStatus::Analyzed` - `None` whenever
+/// this file has no analyzed language-server result at all, in which case no count dots are drawn
+/// rather than a fabricated `0 0`.
+pub(in crate::code_surface) fn render_file_breadcrumb(
+    relative_path: &Path,
+    symbol_path: &[String],
+    diagnostic_counts: Option<(usize, usize)>,
+) -> impl IntoElement {
+    let crumbs = breadcrumb_crumbs(relative_path, symbol_path);
 
     let mut row = div()
         .flex_none()
@@ -832,19 +909,224 @@ pub(in crate::code_surface) fn render_file_breadcrumb(relative_path: &Path) -> i
         .font(font(theme::font::MONO))
         .text_size(px(10.5));
 
-    for (index, segment) in segments.into_iter().enumerate() {
+    for (index, crumb) in crumbs.into_iter().enumerate() {
         if index > 0 {
             row = row.child(div().text_color(theme::text::DISABLED).child("\u{203A}"));
         }
-        let color = if index == last_index {
+        let color = if crumb.active {
             theme::text::SECONDARY
         } else {
-            theme::text::GHOST
+            // `#5e646a`, the inactive-crumb colour the design mockup uses for both ancestor
+            // directories and symbol crumbs.
+            theme::text::FAINTER
         };
-        row = row.child(div().text_color(color).child(segment));
+        row = row.child(div().text_color(color).child(crumb.text));
+    }
+
+    if let Some((errors, warnings)) = diagnostic_counts {
+        row = row.child(div().flex_1());
+        row = row.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(9.0))
+                .children(diagnostic_count_dot(
+                    diagnostics_view::Severity::Error,
+                    errors,
+                ))
+                .children(diagnostic_count_dot(
+                    diagnostics_view::Severity::Warning,
+                    warnings,
+                )),
+        );
     }
 
     row
+}
+
+/// One `● N` group on the breadcrumb's right edge - a 5px severity-coloured dot plus the count,
+/// per the design mockup's File view breadcrumb band.
+///
+/// `None` when `count` is 0: a clean file shows nothing at all rather than a `0`, which is both
+/// the mockup's own shape (it only ever draws groups for non-zero counts) and the honest reading -
+/// the absence of a dot is unambiguous where a grey `0` next to a red dot is not. The dot colour
+/// comes from [`diagnostic_underline_color`], the same severity->colour map the in-code dotted
+/// underlines use, so the breadcrumb can never disagree with the markers it is counting.
+fn diagnostic_count_dot(
+    severity: diagnostics_view::Severity,
+    count: usize,
+) -> Option<impl IntoElement> {
+    if count == 0 {
+        return None;
+    }
+    Some(
+        div()
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .w(px(5.0))
+                    .h(px(5.0))
+                    .rounded_full()
+                    .bg(diagnostic_underline_color(severity)),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme::text::DIM)
+                    .child(count.to_string()),
+            ),
+    )
+}
+
+/// GitHub issue #178's real regression coverage: the breadcrumb band used to render only the file
+/// path, which the Surface C toolbar directly above it already shows - a literal duplicate. These
+/// assert the band now genuinely carries the design's symbol suffix and its error/warning counts,
+/// against the same pure builders [`render_file_breadcrumb`] itself calls.
+#[cfg(test)]
+mod breadcrumb_tests {
+    use super::*;
+    use crate::code_surface::symbols;
+
+    const SOURCE: &str = "\
+mod db {
+    impl QueryBuilder {
+        pub fn build(&self) {
+            let marker = 1;
+        }
+    }
+}
+";
+
+    /// The exact expression `AdeApp::render_file_view` evaluates for a live edit buffer, driven
+    /// here off a real parse of `SOURCE` rather than a hand-written crumb list.
+    fn symbol_path_at_marker(needle: &str) -> Vec<String> {
+        let outline = symbols::symbol_outline(SOURCE, Some("rs"));
+        let offset = SOURCE.find(needle).expect("needle present") + needle.len();
+        symbols::symbol_path_at(&outline, offset)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn the_breadcrumb_really_carries_the_designs_own_path_plus_symbol_chain() {
+        let crumbs = breadcrumb_crumbs(
+            Path::new("src/db/query_builder.rs"),
+            &symbol_path_at_marker("let marker = 1;"),
+        );
+        let texts: Vec<&str> = crumbs.iter().map(|crumb| crumb.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "src",
+                "db",
+                "query_builder.rs",
+                "mod db",
+                "impl QueryBuilder",
+                "build",
+            ],
+            "design_handoff_jerry_ade/README.md's own breadcrumb example, minus the mockup's \
+             elided `mod db`"
+        );
+    }
+
+    #[test]
+    fn exactly_one_crumb_is_active_and_it_is_the_file_name() {
+        let crumbs = breadcrumb_crumbs(
+            Path::new("src/db/query_builder.rs"),
+            &symbol_path_at_marker("let marker = 1;"),
+        );
+        let active: Vec<&str> = crumbs
+            .iter()
+            .filter(|crumb| crumb.active)
+            .map(|crumb| crumb.text.as_str())
+            .collect();
+        assert_eq!(active, vec!["query_builder.rs"]);
+    }
+
+    #[test]
+    fn moving_the_caret_really_changes_the_rendered_crumb_list() {
+        let inside = breadcrumb_crumbs(
+            Path::new("src/db/query_builder.rs"),
+            &symbol_path_at_marker("let marker = 1;"),
+        );
+        // Between `mod db {` and the `impl` that follows it: inside the module, inside nothing
+        // else - so the breadcrumb genuinely sheds two crumbs.
+        let outside = breadcrumb_crumbs(
+            Path::new("src/db/query_builder.rs"),
+            &symbol_path_at_marker("mod db {"),
+        );
+        let texts = |crumbs: &[Crumb]| -> Vec<String> {
+            crumbs.iter().map(|crumb| crumb.text.clone()).collect()
+        };
+        assert_eq!(
+            texts(&outside),
+            vec!["src", "db", "query_builder.rs", "mod db"]
+        );
+        assert_ne!(texts(&inside), texts(&outside));
+    }
+
+    #[test]
+    fn with_no_symbol_path_the_breadcrumb_is_exactly_the_path_it_always_was() {
+        let crumbs = breadcrumb_crumbs(Path::new("Cargo.toml"), &[]);
+        let texts: Vec<&str> = crumbs.iter().map(|crumb| crumb.text.as_str()).collect();
+        assert_eq!(texts, vec!["Cargo.toml"]);
+        assert!(crumbs[0].active);
+    }
+
+    #[test]
+    fn a_clean_file_draws_no_count_dots_at_all() {
+        assert!(diagnostic_count_dot(diagnostics_view::Severity::Error, 0).is_none());
+        assert!(diagnostic_count_dot(diagnostics_view::Severity::Warning, 0).is_none());
+        assert!(diagnostic_count_dot(diagnostics_view::Severity::Error, 1).is_some());
+    }
+
+    /// The counts the band draws come straight off `LspFileStatus::Analyzed`, which
+    /// `crate::lsp::client::lsp_file_status` builds with
+    /// `diagnostics_view::count_errors_and_warnings` - so this drives real `lsp_types::
+    /// Diagnostic` values through that same real counting function and checks the pair the
+    /// breadcrumb would be handed.
+    #[test]
+    fn the_breadcrumb_counts_come_from_a_real_diagnostics_list() {
+        let diagnostics = vec![
+            severity_diagnostic(lsp_core::lsp_types::DiagnosticSeverity::ERROR),
+            severity_diagnostic(lsp_core::lsp_types::DiagnosticSeverity::WARNING),
+            severity_diagnostic(lsp_core::lsp_types::DiagnosticSeverity::WARNING),
+            severity_diagnostic(lsp_core::lsp_types::DiagnosticSeverity::HINT),
+        ];
+        let (errors, warnings) = diagnostics_view::count_errors_and_warnings(&diagnostics);
+        let status = LspFileStatus::Analyzed { errors, warnings };
+        let counts = match &status {
+            LspFileStatus::Analyzed { errors, warnings } => Some((*errors, *warnings)),
+            _ => None,
+        };
+        assert_eq!(
+            counts,
+            Some((1, 2)),
+            "one error and two warnings, with the hint counted as neither"
+        );
+    }
+
+    fn severity_diagnostic(
+        severity: lsp_core::lsp_types::DiagnosticSeverity,
+    ) -> lsp_core::lsp_types::Diagnostic {
+        lsp_core::lsp_types::Diagnostic {
+            range: lsp_core::lsp_types::Range {
+                start: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 4,
+                },
+            },
+            severity: Some(severity),
+            ..Default::default()
+        }
+    }
 }
 
 /// Bundles [`render_file_view_line`]'s two hover-state parameters to keep that function's

@@ -69,6 +69,7 @@ pub mod blame;
 pub mod code_view;
 pub mod edit_buffer;
 pub mod indent;
+pub mod symbols;
 
 pub(crate) mod blame_view;
 pub(crate) mod diff_view;

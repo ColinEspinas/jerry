@@ -531,12 +531,24 @@ impl AdeApp {
                 .background_executor()
                 .spawn({
                     let path = path.clone();
-                    async move { code_view::load_file_with_source(&path) }
+                    let extension = extension.clone();
+                    // GitHub issue #178: the File view breadcrumb's enclosing-symbol outline is a
+                    // second real `tree_sitter::Parser::parse` of the same source, so it runs
+                    // here - on the same background executor, off the back of the same decode -
+                    // rather than on the foreground thread once this task resumes. See
+                    // `code_surface::symbols`' own docs for why the outline is flattened to plain
+                    // data at this point instead of a tree being carried across the await.
+                    async move {
+                        code_view::load_file_with_source(&path).map(|(parsed, source)| {
+                            let symbols = symbols::symbol_outline(&source, extension.as_deref());
+                            (parsed, source, symbols)
+                        })
+                    }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok((parsed, source)) => {
+                    Ok((parsed, source, symbols)) => {
                         // Lazily seed a real edit buffer the first time this file is opened in
                         // File view - never overwrite an existing entry (which may hold real
                         // unsaved edits and a live cursor/selection); see `Self::edit_buffers`'
@@ -604,6 +616,7 @@ impl AdeApp {
                                     buffer.reload_from_disk(
                                         source,
                                         parsed.lines.clone(),
+                                        symbols,
                                         parsed.mtime,
                                         parsed.len,
                                     );
@@ -644,6 +657,7 @@ impl AdeApp {
                                             source,
                                             extension.clone(),
                                             parsed.lines.clone(),
+                                            symbols,
                                             parsed.mtime,
                                             parsed.len,
                                         ),
