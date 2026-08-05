@@ -2740,7 +2740,7 @@ mod tests {
     /// i.e. exactly the colour the File view would paint that token's first character. Falls back
     /// to [`HighlightKind::Text`] for a byte no span covers, matching [`build_lines`]' own
     /// gap-filling rule, so this always answers the same question the renderer does.
-    fn kind_at(spans: &[HighlightSpan], source: &str, text: &str) -> HighlightKind {
+    pub(super) fn kind_at(spans: &[HighlightSpan], source: &str, text: &str) -> HighlightKind {
         let start = source.find(text).expect("substring present in source");
         spans
             .iter()
@@ -5006,7 +5006,7 @@ mod tests {
     /// The bucket the span covering `byte` classifies it as. Deliberately *not* `kind_at`, which
     /// looks its argument up by substring search and so always finds the first `(` in the file -
     /// useless when the whole question is which of several identical characters this one is.
-    fn kind_at_byte(spans: &[HighlightSpan], byte: usize) -> HighlightKind {
+    pub(super) fn kind_at_byte(spans: &[HighlightSpan], byte: usize) -> HighlightKind {
         spans
             .iter()
             .find(|span| span.start <= byte && byte < span.end)
@@ -5014,7 +5014,7 @@ mod tests {
     }
 
     /// The ring colour a real bracket at `byte` got, or `None` if the pipeline left it plain.
-    fn ring_index_at(spans: &[HighlightSpan], byte: usize) -> Option<usize> {
+    pub(super) fn ring_index_at(spans: &[HighlightSpan], byte: usize) -> Option<usize> {
         let kind = spans
             .iter()
             .find(|span| span.start <= byte && byte < span.end)
@@ -5434,6 +5434,220 @@ mod tests {
         assert!(
             runs.contains(&HighlightKind::PunctuationBracket),
             "the trailing `}}`, whose partner is outside the hunk, must stay plain - got {runs:?}"
+        );
+    }
+}
+
+/// GitHub issue: syntax theme redesign - the real fixture corpus.
+///
+/// This module is the honest substitute for "before/after screenshots of each fixture". This
+/// environment *can* screenshot the running app (see `BUILD-LOG.md`), but it has no scripted way
+/// to open a chosen file in the editor, so per-fixture screenshots are not automatable. What is
+/// automatable, and is arguably better evidence, is a dump of exactly what the pipeline classifies
+/// each byte as and exactly what colour that resolves to - which is the thing a screenshot would
+/// have been inspected *for*, minus the eyes.
+///
+/// Each test below renders one real fixture through the real pipeline (`HighlightOptions::default`
+/// -> the real grammar -> the real bracket ring) and asserts the properties the redesign promises.
+/// Run with `--nocapture` to read the full per-line dump for review.
+#[cfg(test)]
+mod fixture_corpus_tests {
+    use super::tests::{kind_at, kind_at_byte, ring_index_at};
+    use super::*;
+    use crate::theme;
+
+    const RUST: &str = include_str!("testdata/fixture.rs.txt");
+    const TSX: &str = include_str!("testdata/fixture.tsx.txt");
+    const PYTHON: &str = include_str!("testdata/fixture.py.txt");
+    const MARKDOWN: &str = include_str!("testdata/fixture.md.txt");
+    const DEEP: &str = include_str!("testdata/fixture.deep.rs.txt");
+    const TORTURE: &str = include_str!("testdata/fixture.torture.rs.txt");
+
+    fn spans_of(source: &str, highlighter: crate::language::HighlighterFn) -> Vec<HighlightSpan> {
+        HighlightOptions::default().highlight(source, Some(highlighter))
+    }
+
+    /// Every distinct `(bucket, resolved colour, contrast against the editor background)` a fixture
+    /// actually produces - the reviewable table a screenshot would only have implied.
+    fn dump(
+        label: &str,
+        source: &str,
+        highlighter: crate::language::HighlighterFn,
+    ) -> Vec<HighlightKind> {
+        let spans = spans_of(source, highlighter);
+        let background = theme::surface::CENTER.resolve();
+        let mut seen: Vec<HighlightKind> = Vec::new();
+        for span in &spans {
+            if !seen.contains(&span.kind) {
+                seen.push(span.kind);
+            }
+        }
+        println!("\n=== {label} ===");
+        for kind in &seen {
+            let color = color_for_kind(*kind);
+            let rgba = color;
+            println!(
+                "  {:24} #{:02x}{:02x}{:02x}  contrast {:5.2}:1",
+                kind.name(),
+                (rgba.r * 255.0).round() as u32,
+                (rgba.g * 255.0).round() as u32,
+                (rgba.b * 255.0).round() as u32,
+                theme::contrast_ratio(rgba, background)
+            );
+        }
+        seen
+    }
+
+    /// Every bucket a fixture reaches must clear its own contrast floor. This is the property a
+    /// reviewer would otherwise be squinting at a screenshot to judge.
+    fn assert_every_bucket_is_readable(label: &str, seen: &[HighlightKind]) {
+        let background = theme::surface::CENTER.resolve();
+        for kind in seen {
+            let rgba: gpui::Rgba = color_for_kind(*kind);
+            let key: String = format!("syntax.{}", kind.name());
+            let Some(floor) = theme::syntax_contrast_floor_for_test(&key) else {
+                continue;
+            };
+            let ratio = theme::contrast_ratio(rgba, background);
+            assert!(
+                ratio >= floor,
+                "{label}: {} renders at {ratio:.2}:1, below its {floor}:1 floor",
+                kind.name()
+            );
+        }
+    }
+
+    #[test]
+    fn rust_fixture_is_fully_readable_and_colours_only_what_it_should() {
+        let seen = dump("Rust", RUST, highlight_rust);
+        assert_every_bucket_is_readable("Rust", &seen);
+        let spans = spans_of(RUST, highlight_rust);
+        // The definition site is coloured; the call sites are not.
+        assert_eq!(
+            kind_at(&spans, RUST, "parse(input"),
+            HighlightKind::FunctionDefinition
+        );
+        // `push` is a *method* call, so it lands in the FunctionMethod bucket - and the point of
+        // the restraint palette is that both call buckets resolve to exactly plain foreground.
+        assert_eq!(
+            kind_at(&spans, RUST, "push("),
+            HighlightKind::FunctionMethod
+        );
+        for call in [HighlightKind::Function, HighlightKind::FunctionMethod] {
+            assert_eq!(
+                color_for_kind(call),
+                color_for_kind(HighlightKind::Text),
+                "a call site must render at plain foreground"
+            );
+        }
+        // The brackets inside the string, char and raw string are never ring-coloured.
+        for needle in ["{ brace ) in", "] ["] {
+            let offset = RUST.find(needle).expect("fixture contains it");
+            assert!(
+                matches!(
+                    kind_at_byte(&spans, offset),
+                    HighlightKind::String | HighlightKind::StringEscape
+                ),
+                "the brackets in {needle:?} must stay part of the string"
+            );
+        }
+    }
+
+    #[test]
+    fn tsx_fixture_is_fully_readable_and_leaves_generics_plain() {
+        let seen = dump("TSX", TSX, highlight_tsx);
+        assert_every_bucket_is_readable("TSX", &seen);
+        let spans = spans_of(TSX, highlight_tsx);
+        // Every `<`/`>` stays the de-emphasized punctuation tone - never a ring colour.
+        for (index, _) in TSX.match_indices('<') {
+            assert_eq!(
+                kind_at_byte(&spans, index),
+                HighlightKind::PunctuationBracket,
+                "a `<` at byte {index} must never join the bracket ring"
+            );
+        }
+    }
+
+    #[test]
+    fn python_fixture_is_fully_readable() {
+        let seen = dump("Python", PYTHON, highlight_python);
+        assert_every_bucket_is_readable("Python", &seen);
+        let spans = spans_of(PYTHON, highlight_python);
+        assert_eq!(
+            kind_at(&spans, PYTHON, "parse(self"),
+            HighlightKind::FunctionDefinition
+        );
+    }
+
+    #[test]
+    fn markdown_fixture_is_fully_readable_and_pairs_each_fence_independently() {
+        let seen = dump("Markdown", MARKDOWN, highlight_markdown);
+        assert_every_bucket_is_readable("Markdown", &seen);
+        let spans = spans_of(MARKDOWN, highlight_markdown);
+        // Both fences are balanced, so each one's outermost pair starts the ring over at 0.
+        let rust_brace = MARKDOWN.find("fn a() {").expect("rust fence") + 7;
+        let python_brace = MARKDOWN.find("d = {").expect("python fence") + 4;
+        for offset in [rust_brace, python_brace] {
+            assert_eq!(
+                ring_index_at(&spans, offset),
+                Some(0),
+                "each fence's outermost pair must start at ring 0"
+            );
+        }
+    }
+
+    #[test]
+    fn the_deep_nesting_fixture_stays_legible_with_the_ring_on_and_off() {
+        let seen = dump("Deep nesting", DEEP, highlight_rust);
+        assert_every_bucket_is_readable("Deep nesting", &seen);
+
+        // Ring on: twelve levels really do cycle, and adjacent levels really do differ.
+        let on = spans_of(DEEP, highlight_rust);
+        let opens: Vec<usize> = DEEP.match_indices('(').map(|(index, _)| index).collect();
+        let ring: Vec<Option<usize>> = opens.iter().map(|o| ring_index_at(&on, *o)).collect();
+        let used: std::collections::HashSet<usize> = ring.iter().flatten().copied().collect();
+        assert_eq!(
+            used.len(),
+            6,
+            "a twelve-level fixture must exercise all six ring colours, got {used:?}"
+        );
+
+        // Ring off: every bracket falls back to the one de-emphasized punctuation tone, and that
+        // tone is still readable - which is what "legible with rainbow off" actually means.
+        let off = HighlightOptions {
+            bracket_pair_colorization: false,
+        }
+        .highlight(DEEP, Some(highlight_rust));
+        for (index, _) in DEEP.match_indices('(') {
+            assert_eq!(
+                kind_at_byte(&off, index),
+                HighlightKind::PunctuationBracket,
+                "with the ring off every bracket must be the plain punctuation tone"
+            );
+        }
+        let rgba: gpui::Rgba = color_for_kind(HighlightKind::PunctuationBracket);
+        assert!(
+            theme::contrast_ratio(rgba, theme::surface::CENTER.resolve()) >= 3.0,
+            "the ring-off bracket tone must still clear 3:1"
+        );
+    }
+
+    #[test]
+    fn the_torture_fixture_never_colours_a_bracket_that_is_not_real_code() {
+        let seen = dump("Bracket torture", TORTURE, highlight_rust);
+        assert_every_bucket_is_readable("Bracket torture", &seen);
+        let spans = spans_of(TORTURE, highlight_rust);
+
+        // The `(` inside the leading comment.
+        let comment_paren = TORTURE.find("Unmatched (").expect("fixture") + 10;
+        assert_eq!(kind_at_byte(&spans, comment_paren), HighlightKind::Comment);
+
+        // The mismatched `([)]`: the stray `)` is left plain rather than consuming the `[`.
+        let stray = TORTURE.find("([)]").expect("fixture") + 2;
+        assert_eq!(
+            kind_at_byte(&spans, stray),
+            HighlightKind::PunctuationBracket,
+            "a closer whose shape does not match the innermost opener must stay plain"
         );
     }
 }

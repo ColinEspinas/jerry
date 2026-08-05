@@ -1,0 +1,6 @@
+// Bracket torture. Unmatched ( in a comment; { in a string; mismatched shapes.
+fn generics<T: Into<Vec<u8>>>(x: HashMap<String, Vec<u8>>) -> Option<T> { None }
+fn closures() { let f = |x: i32| { v.iter().map(|y| (y, [x])).collect::<Vec<_>>() }; }
+fn strings() { let s = "a { b ) c"; let r = r#"raw ] ["#; let c = '{'; let d = '}'; }
+fn mismatched() { let x = ([)]; }
+fn ok_again() { good([1]); }

@@ -1,0 +1,16 @@
+// A TSX fixture: JSX, generics, template literals.
+import { useState } from "react";
+
+interface Props { label: string; count: number }
+
+export function Badge({ label, count }: Props) {
+  const [value, setValue] = useState<Map<string, number[]>>(new Map());
+  const greeting = `hi ${label} (${count})`;
+  const handler = (event: MouseEvent) => setValue(new Map([[label, [count]]]));
+  return (
+    <div className={cx({ active: count > 0 })} onClick={handler}>
+      <span title="a ) paren in an attribute">{greeting}</span>
+      {value.size > 0 && <em>{count}</em>}
+    </div>
+  );
+}

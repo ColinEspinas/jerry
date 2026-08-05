@@ -1,0 +1,18 @@
+# Heading with `code`
+
+Some **bold** and *italic* prose with a [link](https://example.com) and a ![img](i.png).
+An escaped \* asterisk and a bracket in code: `arr[0]`.
+
+```rust
+fn a() { b([1]); }
+```
+
+Prose between two fences.
+
+```python
+d = {'k': [1]}
+```
+
+> A quote with a list:
+> - item one
+> - item two
