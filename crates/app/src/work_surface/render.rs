@@ -1153,7 +1153,12 @@ impl AdeApp {
                 .size_full()
             })
             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                this.plus_menu_open = !this.plus_menu_open;
+                let opening = !this.plus_menu_open;
+                // GitHub issue #176: opening this menu closes whatever other menu was open, so
+                // two popovers can never be painted at once. Read *before* the sweep and applied
+                // after it, because the sweep clears `plus_menu_repo_anchor` too.
+                let _ = this.close_menu_surfaces_except(Some(menus::MenuSurface::Plus));
+                this.plus_menu_open = opening;
                 // This is the tab strip's own `+`, not a rail repo header's - see
                 // `Self::plus_menu_repo_anchor`'s own docs for why `Self::render_plus_menu` needs
                 // to know which one opened it.

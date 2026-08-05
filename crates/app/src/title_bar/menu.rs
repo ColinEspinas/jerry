@@ -1191,6 +1191,57 @@ mod title_menu_tests {
         );
     }
 
+    /// GitHub issue #176 for this surface: clicking a real title-bar label while another menu is
+    /// open must close that one rather than stack on top of it. The file tree's context menu is
+    /// the interesting partner - its scrim `.occlude()`s, but deliberately starts *below* the
+    /// title bar (so the window's caption buttons stay reachable), which is exactly why this click
+    /// really does reach the "File" label and really can leave two menus open.
+    #[gpui::test]
+    fn clicking_a_title_label_closes_an_open_tree_context_menu(cx: &mut TestAppContext) {
+        let (app, cx) = open_windows_variant(cx);
+        app.update(cx, |app, cx| {
+            // `open_tree_context_menu` is `pub(in crate::sidebar)`; its own module's tests drive
+            // it through a real right-click. What matters here is only that a context menu is
+            // really open and really painted when the title label is clicked.
+            app.tree_context_menu = Some(crate::sidebar::tree_ops::TreeContextMenu {
+                target: crate::sidebar::context_menu::ContextTarget::Empty,
+                // Well clear of the title bar's own labels: this popover paints *over* whatever
+                // is beneath it, and a menu opened at the window's top-left corner would sit on
+                // top of the very "File" label this test needs to click.
+                origin_x: 600.0,
+                origin_y: 400.0,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("tree-context-menu").is_some(),
+            "premise: the tree's context menu must really be painted"
+        );
+
+        let bounds = app.read_with(cx, |app, _| {
+            app.title_menu_button_bounds[TitleMenu::File.index()]
+        });
+        cx.simulate_click(center_of(bounds), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.title_menu_open,
+                Some(TitleMenu::File),
+                "the click must really open the File dropdown"
+            );
+            assert!(
+                app.tree_context_menu.is_none(),
+                "and must close the tree's context menu - two menus painted at once is the bug"
+            );
+        });
+        assert!(
+            cx.debug_bounds("tree-context-menu").is_none(),
+            "the context menu must really stop painting, not merely have its state cleared"
+        );
+    }
+
     /// The Agent menu's "Discard worktree" row's real two-step confirm - mirrors the agent
     /// footer's own identical two-click button
     /// (`crate::work_surface::render::AdeApp::render_footer_action_button`), reusing the

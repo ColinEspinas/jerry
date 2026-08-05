@@ -372,19 +372,21 @@ impl AdeApp {
             f32::from(viewport.width),
             f32::from(viewport.height),
         );
-        self.graph_state.row_menu_open = Some(GraphRowMenu {
-            row_index: index,
-            origin_x: px(clamped_x),
-            origin_y: px(clamped_y),
-        });
         // An adversarial audit's own finding: this menu and the Push `▾` menu
         // (`Self::toggle_graph_push_menu`) are independent booleans/options with no shared
         // "only one overlay open" invariant, so without this a right-click while the Push menu
         // was open left both painted at once (and this menu's own scrim, which *does*
         // `stop_propagation` on a left-click, then ate the next click meant to dismiss the Push
-        // menu). Pre-existing gap, not introduced by this change - fixed here since it's the same
-        // "which overlay owns the next click" property this change is already about.
-        self.graph_state.push_menu_open = false;
+        // menu). GitHub issue #176 generalised that one hand-added pair into the real shared
+        // invariant `AdeApp::close_menu_surfaces_except` now enforces across all six menus - this
+        // call replaces the single `push_menu_open = false` that used to live here, and runs
+        // *before* the assignment below so the sweep can't clear what it just set.
+        let _ = self.close_menu_surfaces_except(Some(menus::MenuSurface::GraphRow));
+        self.graph_state.row_menu_open = Some(GraphRowMenu {
+            row_index: index,
+            origin_x: px(clamped_x),
+            origin_y: px(clamped_y),
+        });
         window.focus(&self.graph_focus_handle, cx);
         // GitHub issue #127 - see `Self::open_git_graph`'s own matching comment.
         self.graph_view_focused = true;
@@ -392,10 +394,11 @@ impl AdeApp {
     }
 
     pub(crate) fn toggle_graph_push_menu(&mut self, cx: &mut Context<Self>) {
-        self.graph_state.push_menu_open = !self.graph_state.push_menu_open;
-        if self.graph_state.push_menu_open {
-            self.graph_state.row_menu_open = None;
-        }
+        let opening = !self.graph_state.push_menu_open;
+        // GitHub issue #176 - replaces this method's own hand-added "also close the row menu"
+        // rule with the shared invariant across all six menu surfaces.
+        let _ = self.close_menu_surfaces_except(Some(menus::MenuSurface::GraphPush));
+        self.graph_state.push_menu_open = opening;
         cx.notify();
     }
 
@@ -3267,6 +3270,44 @@ mod graph_row_menu_tests {
                 "opening the Push menu must close the row menu, not paint both at once"
             );
         });
+    }
+
+    /// GitHub issue #176 generalised the pairwise rule above into one shared invariant across all
+    /// six menu surfaces (`crate::root::menus`). This is the part that pair could never cover: a
+    /// real right-click on a graph row must also close a menu that has nothing to do with the
+    /// graph - here the tab strip's `+`, whose own scrim ignores right-clicks entirely and so used
+    /// to stay painted right alongside the row menu.
+    #[gpui::test]
+    fn opening_the_row_menu_closes_an_open_plus_menu(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        app.update(cx, |app, cx| {
+            app.plus_menu_open = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("dropdown-menu-row-Git graph").is_some(),
+            "premise: the + menu must really be painted before the right-click"
+        );
+
+        let row0 = cx.debug_bounds("graph-row-0").expect("row 0 painted");
+        right_click(cx, row0.center());
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.row_menu_open.is_some(),
+                "premise: the right-click must really open the graph row menu"
+            );
+            assert!(
+                !app.plus_menu_open,
+                "and must close the + menu - two popovers open at once is GitHub issue #176"
+            );
+        });
+        assert!(
+            cx.debug_bounds("dropdown-menu-row-Git graph").is_none(),
+            "the + menu must really stop painting, not merely have its flag cleared"
+        );
     }
 
     /// Real, reachable-without-Settings bug an adversarial audit found: `open_git_graph` only

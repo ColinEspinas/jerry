@@ -383,6 +383,11 @@ impl AdeApp {
         if self.tree_inline_edit.is_some() {
             self.cancel_tree_inline_edit(window, cx);
         }
+        // GitHub issue #176 - the reported "2 context menus open at the same time" is most easily
+        // reproduced right here: the `+` menu's own scrim only listens for a *left* click, so a
+        // right-click in the file tree went straight past it to this method and left both
+        // popovers painted. See `AdeApp::close_menu_surfaces_except`.
+        let _ = self.close_menu_surfaces_except(Some(menus::MenuSurface::TreeContext));
         // GitHub issue #145: a right-click on a row that's already part of a real multi-selection
         // (more than just the anchor) must act on the *whole* selection, not collapse it down to
         // just the row under the cursor - the same "right-click within a selection" convention
@@ -3419,6 +3424,124 @@ mod tree_ops_regression_tests {
             assert!(
                 app.tree_context_menu.is_none(),
                 "and it must still have dismissed the menu"
+            );
+        });
+    }
+
+    /// GitHub issue #176's literal report - "2 context menus open at the same time" - through the
+    /// two real surfaces that used to reach it most easily. The tab strip's `+` menu paints a
+    /// full-window scrim, but that scrim only listens for a *left* click, so a right-click in the
+    /// file tree sailed past it, opened this menu, and left both popovers painted. Driven by a
+    /// genuine `MouseButton::Right` platform event, not by calling `open_tree_context_menu`.
+    #[gpui::test]
+    fn a_real_right_click_in_the_file_tree_closes_an_open_plus_menu(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.plus_menu_open = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("dropdown-menu-row-Git graph").is_some(),
+            "premise: the + menu must really be painted before the right-click"
+        );
+
+        let row = cx
+            .debug_bounds("file-tree-row-README.md")
+            .expect("the file row must really paint");
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: row.center(),
+            modifiers: gpui::Modifiers::none(),
+            button: gpui::MouseButton::Right,
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.tree_context_menu.is_some(),
+                "premise: the right-click must really open the tree's own context menu - \
+                 otherwise this test proves nothing about two menus coexisting"
+            );
+            assert!(
+                !app.plus_menu_open,
+                "opening the tree's context menu must close the + menu: two popovers open at \
+                 once is exactly what GitHub issue #176 reports"
+            );
+        });
+        assert!(
+            cx.debug_bounds("dropdown-menu-row-Git graph").is_none(),
+            "the + menu must really stop painting, not merely have its flag cleared"
+        );
+        assert!(
+            cx.debug_bounds("tree-context-menu").is_some(),
+            "and the context menu the right-click opened must really be painted"
+        );
+    }
+
+    /// The other direction, so the rule above can't pass by making the `+` menu permanently
+    /// unopenable. This one lands on the tree menu's own **occluding** scrim, which deliberately
+    /// absorbs the click that dismisses it (see `crate::sidebar::render::AdeApp::
+    /// render_tree_context_menu`'s docs - a dismiss must not also run whatever was underneath) -
+    /// so the first click closes the tree menu *without* opening the `+` menu, and a second click
+    /// on the now-uncovered `+` opens it. Two menus are never open at the same time in either
+    /// step, which is the property GitHub issue #176 is actually about.
+    #[gpui::test]
+    fn clicking_the_tab_strip_plus_under_an_open_tree_context_menu_never_leaves_both_open(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        seed(&repo);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_tree_context_menu(ContextTarget::Empty, 4.0, 4.0, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("tree-context-menu").is_some(),
+            "premise: the context menu must really be painted"
+        );
+
+        let plus = app.read_with(cx, |app, _| app.plus_button_bounds);
+        assert_ne!(
+            plus,
+            gpui::Bounds::default(),
+            "premise: the + button must really have painted by now"
+        );
+        cx.simulate_click(plus.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.tree_context_menu.is_none(),
+                "the first click must dismiss the tree's context menu"
+            );
+            assert!(
+                !app.plus_menu_open,
+                "and must be absorbed by that menu's own occluding scrim rather than also \
+                 opening the + menu underneath it"
+            );
+        });
+
+        cx.simulate_click(plus.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.plus_menu_open,
+                "with the scrim gone, the very same click must really open the + menu - proof \
+                 the step above absorbed a click rather than breaking the button"
+            );
+            assert!(
+                app.tree_context_menu.is_none(),
+                "and the tree's context menu must not have come back"
             );
         });
     }
