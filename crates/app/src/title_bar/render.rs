@@ -119,12 +119,18 @@ impl AdeApp {
                         .size_full(),
                     )
                     .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                        this.title_menu_open = if this.title_menu_open == Some(menu) {
+                        let next = if this.title_menu_open == Some(menu) {
                             None
                         } else {
-                            this.plus_menu_open = false;
                             Some(menu)
                         };
+                        // GitHub issue #176. This used to close only the `+` menu by hand - the
+                        // shared sweep covers the file tree's context menu, the commit composer's
+                        // menu and the graph's two menus as well, none of which this label knew
+                        // about. `Title` is kept so switching File → Edit stays one open menu
+                        // rather than briefly none.
+                        let _ = this.close_menu_surfaces_except(Some(menus::MenuSurface::Title));
+                        this.title_menu_open = next;
                         cx.notify();
                     }))
             }))

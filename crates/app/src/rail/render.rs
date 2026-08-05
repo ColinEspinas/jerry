@@ -998,6 +998,9 @@ impl AdeApp {
             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                 cx.stop_propagation();
                 this.checkout_repo_from_rail(repo_id, window, cx);
+                // GitHub issue #176 - see `AdeApp::close_menu_surfaces_except`. Runs before the
+                // two assignments below, since the sweep clears `plus_menu_repo_anchor`.
+                let _ = this.close_menu_surfaces_except(Some(menus::MenuSurface::Plus));
                 this.plus_menu_open = true;
                 this.plus_menu_repo_anchor = Some(repo_id);
                 this.load_agent_rows(cx);

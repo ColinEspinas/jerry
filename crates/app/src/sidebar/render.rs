@@ -56,6 +56,12 @@ impl AdeApp {
             self.settings_focus.forget_target(&self.tree_focus_handle);
             self.code_focus.forget_target(&self.tree_focus_handle);
         }
+        if view != RightSidebarView::Changes {
+            // GitHub issue #176, the mirror image of the block above: leaving Changes unrenders
+            // the commit composer, but `commit_menu_open` used to stay latched `true` - so coming
+            // back to Changes popped the `▾` popover open again on its own, with no click.
+            self.commit_menu_open = false;
+        }
         self.right_sidebar_view = view;
         if view == RightSidebarView::Changes {
             self.load_diff(self.diff_root.clone(), cx);
@@ -2021,7 +2027,6 @@ impl AdeApp {
         // rendering after a promotion to "real" with no binding behind it - "a real keycap must
         // never render for a keystroke that does nothing" - so this composer never grows one in
         // the first place.
-        let menu_open = self.commit_menu_open;
 
         // Test-only (no-op outside `cfg(test)`/`test-support`, matching every other
         // `debug_selector` in this file - see e.g. `Self::render_status_zoom_value`'s own
@@ -2038,8 +2043,9 @@ impl AdeApp {
             format!("commit-composer-message-{message}")
         };
 
-        let mut composer = div()
+        let composer = div()
             .id("commit-composer")
+            .debug_selector(|| "commit-composer".to_string())
             .relative()
             .flex_none()
             .flex()
@@ -2050,6 +2056,33 @@ impl AdeApp {
             .border_t_1()
             .border_color(theme::border::INNER)
             .bg(theme::surface::FOOTER)
+            .child({
+                // GitHub issue #176: the `▾` popover is no longer a child of this composer (see
+                // `AdeApp::commit_composer_bounds`' own docs), so it needs this composer's real
+                // window-space bounds to anchor off - the same `gpui::canvas` capture
+                // `crate::work_surface::render::AdeApp::render_tab_strip_plus` uses for the `+`
+                // button.
+                let this = cx.entity();
+                gpui::canvas(
+                    move |bounds, _window, cx| {
+                        this.update(cx, |this, _cx| {
+                            this.commit_composer_bounds = bounds;
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                // Explicit insets rather than `.size_full()`: an absolutely-positioned child with
+                // no insets takes its *static* position, which here is the composer's content box
+                // (inside the 12px horizontal padding) while `size_full` still resolves against
+                // the padding box - so the captured origin and size would describe two different
+                // rectangles. Pinning all four edges makes this exactly the composer's own box,
+                // which is what `render_commit_menu` then insets by the design's 12px.
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+            })
             .child(
                 // Header row: `COMMIT` · `N of M staged` · staged diffstat, right-aligned.
                 div()
@@ -2228,7 +2261,11 @@ impl AdeApp {
                             .text_color(theme::text::DIMMER)
                             .child("\u{25be}")
                             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                                this.commit_menu_open = !this.commit_menu_open;
+                                let opening = !this.commit_menu_open;
+                                // GitHub issue #176 - see `AdeApp::close_menu_surfaces_except`.
+                                let _ = this
+                                    .close_menu_surfaces_except(Some(menus::MenuSurface::Commit));
+                                this.commit_menu_open = opening;
                                 cx.notify();
                             })),
                     )
@@ -2247,23 +2284,30 @@ impl AdeApp {
                     ),
             );
 
-        if menu_open {
-            composer = composer.child(self.render_commit_menu(cx));
-        }
-
         composer
     }
 
     /// The commit composer's `▾` split-button popover (Revision R12 §5): *Commit and push* /
     /// *Commit all N files* / *Amend last commit* / *Stash staged files*. Opens **upward** -
     /// `bottom`-anchored, not `top` - since the button it hangs off sits near the bottom of the
-    /// Changes panel. A transparent, `.occlude()`d scrim confined to the composer's own bounds
-    /// (matching [`crate::work_surface::render::AdeApp::render_plus_menu`]'s click-away-
-    /// dismisses shape, scoped smaller here since the composer itself is the only positioned
-    /// ancestor available) closes the menu on a click anywhere else *within the composer* -
-    /// this is not a window-wide click-away like `render_plus_menu`'s own scrim, only the
-    /// composer's own footprint; the popover panel itself also `.occlude()`s and stops that
-    /// click from bubbling further.
+    /// Changes panel.
+    ///
+    /// ## Why this is rendered from `AdeApp::render`, not from the composer (GitHub issue #176)
+    ///
+    /// This popover used to be a *child* of [`Self::render_commit_composer`], which made its
+    /// click-away scrim - `absolute()` with inset 0 - resolve against the composer's own
+    /// `.relative()` box (~135px tall, at the foot of the Changes panel) rather than the window.
+    /// Clicking the Changes list, the file tree, the rail, the tab strip, the editor or the title
+    /// bar therefore did *not* dismiss it, and none of its four rows is clickable either, so the
+    /// only gesture that reliably closed it was a second click on the `▾` toggle itself. That is
+    /// the issue's "the commit one is particularly bugged and hard to close".
+    ///
+    /// It is now a sibling of [`crate::work_surface::render::AdeApp::render_plus_menu`] and the
+    /// file tree's context menu in `AdeApp::render`, with the same genuinely full-window
+    /// `.occlude()`d scrim they use - the established shape in this app for a popover whose anchor
+    /// is a `gpui::canvas`-captured, window-space bounds ([`AdeApp::commit_composer_bounds`]).
+    /// `crate::graph_view::render::AdeApp::render_graph_view`'s own docs record the same move for
+    /// the graph's two menus, made for the same reason.
     ///
     /// Every row is real, visible, and **honestly non-interactive**: only the primary `Commit N
     /// files` button (`Self::commit_staged_files`, backed by a real `wt_core::undo::commit_paths`)
@@ -2271,7 +2315,21 @@ impl AdeApp {
     /// phase doesn't add - each row is dimmed and un-clickable, the same
     /// `work_surface::state::ActionKind::Unimplemented` convention this codebase already uses for
     /// "visible, real, but not wired up yet" (never a clickable-looking no-op).
-    fn render_commit_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_commit_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // The composer's own painted box, in window space. The popover keeps its R12 §5 geometry
+        // relative to that box - inset 12px on both sides, 44px of clearance above the composer's
+        // bottom edge so it clears the primary button row - just expressed against the window now
+        // that this is a root-level child.
+        let composer = self.commit_composer_bounds;
+        let window_height = window.bounds().size.height;
+        let popover_left = composer.origin.x + px(12.0);
+        let popover_width = (composer.size.width - px(24.0)).max(px(0.0));
+        let popover_bottom = window_height - (composer.origin.y + composer.size.height) + px(44.0);
+
         let branch = self
             .worktrees
             .iter()
@@ -2287,7 +2345,12 @@ impl AdeApp {
             .id("commit-menu-scrim")
             .debug_selector(|| "commit-menu-scrim".to_string())
             .absolute()
-            .top(px(0.0))
+            // Starts *below* the title bar, exactly like the file tree's own context-menu scrim
+            // (`Self::render_tree_context_menu`) and for the same real reason it documents: a
+            // full-window `.occlude()`ing layer swallows the window's own close/minimise/maximise
+            // caption buttons and the title bar's drag region, so the window could not be closed
+            // or moved while the menu was up.
+            .top(theme::band::TITLE_BAR)
             .left(px(0.0))
             .right(px(0.0))
             .bottom(px(0.0))
@@ -2309,29 +2372,32 @@ impl AdeApp {
                 this.commit_menu_open = false;
                 cx.notify();
             }))
+            // A right-click anywhere else must dismiss too - the same rule the file tree's and the
+            // graph row's own scrims already follow, so the next right-click doesn't land on an
+            // invisible layer and appear to do nothing at all.
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(|this, _event: &gpui::MouseDownEvent, _window, cx| {
+                    this.commit_menu_open = false;
+                    cx.notify();
+                }),
+            )
             .child(
                 menu_popover_chrome(
                     div()
                         .id("commit-menu-popover")
                         .debug_selector(|| "commit-menu-popover".to_string())
                         .absolute()
-                        .left(px(12.0))
-                        .right(px(12.0))
-                        .bottom(px(44.0))
-                        // The composer itself is short (~135px of header/message-box/button-row),
-                        // shorter than this four-row popover (`bottom(px(44.0))` plus its own
-                        // real painted height) - so the popover's *top* genuinely paints above
-                        // the composer's own top edge, over the Changes rows behind it, which is
-                        // outside the scrim's own bounds (`top(0)/bottom(0)` relative to the
-                        // composer, not the whole sidebar - see this fn's own docs on the scrim
-                        // being "confined to the composer's own bounds"). Without its own
-                        // `.occlude()` here, a click in that overflow region only avoids reaching
-                        // a real Changes row underneath by relying on `Window::
-                        // dispatch_mouse_event`'s bubble-phase registration order happening to
-                        // run this popover's own `stop_propagation` listener first - a
-                        // coincidence of paint order, not a structural guarantee. This makes the
-                        // block real regardless of ordering, the same reasoning as the scrim's
-                        // own `.occlude()` above.
+                        .left(popover_left)
+                        .w(popover_width)
+                        // The scrim starts at `theme::band::TITLE_BAR`, not at the window top, so
+                        // a distance measured from the *window's* bottom edge still lands right -
+                        // `bottom` is unaffected by where the top edge was clipped.
+                        .bottom(popover_bottom)
+                        // Kept from when this popover lived inside the composer: it paints over
+                        // real Changes rows and the primary commit button, and blocking the mouse
+                        // structurally (rather than relying on bubble-phase listener ordering)
+                        // is what stops a click on the panel reaching them.
                         .occlude()
                         .py(px(4.0)),
                     // `COMMIT_MENU`, not `MENU`: same blur/alpha as every other menu (GitHub
@@ -4672,6 +4738,194 @@ mod commit_composer_tests {
                 "a real click on {selector} must never change the real staged set"
             );
         }
+    }
+
+    /// GitHub issue #176's "the commit one is particularly bugged and hard to close". Before this
+    /// fix the popover's dismiss scrim was a child of the composer, so it only covered the
+    /// composer's own ~130px box: a real click anywhere else in the window - the Changes list, the
+    /// file tree, the centre pane - went straight past it and the menu stayed open. This clicks a
+    /// point that is genuinely outside the composer and genuinely inside the window.
+    #[gpui::test]
+    fn a_real_click_far_outside_the_composer_closes_the_commit_menu(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let composer = cx
+            .debug_bounds("commit-composer")
+            .expect("the composer must really paint");
+        let toggle = cx
+            .debug_bounds("commit-composer-menu-toggle")
+            .expect("the ▾ toggle must really paint");
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.commit_menu_open),
+            "premise: the menu must really be open before the click-away below"
+        );
+
+        let popover = cx
+            .debug_bounds("commit-menu-popover")
+            .expect("the popover must really paint while the menu is open");
+
+        // Well up and to the left of both the composer and the popover: the centre pane, hundreds
+        // of pixels from anything the old composer-scoped scrim covered.
+        let away = gpui::Point {
+            x: composer.origin.x / 2.0,
+            y: popover.origin.y / 2.0,
+        };
+        assert!(
+            !composer.contains(&away) && !popover.contains(&away),
+            "premise: {away:?} must really be outside both the composer {composer:?} and the \
+             popover {popover:?}, or this test would be clicking the menu itself"
+        );
+        cx.simulate_click(away, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app.commit_menu_open),
+            "a real click far outside the composer must close the commit menu - the popover's \
+             scrim is window-wide now, not confined to the composer that used to own it"
+        );
+        assert!(
+            cx.debug_bounds("commit-menu-popover").is_none(),
+            "closing must really unpaint the popover, not just flip a flag"
+        );
+    }
+
+    /// The popover moved out of the composer and into `AdeApp::render` (GitHub issue #176), so its
+    /// position is now derived from a `gpui::canvas`-captured window-space anchor rather than from
+    /// its parent's own box. This pins the geometry that move had to preserve: Revision R12 §5's
+    /// 12px inset on both sides of the composer, and an upward-opening panel that clears the
+    /// primary commit button row.
+    #[gpui::test]
+    fn the_commit_menu_popover_really_paints_anchored_to_the_composer(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let toggle = cx
+            .debug_bounds("commit-composer-menu-toggle")
+            .expect("the ▾ toggle must really paint");
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let composer = cx
+            .debug_bounds("commit-composer")
+            .expect("the composer must really paint");
+        let popover = cx
+            .debug_bounds("commit-menu-popover")
+            .expect("the popover must really paint while the menu is open");
+
+        assert_eq!(
+            popover.origin.x,
+            composer.origin.x + px(12.0),
+            "the popover must be inset 12px from the composer's own left edge - a popover \
+             anchored off stale or wrongly-scoped bounds would land somewhere else entirely"
+        );
+        assert_eq!(
+            popover.size.width,
+            composer.size.width - px(24.0),
+            "and inset the same 12px on the right"
+        );
+        assert!(
+            popover.origin.y + popover.size.height < composer.origin.y + composer.size.height,
+            "the popover opens *upward*: its bottom edge {:?} must sit above the composer's own \
+             bottom edge {:?}, clearing the primary commit button row",
+            popover.origin.y + popover.size.height,
+            composer.origin.y + composer.size.height
+        );
+        assert!(
+            popover.origin.y < composer.origin.y,
+            "the four-row popover is taller than the composer, so its top must genuinely paint \
+             above the composer - the exact overflow that made a composer-scoped scrim wrong"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.commit_menu_open),
+            "sanity check: none of the geometry above may be read from a closed menu"
+        );
+    }
+
+    /// Leaving the Changes view unrenders the composer. `commit_menu_open` used to stay latched
+    /// `true` through that, so coming back to Changes popped the popover open again with no click
+    /// (GitHub issue #176).
+    #[gpui::test]
+    fn leaving_the_changes_view_really_closes_the_commit_menu(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let toggle = cx
+            .debug_bounds("commit-composer-menu-toggle")
+            .expect("the ▾ toggle must really paint");
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.commit_menu_open),
+            "premise: the menu must really be open before the view switch"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.set_right_sidebar_view(RightSidebarView::Files, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.commit_menu_open),
+            "switching away from Changes must close the menu, not latch it"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.set_right_sidebar_view(RightSidebarView::Changes, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("commit-menu-popover").is_none(),
+            "returning to Changes must not resurrect a popover the user never reopened"
+        );
+    }
+
+    /// The reported "2 context menus open at the same time", for this pair, end to end through a
+    /// real click on the real `▾` trigger.
+    ///
+    /// Honest about what it discriminates: the `+` menu's own scrim is full-window and
+    /// non-occluding, so that click would incidentally dismiss it even without
+    /// `close_menu_surfaces_except`. What this pins is the *outcome* - one menu open, never two -
+    /// through a real interaction; the sweep itself is what makes that outcome structural rather
+    /// than a coincidence of which scrim happens to be painted where, and
+    /// `crate::root::menus::menu_surface_tests::opening_any_one_surface_closes_all_five_others`
+    /// is the test that fails the moment the sweep stops covering a surface.
+    #[gpui::test]
+    fn opening_the_commit_menu_closes_an_already_open_plus_menu(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        app.update(cx, |app, cx| {
+            app.plus_menu_open = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("dropdown-menu-row-Git graph").is_some(),
+            "premise: the + menu must really be painted before the commit menu opens"
+        );
+
+        let toggle = cx
+            .debug_bounds("commit-composer-menu-toggle")
+            .expect("the ▾ toggle must really paint");
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.commit_menu_open,
+                "the click must really open the commit menu"
+            );
+            assert!(
+                !app.plus_menu_open,
+                "and must close the + menu - two popovers painted at once is the reported bug"
+            );
+        });
+        assert!(
+            cx.debug_bounds("dropdown-menu-row-Git graph").is_none(),
+            "the + menu must really stop painting, not merely have its flag cleared"
+        );
     }
 
     #[gpui::test]

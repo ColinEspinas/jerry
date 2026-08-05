@@ -56,11 +56,13 @@ impl AdeApp {
     /// something else".
     pub(crate) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = true;
-        // The tab strip's `+` menu, the title bar's File/Edit/View/Agent/Help dropdown, and
-        // the "New file" prompt are all unconditional siblings of the palette - see
-        // `Self::plus_menu_open`'s/`Self::title_menu_open`'s/`Self::new_file_input`'s own docs.
-        self.plus_menu_open = false;
-        self.title_menu_open = None;
+        // Every floating menu is an unconditional sibling of the palette - see
+        // `crate::root::menus`. This used to close only the `+` menu and the title bar's
+        // dropdown by hand, which meant opening the palette on top of an open commit-composer or
+        // git-graph menu left that popover painted over it (GitHub issue #176).
+        let _ = self.close_menu_surfaces_except(None);
+        // Not a `MenuSurface`: the "New file" prompt is a focus-owning modal, closed here for the
+        // separate reason `Self::new_file_input`'s own docs give.
         self.new_file_input = None;
         self.palette_focus.capture(window, &self.agents, cx);
         self.palette_scope = palette::PaletteScope::default();
@@ -134,27 +136,21 @@ impl AdeApp {
         if self.palette_open {
             self.close_palette(window, cx);
         }
-        self.plus_menu_open = false;
-        self.title_menu_open = None;
+        // Settings *replaces* the workspace body, so any floating menu left open would either
+        // float over the Settings page or keep painting its own full-window scrim over it,
+        // swallowing the first click a user aimed at it (an adversarial audit's own finding, for
+        // the git graph's two menus in particular: unlike opening a *different* tab, opening
+        // Settings does not clear `graph_tab_active`, so `leave_graph_tab` never runs). One sweep
+        // now, across all six - see `crate::root::menus`; this used to be three separate hand-kept
+        // lists that each covered a different subset (GitHub issue #176).
+        let _ = self.close_menu_surfaces_except(None);
         self.new_file_input = None;
-        // Same reason as the three above: Settings *replaces* the workspace body, so a file-tree
-        // context menu or a half-typed inline name left open would either float over the
-        // Settings page or - worse for the editor - keep the tree's `"tree-editing"` key context
-        // alive on a node that is no longer rendered (GitHub issue #19). The armed *delete
-        // confirmation* is deliberately left alone: it is a real, window-level modal the user is
-        // mid-way through answering, and `crate::root::AdeApp::render` keeps it hidden while
-        // Settings is up rather than silently disarming it.
-        self.tree_context_menu = None;
+        // Not a `MenuSurface`: a half-typed inline name would keep the tree's `"tree-editing"` key
+        // context alive on a node that is no longer rendered (GitHub issue #19). The armed
+        // *delete confirmation* is deliberately left alone: it is a real, window-level modal the
+        // user is mid-way through answering, and `crate::root::AdeApp::render` keeps it hidden
+        // while Settings is up rather than silently disarming it.
         self.tree_inline_edit = None;
-        // Same reason, for the git graph tab's own two window-positioned overlays (GitHub issue
-        // #1's row `⋯`/right-click menu and Push `▾` menu): unlike opening a *different* tab,
-        // opening Settings does not clear `graph_tab_active` (the graph tab, if it was showing,
-        // is still "active" underneath Settings - `crate::graph_view::render::AdeApp::
-        // leave_graph_tab` is not called here), so without this an open row or Push menu kept
-        // painting its full-window scrim over the Settings surface, swallowing the first click a
-        // user aimed at it (an adversarial audit's own finding).
-        self.graph_state.row_menu_open = None;
-        self.graph_state.push_menu_open = false;
         self.settings_open = true;
         self.settings_focus.capture(window, &self.agents, cx);
         self.prune_confirm_armed = false;

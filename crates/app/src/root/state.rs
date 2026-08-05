@@ -250,6 +250,7 @@ impl AdeApp {
             staging_error: None,
             _stage_tasks: TaskPool::new(),
             commit_menu_open: false,
+            commit_composer_bounds: gpui::Bounds::default(),
             open_files_by_worktree: HashMap::new(),
             open_change: None,
             close_tab_confirm_armed: None,
@@ -422,6 +423,18 @@ impl AdeApp {
                 window,
                 |this, window, cx| {
                     this.sync_theme_to_system_appearance(window, cx);
+                },
+            ),
+            // GitHub issue #176. Fires on both edges (activate *and* deactivate), so the callback
+            // has to ask `Window::is_window_active` which one it is rather than assuming - the
+            // same shape `vendor/zed/crates/workspace/src/workspace.rs`'s own
+            // `on_window_activation_changed` uses.
+            _window_activation_subscription: cx.observe_window_activation(
+                window,
+                |this, window, cx| {
+                    if !window.is_window_active() {
+                        this.close_all_menu_surfaces(cx);
+                    }
                 },
             ),
             plus_menu_open: false,
@@ -946,10 +959,14 @@ impl AdeApp {
         // Browsing away disarms a pending prune confirmation - see `Self::request_prune`'s docs.
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
-        // Same reasoning for the commit composer's own split-button popover (Revision R12 §5) -
-        // it targets whatever was previously selected's staged set, so it must not stay open
-        // pointed at the wrong one.
-        self.commit_menu_open = false;
+        // Same reasoning for every floating menu (`crate::root::menus`): the commit composer's
+        // split-button popover (Revision R12 §5) names the previously selected worktree's staged
+        // set, the file tree's context menu targets a row that is about to stop existing, and the
+        // git graph's row menu names a commit in the repo being left - none may stay open pointed
+        // at the wrong one. This used to clear only `commit_menu_open` here and
+        // `tree_context_menu` further down, leaving the graph's two menus behind (GitHub issue
+        // #176's own audit of who closes what).
+        let _ = self.close_menu_surfaces_except(None);
         // Reset per-worktree UI state (see `reset_per_worktree_ui_state`'s docs) so switching
         // never leaks a staged checkbox, open diff, or collapsed-dir entry from whatever was open
         // before. Deliberately runs *before* the focus-fallback block below: both
@@ -983,13 +1000,13 @@ impl AdeApp {
         self.file_tree = file_tree::FileTree::default();
         self.reload_expanded_dirs_from_fold_state();
         // Every one of these holds an absolute path in whatever was just left (GitHub issue #19):
-        // an open context menu targeting a row that is about to stop existing, a half-typed name
-        // for a folder in the old tree, a cut/copied entry a paste here would move across
-        // worktrees/repos, and an armed delete for a path in the old tree. Cleared together, in
-        // the same step as `file_tree`/`expanded_dirs` above and for the same reason - the window
-        // between here and the new walk landing must not leave a control pointing at the old
-        // worktree/repo.
-        self.tree_context_menu = None;
+        // a half-typed name for a folder in the old tree, a cut/copied entry a paste here would
+        // move across worktrees/repos, and an armed delete for a path in the old tree. Cleared
+        // together, in the same step as `file_tree`/`expanded_dirs` above and for the same reason
+        // - the window between here and the new walk landing must not leave a control pointing at
+        // the old worktree/repo. The tree's *context menu* belongs to that same list but is closed
+        // by the `close_menu_surfaces_except` sweep at the top of this method instead, so there is
+        // exactly one place that closes it.
         self.tree_inline_edit = None;
         self.tree_clipboard = None;
         // Every entry names an absolute path in whatever was just left, same reasoning as the

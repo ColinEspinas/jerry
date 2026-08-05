@@ -532,8 +532,22 @@ pub struct AdeApp {
     /// Whether the commit composer's `▾` split-button popover (Revision R12 §5: *Commit and
     /// push* / *Commit all N files* / *Amend last commit* / *Stash staged files*) is open. Closed
     /// on every worktree switch (`Self::select_worktree`) since it targets that worktree's own
-    /// staged set.
+    /// staged set, whenever any other [`menus::MenuSurface`] opens, when the right sidebar leaves
+    /// the Changes view (the composer stops being rendered, and a latched-open flag would pop the
+    /// popover back up on return), and when the window loses focus.
     pub(crate) commit_menu_open: bool,
+    /// The commit composer's own painted bounds, captured every render by a `gpui::canvas` child
+    /// (the same pattern [`Self::plus_button_bounds`] uses). `Bounds::default()` until the
+    /// composer has really painted once.
+    ///
+    /// GitHub issue #176: the popover used to be a *child* of the composer, which made its
+    /// "click-away dismisses" scrim - `absolute()` with inset 0 - resolve against the composer's
+    /// own ~135px box instead of the window, so clicking the Changes list, the file tree, the
+    /// rail, the tab strip or the editor did not close it ("the commit one is particularly bugged
+    /// and hard to close"). It is now a sibling of `Self::render_plus_menu` in [`Render::render`]
+    /// with a genuinely full-window scrim, which means it has to carry its anchor in window space
+    /// like every other popover here does.
+    pub(crate) commit_composer_bounds: gpui::Bounds<Pixels>,
     /// Ordered list of currently-open file tabs, rendered after every agent's own tab by
     /// `Self::render_tab_strip` - **per worktree**, keyed by [`Self::file_tree_root`]
     /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §3: "Switching worktrees
@@ -1431,8 +1445,22 @@ pub struct AdeApp {
     /// once at construction regardless of whether `Settings.theme.follow_system` starts on (see
     /// that method's own docs for why).
     pub(crate) _window_appearance_subscription: Subscription,
+    /// The live `Window::observe_window_activation` subscription that closes every open
+    /// dropdown/context menu when the window itself loses OS focus (GitHub issue #176: "when a
+    /// dropdown loses focus it should be closed"). Held for the entity's whole lifetime, like
+    /// [`Self::_window_appearance_subscription`] beside it - a dropped `Subscription` stops
+    /// firing.
+    ///
+    /// A menu is a transient, click-away surface anchored to a control in *this* window; leaving
+    /// one painted while the user is working in another window means coming back to a stale
+    /// popover positioned off bounds that may since have moved. Only the six
+    /// [`menus::MenuSurface`]s are swept - the palette/Settings/"New file" overlays own real
+    /// keyboard focus and half-typed input, and closing those out from under an alt-tab would
+    /// destroy real work.
+    pub(crate) _window_activation_subscription: Subscription,
     /// Whether the tab strip's `+` menu popover is open - see [`Self::render_plus_menu`].
-    /// Closed by its own scrim click, by picking a row, and defensively by
+    /// Closed by its own scrim click, by picking a row, by opening any other
+    /// [`menus::MenuSurface`], by the window losing focus, and defensively by
     /// [`Self::open_palette`]/[`Self::open_settings`] (it's rendered as an unconditional sibling
     /// of both, so it would otherwise paint over a surface it no longer makes sense above).
     pub(crate) plus_menu_open: bool,
@@ -2186,7 +2214,7 @@ impl AdeApp {
 }
 
 impl Render for AdeApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
@@ -2279,6 +2307,25 @@ impl Render for AdeApp {
             .when_some(self.title_menu_open, |el, menu| {
                 el.child(self.render_title_menu(menu, cx))
             })
+            // The commit composer's `▾` menu (GitHub issue #176) - a window-positioned overlay for
+            // the same reason `render_plus_menu` is one: it is anchored off a `gpui::canvas`-
+            // captured, window-space `Self::commit_composer_bounds`, and its click-away scrim has
+            // to cover the whole window rather than the composer's own 135px box. See
+            // `crate::sidebar::render::AdeApp::render_commit_menu`'s own docs.
+            //
+            // Gated on the composer really being rendered underneath: Settings replaces the
+            // workspace body, the right sidebar may be showing Files instead of Changes, and the
+            // Changes view itself falls back to an error message when there is no real diff - in
+            // all three cases `commit_composer_bounds` is a stale anchor from an earlier frame.
+            // `Self::close_right_sidebar_view`'s own clear keeps `commit_menu_open` from latching
+            // across a view switch; this guard is the belt to that braces.
+            .when(
+                self.commit_menu_open
+                    && !self.settings_open
+                    && self.right_sidebar_view == RightSidebarView::Changes
+                    && self.current_diff().is_some(),
+                |el| el.child(self.render_commit_menu(window, cx)),
+            )
             .children(self.render_hover_card(cx))
             .children(self.render_completions_popover(cx))
             .when(self.new_file_input.is_some(), |el| {
@@ -3552,6 +3599,7 @@ mod repo_list_tests {
 pub(crate) mod caret_blink;
 pub(crate) mod focus;
 pub mod layout;
+pub(crate) mod menus;
 pub(crate) mod new_file;
 pub(crate) mod rem_scope;
 pub(crate) mod resize;
