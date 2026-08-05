@@ -1585,13 +1585,7 @@ fn highlight_with(source: &str, grammar: Grammar) -> Vec<HighlightSpan> {
     else {
         return Vec::new();
     };
-    // GitHub issue #168. This is the single funnel every `highlight_*` entry point - and so every
-    // `crate::language::HighlighterFn` in the extension registry - goes through, which is why
-    // bracket-pair colouring is wired here rather than at each of the thirteen wrappers or at each
-    // renderer: one call site, no `HighlighterFn` signature change, and an injected layer
-    // (a markdown fence's Rust, an HTML `<script>`'s JavaScript) is already interleaved into these
-    // events in source-byte order, so its brackets nest correctly against the host document's.
-    colorize_bracket_pairs(source, fold_highlight_events(events))
+    fold_highlight_events(events)
 }
 
 /// Parses `source` with `tree-sitter-md`'s real block grammar and classifies it through the same
@@ -1686,6 +1680,64 @@ fn fold_highlight_events(
         }
     }
     spans
+}
+
+/// Which optional, settings-gated post-processes run over a freshly classified span list.
+///
+/// Everything a `tree-sitter-highlight` query itself produces is unconditional - a keyword is a
+/// keyword regardless of preference. This struct is for the real classification passes this module
+/// layers *on top* of that, which a user can genuinely want off. There is one so far.
+///
+/// [`Default`] is every option **enabled**, deliberately: each of these shipped on, so the default
+/// has to reproduce current behaviour exactly. That is also what lets the plain [`load_file`] /
+/// [`highlight_block`] / `EditBuffer::new` entry points stay unchanged (they delegate to their own
+/// `*_with_options` sibling with `HighlightOptions::default()`), so only the handful of real
+/// production call sites that can actually see a user's settings have to thread anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HighlightOptions {
+    /// GitHub issue #168's bracket-pair depth ring - `crate::settings::store::AppearanceSettings`'
+    /// own `bracket_pair_colorization`. When `false`, [`colorize_bracket_pairs`] genuinely does
+    /// not run: brackets keep the flat [`HighlightKind::PunctuationBracket`] the grammar gave
+    /// them, which is aliased to plain text, so the result is byte-for-byte what this module
+    /// produced before the feature existed - not a recoloured imitation of it.
+    pub bracket_pair_colorization: bool,
+}
+
+impl Default for HighlightOptions {
+    fn default() -> Self {
+        Self {
+            bracket_pair_colorization: true,
+        }
+    }
+}
+
+impl HighlightOptions {
+    /// Runs whichever post-processes this options set enables over `spans`.
+    ///
+    /// The one real seam between "what the grammar said" and "what this user asked for". Callers
+    /// that have a `Settings` to consult go through here; callers that don't get
+    /// [`HighlightOptions::default`], which is every option on.
+    pub fn apply(self, source: &str, spans: Vec<HighlightSpan>) -> Vec<HighlightSpan> {
+        if self.bracket_pair_colorization {
+            colorize_bracket_pairs(source, spans)
+        } else {
+            spans
+        }
+    }
+
+    /// Classifies `source` with `highlighter` and applies this options set - the whole
+    /// highlight-a-string pipeline in one call, so no caller has to remember that the two steps
+    /// belong together.
+    pub fn highlight(
+        self,
+        source: &str,
+        highlighter: Option<crate::language::HighlighterFn>,
+    ) -> Vec<HighlightSpan> {
+        match highlighter {
+            Some(highlighter) => self.apply(source, highlighter(source)),
+            None => Vec::new(),
+        }
+    }
 }
 
 /// The three bracket shapes [`colorize_bracket_pairs`] really tracks, opener paired with closer.
@@ -1988,19 +2040,22 @@ pub(crate) fn line_ranges(source: &str) -> Vec<Range<usize>> {
 /// real content, and a caller driving row count off this `Vec`'s length (`crate::root::
 /// merge_flow_render::AdeApp::render_conflict_columns`) must render zero rows for it, not one
 /// fabricated blank row.
+///
+/// `options` is required rather than defaulted (unlike [`load_file`], whose plain form stays for
+/// its many existing callers): every one of this function's real callers - the Diff view, the
+/// Merge view, the Markdown preview - has an `&self` to read the user's own settings from, so
+/// there is no call site that would legitimately want to guess.
 pub(crate) fn highlight_block<'a>(
     lines: impl IntoIterator<Item = &'a str>,
     extension: Option<&str>,
+    options: HighlightOptions,
 ) -> Vec<RenderedLine> {
     let lines: Vec<&str> = lines.into_iter().collect();
     if lines.is_empty() {
         return Vec::new();
     }
     let source = lines.join("\n");
-    let spans = match highlighter_for_extension(extension) {
-        Some(highlighter) => highlighter(&source),
-        None => Vec::new(),
-    };
+    let spans = options.highlight(&source, highlighter_for_extension(extension));
     build_lines(&source, &spans)
 }
 
@@ -2035,6 +2090,16 @@ pub fn load_file(path: &Path) -> io::Result<ParsedFile> {
     Ok(load_file_with_source(path)?.0)
 }
 
+/// [`load_file_with_source`] with a real, caller-supplied [`HighlightOptions`] - what
+/// `crate::code_surface::tabs::AdeApp::spawn_file_load` actually calls, having read the user's own
+/// setting on the foreground thread before spawning the background read.
+pub fn load_file_with_options(
+    path: &Path,
+    options: HighlightOptions,
+) -> io::Result<(ParsedFile, String)> {
+    load_file_inner(path, options)
+}
+
 /// [`load_file`]'s real implementation, also handing back the decoded source text - used by
 /// `crate::root::AdeApp::spawn_file_load` to lazily seed a `crate::code_surface::edit_buffer::EditBuffer` from
 /// the exact same background read/decode this already does, rather than a second, independent
@@ -2042,6 +2107,10 @@ pub fn load_file(path: &Path) -> io::Result<ParsedFile> {
 /// kept as the public entry point every other existing caller (and this module's own tests)
 /// already uses unchanged.
 pub fn load_file_with_source(path: &Path) -> io::Result<(ParsedFile, String)> {
+    load_file_inner(path, HighlightOptions::default())
+}
+
+fn load_file_inner(path: &Path, options: HighlightOptions) -> io::Result<(ParsedFile, String)> {
     let metadata = fs::metadata(path)?;
     let len = metadata.len();
     let mtime = metadata.modified().ok();
@@ -2064,10 +2133,7 @@ pub fn load_file_with_source(path: &Path) -> io::Result<(ParsedFile, String)> {
 
     let extension = path.extension().and_then(|ext| ext.to_str());
     let language = language_name_for_extension(extension);
-    let spans = match highlighter_for_extension(extension) {
-        Some(highlighter) => highlighter(&source),
-        None => Vec::new(),
-    };
+    let spans = options.highlight(&source, highlighter_for_extension(extension));
     let lines = build_lines(&source, &spans);
 
     let parsed = ParsedFile {
@@ -4014,7 +4080,11 @@ mod tests {
             "    crate::language::entry_for_extension(extension)?.highlighter",
             "}",
         ];
-        let rendered = highlight_block(lines.iter().copied(), Some("rs"));
+        let rendered = highlight_block(
+            lines.iter().copied(),
+            Some("rs"),
+            HighlightOptions::default(),
+        );
         let kinds: HashSet<HighlightKind> = rendered
             .iter()
             .flat_map(|line| &line.runs)
@@ -4049,7 +4119,11 @@ mod tests {
             "        return ours",
             "    return theirs",
         ];
-        let rendered = highlight_block(lines.iter().copied(), Some("py"));
+        let rendered = highlight_block(
+            lines.iter().copied(),
+            Some("py"),
+            HighlightOptions::default(),
+        );
         let kinds: HashSet<HighlightKind> = rendered
             .iter()
             .flat_map(|line| &line.runs)
@@ -4077,7 +4151,11 @@ mod tests {
 
     #[test]
     fn highlight_block_on_an_unregistered_extension_is_all_plain_text() {
-        let rendered = highlight_block(["-- a comment", "SELECT * FROM t;"], Some("sql"));
+        let rendered = highlight_block(
+            ["-- a comment", "SELECT * FROM t;"],
+            Some("sql"),
+            HighlightOptions::default(),
+        );
         let kinds: HashSet<HighlightKind> = rendered
             .iter()
             .flat_map(|line| &line.runs)
@@ -4098,7 +4176,7 @@ mod tests {
     /// for content that was never real.
     #[test]
     fn highlight_block_on_zero_input_lines_returns_zero_rendered_lines() {
-        let rendered = highlight_block(std::iter::empty(), Some("rs"));
+        let rendered = highlight_block(std::iter::empty(), Some("rs"), HighlightOptions::default());
         assert!(
             rendered.is_empty(),
             "zero real input lines must produce zero RenderedLines, not build_lines' one-empty-\
@@ -4111,7 +4189,7 @@ mod tests {
     /// the fix must not overcorrect into dropping real blank lines too.
     #[test]
     fn highlight_block_on_one_real_blank_line_still_returns_one_rendered_line() {
-        let rendered = highlight_block([""], Some("rs"));
+        let rendered = highlight_block([""], Some("rs"), HighlightOptions::default());
         assert_eq!(rendered.len(), 1);
         assert_eq!(rendered[0].text, "");
     }
@@ -4424,6 +4502,16 @@ mod tests {
     // points the app calls.
     // ---------------------------------------------------------------------------------------
 
+    /// A real grammar's spans **with the default `HighlightOptions` applied** - i.e. the exact
+    /// pipeline a File view with default settings really runs. The bare `highlight_*` functions
+    /// are pure grammar classification and deliberately do not apply the depth ring themselves
+    /// (that is what makes `appearance.bracket_pair_colorization` able to switch it off without
+    /// undoing work), so a test about the ring has to go through `HighlightOptions` the same way
+    /// production does.
+    fn ring_spans(source: &str, highlighter: crate::language::HighlighterFn) -> Vec<HighlightSpan> {
+        HighlightOptions::default().highlight(source, Some(highlighter))
+    }
+
     /// The bucket the span covering `byte` classifies it as. Deliberately *not* `kind_at`, which
     /// looks its argument up by substring search and so always finds the first `(` in the file -
     /// useless when the whole question is which of several identical characters this one is.
@@ -4461,7 +4549,7 @@ mod tests {
     #[test]
     fn real_rust_source_gets_real_depth_varying_bracket_colours() {
         let source = "fn main() {\n    let v = vec![(1, \"(\")];\n}\n";
-        let spans = highlight_rust(source);
+        let spans = ring_spans(source, highlight_rust);
 
         let brace_open = nth_offset(source, '{', 0);
         let bracket_open = nth_offset(source, '[', 0);
@@ -4500,7 +4588,7 @@ mod tests {
     #[test]
     fn real_typescript_source_gets_real_depth_varying_bracket_colours() {
         let source = "function f(m: Map<string, number>) {\n  return [{ a: 1 }];\n}\n";
-        let spans = highlight_ts(source);
+        let spans = ring_spans(source, highlight_ts);
 
         assert_eq!(ring_index_at(&spans, nth_offset(source, '(', 0)), Some(0));
         assert_eq!(ring_index_at(&spans, nth_offset(source, ')', 0)), Some(0));
@@ -4531,7 +4619,7 @@ mod tests {
     fn real_python_source_gets_real_depth_varying_bracket_colours() {
         let source =
             "def f():\n    return sorted([(k, v) for k, v in d.items()])  # ) not a bracket\n";
-        let spans = highlight_python(source);
+        let spans = ring_spans(source, highlight_python);
 
         assert_eq!(ring_index_at(&spans, nth_offset(source, '(', 1)), Some(0)); // sorted(
         assert_eq!(ring_index_at(&spans, nth_offset(source, '[', 0)), Some(1));
@@ -4556,7 +4644,7 @@ mod tests {
     #[test]
     fn rendered_line_runs_really_carry_distinct_bracket_colours() {
         let source = "fn main() {\n    let v = vec![(1, 2)];\n}\n";
-        let lines = build_lines(source, &highlight_rust(source));
+        let lines = build_lines(source, &ring_spans(source, highlight_rust));
 
         let ring_runs: Vec<(String, HighlightKind)> = lines
             .iter()
@@ -4657,7 +4745,7 @@ mod tests {
             ("css", highlight_css, ".a { color: rgb(1, 2, 3); }"),
         ];
         for (name, highlight, source) in coloured {
-            let spans = highlight(source);
+            let spans = ring_spans(source, highlight);
             let ring: Vec<&str> = spans
                 .iter()
                 .filter(|span| HighlightKind::BRACKET_DEPTH_RING.contains(&span.kind))
@@ -4684,7 +4772,7 @@ mod tests {
             ("html", highlight_html, "<div><p>x</p></div>"),
         ];
         for (name, highlight, source) in excluded {
-            let spans = highlight(source);
+            let spans = ring_spans(source, highlight);
             assert!(
                 !spans
                     .iter()
@@ -4694,12 +4782,139 @@ mod tests {
         }
     }
 
+    /// `appearance.bracket_pair_colorization = false` really switches the feature off - the same
+    /// spans, in the same languages, come back with the flat `PunctuationBracket` the grammar gave
+    /// them and no ring bucket anywhere.
+    ///
+    /// Byte-for-byte identical to what this module produced before the feature existed, which is
+    /// the honest meaning of "off": the pass genuinely does not run, so there is no recoloured
+    /// imitation of the old behaviour to drift from it.
+    #[test]
+    fn disabling_bracket_pair_colorization_really_leaves_brackets_plain() {
+        let off = HighlightOptions {
+            bracket_pair_colorization: false,
+        };
+        let cases: [(&str, crate::language::HighlighterFn, &str); 3] = [
+            (
+                "rust",
+                highlight_rust,
+                "fn main() { let v = vec![(1, 2)]; }",
+            ),
+            (
+                "typescript",
+                highlight_ts,
+                "function f() { g([{ a: 1 }]); }",
+            ),
+            ("python", highlight_python, "def f():\n    g([(1, 2)])\n"),
+        ];
+        for (name, highlighter, source) in cases {
+            let raw = highlighter(source);
+            let disabled = off.apply(source, raw.clone());
+            let enabled = HighlightOptions::default().apply(source, raw.clone());
+
+            assert_eq!(
+                disabled, raw,
+                "{name}: with the setting off the span list must be exactly what the grammar                  produced - the pass must not run at all"
+            );
+            assert!(
+                !disabled
+                    .iter()
+                    .any(|span| HighlightKind::BRACKET_DEPTH_RING.contains(&span.kind)),
+                "{name}: no ring bucket may survive with the setting off"
+            );
+            assert!(
+                disabled
+                    .iter()
+                    .any(|span| span.kind == HighlightKind::PunctuationBracket),
+                "{name}: brackets must still be classified as plain PunctuationBracket, not lost"
+            );
+            assert!(
+                enabled
+                    .iter()
+                    .any(|span| HighlightKind::BRACKET_DEPTH_RING.contains(&span.kind)),
+                "{name}: premise - the same source really does get the ring when enabled"
+            );
+        }
+    }
+
+    /// Toggling back on restores the ring exactly, from the same input - the setting is a real
+    /// switch, not a one-way downgrade.
+    #[test]
+    fn re_enabling_bracket_pair_colorization_restores_the_identical_ring() {
+        let source = "fn main() { let v = vec![(1, 2)]; }";
+        let raw = highlight_rust(source);
+        let on = HighlightOptions::default();
+        let off = HighlightOptions {
+            bracket_pair_colorization: false,
+        };
+
+        let first = on.apply(source, raw.clone());
+        let disabled = off.apply(source, raw.clone());
+        let restored = on.apply(source, raw.clone());
+
+        assert_eq!(
+            first, restored,
+            "re-enabling must reproduce the ring exactly"
+        );
+        assert_ne!(
+            disabled, restored,
+            "premise: off and on really do differ for this source"
+        );
+    }
+
+    /// The whole-pipeline entry points honour the setting too, not just the raw `apply` seam -
+    /// `load_file`'s own `_with_options` sibling and `highlight_block_with_options` are what the
+    /// File view and the Diff/Merge views actually call.
+    #[test]
+    fn the_options_aware_entry_points_really_honour_the_setting() {
+        let off = HighlightOptions {
+            bracket_pair_colorization: false,
+        };
+        let ring_count = |lines: &[RenderedLine]| {
+            lines
+                .iter()
+                .flat_map(|line| line.runs.iter())
+                .filter(|(_, kind)| HighlightKind::BRACKET_DEPTH_RING.contains(kind))
+                .count()
+        };
+
+        let hunk = ["fn main() {", "    let v = vec![(1, 2)];", "}"];
+        assert!(
+            ring_count(&highlight_block(
+                hunk,
+                Some("rs"),
+                HighlightOptions::default()
+            )) > 0,
+            "premise: the default really colours this hunk"
+        );
+        assert_eq!(
+            ring_count(&highlight_block(hunk, Some("rs"), off)),
+            0,
+            "highlight_block_with_options must really honour the setting"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sample.rs");
+        std::fs::write(&path, "fn main() { let v = vec![(1, 2)]; }\n").expect("write");
+        let (on_parsed, _) =
+            load_file_with_options(&path, HighlightOptions::default()).expect("load");
+        let (off_parsed, _) = load_file_with_options(&path, off).expect("load");
+        assert!(
+            ring_count(&on_parsed.lines) > 0,
+            "premise: loading really colours this file by default"
+        );
+        assert_eq!(
+            ring_count(&off_parsed.lines),
+            0,
+            "load_file_with_options must really honour the setting"
+        );
+    }
+
     /// A markdown fenced code block's Rust reaches the ring too - the injection path really goes
     /// through the same `highlight_with` funnel, so this needed no markdown-specific wiring.
     #[test]
     fn brackets_inside_a_markdown_fenced_code_block_reach_the_ring() {
         let source = "# Title\n\n```rust\nfn f() { g(1); }\n```\n";
-        let spans = highlight_markdown(source);
+        let spans = ring_spans(source, highlight_markdown);
         assert_eq!(ring_index_at(&spans, nth_offset(source, '{', 0)), Some(0));
         assert_eq!(ring_index_at(&spans, nth_offset(source, '(', 1)), Some(1));
     }
@@ -4710,7 +4925,11 @@ mod tests {
     /// an undiscovered surprise.
     #[test]
     fn a_partial_hunk_colours_its_own_balanced_pairs_and_leaves_the_dangling_ones_plain() {
-        let rendered = highlight_block(["    let v = vec![1];", "}"], Some("rs"));
+        let rendered = highlight_block(
+            ["    let v = vec![1];", "}"],
+            Some("rs"),
+            HighlightOptions::default(),
+        );
         let runs: Vec<HighlightKind> = rendered
             .iter()
             .flat_map(|line| line.runs.iter())

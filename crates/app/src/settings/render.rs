@@ -1078,6 +1078,16 @@ impl AdeApp {
                 |this, cx| this.toggle_caret_blink(cx),
             ),
         );
+        let bracket_pair_row = self.render_settings_row(
+            "Bracket pair colors",
+            "Color matching brackets by nesting depth, so a pair and its contents are easy to trace.",
+            self.render_toggle_control(
+                "settings-bracket-pair-colorization",
+                self.settings.appearance.bracket_pair_colorization,
+                cx,
+                |this, cx| this.toggle_bracket_pair_colorization(cx),
+            ),
+        );
         let indent_guides_row = self.render_settings_row(
             "Indent guides",
             "Vertical lines marking each level of leading indentation in the code editor.",
@@ -1134,6 +1144,7 @@ impl AdeApp {
             .child(caret_style_row)
             .child(caret_blink_row)
             .child(indent_guides_row)
+            .child(bracket_pair_row)
             .child(self.render_snippet_block(settings_store::ConfigPage::Appearance))
     }
 
@@ -2734,6 +2745,19 @@ impl AdeApp {
     /// GitHub issue #122's real indent-guide toggle - `pub(crate)` like [`Self::toggle_caret_blink`]
     /// above, for the same reason: `indent_guide_tests` (`crate::code_surface::editing`) drives
     /// this directly for its own real-render coverage of whether a guide actually paints.
+    /// GitHub issue #168's bracket-pair colorization toggle. Unlike its neighbours this cannot
+    /// simply flip-persist-notify: the depth ring is produced during *highlighting*, not at paint
+    /// time, so every cached `RenderedLine` computed under the old setting has to be rebuilt -
+    /// see [`AdeApp::invalidate_syntax_highlighting`] for the four caches that means and why
+    /// nulling them alone isn't enough.
+    pub(crate) fn toggle_bracket_pair_colorization(&mut self, cx: &mut Context<Self>) {
+        self.settings.appearance.bracket_pair_colorization =
+            !self.settings.appearance.bracket_pair_colorization;
+        self.persist_settings(cx);
+        self.invalidate_syntax_highlighting(cx);
+        cx.notify();
+    }
+
     pub(crate) fn toggle_indent_guides(&mut self, cx: &mut Context<Self>) {
         self.settings.appearance.show_indent_guides = !self.settings.appearance.show_indent_guides;
         self.persist_settings(cx);
@@ -5558,6 +5582,171 @@ mod custom_theme_settings_tests {
         assert!(
             errors[0].starts_with("broken.toml:"),
             "the real error should name the offending file, got: {errors:?}"
+        );
+    }
+}
+
+/// GitHub issue #168's `appearance.bracket_pair_colorization` toggle. Deliberately split the same
+/// way `indent_guide_settings_tests` is: the field/persistence half lives here, and the half that
+/// would actually catch "the toggle flips a field but nothing changes" lives next to the real
+/// highlighting it gates
+/// (`crate::code_surface::code_view::tests::bracket_pair_colorization_setting_tests`) plus the
+/// live-invalidation test in `crate::code_surface::editing`.
+#[cfg(test)]
+mod bracket_pair_colorization_settings_tests {
+    use super::*;
+    use crate::root::AdeApp;
+    use crate::settings::store as settings_store;
+    use gpui::TestAppContext;
+    use std::path::PathBuf;
+
+    /// Same real-load-before-construct helper `indent_guide_settings_tests` uses - see its own
+    /// docs for why loading from disk first is load-bearing rather than incidental.
+    fn open_app_with_state_dir(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        settings_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        let settings = settings_store::Settings::load_or_init_at(&settings_path);
+        cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                Some(repo_path),
+                true,
+                settings,
+                Some(settings_path),
+                window,
+                cx,
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn toggle_bracket_pair_colorization_flips_the_real_setting_and_persists_across_reload(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) =
+            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+
+        assert!(
+            app.read_with(cx, |app, _| app
+                .settings
+                .appearance
+                .bracket_pair_colorization),
+            "sanity check: the real default is on - this shipped enabled, so the setting is an \
+             opt-out, not an opt-in"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_bracket_pair_colorization(cx);
+        });
+        assert!(
+            !app.read_with(cx, |app, _| app
+                .settings
+                .appearance
+                .bracket_pair_colorization),
+            "the real Settings field must have flipped off"
+        );
+        cx.run_until_parked();
+
+        let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        assert!(
+            !reloaded.read_with(cx, |app, _| app
+                .settings
+                .appearance
+                .bracket_pair_colorization),
+            "the toggle must have really been persisted to disk, not just flipped in memory"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_bracket_pair_colorization(cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app
+                .settings
+                .appearance
+                .bracket_pair_colorization),
+            "the real Settings field must have flipped back on"
+        );
+    }
+
+    /// The setting is what `AdeApp::highlight_options` reports - i.e. the value really reaches the
+    /// highlighting pipeline, rather than being a persisted field nothing consumes.
+    #[gpui::test]
+    fn the_setting_really_drives_the_highlight_options_the_pipeline_consumes(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+
+        assert!(
+            app.read_with(cx, |app, _| app
+                .highlight_options()
+                .bracket_pair_colorization),
+            "options must start enabled"
+        );
+        app.update(cx, |app, cx| {
+            app.toggle_bracket_pair_colorization(cx);
+        });
+        assert!(
+            !app.read_with(cx, |app, _| app
+                .highlight_options()
+                .bracket_pair_colorization),
+            "flipping the setting must really change what the highlight pipeline is handed"
+        );
+    }
+
+    /// The real Settings UI row: it paints, and clicking it flips the real persisted value. This
+    /// is what would catch a row wired to nothing, or wired to the wrong handler.
+    #[gpui::test]
+    fn the_appearance_page_row_paints_and_clicking_it_flips_the_real_setting(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Appearance, window, cx);
+        });
+        cx.run_until_parked();
+
+        let bounds = cx
+            .debug_bounds("settings-bracket-pair-colorization")
+            .expect("the Bracket pair colors toggle must really paint on the Appearance page");
+        assert!(
+            app.read_with(cx, |app, _| app
+                .settings
+                .appearance
+                .bracket_pair_colorization),
+            "premise: on before the click"
+        );
+
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app
+                .settings
+                .appearance
+                .bracket_pair_colorization),
+            "clicking the real row must flip the real setting"
+        );
+
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app
+                .settings
+                .appearance
+                .bracket_pair_colorization),
+            "and clicking it again must flip it back"
         );
     }
 }

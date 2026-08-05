@@ -526,12 +526,16 @@ impl AdeApp {
             .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_string());
+        // Read on the foreground thread, before the background read is spawned - the background
+        // closure has no `self` to consult (see `spawn_file_load`'s own stale-worktree discipline
+        // above, which captures everything it needs up front for the same reason).
+        let highlight_options = self.highlight_options();
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn({
                     let path = path.clone();
-                    async move { code_view::load_file_with_source(&path) }
+                    async move { code_view::load_file_with_options(&path, highlight_options) }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {

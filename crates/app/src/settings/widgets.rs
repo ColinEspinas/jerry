@@ -377,13 +377,21 @@ impl AdeApp {
     /// rows" spec) - `id` must be unique per row (used as the GPUI element id).
     pub(in crate::settings) fn render_toggle_control(
         &self,
-        id: impl Into<gpui::ElementId>,
+        id: &'static str,
         on: bool,
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
         div()
             .id(id)
+            // Same lookup key as the element id, so a real test can measure this toggle's own
+            // painted bounds and click it (`VisualTestContext::debug_bounds`) rather than
+            // asserting only on the field the handler happens to write - see
+            // `crate::settings::render::bracket_pair_colorization_settings_tests`. A no-op
+            // outside test builds, matching every other `debug_selector` in this crate; narrowed
+            // from `impl Into<ElementId>` to `&'static str` to make it available, which every one
+            // of this method's call sites already passed.
+            .debug_selector(move || id.to_string())
             .cursor_pointer()
             .flex_none()
             .w(px(26.0))

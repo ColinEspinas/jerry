@@ -322,8 +322,11 @@ impl AdeApp {
             return;
         }
         let extension = relative_path.extension().and_then(|ext| ext.to_str());
-        let ours = code_view::highlight_block(hunk.ours.iter().map(String::as_str), extension);
-        let theirs = code_view::highlight_block(hunk.theirs.iter().map(String::as_str), extension);
+        let options = self.highlight_options();
+        let ours =
+            code_view::highlight_block(hunk.ours.iter().map(String::as_str), extension, options);
+        let theirs =
+            code_view::highlight_block(hunk.theirs.iter().map(String::as_str), extension, options);
         self.merge_highlight_cache =
             Some((relative_path.to_path_buf(), hunk.clone(), ours, theirs));
     }
@@ -342,7 +345,7 @@ impl AdeApp {
     /// overlap), so this stays a synchronous call at the real change point rather than a
     /// background `cx.spawn()` task, the same real-cost-justified choice
     /// `code_surface::diff_view::AdeApp::ensure_diff_highlight_cache`'s docs explain for the Diff view.
-    pub(in crate::merge) fn ensure_active_merge_highlight_cache(&mut self) {
+    pub(crate) fn ensure_active_merge_highlight_cache(&mut self) {
         let Some(flow) = self.merge_flow.as_ref() else {
             return;
         };

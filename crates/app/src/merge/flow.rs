@@ -492,7 +492,14 @@ impl AdeApp {
         let content = file.render();
         let len = content.len() as u64;
         let absolute_path = base_worktree_path.join(&relative_path);
-        let buffer = edit_buffer::EditBuffer::new(absolute_path, content, None, None, len);
+        let buffer = edit_buffer::EditBuffer::new_with_options(
+            absolute_path,
+            content,
+            None,
+            None,
+            len,
+            self.highlight_options(),
+        );
         // A genuinely fresh buffer - bumped here, not reused from a stale value, so a save
         // dispatched against the *previous* buffer for this same file (if any - see the re-click
         // early return above) can never be mistaken for one dispatched against this new one. See

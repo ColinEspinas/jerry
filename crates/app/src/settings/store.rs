@@ -155,6 +155,20 @@ pub struct AppearanceSettings {
     /// monospace character width rather than a hardcoded pixel constant, so the guides never
     /// drift from the file's own actual leading whitespace.
     pub show_indent_guides: bool,
+    /// Whether matched bracket pairs are coloured by nesting depth (GitHub issue #168's
+    /// bracket-pair colorization - what VSCode calls "Bracket Pair Colorization"). `true` by
+    /// default: the feature shipped enabled, so this is a real opt-*out*, not an opt-in that
+    /// would silently turn it off for everyone who already has it.
+    ///
+    /// Unlike every other toggle in this struct, this one is not merely read at paint time - it
+    /// is an input to *span production*
+    /// (`crate::code_surface::code_view::HighlightOptions::apply`, reached through the
+    /// `*_with_options` highlight entry points), because the depth ring is carried as real
+    /// `HighlightKind` variants rather than a render-time colour choice. Cached `RenderedLine`s
+    /// therefore have to be rebuilt when it changes, which is what
+    /// `crate::root::AdeApp::invalidate_syntax_highlighting` exists for - see
+    /// `crate::settings::render::AdeApp::toggle_bracket_pair_colorization`.
+    pub bracket_pair_colorization: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -168,6 +182,7 @@ impl Default for AppearanceSettings {
             caret_style: CaretStyle::default(),
             caret_blink: true,
             show_indent_guides: true,
+            bracket_pair_colorization: true,
         }
     }
 }
@@ -583,7 +598,8 @@ pub fn config_keys_line(page: ConfigPage) -> &'static str {
             "appearance.interface_scale_percent \u{b7} appearance.editor_font_size \u{b7} \
              appearance.terminal_font_size \u{b7} appearance.follow_system_text_size \u{b7} \
              appearance.editor_zoom_percent \u{b7} appearance.caret_style \u{b7} \
-             appearance.caret_blink \u{b7} appearance.show_indent_guides"
+             appearance.caret_blink \u{b7} appearance.show_indent_guides \u{b7} \
+             appearance.bracket_pair_colorization"
         }
         ConfigPage::Theme => {
             "theme.name \u{b7} theme.follow_system \u{b7} theme.high_contrast_diff"
@@ -940,6 +956,45 @@ mod tests {
         assert!(!loaded.appearance.show_indent_guides);
     }
 
+    /// GitHub issue #168's `bracket_pair_colorization` toggle, round-tripped through real TOML
+    /// save/load - same dedicated-test discipline as [`show_indent_guides_round_trips_through_real_toml_save_and_load`]
+    /// above, and additionally pinning that a file written *before* this key existed still loads
+    /// with the feature on. That backward-compatibility case is the one that matters here: this
+    /// shipped enabled, so a missing key has to mean "on", never "off".
+    #[test]
+    fn bracket_pair_colorization_round_trips_and_defaults_on_for_an_older_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+
+        assert!(
+            Settings::default().appearance.bracket_pair_colorization,
+            "sanity check: the real default is on - this is an opt-out, not an opt-in"
+        );
+
+        let mut settings = Settings::default();
+        settings.appearance.bracket_pair_colorization = false;
+        settings.save_at(&path).expect("save should succeed");
+        let loaded = Settings::load_or_init_at(&path);
+
+        assert_eq!(settings, loaded);
+        assert!(!loaded.appearance.bracket_pair_colorization);
+
+        // A real settings file written before this key existed - an `[appearance]` table that
+        // simply doesn't name it.
+        let older = dir.path().join("older.toml");
+        std::fs::write(
+            &older,
+            "[appearance]\ninterface_scale_percent = 110\neditor_font_size = 15.0\n",
+        )
+        .expect("write");
+        let upgraded = Settings::load_or_init_at(&older);
+        assert!(
+            upgraded.appearance.bracket_pair_colorization,
+            "a file predating this key must keep the feature on, not silently lose it"
+        );
+        assert_eq!(upgraded.appearance.interface_scale_percent, 110);
+    }
+
     #[test]
     fn a_missing_file_gets_a_real_default_file_written_and_returns_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1047,6 +1102,7 @@ mod tests {
             caret_style: CaretStyle::Block,
             caret_blink: false,
             show_indent_guides: false,
+            bracket_pair_colorization: false,
         };
         let before = appearance.clone();
 

@@ -406,9 +406,17 @@ impl AdeApp {
         // showing at all. Same real reveal - and same recorded expansions - as the palette's own
         // "reveal in tree".
         self.reveal_in_tree(&absolute_path, cx);
+        let options = self.highlight_options();
         self.insert_edit_buffer(
             relative,
-            edit_buffer::EditBuffer::new(absolute_path, String::new(), extension, None, 0),
+            edit_buffer::EditBuffer::new_with_options(
+                absolute_path,
+                String::new(),
+                extension,
+                None,
+                0,
+                options,
+            ),
         );
         self.refresh_open_diff_file_cache();
         self.hover = None;
