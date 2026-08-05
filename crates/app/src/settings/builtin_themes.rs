@@ -248,18 +248,22 @@ mod tests {
         }
     }
 
-    /// **The migration's own proof.** For every bundled theme and every single registered token,
+    /// **The generator's own proof.** For every bundled theme and every single registered token,
     /// what the app resolves today (through the real, checked-in file, compiled the real way, with
-    /// no derivation anywhere in the path) must equal what the *old* mechanism would have computed
-    /// live for that token - `apply_shift(token.default, derive_shift(jerry_dark, swatches))`.
+    /// no derivation anywhere in the path) must equal what the generator produces right now -
+    /// `derived_palette(derive_shift(jerry_dark, swatches))`.
+    ///
+    /// This used to compare against the *old* live HSL derivation instead, as the migration's
+    /// bit-for-bit proof that turning derived palettes into files changed no colours. The theme
+    /// redesign deliberately changed the derivation - to OKLCH, plus a real contrast-floor guard -
+    /// so that comparison is no longer the right question and has been replaced by this one: the
+    /// checked-in files must be exactly what today's generator makes, which is what stops a
+    /// hand-edit or a stale file from surviving unnoticed.
     ///
     /// Compared at 8-bit-per-channel precision, which is the precision a theme file (and a
-    /// rendered pixel) actually has: the old mechanism produced an unrounded `f32` triple per
-    /// token, and writing it into a `#rrggbb` file necessarily rounds it. That rounding is the
-    /// only difference this migration introduces anywhere, it is at most half of one 1/255 step
-    /// per channel, and it is inherent to any file-based format - see this module's own docs.
+    /// rendered pixel) actually has.
     #[test]
-    fn every_builtin_theme_resolves_exactly_what_the_old_derivation_produced() {
+    fn every_builtin_theme_resolves_exactly_what_the_generator_produces() {
         use crate::settings::custom_theme::compile_palette_by_name;
 
         for source in BUILTIN_THEME_SOURCES.iter().skip(1) {
@@ -267,21 +271,62 @@ mod tests {
                 .expect("a bundled theme must compile")
                 .expect("a bundled non-Jerry-Dark theme has real overrides");
             let shift = theme::derive_shift(jerry_dark_swatches(), source.swatches);
+            let generated: std::collections::HashMap<&str, gpui::Rgba> =
+                theme::derived_palette(shift).into_iter().collect();
 
             for token in theme::all_tokens() {
-                let old = crate::settings::custom_theme::rgba_to_hex(theme::apply_shift(
-                    token.default,
-                    shift,
-                ));
-                let new = crate::settings::custom_theme::rgba_to_hex(
+                let expected = crate::settings::custom_theme::rgba_to_hex(
+                    *generated
+                        .get(token.key)
+                        .expect("derived_palette covers every registered token"),
+                );
+                let actual = crate::settings::custom_theme::rgba_to_hex(
                     *palette
                         .get(token.key)
                         .unwrap_or_else(|| panic!("{} is missing from {}", token.key, source.name)),
                 );
                 assert_eq!(
-                    old, new,
-                    "{}: {} resolves to #{new:06x}, but the old derivation produced #{old:06x}",
+                    expected, actual,
+                    "{}: {} resolves to #{actual:06x}, but the generator produces #{expected:06x} \
+                     - regenerate the bundled files (see this module's docs)",
                     source.name, token.key
+                );
+            }
+        }
+    }
+
+    /// The redesign's own headline guarantee, checked on the real checked-in files rather than on
+    /// the generator in memory: **every** bundled theme clears its syntax contrast floors. This is
+    /// what `theme::enforce_syntax_contrast_floors` exists to make true, and it is stated here as
+    /// well as in `theme::syntax_restraint_tests` because this is the layer where a stale file
+    /// (rather than a bad default) would break it.
+    #[test]
+    fn every_bundled_theme_file_clears_its_syntax_contrast_floors() {
+        use crate::settings::custom_theme::compile_palette_by_name;
+
+        for source in BUILTIN_THEME_SOURCES.iter() {
+            let palette = compile_palette_by_name(source.name, &[])
+                .expect("a bundled theme must compile")
+                .unwrap_or_default();
+            let resolve = |key: &str| {
+                palette.get(key).copied().unwrap_or_else(|| {
+                    theme::token_for_key(key)
+                        .expect("a real registered key")
+                        .default
+                })
+            };
+            let background = resolve("surface.center");
+            for token in theme::all_tokens() {
+                let Some(floor) = theme::syntax_contrast_floor_for_test(token.key) else {
+                    continue;
+                };
+                let ratio = theme::contrast_ratio(resolve(token.key), background);
+                assert!(
+                    ratio >= floor,
+                    "{}: {} is {ratio:.2}:1 against the editor background, below its {floor}:1 \
+                     floor",
+                    source.name,
+                    token.key
                 );
             }
         }
