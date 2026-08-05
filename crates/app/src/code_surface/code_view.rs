@@ -1109,9 +1109,12 @@ const C_BRACKET_SUPPLEMENT: &str = r#"
 /// are.
 ///
 /// The design principle behind wanting it is `theme::syntax`' own module docs' "what earns a
-/// colour" section: a definition site is rare and tells you where a name *comes from*, a call site
-/// is one of the most common things in any file. Colouring both spends the whole contrast budget on
-/// the frequent half.
+/// colour" section: a definition site is rare and tells you where a name *comes from*. One revision
+/// of the palette used that to hold call sites at plain foreground entirely; that was rejected on
+/// the rendered result and walked back, so both are coloured now and the distinction is carried by
+/// hue instead - calls on the blue at H 250, definitions on the violet-blue at H 285. Either way
+/// these rules are what makes the distinction *expressible*, and without them the palette has
+/// nothing to attach it to.
 ///
 /// ## How they win, and how they fail safe
 ///
@@ -1191,6 +1194,39 @@ const RUST_ATTRIBUTE_SUPPLEMENT: &str = r#"
 (attribute (token_tree (token_tree (token_tree (identifier) @attribute))))
 "#;
 
+/// Real supplement appended after `tree-sitter-rust`'s own bundled query, repairing a genuine
+/// **upstream typo** that makes `theme::syntax::CONSTANT` unreachable in Rust.
+///
+/// `tree-sitter-rust-0.24.2/queries/highlights.scm` lines 10-11 read:
+///
+/// ```scheme
+/// ((identifier) @constant
+///  (#match? @constant "^[A-Z][A-Z\d_]+$'"))
+/// ```
+///
+/// Note the stray apostrophe between the `$` and the closing quote - confirmed byte-for-byte with
+/// `od -c` against the real file on disk, not inferred. The regex therefore demands a literal `'`
+/// after end-of-input and can never match anything, so the rule is dead.
+///
+/// Two things go wrong as a result, and the second one survives even if upstream fixes the first:
+/// line 14's `((identifier) @constructor (#match? @constructor "^[A-Z]"))` is a *later* pattern and
+/// `MAX_SIZE` matches `^[A-Z]` too, so last-pattern-wins hands it to `@constructor` ->
+/// [`HighlightKind::Type`]. Measured before this supplement: `const MAX_SIZE: usize = 42;`
+/// classified `MAX_SIZE` as `Type` at its declaration *and* at every use.
+///
+/// That was invisible while the palette held constants and types at related colours. It stopped
+/// being invisible when the redesign gave `syntax.constant` its own orange and `syntax.type` its
+/// own gold - a Rust constant rendered in the *type* colour, colliding with the very tokens it is
+/// supposed to be told apart from.
+///
+/// This is the same *class* of bug as [`RUST_VARIABLE_PREFIX`]: Python (`highlights.scm:8-9`),
+/// JavaScript (`:54-59`) and C (`:3-4`) all reach `@constant` for the identical all-caps
+/// construct; Rust is the sole outlier. Placed before [`RUST_ATTRIBUTE_SUPPLEMENT`] so an
+/// all-caps identifier inside an attribute still reads as an attribute.
+const RUST_CONSTANT_SUPPLEMENT: &str = r#"
+((identifier) @constant (#match? @constant "^[A-Z][A-Z\d_]+$"))
+"#;
+
 const RUST_DEFINITION_SUPPLEMENT: &str = r#"
 (function_item name: (identifier) @function.definition)
 (function_signature_item name: (identifier) @function.definition)
@@ -1199,6 +1235,42 @@ const RUST_DEFINITION_SUPPLEMENT: &str = r#"
 /// See [`RUST_DEFINITION_SUPPLEMENT`]. `function_definition`'s `name` field is an `identifier`
 /// only (no metavariable case, unlike Rust). A `lambda` has no name node at all, so it is
 /// correctly untouched.
+/// Real supplement giving Python the `@variable.parameter` capture its bundled query has **no
+/// pattern for at all** - `tree-sitter-python-0.25.0/queries/highlights.scm` contains zero
+/// `@variable.parameter`, so every parameter fell through to its line-3 blanket
+/// `(identifier) @variable` and `theme::syntax::VARIABLE_PARAMETER` was unreachable in Python.
+///
+/// Same class of gap as [`RUST_VARIABLE_PREFIX`], found the same way: by asking, for each token
+/// the redesign gives a real distinct colour, which grammars can actually emit it. Rust and
+/// TypeScript could; Python and Go could not.
+///
+/// One rule per real parameter shape, every node kind and field checked against
+/// `tree-sitter-python-0.25.0/src/node-types.json` (`parameters`' children are the `parameter`
+/// supertype: bare `identifier`, `default_parameter{name}`, `typed_parameter{children}`,
+/// `typed_default_parameter{name}`, `list_splat_pattern`, `dictionary_splat_pattern`) and each one
+/// compiled and executed rather than assumed.
+///
+/// `self`/`cls` are deliberately restated **after** the parameter rules, and deliberately scoped
+/// to `(parameters ...)` rather than restated blanket. Appending the parameter rules alone would
+/// let them beat [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]'s earlier `variable.builtin` rule and repaint
+/// every `self` in a signature as an ordinary parameter. Restating the *blanket* rule instead
+/// would fix that but break something else: it would also run after that supplement's
+/// `(call function: (identifier) @function)` rule and turn a real `cls(...)` construction back
+/// into a self-reference - which `python_method_calls_match_rust_and_typescript` catches. Scoping
+/// it to the parameter list is what satisfies both.
+const PYTHON_PARAMETER_SUPPLEMENT: &str = r#"
+(parameters (identifier) @variable.parameter)
+(parameters (typed_parameter (identifier) @variable.parameter))
+(parameters (default_parameter name: (identifier) @variable.parameter))
+(parameters (typed_default_parameter name: (identifier) @variable.parameter))
+(parameters (list_splat_pattern (identifier) @variable.parameter))
+(parameters (dictionary_splat_pattern (identifier) @variable.parameter))
+(lambda_parameters (identifier) @variable.parameter)
+
+((parameters (identifier) @variable.builtin)
+ (#match? @variable.builtin "^(self|cls)$"))
+"#;
+
 const PYTHON_DEFINITION_SUPPLEMENT: &str = r#"
 (function_definition name: (identifier) @function.definition)
 "#;
@@ -1227,6 +1299,59 @@ const JAVASCRIPT_DEFINITION_SUPPLEMENT: &str = r#"
 /// See [`RUST_DEFINITION_SUPPLEMENT`] - the TypeScript-only declaration forms, which have no
 /// JavaScript counterpart: an ambient `declare function`, an interface member signature, and an
 /// `abstract` class method.
+/// Real supplement fixing the closest twin of the [`RUST_VARIABLE_PREFIX`] bug that exists in
+/// TypeScript/JavaScript, plus the parameter shapes TypeScript's own query misses.
+///
+/// ## Shorthand properties had no capture at all
+///
+/// `tree-sitter-javascript-0.23.1/queries/highlights.scm` mentions `shorthand_property_identifier`
+/// and `shorthand_property_identifier_pattern` exactly once, at lines 54-59, and there they are
+/// guarded by an **all-caps `#match?` predicate** for `@constant`. The line-4 blanket
+/// `(identifier) @variable` does not reach them - they are different node kinds. So every
+/// ordinary shorthand name emitted **no highlight event whatsoever** and fell to
+/// [`HighlightKind::Text`]:
+///
+/// ```text
+/// const { alpha, beta } = config;    alpha: <none>   beta: <none>
+/// const obj = { alpha, gamma: 1 };   alpha: <none>   gamma: property
+/// ```
+///
+/// That is every object destructure (`const { data, error } = useQuery()`) and every object-literal
+/// shorthand (`return { id, name, count }`) in idiomatic TypeScript - a very large fraction of a
+/// real file rendering as plain foreground for the same reason Rust locals used to.
+///
+/// The `#not-match?` guard is load-bearing: JavaScript's own all-caps `@constant` rule is an
+/// *earlier* pattern, so an unguarded blanket rule appended here would repaint `const { MAX_N } =
+/// limits` from a constant to a variable. Verified both ways - `alpha` becomes `variable`, `MAX_N`
+/// stays `constant`.
+///
+/// ## Three parameter shapes TypeScript's own rules miss
+///
+/// `tree-sitter-typescript-0.23.2/queries/highlights.scm:15-16` captures
+/// `(required_parameter (identifier))` and `(optional_parameter (identifier))` - a **direct**
+/// identifier child only. Three very common shapes therefore missed: an unparenthesized arrow
+/// parameter (`items.map(x => x + 1)`, how most callbacks are written), a rest parameter
+/// (`...rest: string[]`), and a destructured parameter (`function g({ lo, hi }: Range)`).
+///
+/// The rest-parameter rule uses the `pattern:` field rather than `name:`, which is what a real
+/// parse says even though `node-types.json` lists `name: [identifier, rest_pattern]` - dumped from
+/// an actual tree rather than trusted from the schema.
+///
+/// The object-pattern rule is placed after the shorthand rules on purpose: a destructured
+/// parameter is both a shorthand property *and* a parameter, and the parameter reading is the more
+/// specific one.
+const TYPESCRIPT_IDENTIFIER_SUPPLEMENT: &str = r#"
+((shorthand_property_identifier) @variable
+ (#not-match? @variable "^[A-Z_][A-Z\d_]+$"))
+((shorthand_property_identifier_pattern) @variable
+ (#not-match? @variable "^[A-Z_][A-Z\d_]+$"))
+
+(arrow_function parameter: (identifier) @variable.parameter)
+(required_parameter pattern: (rest_pattern (identifier) @variable.parameter))
+(required_parameter
+  pattern: (object_pattern (shorthand_property_identifier_pattern) @variable.parameter))
+"#;
+
 const TYPESCRIPT_DEFINITION_SUPPLEMENT: &str = r#"
 (function_signature name: (identifier) @function.definition)
 (method_signature name: (property_identifier) @function.definition)
@@ -1237,6 +1362,35 @@ const TYPESCRIPT_DEFINITION_SUPPLEMENT: &str = r#"
 /// `identifier` - a real difference from `function_declaration`, checked against
 /// `tree-sitter-go`'s `node-types.json` rather than assumed symmetrical. `method_elem` is the
 /// interface-method node kind in this grammar version (it was `method_spec` in older ones).
+/// Real supplement covering three roles `tree-sitter-go`'s own bundled query never emits, each of
+/// which a sibling grammar here does emit - the same gap class as [`RUST_VARIABLE_PREFIX`].
+///
+/// 1. **`@variable.parameter`.** `tree-sitter-go-0.25.0/queries/highlights.scm` has no
+///    `@variable.parameter` pattern anywhere, so parameters fell through to its line-26 blanket
+///    `(identifier) @variable`. Fields confirmed in that grammar's own `node-types.json`:
+///    `parameter_declaration{name: identifier, type: _type}` and
+///    `variadic_parameter_declaration{name: identifier}`.
+/// 2. **`@constant`.** Go's query has only `@constant.builtin` (`true`/`false`/`nil`/`iota`) and
+///    no `@constant`, because Go has no all-caps convention for upstream to key a heuristic off.
+///    It does have something better: a real `const_spec` node, so the rule here is *semantic*
+///    rather than a name-shape guess - `const MaxRetries = 3` is a constant because the grammar
+///    says it is a const declaration, not because of how it is capitalised.
+/// 3. **`@property` for composite-literal keys.** Go's `(field_identifier) @property` (line 25)
+///    covers `v.Name` but not `User{Name: "x"}`, where the key parses as a plain `identifier`
+///    inside a `literal_element`. Rust's `S { field: a }` and TypeScript's `{ gamma: 1 }` both
+///    reach `@property` for the identical construct; Go was the outlier, so a struct literal's
+///    field names rendered as ordinary locals.
+///
+/// Every pattern compiled and executed against the real grammar before being written down.
+const GO_CLASSIFICATION_SUPPLEMENT: &str = r#"
+(parameter_declaration name: (identifier) @variable.parameter)
+(variadic_parameter_declaration name: (identifier) @variable.parameter)
+
+(const_spec name: (identifier) @constant)
+
+(literal_value (keyed_element key: (literal_element (identifier) @property)))
+"#;
+
 const GO_DEFINITION_SUPPLEMENT: &str = r#"
 (function_declaration name: (identifier) @function.definition)
 (method_declaration name: (field_identifier) @function.definition)
@@ -1364,33 +1518,35 @@ const MARKDOWN_BLOCK_HIGHLIGHTS_SUPPLEMENT: &str = r#"
 fn highlight_query_for(grammar: Grammar) -> String {
     match grammar {
         Grammar::Rust => format!(
-            "{RUST_VARIABLE_PREFIX}\n{}\n{RUST_ATTRIBUTE_SUPPLEMENT}\n\
-             {RUST_DEFINITION_SUPPLEMENT}",
+            "{RUST_VARIABLE_PREFIX}\n{}\n{RUST_CONSTANT_SUPPLEMENT}\n\
+             {RUST_ATTRIBUTE_SUPPLEMENT}\n{RUST_DEFINITION_SUPPLEMENT}",
             tree_sitter_rust::HIGHLIGHTS_QUERY
         ),
         Grammar::Python => {
             format!(
                 "{}\n{PYTHON_HIGHLIGHTS_SUPPLEMENT}\n{PYTHON_BRACKET_SUPPLEMENT}\n\
-                 {PYTHON_DEFINITION_SUPPLEMENT}",
+                 {PYTHON_PARAMETER_SUPPLEMENT}\n{PYTHON_DEFINITION_SUPPLEMENT}",
                 tree_sitter_python::HIGHLIGHTS_QUERY
             )
         }
         Grammar::TypeScript => format!(
-            "{}\n{}\n{TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT}\n\
+            "{}\n{}\n{TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT}\n{TYPESCRIPT_IDENTIFIER_SUPPLEMENT}\n\
              {JAVASCRIPT_DEFINITION_SUPPLEMENT}\n{TYPESCRIPT_DEFINITION_SUPPLEMENT}",
             tree_sitter_javascript::HIGHLIGHT_QUERY,
             tree_sitter_typescript::HIGHLIGHTS_QUERY
         ),
         Grammar::Tsx => format!(
             "{}\n{}\n{}\n{TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT}\n\
-             {JAVASCRIPT_DEFINITION_SUPPLEMENT}\n{TYPESCRIPT_DEFINITION_SUPPLEMENT}",
+             {TYPESCRIPT_IDENTIFIER_SUPPLEMENT}\n{JAVASCRIPT_DEFINITION_SUPPLEMENT}\n\
+             {TYPESCRIPT_DEFINITION_SUPPLEMENT}",
             tree_sitter_javascript::HIGHLIGHT_QUERY,
             tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
             tree_sitter_typescript::HIGHLIGHTS_QUERY
         ),
         Grammar::Toml => tree_sitter_toml_ng::HIGHLIGHTS_QUERY.to_string(),
         Grammar::Go => format!(
-            "{}\n{GO_HIGHLIGHTS_SUPPLEMENT}\n{GO_BRACKET_SUPPLEMENT}\n{GO_DEFINITION_SUPPLEMENT}",
+            "{}\n{GO_HIGHLIGHTS_SUPPLEMENT}\n{GO_BRACKET_SUPPLEMENT}\n\
+             {GO_CLASSIFICATION_SUPPLEMENT}\n{GO_DEFINITION_SUPPLEMENT}",
             tree_sitter_go::HIGHLIGHTS_QUERY
         ),
         Grammar::Json => format!(
@@ -3241,6 +3397,153 @@ mod tests {
         );
         assert_eq!(kind_at(&spans, source, "u8"), HighlightKind::TypeBuiltin);
         assert_eq!(kind_at(&spans, source, "let"), HighlightKind::Keyword);
+    }
+
+    /// A Rust `const`/`static` is a real `Constant`, not a `Type`.
+    ///
+    /// The same class of bug as `a_plain_rust_local_is_a_real_variable_not_unclassified_text`, and
+    /// found by the same question - "which grammars can actually emit the token this colour is
+    /// attached to?". `tree-sitter-rust`'s own `@constant` rule carries a stray apostrophe inside
+    /// its `#match?` regex and can never fire, and its later `@constructor` heuristic then claims
+    /// the identifier. See `RUST_CONSTANT_SUPPLEMENT`.
+    ///
+    /// This was cosmetically invisible until the redesign gave `syntax.constant` its own orange and
+    /// `syntax.type` its own gold, at which point every Rust constant rendered in the type colour.
+    #[test]
+    fn a_rust_const_is_a_real_constant_not_a_type() {
+        let source =
+            "const MAX_SIZE: usize = 42;\nstatic LIMIT: u32 = 7;\nfn f() -> usize { MAX_SIZE }\n";
+        let spans = highlight_rust(source);
+        assert_eq!(
+            kind_at(&spans, source, "MAX_SIZE:"),
+            HighlightKind::Constant,
+            "a const's declaration site must be a Constant, not a Type"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "MAX_SIZE }"),
+            HighlightKind::Constant,
+            "and so must every later use of it"
+        );
+        assert_eq!(kind_at(&spans, source, "LIMIT"), HighlightKind::Constant);
+        // The all-caps rule must not eat ordinary capitalised type names.
+        assert_eq!(kind_at(&spans, source, "usize"), HighlightKind::TypeBuiltin);
+    }
+
+    /// A capitalised *type* is still a type, and an attribute's own identifiers are still
+    /// attributes - the two things `RUST_CONSTANT_SUPPLEMENT`'s all-caps heuristic could plausibly
+    /// have broken.
+    #[test]
+    fn the_rust_constant_heuristic_does_not_claim_types_or_attributes() {
+        let source = "#[derive(Debug)]\nstruct Widget { id: u32 }\n";
+        let spans = highlight_rust(source);
+        assert_eq!(kind_at(&spans, source, "Widget {"), HighlightKind::Type);
+        assert_eq!(kind_at(&spans, source, "derive"), HighlightKind::Attribute);
+        assert_eq!(kind_at(&spans, source, "Debug"), HighlightKind::Attribute);
+    }
+
+    /// A Python parameter is a real `VariableParameter`. `tree-sitter-python`'s bundled query has
+    /// **no** `@variable.parameter` pattern at all, so this token was unreachable in Python before
+    /// `PYTHON_PARAMETER_SUPPLEMENT` - the same gap class as the Rust `@variable` one.
+    #[test]
+    fn python_parameters_are_real_parameters_and_self_is_still_builtin() {
+        let source = "class C:\n    def f(self, a, b: int, c=1, d: str = \"x\", *args, **kw):\n        return self\n";
+        let spans = highlight_python(source);
+        for needle in ["a,", "b:", "c=1", "d: str", "args", "kw)"] {
+            assert_eq!(
+                kind_at(&spans, source, needle),
+                HighlightKind::VariableParameter,
+                "{needle:?} is a parameter binding site"
+            );
+        }
+        // Restated last on purpose - the parameter rules must not repaint `self`.
+        assert_eq!(
+            kind_at(&spans, source, "self,"),
+            HighlightKind::VariableBuiltin,
+            "`self` stays a builtin, not an ordinary parameter"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "self\n"),
+            HighlightKind::VariableBuiltin
+        );
+    }
+
+    /// Go's bundled query emits neither `@variable.parameter` nor `@constant`, and its
+    /// `@property` rule misses a composite literal's own keys. See `GO_CLASSIFICATION_SUPPLEMENT`.
+    #[test]
+    fn go_parameters_constants_and_literal_keys_are_really_classified() {
+        let source = "package main\n\nconst MaxRetries = 3\n\nfunc scale(n int, factor float64) int {\n\treturn n\n}\n\nfunc build() User { return User{Name: \"x\"} }\n";
+        let spans = highlight_go(source);
+        assert_eq!(
+            kind_at(&spans, source, "n int"),
+            HighlightKind::VariableParameter
+        );
+        assert_eq!(
+            kind_at(&spans, source, "factor"),
+            HighlightKind::VariableParameter
+        );
+        assert_eq!(
+            kind_at(&spans, source, "MaxRetries"),
+            HighlightKind::Constant,
+            "a Go const is a constant because the grammar says so, not because of its casing"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "Name:"),
+            HighlightKind::Property,
+            "a struct literal's key is a property, as it is in Rust and TypeScript"
+        );
+    }
+
+    /// A shorthand property had **no capture of any kind** in TypeScript/JavaScript - the closest
+    /// twin of the Rust `@variable` bug, and by blast radius the largest of the gaps this round
+    /// found. See `TYPESCRIPT_IDENTIFIER_SUPPLEMENT`.
+    #[test]
+    fn a_typescript_shorthand_property_is_a_real_variable_not_unclassified_text() {
+        let source = "const { alpha, beta } = config;\nconst obj = { alpha, gamma: 1 };\nconst { MAX_N } = limits;\n";
+        let spans = highlight_typescript(source, false);
+        assert_eq!(
+            kind_at(&spans, source, "alpha, beta"),
+            HighlightKind::Variable
+        );
+        assert_eq!(kind_at(&spans, source, "beta }"), HighlightKind::Variable);
+        assert_eq!(
+            kind_at(&spans, source, "alpha, gamma"),
+            HighlightKind::Variable
+        );
+        assert_eq!(kind_at(&spans, source, "gamma:"), HighlightKind::Property);
+        // The `#not-match?` guard: an all-caps shorthand still reaches JavaScript's own earlier
+        // `@constant` rule rather than being repainted a variable.
+        assert_eq!(kind_at(&spans, source, "MAX_N }"), HighlightKind::Constant);
+    }
+
+    /// The three parameter shapes `tree-sitter-typescript`'s own `required_parameter`/
+    /// `optional_parameter` rules miss, the arrow-function one being how most callbacks are
+    /// written. See `TYPESCRIPT_IDENTIFIER_SUPPLEMENT`.
+    #[test]
+    fn typescript_arrow_rest_and_destructured_parameters_are_real_parameters() {
+        let source = "const f = items.map(x => x + 1);\nfunction pick(a: number, ...rest: string[]) {}\nfunction g({ lo, hi }: Range) {}\n";
+        let spans = highlight_typescript(source, false);
+        assert_eq!(
+            kind_at(&spans, source, "x =>"),
+            HighlightKind::VariableParameter,
+            "an unparenthesized arrow parameter is still a parameter"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "rest:"),
+            HighlightKind::VariableParameter
+        );
+        assert_eq!(
+            kind_at(&spans, source, "lo,"),
+            HighlightKind::VariableParameter
+        );
+        assert_eq!(
+            kind_at(&spans, source, "hi }"),
+            HighlightKind::VariableParameter
+        );
+        // The rules the bundled query already got right must be untouched.
+        assert_eq!(
+            kind_at(&spans, source, "a: number"),
+            HighlightKind::VariableParameter
+        );
     }
 
     /// The blanket variable rule must not swallow the contents of an attribute. See
