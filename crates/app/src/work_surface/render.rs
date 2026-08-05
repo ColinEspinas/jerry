@@ -178,6 +178,44 @@ impl AdeApp {
         }
     }
 
+    /// GitHub issue #158's terminal Copy. Scoped to `Some("terminal")` in
+    /// `crate::default_key_bindings` (`Ctrl+Shift+C`, `Cmd+C` on macOS) for the reason that
+    /// scoping exists at all here: plain `Ctrl+C` is the pty's own `SIGINT` byte and must never
+    /// be claimed as a copy shortcut, which is exactly why every terminal emulator puts copy on
+    /// the shifted variant instead. Targets the active agent's pane, matching
+    /// [`Self::handle_terminal_clear_action`]'s own "the centre pane is genuinely showing right
+    /// now" target.
+    pub(crate) fn handle_terminal_copy_action(
+        &mut self,
+        _action: &TerminalCopy,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(agent) = self.agents.active() {
+            agent
+                .pane
+                .clone()
+                .update(cx, |pane, cx| pane.copy_selection(cx));
+        }
+    }
+
+    /// GitHub issue #158's terminal Paste - the counterpart to
+    /// [`Self::handle_terminal_copy_action`], on `Ctrl+Shift+V` (`Cmd+V` on macOS) for the same
+    /// reason (plain `Ctrl+V` is the pty's own `0x16`, readline's `quoted-insert`).
+    pub(crate) fn handle_terminal_paste_action(
+        &mut self,
+        _action: &TerminalPaste,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(agent) = self.agents.active() {
+            agent
+                .pane
+                .clone()
+                .update(cx, |pane, cx| pane.paste_from_clipboard(cx));
+        }
+    }
+
     /// Activates agent `id`'s tab and, if it maps to a currently-listed worktree, also selects
     /// that worktree, keeping the file tree/diff sidebar in sync with the agent just clicked
     /// (the sidebar is still driven by [`Self::selected`] - a `focused_agent`-driven Zone 2/3
@@ -4176,6 +4214,225 @@ mod tab_order_persistence_tests {
             restored_order.iter().position(|t| t == &b_ref)
                 < restored_order.iter().position(|t| t == &a_ref),
             "the drag-reordered position must survive a real restart - got {restored_order:?}"
+        );
+    }
+}
+
+/// GitHub issue #158's `TerminalCopy`/`TerminalPaste` actions - real coverage that dispatching
+/// each one reaches whichever agent is genuinely active right now, and that copy really lands on
+/// the real OS clipboard (checked the same way `crate::sidebar::tree_ops`' own
+/// `copy_relative_path_writes_the_worktree_relative_path` checks "Copy Path", since this app has
+/// exactly one clipboard mechanism and both go through it).
+///
+/// These fail against the pre-fix tree twice over: the actions didn't exist, and neither did any
+/// selection for copy to read.
+#[cfg(test)]
+mod terminal_clipboard_action_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::{Focusable, TestAppContext};
+
+    /// Places `text` at a fixed, addressed grid position in the active agent's pane, well below
+    /// where a freshly-spawned shell's own prompt lands, so the row this test then selects can't
+    /// be overwritten by real shell output arriving in the background.
+    fn seed_active_pane(app: &gpui::Entity<AdeApp>, cx: &mut gpui::VisualTestContext, text: &str) {
+        let pane = app
+            .read_with(cx, |app, _| app.agents.active().map(|s| s.pane.clone()))
+            .expect("a fresh test window has one real, active shell agent");
+        pane.update(cx, |pane, cx| {
+            // `ESC[10;1H` - row 10, column 1 (1-indexed), i.e. grid row 9, column 0.
+            pane.inject_bytes_for_test(format!("\x1b[10;1H{text}").as_bytes(), cx);
+            pane.select_cells_for_test(9, 0..text.chars().count());
+        });
+    }
+
+    #[gpui::test]
+    fn dispatching_terminal_copy_puts_the_real_selection_on_the_real_clipboard(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        cx.update(|_window, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("stale".into()))
+        });
+        seed_active_pane(&app, cx, "ade-selected-text");
+
+        cx.dispatch_action(TerminalCopy);
+
+        let text = cx.update(|_window, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(
+            text.as_deref(),
+            Some("ade-selected-text"),
+            "TerminalCopy must reach the active agent's pane and write its real selection to \
+             the real system clipboard"
+        );
+    }
+
+    /// Only the *active* agent's selection is copied - the same "which pane does this act on"
+    /// contract `terminal_clear_action_tests` pins for `TerminalClear`.
+    #[gpui::test]
+    fn dispatching_terminal_copy_uses_only_the_active_agents_selection(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        // The window's own initial agent gets a selection first, then a second agent (which
+        // becomes active) gets a different one.
+        seed_active_pane(&app, cx, "background-agent-text");
+        app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                AgentKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        seed_active_pane(&app, cx, "active-agent-text");
+
+        cx.dispatch_action(TerminalCopy);
+
+        let text = cx.update(|_window, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(text.as_deref(), Some("active-agent-text"));
+    }
+
+    /// The whole point of GitHub issue #158, driven by a **real keystroke** rather than
+    /// `dispatch_action`: with a terminal genuinely focused, the copy shortcut must reach
+    /// `TerminalCopy` and not `TerminalPane::handle_key_down`.
+    ///
+    /// This is the assertion that pins the fix's most load-bearing detail. Without the binding,
+    /// `crate::terminal::pane::keystroke_to_bytes`'s control-byte branch ignores `shift`
+    /// entirely, so `Ctrl+Shift+C` over a focused terminal produced `0x03` - it *interrupted the
+    /// running process* instead of copying. GPUI dispatches matching `KeyBinding`s before any
+    /// `on_key_down` listener and an action handler stops propagation by default in the bubble
+    /// phase, which is what makes a bound action win here.
+    #[gpui::test]
+    fn the_real_copy_keystroke_over_a_focused_terminal_copies_instead_of_typing(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        cx.update(|_window, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("stale".into()))
+        });
+        seed_active_pane(&app, cx, "typed-not-copied");
+
+        // The keystroke can only reach a `"terminal"`-scoped binding while the pane genuinely
+        // holds focus - which is the exact condition the issue reports the bug under.
+        app.update_in(cx, |app, window, cx| {
+            let pane = app.agents.active().expect("an active agent").pane.clone();
+            let handle = pane.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-shift-c"
+        });
+        cx.run_until_parked();
+
+        let text = cx.update(|_window, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(
+            text.as_deref(),
+            Some("typed-not-copied"),
+            "the real copy keystroke over a focused terminal must reach TerminalCopy - before              this fix it reached keystroke_to_bytes and sent SIGINT to the child process"
+        );
+    }
+
+    /// The paste counterpart of the keystroke test above, proven by the real pty echo.
+    #[gpui::test]
+    fn the_real_paste_keystroke_over_a_focused_terminal_reaches_the_pty(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        cx.update(|_window, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                "ade-keystroke-paste".into(),
+            ))
+        });
+        app.update_in(cx, |app, window, cx| {
+            let pane = app.agents.active().expect("an active agent").pane.clone();
+            let handle = pane.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-v"
+        } else {
+            "ctrl-shift-v"
+        });
+
+        let mut saw_pasted_text = false;
+        for _ in 0..50 {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(8));
+            cx.run_until_parked();
+            let lines = app.read_with(cx, |app, cx| {
+                app.agents
+                    .active()
+                    .expect("an active agent")
+                    .pane
+                    .read(cx)
+                    .visible_text_lines()
+            });
+            if lines
+                .iter()
+                .any(|line| line.contains("ade-keystroke-paste"))
+            {
+                saw_pasted_text = true;
+                break;
+            }
+        }
+        assert!(
+            saw_pasted_text,
+            "the real paste keystroke over a focused terminal must reach TerminalPaste"
+        );
+    }
+
+    /// The paste half, proven by the pty's own echo rather than by asserting `write_input` was
+    /// called - mirroring `terminal_clear_action_tests`' discipline for `TerminalClear`.
+    #[gpui::test]
+    fn dispatching_terminal_paste_reaches_the_active_agents_real_pty(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        cx.update(|_window, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("ade-pasted-marker".into()))
+        });
+        cx.dispatch_action(TerminalPaste);
+
+        let mut saw_pasted_text = false;
+        for _ in 0..50 {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(8));
+            cx.run_until_parked();
+            let lines = app.read_with(cx, |app, cx| {
+                app.agents
+                    .active()
+                    .expect("an active agent")
+                    .pane
+                    .read(cx)
+                    .visible_text_lines()
+            });
+            if lines.iter().any(|line| line.contains("ade-pasted-marker")) {
+                saw_pasted_text = true;
+                break;
+            }
+        }
+        assert!(
+            saw_pasted_text,
+            "expected the active agent's real pty to echo back the clipboard text \
+             TerminalPaste's handler writes"
         );
     }
 }

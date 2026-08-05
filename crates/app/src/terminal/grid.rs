@@ -50,11 +50,27 @@
 //! `Color::Indexed` (matching `vendor/zed/crates/terminal/src/terminal.rs`'s
 //! `get_color_at_index`/`rgb_for_index`, a public xterm convention). A program that repalettes
 //! its own colors via OSC renders with the default palette instead.
+//!
+//! ## Text selection (GitHub issue #158)
+//!
+//! Selection is not tracked here at all - it lives in `alacritty_terminal`'s own
+//! `Term::selection` field (`term/mod.rs:275`, a real `pub Option<Selection>`), driven through
+//! its own `Selection::new`/`Selection::update` API (`selection.rs:125`/`:133`) and read back
+//! through `Term::selection_to_string` (`term/mod.rs:529`). This module only translates between
+//! that API's `Point`/`Side` coordinates and the row/column [`CellPosition`] the pane's mouse
+//! handling produces, so no second, drifting copy of "what is selected" exists. Selection
+//! invalidation is likewise `Term`'s own and not re-implemented here: it rotates the selection
+//! with the grid when the screen scrolls (`Term::scroll_down_relative`/`scroll_up_relative`'s
+//! own `Selection::rotate` calls) and drops it on `ClearMode::All` (`term/mod.rs:1803`) and on
+//! an alt-screen swap (`Term::swap_alt`, `:733`) - which is why [`TerminalGrid::clear`], itself
+//! just an `ESC[2J` through the same parser, needs no selection handling of its own.
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::{Cell as AlacCell, Flags};
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor, StdSyncHandler};
 
 /// A concrete [`Dimensions`] impl for a fixed rows/cols grid. Scrollback history is reported as
@@ -127,6 +143,51 @@ pub struct GridCell {
     pub italic: bool,
     pub underline: bool,
     pub strikethrough: bool,
+    /// Whether this cell falls inside the live text selection (GitHub issue #158). Derived
+    /// every [`TerminalGrid::visible_rows`] call from `alacritty_terminal`'s own
+    /// `RenderableContent::selection` (`term/mod.rs:2408`, itself `Term::selection.to_range`),
+    /// never stored - so it can't go stale against the real selection the way a separately
+    /// tracked copy would.
+    pub selected: bool,
+}
+
+/// Which half of a character cell a pointer position fell in - the row/column-space counterpart
+/// of `alacritty_terminal::index::Side` (`index.rs:14`, `pub type Side = Direction`), which is
+/// what decides whether the cell under the pointer is included in a drag selection or not.
+/// Mirrored here rather than re-exporting `Side` so `crate::terminal::pane`'s mouse handling
+/// never touches `alacritty_terminal` types directly, matching this module's existing contract
+/// for [`GridCell`]'s already-resolved RGB colors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellSide {
+    Left,
+    Right,
+}
+
+impl CellSide {
+    fn to_alacritty(self) -> Side {
+        match self {
+            CellSide::Left => Side::Left,
+            CellSide::Right => Side::Right,
+        }
+    }
+}
+
+/// A position inside the visible grid, in the same viewport row/column space
+/// [`TerminalGrid::visible_rows`] returns (`row` indexes that `Vec`, `column` indexes a row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellPosition {
+    pub row: usize,
+    pub column: usize,
+    pub side: CellSide,
+}
+
+impl CellPosition {
+    /// Valid only while `display_offset == 0`, which is always the case here - this module
+    /// never calls `Term::scroll_display` (see the module docs' "no scrollback UI" scope cut),
+    /// so a viewport row index *is* the grid `Line` index.
+    fn to_alacritty(self) -> AlacPoint {
+        AlacPoint::new(Line(self.row as i32), Column(self.column))
+    }
 }
 
 /// Default foreground/background, used both for `NamedColor::Foreground`/`Background` and this
@@ -134,6 +195,14 @@ pub struct GridCell {
 /// `rgb(0x1e1e1e)`).
 pub const DEFAULT_FOREGROUND: (u8, u8, u8) = (0xd4, 0xd4, 0xd4);
 pub const DEFAULT_BACKGROUND: (u8, u8, u8) = (0x1e, 0x1e, 0x1e);
+
+/// The fill painted behind a selected cell (GitHub issue #158). `#264f78` - VS Code's own
+/// `terminal.selectionBackground`, the same source [`NAMED_COLOR_PALETTE`] below already takes
+/// its 16 ANSI values from, rather than `crate::theme::editor::SELECTION`: this module's colors
+/// are deliberately a fixed palette independent of the live theme (see the module docs' palette
+/// scope cut), and a selection fill that tracked the theme while the 16 colors behind it did not
+/// would be the only thing in the terminal that did.
+pub const SELECTION_BACKGROUND: (u8, u8, u8) = (0x26, 0x4f, 0x78);
 
 /// The standard ANSI 16-color palette (VS Code's default terminal theme values), indexed
 /// `0..=15` by `NamedColor`'s own discriminants / `Color::Indexed(0..=15)`.
@@ -224,7 +293,7 @@ fn resolve_color(color: Color) -> (u8, u8, u8) {
     }
 }
 
-fn grid_cell_from_alacritty(cell: &AlacCell, is_cursor: bool) -> GridCell {
+fn grid_cell_from_alacritty(cell: &AlacCell, is_cursor: bool, selected: bool) -> GridCell {
     let mut fg = resolve_color(cell.fg);
     let mut bg = resolve_color(cell.bg);
     if cell.flags.contains(Flags::INVERSE) {
@@ -234,6 +303,7 @@ fn grid_cell_from_alacritty(cell: &AlacCell, is_cursor: bool) -> GridCell {
         std::mem::swap(&mut fg, &mut bg);
     }
     GridCell {
+        selected,
         // An uninitialized-by-any-write cell holds `'\0'` (`Cell::default()` in
         // `term/cell.rs` uses `c: ' '` only as the *constructed* default) - render as a
         // space either way.
@@ -332,11 +402,13 @@ impl TerminalGrid {
 
     /// A snapshot of the currently visible grid (`rows.len() == screen_lines`, each row has
     /// exactly `columns` cells). The cell at the cursor's current position (if visible) has its
-    /// fg/bg swapped, so the renderer doesn't need to separately overlay a cursor glyph.
+    /// fg/bg swapped, so the renderer doesn't need to separately overlay a cursor glyph, and
+    /// every cell inside the live selection is flagged [`GridCell::selected`].
     pub fn visible_rows(&self) -> Vec<Vec<GridCell>> {
         let content = self.term.renderable_content();
         let cursor_point =
             (content.cursor.shape != CursorShape::Hidden).then_some(content.cursor.point);
+        let selection = content.selection;
 
         let mut rows: Vec<Vec<GridCell>> = (0..self.size.rows)
             .map(|_| Vec::with_capacity(self.size.cols))
@@ -352,10 +424,58 @@ impl TerminalGrid {
                 continue;
             };
             let is_cursor = cursor_point == Some(indexed.point);
-            row.push(grid_cell_from_alacritty(indexed.cell, is_cursor));
+            let selected = selection.is_some_and(|range| range.contains(indexed.point));
+            row.push(grid_cell_from_alacritty(indexed.cell, is_cursor, selected));
         }
 
         rows
+    }
+
+    // ------------------------------------------------------------------ selection (issue #158)
+
+    /// Anchors a new selection at `position`, discarding any previous one - what a real
+    /// mouse-down inside the grid does. A selection anchored and never dragged is genuinely
+    /// *empty* (`Selection::is_empty`, `selection.rs:193`), so [`Self::selected_text`] returns
+    /// `None` for it: a plain click therefore clears the selection rather than selecting one
+    /// stray character, without this needing a "was it a drag?" flag of its own.
+    pub fn start_selection(&mut self, position: CellPosition) {
+        self.term.selection = Some(Selection::new(
+            SelectionType::Simple,
+            position.to_alacritty(),
+            position.side.to_alacritty(),
+        ));
+    }
+
+    /// Moves the *end* of the in-progress selection to `position` (`Selection::update`,
+    /// `selection.rs:133`) - what a real mouse-drag does. A no-op when nothing is anchored, so
+    /// an ordinary hover can never conjure a selection out of nothing.
+    pub fn update_selection(&mut self, position: CellPosition) {
+        if let Some(selection) = self.term.selection.as_mut() {
+            selection.update(position.to_alacritty(), position.side.to_alacritty());
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.term.selection = None;
+    }
+
+    /// The real selected text, straight out of `Term::selection_to_string`
+    /// (`term/mod.rs:529`) - `None` when nothing is selected, when the anchored selection is
+    /// still empty, or when the selected span is entirely blank (a drag across empty screen has
+    /// nothing worth putting on the clipboard, and silently replacing the clipboard with `""`
+    /// would destroy whatever the user copied last).
+    pub fn selected_text(&self) -> Option<String> {
+        self.term
+            .selection_to_string()
+            .filter(|text| !text.is_empty())
+    }
+
+    /// Whether the running program has turned on bracketed-paste mode (`DECSET 2004`), which
+    /// decides how [`crate::terminal::pane::TerminalPane`] frames pasted bytes - see that
+    /// method's own docs. Read live off `Term::mode()` (`term/mod.rs:709`) rather than latched,
+    /// since a program can enable and disable it at any point in its own lifetime.
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 }
 
@@ -538,5 +658,179 @@ mod tests {
             "expected 'O' at row 2 col 3, got rows: {rows:?}"
         );
         assert_eq!(rows[1][3].c, 'K');
+    }
+}
+
+/// GitHub issue #158: before this, `TerminalGrid` exposed no selection surface at all -
+/// `Term::selection` was never written and `Term::selection_to_string` never called, so there
+/// was nothing for a Copy binding to copy even once one existed. These cover the real
+/// `alacritty_terminal` selection API this module now drives, with no GPUI window involved.
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    fn left(row: usize, column: usize) -> CellPosition {
+        CellPosition {
+            row,
+            column,
+            side: CellSide::Left,
+        }
+    }
+
+    fn right(row: usize, column: usize) -> CellPosition {
+        CellPosition {
+            row,
+            column,
+            side: CellSide::Right,
+        }
+    }
+
+    #[test]
+    fn nothing_is_selected_until_a_selection_is_actually_dragged() {
+        let mut grid = TerminalGrid::new(5, 20);
+        grid.append_bytes(b"hello world");
+        assert_eq!(grid.selected_text(), None, "no selection has been anchored");
+
+        // A plain click (anchor, no drag) is genuinely empty - it must clear a selection, not
+        // select the one character under the pointer.
+        grid.start_selection(left(0, 3));
+        assert_eq!(
+            grid.selected_text(),
+            None,
+            "an anchored-but-never-dragged selection must not put a stray character on the \
+             clipboard"
+        );
+    }
+
+    #[test]
+    fn a_drag_across_one_row_selects_exactly_those_characters() {
+        let mut grid = TerminalGrid::new(5, 20);
+        grid.append_bytes(b"hello world");
+
+        // Columns 6..=10 are "world"; anchoring on the left of column 6 and releasing on the
+        // right of column 10 is exactly the span a real left-to-right drag produces.
+        grid.start_selection(left(0, 6));
+        grid.update_selection(right(0, 10));
+
+        assert_eq!(grid.selected_text().as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn a_backwards_drag_selects_the_same_span_as_a_forwards_one() {
+        let mut grid = TerminalGrid::new(5, 20);
+        grid.append_bytes(b"hello world");
+
+        grid.start_selection(right(0, 10));
+        grid.update_selection(left(0, 6));
+
+        assert_eq!(
+            grid.selected_text().as_deref(),
+            Some("world"),
+            "`Selection::to_range` orders its own anchors, so dragging right-to-left must \
+             produce the identical text"
+        );
+    }
+
+    #[test]
+    fn a_multi_row_drag_selects_across_the_line_break() {
+        let mut grid = TerminalGrid::new(5, 20);
+        grid.append_bytes(b"first line\r\nsecond line");
+
+        grid.start_selection(left(0, 6));
+        grid.update_selection(right(1, 5));
+
+        assert_eq!(
+            grid.selected_text().as_deref(),
+            Some("line\nsecond"),
+            "a real cross-row selection keeps the line break `Term::bounds_to_string` inserts"
+        );
+    }
+
+    #[test]
+    fn clearing_the_selection_really_clears_it() {
+        let mut grid = TerminalGrid::new(5, 20);
+        grid.append_bytes(b"hello world");
+        grid.start_selection(left(0, 0));
+        grid.update_selection(right(0, 4));
+        assert_eq!(grid.selected_text().as_deref(), Some("hello"));
+
+        grid.clear_selection();
+        assert_eq!(grid.selected_text(), None);
+    }
+
+    /// Pins the module docs' claim that selection invalidation is `alacritty_terminal`'s job:
+    /// [`TerminalGrid::clear`] is only an `ESC[2J` through the parser and has no selection code
+    /// of its own, so a stale selection surviving a clear would be a real bug (copy would then
+    /// return text that is no longer on screen).
+    #[test]
+    fn clearing_the_screen_drops_the_selection_without_this_module_doing_anything() {
+        let mut grid = TerminalGrid::new(5, 20);
+        grid.append_bytes(b"hello world");
+        grid.start_selection(left(0, 0));
+        grid.update_selection(right(0, 4));
+        assert_eq!(grid.selected_text().as_deref(), Some("hello"));
+
+        grid.clear();
+        assert_eq!(grid.selected_text(), None);
+    }
+
+    #[test]
+    fn a_drag_across_blank_screen_selects_nothing_worth_copying() {
+        let mut grid = TerminalGrid::new(5, 20);
+        grid.start_selection(left(2, 0));
+        grid.update_selection(right(2, 15));
+        assert_eq!(
+            grid.selected_text(),
+            None,
+            "an all-blank span must not overwrite the clipboard with an empty string"
+        );
+    }
+
+    /// The selection has to be *visible*, not just readable - a `GridCell` that never carried
+    /// the flag would leave the renderer with nothing to paint, so a user dragging across the
+    /// terminal would see no feedback at all.
+    #[test]
+    fn selected_cells_are_flagged_for_the_renderer() {
+        let mut grid = TerminalGrid::new(5, 20);
+        grid.append_bytes(b"hello world");
+        grid.start_selection(left(0, 6));
+        grid.update_selection(right(0, 10));
+
+        let rows = grid.visible_rows();
+        let flagged: String = rows[0]
+            .iter()
+            .filter(|cell| cell.selected)
+            .map(|cell| cell.c)
+            .collect();
+        assert_eq!(flagged, "world");
+        assert!(
+            rows[1].iter().all(|cell| !cell.selected),
+            "a single-row selection must not flag cells on any other row"
+        );
+    }
+
+    #[test]
+    fn no_selection_means_no_cell_is_flagged() {
+        let mut grid = TerminalGrid::new(5, 20);
+        grid.append_bytes(b"hello world");
+        let rows = grid.visible_rows();
+        assert!(rows.iter().flatten().all(|cell| !cell.selected));
+    }
+
+    /// Paste framing depends on this being read from the *live* `Term::mode()` - a program that
+    /// turns bracketed paste on (`DECSET 2004`) and later off must be tracked both ways.
+    #[test]
+    fn bracketed_paste_mode_tracks_the_real_terminal_mode() {
+        let mut grid = TerminalGrid::new(5, 20);
+        assert!(
+            !grid.bracketed_paste_enabled(),
+            "bracketed paste is off until a program actually enables it"
+        );
+
+        grid.append_bytes(b"\x1b[?2004h");
+        assert!(grid.bracketed_paste_enabled());
+
+        grid.append_bytes(b"\x1b[?2004l");
+        assert!(!grid.bracketed_paste_enabled());
     }
 }

@@ -194,6 +194,8 @@ actions!(
         FileTreeUndo,
         FileTreeRedo,
         TerminalClear,
+        TerminalCopy,
+        TerminalPaste,
     ]
 );
 
@@ -2233,6 +2235,8 @@ impl Render for AdeApp {
             .on_action(cx.listener(Self::handle_jump_to_agent_8_action))
             .on_action(cx.listener(Self::handle_close_focused_tab_action))
             .on_action(cx.listener(Self::handle_terminal_clear_action))
+            .on_action(cx.listener(Self::handle_terminal_copy_action))
+            .on_action(cx.listener(Self::handle_terminal_paste_action))
             .child(self.render_title_bar(cx))
             // The Settings surface (`design_handoff_jerry_ade/README.md`: "a separate surface,
             // not a modal: it replaces the three zones while the title bar and status bar
