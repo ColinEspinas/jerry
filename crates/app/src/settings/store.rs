@@ -12,12 +12,10 @@
 //! `crate::settings::render`'s per-page docs for which) - no field exists here "for
 //! completeness" just because the mockup shows a row for it.
 //!
-//! One documented exception, added with GitHub issue #18: [`FileTreeSettings`] is read and
-//! applied for real (`crate::root::AdeApp::load_file_tree` bounds every walk with it) but has no
-//! settings *page* and appears in no config banner - it is a file-only tunable. It is called out
-//! here rather than quietly breaking the rule above: the invariant that still holds for every
-//! field, this one included, is "loaded, saved, and genuinely consumed by real behaviour"; what
-//! this one lacks is a UI surface, not a consumer.
+//! There used to be a documented exception here - `FileTreeSettings::max_entries`, the file tree
+//! walk's entry cap (GitHub issue #18), a real file-only tunable with no settings page. GitHub
+//! issue #160 removed the cap itself ("File tree should load all folders and files"), so the
+//! field went with it rather than staying on as a value nothing reads.
 //!
 //! [`EditorSettings`] (GitHub issue #26) is the same kind of file-only tunable: real, applied
 //! defaults for Tab/Shift+Tab indentation (`crate::code_surface::editing`'s
@@ -98,7 +96,6 @@ pub struct Settings {
     pub appearance: AppearanceSettings,
     pub theme: ThemeSettings,
     pub keymap: KeymapSettings,
-    pub file_tree: FileTreeSettings,
     pub blame: BlameSettings,
     pub editor: EditorSettings,
     pub icon_pack: IconPackSettings,
@@ -307,26 +304,6 @@ pub struct KeybindingOverride {
     pub keystrokes: String,
 }
 
-/// The Files tree's one real tunable (GitHub issue #18 §4): how many entries a single
-/// `crate::sidebar::file_tree::build_file_tree` walk will collect before stopping. Not backed by a
-/// settings *page* (unlike every other section here) - it's the "large, configurable" cap the
-/// issue asks any surviving safety cap to be, edited from `settings.toml` directly, and when it
-/// is hit the sidebar shows a real "load more" action naming the count it stopped at, rather
-/// than a silent cut-off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct FileTreeSettings {
-    pub max_entries: usize,
-}
-
-impl Default for FileTreeSettings {
-    fn default() -> Self {
-        Self {
-            max_entries: FILE_TREE_MAX_ENTRIES_DEFAULT,
-        }
-    }
-}
-
 /// Inline git blame (GitHub issue #29): whether Surface C's File view shows the current line's
 /// author/relative-date/summary, dimmed, at the end of the line - see
 /// `crate::code_surface::blame_view`'s own module docs for the real off-thread/caching mechanism
@@ -350,35 +327,6 @@ pub struct BlameSettings {
 impl Default for BlameSettings {
     fn default() -> Self {
         Self { show_inline: true }
-    }
-}
-
-/// 20,000 entries - four times the old hard-coded 5,000 bound, and comfortably more than any
-/// real source tree this app is meant for once dot-directories (`.git`, and with them the vast
-/// majority of a repository's loose files) are already skipped by the walk itself.
-pub const FILE_TREE_MAX_ENTRIES_DEFAULT: usize = 20_000;
-
-/// A hand-edited `max_entries` below this can't render a useful tree at all, so it's clamped up
-/// rather than honoured - the same [`AppearanceSettings::sanitize`] discipline applied here.
-pub const FILE_TREE_MAX_ENTRIES_MIN: usize = 100;
-
-/// And a real upper clamp, which the first version of this setting was missing. It is not an
-/// arbitrary round number: two pieces of *foreground-thread* work scale linearly with the number
-/// of loaded entries - `crate::root::AdeApp::rebuild_palette_file_candidates` allocates one
-/// candidate per file in the walk-completion handler, and `render_file_tree` scans every loaded
-/// entry once per frame to resolve which rows are visible. At 100,000 both are real but
-/// absorbable; at the millions a hand-edited file could otherwise ask for, the first is a
-/// multi-second freeze on load and the second is a per-frame one. This is the honest hard
-/// ceiling on how much tree this sidebar holds, and the tree says so (see
-/// `crate::sidebar::render::AdeApp::render_file_tree`'s truncation row) rather than cutting off
-/// silently.
-pub const FILE_TREE_MAX_ENTRIES_MAX: usize = 100_000;
-
-impl FileTreeSettings {
-    pub fn sanitize(&mut self) {
-        self.max_entries = self
-            .max_entries
-            .clamp(FILE_TREE_MAX_ENTRIES_MIN, FILE_TREE_MAX_ENTRIES_MAX);
     }
 }
 
@@ -498,14 +446,12 @@ impl Settings {
     /// doesn't exist yet, writes a default file there (via [`Settings::save_at`]) so the config
     /// file exists on first run; a save failure there is also logged rather than propagated. A
     /// file that does parse still gets every section's own `sanitize` applied
-    /// ([`AppearanceSettings::sanitize`], [`FileTreeSettings::sanitize`],
-    /// [`EditorSettings::sanitize`]).
+    /// ([`AppearanceSettings::sanitize`], [`EditorSettings::sanitize`]).
     pub fn load_or_init_at(path: &Path) -> Settings {
         match std::fs::read_to_string(path) {
             Ok(contents) => match toml::from_str::<Settings>(&contents) {
                 Ok(mut settings) => {
                     settings.appearance.sanitize();
-                    settings.file_tree.sanitize();
                     settings.editor.sanitize();
                     settings
                 }
@@ -713,10 +659,6 @@ mod tests {
             settings.keymap.overrides.is_empty(),
             "a fresh install has no real rebinds yet"
         );
-        assert_eq!(
-            settings.file_tree.max_entries,
-            FILE_TREE_MAX_ENTRIES_DEFAULT
-        );
         assert!(
             settings.editor.minimap_enabled,
             "the minimap is on by default"
@@ -753,28 +695,25 @@ mod tests {
         );
     }
 
+    /// GitHub issue #160 deleted `[file_tree] max_entries` outright. A `settings.toml` written by
+    /// an older build still has that section in it, and it must load as a plain no-op rather than
+    /// failing the whole file back to defaults and quietly losing every other setting with it.
     #[test]
-    fn a_hand_edited_file_tree_cap_round_trips_and_an_absurd_one_is_clamped() {
+    fn a_settings_file_still_carrying_the_removed_file_tree_cap_loads_the_rest_of_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("settings.toml");
-        std::fs::write(&path, "[file_tree]\nmax_entries = 50000\n").expect("write");
-        assert_eq!(
-            Settings::load_or_init_at(&path).file_tree.max_entries,
-            50_000
-        );
+        std::fs::write(
+            &path,
+            "[file_tree]\nmax_entries = 50000\n\n[editor]\ntab_width = 2\n",
+        )
+        .expect("write");
 
-        std::fs::write(&path, "[file_tree]\nmax_entries = 5000000\n").expect("write");
-        assert_eq!(
-            Settings::load_or_init_at(&path).file_tree.max_entries,
-            FILE_TREE_MAX_ENTRIES_MAX,
-            "a cap larger than the foreground thread can absorb is clamped down, not honoured"
-        );
+        let loaded = Settings::load_or_init_at(&path);
 
-        std::fs::write(&path, "[file_tree]\nmax_entries = 1\n").expect("write");
         assert_eq!(
-            Settings::load_or_init_at(&path).file_tree.max_entries,
-            FILE_TREE_MAX_ENTRIES_MIN,
-            "a cap too small to render a usable tree is clamped up, not honoured"
+            loaded.editor.tab_width, 2,
+            "the removed section must be ignored, not treated as a parse failure that discards \
+             the whole file"
         );
     }
 

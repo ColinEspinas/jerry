@@ -5,28 +5,42 @@
 //! importantly, keeping this fast: `.git` can contain many thousands of loose objects, and
 //! walking it would make browsing unusably slow.
 //!
-//! ## No entry is ever hidden without saying so (GitHub issue #18 §4)
+//! ## No entry is hidden, and no entry is left unloaded (GitHub issues #18 §4, #160)
 //!
-//! There is no longer a render-time cap: `crate::sidebar::render::AdeApp::render_file_tree` is a
-//! real virtualized `gpui::uniform_list`, so every visible row is rendered and only the rows
-//! genuinely on screen become elements. The old `MAX_RENDERED_FILE_ENTRIES` (500) cap and its
+//! There is no render-time cap: `crate::sidebar::render::AdeApp::render_file_tree` is a real
+//! virtualized `gpui::uniform_list`, so every visible row is rendered and only the rows genuinely
+//! on screen become elements. The old `MAX_RENDERED_FILE_ENTRIES` (500) cap and its
 //! "... and N more entries not shown" row are gone.
 //!
-//! One cap survives, and it is a *load* bound rather than a render one: the recursive walk is
-//! bounded by [`FileTreeSettings::max_entries`](crate::settings::store::FileTreeSettings), a
-//! real, configurable `settings.toml` value (20,000 by default). It exists because the walk is
-//! eager and synchronous - `crate::root::AdeApp::rebuild_palette_file_candidates` needs the whole
-//! tree for file search, so it cannot be made lazy - and pointing this app at a directory with a
-//! million files should not allocate a million `PathBuf`s before the first frame. When it is hit
-//! the listing reports [`FileTreeListing::truncated`] and the sidebar shows a real
-//! "Stopped at N entries - load more" action
-//! (`crate::sidebar::render::AdeApp::load_more_file_tree_entries`), which re-walks with a
-//! tenfold larger budget. Still a budget, deliberately - see that method's own docs - but the
-//! row always names the count the walk stopped at, so nothing is ever *silently* cut off.
+//! There is no *load*-time cap either, as of issue #160 ("File tree should load all folders and
+//! files"). The walk used to stop at `Settings.file_tree.max_entries` (20,000 by default) and the
+//! sidebar showed a "Stopped at N entries - load more" action that re-walked with a tenfold
+//! larger budget. Both are gone: this walk collects the whole tree.
+//!
+//! Removing that bound was only safe because the two costs it was really guarding no longer scale
+//! with the size of the loaded tree on the foreground thread:
+//!
+//! - The walk itself has always run on `gpui::BackgroundExecutor`
+//!   (`crate::root::AdeApp::load_file_tree`), so a huge `node_modules`/`target` never blocked a
+//!   frame - it only decided *how much* the completion handler then had to do.
+//! - That completion handler used to build the palette's file-candidate list
+//!   (`crate::root::AdeApp::rebuild_palette_file_candidates`, one allocation-heavy
+//!   `crate::palette::state::FileCandidate` per file) on the foreground thread. It is now built on
+//!   the background executor too, in the same task, before anything is applied to the app.
+//! - [`FileTree::visible_indices`] - called once per frame by `render_file_tree` - used to scan
+//!   *every* loaded entry to decide which rows are showing, so a collapsed million-entry subtree
+//!   still cost a million iterations per frame. It now skips a collapsed directory's whole subtree
+//!   in one step using [`FileTree`]'s precomputed spans, making it O(visible rows) instead of
+//!   O(loaded entries).
+//!
+//! What survives is [`MAX_DEPTH`], which is not an entry budget at all but a stack-overflow guard
+//! on a recursive walk, and it reports itself through [`FileTreeListing::partial`] exactly as
+//! before.
 
 use std::collections::HashSet;
 use std::fs;
 use std::io;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use gpui::Rgba;
@@ -44,17 +58,121 @@ pub struct FileTreeEntry {
     pub is_dir: bool,
 }
 
-/// A completed walk: the flattened entries, plus the two ways it can be less than the whole
-/// truth. `truncated` is the honest half of the load cap (see the module docs) and is what the
-/// sidebar's "load more" action keys off. `partial` covers the quieter case - a subdirectory the
-/// walk couldn't read, or one that was deeper than [`MAX_DEPTH`] - which is deliberately *not*
-/// surfaced as a user-facing action but must still stop
-/// `crate::sidebar::render::AdeApp::prune_stale_fold_state` from treating this listing as a
-/// complete inventory of the worktree's directories.
+/// The loaded tree: [`build_file_tree`]'s pre-order entries, plus the derived per-entry subtree
+/// spans [`Self::visible_indices`] uses to skip a collapsed directory's descendants in one step.
+///
+/// The spans are deliberately *not* a public field and cannot be supplied by a caller: [`FileTree::new`]
+/// is the only way to make one, and it always derives them from the entries it is given. This is
+/// the same "a derived value gets exactly one assignment point" discipline
+/// `crate::root::AdeApp::set_file_tree_root` applies to `fold_state_root_key` - here it matters
+/// because a stale span wouldn't error, it would silently show a collapsed folder's children.
+///
+/// Derefs to `[FileTreeEntry]`, so everything that just reads rows (`len`, `iter`, indexing) uses
+/// it exactly as it used the old `Vec<FileTreeEntry>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileTree {
+    entries: Vec<FileTreeEntry>,
+    /// `subtree_spans[i]` is how many entries immediately following `i` are inside entry `i`'s
+    /// subtree - `0` for every file, and for a directory whose contents the walk never reached.
+    subtree_spans: Vec<usize>,
+}
+
+impl FileTree {
+    /// Wraps a pre-order, depth-annotated entry list (the shape [`build_file_tree`] produces),
+    /// deriving its subtree spans in one O(n) pass. Called on the background executor as the last
+    /// step of the walk, never on the foreground thread.
+    pub fn new(entries: Vec<FileTreeEntry>) -> Self {
+        let subtree_spans = subtree_spans(&entries);
+        Self {
+            entries,
+            subtree_spans,
+        }
+    }
+
+    /// The rows that should be rendered given which directories are **expanded**, as indices into
+    /// this tree. An unexpanded directory's own row still shows; everything nested underneath it
+    /// is skipped.
+    ///
+    /// Keyed on expanded-ness, not collapsed-ness, and that inversion is the whole of GitHub
+    /// issue #18 §1: absence from this set means *collapsed*, so a worktree nobody has ever
+    /// expanded anything in - including a freshly created one - opens showing only its root-level
+    /// entries, with no separate "first open" special case anywhere.
+    ///
+    /// Costs O(visible rows), not O(loaded entries): a collapsed directory is stepped over
+    /// wholesale via its [span](Self::new) rather than by scanning its descendants and discarding
+    /// them one at a time. `crate::sidebar::render::AdeApp::render_file_tree` calls this once per
+    /// frame, so before issue #160 removed the load cap that scan was the per-frame cost the cap
+    /// was partly there to bound.
+    ///
+    /// Indices rather than borrowed entries because `render_file_tree` needs the result inside a
+    /// `'static` closure that cannot hold a borrow of the app; [`Self::visible_entries`] is the
+    /// borrowing twin, defined in terms of this one so the two can never disagree.
+    pub fn visible_indices(&self, expanded: &HashSet<PathBuf>) -> Vec<usize> {
+        let mut visible = Vec::new();
+        let mut index = 0;
+        while let Some(entry) = self.entries.get(index) {
+            visible.push(index);
+            index += if entry.is_dir && !expanded.contains(&entry.path) {
+                // Bounds-checked rather than trusted: a span that was somehow short would render
+                // extra rows, but a `+ 0` step would hang the loop.
+                1 + self.subtree_spans.get(index).copied().unwrap_or(0)
+            } else {
+                1
+            };
+        }
+        visible
+    }
+
+    /// [`Self::visible_indices`]' borrowing twin - the same rows, as entries.
+    pub fn visible_entries(&self, expanded: &HashSet<PathBuf>) -> Vec<&FileTreeEntry> {
+        self.visible_indices(expanded)
+            .into_iter()
+            .map(|index| &self.entries[index])
+            .collect()
+    }
+}
+
+impl Deref for FileTree {
+    type Target = [FileTreeEntry];
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+/// Derives every entry's subtree span from the list's own pre-order `depth` shape: an entry's
+/// subtree is the contiguous run of following entries that are deeper than it, which ends at the
+/// first entry whose depth is less than or equal to its own.
+fn subtree_spans(entries: &[FileTreeEntry]) -> Vec<usize> {
+    let mut spans = vec![0usize; entries.len()];
+    // The current entry's open ancestors, outermost first. An entry at depth `d` has exactly `d`
+    // of them, so anything deeper on this stack has just been closed by reaching this entry.
+    let mut open: Vec<usize> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        while open.len() > entry.depth {
+            if let Some(ancestor) = open.pop() {
+                spans[ancestor] = index - ancestor - 1;
+            }
+        }
+        open.push(index);
+    }
+    while let Some(ancestor) = open.pop() {
+        spans[ancestor] = entries.len() - ancestor - 1;
+    }
+    spans
+}
+
+/// A completed walk: the loaded tree, plus the one way it can still be less than the whole truth.
+/// `partial` covers the quiet cases - a subdirectory the walk couldn't read, or one that was
+/// deeper than [`MAX_DEPTH`] - which are deliberately *not* surfaced as a user-facing action but
+/// must still stop `crate::sidebar::render::AdeApp::prune_stale_fold_state` from treating this
+/// listing as a complete inventory of the worktree's directories.
+///
+/// There is no `truncated` counterpart any more: the walk has no entry budget to stop at (issue
+/// #160 - see the module docs).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileTreeListing {
-    pub entries: Vec<FileTreeEntry>,
-    pub truncated: bool,
+    pub tree: FileTree,
     pub partial: bool,
 }
 
@@ -62,16 +180,9 @@ impl FileTreeListing {
     /// Whether this listing is a complete inventory of the tree - the only condition under which
     /// "a directory isn't in here" may be taken as "that directory no longer exists".
     pub fn is_complete(&self) -> bool {
-        !self.truncated && !self.partial
+        !self.partial
     }
 }
-
-/// The ceiling `crate::sidebar::render::AdeApp::load_more_file_tree_entries` escalates towards.
-/// Deliberately the same number as `crate::settings::store::FILE_TREE_MAX_ENTRIES_MAX` - see that
-/// constant for the real reasoning (two foreground-thread costs that scale with the loaded entry
-/// count). An escape hatch that could exceed the configured maximum would just be the unbounded
-/// walk again, wearing a click.
-pub const MAX_LOAD_MORE_ENTRIES: usize = crate::settings::store::FILE_TREE_MAX_ENTRIES_MAX;
 
 /// How deep the walk will recurse. A defensive bound on stack depth, not a product decision: the
 /// walk is recursive, and while `std::fs::DirEntry::file_type` doesn't follow symlinks (so a
@@ -83,24 +194,29 @@ pub const MAX_DEPTH: usize = 64;
 /// Recursively lists `root`'s contents (directories first, then alphabetically within each
 /// group) as a flattened, depth-annotated list suitable for indented rendering.
 ///
-/// `limit` is the maximum number of entries to collect. `None` is genuinely unbounded and is a
-/// test-only convenience: every production caller passes a real cap (see
-/// `crate::root::AdeApp::load_file_tree`), including the sidebar's own "load more" action.
-pub fn build_file_tree(root: &Path, limit: Option<usize>) -> io::Result<FileTreeListing> {
-    let mut listing = FileTreeListing::default();
-    let mut budget = limit.unwrap_or(usize::MAX);
-    visit(root, 0, &mut budget, &mut listing)?;
-    Ok(listing)
+/// Genuinely unbounded in entry count (GitHub issue #160): every folder and file under `root`
+/// that isn't a dotfile and isn't deeper than [`MAX_DEPTH`] is collected. See the module docs for
+/// why that is safe here and what had to change on the foreground thread to keep it that way.
+pub fn build_file_tree(root: &Path) -> io::Result<FileTreeListing> {
+    let mut walk = Walk::default();
+    visit(root, 0, &mut walk)?;
+    Ok(FileTreeListing {
+        tree: FileTree::new(walk.entries),
+        partial: walk.partial,
+    })
 }
 
-fn visit(
-    dir: &Path,
-    depth: usize,
-    budget: &mut usize,
-    listing: &mut FileTreeListing,
-) -> io::Result<()> {
+/// The walk's own mutable accumulator - deliberately not a [`FileTreeListing`], since the spans a
+/// [`FileTree`] carries can only be derived once the entry list is finished.
+#[derive(Default)]
+struct Walk {
+    entries: Vec<FileTreeEntry>,
+    partial: bool,
+}
+
+fn visit(dir: &Path, depth: usize, walk: &mut Walk) -> io::Result<()> {
     if depth >= MAX_DEPTH {
-        listing.partial = true;
+        walk.partial = true;
         return Ok(());
     }
     let mut children: Vec<fs::DirEntry> = fs::read_dir(dir)?
@@ -111,7 +227,7 @@ fn visit(
             // inventory when it isn't, which is what `prune_stale_fold_state` would then delete
             // real fold state on the strength of.
             Err(_) => {
-                listing.partial = true;
+                walk.partial = true;
                 None
             }
         })
@@ -128,24 +244,18 @@ fn visit(
     });
 
     for child in children {
-        if *budget == 0 {
-            listing.truncated = true;
-            return Ok(());
-        }
-        *budget -= 1;
-
         let path = child.path();
         // A `file_type()` that fails leaves a real directory recorded as a file, so its whole
         // subtree is never walked - the same "incomplete but doesn't look it" hazard as above.
         let is_dir = match child.file_type() {
             Ok(file_type) => file_type.is_dir(),
             Err(_) => {
-                listing.partial = true;
+                walk.partial = true;
                 false
             }
         };
         let name = child.file_name().to_string_lossy().into_owned();
-        listing.entries.push(FileTreeEntry {
+        walk.entries.push(FileTreeEntry {
             path: path.clone(),
             name,
             depth,
@@ -159,8 +269,8 @@ fn visit(
             // though, which `partial` records - without it, an unreadable folder would look
             // exactly like a deleted one to `prune_stale_fold_state`, which would then throw
             // away every fold-state entry beneath it.
-            if visit(&path, depth + 1, budget, listing).is_err() {
-                listing.partial = true;
+            if visit(&path, depth + 1, walk).is_err() {
+                walk.partial = true;
             }
         }
     }
@@ -189,38 +299,13 @@ pub fn lang_chip_for_name(name: &str) -> LangChip {
     LangChip { label, fg, bg }
 }
 
-/// Filters a flattened, depth-annotated [`build_file_tree`] listing down to the rows that should
-/// be rendered given which directories are **expanded** (an unexpanded directory's own row still
-/// shows, but everything nested underneath it is hidden until it is expanded).
-///
-/// Keyed on expanded-ness, not collapsed-ness, and that inversion is the whole of GitHub issue
-/// #18 §1: absence from this set means *collapsed*, so a worktree nobody has ever expanded
-/// anything in - including a freshly created one - opens showing only its root-level entries,
-/// with no separate "first open" special case anywhere.
-///
-/// Relies on `entries` being in [`build_file_tree`]'s pre-order depth-first shape: once an
-/// unexpanded directory at depth `d` is seen, every following entry with `depth > d` is skipped
-/// until one with `depth <= d` is reached. Expanded directories nested inside an already-hidden
-/// subtree need no special case - they're skipped along with the rest of their parent, so a stale
-/// deep expansion can never make a row appear underneath a collapsed ancestor.
-/// Defined in terms of [`visible_indices`] rather than duplicating the walk, so the two can
-/// never disagree about which rows are showing.
-pub fn visible_entries<'a>(
-    entries: &'a [FileTreeEntry],
-    expanded: &HashSet<PathBuf>,
-) -> Vec<&'a FileTreeEntry> {
-    visible_indices(entries, expanded)
-        .into_iter()
-        .map(|index| &entries[index])
-        .collect()
-}
-
-/// [`visible_entries`]'s index-returning twin - the same walk, reporting positions in `entries`
-/// rather than borrowing from it. `crate::sidebar::render::AdeApp::render_file_tree` needs the
-/// result inside a `'static` closure that cannot hold a borrow of the app, and re-running the
-/// walk inside that closure would mean walking the whole loaded tree once per `uniform_list`
-/// pass (three per frame) instead of once per frame.
-pub fn visible_indices(entries: &[FileTreeEntry], expanded: &HashSet<PathBuf>) -> Vec<usize> {
+/// The pre-span definition of [`FileTree::visible_indices`], kept as the oracle its own test
+/// checks the fast, span-based implementation against: once an unexpanded directory at depth `d`
+/// is seen, every following entry with `depth > d` is skipped until one with `depth <= d` is
+/// reached. Correct but O(loaded entries) - which is exactly what issue #160 could not afford to
+/// keep doing once the load cap was gone.
+#[cfg(test)]
+fn visible_indices_by_depth(entries: &[FileTreeEntry], expanded: &HashSet<PathBuf>) -> Vec<usize> {
     let mut visible = Vec::new();
     let mut hidden_below_depth: Option<usize> = None;
 
@@ -302,10 +387,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn tree_of(root: &Path) -> Vec<FileTreeEntry> {
-        build_file_tree(root, None)
-            .expect("build_file_tree")
-            .entries
+    fn tree_of(root: &Path) -> FileTree {
+        build_file_tree(root).expect("build_file_tree").tree
     }
 
     #[test]
@@ -348,43 +431,16 @@ mod tests {
     #[test]
     fn empty_directory_yields_no_entries() {
         let dir = TempDir::new().expect("tempdir");
-        let listing = build_file_tree(dir.path(), None).expect("build_file_tree");
-        assert!(listing.entries.is_empty());
-        assert!(!listing.truncated);
+        let listing = build_file_tree(dir.path()).expect("build_file_tree");
+        assert!(listing.tree.is_empty());
+        assert!(listing.is_complete());
     }
 
     #[test]
     fn nonexistent_root_returns_io_error() {
         let missing = PathBuf::from("/definitely/not/a/real/path/for/ade/file-tree-test");
-        let result = build_file_tree(&missing, None);
+        let result = build_file_tree(&missing);
         assert!(result.is_err());
-    }
-
-    /// The load cap must be honest in both directions: a walk that hits it says so, and one that
-    /// doesn't must never claim it did (which would put a "Show all entries" action in the
-    /// sidebar for a tree that is already complete).
-    #[test]
-    fn a_walk_that_hits_its_limit_reports_truncation_and_one_that_does_not_says_so() {
-        let dir = TempDir::new().expect("tempdir");
-        for index in 0..10 {
-            fs::write(dir.path().join(format!("f-{index}.txt")), "x").expect("write");
-        }
-
-        let capped = build_file_tree(dir.path(), Some(4)).expect("build_file_tree");
-        assert_eq!(capped.entries.len(), 4);
-        assert!(capped.truncated);
-
-        let complete = build_file_tree(dir.path(), Some(10)).expect("build_file_tree");
-        assert_eq!(complete.entries.len(), 10);
-        assert!(
-            !complete.truncated,
-            "a walk that collected everything must not report truncation, even when the entry \
-             count exactly equals the budget"
-        );
-
-        let uncapped = build_file_tree(dir.path(), None).expect("build_file_tree");
-        assert_eq!(uncapped.entries.len(), 10);
-        assert!(!uncapped.truncated);
     }
 
     /// A directory the walk can't read is skipped (so one bad folder never blanks the sidebar),
@@ -411,12 +467,12 @@ mod tests {
             return;
         }
 
-        let listing = build_file_tree(dir.path(), None).expect("build_file_tree");
+        let listing = build_file_tree(dir.path()).expect("build_file_tree");
         // Restore before any assertion can fail, or `TempDir`'s own cleanup fails too.
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("chmod back");
 
         assert!(
-            listing.entries.iter().any(|entry| entry.name == "file.txt"),
+            listing.tree.iter().any(|entry| entry.name == "file.txt"),
             "the readable part of the tree must still be listed"
         );
         assert!(listing.partial, "the skipped directory must be reported");
@@ -424,7 +480,6 @@ mod tests {
             !listing.is_complete(),
             "and so this listing must never be used as a complete inventory"
         );
-        assert!(!listing.truncated, "no entry budget was involved");
     }
 
     /// The recursion bound - a defensive stack guard, reported the same honest way.
@@ -437,11 +492,10 @@ mod tests {
         }
         fs::create_dir_all(&deep).expect("mkdir -p");
 
-        let listing = build_file_tree(dir.path(), None).expect("build_file_tree");
+        let listing = build_file_tree(dir.path()).expect("build_file_tree");
 
-        assert_eq!(listing.entries.len(), MAX_DEPTH);
+        assert_eq!(listing.tree.len(), MAX_DEPTH);
         assert!(listing.partial);
-        assert!(!listing.truncated);
     }
 
     /// The listing has to hold hundreds of entries in a single directory without any cap of its
@@ -454,17 +508,104 @@ mod tests {
             fs::write(dir.path().join(format!("f-{index:03}.txt")), "x").expect("write");
         }
 
-        let listing = build_file_tree(dir.path(), Some(20_000)).expect("build_file_tree");
+        let listing = build_file_tree(dir.path()).expect("build_file_tree");
 
-        assert_eq!(listing.entries.len(), 800);
-        assert!(!listing.truncated);
+        assert_eq!(listing.tree.len(), 800);
+        assert!(listing.is_complete());
         let expanded = HashSet::new();
         assert_eq!(
-            visible_entries(&listing.entries, &expanded).len(),
+            listing.tree.visible_entries(&expanded).len(),
             800,
             "every entry in a flat directory is visible with nothing expanded, and none of them \
              may be dropped by a render cap"
         );
+    }
+
+    /// GitHub issue #160, at the level the walk itself decides it: a tree with more entries than
+    /// the removed 20,000-entry default cap must come back whole, with no truncation flag left
+    /// anywhere to hang a "load more" row off.
+    ///
+    /// Built as a wide, shallow fan (200 directories x 105 files) rather than 21,000 files in one
+    /// folder, so it also exercises the recursive descent the old budget used to cut short
+    /// mid-subtree.
+    #[test]
+    fn a_tree_larger_than_the_removed_twenty_thousand_entry_cap_loads_completely() {
+        const DIRS: usize = 200;
+        const FILES_PER_DIR: usize = 105;
+        // 200 directory rows + 21,000 file rows - comfortably past the 20,000 the walk used to
+        // stop at. Checked at compile time so the fixture can never be shrunk below the removed
+        // cap and go on passing for the wrong reason.
+        const EXPECTED: usize = DIRS + DIRS * FILES_PER_DIR;
+        const _: () = assert!(EXPECTED > 20_000);
+
+        let dir = TempDir::new().expect("tempdir");
+        for d in 0..DIRS {
+            let sub = dir.path().join(format!("d-{d:03}"));
+            fs::create_dir(&sub).expect("mkdir");
+            for f in 0..FILES_PER_DIR {
+                fs::write(sub.join(format!("f-{f:03}.txt")), "x").expect("write");
+            }
+        }
+
+        let listing = build_file_tree(dir.path()).expect("build_file_tree");
+
+        assert_eq!(
+            listing.tree.len(),
+            EXPECTED,
+            "every folder and every file must be loaded - the old cap stopped at 20,000"
+        );
+        assert!(
+            listing.is_complete(),
+            "and a walk that reached everything is a complete inventory"
+        );
+        // The last directory's last file is the entry furthest past the old cut-off; naming it
+        // proves the walk really continued rather than merely counting to a bigger number.
+        let last = dir
+            .path()
+            .join(format!("d-{:03}", DIRS - 1))
+            .join(format!("f-{:03}.txt", FILES_PER_DIR - 1));
+        assert!(
+            listing.tree.iter().any(|entry| entry.path == last),
+            "{} is ~1,000 entries past the removed cap and must still be present",
+            last.display()
+        );
+    }
+
+    /// The span-based skip must agree with the depth-scan it replaced on a real, nested tree -
+    /// for every combination of expanded folders, not just the one a hand-written case picks.
+    #[test]
+    fn span_based_visibility_matches_the_depth_scan_for_every_expansion() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::create_dir_all(dir.path().join("a/b/c")).expect("mkdir -p");
+        fs::create_dir_all(dir.path().join("a/d")).expect("mkdir -p");
+        fs::create_dir(dir.path().join("e")).expect("mkdir");
+        fs::write(dir.path().join("a/b/c/deep.txt"), "x").expect("write");
+        fs::write(dir.path().join("a/b/mid.txt"), "x").expect("write");
+        fs::write(dir.path().join("a/d/other.txt"), "x").expect("write");
+        fs::write(dir.path().join("e/leaf.txt"), "x").expect("write");
+        fs::write(dir.path().join("root.txt"), "x").expect("write");
+
+        let tree = tree_of(dir.path());
+        let dirs: Vec<PathBuf> = tree
+            .iter()
+            .filter(|entry| entry.is_dir)
+            .map(|entry| entry.path.clone())
+            .collect();
+        assert_eq!(dirs.len(), 5, "a/ a/b/ a/b/c/ a/d/ e/");
+
+        for mask in 0..(1u32 << dirs.len()) {
+            let expanded: HashSet<PathBuf> = dirs
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| mask & (1 << bit) != 0)
+                .map(|(_, path)| path.clone())
+                .collect();
+            assert_eq!(
+                tree.visible_indices(&expanded),
+                visible_indices_by_depth(&tree, &expanded),
+                "span-based visibility diverged from the depth scan for expansion mask {mask:#b}"
+            );
+        }
     }
 
     fn same(a: Rgba, b: Rgba) -> bool {
@@ -520,33 +661,40 @@ mod tests {
         }
     }
 
+    /// Hand-built fixtures go through the same [`FileTree::new`] every real walk does, so the
+    /// subtree spans under test are always the derived ones - there is deliberately no way to
+    /// hand-write a span.
+    fn tree(entries: Vec<FileTreeEntry>) -> FileTree {
+        FileTree::new(entries)
+    }
+
     /// Issue #18 §1's default state, at the level it's actually decided: nothing expanded means
     /// root-level entries only.
     #[test]
     fn nothing_expanded_shows_only_root_level_entries() {
-        let entries = vec![
+        let entries = tree(vec![
             entry("sub", 0, true),
             entry("nested.txt", 1, false),
             entry("a.txt", 0, false),
-        ];
-        let visible = visible_entries(&entries, &HashSet::new());
+        ]);
+        let visible = entries.visible_entries(&HashSet::new());
         let names: Vec<&str> = visible.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["sub", "a.txt"]);
     }
 
     #[test]
     fn expanding_a_directory_reveals_only_its_own_immediate_subtree() {
-        let entries = vec![
+        let entries = tree(vec![
             entry("sub", 0, true),
             entry("nested.txt", 1, false),
             entry("deeper", 1, true),
             entry("deepest.txt", 2, false),
             entry("a.txt", 0, false),
-        ];
+        ]);
         let mut expanded = HashSet::new();
         expanded.insert(PathBuf::from("sub"));
 
-        let visible = visible_entries(&entries, &expanded);
+        let visible = entries.visible_entries(&expanded);
         let names: Vec<&str> = visible.iter().map(|e| e.name.as_str()).collect();
         // "deeper" shows because its parent is expanded, but its own children stay hidden until
         // it is expanded too.
@@ -555,16 +703,16 @@ mod tests {
 
     #[test]
     fn expanding_a_whole_chain_reveals_the_deepest_entry() {
-        let entries = vec![
+        let entries = tree(vec![
             entry("sub", 0, true),
             entry("deeper", 1, true),
             entry("deepest.txt", 2, false),
-        ];
+        ]);
         let mut expanded = HashSet::new();
         expanded.insert(PathBuf::from("sub"));
         expanded.insert(PathBuf::from("deeper"));
 
-        let visible = visible_entries(&entries, &expanded);
+        let visible = entries.visible_entries(&expanded);
         let names: Vec<&str> = visible.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["sub", "deeper", "deepest.txt"]);
     }
@@ -573,27 +721,27 @@ mod tests {
     /// collapsed) must never punch a hole through a collapsed ancestor.
     #[test]
     fn an_expanded_directory_under_a_collapsed_ancestor_stays_hidden() {
-        let entries = vec![
+        let entries = tree(vec![
             entry("sub", 0, true),
             entry("deeper", 1, true),
             entry("deepest.txt", 2, false),
             entry("a.txt", 0, false),
-        ];
+        ]);
         let mut expanded = HashSet::new();
         expanded.insert(PathBuf::from("deeper"));
 
-        let visible = visible_entries(&entries, &expanded);
+        let visible = entries.visible_entries(&expanded);
         let names: Vec<&str> = visible.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["sub", "a.txt"]);
     }
 
     #[test]
     fn expanding_a_directory_with_no_children_reveals_nothing_extra() {
-        let entries = vec![entry("empty-dir", 0, true), entry("a.txt", 0, false)];
+        let entries = tree(vec![entry("empty-dir", 0, true), entry("a.txt", 0, false)]);
         let mut expanded = HashSet::new();
         expanded.insert(PathBuf::from("empty-dir"));
 
-        let visible = visible_entries(&entries, &expanded);
+        let visible = entries.visible_entries(&expanded);
         assert_eq!(visible.len(), 2);
     }
 
@@ -608,7 +756,7 @@ mod tests {
         let mut expanded = HashSet::new();
         expanded.insert(dir.path().join("sub"));
 
-        let visible = visible_entries(&entries, &expanded);
+        let visible = entries.visible_entries(&expanded);
         let names: Vec<&str> = visible.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["sub", "nested.txt", "a.txt"]);
     }
