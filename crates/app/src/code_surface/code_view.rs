@@ -5974,17 +5974,23 @@ mod fixture_corpus_tests {
             kind_at(&spans, RUST, "parse(input"),
             HighlightKind::FunctionDefinition
         );
-        // `push` is a *method* call, so it lands in the FunctionMethod bucket - and the point of
-        // the restraint palette is that both call buckets resolve to exactly plain foreground.
+        // `push` is a *method* call, so it lands in the FunctionMethod bucket. Both call buckets
+        // share one blue, and the definition site is a distinct violet-blue - the restraint
+        // revision held all three at plain foreground and this is the assertion that replaced it.
         assert_eq!(
             kind_at(&spans, RUST, "push("),
             HighlightKind::FunctionMethod
         );
         for call in [HighlightKind::Function, HighlightKind::FunctionMethod] {
-            assert_eq!(
+            assert_ne!(
                 color_for_kind(call),
                 color_for_kind(HighlightKind::Text),
-                "a call site must render at plain foreground"
+                "a call site carries real colour"
+            );
+            assert_ne!(
+                color_for_kind(call),
+                color_for_kind(HighlightKind::FunctionDefinition),
+                "and is still tellable apart from a definition site"
             );
         }
         // The brackets inside the string, char and raw string are never ring-coloured.

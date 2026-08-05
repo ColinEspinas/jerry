@@ -298,7 +298,7 @@ mod tests {
     /// The redesign's own headline guarantee, checked on the real checked-in files rather than on
     /// the generator in memory: **every** bundled theme clears its syntax contrast floors. This is
     /// what `theme::enforce_syntax_contrast_floors` exists to make true, and it is stated here as
-    /// well as in `theme::syntax_restraint_tests` because this is the layer where a stale file
+    /// well as in `theme::syntax_palette_tests` because this is the layer where a stale file
     /// (rather than a bad default) would break it.
     #[test]
     fn every_bundled_theme_file_clears_its_syntax_contrast_floors() {

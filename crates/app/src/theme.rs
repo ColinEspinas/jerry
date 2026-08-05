@@ -584,17 +584,18 @@ pub fn derive_shift(base_swatches: [u32; 5], target_swatches: [u32; 5]) -> Oklch
     }
 }
 
-/// Jerry Dark's own real accent blue ([`syntax::FUNCTION_DEFINITION`]/`#88b4ed`) - the reference
-/// hue [`shift_from_seed`] rotates a user's seed colour against. Pinned here as the one place that
+/// Jerry Dark's own real accent blue ([`syntax::FUNCTION`]/`#74ade8`) - the reference hue
+/// [`shift_from_seed`] rotates a user's seed colour against. Pinned here as the one place that
 /// choice is made, rather than repeated at each caller.
 ///
-/// It used to be `syntax::FUNCTION`'s `#74ade8`, and the theme redesign had to move it: under the
-/// restraint palette a function *call* renders at plain foreground, so `FUNCTION` is now a
-/// near-neutral grey whose hue is numerically meaningless. Rotating a whole palette against it
-/// would have produced garbage from a constant that still looked plausible -
+/// It moved to `syntax::FUNCTION_DEFINITION`'s `#88b4ed` for one revision, because the restraint
+/// palette had rendered a function *call* at plain foreground - leaving `FUNCTION` a near-neutral
+/// grey whose hue was numerically meaningless, so rotating a whole palette against it would have
+/// produced garbage from a constant that still looked plausible. That revision is walked back and
+/// `FUNCTION` is a genuinely chromatic blue again, so this points back at it.
 /// [`derivation_tests::the_seed_reference_accent_is_a_genuinely_chromatic_colour`] exists to stop
-/// that specific class of silent breakage from recurring.
-const SEED_REFERENCE_ACCENT: u32 = 0x88b4ed;
+/// that class of silent breakage from recurring either way.
+const SEED_REFERENCE_ACCENT: u32 = 0x74ade8;
 
 /// Derives an [`OklchShift`] from a single seed colour - the real maths behind the Themes page's
 /// "Generate from colour" action (GitHub issue #141).
@@ -1113,76 +1114,75 @@ pub mod diff {
 ///
 /// ## What earns a colour
 ///
-/// Six accent hues, all at one OKLCH lightness (0.760) and one chroma (0.095), differing only in
-/// hue. The whole colour -> meaning mapping is meant to be recitable from memory:
+/// **Ten accent hues, all at one OKLCH lightness (0.732) and one chroma (0.105), differing only in
+/// hue.** Every semantic category a reader actually distinguishes gets one; the only things left
+/// at plain foreground are the neutrals ([`TEXT`], [`EMBEDDED`]) and the deliberately de-emphasized
+/// punctuation family.
 ///
 /// | hue | OKLCH H | what it means |
 /// |---|---|---|
-/// | green `#8bc18c` | 145 | [`STRING`] (and [`STRING_ESCAPE`], the same hue lifted in lightness) |
-/// | amber `#d8a76d` | 70 | [`CONSTANT`] / [`NUMBER`] / [`CONSTANT_BUILTIN`] / [`VARIABLE_BUILTIN`] / [`ATTRIBUTE`] |
-/// | blue `#88b4ed` | 255 | [`FUNCTION_DEFINITION`] (and [`LINK`]) |
-/// | cyan `#5ec4c4` | 195 | [`TYPE`] / [`TYPE_BUILTIN`] / [`TAG`] / [`HEADING`] |
-/// | magenta `#cc9ed7` | 320 | [`VARIABLE_PARAMETER`] (and [`EMPHASIS`]) |
-/// | red `#dc655f`-family | 25 | diagnostics only - [`ERROR_UNDERLINE`], the two diagnostic messages |
+/// | red-rose `#e28c93` | 15 | [`VARIABLE_PARAMETER`] |
+/// | orange `#de946b` | 50 | [`CONSTANT`] / [`CONSTANT_BUILTIN`] / [`NUMBER`] / [`VARIABLE_BUILTIN`] |
+/// | gold `#c7a356` | 85 | [`TYPE`] / [`TYPE_BUILTIN`] / [`TAG`] / [`HEADING`] |
+/// | green `#98b46a` | 126 | [`STRING`] (and [`STRING_ESCAPE`], the same hue lifted in lightness) |
+/// | teal `#4bbeb1` | 185 | [`ATTRIBUTE`] |
+/// | cyan-blue `#51b7d8` | 222 | [`PROPERTY`] |
+/// | blue `#74ade8` | 250 | [`FUNCTION`] / [`FUNCTION_METHOD`] / [`LINK`] / [`CARET`] |
+/// | violet-blue `#a19fe8` | 285 | [`FUNCTION_DEFINITION`] |
+/// | purple `#c194d6` | 315 | [`KEYWORD`] (and [`EMPHASIS`]) |
+/// | rose `#da8db2` | 350 | [`VARIABLE`] |
 ///
 /// And a neutral ramp: [`STRONG`] `L 0.885` > [`TEXT`] `L 0.762` > [`COMMENT_DOC`] `L 0.660` >
 /// [`COMMENT`] `L 0.600` > punctuation `L 0.560`.
 ///
-/// **What is deliberately not coloured** is the more important half of the design. [`VARIABLE`],
-/// [`PROPERTY`], [`FUNCTION`], [`FUNCTION_METHOD`], [`KEYWORD`] and [`EMBEDDED`] all resolve to
-/// exactly [`TEXT`]. Those are the things a source file is mostly *made of*, and colouring them
-/// spends the entire contrast budget on the most frequent tokens on screen -
-/// [`syntax_restraint_tests::variables_properties_and_calls_render_at_plain_foreground_in_every_bundled_theme`]
-/// pins it across every bundled theme.
+/// ## Where the tier comes from, and why this walked an earlier revision back
 ///
-/// tonsky's "I am sorry, but everyone is getting syntax highlighting wrong" is where the argument
-/// comes from, and it is worth quoting exactly, because the useful part is not "don't colour
-/// variables" but *where he draws the line*:
+/// The `L 0.732 / C 0.105` tier is not a fresh invention: it is **the OKLCH of this app's own
+/// original `syntax.function` blue `#74ade8`**, the palette the maintainer says they preferred.
+/// Every accent above is that colour rotated in hue only, so `FUNCTION` reproduces the original
+/// value bit-exactly and `STRING` lands ΔE 2 (below a just-noticeable difference) from the
+/// original `#9dbb6f`. The rest keep their original hue and move only onto the shared tier - the
+/// largest drift is ΔE 16 on [`KEYWORD`], which stays unmistakably the same purple.
 ///
-/// > I don't highlight variables or function calls - they are everywhere, your code is probably
-/// > 75% variable names and function calls.
+/// The revision this replaces held [`KEYWORD`], [`FUNCTION`] and [`FUNCTION_METHOD`] at *exactly*
+/// [`TEXT`]'s grey, on tonsky's "I don't highlight variables or function calls" argument. The
+/// maintainer looked at the built app and rejected it: *"I don't like the new colors at all. I
+/// preferred the old colors but I think they were not used correctly."* That is the verdict of the
+/// person who reads this screen all day, and it is not a lone opinion - Asenov, Hilliges and
+/// Muller's CHI'16 controlled study, *The Effect of Richer Visualizations on Code Comprehension*,
+/// measured 33 participants across three levels of visual richness and found richer colour cut
+/// time-to-answer on structural comprehension questions by 21-75% **with no loss of correctness**,
+/// and recommended in as many words that tool designers *"use a wider variety of colors by default"*
+/// and *"enable the highlighting of more constructs."* Its one real caution is about non-colour
+/// noise (icons replacing keywords, background tinting everywhere), not about hue count.
 ///
-/// > Notice that we've kept variable declarations. These are not as ubiquitous and help you
-/// > quickly answer a common question: where does this thing come from?
+/// So the restraint pass is walked back deliberately. What is **kept** from it is the construction
+/// method, which was never the problem: one perceptual tier for every accent, contrast floors
+/// enforced rather than assumed, and the definition-site query work in
+/// [`crate::code_surface::code_view`] - which now buys a real distinction between a declaration and
+/// a call rather than between "coloured" and "not coloured".
 ///
-/// So: **use sites plain, binding sites coloured.** That is why
-/// [`crate::code_surface::code_view`] grew real definition-site query rules - without them the
-/// distinction is not expressible at all, since no bundled grammar query makes it.
+/// ## Solarized's actual discipline, in OKLCH
 ///
-/// Motlin's "How to pick colors for a syntax highlighting theme" is often read as arguing the
-/// opposite, and it does not. His claim is *relational* - "Keywords, parameters, locals, and
-/// fields should use distinct colors", i.e. if you colour these they must differ from each other -
-/// and he never asserts that a variable *reference* deserves colour against plain foreground. His
-/// own stated principle points the other way:
-///
-/// > Contrast is a scarce resource which we only spend to resolve ambiguity.
-///
-/// > Escape sequences don't get confused with anything else, because they're inside a string.
-///
-/// That second one is the general rule that context can substitute for contrast, and it is exactly
-/// what makes a plain use site affordable once its declaration nearby is already distinguished.
-///
-/// [`VARIABLE_PARAMETER`] keeps a real accent under both authors' rules for one specific reason:
-/// every grammar here captures `@variable.parameter` at the *parameter declaration*
-/// (`tree-sitter-rust`'s `(parameter (identifier) @variable.parameter)`, `-typescript`'s
-/// `required_parameter`/`optional_parameter`), never at a use inside the body. It is already a
-/// binding site, so colouring it is tonsky's own rule rather than an exception to it - and it
-/// resolves precisely the local-versus-parameter ambiguity Motlin names.
-///
-/// The one place the two authors genuinely disagree is left decided rather than papered over:
-/// Motlin's strongest case is a bare `count++` where you cannot tell a field from a local without
-/// scrolling, and per-use colouring would answer it. tonsky simply prices that answer as
-/// unaffordable at 75% of the screen. This palette takes tonsky's side, and [`PROPERTY`] is
-/// therefore plain text: a member access is already marked by the `.` in front of it, which is
-/// context doing the work contrast would otherwise have to.
+/// Solarized's real method is symmetric CIELAB lightness relationships, so light and dark modes
+/// keep an identical perceived contrast structure instead of being naive inversions of each other.
+/// The equivalent here is stronger, because OKLCH's lightness is more perceptually uniform than
+/// CIELAB's: every accent shares one `L` and one `C` and differs *only* in hue, so no accent can
+/// shout louder than another, and [`enforce_syntax_contrast_floors`] re-establishes the same
+/// relationship against each derived theme's own background rather than trusting the transform.
+/// [`syntax_palette_tests::every_accent_shares_one_lightness_and_one_chroma`] pins the tier and
+/// [`syntax_palette_tests::every_accent_hue_family_stays_a_real_hue_apart`] pins the spacing.
 ///
 /// ## Contrast, measured
 ///
-/// Every accent lands 8.17-8.86:1 against [`super::surface::CENTER`]. [`COMMENT`] is 4.65:1 - it
-/// used to be **3.03:1**, a real ghost-grey failure of the 4.5:1 body-text floor, and the single
-/// clearest legibility bug the redesign's audit found. Punctuation is 3.94:1: below plain text on
-/// purpose, above the 3:1 floor on purpose. [`syntax_restraint_tests`] pins all three properties,
-/// and [`enforce_syntax_contrast_floors`] is what makes them hold in the five *derived* themes too.
+/// Every accent lands 7.32-8.10:1 against [`super::surface::CENTER`], and the closest any accent
+/// comes to plain [`TEXT`] is ΔE 27.8 - roughly 12x the ~2.3 just-noticeable difference, which is
+/// the number that actually answers "is this visibly coloured or just a different hex".
+/// [`COMMENT`] is 4.88:1 - it used to be **3.03:1**, a real ghost-grey failure of the 4.5:1
+/// body-text floor, and the single clearest legibility bug the redesign's audit found. Punctuation
+/// is 4.13:1: below plain text on purpose, above the 3:1 floor on purpose. [`syntax_palette_tests`]
+/// pins all of it, and [`enforce_syntax_contrast_floors`] is what makes it hold in the five
+/// *derived* themes too.
 ///
 /// ## The bracket-pair depth ring (GitHub issue #168)
 ///
@@ -1191,18 +1191,24 @@ pub mod diff {
 /// partner keeps [`PUNCTUATION_BRACKET`] instead, which is what makes malformed or mid-edit code
 /// degrade visibly-but-quietly rather than lying about structure.
 ///
-/// The ring is built the same way the accents are - six hues at **one** OKLCH lightness (0.700)
-/// and **one** chroma (0.080) - and sits deliberately *under* the accents on every axis: dimmer
-/// (L 0.700 vs 0.760) and less saturated (C 0.080 vs 0.095, a Lab C* of 28.6 against the accents'
-/// 34.2). A bracket must never shout louder than a string.
-/// [`syntax_bracket_ring_tests::the_ring_stays_inside_the_palettes_own_chroma_register`] pins that.
+/// The ring is built the same way the accents are - six hues at **one** OKLCH lightness and
+/// **one** chroma - but it is placed on a different tier entirely: **`L 0.560 / C 0.090`, which is
+/// exactly [`PUNCTUATION_BRACKET`]'s own lightness.** A bracket *is* punctuation; colouring it
+/// should tell you the nesting depth without promoting it above the code it encloses, so the ring
+/// keeps the punctuation weight and spends only hue. It sits under the accents on both axes
+/// (L 0.560 vs 0.732, C 0.090 vs 0.105), and
+/// [`syntax_bracket_ring_tests::the_ring_stays_inside_the_palettes_own_chroma_register`] pins the
+/// chroma half.
 ///
-/// Its six hues (350, 47, 107, 170, 225, 287) are set at the *midpoints* between the accent hues,
-/// so no ring colour sits on top of a semantic one - the closest is
-/// [`syntax_bracket_ring_tests::no_ring_colour_is_confusable_with_a_syntax_accent`]'s measured
-/// worst case. That check is new, and it exists because the previous ring had `BRACKET_1` at hue
-/// 23 against [`ERROR_UNDERLINE`]'s 25 - two degrees apart, i.e. a matched depth-0 bracket
-/// essentially wearing the error colour.
+/// Its six hues are the canonical even split - **0, 60, 120, 180, 240, 300** - because with ten
+/// semantic hue families on the wheel there is no longer a set of six *gaps* wide enough to hide
+/// in. That is the real change here and it is worth stating plainly: the ring stopped buying its
+/// separation from hue and started buying it from lightness, which turns out to be a much better
+/// trade. Measured against the semantic accents in Jerry Dark it went from ΔE 11.3 (the previous
+/// ring's worst case, against a palette of *eight* families) to **20.8** against a palette of ten.
+/// The check that measures it exists because an earlier ring had `BRACKET_1` at hue 23 against
+/// [`ERROR_UNDERLINE`]'s 25 - two degrees apart, i.e. a matched depth-0 bracket essentially
+/// wearing the error colour.
 ///
 /// Measured, across **every** bundled theme rather than only Jerry Dark:
 ///
@@ -1234,10 +1240,10 @@ pub mod diff {
 /// app's palette never designed a hue for reads like its *parent* rather than like plain
 /// foreground text:
 ///
-/// - [`FUNCTION_METHOD`] defaults to [`FUNCTION`]'s plain-foreground value (a method call is
-///   still a call - both are use sites, and neither is coloured)
-/// - [`TYPE_BUILTIN`] to [`TYPE`]'s cyan (`i32`/`number`/`void` are still types)
-/// - [`CONSTANT_BUILTIN`] to [`CONSTANT`]'s amber (`true`/`None`/`undefined` are still constants)
+/// - [`FUNCTION_METHOD`] defaults to [`FUNCTION`]'s blue (a method call is still a call - both are
+///   use sites, and both are coloured alike)
+/// - [`TYPE_BUILTIN`] to [`TYPE`]'s gold (`i32`/`number`/`void` are still types)
+/// - [`CONSTANT_BUILTIN`] to [`CONSTANT`]'s orange (`true`/`None`/`undefined` are still constants)
 /// - [`TAG`] to [`TYPE`]'s (preserves this module's pre-existing, deliberate "a JSX element name
 ///   is coloured like the type it names" choice - see the historical note on
 ///   [`crate::code_surface::code_view::HighlightKind::Tag`])
@@ -1259,36 +1265,37 @@ pub mod syntax {
     use super::{token, ColorToken};
 
     pub const TEXT: ColorToken = token("syntax.text", 0xacb2bc);
-    pub const KEYWORD: ColorToken = token("syntax.keyword", 0xacb2bc);
-    pub const FUNCTION: ColorToken = token("syntax.function", 0xacb2bc);
+    pub const KEYWORD: ColorToken = token("syntax.keyword", 0xc194d6);
+    pub const FUNCTION: ColorToken = token("syntax.function", 0x74ade8);
     /// `function.method` (`tree-sitter-rust`'s `@function.method`, `-javascript`'s own) - see the
     /// module docs' fallback-chain section.
-    pub const FUNCTION_METHOD: ColorToken = token("syntax.function_method", 0xacb2bc);
+    pub const FUNCTION_METHOD: ColorToken = token("syntax.function_method", 0x74ade8);
     /// `function.definition` - a function or method's name **where it is declared**, the one
     /// place the reader learns where a name comes from. See
     /// `crate::code_surface::code_view`'s own `RUST_DEFINITION_SUPPLEMENT` for the real query
     /// rules that separate this from a call site (no bundled grammar query does).
     ///
-    /// Starts life as a direct alias of [`FUNCTION`], so this commit is a pure classification
-    /// change with no visual difference at all - the palette rebuild that follows is what gives
-    /// the definition site its own accent and moves the call site to plain foreground.
-    pub const FUNCTION_DEFINITION: ColorToken = token("syntax.function_definition", 0x88b4ed);
-    pub const TYPE: ColorToken = token("syntax.type", 0x5ec4c4);
+    /// A violet-blue: [`FUNCTION`]'s own blue rotated 35 degrees on the shared accent tier, so a
+    /// declaration reads as a *distinguished call* rather than as an unrelated concept. Measured
+    /// ΔE 19.6 from [`FUNCTION`] - well clear of the ~2.3 just-noticeable difference, and pinned by
+    /// [`syntax_palette_tests::a_definition_site_is_clearly_distinguishable_from_a_call_site`].
+    pub const FUNCTION_DEFINITION: ColorToken = token("syntax.function_definition", 0xa19fe8);
+    pub const TYPE: ColorToken = token("syntax.type", 0xc7a356);
     /// `type.builtin` (`tree-sitter-rust`'s `(primitive_type) @type.builtin`, `-typescript`'s
     /// `(predefined_type) @type.builtin`) - see the module docs' fallback-chain section.
-    pub const TYPE_BUILTIN: ColorToken = token("syntax.type_builtin", 0x5ec4c4);
+    pub const TYPE_BUILTIN: ColorToken = token("syntax.type_builtin", 0xc7a356);
     /// `constant` (an all-caps identifier, per every one of this app's four grammars' own naming
     /// convention heuristic) - the same value [`LITERAL`] used to carry before this module split
     /// the old six-bucket "Literal" classification into its real, individually-scoped captures.
-    pub const CONSTANT: ColorToken = token("syntax.constant", 0xd8a76d);
+    pub const CONSTANT: ColorToken = token("syntax.constant", 0xde946b);
     /// `constant.builtin` (`true`/`false`/`None`/`undefined`/an integer or float literal - Rust
     /// and JavaScript/TypeScript both route numeric/boolean literals through this real capture
     /// name rather than a plain `number`) - see the module docs' fallback-chain section.
-    pub const CONSTANT_BUILTIN: ColorToken = token("syntax.constant_builtin", 0xd8a76d);
+    pub const CONSTANT_BUILTIN: ColorToken = token("syntax.constant_builtin", 0xde946b);
     /// `string` (`(string_literal) @string`, `(template_string) @string`, ...) - a real, distinct
     /// hue from [`CONSTANT`] (unlike the replaced six-bucket palette, which lumped every literal
     /// together) so a string reads apart from a number at a glance.
-    pub const STRING: ColorToken = token("syntax.string", 0x8bc18c);
+    pub const STRING: ColorToken = token("syntax.string", 0x98b46a);
     /// `string.escape` - registered under both this checklist name and the real capture name every
     /// one of this app's grammars that supports escapes actually emits, plain `escape`
     /// (`tree-sitter-rust`'s `(escape_sequence) @escape`, `-python`'s own identical rule; neither
@@ -1297,14 +1304,14 @@ pub mod syntax {
     /// for Rust/Python source only). A brighter tint of [`STRING`] rather than a plain alias: an
     /// escape sequence is a real, deliberately-distinct sub-token within a string, not a fallback
     /// case.
-    pub const STRING_ESCAPE: ColorToken = token("syntax.string_escape", 0xa8e0a9);
+    pub const STRING_ESCAPE: ColorToken = token("syntax.string_escape", 0xbddb8e);
     /// `number` (`-python`'s `[(integer)(float)] @number`, `-javascript`'s `(number) @number`;
     /// Rust has no separate `number` capture at all - its own numeric literals arrive as
     /// `@constant.builtin` instead, see [`CONSTANT_BUILTIN`]). Defaults to [`CONSTANT`]'s value:
     /// both are numeric-literal buckets under a different grammar's own naming choice, and keeping
     /// them visually identical is what makes "a number looks like a number" consistent regardless
     /// of which of the four languages produced it.
-    pub const NUMBER: ColorToken = token("syntax.number", 0xd8a76d);
+    pub const NUMBER: ColorToken = token("syntax.number", 0xde946b);
     pub const COMMENT: ColorToken = token("syntax.comment", 0x7a818a);
     /// `comment.doc` - registered under both this checklist name and the real capture name
     /// `tree-sitter-rust`'s own query actually emits, `comment.documentation`
@@ -1314,40 +1321,40 @@ pub mod syntax {
     /// one, the same real distinction most editors make.
     pub const COMMENT_DOC: ColorToken = token("syntax.comment_doc", 0x8c939c);
     /// `variable` - a real, live-classified bucket (`-python`'s own blanket `(identifier)
-    /// @variable`, `-javascript`'s identical blanket rule). A muted dusty rose, and deliberately
-    /// the quietest colour in this palette: a plain identifier is the most common token this
-    /// module ever colours, so it has to read as clearly *not* plain text without shouting. See
-    /// the module docs' "identifier family" section for how this hue was chosen and measured.
+    /// @variable`, `-javascript`'s identical blanket rule). A dusty rose on the shared accent
+    /// tier, warm against [`PROPERTY`]'s cool cyan-blue so an `a.b.c` chain reads at a glance.
     ///
     /// This used to default to [`TEXT`]'s near-white `#acb2be`, which meant every identifier in a
     /// file rendered as plain grey - the single biggest reason code here read as undifferentiated
-    /// white.
-    pub const VARIABLE: ColorToken = token("syntax.variable", 0xde99be);
+    /// white. Rust needed `RUST_VARIABLE_PREFIX` in `crate::code_surface::code_view` before this
+    /// token was reachable at all in this app's own primary language.
+    pub const VARIABLE: ColorToken = token("syntax.variable", 0xda8db2);
     /// `variable.parameter` (`tree-sitter-rust`'s `(parameter (identifier) @variable.parameter)`,
     /// `-typescript`'s `required_parameter`/`optional_parameter` rules) - [`VARIABLE`]'s own rose
     /// family, deeper and considerably more saturated. A function's inputs are worth picking out
     /// from the locals around them, and staying inside [`VARIABLE`]'s family says "still a
     /// variable, just a distinguished one" rather than inventing an unrelated hue for a closely
     /// related concept. Deeper rather than brighter for a real reason - see the module docs.
-    pub const VARIABLE_PARAMETER: ColorToken = token("syntax.variable_parameter", 0xcc9ed7);
+    pub const VARIABLE_PARAMETER: ColorToken = token("syntax.variable_parameter", 0xe28c93);
     /// `variable.builtin` (`self`/`this`/`super`/`cls`) - the bucket the replaced six-colour
     /// design table called "literal/self"; defaults to [`CONSTANT`]'s old `LITERAL` value so this
     /// one real, pre-existing visual choice (self-references read like literals here) survives the
     /// split unchanged.
-    pub const VARIABLE_BUILTIN: ColorToken = token("syntax.variable_builtin", 0xd8a76d);
+    pub const VARIABLE_BUILTIN: ColorToken = token("syntax.variable_builtin", 0xde946b);
     /// `property` (a field/attribute access - `tree-sitter-rust`'s `(field_identifier) @property`,
     /// `-python`'s `(attribute attribute: (identifier) @property)`, `-javascript`'s
     /// `(property_identifier) @property`) - a muted cyan-blue, deliberately outside [`VARIABLE`]'s
     /// warm family: a field access is not a local binding but a name looked up on another object,
     /// and the warm/cool split is what makes an `a.b.c` chain legible at a glance. See the module
     /// docs' "identifier family" section.
-    pub const PROPERTY: ColorToken = token("syntax.property", 0x68bedf);
+    pub const PROPERTY: ColorToken = token("syntax.property", 0x51b7d8);
     /// `operator` (`+`, `==`, `&&`, ...) - a real, live-classified bucket (previously fell
-    /// through unmatched); defaults to [`TEXT`]'s value for the same reason [`VARIABLE`] does -
-    /// this app's palette has never coloured punctuation/operators.
+    /// through unmatched). The one family deliberately held *below* plain [`TEXT`]: being quieter
+    /// than the code is the whole job of punctuation, so it sits at `L 0.560` and clears the 3:1
+    /// de-emphasized floor rather than the 4.5:1 body-text one.
     pub const OPERATOR: ColorToken = token("syntax.operator", 0x6f757e);
     /// `punctuation.bracket` (`(`/`)`/`[`/`]`/`{`/`}`, and `<`/`>` in a generic-argument position)
-    /// - see [`OPERATOR`]'s own docs for why this defaults to [`TEXT`]'s value.
+    /// - see [`OPERATOR`]'s own docs for why this sits below plain [`TEXT`].
     pub const PUNCTUATION_BRACKET: ColorToken = token("syntax.punctuation_bracket", 0x6f757e);
     /// `punctuation.delimiter` (`,`/`;`/`:`/`.`/`::`) - see [`OPERATOR`]'s own docs.
     pub const PUNCTUATION_DELIMITER: ColorToken = token("syntax.punctuation_delimiter", 0x6f757e);
@@ -1358,29 +1365,29 @@ pub mod syntax {
     /// were chosen and measured, and
     /// [`crate::code_surface::code_view::colorize_bracket_pairs`] for the real matcher that
     /// decides which brackets reach these buckets at all (an unmatched one keeps
-    /// [`PUNCTUATION_BRACKET`]'s plain-text colour, which is exactly why that token stays aliased
-    /// to [`TEXT`]).
-    pub const BRACKET_1: ColorToken = token("syntax.bracket_1", 0xc88a9c);
+    /// [`PUNCTUATION_BRACKET`]'s de-emphasized tone, which is what makes malformed or mid-edit
+    /// code degrade visibly-but-quietly rather than lying about structure).
+    pub const BRACKET_1: ColorToken = token("syntax.bracket_1", 0x9f5d72);
     /// Bracket-pair depth ring, colour 2 of 6 (nesting depth 1, 7, ...) - see [`BRACKET_1`].
-    pub const BRACKET_2: ColorToken = token("syntax.bracket_2", 0xc4936b);
+    pub const BRACKET_2: ColorToken = token("syntax.bracket_2", 0x9b673b);
     /// Bracket-pair depth ring, colour 3 of 6 (nesting depth 2, 8, ...) - see [`BRACKET_1`].
-    pub const BRACKET_3: ColorToken = token("syntax.bracket_3", 0x98a66d);
+    pub const BRACKET_3: ColorToken = token("syntax.bracket_3", 0x6e7c3c);
     /// Bracket-pair depth ring, colour 4 of 6 (nesting depth 3, 9, ...) - see [`BRACKET_1`].
-    pub const BRACKET_4: ColorToken = token("syntax.bracket_4", 0x62afa0);
+    pub const BRACKET_4: ColorToken = token("syntax.bracket_4", 0x268676);
     /// Bracket-pair depth ring, colour 5 of 6 (nesting depth 4, 10, ...) - see [`BRACKET_1`].
-    pub const BRACKET_5: ColorToken = token("syntax.bracket_5", 0x6fa5cb);
+    pub const BRACKET_5: ColorToken = token("syntax.bracket_5", 0x3d7ba4);
     /// Bracket-pair depth ring, colour 6 of 6 (nesting depth 5, 11, ...) - see [`BRACKET_1`].
-    pub const BRACKET_6: ColorToken = token("syntax.bracket_6", 0xa693c9);
+    pub const BRACKET_6: ColorToken = token("syntax.bracket_6", 0x7d68a2);
     /// `tag` (a lowercase JSX element name, `-javascript`'s own JSX query) - see the module docs'
     /// fallback-chain section for why this defaults to [`TYPE`]'s value rather than its own hue: it
     /// preserves this module's pre-existing "a JSX element name is coloured like the type it
     /// names" choice unchanged, now through a real, dedicated schema slot instead of folding `tag`
     /// and `type` into one [`crate::code_surface::code_view::HighlightKind`] variant.
-    pub const TAG: ColorToken = token("syntax.tag", 0x5ec4c4);
+    pub const TAG: ColorToken = token("syntax.tag", 0xc7a356);
     /// `attribute` (Rust's `#[derive(...)]`/`#![...]`, `-javascript`'s JSX attribute name query) -
     /// a real, distinct hue (not a fallback) since a decorator/attribute is genuinely unlike
     /// anything else in the six-bucket original palette.
-    pub const ATTRIBUTE: ColorToken = token("syntax.attribute", 0xd8a76d);
+    pub const ATTRIBUTE: ColorToken = token("syntax.attribute", 0x4bbeb1);
     /// `embedded` (the interpolated-expression region of a template string/f-string, e.g.
     /// `` `n=${count}` ``'s `${count}` or an f-string's `{value}`) - defaults to [`TEXT`]'s
     /// value. The
@@ -1397,14 +1404,12 @@ pub mod syntax {
     /// force-fittable onto an existing bucket - see this module's own fallback-chain docs above),
     /// so they get their own honestly-named [`crate::code_surface::code_view::HighlightKind`]
     /// variants and real, distinct hues rather than a confusing reuse of e.g. `KEYWORD` for a
-    /// heading. Real, chosen values, not yet visually verified in a running window (this
-    /// environment cannot screenshot GPUI output) - see that limitation noted in this repo's own
-    /// session history.
-    pub const HEADING: ColorToken = token("syntax.heading", 0x5ec4c4);
+    /// heading. Verified in a real rendered window - see `docs/screenshots/jerry-dark-markdown.png`.
+    pub const HEADING: ColorToken = token("syntax.heading", 0xc7a356);
     /// `text.uri`/`text.reference` (a link's destination and its visible label/text) - reuses
     /// [`FUNCTION`]'s own blue as its default, the conventional "this is a link" hue in most
     /// editors/themes.
-    pub const LINK: ColorToken = token("syntax.link", 0x88b4ed);
+    pub const LINK: ColorToken = token("syntax.link", 0x74ade8);
     /// `text.strong` (`**bold**`) - a real, distinct hue since this app's rendering pipeline has
     /// no per-run font-weight support yet (`RenderedLine::runs` only carries `(SharedString,
     /// HighlightKind)` - no style/weight field), so a colour is the only real signal available
@@ -1412,11 +1417,11 @@ pub mod syntax {
     /// as more prominent than plain text even without real bold rendering.
     pub const STRONG: ColorToken = token("syntax.strong", 0xd3dae4);
     /// `text.emphasis` (`*italic*`) - same real font-style limitation as [`STRONG`]; a soft
-    /// lavender, distinct from [`super::syntax::KEYWORD`]'s stronger purple, so emphasis reads as
-    /// a milder stylistic cue rather than a structural one.
-    pub const EMPHASIS: ColorToken = token("syntax.emphasis", 0xcc9ed7);
+    /// shares [`super::syntax::KEYWORD`]'s purple, which is unambiguous in context: a Markdown
+    /// file has no keywords for it to collide with, exactly as [`HEADING`] shares [`TYPE`]'s gold.
+    pub const EMPHASIS: ColorToken = token("syntax.emphasis", 0xc194d6);
 
-    pub const CARET: ColorToken = token("syntax.caret", 0x5894e0);
+    pub const CARET: ColorToken = token("syntax.caret", 0x4d97de);
     /// The code editor's real selection fill opacity (GitHub issue #27) while genuinely
     /// focused - applied on top of [`CARET`], the same color the solid caret itself paints, so
     /// selection and caret read as one consistent, theme-aware "insertion cursor" family rather
@@ -1427,7 +1432,7 @@ pub mod syntax {
     /// visible, just clearly de-emphasized relative to the focused case above.
     pub const SELECTION_UNFOCUSED_OPACITY: f32 = 0.14;
     pub const ERROR_UNDERLINE: ColorToken = token("syntax.error_underline", 0xdc655f); // 2px dotted
-    pub const HOVER_UNDERLINE: ColorToken = token("syntax.hover_underline", 0x5f82b0); // 1px solid
+    pub const HOVER_UNDERLINE: ColorToken = token("syntax.hover_underline", 0x5a84af); // 1px solid
 
     /// The File view's Diagnostic-state row tint (`README.md`: "row tinted `#191416`") -
     /// distinct from [`super::surface::CURRENT_LINE`].
@@ -2695,7 +2700,7 @@ mod theme_runtime_tests {
             "the real default before any test touches it"
         );
         assert!(same(surface::WINDOW.resolve(), surface::WINDOW.default));
-        assert!(same(syntax::KEYWORD.resolve(), hex_rgba(0xacb2bc)));
+        assert!(same(syntax::KEYWORD.resolve(), hex_rgba(0xc194d6)));
     }
 
     /// The real, load-bearing proof a palette actually changes what gets rendered.
@@ -2725,23 +2730,24 @@ mod theme_runtime_tests {
     /// rewrite bought. Moving `syntax.operator` must not drag `syntax.text` (its old alias
     /// target) along with it, and vice versa.
     ///
-    /// Uses `FUNCTION`/`TEXT` specifically because those two genuinely still *share* a default,
-    /// which is what makes the test meaningful: if the two started from different values, an
-    /// assertion that they resolve differently would pass trivially without proving anything about
-    /// the override mechanism. (`VARIABLE_PARAMETER`/`VARIABLE` used to serve this role, until the
-    /// identifier family got its own real colours - see `syntax`'s own module docs.)
+    /// Uses `FUNCTION_METHOD`/`FUNCTION` specifically because those two genuinely still *share* a
+    /// default, which is what makes the test meaningful: if the two started from different values,
+    /// an assertion that they resolve differently would pass trivially without proving anything
+    /// about the override mechanism. (`VARIABLE_PARAMETER`/`VARIABLE` served this role first, then
+    /// `FUNCTION`/`TEXT`; both pairs stopped sharing a default as the palette gave more buckets
+    /// real colours of their own - see `syntax`'s own module docs.)
     #[test]
     fn a_former_alias_can_now_be_moved_without_moving_what_it_used_to_alias() {
         assert!(
-            same(syntax::FUNCTION.default, syntax::TEXT.default),
+            same(syntax::FUNCTION_METHOD.default, syntax::FUNCTION.default),
             "sanity check: the two still share a default, which is what makes this test meaningful"
         );
-        let _guard = with_palette(&[("syntax.function", 0x50fa7b)]);
-        assert!(same(syntax::FUNCTION.resolve(), hex_rgba(0x50fa7b)));
+        let _guard = with_palette(&[("syntax.function_method", 0x50fa7b)]);
+        assert!(same(syntax::FUNCTION_METHOD.resolve(), hex_rgba(0x50fa7b)));
         assert!(
-            same(syntax::TEXT.resolve(), syntax::TEXT.default),
-            "syntax::TEXT used to be the very same const - overriding the function bucket must no \
-             longer touch it"
+            same(syntax::FUNCTION.resolve(), syntax::FUNCTION.default),
+            "syntax::FUNCTION_METHOD used to be the very same const - overriding the method bucket \
+             must no longer touch it"
         );
     }
 
@@ -3154,30 +3160,30 @@ mod syntax_bracket_ring_tests {
     /// because they only ever compared ring colours to *plain text* and to each other.
     #[test]
     fn no_ring_colour_is_confusable_with_a_syntax_accent() {
-        // Lower than the ~18 the ring holds against *itself*, and lower again than it was before
-        // identifiers got real colour back. That second drop is a direct, measurable cost of this
-        // palette's own change of mind, and is recorded rather than smoothed over: the semantic
-        // set went from six hue families to eight when `VARIABLE` and `PROPERTY` stopped being
-        // plain foreground, so fourteen colours now share one lightness band where twelve did.
-        // At even spacing that is ~26 degrees apart, and the ring's separation is consequently
-        // carried mainly by *lightness and chroma* (0.700/0.080 against the semantic 0.760/0.095)
-        // rather than by hue.
+        // This floor was **raised** from 8.0 when the ring moved off the accent lightness band
+        // and down onto the punctuation one (`L 0.560`, see `syntax`' own bracket-ring docs).
+        // The previous ring sat at `L 0.700 / C 0.080` against accents at `0.760 / 0.095` and had
+        // to buy its separation from hue - which stopped working once the accent set grew to ten
+        // families, because there is no longer a set of six hue gaps wide enough to hide in. Held
+        // at that tier, `BRACKET_5` measured ΔE 9.9 from `FUNCTION`.
         //
-        // What keeps that honest rather than merely tolerable: a ring colour only ever paints a
-        // single bracket glyph, never a word, so the confusion this guards against is far weaker
-        // than one nesting level against the next. Real measured worst case across every bundled
-        // theme: 8.5, `BRACKET_2` against `CONSTANT` in `Moss`, whose derivation compresses chroma
-        // hardest of the six. Jerry Dark itself, the palette anyone actually authored, measures
-        // 11.3 at its worst. This floor is the honest price of the identifier change and is
-        // recorded as such - if a future palette wants it back, the lever is fewer semantic hues,
-        // not a louder ring.
-        const MIN_DELTA_E: f32 = 8.0;
+        // Buying the separation from lightness instead is strictly better and the numbers say so:
+        // measured worst case across every bundled theme is now **12.6** (`Ember`), against 8.5
+        // before, and Jerry Dark itself - the palette anyone actually authored - measures **20.8**
+        // against the previous 11.3. Every one of the ten accents is checked here, not the five
+        // representatives the restraint palette had.
+        const MIN_DELTA_E: f32 = 12.0;
         let accents = [
-            ("STRING", syntax::STRING),
-            ("CONSTANT", syntax::CONSTANT),
-            ("FUNCTION_DEFINITION", syntax::FUNCTION_DEFINITION),
-            ("TYPE", syntax::TYPE),
             ("VARIABLE_PARAMETER", syntax::VARIABLE_PARAMETER),
+            ("CONSTANT", syntax::CONSTANT),
+            ("TYPE", syntax::TYPE),
+            ("STRING", syntax::STRING),
+            ("ATTRIBUTE", syntax::ATTRIBUTE),
+            ("PROPERTY", syntax::PROPERTY),
+            ("FUNCTION", syntax::FUNCTION),
+            ("FUNCTION_DEFINITION", syntax::FUNCTION_DEFINITION),
+            ("KEYWORD", syntax::KEYWORD),
+            ("VARIABLE", syntax::VARIABLE),
             ("ERROR_UNDERLINE", syntax::ERROR_UNDERLINE),
         ];
         for def in crate::settings::state::THEME_DEFS.iter() {
@@ -3359,21 +3365,25 @@ mod syntax_bracket_ring_tests {
 
     /// A ring colour sits between two semantic hues and must never be mistakable for either.
     ///
-    /// See `no_ring_colour_is_confusable_with_a_syntax_accent` for why this floor is where it is:
-    /// the semantic set grew from six hue families to eight when identifiers got real colour back,
-    /// so the ring has measurably less room than it did. Real measured worst case in Jerry Dark:
-    /// ΔE 11.3, `BRACKET_2` against `CONSTANT`.
+    /// The strict, Jerry-Dark-only counterpart to
+    /// `no_ring_colour_is_confusable_with_a_syntax_accent`. Its floor was raised from 11 to 18 when
+    /// the ring moved onto the punctuation lightness band: measured worst case here is now ΔE 20.8,
+    /// against 11.3 for the ring this replaced. A palette that grew from eight semantic hue
+    /// families to ten therefore ended up with a *more* clearly separated bracket ring, not a less
+    /// one - which is the whole argument for spending lightness rather than hue on it.
     #[test]
     fn no_ring_colour_impersonates_the_semantic_token_it_borrows_its_hue_from() {
-        const MIN_DELTA_E: f32 = 11.0;
-        let semantic: [(&str, ColorToken); 8] = [
+        const MIN_DELTA_E: f32 = 18.0;
+        let semantic: [(&str, ColorToken); 10] = [
             ("KEYWORD", syntax::KEYWORD),
             ("FUNCTION", syntax::FUNCTION),
+            ("FUNCTION_DEFINITION", syntax::FUNCTION_DEFINITION),
             ("TYPE", syntax::TYPE),
             ("CONSTANT", syntax::CONSTANT),
             ("STRING", syntax::STRING),
             ("VARIABLE", syntax::VARIABLE),
             ("VARIABLE_PARAMETER", syntax::VARIABLE_PARAMETER),
+            ("PROPERTY", syntax::PROPERTY),
             ("ATTRIBUTE", syntax::ATTRIBUTE),
         ];
         let _guard = with_bundled_theme("Jerry Dark");
@@ -3456,22 +3466,27 @@ mod syntax_color_math {
 }
 
 #[cfg(test)]
-mod syntax_restraint_tests {
+mod syntax_palette_tests {
     use super::syntax_color_math::delta_e;
     use super::syntax_contrast_tests::{contrast_ratio, with_bundled_theme};
     use super::*;
 
-    /// Every token that the restraint palette deliberately holds **at plain foreground**, because
-    /// it is one of the things a source file is mostly made of. See `syntax`'s own "what earns a
-    /// colour" docs for the argument, and `code_view`'s definition-site supplements for the query
-    /// work that made the `FUNCTION` half of this possible.
+    /// The only tokens still held at *exactly* plain foreground, and the reason each one is.
+    ///
+    /// [`syntax::EMBEDDED`] covers the leftover bytes of a template-string/f-string interpolation
+    /// that no more specific capture claims - the interpolated expression's own identifiers, calls
+    /// and numbers all win over it by nesting, so it is essentially never the visible colour of a
+    /// real token and giving it an eleventh hue would spend one on nothing.
+    ///
+    /// Note what is *not* in this list any more: `KEYWORD`, `FUNCTION` and `FUNCTION_METHOD`. An
+    /// earlier revision of this palette held all three at exactly `TEXT`, following tonsky's
+    /// use-site/binding-site line. The maintainer looked at the built app and rejected it - "I
+    /// preferred the old colors but I think they were not used correctly" - and the CHI'16 study
+    /// cited in `syntax`' own module docs measured the same thing objectively. See
+    /// `keywords_calls_and_identifiers_all_carry_real_colour_in_every_bundled_theme`, which is the
+    /// test that replaced the one asserting the opposite.
     fn plain_foreground_tokens() -> Vec<(&'static str, ColorToken)> {
-        vec![
-            ("KEYWORD", syntax::KEYWORD),
-            ("FUNCTION", syntax::FUNCTION),
-            ("FUNCTION_METHOD", syntax::FUNCTION_METHOD),
-            ("EMBEDDED", syntax::EMBEDDED),
-        ]
+        vec![("EMBEDDED", syntax::EMBEDDED)]
     }
 
     /// The de-emphasized punctuation family - deliberately *below* plain text, never above it.
@@ -3483,28 +3498,27 @@ mod syntax_restraint_tests {
         ]
     }
 
-    /// The real accent tokens - one representative per hue family, which is the set the
-    /// "at most six" budget is actually about.
+    /// The real accent tier - one representative per hue family. All ten sit at one OKLCH
+    /// lightness and one chroma and differ only in hue, which is the property
+    /// `every_accent_shares_one_lightness_and_one_chroma` measures.
     fn accent_tokens() -> Vec<(&'static str, ColorToken)> {
         vec![
-            ("STRING", syntax::STRING),
-            ("CONSTANT", syntax::CONSTANT),
-            ("FUNCTION_DEFINITION", syntax::FUNCTION_DEFINITION),
-            ("TYPE", syntax::TYPE),
             ("VARIABLE_PARAMETER", syntax::VARIABLE_PARAMETER),
+            ("CONSTANT", syntax::CONSTANT),
+            ("TYPE", syntax::TYPE),
+            ("STRING", syntax::STRING),
+            ("ATTRIBUTE", syntax::ATTRIBUTE),
+            ("PROPERTY", syntax::PROPERTY),
+            ("FUNCTION", syntax::FUNCTION),
+            ("FUNCTION_DEFINITION", syntax::FUNCTION_DEFINITION),
+            ("KEYWORD", syntax::KEYWORD),
+            ("VARIABLE", syntax::VARIABLE),
         ]
     }
 
-    /// Function **calls** and keywords render at exactly plain foreground, in every bundled theme.
-    ///
-    /// Note what is deliberately *not* in this list any more: `VARIABLE` and `PROPERTY`. An earlier
-    /// revision held all of these plain, following tonsky's use-site/binding-site line. The
-    /// maintainer looked at the rendered result and rejected it twice - "most of the text is just
-    /// white" - so ordinary identifiers got real colour back. See `syntax`' own module docs for the
-    /// full account, and `identifiers_are_genuinely_tinted_not_almost_plain_text` for the property
-    /// that replaced this one for those two tokens.
+    /// Only [`syntax::EMBEDDED`] resolves to exactly plain text, in every bundled theme.
     #[test]
-    fn calls_and_keywords_render_at_plain_foreground_in_every_bundled_theme() {
+    fn only_the_deliberately_neutral_tokens_render_at_plain_foreground() {
         for def in crate::settings::state::THEME_DEFS.iter() {
             let _guard = with_bundled_theme(def.name);
             let text = syntax::TEXT.resolve();
@@ -3513,43 +3527,42 @@ mod syntax_restraint_tests {
                 assert_eq!(
                     (value.r, value.g, value.b),
                     (text.r, text.g, text.b),
-                    "{name} must resolve to exactly plain text in {} - the restraint palette \
-                     colours definition sites, not use sites",
+                    "{name} must resolve to exactly plain text in {}",
                     def.name
                 );
             }
         }
     }
 
-    /// The counterpart to the test above, and the one that exists because contrast maths alone
-    /// missed this: an ordinary identifier must be **visibly** tinted, not merely a different hex
-    /// that reads as grey on screen.
+    /// **The test that replaced `calls_and_keywords_render_at_plain_foreground_in_every_bundled_theme`.**
+    ///
+    /// Every accent - very much including `KEYWORD`, `FUNCTION` and `FUNCTION_METHOD`, which an
+    /// earlier revision pinned to *exactly* plain text - must be visibly coloured against the plain
+    /// foreground it sits next to, in every bundled theme.
     ///
     /// The floor is stated in CIE-Lab ΔE against plain text rather than in contrast ratio,
     /// deliberately. A colour can sit at a perfectly good contrast ratio against the *background*
-    /// and still be indistinguishable from the plain foreground next to it - which is exactly the
-    /// failure the maintainer caught by looking at a screenshot, twice, while every contrast
-    /// assertion in this file was green.
+    /// and still be indistinguishable from the plain foreground beside it - which is exactly the
+    /// failure the maintainer caught by looking at a screenshot while every contrast assertion in
+    /// this file was green.
     ///
-    /// 18 is ~8x the ~2.3 just-noticeable difference. Jerry Dark itself measures far above it
-    /// (`VARIABLE` 31.5, `PROPERTY` 25.1); the floor is set by `Moss`, whose derivation compresses
-    /// chroma hardest and lands `PROPERTY` at 18.6.
+    /// 18 is ~8x the ~2.3 just-noticeable difference. Jerry Dark itself measures 27.8 at its worst
+    /// (`PROPERTY`); the floor is set by the derived themes, whose transform compresses chroma.
     #[test]
-    fn identifiers_are_genuinely_tinted_not_almost_plain_text() {
+    fn keywords_calls_and_identifiers_all_carry_real_colour_in_every_bundled_theme() {
         const MIN_DELTA_E: f32 = 18.0;
         for def in crate::settings::state::THEME_DEFS.iter() {
             let _guard = with_bundled_theme(def.name);
             let text = syntax::TEXT.resolve();
-            for (name, token) in [
-                ("VARIABLE", syntax::VARIABLE),
-                ("PROPERTY", syntax::PROPERTY),
-                ("VARIABLE_PARAMETER", syntax::VARIABLE_PARAMETER),
-            ] {
+            for (name, token) in accent_tokens()
+                .into_iter()
+                .chain([("FUNCTION_METHOD", syntax::FUNCTION_METHOD)])
+            {
                 let distance = delta_e(token.resolve(), text);
                 assert!(
                     distance >= MIN_DELTA_E,
-                    "{name} is only ΔE {distance:.1} from plain text in {} - an identifier has to \
-                     read as genuinely coloured, not as a hex that happens to differ",
+                    "{name} is only ΔE {distance:.1} from plain text in {} - it has to read as \
+                     genuinely coloured, not as a hex that happens to differ",
                     def.name
                 );
             }
@@ -3581,9 +3594,9 @@ mod syntax_restraint_tests {
         }
     }
 
-    /// The other half of the same idea: a *definition* site really is coloured, and really is
-    /// distinguishable from the call sites around it. Without this, the test above would be
-    /// satisfiable by simply having no colour at all.
+    /// The other half of the same idea: a *definition* site really is distinguishable from the
+    /// call sites around it. Now that both are coloured, this is the only thing keeping the
+    /// definition-site query work in `code_view` visible at all.
     #[test]
     fn a_definition_site_is_clearly_distinguishable_from_a_call_site() {
         for def in crate::settings::state::THEME_DEFS.iter() {
@@ -3636,61 +3649,72 @@ mod syntax_restraint_tests {
         }
     }
 
-    /// The palette's own restraint budget, measured rather than asserted in a comment.
+    /// **The test that replaced `the_palette_spends_at_most_six_accent_hues_plus_two_identifier_tints`.**
     ///
-    /// Two tiers, and the split is the honest record of a real design change:
+    /// That one enforced a *restraint budget* - at most six accent hues - and the budget is exactly
+    /// what the maintainer rejected on sight and what the CHI'16 study contradicts. Deleting it
+    /// without replacement would leave nothing pinning the palette's structure, so what replaces it
+    /// pins the property that actually matters once "more colour" is the goal: **every hue family
+    /// is a real hue apart from every other one.** A wider palette is only an improvement if its
+    /// members are still individually identifiable.
     ///
-    /// - **Six accent hues** for what is rare and anchoring - strings, constants, definition
-    ///   sites, types, parameter bindings, diagnostics. This is the spec's own "≤ 6 accent hues"
-    ///   budget and it still holds exactly.
-    /// - **Two identifier tints** on top, for `VARIABLE` and `PROPERTY`. These are *not* accents in
-    ///   the spec's sense - they are the ubiquitous tokens the accent budget is deliberately spent
-    ///   away from - but they are genuinely coloured rather than plain foreground, because holding
-    ///   them at plain foreground produced a screen the maintainer rejected on sight, twice.
-    ///
-    /// So: eight hue families total, six of them accents. Stated as two numbers rather than one
-    /// because collapsing them would hide the deviation from the spec instead of recording it.
+    /// The bound on the *count* is kept, just moved up: ten semantic families is a deliberate
+    /// ceiling, not an invitation to keep adding. Past roughly that many, the wheel cannot hold
+    /// them 25 degrees apart at one lightness and one chroma - which is precisely how the bracket
+    /// ring lost its room and had to drop a tier (see `syntax`' own bracket-ring docs).
     #[test]
-    fn the_palette_spends_at_most_six_accent_hues_plus_two_identifier_tints() {
-        let mut families: Vec<f32> = Vec::new();
+    fn every_accent_hue_family_stays_a_real_hue_apart() {
+        const MIN_SEPARATION: f32 = 25.0;
+        let mut families: Vec<(&'static str, f32)> = Vec::new();
+        for (name, token) in accent_tokens() {
+            let (_, _, hue) = oklch_of(token.default);
+            for (other_name, other_hue) in &families {
+                let separation = hue_distance(*other_hue, hue);
+                assert!(
+                    separation >= MIN_SEPARATION,
+                    "{name} and {other_name} are only {separation:.1} degrees apart - at one \
+                     lightness and one chroma, hue is the *only* thing telling two accents apart"
+                );
+            }
+            families.push((name, hue));
+        }
+        assert!(
+            families.len() <= 10,
+            "ten semantic hue families is the ceiling, found {}",
+            families.len()
+        );
+    }
+
+    /// The accents are the whole palette's chromatic surface: no *other* syntax token may invent an
+    /// eleventh hue family behind the accent tier's back. Diagnostics are exempt - they are a
+    /// different channel (an underline and a row tint, never a token foreground) and deliberately
+    /// own the pure red the accent wheel leaves free.
+    #[test]
+    fn no_syntax_token_invents_a_hue_outside_the_accent_wheel() {
+        let accent_hues: Vec<f32> = accent_tokens()
+            .into_iter()
+            .map(|(_, token)| oklch_of(token.default).2)
+            .collect();
         for token in all_tokens() {
-            if !token.key.starts_with("syntax.") || token.key.starts_with("syntax.bracket_") {
+            if !token.key.starts_with("syntax.")
+                || token.key.starts_with("syntax.bracket_")
+                || token.key.contains("diagnostic")
+                || token.key.contains("underline")
+            {
                 continue;
             }
             let (_, chroma, hue) = oklch_of(token.default);
             if chroma <= 0.03 {
                 continue; // a neutral, not an accent
             }
-            if !families
-                .iter()
-                .any(|existing| hue_distance(*existing, hue) < 20.0)
-            {
-                families.push(hue);
-            }
+            assert!(
+                accent_hues
+                    .iter()
+                    .any(|accent| hue_distance(*accent, hue) < 5.0),
+                "{} sits at hue {hue:.0}, which is not one of the accent wheel's own families",
+                token.key
+            );
         }
-        assert!(
-            families.len() <= 8,
-            "six accent hue families plus at most two identifier tints, found {}: {:?}",
-            families.len(),
-            families.iter().map(|h| h.round()).collect::<Vec<_>>()
-        );
-
-        // And the accent tier on its own still holds the spec's actual ≤ 6 budget.
-        let mut accent_families: Vec<f32> = Vec::new();
-        for (_, token) in accent_tokens() {
-            let (_, _, hue) = oklch_of(token.default);
-            if !accent_families
-                .iter()
-                .any(|existing| hue_distance(*existing, hue) < 20.0)
-            {
-                accent_families.push(hue);
-            }
-        }
-        assert!(
-            accent_families.len() <= 6,
-            "the accent tier allows at most six hue families, found {}",
-            accent_families.len()
-        );
     }
 
     /// Perceptual construction: the accents differ from each other by *hue*, not by lightness or
