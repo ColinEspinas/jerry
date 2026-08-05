@@ -1111,139 +1111,121 @@ pub mod diff {
 /// files, read directly off the fetched crates under `~/.cargo/registry/src/`, not guessed) each
 /// bucket exists to cover.
 ///
-/// ## The identifier family (the rose/pink and cyan hues)
+/// ## What earns a colour
 ///
-/// [`VARIABLE`], [`VARIABLE_PARAMETER`] and [`PROPERTY`] are real, independently authored hues.
-/// They used to default to [`TEXT`]'s near-white `#acb2be`, which was a genuine legibility
-/// problem rather than a stylistic preference: plain identifiers, function parameters and field
-/// access together are a very large fraction of the tokens in any real source file, so colouring
-/// all three as plain text left most of a typical screen reading as one undifferentiated grey.
+/// Six accent hues, all at one OKLCH lightness (0.760) and one chroma (0.095), differing only in
+/// hue. The whole colour -> meaning mapping is meant to be recitable from memory:
 ///
-/// The three colours fill hue territory nothing else in this palette had claimed. Measured
-/// against every other syntax colour here (a real CIE Lab ΔE sweep, not an eyeball), the closest
-/// any of them lands to an existing token is ΔE 16, and the closest two of them land to each
-/// other is ΔE 17 - both comfortably above the ~2.3 just-noticeable threshold, so these read as
-/// genuinely different colours rather than as tints of something already in use:
+/// | hue | OKLCH H | what it means |
+/// |---|---|---|
+/// | green `#8bc18c` | 145 | [`STRING`] (and [`STRING_ESCAPE`], the same hue lifted in lightness) |
+/// | amber `#d8a76d` | 70 | [`CONSTANT`] / [`NUMBER`] / [`CONSTANT_BUILTIN`] / [`VARIABLE_BUILTIN`] / [`ATTRIBUTE`] |
+/// | blue `#88b4ed` | 255 | [`FUNCTION_DEFINITION`] (and [`LINK`]) |
+/// | cyan `#5ec4c4` | 195 | [`TYPE`] / [`TYPE_BUILTIN`] / [`TAG`] / [`HEADING`] |
+/// | magenta `#cc9ed7` | 320 | [`VARIABLE_PARAMETER`] (and [`EMPHASIS`]) |
+/// | red `#dc655f`-family | 25 | diagnostics only - [`ERROR_UNDERLINE`], the two diagnostic messages |
 ///
-/// - [`VARIABLE`] `#bd89a5` - a muted dusty rose. Deliberately the quietest of the three (the
-///   lowest saturation in the whole palette bar the greys): a plain identifier is the single most
-///   common thing this palette ever colours, so it has to be clearly *not* plain text without
-///   turning a screen of code into confetti.
-/// - [`VARIABLE_PARAMETER`] `#bd566e` - the same rose family, deeper and considerably more
-///   saturated. A function's own inputs are worth picking out from the locals around them, and
-///   staying in [`VARIABLE`]'s family says "this is still a variable, just a distinguished one"
-///   rather than inventing an unrelated hue for a closely related concept.
+/// And a neutral ramp: [`STRONG`] `L 0.885` > [`TEXT`] `L 0.762` > [`COMMENT_DOC`] `L 0.660` >
+/// [`COMMENT`] `L 0.600` > punctuation `L 0.560`.
 ///
-///   It steps *down* in lightness rather than up, which is a real constraint rather than a
-///   preference: "Paper", the bundled light theme, is derived by inverting lightness (see
-///   [`apply_shift`]'s own docs), so any token much lighter than about 72% clips to near-black
-///   there and collapses into the other light tokens. A brighter pink parameter measured a fine
-///   ΔE 16 from plain text in Jerry Dark and ΔE 9.5 - i.e. barely distinguishable - in Paper. The
-///   deeper tone keeps at least ΔE 16 from both plain text and [`VARIABLE`] in *every* bundled
-///   theme, which is what [`syntax_identifier_palette_tests`] now pins.
-/// - [`PROPERTY`] `#75b2c7` - a muted cyan-blue, deliberately *outside* the rose family. A field
-///   access is not a local binding: it is a name looked up on another object, and giving it a
-///   cool counterpart to the warm locals is what makes an `a.b.c` chain legible at a glance.
+/// **What is deliberately not coloured** is the more important half of the design. [`VARIABLE`],
+/// [`PROPERTY`], [`FUNCTION`], [`FUNCTION_METHOD`], [`KEYWORD`] and [`EMBEDDED`] all resolve to
+/// exactly [`TEXT`]. Those are the things a source file is mostly *made of*, and colouring them
+/// spends the entire contrast budget on the most frequent tokens on screen -
+/// [`syntax_restraint_tests::variables_properties_and_calls_render_at_plain_foreground_in_every_bundled_theme`]
+/// pins it across every bundled theme.
 ///
-/// Colours the maintainer explicitly kept out of this pass: [`OPERATOR`],
-/// [`PUNCTUATION_BRACKET`], [`PUNCTUATION_DELIMITER`] and [`EMBEDDED`] still default to [`TEXT`]'s
-/// own `#acb2be`. That is this palette's long-standing, deliberate choice not to colour operators
-/// and punctuation (see the historical design note preserved on
-/// [`crate::code_surface::code_view::HighlightKind`]); real bracket-pair colouring is a separate,
-/// larger feature to be considered on its own terms, not something to smuggle in here.
+/// tonsky's "I am sorry, but everyone is getting syntax highlighting wrong" is where the argument
+/// comes from, and it is worth quoting exactly, because the useful part is not "don't colour
+/// variables" but *where he draws the line*:
+///
+/// > I don't highlight variables or function calls - they are everywhere, your code is probably
+/// > 75% variable names and function calls.
+///
+/// > Notice that we've kept variable declarations. These are not as ubiquitous and help you
+/// > quickly answer a common question: where does this thing come from?
+///
+/// So: **use sites plain, binding sites coloured.** That is why
+/// [`crate::code_surface::code_view`] grew real definition-site query rules - without them the
+/// distinction is not expressible at all, since no bundled grammar query makes it.
+///
+/// Motlin's "How to pick colors for a syntax highlighting theme" is often read as arguing the
+/// opposite, and it does not. His claim is *relational* - "Keywords, parameters, locals, and
+/// fields should use distinct colors", i.e. if you colour these they must differ from each other -
+/// and he never asserts that a variable *reference* deserves colour against plain foreground. His
+/// own stated principle points the other way:
+///
+/// > Contrast is a scarce resource which we only spend to resolve ambiguity.
+///
+/// > Escape sequences don't get confused with anything else, because they're inside a string.
+///
+/// That second one is the general rule that context can substitute for contrast, and it is exactly
+/// what makes a plain use site affordable once its declaration nearby is already distinguished.
+///
+/// [`VARIABLE_PARAMETER`] keeps a real accent under both authors' rules for one specific reason:
+/// every grammar here captures `@variable.parameter` at the *parameter declaration*
+/// (`tree-sitter-rust`'s `(parameter (identifier) @variable.parameter)`, `-typescript`'s
+/// `required_parameter`/`optional_parameter`), never at a use inside the body. It is already a
+/// binding site, so colouring it is tonsky's own rule rather than an exception to it - and it
+/// resolves precisely the local-versus-parameter ambiguity Motlin names.
+///
+/// The one place the two authors genuinely disagree is left decided rather than papered over:
+/// Motlin's strongest case is a bare `count++` where you cannot tell a field from a local without
+/// scrolling, and per-use colouring would answer it. tonsky simply prices that answer as
+/// unaffordable at 75% of the screen. This palette takes tonsky's side, and [`PROPERTY`] is
+/// therefore plain text: a member access is already marked by the `.` in front of it, which is
+/// context doing the work contrast would otherwise have to.
+///
+/// ## Contrast, measured
+///
+/// Every accent lands 8.17-8.86:1 against [`super::surface::CENTER`]. [`COMMENT`] is 4.65:1 - it
+/// used to be **3.03:1**, a real ghost-grey failure of the 4.5:1 body-text floor, and the single
+/// clearest legibility bug the redesign's audit found. Punctuation is 3.94:1: below plain text on
+/// purpose, above the 3:1 floor on purpose. [`syntax_restraint_tests`] pins all three properties,
+/// and [`enforce_syntax_contrast_floors`] is what makes them hold in the five *derived* themes too.
 ///
 /// ## The bracket-pair depth ring (GitHub issue #168)
 ///
-/// That separate feature has since landed, and it deliberately did **not** change the paragraph
-/// above: [`PUNCTUATION_BRACKET`] is still exactly [`TEXT`], pinned by
-/// [`syntax_contrast_tests::operators_and_punctuation_deliberately_still_render_as_plain_text`].
-/// It is now the *fallback* a bracket keeps when it has no real matching partner, which is what
-/// makes malformed/mid-edit code degrade visibly-but-quietly instead of lying about structure.
+/// A bracket that is half of a real matched pair paints one of six ring colours ([`BRACKET_1`] ..
+/// [`BRACKET_6`]), chosen by `nesting depth % 6`, both halves alike. A bracket with no matching
+/// partner keeps [`PUNCTUATION_BRACKET`] instead, which is what makes malformed or mid-edit code
+/// degrade visibly-but-quietly rather than lying about structure.
 ///
-/// A bracket that *is* half of a real matched pair paints one of six ring colours
-/// ([`BRACKET_1`] .. [`BRACKET_6`]), chosen by `nesting depth % 6`, both halves alike - so a pair
-/// and everything scoped inside it can be traced at a glance. Six, cycling quickly, matches what
-/// VSCode and most editors that ship this feature use; a longer ring buys nothing once adjacent
-/// depths are already unmistakable. `graph::LANES` is this file's existing precedent for an
-/// N-colour rotation, but these are six independent flat consts rather than a `[ColorToken; 6]`
-/// array for a real reason: each one's key has to be exactly `syntax.{HighlightKind::name()}`
-/// (see [`crate::settings::vscode_theme::tests::every_highlight_kind_maps_onto_a_real_syntax_token`]),
-/// and an array token's key carries a dotted index (`graph.lanes.0`) that a `[syntax]` table key
-/// is documented never to have.
+/// The ring is built the same way the accents are - six hues at **one** OKLCH lightness (0.700)
+/// and **one** chroma (0.080) - and sits deliberately *under* the accents on every axis: dimmer
+/// (L 0.700 vs 0.760) and less saturated (C 0.080 vs 0.095, a Lab C* of 28.6 against the accents'
+/// 34.2). A bracket must never shout louder than a string.
+/// [`syntax_bracket_ring_tests::the_ring_stays_inside_the_palettes_own_chroma_register`] pins that.
 ///
-/// The six are **not independently chosen colours**. Each one is derived from a hue this palette
-/// already speaks, held at this palette's own chroma and lightness register, so the ring reads as
-/// "this palette, cycling" rather than as six new colours nobody else in this file uses:
+/// Its six hues (350, 47, 107, 170, 225, 287) are set at the *midpoints* between the accent hues,
+/// so no ring colour sits on top of a semantic one - the closest is
+/// [`syntax_bracket_ring_tests::no_ring_colour_is_confusable_with_a_syntax_accent`]'s measured
+/// worst case. That check is new, and it exists because the previous ring had `BRACKET_1` at hue
+/// 23 against [`ERROR_UNDERLINE`]'s 25 - two degrees apart, i.e. a matched depth-0 bracket
+/// essentially wearing the error colour.
 ///
-/// | ring slot | hue borrowed from | Lab hue (anchor) |
-/// |---|---|---|
-/// | [`BRACKET_1`] `#eb7f7b` salmon | [`VARIABLE_PARAMETER`]'s rose-red | 27 (9) |
-/// | [`BRACKET_2`] `#7dd7b9` mint | [`ATTRIBUTE`]'s teal | 169 (185) |
-/// | [`BRACKET_3`] `#c48648` amber | [`CONSTANT`]'s brown | 68 (71) |
-/// | [`BRACKET_4`] `#8f7cbd` violet | [`KEYWORD`]'s purple | 304 (317) |
-/// | [`BRACKET_5`] `#6c9052` moss | [`STRING`]'s green | 130 (123) |
-/// | [`BRACKET_6`] `#2d96c7` steel blue | [`FUNCTION`]'s blue | 249 (266) |
-///
-/// Those six anchors are the widest-spread six of this palette's nine real hues (minimum gap 51
-/// degrees), so the ring covers the whole wheel without ever leaving the palette's vocabulary.
-/// Each slot is then offset from its anchor - in hue by up to ~18 degrees, and more importantly in
-/// lightness - so a coloured bracket never impersonates the semantic token it borrows from: the
-/// tightest is [`BRACKET_6`] against [`FUNCTION`] at ΔE 14.8, and no ring colour comes within
-/// ΔE 14 of any semantic token.
-///
-/// ## Why this replaced the first version of this ring
-///
-/// The first ring shipped here (`#39e9d9` turquoise, `#af52ec` violet, `#36d535` green, ...) was
-/// produced by maximising pairwise CIE-Lab ΔE in open colour space, and it was wrong in a way the
-/// distinctness tests could not see. Maximising ΔE rewards **chroma**, so the optimiser bought
-/// separation by cranking saturation, and the result sat completely outside this palette's own
-/// register:
-///
-/// | | mean C* | max C* |
-/// |---|---|---|
-/// | this palette's non-neutral tokens | 33.7 | 53.4 ([`KEYWORD`]) |
-/// | the replaced ring | **66.4** | **93.3** |
-/// | this ring | 39.7 | 46.0 |
-///
-/// Two of the six were nearly twice as saturated as the most saturated colour this palette had
-/// ever used. Every distinctness check passed; it still read as a jarring accent dropped on top of
-/// a muted palette, which is exactly what it was. The lesson is recorded here because the failure
-/// is not obvious from the tests: *a colour set can be perfectly distinguishable and still not
-/// belong*, and [`syntax_bracket_ring_tests::the_ring_stays_inside_the_palettes_own_chroma_register`]
-/// exists specifically to catch a future change re-introducing it.
-///
-/// The distinctness floors below are correspondingly lower than the replaced ring's, and
-/// deliberately so - they are now set from what a reader actually needs rather than from what an
-/// unconstrained optimiser happened to reach. Measured across **every** bundled theme, not just
-/// Jerry Dark (the five others are generated from these defaults by [`derive_shift`], so a value
-/// that is fine here can still collapse under one of them):
+/// Measured, across **every** bundled theme rather than only Jerry Dark:
 ///
 /// - **Cyclically adjacent depths** (`n` against `n + 1`, the only comparison a reader actually
-///   makes, since those two nest directly inside one another): worst ΔE 34.0, and 63.7 in Jerry
-///   Dark itself. That is >14x the ~2.3 just-noticeable difference.
-/// - **Any two ring colours**: worst ΔE 26.7.
-/// - **Against plain text**, so a matched bracket never reads like an unmatched one (a real,
-///   load-bearing distinction here - see [`BRACKET_1`]): worst ΔE 19.0.
-/// - **Readable**: every colour clears 2.5:1 against [`super::surface::CENTER`] in every bundled
-///   theme. A bracket is one thin glyph, so it is held to the floor
-///   [`syntax_contrast_tests::every_syntax_token_clears_a_real_contrast_floor_in_jerry_dark_and_paper`]
-///   only demands of Jerry Dark and `Paper`, not the looser 1.5:1 the other four get.
+///   makes): worst ΔE 20.7, ~9x the ~2.3 just-noticeable difference.
+/// - **Against plain text**, so a matched bracket never reads as unmatched: worst ΔE 16.7.
+/// - **Against the de-emphasized punctuation tone**, the other thing an uncoloured bracket can be:
+///   worst ΔE 26.5.
+/// - **Readable**: every ring colour clears 3:1 against the editor background in every bundled
+///   theme, guaranteed by [`enforce_syntax_contrast_floors`] rather than by luck.
 ///
-/// The narrow lightness band these sit in is load-bearing for one specific reason: `Paper` derives
-/// from these defaults through [`derive_shift`]'s *inverting* lightness fit
-/// (`l' = -1.286 l + 1.015`), so a source colour much lighter than ~0.68 lands near-black there. An
-/// earlier draft had exactly that bug - a `#9b8cff` periwinkle deriving to `#020109`, ΔE 8.8 from
-/// `Paper`'s own plain text, i.e. a "coloured" bracket indistinguishable from an uncoloured one.
+/// These floors are lower than the ring this replaced was held to, and that is the point rather
+/// than a regression: ΔE is bought with chroma, and six hues at one low chroma have a hard ceiling
+/// on how far apart they can be. The previous ring reached its numbers by being the most saturated
+/// thing in the palette - a maintainer looking at the real thing called it out, and none of the
+/// ΔE-only checks could see it.
 ///
-/// **Not verified against a rendered window.** This environment cannot screenshot real GPUI
-/// output, so every claim above is measured colour maths and hue-family reasoning, not something
-/// anyone has looked at. The register mismatch that motivated this rewrite was caught by a
-/// maintainer looking at the real thing, not by any of the numbers here.
-///
-/// The five generated theme files carry their own derived values for all six (see
-/// [`crate::settings::builtin_themes`]), and an imported VSCode theme maps its own
-/// `editorBracketHighlight.foreground1..6` family straight onto them - see
-/// [`crate::settings::vscode_theme`]'s `COLOR_KEY_MAP`.
+/// **`<` and `>` deliberately do not participate**, which is a decision rather than an omission.
+/// They really do arrive as `punctuation.bracket` (Rust and TypeScript capture type-argument
+/// brackets that way, and `tree-sitter-html` captures a tag's own). Tracking them would make HTML
+/// actively wrong - `<div>` and `</div>` are two same-level pairs, not one open/close pair, so a
+/// stack matcher paints a whole document flat depth-0 while implying structure that is not there.
+/// See `crate::code_surface::code_view::colorize_bracket_pairs`' own docs.
 ///
 /// ## The default fallback chain (GitHub issue #31)
 ///
@@ -1252,15 +1234,15 @@ pub mod diff {
 /// app's palette never designed a hue for reads like its *parent* rather than like plain
 /// foreground text:
 ///
-/// - [`FUNCTION_METHOD`] defaults to [`FUNCTION`]'s `#74ade8` (a method is still a function)
-/// - [`TYPE_BUILTIN`] to [`TYPE`]'s `#dfc184` (`i32`/`number`/`void` are still types)
-/// - [`CONSTANT_BUILTIN`] to [`CONSTANT`]'s `#bf956a` (`true`/`None`/`undefined` are still
-///   constants)
+/// - [`FUNCTION_METHOD`] defaults to [`FUNCTION`]'s plain-foreground value (a method call is
+///   still a call - both are use sites, and neither is coloured)
+/// - [`TYPE_BUILTIN`] to [`TYPE`]'s cyan (`i32`/`number`/`void` are still types)
+/// - [`CONSTANT_BUILTIN`] to [`CONSTANT`]'s amber (`true`/`None`/`undefined` are still constants)
 /// - [`TAG`] to [`TYPE`]'s (preserves this module's pre-existing, deliberate "a JSX element name
 ///   is coloured like the type it names" choice - see the historical note on
 ///   [`crate::code_surface::code_view::HighlightKind::Tag`])
-/// - [`OPERATOR`], [`PUNCTUATION_BRACKET`], [`PUNCTUATION_DELIMITER`] and [`EMBEDDED`] to
-///   [`TEXT`]'s, per the section above
+/// - [`OPERATOR`], [`PUNCTUATION_BRACKET`] and [`PUNCTUATION_DELIMITER`] share the one
+///   de-emphasized punctuation tone; [`EMBEDDED`] is plain [`TEXT`]
 ///
 /// Each of those is a real, live-classified bucket (a genuine `tree-sitter-highlight` capture this
 /// module's `HIGHLIGHT_NAMES` actually recognizes - see
@@ -3161,6 +3143,68 @@ mod syntax_bracket_ring_tests {
                         def.name
                     );
                 }
+            }
+        }
+    }
+
+    /// No ring colour may be confusable with a semantic accent - the spec's own words. This is a
+    /// new check, and it exists because of a real defect in the ring this replaced: its
+    /// `BRACKET_1` sat at OKLCH hue 23 against `ERROR_UNDERLINE`'s 25, two degrees apart, so a
+    /// matched depth-0 bracket wore essentially the error colour. Every ΔE check of the day passed,
+    /// because they only ever compared ring colours to *plain text* and to each other.
+    #[test]
+    fn no_ring_colour_is_confusable_with_a_syntax_accent() {
+        // 10 rather than the ~18 the ring holds against *itself*, and deliberately so. A ring
+        // colour is separated from an accent on three axes at once - hue (it sits at the midpoint
+        // between two accent hues), lightness (0.700 vs 0.760) and chroma (0.080 vs 0.095) - and
+        // it is also a single bracket glyph rather than a word, so the comparison a reader could
+        // actually get wrong is far weaker than one nesting level against the next. The real
+        // measured worst case is 11.7, `BRACKET_6` against `FUNCTION_DEFINITION` in `Paper`, which
+        // is the theme whose derivation compresses lightness and chroma hardest; in Jerry Dark
+        // itself nothing comes within ΔE 15.9.
+        const MIN_DELTA_E: f32 = 10.0;
+        let accents = [
+            ("STRING", syntax::STRING),
+            ("CONSTANT", syntax::CONSTANT),
+            ("FUNCTION_DEFINITION", syntax::FUNCTION_DEFINITION),
+            ("TYPE", syntax::TYPE),
+            ("VARIABLE_PARAMETER", syntax::VARIABLE_PARAMETER),
+            ("ERROR_UNDERLINE", syntax::ERROR_UNDERLINE),
+        ];
+        for def in crate::settings::state::THEME_DEFS.iter() {
+            let _guard = with_bundled_theme(def.name);
+            for (ring_name, ring_token) in ring_tokens() {
+                for (accent_name, accent_token) in accents {
+                    let distance = delta_e(ring_token.resolve(), accent_token.resolve());
+                    assert!(
+                        distance >= MIN_DELTA_E,
+                        "{ring_name} is only ΔE {distance:.1} from {accent_name} in {} - a \
+                         coloured bracket must never impersonate a semantic token",
+                        def.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// The other thing an uncoloured bracket can be. Since the redesign,
+    /// `syntax::PUNCTUATION_BRACKET` is no longer plain text but its own dimmer tone, so a ring
+    /// colour has to stay clear of *both* - this covers the half
+    /// `every_ring_colour_is_perceptibly_different_from_plain_text` does not.
+    #[test]
+    fn every_ring_colour_stays_clear_of_the_de_emphasized_bracket_tone() {
+        const MIN_DELTA_E: f32 = 14.0;
+        for def in crate::settings::state::THEME_DEFS.iter() {
+            let _guard = with_bundled_theme(def.name);
+            let unmatched = syntax::PUNCTUATION_BRACKET.resolve();
+            for (name, token) in ring_tokens() {
+                let distance = delta_e(token.resolve(), unmatched);
+                assert!(
+                    distance >= MIN_DELTA_E,
+                    "{name} is only ΔE {distance:.1} from the unmatched-bracket tone in {} - the \
+                     matched/unmatched distinction would be invisible",
+                    def.name
+                );
             }
         }
     }
