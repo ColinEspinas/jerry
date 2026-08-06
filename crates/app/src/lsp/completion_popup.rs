@@ -281,13 +281,23 @@ impl AdeApp {
         }
         // Follow the *item* the user had selected to its new row, rather than keeping the raw row
         // number (which would silently point at a different completion once the list narrows).
-        // Falls back to the new best match when that item didn't survive the narrowing, or when it
-        // survived only past the last keyboard-reachable row.
-        *selected = previously_selected_item
+        // Falls back to the new best match when that item didn't survive the narrowing. No
+        // keyboard-reachable-row cap here (unlike an earlier version of this fix): GitHub issue
+        // #185's real virtualized scrolling means every real row is reachable regardless of how
+        // far down the now-narrowed list it lands, so the followed row is scrolled into view
+        // below instead of being discarded.
+        let next_selected = previously_selected_item
             .and_then(|item| next_visible.iter().position(|index| *index == item))
-            .filter(|row| *row < MAX_RENDERED_COMPLETION_ITEMS)
             .unwrap_or(0);
+        *selected = next_selected;
         *visible = next_visible;
+        // Same real "scroll the minimum amount needed to bring this row into view" strategy
+        // `Self::move_completions_selection` uses for the identical job - the followed row can
+        // land well outside the current viewport (a filter narrowing the list changes every row's
+        // own position), and without this the selection highlight would move somewhere the user
+        // can't actually see.
+        self.completions_scroll_handle
+            .scroll_to_item(next_selected, gpui::ScrollStrategy::Nearest);
         cx.notify();
     }
 
@@ -904,10 +914,12 @@ mod completions_scroll_tests {
         app.update(cx, |app, cx| {
             app.completions = Some(CompletionsEntry {
                 path: relative.clone(),
-                status: CompletionsStatus::Ready {
-                    items: fake_items(count),
-                    selected: 0,
-                },
+                // Empty query - every item stays visible, in the real server's own order (see
+                // `completion_view::completion_match`'s own docs), matching what this helper's
+                // real callers (real scroll-position/virtualization tests) need: an unshifted,
+                // predictable `visible` for their own index-based assertions.
+                status: CompletionsStatus::ready(fake_items(count), "")
+                    .expect("a real, non-empty item list must produce a real Ready state"),
             });
             cx.notify();
         });
